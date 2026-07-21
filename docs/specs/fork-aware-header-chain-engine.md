@@ -1,8 +1,8 @@
 # Fork-aware headers-only chain engine specification
 
-Status: normative design oracle for the replacement of PR #229  
-Version: 1.2  
-Date: 2026-07-20  
+Status: normative design oracle for the replacement of PR #229<br>
+Version: 1.3<br>
+Date: 2026-07-21<br>
 Scope: Zakura native header sync and its integration with Zakura full state
 
 ## Document overview
@@ -85,7 +85,7 @@ Lists the Zakura code and official Zcash specifications that define the required
 ## 1. Scope and authority
 
 - **ZC — Zcash consensus:** mandatory production Mainnet/Testnet behavior required to accept the same observable header rules as Zcash full consensus. Exceptions for custom networks or disabled proof of work are never included in a ZC rule.
-- **ZP — Zcash deployment security:** production-network trust pins or operational requirements imposed by the Zcash specification on full validators, but not derivable from header validity alone.
+- **ZP — Zcash deployment security:** trust pins or operational requirements with the exact scope imposed by the Zcash specification on full validators, but not derivable from header validity alone. Stronger Zakura deployment policy is classified as LS.
 - **ZF — Zakura fork choice:** deterministic local policy used by Zakura when consensus does not prescribe a deterministic choice.
 - **ZW — Zakura wire/integration:** native protocol or full-node integration behavior.
 - **LS — local safety/liveness:** crash consistency, resource, scheduling, and operator policy.
@@ -209,7 +209,9 @@ Validation proceeds in the following order so cheap bounds precede CPU work and 
 
 **LC-COMMIT-02 [ZW] — Custom-schedule commitment parsing.** Regtest and configured custom networks MUST run the same commitment parser using their configured activation schedule, including overlapping activation-height behavior. A custom activation schedule MUST NOT bypass or guess the commitment variant.
 
-**LC-VAL-05 [ZC] — Target and hash validation.** On production Mainnet/Testnet, compact `nBits` MUST decode to a positive, non-overflowing target no easier than the network PoW limit, and the little-endian integer value of the header hash MUST be less than or equal to that target. LC-VAL-05 runs before LC-VAL-04 so the free target checks reject a candidate before any Equihash CPU cost, matching the check order in `zakura-consensus::block::check`.
+**LC-VAL-05 [ZC] — Target and hash validation.** On production Mainnet/Testnet, compact `nBits` MUST decode to a positive, non-overflowing target no easier than the network PoW limit, and the little-endian integer value of the header hash MUST be less than or equal to that target.
+
+Non-normative implementation advice: run LC-VAL-05 before LC-VAL-04 so the inexpensive target checks reject a candidate before any Equihash CPU cost, matching the current check order in `zakura-consensus::block::check`. Validation order is not a Zcash consensus rule.
 
 **LC-VAL-04 [ZC] — Equihash verification.** On production Mainnet/Testnet, the Equihash solution size and parameters MUST match the network and height, and the Equihash proof MUST verify. Production headers MUST NOT use the short Regtest proof shape.
 
@@ -217,7 +219,7 @@ Validation proceeds in the following order so cheap bounds precede CPU work and 
 
 **LC-POW-01 [ZW] — Configured proof-of-work waiver.** Regtest or a configured custom network MAY explicitly disable proof of work only through its authenticated local network parameters. In that mode the engine MUST still enforce the configured solution encoding and parameters and the positive, non-overflowing PoW-limit-bounded target, but MUST mirror full state by waiving exactly the Equihash-proof check, header-hash-to-target filter, and contextual `ThresholdBits` equality. This exception MUST NOT be reachable for production Mainnet/Testnet identifiers.
 
-**LC-VAL-07 [ZC] — Median and maximum time.** For every non-genesis production Mainnet/Testnet candidate, `nTime` MUST be strictly greater than median-time-past of up to the preceding 11 linked headers. At every non-genesis Mainnet height, and on Testnet where `Network::is_max_block_time_enforced(height)` becomes active (currently height 653,606), `nTime` MUST also be no greater than MTP plus 90 minutes. zcashd deployed the Mainnet bound as a soft fork from height 2; the shared `is_max_block_time_enforced` parity function enforces it at every Mainnet height, the two are observably identical on the real chain, and the shared function is authoritative for LC-PARITY-01.
+**LC-VAL-07 [ZC] — Median and maximum time.** For every non-genesis production Mainnet/Testnet candidate, `nTime` MUST be strictly greater than median-time-past of up to the preceding 11 linked headers. `nTime` MUST also be no greater than MTP plus 90 minutes at Mainnet height 2 and above and at Testnet height 653,606 and above. The height-1 Mainnet exception is part of the consensus boundary even though the historical height-1 block would also satisfy the bound. Any shared helper used for LC-PARITY-01 MUST return this exact production-network behavior; a local helper that enforces the bound at Mainnet height 1 is a parity bug, not an alternative authority.
 
 **LC-TIME-01 [ZW] — Custom-network time rules.** Regtest and configured custom networks MUST apply the same MTP algorithm and the exact height-dependent maximum-time policy returned by their authenticated local network parameters and full state. They MUST NOT inherit Mainnet/Testnet activation heights by name or bypass MTP merely because proof of work is disabled.
 
@@ -225,9 +227,9 @@ Validation proceeds in the following order so cheap bounds precede CPU work and 
 
 **LC-VAL-09 [LS] — Checkpoint ancestry.** At every configured local sync-checkpoint height present in a candidate path, the computed hash MUST exactly equal the configured checkpoint hash. The candidate’s ancestry MUST be consistent with genesis, every applicable settled-upgrade pin and local checkpoint, and `finalized`. This is trusted local selection policy, not a context-free Zcash header rule.
 
-**LC-VAL-10 [ZC] — Per-block work calculation.** Per-block work MUST be computed from the validated compact target as `floor(2^256 / (target + 1))`, using the same target conversion as `zakura-chain`.
+**LC-VAL-10 [ZC] — Per-block work calculation.** Per-block work MUST be computed from the validated compact target as `floor(2^256 / (target + 1))`, using the same target conversion as `zakura-chain`, and MUST be represented without narrowing to less than 256 bits.
 
-**LC-WORKCALC-01 [LS] — Checked cumulative work.** Candidate suffix cumulative work MUST be the checked sum of per-block work from the current work anchor using the same integer ordering as `zakura-chain`. Conversion or sum overflow is a fail-closed local error and MUST NOT produce a selectable candidate or wrapped advertised work.
+**LC-WORKCALC-01 [LS] — Checked cumulative work.** Candidate suffix cumulative work MUST use a 256-bit unsigned representation and MUST be the checked sum of exact per-block work from the current work anchor. No per-block or cumulative value may be narrowed to `u128`. Overflow beyond `2^256 - 1` is a fail-closed local representation error under the Zcash ecosystem assumption that total chain work remains below `2^256`; it MUST NOT wrap, produce a selectable candidate, or produce advertised work.
 
 **LC-VAL-11 [LS] — Validation before admission.** Only after every applicable preceding pipeline rule, including LC-COMMIT-01/02 and LC-POW-01, passes MAY the engine apply resource admission, atomically insert nodes and indexes, recompute eligibility, and evaluate fork choice. `DeferredUntil` is the sole non-passing result admitted by LC-VAL-08; all other deterministic checks MUST still pass before that node is stored as deferred. Response partitioning MUST NOT create intermediate selection semantics different from insertion of the complete validated sequence.
 
@@ -239,7 +241,9 @@ Validation proceeds in the following order so cheap bounds precede CPU work and 
 
 **LC-ANCHOR-03 [LS] — Post-anchor validation context.** A client starting at a later checkpoint MUST acquire the checkpoint header and enough linked predecessors to validate the first post-anchor header—up to 27 predecessors before the anchor, for 28 total context headers ending at the anchor. It MUST authenticate the anchor by exact configured hash and authenticate predecessor context by the backward hash links ending in that anchor. This context is immutable validation context below `finalized`, not a selectable fork.
 
-**LC-ANCHOR-04 [ZP] — Release-authenticated settled pin.** Before a deployment in either mode—integrated/full-validator or headers-only—publishes any header or verified frontier for Mainnet or Testnet, its release-authenticated network manifest MUST independently contain the exact `(upgrade, activation_height, activation_hash)` pin for that network’s most recent settled network upgrade. “Release-authenticated” means immutable data compiled into, or cryptographically authenticated with, the installed release artifact; an unsigned runtime file or peer response is insufficient. The engine MUST fail closed if that pin is missing, malformed, duplicated inconsistently, or unavailable for the selected network; enabling or disabling optional sync checkpoints MUST NOT remove or replace it. Every candidate reaching or passing the activation height MUST contain that exact hash in its ancestry. For version 1.2, the settled tuples, with hashes written in the protocol specification’s RPC display order and canonically parsed into `block::Hash`, are:
+The Zcash protocol requires the settled activation hash when a full validator risks Mainnet funds or displays Mainnet transaction information. Zakura deliberately strengthens that requirement across networks and modes as local deployment policy.
+
+**LC-ANCHOR-04 [LS] — Mode-independent release-authenticated settled pin.** Before a deployment in either mode—integrated/full-validator or headers-only—publishes any header or verified frontier for Mainnet or Testnet, its release-authenticated network manifest MUST independently contain the exact `(upgrade, activation_height, activation_hash)` pin for that network’s most recent settled network upgrade. “Release-authenticated” means immutable data compiled into, or cryptographically authenticated with, the installed release artifact; an unsigned runtime file or peer response is insufficient. The engine MUST fail closed if that pin is missing, malformed, duplicated inconsistently, or unavailable for the selected network; enabling or disabling optional sync checkpoints MUST NOT remove or replace it. Every candidate reaching or passing the activation height MUST contain that exact hash in its ancestry. For version 1.3, the settled tuples, with hashes written in the protocol specification’s RPC display order and canonically parsed into `block::Hash`, are:
 
 | Network | Upgrade | Activation height | Activation hash (RPC display order) |
 | --- | --- | ---: | --- |
@@ -248,9 +252,9 @@ Validation proceeds in the following order so cheap bounds precede CPU work and 
 
 These values MUST come from the release-authenticated manifest rather than peer status or the optional checkpoint files.
 
-Non-normative implementation warning: at version 1.2 publication, `main-checkpoints.txt` ends at height 3,358,006 and `test-checkpoints.txt` ends at 4,023,200, both below their NU6.2 activation height. Those files therefore cannot satisfy LC-ANCHOR-04 without the independent settled-upgrade manifest.
+Non-normative implementation warning: at version 1.3 publication, `main-checkpoints.txt` ends at height 3,358,006 and `test-checkpoints.txt` ends at 4,023,200, both below their NU6.2 activation height. Those files therefore cannot satisfy LC-ANCHOR-04 without the independent settled-upgrade manifest.
 
-**LC-ANCHOR-05 [ZP] — Atomic settled-pin updates.** A release that changes which upgrade is most recently settled or changes a settled activation tuple MUST update the manifest and both-network conformance vectors atomically. Runtime peer claims, candidate-upgrade configuration such as NU6.3/NU7, and mere passage of an activation height MUST NOT create, supersede, or mutate a settled-upgrade pin.
+**LC-ANCHOR-05 [LS] — Atomic settled-pin updates.** A release that changes which upgrade is most recently settled or changes a settled activation tuple MUST update the manifest and both-network conformance vectors atomically. Runtime peer claims, candidate-upgrade configuration such as NU6.3/NU7, and mere passage of an activation height MUST NOT create, supersede, or mutate a settled-upgrade pin.
 
 ### 3.3 Eligibility and deterministic fork choice
 
@@ -369,9 +373,11 @@ VCT/tree-aux records are execution assistance. They can help reconstruct and aut
 
 ### 5.1 Negotiation and common codec
 
-Native stream version 8 is a breaking successor to v7. Negotiation advertises supported versions and selects exactly one codec for a stream. Integers below are unsigned little-endian. Hashes are 32 raw internal bytes. Heights are `u32` constrained to `block::Height::MAX`; request IDs are nonzero `u64`; work is `u128` encoded as exactly 16 bytes. All messages retain the negotiated application frame limit and the local 2 MiB hard message cap.
+Native stream version 8 is a breaking successor to v7. Negotiation advertises supported versions and selects exactly one codec for a stream. Integers below are unsigned little-endian. Hashes are 32 raw internal bytes. Heights are `u32` constrained to `block::Height::MAX`; request IDs are nonzero `u64`; work is an unsigned 256-bit integer encoded as exactly 32 little-endian bytes. All messages retain the negotiated application frame limit and the local 2 MiB hard message cap.
 
-**LC-V8-01 [ZW] — Bounded v8 decoding.** A v8 decoder MUST reject unknown discriminants, zero request IDs, invalid booleans, out-of-range heights, count/vector disagreement, trailing bytes, arithmetic overflow, and messages exceeding either negotiated or hard byte/count limits before allocation or CPU-heavy validation.
+Version 1.3 replaces the draft version 1.2 16-byte work field before v8 deployment. Implementations of that obsolete draft encoding are incompatible with this specification.
+
+**LC-V8-01 [ZW] — Bounded v8 decoding.** A v8 decoder MUST reject unknown discriminants, zero request IDs, invalid booleans, out-of-range heights, count/vector disagreement, trailing bytes, arithmetic overflow, and messages exceeding either negotiated or hard byte/count limits before allocation or CPU-heavy validation. A version 1.3 implementation MUST NOT negotiate v8 with a peer known to implement the obsolete draft 16-byte work encoding.
 
 ### 5.2 Messages
 
@@ -391,7 +397,7 @@ work_anchor_height        u32
 work_anchor_hash          [u8; 32]
 selected_tip_height       u32
 selected_tip_hash         [u8; 32]
-suffix_cumulative_work    u128 (16-byte little-endian)
+suffix_cumulative_work    uint256 (32-byte little-endian)
 oldest_retained_height    u32
 max_headers_per_response  u32
 max_inflight_requests     u16
@@ -497,6 +503,8 @@ Each schema-1 height must equal its parallel header’s inferred height. Root de
 
 **LC-V7-03 [ZW] — Disconnected-fork fallback.** When an advertised fork cannot connect through retained v7 ancestry, the scheduler SHOULD prefer v8 or legacy locator-based Zcash `getheaders`; it MUST NOT overwrite the selected projection by height to manufacture connectivity.
 
+**LC-V7-04 [ZW] — ZIP 204 `getheaders` conformance.** When Zakura uses or serves the standard Zcash `getheaders` fallback, it MUST use the negotiated Zcash P2P codec and ZIP 204 semantics. A server MUST return headers after the first locator hash found on its best chain, stopping at `hash_stop` or 160 headers, whichever comes first. A requester MUST reject a response containing more than 160 headers and MUST require canonical header encodings, exact payload consumption, and one contiguous `hashPrevBlock` sequence before admission. Both sides MUST enforce canonical CompactSize encoding, the P2P message checksum, and the 2 MiB payload limit. Over-limit, malformed, or non-contiguous responses are peer-attributable protocol violations; an empty response alone is not proof that the peer advertised an invalid chain.
+
 ## 6. Consensus parity and intentional limits
 
 | Rule or evidence | Headers-only engine | Full Zakura state | Authority / intentional difference |
@@ -509,7 +517,7 @@ Each schema-1 height must equal its parallel header’s inferred height. Root de
 | Contextual difficulty | Same branch-local 28-header context and upgrade rules | Same algorithm over full blocks | Zcash consensus |
 | Median time | Same preceding 11 headers and MTP bounds | Same | Zcash consensus |
 | Local two-hour future rule | Deferred and reevaluated | Temporarily rejected/retried | Nondeterministic local-clock policy |
-| Most recent settled upgrade | Mandatory manifest pin in every mode | Mandatory manifest pin | Zcash deployment-security requirement, independent of sync checkpoints |
+| Most recent settled upgrade | Mandatory manifest pin in every mode | Mandatory manifest pin | Zakura strengthening of the Zcash Mainnet full-validator deployment-security requirement |
 | Local sync checkpoints | Exact configured hash plus absolute trust pin | Checkpoint verifier / finalized state | Trusted local policy; normal post-anchor validation |
 | Finality | Automatic 1,000-deep disclosed local pin | Only fully verified full-state finalization | Deliberate mode-specific trust policy |
 | Work | Same target-derived formula | Same | Zcash consensus ordering input |
@@ -547,7 +555,7 @@ Each named test below is a deterministic test target or parameterized suite. Mod
 - **HV-04 `difficulty_differential`:** every upgrade boundary, first 28 heights, 17/28-header window edges, damping/bounds, ZIP 205/208 Testnet minimum difficulty, response partition permutations, and differential calls against `AdjustedDifficulty`.
 - **HV-05 `mtp_and_future_time`:** 1–11 predecessor medians, equality/one-second boundaries, Mainnet height 1/2, Testnet height 653,605/653,606, Regtest/custom activation schedules with PoW enabled and disabled, two-hour equality, deferred reevaluation, clock advancement, and restart while deferred.
 - **HV-06 `checkpoint_anchor_context`:** genesis, each configured checkpoint fixture, conflicting ancestry, observable checkpoint checks, trusted later-start context of 28 headers, bad backward linkage, and normal first post-anchor validation.
-- **HV-07 `work_vectors`:** compact target to work vectors, suffix sums, overflow fail-close, locally recomputed versus advertised work, and raw-hash equal-work comparator.
+- **HV-07 `work_vectors`:** compact target to exact 256-bit work vectors, values above `u128::MAX`, 256-bit suffix sums, overflow fail-close at the `2^256` boundary, locally recomputed versus advertised work, 32-byte little-endian v8 work encoding, and the raw-hash equal-work comparator.
 - **HV-08 `commitment_field_structure`:** every production activation boundary, malformed and canonical Sapling-root encodings, zero/nonzero Heartwood activation reserved fields, Canopy-at-Heartwood overlapping activation, NU5-and-later opaque commitment structure, and Regtest/custom activation schedules differential-tested against `Header::commitment(network, height)`.
 - **HV-09 `settled_upgrade_pins`:** Mainnet NU6.2 at 3,364,600 and Testnet NU6.2 at 4,052,000 with correct/wrong/missing hashes; absent, malformed, duplicate-conflicting, stale, and peer-supplied-only manifests; optional checkpoints disabled or ending below activation; candidate-upgrade non-promotion; and fail-closed startup before publication on both networks and in both engine modes.
 
@@ -570,14 +578,14 @@ Each named test below is a deterministic test target or parameterized suite. Mod
 
 #### Protocol and differential behavior
 
-- **P8-01 `v8_codec_and_fuzz`:** every message/outcome, exact integer/hash encoding, zero IDs, booleans, bounds, trailing bytes, oversized payloads, vector lengths, version-selected discriminant 4, v7 `NewBlock` rejection as v8, and mutation fuzzing.
+- **P8-01 `v8_codec_and_fuzz`:** every message/outcome, exact integer/hash encoding including 32-byte little-endian work, zero IDs, booleans, bounds, trailing bytes, oversized payloads, vector lengths, version-selected discriminant 4, v7 `NewBlock` rejection as v8, and mutation fuzzing.
 - **P8-02 `locator_vectors`:** tips from heights 0 through 2,000, exact exponential offsets, 1,000 offset, final anchor, deduplication, order, and 13-entry cap.
 - **P8-03 `target_snapshot_and_continuation`:** target changes during serve, selection changes during serve, count/byte continuations, same target across pages, exact completed tip, and no silent substitution.
 - **P8-04 `outcomes_and_attribution`:** all four explicit outcomes, stale refresh, busy backoff, malformed ancestor, mismatched target/ID, invalid header, and score/no-score assertions.
 - **P8-05 `multipeer_fork_discovery`:** shorter-higher-work, longer-lower-work, same-height equal-work, same-height greater-work, unknown fork, same-height status trigger, and permutation-independent convergence.
 - **P8-06 `aux_schema_and_body_hints`:** schema mask/selector negotiation, exact schema-1 156-byte golden vectors, every field and root encoding, height mismatch, preactivation defaults, NU5/NU6.3/NU7 boundaries, all-or-none parallel counts, unavailable metadata fallback, unknown/future schemas, `0`/`1`/`2,000,000`/`2,000,001` body hints, and proof that hints cannot drive allocation or admission credit.
 - **P8-07 `status_propagation`:** initial status immediately after negotiation, change-driven updates for tip/anchor/retention/cap changes, burst coalescing with the two-second freshness and one-per-second floor, configured periodic refresh, snapshot atomicity against concurrent selection changes, and non-punitive handling of silent or stale-status peers.
-- **P7-01 `v7_compatibility`:** selected projection serving, retained-parent acceptance, stale implicit anchor, no false score, unknown fork limitation, locator fallback, and v7-only `NewBlock` discriminant behavior.
+- **P7-01 `v7_compatibility`:** selected projection serving, retained-parent acceptance, stale implicit anchor, no false score, unknown fork limitation, and v7-only `NewBlock` discriminant behavior; standard Zcash fallback with ZIP 204 locator selection, `hash_stop`, the 160-header response bound, canonical CompactSize and header encodings, checksum and 2 MiB framing, contiguous responses, malformed-response attribution, and non-punitive empty responses.
 - **DF-01 `header_full_state_parity`:** body-valid generated fork graphs fed to the integrated header engine and full state from the same finalized anchor; require identical observable-header acceptance, work, raw-hash tie order, and selected tip before a full-state finalization event.
 - **DF-02 `intentional_difference_vectors`:** coinbase height, Merkle/body mismatch, transaction/proof/script failure, nullifier/anchor/value-pool/state-transition failure, local future time, and header-valid/body-invalid outcomes, each with an asserted typed explanation.
 
@@ -601,6 +609,7 @@ The following matrix supersedes the old audit invariant that the verified chain 
 | Incumbent-relative 1,000-block rule makes arrival order select an unreplaceable fork | eligibility relative only to `finalized`; explicit integrated and headers-only finality sources | DG-05, DG-07 |
 | Header commitment field is not structurally interpreted at inferred height | mandatory `Header::commitment(network, height)` parity | HV-08, DF-01 |
 | v8 auxiliary records, body hints, and discriminant 4 are underspecified | exact schema/hint codec, immutable schema evolution, and explicit removal of v8 `NewBlock` | P8-01, P8-06, P7-01 |
+| Legacy `getheaders` fallback can drift from Zcash P2P semantics | explicit ZIP 204 codec, locator, count, framing, and continuity requirements | P7-01 |
 | Consensus authority is mixed with custom/checkpoint/Zakura policy | separate ZC, ZP, ZF, ZW, and LS rules and parity assertions | HV-03, HV-06, HV-09, DF-01, conformance-manifest self-test |
 
 The 15 named audit scenarios are executable cases, not prose-only acceptance examples:
@@ -670,7 +679,7 @@ Every normative rule is mapped here. A range such as `LC-SCOPE-01..03` includes 
 | LC-V8-08..12 | P8-03, P8-04, P8-05 |
 | LC-V8-13..16 | P8-01, P8-06, P7-01 |
 | LC-V8-17 | P8-05, P8-07 |
-| LC-V7-01..03 | P7-01, IN-07 |
+| LC-V7-01..04 | P7-01, IN-07 |
 | LC-PARITY-01..03 | HV-03, HV-08, DF-01, DF-02 |
 | LC-TEST-01..02 | conformance-manifest self-test |
 | LC-ACCEPT-01..05 | conformance-manifest self-test, all suites in sections 7.2 and 7.3 |
@@ -687,7 +696,7 @@ The “architecture dependency check” asserts that wallet scanning, FlyClient 
 
 **LC-ACCEPT-04 [LS] — Terminating body-failure handling.** Body-invalid and body-unavailable cases MUST terminate each retry episode in either deterministic reselection or an explicit persistent alarm; neither may produce an infinite silent retry.
 
-**LC-ACCEPT-05 [LS] — Explained parity differences.** The full-state/header differential suite MUST enumerate and explain every intentional difference. Version 1.2 acceptance MUST contain no unresolved design placeholders.
+**LC-ACCEPT-05 [LS] — Explained parity differences.** The full-state/header differential suite MUST enumerate and explain every intentional difference. Version 1.3 acceptance MUST contain no unresolved design placeholders.
 
 ## 8. Implementation oracle and source authority
 
@@ -699,7 +708,7 @@ The implementation must share code with or remain differential-test equivalent t
 | --- | --- |
 | Canonical header/version encoding and local future-time rule | `zakura-chain/src/block/serialize.rs`, `zakura-chain/src/block/header.rs` |
 | Height-dependent header commitment-field interpretation | `zakura-chain/src/block/header.rs` (`Header::commitment`), `zakura-chain/src/block/commitment.rs` (`Commitment::from_bytes`) |
-| Compact target, work formula, and integer ordering | `zakura-chain/src/work/difficulty.rs` |
+| Compact target, work formula, and integer ordering | `zakura-chain/src/work/difficulty.rs`; its target conversion remains authoritative, but the redesign replaces the existing `u128` `Work` and `PartialCumulativeWork` storage with the exact 256-bit representation required by LC-VAL-10 and LC-WORKCALC-01 |
 | Equihash and context-free PoW checks | `zakura-consensus/src/block/check.rs` |
 | Contextual 28-header difficulty, 11-header MTP, and MTP+90-minute rule | `zakura-state/src/service/check/difficulty.rs`, `zakura-state/src/service/check.rs` |
 | Full-state greatest-work/raw-tip-hash ordering | `zakura-state/src/service/non_finalized_state/chain.rs` (`impl Ord for Chain`) |
@@ -715,7 +724,7 @@ Non-normative provenance: the production failure evidence that motivated the aud
 
 ### 8.2 Official protocol sources
 
-- [Zcash Protocol Specification](https://zips.z.cash/protocol/protocol.pdf), version `v2026.7.0-33-gc55edc [NU6.2]` dated 2026-07-12 for the version 1.2 settled hashes, and especially its block-header, difficulty-adjustment, work, and best-chain rules.
+- [Zcash Protocol Specification](https://zips.z.cash/protocol/protocol.pdf), version `v2026.7.0-33-gc55edc [NU6.2]` dated 2026-07-12 for the version 1.3 settled hashes, and especially its block-header, difficulty-adjustment, work, and best-chain rules.
 - [ZIP 204: Zcash P2P Network Protocol](https://zips.z.cash/zip-0204), for bounded framing, locators, and contiguous header responses. Native v8 remains Zakura-specific.
 - [ZIP 205](https://zips.z.cash/zip-0205) and [ZIP 208](https://zips.z.cash/zip-0208), for Testnet difficulty and Blossom target-spacing behavior.
 - [ZIP 221: FlyClient consensus-layer changes](https://zips.z.cash/zip-0221), for history-tree commitments and work metadata. Its logarithmic proof protocol is explicitly excluded from v1.
@@ -723,8 +732,25 @@ Non-normative provenance: the production failure evidence that motivated the aud
 - [ZIP 307: light-client payment detection](https://zips.z.cash/zip-0307), explicitly excluded because this specification is a header-chain engine, not a wallet scanning protocol.
 - [Official ZIP index](https://zips.z.cash/), for upgrade proposal status. Candidate status alone is never evidence that an upgrade is settled and never changes LC-ANCHOR-04/05 or an auxiliary schema.
 
-### 8.3 Fixed design decisions
+### 8.3 Applicable source-to-rule audit
 
-This version fixes the following choices: one integrated reusable engine; linear verification of all candidate headers; native v8 fork discovery with limited v7 compatibility; independent `header_best`, `verified_best`, and `finalized`; Zakura’s greater-raw-tip-hash equal-work policy; integrated finality sourced only from fully verified state; headers-only automatic local finality 1,000 descendants behind `header_best`; an eligible-candidate-tip cap equal to the shared non-finalized fork-cap constant, currently 10; 65,536 non-finalized DAG nodes; body-invalid branch disqualification; body-unavailable selection plus alarm; independent mandatory settled-upgrade pins in every deployment mode; absolute local checkpoint pins with observable header checks; v8 auxiliary schema 1 and no v8 `NewBlock`; and authenticated-only use of VCT/tree-aux metadata.
+| Official source | Applicable behavior | Rules and tests |
+| --- | --- | --- |
+| Protocol section 3.3, The Block Chain | visible candidate tree, greatest total work, protocol first-seen equal-work guidance, settled-upgrade scope, optional rollback limit | LC-SCOPE-01..03, LC-SELECT-01..04, LC-ANCHOR-04, LC-FINAL-01..04; DG-01, DG-05, HV-07, DF-01..02 |
+| Protocol section 3.12, Mainnet and Testnet | genesis and settled activation hashes in RPC display order | LC-ANCHOR-01, LC-ANCHOR-04..05; HV-06, HV-09 |
+| Protocol section 7.6, Block Header Encoding and Consensus | signed version, canonical solution encoding, MTP, exact Mainnet/Testnet maximum-time activation heights, and upgrade-specific commitment semantics | LC-VAL-02..08, LC-COMMIT-01; HV-02..05, HV-08, DF-01 |
+| Protocol sections 7.7.1–7.7.2, Equihash and difficulty filter | Equihash parameters/solution and little-endian header-hash target filter | LC-VAL-04..05; HV-03, DF-01 |
+| Protocol sections 7.7.3–7.7.4; ZIP 205; ZIP 208 | 17-block averaging, 11-block medians, compact-target conversion, Testnet minimum difficulty, and Blossom spacing | LC-VAL-06; HV-04, DF-01 |
+| Protocol section 7.7.5; ZIP 221 work metadata | exact per-block work and ecosystem 256-bit cumulative-work bound | LC-VAL-10, LC-WORKCALC-01, LC-SELECT-02, LC-V8-02; HV-07, P8-01, DF-01 |
+| ZIP 204 | negotiated P2P framing, canonical CompactSize, `getheaders` locator/`hash_stop` behavior, 160-header cap, and contiguous responses | LC-VAL-01, LC-V7-03..04; HV-01, P7-01 |
+| ZIP 221 | Heartwood activation zero, history-tree commitment semantics, and one-header-later authentication boundary | LC-COMMIT-01, LC-AUX-01..04; HV-08, IN-06 |
+| ZIP 244 | NU5 `hashBlockCommitments` and `hashAuthDataRoot` semantics | LC-COMMIT-01, LC-AUX-01..04; HV-08, IN-02, IN-06 |
+| ZIP 307 | wallet scanning and payment detection, explicitly outside this engine | LC-SCOPE-04; architecture dependency check |
+
+This table covers every part of the cited Zcash sources that this engine implements, strengthens, or explicitly excludes. Transaction, proof, script, note, nullifier, and state-transition rules remain full-state responsibilities under LC-SCOPE-03 and are not re-specified here.
+
+### 8.4 Fixed design decisions
+
+This version fixes the following choices: one integrated reusable engine; linear verification of all candidate headers; native v8 fork discovery with limited v7 compatibility and ZIP 204-conformant fallback; independent `header_best`, `verified_best`, and `finalized`; exact 256-bit work with 32-byte little-endian v8 encoding; Zakura’s greater-raw-tip-hash equal-work policy; integrated finality sourced only from fully verified state; headers-only automatic local finality 1,000 descendants behind `header_best`; an eligible-candidate-tip cap equal to the shared non-finalized fork-cap constant, currently 10; 65,536 non-finalized DAG nodes; body-invalid branch disqualification; body-unavailable selection plus alarm; independent mandatory settled-upgrade pins in every deployment mode as a deliberate strengthening of the Zcash deployment requirement; absolute local checkpoint pins with observable header checks; v8 auxiliary schema 1 and no v8 `NewBlock`; and authenticated-only use of VCT/tree-aux metadata.
 
 Any future change to one of these choices requires a new specification version, explicit migration and compatibility rules, and corresponding updates to the conformance manifest. It is not an implementation detail.

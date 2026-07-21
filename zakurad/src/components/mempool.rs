@@ -809,6 +809,7 @@ impl Service<Request> for Mempool {
             // So we don't need to check them here.
             if let Some(tip_height) = best_tip_height {
                 let expired_transactions = storage.remove_expired_transactions(tip_height);
+                // Remove transactions that are expired from the peers list
                 send_to_peers_ids.retain(|id| !expired_transactions.contains(id));
 
                 if !expired_transactions.is_empty() {

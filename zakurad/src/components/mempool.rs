@@ -157,7 +157,11 @@ enum ActiveState {
         /// The transaction download and verify stream.
         tx_downloads: Pin<Box<InboundTxDownloads>>,
 
-        /// Verified transaction IDs that still need to be advertised to peers.
+        /// Verified transaction IDs awaiting proactive advertisement through
+        /// the peer set.
+        ///
+        /// This pending set is separate from the full mempool inventory served
+        /// by [`Request::TransactionIds`] when a peer requests it.
         pending_gossip_tx_ids: HashSet<UnminedTxId>,
 
         /// Last seen chain tip hash that mempool transactions have been verified against.

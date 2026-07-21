@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "session": null,
+  "batch_runs_used": 0,
+  "next_exp_id": 1,
+  "droplets": {},
+  "in_flight": {},
+  "noise_band_pct": null
+}

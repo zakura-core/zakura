@@ -2463,6 +2463,14 @@ impl ZakuraDiscoveryInner {
             .retain(|node_id, _| connected_node_ids.contains(node_id));
         for entry in self.active_services.values_mut() {
             entry.prune_expired_live_summaries(now_unix_secs);
+            if entry
+                .record
+                .as_ref()
+                .is_some_and(|record| record.body.expires_at_unix_secs < now_unix_secs)
+            {
+                entry.record = None;
+                entry.refresh_live_derived_services();
+            }
         }
         self.active_services
             .retain(|_, entry| !entry.is_empty_live_only());
@@ -7844,6 +7852,29 @@ mod tests {
             .connected;
         assert!(!stale_candidates.contains(&live_only_node_id));
         assert!(stale_candidates.contains(&record_backed_node_id));
+    }
+
+    #[tokio::test]
+    async fn expired_connected_record_service_membership_is_pruned() {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let record = runtime_record_with(1, service(43), test_addr(43));
+        let node_id = record.body.node_id;
+        let expires_at = record.body.expires_at_unix_secs;
+        connected_tx.send_replace(vec![peer_id_for(node_id)]);
+
+        handle
+            .import_connected_peer_record(record, node_id)
+            .await
+            .expect("connected record imports");
+        assert_eq!(
+            handle.active_services(node_id).await,
+            Some(vec![service(43)])
+        );
+
+        let mut inner = handle.inner.lock().await;
+        inner.sync_active_services(&[node_id], expires_at.saturating_add(1));
+        assert!(!inner.active_services.contains_key(&node_id));
     }
 
     #[tokio::test]

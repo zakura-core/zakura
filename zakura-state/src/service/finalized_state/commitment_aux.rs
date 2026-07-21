@@ -871,6 +871,25 @@ mod tests {
             .expect("seeding commitment root index succeeds");
     }
 
+    #[test]
+    fn commitment_root_range_stops_at_first_gap() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_mainnet_db();
+
+        seed_index_roots(&db, [10, 12]);
+
+        assert_eq!(
+            db.commitment_roots_by_height_range(block::Height(10)..=block::Height(12))
+                .into_iter()
+                .map(|roots| roots.height)
+                .collect::<Vec<_>>(),
+            vec![block::Height(10)],
+        );
+        assert!(db
+            .commitment_roots_by_height_range(block::Height(11)..=block::Height(12))
+            .is_empty());
+    }
+
     fn set_upgrade_height(db: &ZakuraDb, height: block::Height) {
         let mut batch = DiskWriteBatch::new();
         batch.update_vct_upgrade_marker(db, height);

@@ -34,6 +34,7 @@ use super::disk_format::upgrade::restorable_db_versions;
 
 pub mod block;
 pub mod chain;
+pub(crate) mod commitment_roots_db;
 pub mod metrics;
 
 /// Minimum number of transactions in a block before the per-transaction batch

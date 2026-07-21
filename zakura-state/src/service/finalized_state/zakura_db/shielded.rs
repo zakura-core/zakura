@@ -17,10 +17,8 @@ use std::{
     sync::Arc,
 };
 
-use std::ops::RangeInclusive;
-
 use zakura_chain::{
-    block::{merkle::AuthDataRoot, Height},
+    block::Height,
     ironwood, orchard,
     parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
     sapling, sprout,
@@ -32,10 +30,9 @@ use crate::{
     request::{FinalizedBlock, Treestate},
     service::finalized_state::{
         disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
-        disk_format::{shielded::CommitmentRootsByHeight, RawBytes},
+        disk_format::RawBytes,
         vct::VctWriteData,
         zakura_db::ZakuraDb,
-        COMMITMENT_ROOTS_BY_HEIGHT,
     },
     MissingSproutTipTree, TransactionLocation, ValidateContextError,
 };
@@ -137,43 +134,6 @@ impl ZakuraDb {
     pub fn contains_orchard_anchor(&self, orchard_anchor: &orchard::tree::Root) -> bool {
         let orchard_anchors = self.db.cf_handle("orchard_anchors").unwrap();
         self.db.zs_contains(&orchard_anchors, &orchard_anchor)
-    }
-
-    /// Returns the per-block Sapling/Orchard commitment roots stored in the
-    /// `commitment_roots_by_height` serving index for the **contiguous** prefix of `range`
-    /// that is present, in ascending height order (design §4).
-    ///
-    /// Reads stop at the first absent height, so the result is always a gap-free run from
-    /// `range.start()` — exactly what the `tree_aux` `BlockRoots` serve and `fetch_roots`
-    /// client expect. A node populates this index for every block it commits (fast or
-    /// legacy), so a fast-synced node — which holds no per-height trees — can still serve
-    /// roots here. Returns an empty vec for a database written before the index existed
-    /// (e.g. a pre-index archive node), where the caller falls back to `produce_block_roots`.
-    pub fn commitment_roots_by_height_range(
-        &self,
-        range: RangeInclusive<Height>,
-    ) -> Vec<BlockCommitmentRoots> {
-        let cf = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
-        let mut roots = Vec::new();
-        for height in (range.start().0..=range.end().0).map(Height) {
-            let Some(value) = self
-                .db
-                .zs_get::<_, _, CommitmentRootsByHeight>(&cf, &height)
-            else {
-                break;
-            };
-            roots.push(BlockCommitmentRoots {
-                height,
-                sapling_root: value.sapling,
-                orchard_root: value.orchard,
-                ironwood_root: value.ironwood,
-                sapling_tx: value.sapling_tx,
-                orchard_tx: value.orchard_tx,
-                ironwood_tx: value.ironwood_tx,
-                auth_data_root: value.auth_data_root,
-            });
-        }
-        roots
     }
 
     /// POC: returns `(sapling_count, sapling_digest, orchard_count, orchard_digest)`,
@@ -865,16 +825,18 @@ impl DiskWriteBatch {
             // Persist the per-height roots into the serving index even though no per-height
             // tree is written, so this fast-synced node can still serve `tree_aux` roots
             // (design §4); otherwise the root-serving fleet collapses as nodes fast-sync.
-            self.insert_commitment_roots_by_height(
+            self.insert_body_derived_commitment_roots(
                 zakura_db,
-                *height,
-                &sapling_root,
-                &orchard_root,
-                &ironwood_root,
-                sapling_tx,
-                orchard_tx,
-                ironwood_tx,
-                &auth_data_root,
+                &BlockCommitmentRoots {
+                    height: *height,
+                    sapling_root,
+                    orchard_root,
+                    ironwood_root,
+                    sapling_tx,
+                    orchard_tx,
+                    ironwood_tx,
+                    auth_data_root,
+                },
             );
             self.update_history_tree(zakura_db, history_tree);
             return Ok(());
@@ -923,16 +885,18 @@ impl DiskWriteBatch {
         // (not just when a tree changed — the index must be gap-free for contiguous serving),
         // so a legacy/archive node serves `tree_aux` roots from the compact index too, and a
         // node that later fast-syncs above this height already has the lower range covered.
-        self.insert_commitment_roots_by_height(
+        self.insert_body_derived_commitment_roots(
             zakura_db,
-            *height,
-            &note_commitment_trees.sapling.root(),
-            &note_commitment_trees.orchard.root(),
-            &note_commitment_trees.ironwood.root(),
-            sapling_tx,
-            orchard_tx,
-            ironwood_tx,
-            &auth_data_root,
+            &BlockCommitmentRoots {
+                height: *height,
+                sapling_root: note_commitment_trees.sapling.root(),
+                orchard_root: note_commitment_trees.orchard.root(),
+                ironwood_root: note_commitment_trees.ironwood.root(),
+                sapling_tx,
+                orchard_tx,
+                ironwood_tx,
+                auth_data_root,
+            },
         );
 
         self.update_history_tree(zakura_db, history_tree);
@@ -1027,57 +991,6 @@ impl DiskWriteBatch {
     pub fn insert_sapling_anchor(&mut self, zakura_db: &ZakuraDb, root: &sapling::tree::Root) {
         let sapling_anchors = zakura_db.db.cf_handle("sapling_anchors").unwrap();
         self.zs_insert(&sapling_anchors, root, ());
-    }
-
-    /// Inserts the per-height Sapling/Orchard commitment roots into the
-    /// `commitment_roots_by_height` serving index (design §4).
-    ///
-    /// Written on every committed block, fast or legacy, so any node — including a
-    /// fast-synced node that holds no per-height trees — can serve the `tree_aux`
-    /// `BlockRoots` read from this compact 64-byte-per-height index. Idempotent
-    /// (re-inserting the same height overwrites with the identical value).
-    #[allow(clippy::too_many_arguments)]
-    pub fn insert_commitment_roots_by_height(
-        &mut self,
-        zakura_db: &ZakuraDb,
-        height: Height,
-        sapling_root: &sapling::tree::Root,
-        orchard_root: &orchard::tree::Root,
-        ironwood_root: &ironwood::tree::Root,
-        sapling_tx: u64,
-        orchard_tx: u64,
-        ironwood_tx: u64,
-        auth_data_root: &AuthDataRoot,
-    ) {
-        let cf = zakura_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
-        self.zs_insert(
-            &cf,
-            height,
-            CommitmentRootsByHeight {
-                sapling: *sapling_root,
-                orchard: *orchard_root,
-                ironwood: *ironwood_root,
-                sapling_tx,
-                orchard_tx,
-                ironwood_tx,
-                auth_data_root: *auth_data_root,
-            },
-        );
-    }
-
-    /// Deletes the commitment-roots serving-index entries in `[from, to)`.
-    ///
-    /// Used by the finalized rollback to truncate the index above the rollback target, the
-    /// same way the per-height trees and anchors above the target are removed, so a
-    /// rolled-back database does not retain root entries for heights it no longer holds.
-    pub fn delete_range_commitment_roots_by_height(
-        &mut self,
-        zakura_db: &ZakuraDb,
-        from: &Height,
-        to: &Height,
-    ) {
-        let cf = zakura_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
-        self.zs_delete_range(&cf, from, to);
     }
 
     /// Records the verified-commitment-trees fast-sync marker: per-height

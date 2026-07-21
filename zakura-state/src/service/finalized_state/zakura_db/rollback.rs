@@ -31,7 +31,6 @@ use crate::{
         finalized_state::{
             disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
             disk_format::{
-                shielded::CommitmentRootsByHeight,
                 transparent::{
                     AddressBalanceLocation, AddressTransaction, AddressUnspentOutput,
                     OutputLocation,
@@ -43,7 +42,7 @@ use crate::{
                 transparent::{BALANCE_BY_TRANSPARENT_ADDR, TX_LOC_BY_SPENT_OUT_LOC},
                 ZakuraDb,
             },
-            COMMITMENT_ROOTS_BY_HEIGHT, STATE_COLUMN_FAMILIES_IN_CODE,
+            STATE_COLUMN_FAMILIES_IN_CODE,
         },
         non_finalized_state::write_semantically_verified_backup_block,
     },
@@ -914,8 +913,6 @@ fn delete_zakura_headers_above(db: &ZakuraDb, batch: &mut DiskWriteBatch, target
         .db
         .cf_handle("zakura_header_body_size_by_height")
         .unwrap();
-    let roots_by_height = db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
-
     let Some((tip_height, _tip_hash)) = db
         .db
         .zs_last_key_value::<_, Height, block::Hash>(&hash_by_height)
@@ -930,7 +927,10 @@ fn delete_zakura_headers_above(db: &ZakuraDb, batch: &mut DiskWriteBatch, target
         batch.zs_delete(&hash_by_height, height);
         batch.zs_delete(&header_by_height, height);
         batch.zs_delete(&body_size_by_height, height);
-        batch.zs_delete(&roots_by_height, height);
+    }
+
+    if let Ok(first_deleted) = target_height.next() {
+        batch.delete_header_reorg_commitment_roots(db, first_deleted, tip_height);
     }
 }
 
@@ -1045,7 +1045,7 @@ fn prune_tree_indexes(
 
     // Truncate the per-height commitment-roots serving index above the target, so a rolled-back
     // database does not serve roots for heights it no longer holds.
-    batch.delete_range_commitment_roots_by_height(db, &Height(target_height.0 + 1), &Height::MAX);
+    batch.truncate_commitment_roots_after(db, target_height);
 
     // Delete every sapling/orchard/ironwood subtree whose notes extend past the target height. Subtree
     // indexes are read back from the database and number far fewer than `u16::MAX`, so `index.0 + 1`
@@ -1100,18 +1100,11 @@ struct RetainedShieldedRoots {
 fn retained_shielded_roots(db: &ZakuraDb, target_height: Height) -> RetainedShieldedRoots {
     let mut retained = RetainedShieldedRoots::default();
 
-    let commitment_roots_by_height = db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
-    for (_height, roots) in db
-        .db
-        .zs_forward_range_iter::<_, Height, CommitmentRootsByHeight, _>(
-            &commitment_roots_by_height,
-            ..=target_height,
-        )
-    {
-        retained.sapling.insert(roots.sapling);
-        retained.orchard.insert(roots.orchard);
-        retained.ironwood.insert(roots.ironwood);
-    }
+    db.visit_commitment_roots_for_migration(..=target_height, |_height, roots| {
+        retained.sapling.insert(roots.sapling_root);
+        retained.orchard.insert(roots.orchard_root);
+        retained.ironwood.insert(roots.ironwood_root);
+    });
 
     for (_height, tree) in db.sapling_tree_by_height_range(..=target_height) {
         retained.sapling.insert(tree.root());
@@ -1134,29 +1127,23 @@ fn prune_fast_commitment_anchors_from_index(
     target_height: Height,
     retained_roots: &RetainedShieldedRoots,
 ) {
-    let commitment_roots_by_height = db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
-    let rolled_back_roots: BTreeMap<_, CommitmentRootsByHeight> = db
-        .db
-        .zs_forward_range_iter(
-            &commitment_roots_by_height,
-            (
-                std::ops::Bound::Excluded(target_height),
-                std::ops::Bound::Unbounded,
-            ),
-        )
-        .collect();
-
-    for (_height, roots) in rolled_back_roots {
-        if !retained_roots.sapling.contains(&roots.sapling) {
-            batch.delete_sapling_anchor(db, &roots.sapling);
-        }
-        if !retained_roots.orchard.contains(&roots.orchard) {
-            batch.delete_orchard_anchor(db, &roots.orchard);
-        }
-        if !retained_roots.ironwood.contains(&roots.ironwood) {
-            batch.delete_ironwood_anchor(db, &roots.ironwood);
-        }
-    }
+    db.visit_commitment_roots_for_migration(
+        (
+            std::ops::Bound::Excluded(target_height),
+            std::ops::Bound::Unbounded,
+        ),
+        |_height, roots| {
+            if !retained_roots.sapling.contains(&roots.sapling_root) {
+                batch.delete_sapling_anchor(db, &roots.sapling_root);
+            }
+            if !retained_roots.orchard.contains(&roots.orchard_root) {
+                batch.delete_orchard_anchor(db, &roots.orchard_root);
+            }
+            if !retained_roots.ironwood.contains(&roots.ironwood_root) {
+                batch.delete_ironwood_anchor(db, &roots.ironwood_root);
+            }
+        },
+    );
 }
 
 fn clear_backup_dir(path: &PathBuf) -> Result<(), std::io::Error> {
@@ -1518,6 +1505,17 @@ mod tests {
             batch.zs_insert(&header_by_height, height, &header);
             // The value type is irrelevant to deletion-by-key; reuse `Height` as a stand-in.
             batch.zs_insert(&body_size_by_height, height, height);
+            batch.insert_commitment_roots_by_height(
+                &db,
+                height,
+                &sapling_root(h.into()),
+                &orchard_root(h.into()),
+                &ironwood_root(h.into()),
+                0,
+                0,
+                0,
+                &zakura_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+            );
         }
         db.write_batch(batch)
             .expect("seeding the header store succeeds");
@@ -1555,6 +1553,10 @@ mod tests {
                     .is_some(),
                 "height_by_hash retains the index for height {h}",
             );
+            assert!(
+                db.commitment_roots(height).is_some(),
+                "commitment roots retain height {h}",
+            );
         }
 
         // Heights 4..=5 (> target) are gone from every CF, including the hash→height index.
@@ -1583,6 +1585,10 @@ mod tests {
                     .zs_get::<_, _, Height>(&height_by_hash, &hash_at(h))
                     .is_none(),
                 "height_by_hash drops the index for height {h}",
+            );
+            assert!(
+                db.commitment_roots(height).is_none(),
+                "commitment roots drop height {h}",
             );
         }
     }

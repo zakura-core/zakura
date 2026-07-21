@@ -114,6 +114,7 @@ pub use vct::{
     generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
     GeneratorError, NextVctBlock,
 };
+pub use zakura_db::commitment_roots_db::COMMITMENT_ROOTS_BY_HEIGHT;
 pub use zakura_db::ZakuraDb;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -205,10 +206,6 @@ pub const VCT_SYNC_METADATA: &str = "vct_sync_metadata";
 /// This height is the first block committed by code that writes the
 /// [`COMMITMENT_ROOTS_BY_HEIGHT`] serving index.
 pub const VCT_UPGRADE_METADATA: &str = "vct_upgrade_metadata";
-
-/// The name of the column family holding per-height Sapling/Orchard
-/// note-commitment roots, keyed by [`block::Height`].
-pub const COMMITMENT_ROOTS_BY_HEIGHT: &str = "commitment_roots_by_height";
 
 /// The finalized part of the chain state, stored in the db.
 ///

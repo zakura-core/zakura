@@ -669,6 +669,9 @@ cmd_start() {
   # shellcheck disable=SC2087  # client-side expansion of label/refs is intended
   $SSH "${SSH_OPTS[@]}" "root@$ip" bash -s <<REMOTE
 set -euo pipefail
+# fresh per-label output: the bench script APPENDS to summary.md, so a stale
+# same-label dir would leave two tables in one file
+rm -rf ${BENCH_OUT_REMOTE}/${label} ${BENCH_OUT_REMOTE}/${label}.log ${BENCH_OUT_REMOTE}/${label}.pid
 mkdir -p ${BENCH_OUT_REMOTE}/${label}
 cd ${CTL_CLONE_REMOTE}
 nohup env \
@@ -1038,7 +1041,12 @@ metric (default: checkpoint-zone post-commit blk/s), re-ranked top-5 backlog.
    broken (provision or bench fails twice), fall back to the shared runner:
    `gh workflow run checkpoint-sync-bench.yml -f build_ref=<branch> -f baseline_ref=main`,
    poll `gh run list --workflow=checkpoint-sync-bench.yml`, then
-   `gh run download <id>` and feed its `summary.md` to verdict.py as usual.
+   `gh run download <id>`. Caveat: inside Actions the script writes its table
+   to `GITHUB_STEP_SUMMARY`, so the artifact may lack `summary.md` — if so,
+   derive post-commit blk/s from each `samples-*.csv` (height delta ÷ elapsed
+   after the first height increase) and record the verdict as PROMISING at
+   most; confirm on a recovered droplet before calling any fallback result a
+   WIN.
 7. **Verdict**: `bench.sh collect` → verdict.json.
    - WIN_CANDIDATE → one confirmation run (same refs). Two above-threshold
      runs = **WIN**: run full workspace tests in the worktree

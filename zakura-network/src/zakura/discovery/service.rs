@@ -211,7 +211,9 @@ impl Service for DiscoveryService {
     }
 
     fn add_peer(&self, mut peer: Peer) {
-        let Some((recv, send)) = peer.take_stream(ZAKURA_STREAM_DISCOVERY) else {
+        let Some((session_id, recv, send)) =
+            peer.take_stream_with_session_id(ZAKURA_STREAM_DISCOVERY)
+        else {
             return;
         };
         let Some(peer_node_id) = node_id_from_peer_id(&peer.id) else {
@@ -256,8 +258,9 @@ impl Service for DiscoveryService {
             },
             async move {
                 let decision = handle
-                    .admit_peer(
+                    .admit_peer_session(
                         conn_id,
+                        session_id,
                         discovery_session.peer_id().clone(),
                         discovery_session.direction(),
                     )
@@ -281,6 +284,7 @@ impl Service for DiscoveryService {
                     peer_node_id,
                     discovery_session,
                     conn_id,
+                    session_id,
                     recv,
                     service_cancel,
                     connection_cancel,
@@ -307,6 +311,7 @@ struct DiscoveryExchangeStart {
     peer_node_id: NodeId,
     discovery_session: DiscoveryPeerSession,
     conn_id: ZakuraConnId,
+    session_id: u64,
     recv: FramedRecv,
     service_cancel: CancellationToken,
     connection_cancel: CancellationToken,
@@ -322,6 +327,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         peer_node_id,
         discovery_session,
         conn_id,
+        session_id,
         recv,
         service_cancel,
         connection_cancel,
@@ -337,6 +343,8 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         block_sync,
         peer_node_id,
         session: discovery_session.clone(),
+        conn_id,
+        session_id,
         progress: progress.clone(),
     };
     let sink_service_cancel = service_cancel.clone();
@@ -371,10 +379,10 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         progress,
     };
     // SR-1: a panic in the source task skips its `service_cancel.cancel()`,
-    // `handle.remove_peer()`, and discovery-only connection cancellation,
+    // `handle.remove_session()`, and discovery-only connection cancellation,
     // leaving admitted discovery state behind a half-live connection. On the
     // unwind path, disconnect this one peer; the connection teardown then drives
-    // the async `remove_peer` through the registry. Normal exits run the inline
+    // the async session removal through the registry. Normal exits run the inline
     // cleanup below, so `on_panic` is the panic-only path.
     let source_task_peer_id = peer_id.clone();
     let panic_source_service_cancel = service_cancel.clone();
@@ -395,7 +403,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
                 handle.mark_short_lived_exchange(&peer_node_id).await;
             }
             service_cancel.cancel();
-            handle.remove_peer(&peer_id, conn_id).await;
+            handle.remove_session(&peer_id, conn_id, session_id).await;
             if exchanged
                 && !peer_has_other_service_owner(
                     source_header_sync.as_ref(),
@@ -417,6 +425,8 @@ struct DiscoverySink {
     block_sync: Option<BlockSyncHandle>,
     peer_node_id: NodeId,
     session: DiscoveryPeerSession,
+    conn_id: ZakuraConnId,
+    session_id: u64,
     progress: Arc<DiscoveryExchangeProgress>,
 }
 
@@ -450,6 +460,14 @@ async fn run_discovery_pipe(
 
 impl DiscoverySink {
     async fn handle_message(&self, message: DiscoveryMessage) -> Result<(), SinkReject> {
+        if !self
+            .handle
+            .is_current_session(self.session.peer_id(), self.conn_id, self.session_id)
+            .await
+        {
+            return Ok(());
+        }
+
         match message {
             DiscoveryMessage::Hello { record } => self.handle_hello(record).await,
             DiscoveryMessage::GetPeers {

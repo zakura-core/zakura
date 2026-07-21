@@ -77,8 +77,12 @@ assume every publishable crate has the `zakura` package version.
 
 Update:
 
-- the README `cargo install --git ... --tag` example
-- `zakurad/tests/common/configs/<version>.toml`
+- the README `cargo install --git ... --tag` example for stable releases only;
+  while preparing a release candidate, keep the general install example on the
+  latest stable tag
+- `zakurad/tests/common/configs/<version>.toml`, then remove stale generated
+  release fixtures so the directory retains only the current release fixture
+  and custom test configurations
 - `ESTIMATED_RELEASE_HEIGHT` from the current chain tip and expected tag date
 - pending `changelog-unreleased/<PR-number>.md` fragments according to project
   policy
@@ -88,7 +92,12 @@ Update:
   current release
 
 Generate the stored config from the release branch; do not copy it blindly when
-config defaults or fields changed.
+config defaults or fields changed. Run the exact acceptance config test to
+verify both the generated fixture and the retained fixture set:
+
+```bash
+cargo test -p zakura --test acceptance config_tests -- --exact
+```
 
 After the `zakura` package version bump is final, run:
 

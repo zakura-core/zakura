@@ -377,7 +377,7 @@ impl BlockSyncService {
         self.inner.routine_wiring.as_ref().is_some_and(|wiring| {
             wiring
                 .registry
-                .session_park_expired(peer, conn_id, Instant::now())
+                .has_expired_session_park(peer, conn_id, Instant::now())
         })
     }
 
@@ -388,12 +388,12 @@ impl BlockSyncService {
             .is_some_and(|wiring| wiring.registry.is_peer_parked(peer_id, Instant::now()))
     }
 
-    fn peer_parked_until(&self, peer_id: &ZakuraPeerId) -> Option<Instant> {
+    fn peer_park_deadline(&self, peer_id: &ZakuraPeerId) -> Option<Instant> {
         let now = Instant::now();
         self.inner
             .routine_wiring
             .as_ref()
-            .and_then(|wiring| wiring.registry.peer_parked_until(peer_id, now))
+            .and_then(|wiring| wiring.registry.peer_park_deadline(peer_id, now))
     }
 }
 
@@ -420,8 +420,8 @@ impl Service for BlockSyncService {
         _negotiated: u64,
         direction: ServicePeerDirection,
     ) -> OrderedSessionDemand {
-        if let Some(until) = self.peer_parked_until(peer) {
-            return OrderedSessionDemand::RetryAt(until);
+        if let Some(deadline) = self.peer_park_deadline(peer) {
+            return OrderedSessionDemand::RetryAt(deadline);
         }
 
         let mut peer_snapshot = self.inner.peer_snapshot.clone();
@@ -544,7 +544,7 @@ impl Service for BlockSyncService {
                 let re_admitted =
                     wiring
                         .registry
-                        .take_parked_session(&peer_id, conn_id, Instant::now());
+                        .take_session_park(&peer_id, conn_id, Instant::now());
                 (Some(generation), re_admitted)
             } else {
                 (None, false)

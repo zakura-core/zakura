@@ -118,12 +118,12 @@ pub(super) struct OutstandingClaim {
 
 /// A no-progress park recorded by the routine that made the decision.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct PeerPark {
+struct SessionPark {
     /// The connection whose session was parked. An expired park for this same
     /// connection remains gated on body work until it is re-admitted.
     conn_id: Option<ZakuraConnId>,
     /// Refuse block-sync admission for this peer until this deadline.
-    until: Instant,
+    deadline: Instant,
 }
 
 /// The shared per-peer fact table. `Arc`-wrapped at the construction site so the
@@ -131,7 +131,7 @@ struct PeerPark {
 #[derive(Debug)]
 pub(super) struct PeerRegistry {
     peers: StdMutex<HashMap<ZakuraPeerId, Entry>>,
-    parked_peers: StdMutex<HashMap<ZakuraPeerId, PeerPark>>,
+    session_parks: StdMutex<HashMap<ZakuraPeerId, SessionPark>>,
     /// Source of monotonically-increasing routine generations.
     next_generation: std::sync::atomic::AtomicU64,
 }
@@ -146,7 +146,7 @@ impl PeerRegistry {
     pub(super) fn new() -> Self {
         Self {
             peers: StdMutex::new(HashMap::new()),
-            parked_peers: StdMutex::new(HashMap::new()),
+            session_parks: StdMutex::new(HashMap::new()),
             next_generation: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -157,10 +157,10 @@ impl PeerRegistry {
             .expect("peer registry mutex is never poisoned")
     }
 
-    fn lock_parked(&self) -> std::sync::MutexGuard<'_, HashMap<ZakuraPeerId, PeerPark>> {
-        self.parked_peers
+    fn lock_session_parks(&self) -> std::sync::MutexGuard<'_, HashMap<ZakuraPeerId, SessionPark>> {
+        self.session_parks
             .lock()
-            .expect("peer registry parked-peer mutex is never poisoned")
+            .expect("peer registry session-park mutex is never poisoned")
     }
 
     /// Record the connection-local session park at the no-progress decision site.
@@ -170,7 +170,7 @@ impl PeerRegistry {
         peer: &ZakuraPeerId,
         conn_id: ZakuraConnId,
         generation: u64,
-        until: Instant,
+        deadline: Instant,
     ) -> bool {
         let peers = self.lock();
         if peers
@@ -179,25 +179,25 @@ impl PeerRegistry {
         {
             return false;
         }
-        self.lock_parked().insert(
+        self.lock_session_parks().insert(
             peer.clone(),
-            PeerPark {
+            SessionPark {
                 conn_id: Some(conn_id),
-                until,
+                deadline,
             },
         );
         true
     }
 
-    /// Refuse this peer at block-sync admission until `until` without associating
+    /// Refuse this peer at block-sync admission until `deadline` without associating
     /// the park with a live connection.
     #[cfg(test)]
-    pub(super) fn park_peer_until(&self, peer: &ZakuraPeerId, until: Instant) {
-        self.lock_parked().insert(
+    pub(super) fn park_peer_until(&self, peer: &ZakuraPeerId, deadline: Instant) {
+        self.lock_session_parks().insert(
             peer.clone(),
-            PeerPark {
+            SessionPark {
                 conn_id: None,
-                until,
+                deadline,
             },
         );
     }
@@ -207,63 +207,63 @@ impl PeerRegistry {
         &self,
         peer: &ZakuraPeerId,
         conn_id: ZakuraConnId,
-        until: Instant,
+        deadline: Instant,
     ) {
-        self.lock_parked().insert(
+        self.lock_session_parks().insert(
             peer.clone(),
-            PeerPark {
+            SessionPark {
                 conn_id: Some(conn_id),
-                until,
+                deadline,
             },
         );
     }
 
     /// Return this peer's active local park deadline.
-    pub(super) fn peer_parked_until(&self, peer: &ZakuraPeerId, now: Instant) -> Option<Instant> {
-        let mut parked_peers = self.lock_parked();
+    pub(super) fn peer_park_deadline(&self, peer: &ZakuraPeerId, now: Instant) -> Option<Instant> {
+        let mut session_parks = self.lock_session_parks();
         // An expired connection-associated park still carries the same-connection
         // body-work gate. Only expired parks with no live connection can be collected here.
-        parked_peers.retain(|_, park| park.until > now || park.conn_id.is_some());
-        parked_peers
+        session_parks.retain(|_, park| park.deadline > now || park.conn_id.is_some());
+        session_parks
             .get(peer)
-            .filter(|park| park.until > now)
-            .map(|park| park.until)
+            .filter(|park| park.deadline > now)
+            .map(|park| park.deadline)
     }
 
     /// Whether the peer is still in its no-progress reconnect cooldown.
     pub(super) fn is_peer_parked(&self, peer: &ZakuraPeerId, now: Instant) -> bool {
-        self.peer_parked_until(peer, now).is_some()
+        self.peer_park_deadline(peer, now).is_some()
     }
 
     /// Whether this connection owns an expired park and must wait for body work.
-    pub(super) fn session_park_expired(
+    pub(super) fn has_expired_session_park(
         &self,
         peer: &ZakuraPeerId,
         conn_id: ZakuraConnId,
         now: Instant,
     ) -> bool {
-        self.lock_parked()
+        self.lock_session_parks()
             .get(peer)
-            .is_some_and(|park| park.conn_id == Some(conn_id) && park.until <= now)
+            .is_some_and(|park| park.conn_id == Some(conn_id) && park.deadline <= now)
     }
 
     /// Consume an expired park when admitting a stream. Returns whether this is
     /// the parked connection's one bounded re-admission. A different connection
     /// clears the stale association and is admitted normally.
-    pub(super) fn take_parked_session(
+    pub(super) fn take_session_park(
         &self,
         peer: &ZakuraPeerId,
         conn_id: ZakuraConnId,
         now: Instant,
     ) -> bool {
-        let mut parked_peers = self.lock_parked();
-        let Some(park) = parked_peers.get(peer).copied() else {
+        let mut session_parks = self.lock_session_parks();
+        let Some(park) = session_parks.get(peer).copied() else {
             return false;
         };
-        if park.until > now {
+        if park.deadline > now {
             return false;
         }
-        parked_peers.remove(peer);
+        session_parks.remove(peer);
         park.conn_id == Some(conn_id)
     }
 
@@ -275,15 +275,15 @@ impl PeerRegistry {
         conn_id: ZakuraConnId,
         now: Instant,
     ) {
-        let mut parked_peers = self.lock_parked();
-        let Some(park) = parked_peers.get_mut(peer) else {
+        let mut session_parks = self.lock_session_parks();
+        let Some(park) = session_parks.get_mut(peer) else {
             return;
         };
         if park.conn_id != Some(conn_id) {
             return;
         }
-        if park.until <= now {
-            parked_peers.remove(peer);
+        if park.deadline <= now {
+            session_parks.remove(peer);
         } else {
             park.conn_id = None;
         }
@@ -944,12 +944,20 @@ mod floor_bias_tests {
         ));
 
         assert_eq!(
-            reg.peer_parked_until(&peer, now),
+            reg.peer_park_deadline(&peer, now),
             Some(now + std::time::Duration::from_secs(1)),
         );
-        assert!(reg.session_park_expired(&peer, conn_id, now + std::time::Duration::from_secs(2),));
-        assert!(reg.take_parked_session(&peer, conn_id, now + std::time::Duration::from_secs(2),));
-        assert!(!reg.session_park_expired(&peer, conn_id, now + std::time::Duration::from_secs(2),));
+        assert!(reg.has_expired_session_park(
+            &peer,
+            conn_id,
+            now + std::time::Duration::from_secs(2),
+        ));
+        assert!(reg.take_session_park(&peer, conn_id, now + std::time::Duration::from_secs(2)));
+        assert!(!reg.has_expired_session_park(
+            &peer,
+            conn_id,
+            now + std::time::Duration::from_secs(2),
+        ));
     }
 
     #[test]
@@ -959,23 +967,23 @@ mod floor_bias_tests {
         let old_conn_id = 7;
         let new_conn_id = 8;
         let now = Instant::now();
-        let until = now + std::time::Duration::from_secs(1);
+        let deadline = now + std::time::Duration::from_secs(1);
         let generation = reg.admit(
             &peer,
             ServicePeerDirection::Outbound,
             &super::super::ZakuraBlockSyncConfig::default(),
         );
 
-        assert!(reg.park_session(&peer, old_conn_id, generation, until));
+        assert!(reg.park_session(&peer, old_conn_id, generation, deadline));
         reg.connection_closed(&peer, old_conn_id, now);
 
-        assert_eq!(reg.peer_parked_until(&peer, now), Some(until));
-        assert!(!reg.session_park_expired(
+        assert_eq!(reg.peer_park_deadline(&peer, now), Some(deadline));
+        assert!(!reg.has_expired_session_park(
             &peer,
             old_conn_id,
             now + std::time::Duration::from_secs(2),
         ));
-        assert!(!reg.session_park_expired(
+        assert!(!reg.has_expired_session_park(
             &peer,
             new_conn_id,
             now + std::time::Duration::from_secs(2),

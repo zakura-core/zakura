@@ -1206,3 +1206,30 @@ fn state_commit_duplicate_errors_are_duplicate_requests() {
     );
     assert_eq!(err.misbehavior_score(), 0);
 }
+
+/// Peer-attributable contextual errors must keep their misbehavior score after
+/// the state wraps them for the consensus verifier.
+#[test]
+fn state_commit_context_errors_keep_misbehavior_scores() {
+    let invalid_commitment = zakura_state::CommitBlockError::ValidateContextError(Box::new(
+        zakura_state::ValidateContextError::InvalidBlockCommitment(
+            zakura_chain::block::CommitmentError::InvalidChainHistoryActivationReserved {
+                actual: [1; 32],
+            },
+        ),
+    ));
+    let source: BoxError = Box::new(zakura_state::CommitSemanticallyVerifiedError::from(
+        invalid_commitment,
+    ));
+
+    let err = map_commit_error(source, zakura_chain::block::Hash([0; 32]));
+
+    assert!(
+        matches!(err, VerifyBlockError::Commit(_)),
+        "state commit errors must be unwrapped into VerifyBlockError::Commit, got: {err:?}"
+    );
+    assert_eq!(err.misbehavior_score(), 100);
+
+    let router_error = crate::router::RouterError::from(err);
+    assert_eq!(router_error.misbehavior_score(), 100);
+}

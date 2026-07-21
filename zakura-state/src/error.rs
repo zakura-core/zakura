@@ -192,8 +192,25 @@ impl CommitBlockError {
     }
 
     /// Returns a suggested misbehaviour score increment for a certain error.
+    ///
+    /// Contextual failures only score when they prove that the supplied block
+    /// violates consensus relative to its declared parent. Transient and local
+    /// state failures remain unscored.
     pub fn misbehavior_score(&self) -> u32 {
-        0
+        match self {
+            CommitBlockError::ValidateContextError(error)
+                if matches!(
+                    error.as_ref(),
+                    ValidateContextError::TimeTooEarly { .. }
+                        | ValidateContextError::TimeTooLate { .. }
+                        | ValidateContextError::InvalidDifficultyThreshold { .. }
+                        | ValidateContextError::InvalidBlockCommitment(_)
+                ) =>
+            {
+                100
+            }
+            _ => 0,
+        }
     }
 }
 
@@ -933,17 +950,43 @@ impl DuplicateNullifierError for orchard::Nullifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zakura_chain::block::Height;
+    use zakura_chain::{
+        block::{CommitmentError, Height},
+        parameters::Network,
+        work::difficulty::INVALID_COMPACT_DIFFICULTY,
+    };
 
     #[test]
     fn commit_block_error_misbehavior_scores() {
-        let context_err = CommitBlockError::ValidateContextError(Box::new(
-            ValidateContextError::NonSequentialBlock {
-                candidate_height: Height(5),
-                parent_height: Height(3),
+        let block_time = DateTime::from_timestamp(1_000_000, 0)
+            .expect("test timestamp is in the supported range");
+        let peer_faults = [
+            ValidateContextError::TimeTooEarly {
+                candidate_time: block_time,
+                median_time_past: block_time,
             },
+            ValidateContextError::TimeTooLate {
+                candidate_time: block_time,
+                block_time_max: block_time,
+            },
+            ValidateContextError::InvalidDifficultyThreshold {
+                difficulty_threshold: INVALID_COMPACT_DIFFICULTY,
+                expected_difficulty: Network::Mainnet.target_difficulty_limit().to_compact(),
+            },
+            ValidateContextError::InvalidBlockCommitment(
+                CommitmentError::InvalidChainHistoryActivationReserved { actual: [1; 32] },
+            ),
+        ];
+
+        for error in peer_faults {
+            let commit_error = CommitBlockError::ValidateContextError(Box::new(error));
+            assert_eq!(commit_error.misbehavior_score(), 100);
+        }
+
+        let transient_context_error = CommitBlockError::ValidateContextError(Box::new(
+            ValidateContextError::NotReadyToBeCommitted,
         ));
-        assert_eq!(context_err.misbehavior_score(), 0);
+        assert_eq!(transient_context_error.misbehavior_score(), 0);
 
         let dup_err = CommitBlockError::Duplicate {
             hash_or_height: None,

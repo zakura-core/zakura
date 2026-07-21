@@ -681,6 +681,10 @@ SSH="${SSH_BIN:-ssh}"; SCP="${SCP_BIN:-scp}"
 SSH_OPTS=(-i "$SSH_KEY_FILE" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)
 die() { echo "bench.sh: $*" >&2; exit 1; }
 
+# labels render into unquoted remote heredocs and scp paths — same charset
+# guard as droplet.sh names
+check_label() { case "$1" in *[!A-Za-z0-9._-]*) die "bad label: $1";; esac; }
+
 ip_of() { bash "$DIR/droplet.sh" ip "$1"; }
 
 cmd_start() {
@@ -688,26 +692,46 @@ cmd_start() {
   local build_ref="${3:?usage: bench.sh start NAME LABEL BUILD_REF [BASELINE_REF] [KEY=VAL...]}"
   shift 3
   # optional 4th positional is BASELINE_REF; KEY=VAL args are extra env either
-  # way (refs never contain '=', env pairs always do)
+  # way (refs never contain '=', env pairs always do — a git-legal ref WITH '='
+  # would be misrouted to env, so don't name refs like that)
   local baseline_ref="main"
   if [ $# -gt 0 ] && [[ "$1" != *=* ]]; then baseline_ref="$1"; shift; fi
-  local extra_env=("$@")
+  check_label "$label"
+  # git-legal refs can contain quote chars; restrict to a safe charset before
+  # rendering into the remote script
+  local r
+  for r in "$build_ref" "$baseline_ref"; do
+    case "$r" in *[!A-Za-z0-9._/-]*) die "bad ref: $r";; esac
+  done
+  # pre-render KEY=VAL pairs with single-quoted values so URLs, spaces, and &
+  # survive the remote env list intact
+  local env_str="" kv k v
+  for kv in "$@"; do
+    [[ "$kv" == *=* ]] || die "extra env not KEY=VAL: $kv"
+    k="${kv%%=*}"; v="${kv#*=}"
+    case "$k" in [!A-Za-z_]*|*[!A-Za-z0-9_]*) die "bad env key: $k";; esac
+    env_str+=" $k='${v//\'/\'\\\'\'}'"
+  done
   local ip; ip="$(ip_of "$name")"; [ -n "$ip" ] || die "no droplet $name"
   # shellcheck disable=SC2087  # client-side expansion of label/refs is intended
   $SSH "${SSH_OPTS[@]}" "root@$ip" bash -s <<REMOTE
 set -euo pipefail
 # fresh per-label output: the bench script APPENDS to summary.md, so a stale
 # same-label dir would leave two tables in one file
-rm -rf ${BENCH_OUT_REMOTE}/${label} ${BENCH_OUT_REMOTE}/${label}.log ${BENCH_OUT_REMOTE}/${label}.pid
+rm -rf ${BENCH_OUT_REMOTE}/${label} ${BENCH_OUT_REMOTE}/${label}.log ${BENCH_OUT_REMOTE}/${label}.pid ${BENCH_OUT_REMOTE}/${label}.exit
 mkdir -p ${BENCH_OUT_REMOTE}/${label}
 cd ${CTL_CLONE_REMOTE}
-nohup env \
-  BUILD_REF='${build_ref}' BASELINE_REF='${baseline_ref}' \
-  TARGET_P2P_STACK=zakura BASELINE_P2P_STACK=zakura \
-  BENCH_HOME='${BENCH_HOME_REMOTE}' \
-  OUT_DIR='${BENCH_OUT_REMOTE}/${label}' DASHBOARD=1 ${extra_env[@]+${extra_env[@]}} \
-  bash scripts/checkpoint-sync-bench.sh \
-  > ${BENCH_OUT_REMOTE}/${label}.log 2>&1 < /dev/null &
+# the subshell records the true exit code; nohup+disown+detached stdio survive
+# ssh teardown. status reads .exit first, so DONE:<code> is honest even after
+# crashes or PID reuse.
+( nohup env \
+    BUILD_REF='${build_ref}' BASELINE_REF='${baseline_ref}' \
+    TARGET_P2P_STACK=zakura BASELINE_P2P_STACK=zakura \
+    BENCH_HOME='${BENCH_HOME_REMOTE}' \
+    OUT_DIR='${BENCH_OUT_REMOTE}/${label}' DASHBOARD=1${env_str} \
+    bash scripts/checkpoint-sync-bench.sh
+  echo \$? > ${BENCH_OUT_REMOTE}/${label}.exit
+) > ${BENCH_OUT_REMOTE}/${label}.log 2>&1 < /dev/null &
 echo \$! > ${BENCH_OUT_REMOTE}/${label}.pid
 disown
 REMOTE
@@ -716,18 +740,20 @@ REMOTE
 
 cmd_status() {
   local name="${1:?}" label="${2:?}"
+  check_label "$label"
   local ip; ip="$(ip_of "$name")"; [ -n "$ip" ] || die "no droplet $name"
+  # shellcheck disable=SC2087  # client-side expansion of label is intended
   $SSH "${SSH_OPTS[@]}" "root@$ip" bash -s <<REMOTE
 if [ ! -f ${BENCH_OUT_REMOTE}/${label}.pid ]; then echo ABSENT; exit 0; fi
+if [ -f ${BENCH_OUT_REMOTE}/${label}.exit ]; then echo "DONE:\$(cat ${BENCH_OUT_REMOTE}/${label}.exit)"; exit 0; fi
 pid=\$(cat ${BENCH_OUT_REMOTE}/${label}.pid)
-if kill -0 "\$pid" 2>/dev/null; then echo RUNNING; else
-  if [ -f ${BENCH_OUT_REMOTE}/${label}/summary.md ]; then echo DONE:0; else echo DONE:1; fi
-fi
+if kill -0 "\$pid" 2>/dev/null; then echo RUNNING; else echo DONE:1; fi
 REMOTE
 }
 
 cmd_collect() {
   local name="${1:?}" label="${2:?}"
+  check_label "$label"
   local ip; ip="$(ip_of "$name")"; [ -n "$ip" ] || die "no droplet $name"
   local st; st="$(cmd_status "$name" "$label")"
   [ "${st#DONE}" != "$st" ] || die "bench '$label' is $st, not DONE"
@@ -1101,6 +1127,13 @@ Write `perf-lab/state.json` at every transition and commit it with the ledger:
   and increment `batch_runs_used` (reset to 0 at each batch boundary).
 - experiment id allocated: increment `next_exp_id`.
 - calibration: `noise_band_pct` mirrors config.env.
+
+Status semantics: only a SUCCESSFUL `bench.sh status` call yields
+ABSENT/RUNNING/DONE — an ssh transport failure (nonzero exit, empty output)
+means UNKNOWN, retry later. Enforce a wall-clock cap from
+`in_flight[label].started_at` (3 h default): past it, treat the run as failed
+regardless of reported status, collect whatever exists, and destroy/
+re-provision as needed.
 
 A fresh session must be able to reconstruct everything it needs from
 state.json + LEDGER.md alone.

@@ -218,22 +218,6 @@ struct BlockSyncServiceInner {
     next_session_id: AtomicU64,
 }
 
-/// Read-only view of the peers actually admitted by the block-sync service.
-#[derive(Clone, Debug)]
-pub(crate) struct BlockSyncAdmissionHandle {
-    inner: Arc<BlockSyncServiceInner>,
-}
-
-impl BlockSyncAdmissionHandle {
-    pub(crate) fn has_peer(&self, peer: &ZakuraPeerId) -> bool {
-        self.inner
-            .peers
-            .lock()
-            .expect("block-sync peer map mutex is never poisoned")
-            .contains_key(peer)
-    }
-}
-
 #[derive(Debug)]
 struct BlockSyncPeerRecord {
     conn_id: ZakuraConnId,
@@ -243,12 +227,6 @@ struct BlockSyncPeerRecord {
 }
 
 impl BlockSyncService {
-    pub(crate) fn admission_handle(&self) -> BlockSyncAdmissionHandle {
-        BlockSyncAdmissionHandle {
-            inner: self.inner.clone(),
-        }
-    }
-
     pub(crate) fn new(config: ZakuraBlockSyncConfig) -> Self {
         Self::new_with_startup(BlockSyncStartup::inert(config))
     }
@@ -403,6 +381,15 @@ impl Service for BlockSyncService {
 
     fn streams(&self) -> &[Stream] {
         block_sync_streams()
+    }
+
+    fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        self.inner
+            .peers
+            .lock()
+            .expect("block-sync peer map mutex is never poisoned")
+            .get(peer)
+            .is_some_and(|record| record.conn_id == conn_id)
     }
 
     fn wants_peer(

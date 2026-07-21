@@ -1567,12 +1567,12 @@ pub(crate) fn service_registry(
     discovery_service: Arc<super::DiscoveryService>,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
     let mut services = vec![legacy_service.clone()];
-    if let Some(header_sync) = &header_sync {
-        services.push(Arc::new(HeaderSyncService::new(header_sync.clone())) as Arc<dyn Service>);
+    let header_sync_service = if let Some(header_sync) = &header_sync {
+        Arc::new(HeaderSyncService::new(header_sync.clone())) as Arc<dyn Service>
     } else {
-        services
-            .push(Arc::new(HeaderSyncPassthroughService::new(legacy_service)) as Arc<dyn Service>);
-    }
+        Arc::new(HeaderSyncPassthroughService::new(legacy_service.clone())) as Arc<dyn Service>
+    };
+    services.push(header_sync_service.clone());
     let block_sync = match block_sync {
         Some(block_sync) => BlockSyncService::new_with_handle(block_sync_config, block_sync),
         None => match header_sync.as_ref() {
@@ -1583,9 +1583,14 @@ pub(crate) fn service_registry(
             None => BlockSyncService::new(block_sync_config),
         },
     };
-    discovery_service.set_block_sync_admission(block_sync.admission_handle());
+    let block_sync = Arc::new(block_sync) as Arc<dyn Service>;
+    discovery_service.set_connection_owners(vec![
+        legacy_service,
+        header_sync_service,
+        block_sync.clone(),
+    ]);
     services.push(discovery_service as Arc<dyn Service>);
-    services.push(Arc::new(block_sync) as Arc<dyn Service>);
+    services.push(block_sync);
 
     Ok(Arc::new(
         ServiceRegistry::new(services).map_err(|error| -> BoxError { Box::new(error) })?,

@@ -1541,21 +1541,21 @@ impl ZakuraDiscoveryHandle {
         now_unix_secs: u64,
         wall_clock_sequence: u64,
     ) -> Result<Arc<ZakuraNodeRecord>, DiscoveryWireError> {
-        let record = {
-            let mut inner = self.inner.lock().await;
-            let current = self.current_self_record();
-            if current.body.expires_at_unix_secs
-                > now_unix_secs.saturating_add(inner.config.refresh_interval.as_secs())
-            {
-                return Ok(current);
-            }
-            let record_ttl = inner.config.record_ttl;
-            Arc::new(inner.local.build_self_record(
-                now_unix_secs,
-                wall_clock_sequence,
-                record_ttl,
-            )?)
-        };
+        let mut inner = self.inner.lock().await;
+        let current = self.current_self_record();
+        if current.body.expires_at_unix_secs
+            > now_unix_secs.saturating_add(inner.config.refresh_interval.as_secs())
+        {
+            return Ok(current);
+        }
+        let record_ttl = inner.config.record_ttl;
+        let record = Arc::new(inner.local.build_self_record(
+            now_unix_secs,
+            wall_clock_sequence,
+            record_ttl,
+        )?);
+        // Publish before releasing the state lock so concurrent refreshers cannot publish a lower
+        // sequence after a newer record.
         self.self_record_tx.send_replace(record.clone());
         Ok(record)
     }
@@ -1626,7 +1626,7 @@ impl ZakuraDiscoveryHandle {
     ) -> ServiceAdmissionDecision {
         let mut inner = self.inner.lock().await;
         if let Some(peer) = inner.admitted_peers.get_mut(&peer_id) {
-            if (conn_id, session_id) < (peer.conn_id, peer.session_id) {
+            if (conn_id, session_id) <= (peer.conn_id, peer.session_id) {
                 return ServiceAdmissionDecision::RejectNotUseful;
             }
 
@@ -1866,8 +1866,11 @@ impl ZakuraDiscoveryHandle {
             return Ok(());
         }
 
-        let Some(expires_at_unix_secs) =
-            effective_live_summary_expiry(services.expires_at_unix_secs, now)
+        let Some(expires_at_unix_secs) = effective_live_summary_expiry(
+            services.expires_at_unix_secs,
+            now,
+            inner.config.clock_skew_tolerance,
+        )
         else {
             if let Some(entry) = inner.active_services.get_mut(&peer_node_id) {
                 entry.live_summaries.clear();
@@ -3348,14 +3351,17 @@ fn push_unique_service(services: &mut Vec<ZakuraServiceId>, service: ZakuraServi
     }
 }
 
-fn effective_live_summary_expiry(declared_expires_at: u64, now_unix_secs: u64) -> Option<u64> {
-    if declared_expires_at <= now_unix_secs {
+fn effective_live_summary_expiry(
+    declared_expires_at: u64,
+    now_unix_secs: u64,
+    clock_skew_tolerance: Duration,
+) -> Option<u64> {
+    if declared_expires_at.saturating_add(clock_skew_tolerance.as_secs()) <= now_unix_secs {
         return None;
     }
-    Some(
-        declared_expires_at
-            .min(now_unix_secs.saturating_add(DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs())),
-    )
+    // This response arrived on the authenticated live stream. Use a bounded local receipt TTL so
+    // ordinary clock skew cannot make an honest peer's summary expire before the next exchange.
+    Some(now_unix_secs.saturating_add(DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs()))
 }
 
 fn header_sync_candidate_preference(
@@ -6855,11 +6861,62 @@ mod tests {
             .expect("updated live summary entry exists");
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].observed_at_unix_secs, now + 1);
-        assert_eq!(cached[0].expires_at_unix_secs, now + 10);
+        assert_eq!(
+            cached[0].expires_at_unix_secs,
+            now + 1 + DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs()
+        );
         assert_eq!(
             cached[0].summary,
             ZakuraLiveServiceSummary::Discovery(updated_summary)
         );
+    }
+
+    #[tokio::test]
+    async fn connected_services_tolerate_clock_skew_with_a_local_receipt_ttl() {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let node_id = secret_key().public();
+        connected_tx.send_replace(vec![peer_id_for(node_id)]);
+
+        handle
+            .import_connected_peer_services_at(
+                first_party_services(
+                    node_id,
+                    NOW - 1,
+                    vec![ServiceSummaryEnvelope::discovery(&discovery_summary())
+                        .expect("test discovery summary encodes")],
+                ),
+                node_id,
+                NOW,
+            )
+            .await
+            .expect("a live first-party summary inside the clock-skew window imports");
+        let cached = handle
+            .live_service_summaries_at(node_id, NOW)
+            .await
+            .expect("clock-skew-tolerant summary remains live");
+        assert_eq!(
+            cached[0].expires_at_unix_secs,
+            NOW + DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs()
+        );
+
+        handle
+            .import_connected_peer_services_at(
+                first_party_services(
+                    node_id,
+                    NOW - DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs() - 1,
+                    vec![ServiceSummaryEnvelope::discovery(&discovery_summary())
+                        .expect("test discovery summary encodes")],
+                ),
+                node_id,
+                NOW,
+            )
+            .await
+            .expect("a stale live summary is ignored without rejecting the connection");
+        assert!(handle
+            .live_service_summaries_at(node_id, NOW)
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -8073,6 +8130,12 @@ mod tests {
                 .admit_peer_session(2, 2, peer.clone(), ServicePeerDirection::Inbound)
                 .await,
             ServiceAdmissionDecision::Admit
+        );
+        assert_eq!(
+            handle
+                .admit_peer_session(2, 2, peer.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::RejectNotUseful
         );
 
         handle.remove_session(&peer, 2, 1).await;

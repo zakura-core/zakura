@@ -42,6 +42,12 @@ READY | BLOCKED(<why>) | DONE(EXP-NNN) | DROPPED(<why>).
   within-invocation A/Bs. Harness tooling, PR-able upstream; tightens B-01/
   B-02 thresholds.
 
+- B-14 READY — Harness: free the baseline fork before the primary leg runs
+  (one-liner after the baseline `summary_row` in
+  scripts/checkpoint-sync-bench.sh). Each leg's fork grows to ~116 GB
+  hardlink-unique on the 200 GB c-16 disk; aa2 filled the disk to 0 and
+  stalled RocksDB into the wall cap. Upstreamable.
+
 ## Structural-class (yellow)
 
 - B-09 READY — `FromDisk` TODO at

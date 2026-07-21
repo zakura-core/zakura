@@ -777,6 +777,20 @@ Decision: reject in favor of checkpoint-gated promotion.
 
 ### Phase 0: simplify existing boundaries
 
+Complete on `main`:
+
+- backward header sync was removed in
+  [PR #227](https://github.com/zakura-core/zakura/pull/227);
+- exact operation identity was added in
+  [PR #246](https://github.com/zakura-core/zakura/pull/246);
+- checked, aligned range payloads were added in
+  [PR #298](https://github.com/zakura-core/zakura/pull/298) and hardened in
+  [PR #309](https://github.com/zakura-core/zakura/pull/309);
+- commitment-root index access was centralized in
+  [PR #307](https://github.com/zakura-core/zakura/pull/307);
+- history-tree snapshot decoding was made fallible in
+  [PR #316](https://github.com/zakura-core/zakura/pull/316).
+
 1. Remove the backward header-sync lane, its work-queue priority, buffering paths,
    tracing, and tests.
 2. Enforce the forward-only startup invariant from Section 10.
@@ -795,23 +809,28 @@ Decision: reject in favor of checkpoint-gated promotion.
 ### Phase 1: establish the persistence boundary
 
 1. Add the database format transition from Section 6.1.
-2. Introduce or complete `VerifiedHeaderCommitmentRoots` with private fields.
-3. Add a write helper that accepts only the verified type.
-4. Stop `CommitHeaderRange` from writing raw peer roots.
-5. Ensure serving reads only authenticated or body-derived rows.
-6. Preserve committed-body precedence.
+2. Add the minimal durable `HeaderRootAuthFrontier` representation needed by that
+   transition.
+3. Initialize or rebase the frontier from the verified body history tree and its
+   canonical tip.
+4. Restore the frontier at startup using fallible snapshot decoding and coherence
+   checks.
+5. Introduce or complete `VerifiedHeaderCommitmentRoots` with private fields.
+6. Add a write helper that accepts only the verified type and atomically persists
+   promoted roots with the frontier.
+7. Stop `CommitHeaderRange` from writing raw peer roots.
+8. Ensure serving reads only authenticated or body-derived rows.
+9. Preserve committed-body precedence.
 
 ### Phase 2: add the state-owned frontier
 
-1. Add `HeaderRootAuthFrontier`.
-2. Add `CompletedCheckpointFrontier`.
-3. Persist the root-authentication frontier atomically with promoted roots.
-4. Advance the completed-checkpoint frontier only after a durable bracket-closing
+1. Add `CompletedCheckpointFrontier`.
+2. Advance the completed-checkpoint frontier only after a durable bracket-closing
    header commit.
-5. Initialize or rebase the frontiers from the verified body history tree and
-   canonical header store.
-6. Add startup coherence checks and defensive reconstruction.
-7. Publish both frontiers to header sync using a watch or existing frontier event.
+3. Initialize or rebase the completed-checkpoint frontier from the canonical header
+   store.
+4. Add defensive reconstruction for both frontiers.
+5. Publish both frontiers to header sync using a watch or existing frontier event.
 
 ### Phase 3: add root authentication requests
 

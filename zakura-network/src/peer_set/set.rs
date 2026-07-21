@@ -136,7 +136,7 @@ use crate::{
         InventoryChange, InventoryRegistry,
     },
     protocol::{
-        external::{canonical_socket_addr, InventoryHash},
+        external::{canonical_ip, canonical_socket_addr, InventoryHash},
         internal::{Request, Response},
     },
     BannedIps, BoxError, Config, PeerError, PeerSocketAddr, SharedPeerError,
@@ -161,16 +161,6 @@ pub struct MorePeers;
 pub struct CancelClientWork;
 
 type ResponseFuture = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send + 'static>>;
-
-/// Canonicalizes an [`IpAddr`] so an IPv4-mapped IPv6 address (`::ffff:A.B.C.D`) compares
-/// equal to its canonical IPv4 form.
-///
-/// The ban map and address book are keyed on canonical IPs, but a dual-stack listener reports
-/// inbound IPv4 peers as IPv4-mapped IPv6. Canonicalizing before comparing keeps ban re-checks
-/// and per-IP connection accounting from treating the two forms as different hosts.
-fn canonical_ip(ip: IpAddr) -> IpAddr {
-    canonical_socket_addr(SocketAddr::new(ip, 0)).ip()
-}
 
 /// Classification of a `FindBlocks`/`FindHeaders` response, sent from a
 /// response-wrapping future to [`PeerSet::poll_ready`] via an mpsc channel so

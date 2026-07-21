@@ -45,7 +45,7 @@ use crate::{
     },
     peer_set::{ConnectionTracker, InventoryChange},
     protocol::{
-        external::{canonical_socket_addr, types::*, AddrInVersion, Codec, InventoryHash, Message},
+        external::{canonical_ip, types::*, AddrInVersion, Codec, InventoryHash, Message},
         internal::{Request, Response},
     },
     types::MetaAddr,
@@ -184,12 +184,6 @@ pub struct ConnectionInfo {
     /// requests are still shed for backpressure, but the connection is not
     /// severed). See [`Connection::handle_inbound_overload`].
     pub is_protected_peer: bool,
-}
-
-/// Canonicalizes `ip` so an IPv4-mapped IPv6 address (`::ffff:A.B.C.D`) compares
-/// equal to its plain IPv4 form, matching how inbound peer accounting keys peers.
-fn canonical_ip(ip: IpAddr) -> IpAddr {
-    canonical_socket_addr(SocketAddr::new(ip, 0)).ip()
 }
 
 /// The peer address that we are handshaking with.

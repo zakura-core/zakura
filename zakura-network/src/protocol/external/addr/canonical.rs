@@ -46,6 +46,12 @@ pub fn canonical_socket_addr(socket_addr: impl Into<SocketAddr>) -> SocketAddr {
     socket_addr
 }
 
+/// Canonicalizes an [`IpAddr`] so an IPv4-mapped IPv6 address
+/// (`::ffff:A.B.C.D`) compares equal to its canonical IPv4 form.
+pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
+    canonical_socket_addr(SocketAddr::new(ip, 0)).ip()
+}
+
 /// Transform a [`PeerSocketAddr`] into a canonical Zebra [`PeerSocketAddr`], converting
 /// IPv6-mapped IPv4 addresses, and removing IPv6 scope IDs and flow information.
 ///

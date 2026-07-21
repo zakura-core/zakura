@@ -16,6 +16,7 @@ pub mod arbitrary;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use addr::canonical::canonical_ip;
 pub use addr::{canonical_peer_addr, canonical_socket_addr, AddrInVersion};
 pub use codec::Codec;
 pub use inv::{InventoryHash, MAX_TX_INV_IN_SENT_MESSAGE};

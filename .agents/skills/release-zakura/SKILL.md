@@ -80,12 +80,26 @@ Update:
 - the README `cargo install --git ... --tag` example
 - `zakurad/tests/common/configs/<version>.toml`
 - `ESTIMATED_RELEASE_HEIGHT` from the current chain tip and expected tag date
-- the root changelog according to project policy
+- pending `changelog-unreleased/<PR-number>.md` fragments according to project
+  policy
+- the root changelog by running the fragment assembler after the `zakura`
+  package version bump is final
 - examples in release documentation only when they are intended to track the
   current release
 
 Generate the stored config from the release branch; do not copy it blindly when
 config defaults or fields changed.
+
+After the `zakura` package version bump is final, run:
+
+```bash
+make prepare-release-changelog RELEASE_TAG=<tag>
+```
+
+Review and commit the generated root changelog and fragment deletions.
+For a stable release, confirm the generated section combines and replaces all
+matching release-candidate sections; no `X.Y.Z-rc*` section for that stable
+version should remain in the root changelog.
 
 ## Verify before opening or approving the PR
 
@@ -93,7 +107,7 @@ Run:
 
 ```bash
 cargo metadata --no-deps --format-version 1 --locked
-./scripts/check-release-version.sh <tag>
+make pre-release RELEASE_TAG=<tag> BASE_TAG=<previous-tag>
 ./scripts/check-crate-packaging.sh --verify
 ```
 
@@ -121,12 +135,14 @@ checks and why.
   a skipped result usually means the label is missing.
 - Include motivation, solution, test evidence, issue/reference links, risk
   classification, follow-up work, and AI disclosure.
+- Confirm all `changelog-unreleased/<PR-number>.md` files were consumed and the
+  generated root changelog was committed.
 - Verify the release graph independently; a green ordinary PR build does not
   prove crates.io packaging.
-- Post-1.0.0 releases only: confirm the root changelog or a separate draft
-  contains concrete release notes for every user-visible change since the
-  previous release. Through 1.0.0 the changelog is frozen — 1.0.0 ships
-  "Initial release" only in the root changelog.
+- Post-1.0.0 releases only: confirm the assembled root changelog contains
+  concrete release notes for every user-visible change since the previous
+  release. Through 1.0.0 the changelog is frozen — 1.0.0 ships "Initial
+  release" only in the root changelog.
 - Audit the checklist against `docs/release-tag-protection.md`.
 - Wait for required human approval and all enabled CI checks.
 

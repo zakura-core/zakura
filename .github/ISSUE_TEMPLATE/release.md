@@ -38,10 +38,10 @@ Follow the steps in the [release checklist](https://github.com/zakura-core/zakur
 
 Release PR:
 
-- [ ] Update Changelog
+- [ ] Review and assemble root changelog fragments
 - [ ] Update README
 - [ ] Update Zakura Versions
-- [ ] Update Crate Versions and Crate Change Logs
+- [ ] Update Crate Versions
 - [ ] Update End of Support Height
 
 Publish Release:

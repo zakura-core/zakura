@@ -94,7 +94,11 @@ When the PR adds abstraction, flags, generics, or refactors:
 
 ### Changelog & Release Process
 
-- User-visible changes need a `CHANGELOG.md` entry under `[Unreleased]`
+- Every ordinary PR needs one `changelog-unreleased/<PR-number>.md` fragment;
+  use the explicit no-changelog marker for internal-only work
+- User-visible changes use the appropriate Keep a Changelog category
+- Ordinary PRs do not directly edit the root changelog; release preparation
+  consumes the fragments
 - PR labels must match the intended changelog category (`C-bug`, `C-feature`, `C-security`, etc.)
 - PR title follows conventional commits (squash-merged to main)
 

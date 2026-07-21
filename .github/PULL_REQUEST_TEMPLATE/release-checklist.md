@@ -42,25 +42,23 @@ Changelog policy lives in
 [`CHANGELOG_GUIDELINES.md`](https://github.com/zakura-core/zakura/blob/main/CHANGELOG_GUIDELINES.md) —
 follow it if it and these steps ever disagree. In particular, `v1.0.0` and its
 release candidates take a single "Initial release" entry (already in place)
-and **skip** the draft-changelog steps below; they apply to releases after
+and **skip** the fragment-assembly steps below; they apply to releases after
 `v1.0.0`.
 
-**Important**: Any merge into `main` deletes any edits to the draft changelog.
-Once you are ready to tag a release, copy the draft changelog into `CHANGELOG.md`.
+Unreleased notes live in one `changelog-unreleased/<PR-number>.md` fragment per
+PR. To prepare them for assembly:
 
-We use [the Release Drafter workflow](https://github.com/marketplace/actions/release-drafter) to automatically create a [draft changelog](https://github.com/zakura-core/zakura/releases). We follow the [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) format.
+- [ ] Run `./scripts/changelog.py check`.
+- [ ] Review every pending fragment for concrete operator-visible effects.
+- [ ] Remove trivial entries by changing their fragment to an explicit
+      no-changelog fragment with a reason.
+- [ ] Combine duplicate descriptions by editing the relevant fragments.
+- [ ] Check each category. Prefer `Fixed` if you're not sure.
+- [ ] Confirm every item contains its PR link.
 
-To create the final change log:
-
-- [ ] Copy the [**latest** draft
-      changelog](https://github.com/zakura-core/zakura/releases) into
-      `CHANGELOG.md` (there can be multiple draft releases)
-- [ ] Delete any trivial changes
-  - [ ] Put the list of deleted changelog entries in a PR comment to make reviewing easier
-- [ ] Combine duplicate changes
-- [ ] Edit change descriptions so they will make sense to Zakura users
-- [ ] Check the category for each change
-  - Prefer the "Fix" category if you're not sure
+Do not copy GitHub draft release notes or edit the shared `[Unreleased]`
+section. The version-aware assembly runs after all package version bumps below.
+Release Drafter remains responsible for the separate GitHub release-note draft.
 
 ## README
 
@@ -81,7 +79,7 @@ fastmod --fixed-strings '1.58' '1.65'
 
 ## Create the Release PR
 
-- [ ] Push the updated changelog and README into a new branch
+- [ ] Push the reviewed fragments and README updates into a new branch
       for example: `bump-v1.0.0` - this needs to be different to the tag name
 - [ ] Create a release PR by adding `&template=release-checklist.md` to the comparing url ([Example](https://github.com/zakura-core/zakura/compare/bump-v1.0.0?expand=1&template=release-checklist.md)).
 - [ ] Freeze the [`batched` queue](https://dashboard.mergify.com/github/valargroup/repo/zakura/queues) using Mergify.
@@ -137,11 +135,6 @@ The replacements are global path-string substitutions, mirroring
 than `cache_dir` (for example `cookie_dir`), so per-field rewrites produce a
 snapshot the test rejects.
 
-- [ ] On the release commit, run the pre-release checks for the tag you are
-      about to create, using the previous release tag as the base:
-      `make pre-release RELEASE_TAG=v<version> BASE_TAG=v<previous-release-tag>`
-      For example: `make pre-release RELEASE_TAG=v1.0.0 BASE_TAG=v1.0.0-rc5`
-
 ## Update Crate Versions
 
 If you're publishing crates for the first time, [log in to crates.io](https://github.com/zakura-core/zakura/dev/crate-owners.html#logging-in-to-cratesio),
@@ -175,6 +168,25 @@ cargo release replace --verbose --execute --allow-branch '*' -p zakura
 ```
 
 - [ ] Commit and push the above version changes to the release branch.
+
+## Assemble and Verify the Change Log
+
+- [ ] Assemble the fragments after the `zakura` package version bump is final:
+
+```sh
+make prepare-release-changelog RELEASE_TAG=v<version>
+```
+
+- [ ] Review the generated root changelog and confirm every
+      `changelog-unreleased/<PR-number>.md` file was consumed.
+- [ ] For a stable release, confirm the generated section combines and replaces
+      every matching `v<version>-rc*` changelog section.
+- [ ] Commit the generated changelog and fragment deletions.
+- [ ] On that release commit, run the complete pre-release gate with the
+      previous release tag as the base:
+      `make pre-release RELEASE_TAG=v<version> BASE_TAG=v<previous-release-tag>`.
+      For example:
+      `make pre-release RELEASE_TAG=v1.0.3 BASE_TAG=v1.0.2`.
 
 ## Update End of Support
 

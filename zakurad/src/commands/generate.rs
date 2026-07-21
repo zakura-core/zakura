@@ -3,6 +3,7 @@
 use crate::config::ZakuradConfig;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
+use zakura_chain::common::atomic_write;
 
 /// Generate a default `zakura.toml` configuration
 #[derive(Command, Debug, Default, Parser)]
@@ -78,11 +79,9 @@ impl Runnable for GenerateCmd {
         output += &document_network_p2p_config(&conf);
         match self.output_file {
             Some(ref output_file) => {
-                use std::{fs::File, io::Write};
-                File::create(output_file)
-                    .expect("must be able to open output file")
-                    .write_all(output.as_bytes())
-                    .expect("must be able to write output");
+                atomic_write(output_file.as_str().into(), output.as_bytes())
+                    .expect("must be able to write output atomically")
+                    .expect("must be able to replace output file atomically");
             }
             None => {
                 println!("{output}");

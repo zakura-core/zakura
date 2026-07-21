@@ -264,6 +264,8 @@ fn generate_args() -> Result<()> {
 
     // Add a config file name to tempdir path
     let generated_config_path = testdir.path().join("zakura.toml");
+    let previous_config = "previous config contents";
+    fs::write(&generated_config_path, previous_config)?;
 
     // Valid
     let child =
@@ -281,6 +283,13 @@ fn generate_args() -> Result<()> {
         generated_config_path.exists(),
         &output,
         "generated config file not found"
+    );
+    let generated_config = fs::read_to_string(&generated_config_path)?;
+    assert_with_context!(
+        generated_config.starts_with("# Default configuration for zakurad.")
+            && !generated_config.contains(previous_config),
+        &output,
+        "generated config did not replace previous contents"
     );
 
     Ok(())

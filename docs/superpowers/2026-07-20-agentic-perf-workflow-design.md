@@ -101,13 +101,16 @@ comparison).
 ### Perf-lab droplet lifecycle
 
 - **Provision per session, not per run**: at loop start, create one droplet
-  (dedicated-CPU class, size/region fixed in `perf-lab/config` — chosen in
-  Phase 0 to match the feed peer's region); bootstrap installs build deps,
-  clones the repo, and lets the bench script populate its `BENCH_HOME` cache
-  (snapshot download + per-SHA binary cache). Reused across the whole
-  session's experiments so builds stay incremental and the snapshot downloads
-  once. A second droplet is added only when two L2-ready experiments are
-  queued.
+  (dedicated-CPU class, size/region fixed in `perf-lab/config.env`). Droplets
+  boot from the newest `zakura-pr-node-*` **golden image** (baked by
+  `zakura-pr-node-bake.yml`: build deps, rustup on the default PATH, repo
+  clone at `/root/zakura`, warm release cargo cache), falling back to
+  `ubuntu-24-04-x64` + a bootstrap script when no image exists. Provisioning
+  symlinks the bench script's `BENCH_HOME` build dirs onto the golden
+  clone/cache so even the first experiment build is incremental; the state
+  snapshot downloads once per droplet into `BENCH_HOME`. The droplet is
+  reused across the whole session's experiments. A second droplet is added
+  only when two L2-ready experiments are queued.
 - **Naming/tagging**: every loop-created resource is named `perf-lab-*` and
   tagged `zakura-perf-lab`. A dedicated SSH key (`perf-lab-claude`) is created
   once in Phase 0.
@@ -339,8 +342,9 @@ from `gh pr list` at session start.
   counts, second droplet for parallel L2 runs.
 - **Phase 3 — optional.** Frozen-cohort determinism ported to perf-lab
   droplets (only if live-peer variance proves limiting), near-tip
-  full-verification campaign (needs a higher snapshot), baked perf-lab droplet
-  image to cut bootstrap time.
+  full-verification campaign (needs a higher snapshot), a perf-lab-specific
+  bake (golden image plus a pre-extracted bench snapshot) if the per-droplet
+  snapshot download ever matters.
 
 Phases 0–1 are one PR-sized unit of tooling each (scripts + docs on this
 branch), per the lean-PR convention; nothing lands on `main` unless Adam wants

@@ -3625,8 +3625,7 @@ fn is_ipv6_ipv4_compatible(ip: &Ipv6Addr) -> bool {
 
 fn is_ipv6_nat64_translation(ip: &Ipv6Addr) -> bool {
     let segments = ip.segments();
-    (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6] == [0; 4])
-        || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 1)
+    segments[0] == 0x0064 && segments[1] == 0xff9b && (segments[2..6] == [0; 4] || segments[2] == 1)
 }
 
 // Import accepts records inside the clock-skew window, but runtime liveness is strict.

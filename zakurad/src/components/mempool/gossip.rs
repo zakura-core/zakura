@@ -6,6 +6,8 @@
 //! and advertises them to peers. Failed advertisements restore IDs that remain
 //! in the mempool, allowing retries without reintroducing removed transactions.
 
+use std::collections::HashSet;
+
 use tokio::sync::broadcast::{
     self,
     error::{RecvError, TryRecvError},
@@ -14,6 +16,7 @@ use tower::{timeout::Timeout, Service, ServiceExt};
 
 use zakura_network::MAX_TX_INV_IN_SENT_MESSAGE;
 
+use zakura_chain::transaction::UnminedTxId;
 use zakura_network as zn;
 use zakura_node_services::mempool::{MempoolChange, Request, Response};
 
@@ -195,12 +198,15 @@ where
         "full list of pending mempool transactions in broadcast"
     );
 
-    let broadcast_result = match broadcast_network.ready().await {
-        Ok(network) => network.call(request).await,
-        Err(error) => Err(error),
+    let network = match broadcast_network.ready().await {
+        Ok(network) => network,
+        Err(error) => {
+            requeue_pending_mempool_transaction_ids(mempool, retry_tx_ids).await?;
+            return Err(error);
+        }
     };
 
-    if let Err(error) = broadcast_result {
+    if let Err(error) = network.call(request).await {
         warn!(
             ?error,
             transactions = txs_len,
@@ -208,18 +214,7 @@ where
         );
         metrics::counter!("mempool.gossip.failed.broadcasts.total").increment(1);
 
-        let response = mempool
-            .ready()
-            .await?
-            .call(Request::RequeuePendingGossipTransactionIds(retry_tx_ids))
-            .await?;
-        if !matches!(response, Response::RequeuedPendingGossipTransactionIds) {
-            return Err(std::io::Error::other(
-                "requeue pending transaction IDs request returned a different response variant",
-            )
-            .into());
-        }
-
+        requeue_pending_mempool_transaction_ids(mempool, retry_tx_ids).await?;
         return Ok((txs_len, true));
     }
 
@@ -227,6 +222,30 @@ where
     metrics::counter!("mempool.gossiped.transactions.total").increment(txs_len);
 
     Ok((txs_len, txs_len == MAX_TX_INV_IN_SENT_MESSAGE))
+}
+
+/// Restore a failed advertisement batch to the mempool's pending gossip set.
+async fn requeue_pending_mempool_transaction_ids<ZM>(
+    mempool: &mut ZM,
+    tx_ids: HashSet<UnminedTxId>,
+) -> Result<(), BoxError>
+where
+    ZM: Service<Request, Response = Response, Error = BoxError> + Send + Clone + 'static,
+    ZM::Future: Send + 'static,
+{
+    let response = mempool
+        .ready()
+        .await?
+        .call(Request::RequeuePendingGossipTransactionIds(tx_ids))
+        .await?;
+    if !matches!(response, Response::RequeuedPendingGossipTransactionIds) {
+        return Err(std::io::Error::other(
+            "requeue pending transaction IDs request returned a different response variant",
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -926,8 +926,13 @@ impl Service<Request> for Mempool {
                 Request::RequeuePendingGossipTransactionIds(ref tx_ids) => {
                     trace!(?req, "got mempool request");
 
-                    let stored_tx_ids: HashSet<_> = storage.tx_ids().collect();
-                    pending_gossip_tx_ids.extend(tx_ids.intersection(&stored_tx_ids).copied());
+                    pending_gossip_tx_ids.extend(tx_ids.iter().filter_map(|tx_id| {
+                        storage
+                            .transactions()
+                            .get(&tx_id.mined_id())
+                            .filter(|stored_tx| stored_tx.transaction.id == *tx_id)
+                            .map(|_| *tx_id)
+                    }));
 
                     async move { Ok(Response::RequeuedPendingGossipTransactionIds) }.boxed()
                 }

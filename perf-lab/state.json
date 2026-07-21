@@ -9,6 +9,14 @@
       "created_at": "2026-07-21T15:47:00Z"
     }
   },
-  "in_flight": {},
+  "in_flight": {
+    "exp000": {
+      "droplet": "perf-lab-cal",
+      "build_ref": "adam/perf-exp/000-noop-dry-run",
+      "baseline_ref": "4784aca6844fb98a5642648a2bd4efc66187c218",
+      "exp": "EXP-000",
+      "started_at": "2026-07-21T21:50:00Z"
+    }
+  },
   "noise_band_pct": 8.7
 }

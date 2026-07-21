@@ -479,7 +479,15 @@ ensure_key() {
   if ! $DOCTL compute ssh-key list --format Name --no-header | grep -qx "$SSH_KEY_NAME"; then
     run $DOCTL compute ssh-key import "$SSH_KEY_NAME" --public-key-file "$SSH_KEY_FILE.pub"
   fi
-  FP=$(ssh-keygen -lf "$SSH_KEY_FILE.pub" -E md5 | awk '{print $2}' | sed 's/^MD5://')
+  # In real mode the run-wrapped keygen above guarantees the pubkey exists; in
+  # DRYRUN it may not, so substitute a placeholder instead of failing.
+  if [ -f "$SSH_KEY_FILE.pub" ]; then
+    FP=$(ssh-keygen -lf "$SSH_KEY_FILE.pub" -E md5 | awk '{print $2}' | sed 's/^MD5://')
+  elif [ -n "${DRYRUN:-}" ]; then
+    FP="dryrun-fp-placeholder"
+  else
+    die "ssh public key missing after keygen: $SSH_KEY_FILE.pub"
+  fi
 }
 
 golden_image() {  # newest zakura-pr-node-* image id, empty if none (pr-node recipe)
@@ -625,10 +633,10 @@ Expected: all three `PASS` lines (the stub's `droplet list` returns `[]`, so the
 - [ ] **Step 4: DRYRUN provision prints, creates nothing**
 
 ```bash
-DRYRUN=1 DOCTL_BIN=perf-lab/tests/doctl_stub.sh DOCTL_LOG=$(mktemp) bash perf-lab/droplet.sh provision test 2>&1 | grep DRYRUN
+DRYRUN=1 DOCTL_BIN=perf-lab/tests/doctl_stub.sh DOCTL_LOG=$(mktemp) bash perf-lab/droplet.sh provision test 2>&1 | grep "DRYRUN: .*droplet create perf-lab-test"
 ```
 
-Expected: a `DRYRUN: … droplet create perf-lab-test … --tag-name zakura-perf-lab …` line.
+Expected: exactly the create line, e.g. `DRYRUN: perf-lab/tests/doctl_stub.sh compute droplet create perf-lab-test --region nyc3 --size c-16 --image ubuntu-24-04-x64 --ssh-keys dryrun-fp-placeholder --tag-name zakura-perf-lab --wait --format ID,PublicIPv4 --no-header` (fallback image, since the stub reports no golden images; the placeholder fingerprint appears when no real key exists).
 
 - [ ] **Step 5: Commit**
 

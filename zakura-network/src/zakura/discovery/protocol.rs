@@ -912,9 +912,9 @@ pub struct ZakuraDiscoveryPersistedEntry {
 
 /// A locally dialable discovery candidate.
 ///
-/// Candidates may come from first-party confirmed signed discovery records or from trusted static
-/// bootstrap configuration. Only signed records are eligible for peer samples; unsigned static
-/// candidates are local dial hints.
+/// Candidates may come from signed discovery records or from trusted static bootstrap
+/// configuration. Only signed records are eligible for peer samples; unsigned static candidates
+/// are local dial hints.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZakuraDiscoveryDialCandidate {
     /// Candidate iroh node id.
@@ -1952,6 +1952,14 @@ impl ZakuraDiscoveryHandle {
         )
     }
 
+    pub(crate) async fn dial_backoff(&self) -> (Duration, Duration) {
+        let inner = self.inner.lock().await;
+        (
+            inner.config.dial_backoff_base,
+            inner.config.dial_backoff_max,
+        )
+    }
+
     /// Returns service-aware candidates, using fallback to general peers only when requested.
     pub async fn service_candidates(
         &self,
@@ -2693,7 +2701,6 @@ impl ZakuraDiscoveryBook {
                         dial_backoff.0,
                         dial_backoff.1,
                     )
-                    && entry_has_confirmed_dial_authority(entry)
                     && has_wanted_services(&entry.record, wanted_services)
                     && has_discovery_usable_direct_addrs(entry)
             })
@@ -3407,10 +3414,6 @@ fn has_discovery_usable_direct_addrs(entry: &ZakuraDiscoveryEntry) -> bool {
         })
 }
 
-fn entry_has_confirmed_dial_authority(entry: &ZakuraDiscoveryEntry) -> bool {
-    entry.is_static || entry.source == Some(entry.record.body.node_id)
-}
-
 /// Returns true only for addresses that are safe to dial from untrusted discovery gossip.
 ///
 /// A signed `ZakuraNodeRecord` proves control of the node key, not ownership of the advertised
@@ -3425,23 +3428,29 @@ fn is_discovery_dialable_addr(addr: &SocketAddr) -> bool {
     }
 
     match addr.ip() {
-        IpAddr::V4(ip) => {
-            !ip.is_unspecified()
-                && !ip.is_loopback()
-                && !ip.is_multicast()
-                && !ip.is_broadcast()
-                && !ip.is_link_local()
-                && !ip.is_private()
-                && !is_ipv4_shared(&ip)
-        }
-        IpAddr::V6(ip) => {
-            !ip.is_unspecified()
-                && !ip.is_loopback()
-                && !ip.is_multicast()
-                && !is_ipv6_unicast_link_local(&ip)
-                && !is_ipv6_unique_local(&ip)
-        }
+        IpAddr::V4(ip) => is_discovery_dialable_ipv4(&ip),
+        IpAddr::V6(ip) => ipv6_mapped_ipv4(&ip).map_or_else(
+            || {
+                !ip.is_unspecified()
+                    && !ip.is_loopback()
+                    && !ip.is_multicast()
+                    && !is_ipv6_unicast_link_local(&ip)
+                    && !is_ipv6_unique_local(&ip)
+                    && !is_ipv6_site_local(&ip)
+            },
+            |mapped| is_discovery_dialable_ipv4(&mapped),
+        ),
     }
+}
+
+fn is_discovery_dialable_ipv4(ip: &Ipv4Addr) -> bool {
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && !ip.is_broadcast()
+        && !ip.is_link_local()
+        && !ip.is_private()
+        && !is_ipv4_shared(ip)
 }
 
 fn is_static_discovery_configured_addr_usable(addr: &SocketAddr) -> bool {
@@ -3459,6 +3468,12 @@ fn is_ipv6_unicast_link_local(ip: &Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
+fn ipv6_mapped_ipv4(ip: &Ipv6Addr) -> Option<Ipv4Addr> {
+    let octets = ip.octets();
+    (octets[..10] == [0; 10] && octets[10..12] == [0xff; 2])
+        .then(|| Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]))
+}
+
 // `Ipv4Addr::is_shared` is still unstable, so match the RFC 6598 100.64.0.0/10 range directly,
 // mirroring `is_ipv6_unicast_link_local`.
 fn is_ipv4_shared(ip: &Ipv4Addr) -> bool {
@@ -3469,6 +3484,12 @@ fn is_ipv4_shared(ip: &Ipv4Addr) -> bool {
 // `Ipv6Addr::is_unique_local` is still unstable, so match the RFC 4193 fc00::/7 range directly.
 fn is_ipv6_unique_local(ip: &Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xfe00) == 0xfc00
+}
+
+// Deprecated RFC 3879 site-local addresses remain internal targets even though they are outside
+// the modern RFC 4193 unique-local range.
+fn is_ipv6_site_local(ip: &Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfec0
 }
 
 // Import accepts records inside the clock-skew window, but runtime liveness is strict.
@@ -5696,6 +5717,15 @@ mod tests {
                 IpAddr::V6(Ipv6Addr::new(0xfd12, 0x3456, 0, 0, 0, 0, 0, 1)),
                 8233,
             ),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 1)),
+                8233,
+            ),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 1)),
+                8233,
+            ),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1)), 8233),
         ];
 
         for (index, bad_addr) in bad_addrs.into_iter().enumerate() {
@@ -5747,7 +5777,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_book_gossiped_public_third_party_record_is_not_dialable() {
+    fn discovery_book_gossiped_public_third_party_record_is_dialable() {
         let mut book = ZakuraDiscoveryBook::default();
         let gossip_source = secret_key().public();
         let public_target = signed_record_with_addrs(
@@ -5770,7 +5800,7 @@ mod tests {
             &public_target
         );
 
-        assert!(
+        assert_eq!(
             book.dial_candidates(
                 10,
                 &[service(1)],
@@ -5784,11 +5814,13 @@ mod tests {
                     DEFAULT_DISCOVERY_DIAL_BACKOFF_MAX,
                 ),
                 &mut StdRng::seed_from_u64(7),
-            )
-            .is_empty(),
-            "unconfirmed third-party public gossip must not drive native dials"
+            ),
+            vec![candidate_for(&public_target, false)],
+            "valid public gossip must expand discovery beyond directly connected peers"
         );
 
+        // A later first-party exchange still updates the record's source metadata without changing
+        // its dialability.
         assert_eq!(
             book.import_record(public_target.clone(), Some(target_id), NOW + 1, &context())
                 .expect("first-party self-record confirmation imports"),

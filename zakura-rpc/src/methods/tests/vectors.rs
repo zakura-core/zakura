@@ -32,8 +32,8 @@ use zakura_network::{
 };
 use zakura_node_services::BoxError;
 use zakura_state::{
-    GetBlockTemplateChainInfo, IntoDisk, LatestChainTip, ReadRequest, ReadResponse,
-    ReadStateService,
+    BestChainUnspentOutput, GetBlockTemplateChainInfo, IntoDisk, LatestChainTip, MinedTx,
+    ReadRequest, ReadResponse, ReadStateService,
 };
 use zakura_test::mock_service::MockService;
 
@@ -781,28 +781,18 @@ async fn rpc_getblock_includes_empty_ironwood_tree_after_nu6_3_activation() {
         tokio::spawn(async move { rpc.get_block(height.0.to_string(), Some(1)).await });
 
     read_state
-        .expect_request(ReadRequest::BlockHeader(hash_or_height))
+        .expect_request(ReadRequest::BlockHeaderData(hash_or_height))
         .await
-        .respond(ReadResponse::BlockHeader {
+        .respond(ReadResponse::BlockHeaderData {
             header: block.header.clone(),
             hash,
             height,
             next_block_hash: None,
+            sapling_tree: Some(Arc::new(
+                zakura_chain::sapling::tree::NoteCommitmentTree::default(),
+            )),
+            depth: Some(0),
         });
-
-    // The header was requested by height, but follow-up reads must use its
-    // resolved hash so a reorg cannot substitute another block at this height.
-    read_state
-        .expect_request(ReadRequest::SaplingTree(hash.into()))
-        .await
-        .respond(ReadResponse::SaplingTree(Some(Arc::new(
-            zakura_chain::sapling::tree::NoteCommitmentTree::default(),
-        ))));
-
-    read_state
-        .expect_request(ReadRequest::Depth(hash))
-        .await
-        .respond(ReadResponse::Depth(Some(0)));
 
     read_state
         .expect_request(ReadRequest::TransactionIdsForBlock(hash.into()))
@@ -1022,24 +1012,18 @@ async fn rpc_getblock_side_chain_verbosity2_does_not_panic() {
     let hash_str = block_hash.to_string();
     let block_future = tokio::spawn(async move { rpc_clone.get_block(hash_str, Some(2u8)).await });
 
-    // get_block_header: BlockHeader, SaplingTree, Depth (None = side chain)
+    // get_block_header: all best-chain context comes from one state request.
     read_state
-        .expect_request(ReadRequest::BlockHeader(block_hash.into()))
+        .expect_request(ReadRequest::BlockHeaderData(block_hash.into()))
         .await
-        .respond(ReadResponse::BlockHeader {
+        .respond(ReadResponse::BlockHeaderData {
             header: block_header,
             hash: block_hash,
             height: zakura_chain::block::Height(0),
             next_block_hash: None,
+            sapling_tree: Some(Default::default()),
+            depth: None,
         });
-    read_state
-        .expect_request_that(|req| matches!(req, ReadRequest::SaplingTree(_)))
-        .await
-        .respond(ReadResponse::SaplingTree(Some(Default::default())));
-    read_state
-        .expect_request(ReadRequest::Depth(block_hash))
-        .await
-        .respond(ReadResponse::Depth(None));
 
     // get_block: BlockAndSize, OrchardTree, BlockInfo x2
     read_state
@@ -3335,6 +3319,73 @@ async fn rpc_addnode() {
     );
 
     mempool.expect_no_requests().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_gettxout_uses_one_best_chain_snapshot() {
+    let _init_guard = zakura_test::init();
+
+    let block: Arc<Block> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .get(&1)
+        .expect("test vector should contain block 1")
+        .zcash_deserialize_into()
+        .expect("test block should deserialize");
+    let tx = block.transactions[0].clone();
+    let txid = tx.hash();
+    let outpoint = zakura_chain::transparent::OutPoint {
+        hash: txid,
+        index: 0,
+    };
+    let tip_hash = block.hash();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let get_tx_out = tokio::spawn(async move {
+        rpc.get_tx_out(txid.encode_hex::<String>(), 0, Some(false))
+            .await
+    });
+
+    read_state
+        .expect_request(ReadRequest::BestChainUnspentOutput(outpoint))
+        .await
+        .respond(ReadResponse::BestChainUnspentOutput(Some(
+            BestChainUnspentOutput {
+                tip_hash,
+                transaction: MinedTx::new(tx, Height(1), 1, block.header.time),
+            },
+        )));
+
+    let response = get_tx_out
+        .await
+        .expect("gettxout task should not panic")
+        .expect("gettxout should succeed")
+        .0
+        .expect("test output should be unspent");
+    let response = serde_json::to_value(response).expect("response should serialize");
+
+    assert_eq!(response["bestblock"], tip_hash.to_string());
+    assert_eq!(response["confirmations"], 1);
+    read_state.expect_no_requests().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

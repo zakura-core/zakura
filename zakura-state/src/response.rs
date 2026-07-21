@@ -184,6 +184,17 @@ pub struct MinedTx {
     pub block_time: DateTime<Utc>,
 }
 
+/// An unspent output's transaction and tip context from one best-chain
+/// snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BestChainUnspentOutput {
+    /// The best-chain tip hash used to calculate `transaction.confirmations`.
+    pub tip_hash: block::Hash,
+
+    /// The transaction that creates the unspent output.
+    pub transaction: MinedTx,
+}
+
 impl MinedTx {
     /// Creates a new [`MinedTx`]
     pub fn new(
@@ -422,6 +433,22 @@ pub enum ReadResponse {
         next_block_hash: Option<block::Hash>,
     },
 
+    /// Block-header data captured from one snapshot of the current best chain.
+    BlockHeaderData {
+        /// The header of the requested block.
+        header: Arc<block::Header>,
+        /// The hash of the requested block.
+        hash: block::Hash,
+        /// The height of the requested block.
+        height: block::Height,
+        /// The hash of the next block after the requested block.
+        next_block_hash: Option<block::Hash>,
+        /// The Sapling note commitment tree after the requested block.
+        sapling_tree: Option<Arc<sapling::tree::NoteCommitmentTree>>,
+        /// The requested block's depth in the best chain.
+        depth: Option<u32>,
+    },
+
     /// Response to [`ReadRequest::Transaction`] with the specified transaction.
     Transaction(Option<MinedTx>),
 
@@ -474,6 +501,10 @@ pub enum ReadResponse {
     /// The response to a `UnspentBestChainUtxo` request, from verified blocks in the
     /// _best_ non-finalized chain, or the finalized chain.
     UnspentBestChainUtxo(Option<transparent::Utxo>),
+
+    /// An unspent output and its transaction and tip context from one snapshot
+    /// of the current best chain.
+    BestChainUnspentOutput(Option<BestChainUnspentOutput>),
 
     /// The response to an `AnyChainUtxo` request, from verified blocks in
     /// _any_ non-finalized chain, or the finalized chain.
@@ -644,6 +675,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::BlockRoots(_)
             | ReadResponse::TipPoolValues { .. }
             | ReadResponse::BlockInfo(_)
+            | ReadResponse::BlockHeaderData { .. }
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)
             | ReadResponse::SaplingTree(_)
@@ -662,6 +694,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::MissingBlockBodyMetadata(_)
             | ReadResponse::BlockSizeHints(_)
             | ReadResponse::Blocks(_)
+            | ReadResponse::BestChainUnspentOutput(_)
             | ReadResponse::NonFinalizedBlocksListener(_)
             | ReadResponse::IsTransparentOutputSpent(_) => {
                 Err("there is no corresponding Response for this ReadResponse")

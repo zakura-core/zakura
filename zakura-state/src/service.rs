@@ -59,9 +59,9 @@ use crate::{
         read::find,
         watch_receiver::WatchReceiver,
     },
-    BoxError, CheckpointVerifiedBlock, CommitHeaderRangeError, CommitSemanticallyVerifiedError,
-    Config, KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
-    StateInitError,
+    BestChainUnspentOutput, BoxError, CheckpointVerifiedBlock, CommitHeaderRangeError,
+    CommitSemanticallyVerifiedError, Config, KnownBlock, ReadRequest, ReadResponse, Request,
+    Response, SemanticallyVerifiedBlock, StateInitError,
 };
 
 pub mod block_iter;
@@ -1792,6 +1792,40 @@ impl Service<ReadRequest> for ReadStateService {
                 })
             }
 
+            // Used by the verbose getblockheader RPC.
+            ReadRequest::BlockHeaderData(hash_or_height) => {
+                let best_chain = state.latest_best_chain();
+
+                let height = hash_or_height
+                    .height_or_else(|hash| {
+                        read::find::height_by_hash(best_chain.clone(), &state.db, hash)
+                    })
+                    .ok_or_else(|| BoxError::from("block hash or height not found"))?;
+
+                let hash = hash_or_height
+                    .hash_or_else(|height| {
+                        read::find::hash_by_height(best_chain.clone(), &state.db, height)
+                    })
+                    .ok_or_else(|| BoxError::from("block hash or height not found"))?;
+
+                let next_height = height.next()?;
+                let next_block_hash =
+                    read::find::hash_by_height(best_chain.clone(), &state.db, next_height);
+                let header = read::block_header(best_chain.clone(), &state.db, hash.into())
+                    .ok_or_else(|| BoxError::from("block hash or height not found"))?;
+                let sapling_tree = read::sapling_tree(best_chain.clone(), &state.db, hash.into());
+                let depth = read::depth(best_chain, &state.db, hash);
+
+                Ok(ReadResponse::BlockHeaderData {
+                    header,
+                    hash,
+                    height,
+                    next_block_hash,
+                    sapling_tree,
+                    depth,
+                })
+            }
+
             // For the get_raw_transaction RPC and the StateService.
             ReadRequest::Transaction(hash) => Ok(ReadResponse::Transaction(
                 read::mined_transaction(state.latest_best_chain(), &state.db, hash),
@@ -1832,6 +1866,24 @@ impl Service<ReadRequest> for ReadStateService {
             ReadRequest::UnspentBestChainUtxo(outpoint) => Ok(ReadResponse::UnspentBestChainUtxo(
                 read::unspent_utxo(state.latest_best_chain(), &state.db, outpoint),
             )),
+
+            // Used by the gettxout RPC.
+            ReadRequest::BestChainUnspentOutput(outpoint) => {
+                let best_chain = state.latest_best_chain();
+                let output =
+                    read::unspent_utxo(best_chain.clone(), &state.db, outpoint).and_then(|_| {
+                        let (_, tip_hash) = read::tip(best_chain.clone(), &state.db)?;
+                        let transaction =
+                            read::mined_transaction(best_chain, &state.db, outpoint.hash)?;
+
+                        Some(BestChainUnspentOutput {
+                            tip_hash,
+                            transaction,
+                        })
+                    });
+
+                Ok(ReadResponse::BestChainUnspentOutput(output))
+            }
 
             // Manually used by the StateService to implement part of AwaitUtxo.
             ReadRequest::AnyChainUtxo(outpoint) => Ok(ReadResponse::AnyChainUtxo(read::any_utxo(

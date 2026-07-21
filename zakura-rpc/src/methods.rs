@@ -1503,15 +1503,15 @@ where
                 // Reference for the legacy error code:
                 // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/blockchain.cpp#L629>
                 .map_error(server::error::LegacyCode::InvalidParameter)?;
-        let zakura_state::ReadResponse::BlockHeader {
-            header,
-            hash,
-            height,
-            next_block_hash,
-        } = self
+        let request = if verbose {
+            zakura_state::ReadRequest::BlockHeaderData(hash_or_height)
+        } else {
+            zakura_state::ReadRequest::BlockHeader(hash_or_height)
+        };
+        let state_response = self
             .read_state
             .clone()
-            .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
+            .oneshot(request)
             .await
             .map_err(|_| "block height not in best chain")
             .map_error(
@@ -1524,39 +1524,28 @@ where
                 } else {
                     server::error::LegacyCode::InvalidParameter
                 },
-            )?
-        else {
-            panic!("unexpected response to BlockHeader request")
-        };
+            )?;
 
         let response = if !verbose {
+            let zakura_state::ReadResponse::BlockHeader { header, .. } = state_response else {
+                panic!("unexpected response to BlockHeader request")
+            };
+
             GetBlockHeaderResponse::Raw(HexData(header.zcash_serialize_to_vec().map_misc_error()?))
         } else {
-            let zakura_state::ReadResponse::SaplingTree(sapling_tree) = self
-                .read_state
-                .clone()
-                // Use the resolved hash so a reorg cannot combine this header
-                // with the Sapling tree from a different block at the same
-                // height.
-                .oneshot(zakura_state::ReadRequest::SaplingTree(hash.into()))
-                .await
-                .map_misc_error()?
+            let zakura_state::ReadResponse::BlockHeaderData {
+                header,
+                hash,
+                height,
+                next_block_hash,
+                sapling_tree,
+                depth,
+            } = state_response
             else {
-                panic!("unexpected response to SaplingTree request")
+                panic!("unexpected response to BlockHeaderData request")
             };
 
-            // This could be `None` if there's a chain reorg between state queries.
             let sapling_tree = sapling_tree.ok_or_misc_error("missing Sapling tree")?;
-
-            let zakura_state::ReadResponse::Depth(depth) = self
-                .read_state
-                .clone()
-                .oneshot(zakura_state::ReadRequest::Depth(hash))
-                .await
-                .map_misc_error()?
-            else {
-                panic!("unexpected response to SaplingTree request")
-            };
 
             // From <https://zcash.github.io/rpc/getblock.html>
             // TODO: Deduplicate const definition, consider refactoring this to avoid duplicate logic
@@ -3202,32 +3191,16 @@ where
             };
         }
 
-        // TODO: Ensure that the returned tip hash is always valid for the response, i.e. that Zebra can't return a tip that
-        //       hadn't yet included the queried transaction output.
-
-        // Get the best block tip hash
-        let tip_rsp = self
-            .read_state
-            .clone()
-            .oneshot(zakura_state::ReadRequest::Tip)
-            .await
-            .map_misc_error()?;
-
-        let best_block_hash = match tip_rsp {
-            zakura_state::ReadResponse::Tip(tip) => tip.ok_or_misc_error("No blocks in state")?.1,
-            _ => unreachable!("unmatched response to a `Tip` request"),
-        };
-
-        // State path
         let rsp = self
             .read_state
             .clone()
-            .oneshot(zakura_state::ReadRequest::Transaction(txid))
+            .oneshot(zakura_state::ReadRequest::BestChainUnspentOutput(outpoint))
             .await
             .map_misc_error()?;
 
         match rsp {
-            zakura_state::ReadResponse::Transaction(Some(tx)) => {
+            zakura_state::ReadResponse::BestChainUnspentOutput(Some(output_info)) => {
+                let tx = output_info.transaction;
                 let outputs = tx.tx.outputs();
                 let index: usize = n.try_into().expect("u32 always fits in usize");
                 let output = match outputs.get(index) {
@@ -3236,33 +3209,10 @@ where
                     None => return Ok(GetTxOutResponse(None)),
                 };
 
-                // Prune state outputs that are spent
-                let is_spent = {
-                    let rsp = self
-                        .read_state
-                        .clone()
-                        .oneshot(zakura_state::ReadRequest::IsTransparentOutputSpent(
-                            outpoint,
-                        ))
-                        .await
-                        .map_misc_error()?;
-
-                    match rsp {
-                        zakura_state::ReadResponse::IsTransparentOutputSpent(spent) => spent,
-                        _ => unreachable!(
-                            "unmatched response to an `IsTransparentOutputSpent` request"
-                        ),
-                    }
-                };
-
-                if is_spent {
-                    return Ok(GetTxOutResponse(None));
-                }
-
                 Ok(GetTxOutResponse(Some(
                     types::transaction::OutputObject::from_output(
                         output,
-                        best_block_hash.to_string(),
+                        output_info.tip_hash.to_string(),
                         tx.confirmations,
                         tx.tx.version(),
                         tx.tx.is_coinbase(),
@@ -3270,8 +3220,8 @@ where
                     ),
                 )))
             }
-            zakura_state::ReadResponse::Transaction(None) => Ok(GetTxOutResponse(None)),
-            _ => unreachable!("unmatched response to a `Transaction` request"),
+            zakura_state::ReadResponse::BestChainUnspentOutput(None) => Ok(GetTxOutResponse(None)),
+            _ => unreachable!("unmatched response to a `BestChainUnspentOutput` request"),
         }
     }
 }

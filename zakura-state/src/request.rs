@@ -1305,6 +1305,12 @@ pub enum ReadRequest {
     /// [`block::Height`] using `.into()`.
     BlockHeader(HashOrHeight),
 
+    /// Looks up the block header, Sapling tree, and depth using one snapshot of
+    /// the current best chain.
+    ///
+    /// Returns [`ReadResponse::BlockHeaderData`].
+    BlockHeaderData(HashOrHeight),
+
     /// Looks up a transaction by hash in the current best chain.
     ///
     /// Returns
@@ -1354,6 +1360,12 @@ pub enum ReadRequest {
     ///
     /// Checks verified blocks in the finalized chain and the _best_ non-finalized chain.
     UnspentBestChainUtxo(transparent::OutPoint),
+
+    /// Looks up an unspent output and its transaction and tip context using one
+    /// snapshot of the current best chain.
+    ///
+    /// Returns [`ReadResponse::BestChainUnspentOutput`].
+    BestChainUnspentOutput(transparent::OutPoint),
 
     /// Looks up a UTXO identified by the given [`OutPoint`](transparent::OutPoint),
     /// returning `None` immediately if it is unknown.
@@ -1670,11 +1682,13 @@ impl ReadRequest {
             ReadRequest::AnyChainBlock(_) => "any_chain_block",
             ReadRequest::BlockAndSize(_) => "block_and_size",
             ReadRequest::BlockHeader(_) => "block_header",
+            ReadRequest::BlockHeaderData(_) => "block_header_data",
             ReadRequest::Transaction(_) => "transaction",
             ReadRequest::AnyChainTransaction(_) => "any_chain_transaction",
             ReadRequest::TransactionIdsForBlock(_) => "transaction_ids_for_block",
             ReadRequest::AnyChainTransactionIdsForBlock(_) => "any_chain_transaction_ids_for_block",
             ReadRequest::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
+            ReadRequest::BestChainUnspentOutput(_) => "best_chain_unspent_output",
             ReadRequest::AnyChainUtxo { .. } => "any_chain_utxo",
             ReadRequest::BlockLocator => "block_locator",
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",

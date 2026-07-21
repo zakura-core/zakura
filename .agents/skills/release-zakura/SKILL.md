@@ -105,7 +105,13 @@ After the `zakura` package version bump is final, run:
 make prepare-release-changelog RELEASE_TAG=<tag>
 ```
 
-Review and commit the generated root changelog and fragment deletions.
+This target is defined in `make/release.mk`. It must consume every numbered
+`changelog-unreleased/<PR-number>.md` fragment into the root changelog,
+including explicit no-changelog fragments. Keep
+`changelog-unreleased/README.md`; it documents the fragment format and is not a
+pending fragment.
+
+Review and commit the generated root changelog and numbered fragment deletions.
 For a stable release, confirm the generated section combines and replaces all
 matching release-candidate sections; no `X.Y.Z-rc*` section for that stable
 version should remain in the root changelog.

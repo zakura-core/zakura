@@ -46,5 +46,5 @@ help:
 	@echo ""
 	@echo "  Release:"
 	@echo "  prepare-release-changelog RELEASE_TAG=vX.Y.Z   Assemble and consume pending changelog fragments"
-	@echo "  pre-release RELEASE_TAG=vX.Y.Z BASE_TAG=vX.Y.Z   Run changelog, version, release-state, and packaging checks"
+	@echo "  pre-release RELEASE_TAG=vX.Y.Z BASE_TAG=vX.Y.Z   Verify committed changelog; fail if stale; run remaining release checks"
 	@echo "  sign-release TAG=vX.Y.Z          Sign a release's SHA256SUMS.txt with the maintainer minisign key (see VERIFY.md)"

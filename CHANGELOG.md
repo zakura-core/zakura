@@ -48,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Make retained peer-ban insertion and eviction O(1) rather than O(N),
   preventing ban-list maintenance from slowing as the 20,000-IP bound fills
   ([#286](https://github.com/zakura-core/zakura/pull/286)).
+- Stop the experimental dummy CPU miner from continuing to use a stale block
+  template after template generation fails
+  ([#333](https://github.com/zakura-core/zakura/pull/333)).
+- Replace outdated Zebra branding in Zakura logs, errors, RPC responses, CLI
+  help, and operator tooling
+  ([#335](https://github.com/zakura-core/zakura/pull/335)).
 
 ## [1.0.2] - 2026-07-20
 

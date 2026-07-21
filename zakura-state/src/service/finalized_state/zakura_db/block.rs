@@ -1875,7 +1875,19 @@ impl DiskWriteBatch {
                     self.zs_delete(&zakura_body_size_by_height, old_height);
                 }
 
-                self.delete_header_reorg_commitment_roots(zakura_db, height, best_header_tip);
+                if !zakura_db.has_header_root_auth_frontier_row() {
+                    self.delete_header_reorg_commitment_roots(zakura_db, height, best_header_tip);
+                } else if let Some(body_tip) = zakura_db.finalized_tip_height() {
+                    self.truncate_commitment_roots_after(zakura_db, body_tip);
+                    zakura_db
+                        .prepare_header_root_auth_frontier_from_body_tip(self)
+                        .map_err(|error| CommitHeaderRangeError::HeaderRootAuthFrontier {
+                            reason: error.to_string(),
+                        })?;
+                } else {
+                    self.truncate_all_commitment_roots(zakura_db);
+                    self.delete_header_root_auth_frontier(zakura_db);
+                }
             }
         } else if let Some(old_hash) =
             db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &height)
@@ -1993,8 +2005,9 @@ impl DiskWriteBatch {
         self.prepare_header_range_batch_with_roots(zakura_db, anchor, headers, body_sizes, &roots)
     }
 
-    /// Prepare a database batch containing a contextually validated header range
-    /// and one provisional tree-aux root per header.
+    /// Prepare a database batch containing a contextually validated header range.
+    ///
+    /// Tree-aux roots are shape-checked but are not persisted until authenticated.
     #[allow(clippy::unwrap_in_result)]
     pub fn prepare_header_range_batch_with_roots(
         &mut self,
@@ -2221,15 +2234,26 @@ impl DiskWriteBatch {
                 self.zs_delete(&body_size_by_height, height);
             }
 
-            self.delete_header_reorg_commitment_roots(
-                zakura_db,
-                first_conflicting_height,
-                best_header_tip,
-            );
+            if !zakura_db.has_header_root_auth_frontier_row() {
+                self.delete_header_reorg_commitment_roots(
+                    zakura_db,
+                    first_conflicting_height,
+                    best_header_tip,
+                );
+            } else if let Some(body_tip) = finalized_height {
+                self.truncate_commitment_roots_after(zakura_db, body_tip);
+                zakura_db
+                    .prepare_header_root_auth_frontier_from_body_tip(self)
+                    .map_err(|error| CommitHeaderRangeError::HeaderRootAuthFrontier {
+                        reason: error.to_string(),
+                    })?;
+            } else {
+                self.truncate_all_commitment_roots(zakura_db);
+                self.delete_header_root_auth_frontier(zakura_db);
+            }
         }
 
-        for (index, (height, hash, header, body_size)) in validated_headers.into_iter().enumerate()
-        {
+        for (height, hash, header, body_size) in validated_headers {
             // Finalized block heights already have authoritative block rows and
             // verified roots, even when pruning has removed their transactions.
             // Re-delivered headers must not recreate provisional zakura rows
@@ -2257,8 +2281,6 @@ impl DiskWriteBatch {
             } else {
                 self.zs_delete(&body_size_by_height, height);
             }
-            let roots = &tree_aux_roots[index];
-            self.insert_legacy_header_commitment_roots(zakura_db, roots);
         }
 
         Ok(block::Hash::from(

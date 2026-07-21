@@ -326,7 +326,7 @@ impl ZakuraDb {
         // to an explicit writable reopen.
         if !read_only && config.repair_zakura_header_store_on_startup {
             db.audit_and_repair_zakura_header_store()
-                .expect("startup header-store repair write failed: RocksDB is unavailable");
+                .unwrap_or_else(|error| panic!("startup header-store repair failed: {error}"));
         }
 
         db.run_startup_format_change(format_change, prepared_vct_repair);

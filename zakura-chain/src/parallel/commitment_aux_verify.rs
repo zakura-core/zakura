@@ -16,13 +16,36 @@ use crate::{
     sapling,
 };
 
-/// Result of verifying supplied header-sync commitment roots from header parts.
+/// Commitment roots authenticated by their successor headers.
+///
+/// The private fields make successful verification the only construction path.
 #[derive(Clone, Debug)]
-pub struct SuppliedRootsVerification {
-    /// The history tree after folding only roots confirmed by this delivery.
-    pub tree: HistoryTree,
-    /// Last height whose supplied roots were confirmed and folded.
-    pub confirmed_tip: Option<Height>,
+pub struct VerifiedHeaderCommitmentRoots {
+    confirmed_roots: Vec<BlockCommitmentRoots>,
+    confirmed_hashes: Vec<block::Hash>,
+    history_tree: HistoryTree,
+}
+
+impl VerifiedHeaderCommitmentRoots {
+    /// Returns the roots confirmed by this delivery, in ascending height order.
+    pub fn confirmed_roots(&self) -> &[BlockCommitmentRoots] {
+        &self.confirmed_roots
+    }
+
+    /// Returns the header hashes corresponding to the confirmed roots.
+    pub fn confirmed_hashes(&self) -> &[block::Hash] {
+        &self.confirmed_hashes
+    }
+
+    /// Returns the header hash at the confirmed tip, if any roots were confirmed.
+    pub fn confirmed_hash(&self) -> Option<block::Hash> {
+        self.confirmed_hashes.last().copied()
+    }
+
+    /// Returns the history tree after folding the confirmed roots.
+    pub fn history_tree(&self) -> &HistoryTree {
+        &self.history_tree
+    }
 }
 
 /// A supplied-root verification failure.
@@ -54,12 +77,13 @@ pub fn verify_supplied_roots_from_parts<'a, I>(
     network: &Network,
     mut tree: HistoryTree,
     items: I,
-) -> Result<SuppliedRootsVerification, (Height, SuppliedRootsError)>
+) -> Result<VerifiedHeaderCommitmentRoots, (Height, SuppliedRootsError)>
 where
     I: IntoIterator<Item = (&'a Header, &'a BlockCommitmentRoots)>,
 {
     let items = items.into_iter().collect::<Vec<_>>();
-    let mut confirmed_tip = None;
+    let mut confirmed_roots = Vec::with_capacity(items.len().saturating_sub(1));
+    let mut confirmed_hashes = Vec::with_capacity(items.len().saturating_sub(1));
 
     for (index, (header, roots)) in items.iter().enumerate() {
         let height = roots.height;
@@ -106,12 +130,14 @@ where
         .map_err(Arc::new)
         .map_err(SuppliedRootsError::from)
         .map_err(|error| (height, error))?;
-        confirmed_tip = Some(height);
+        confirmed_roots.push((*roots).clone());
+        confirmed_hashes.push(block::Hash::from(*header));
     }
 
-    Ok(SuppliedRootsVerification {
-        tree,
-        confirmed_tip,
+    Ok(VerifiedHeaderCommitmentRoots {
+        confirmed_roots,
+        confirmed_hashes,
+        history_tree: tree,
     })
 }
 
@@ -525,12 +551,16 @@ mod tests {
             .expect("real roots verify against the headers");
 
         assert_eq!(
-            verified.confirmed_tip,
-            Some(Height(activation)),
+            verified.confirmed_roots(),
+            std::slice::from_ref(&act_roots),
             "a two-header range only confirms the first header's roots"
         );
         assert_eq!(
-            verified.tree.hash(),
+            verified.confirmed_hash(),
+            Some(block::Hash::from(act_block.header.as_ref())),
+        );
+        assert_eq!(
+            verified.history_tree().hash(),
             HistoryTree::from_block(
                 &Mainnet,
                 act_block,

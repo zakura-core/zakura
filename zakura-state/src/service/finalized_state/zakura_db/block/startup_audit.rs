@@ -22,6 +22,7 @@
 
 use std::{fmt::Debug, ops::Bound::*, sync::Arc};
 
+use thiserror::Error;
 use zakura_chain::block::{self, Height};
 
 use super::{
@@ -30,8 +31,9 @@ use super::{
 };
 use crate::service::finalized_state::{
     disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
-    disk_format::{FromDisk, IntoDisk},
+    disk_format::{upgrade::header_root_auth_frontier::UPGRADE_VERSION, FromDisk, IntoDisk},
     zakura_db::{commitment_roots_db::COMMITMENT_ROOTS_BY_HEIGHT, ZakuraDb},
+    HeaderRootAuthFrontierError,
 };
 
 /// How many violations are included in the repair log line. The full list can
@@ -41,6 +43,14 @@ const LOGGED_VIOLATIONS: usize = 8;
 /// Maximum number of rows the startup audit materializes from one column
 /// family at a time. Roughly 1.5MB with 1.5 KB headers.
 const AUDIT_BATCH_ROWS: usize = 100_000;
+
+#[derive(Debug, Error)]
+pub(crate) enum ZakuraStoreRepairError {
+    #[error("header-store repair database write failed: {0}")]
+    RocksDb(#[from] rocksdb::Error),
+    #[error("header-store repair could not rebase authenticated roots: {0}")]
+    HeaderRootAuthFrontier(#[from] HeaderRootAuthFrontierError),
+}
 
 /// A single header-store invariant violation found by the startup audit.
 ///
@@ -118,6 +128,9 @@ pub(crate) enum ZakuraStoreViolation {
         /// The height the entry points at.
         points_at: Height,
     },
+
+    /// Header-root authentication state exists without a finalized body tip.
+    AuthenticatedStateWithoutFinalizedTip,
 }
 
 /// The outcome of a startup repair: what was found and what was deleted.
@@ -172,7 +185,26 @@ impl ZakuraDb {
     /// startup.
     pub(crate) fn audit_and_repair_zakura_header_store(
         &self,
-    ) -> Result<Option<ZakuraStoreRepair>, rocksdb::Error> {
+    ) -> Result<Option<ZakuraStoreRepair>, ZakuraStoreRepairError> {
+        let audit_commitment_roots = self
+            .format_version_on_disk()
+            .ok()
+            .flatten()
+            .is_some_and(|version| version >= UPGRADE_VERSION);
+        self.audit_and_repair_zakura_header_store_inner(audit_commitment_roots)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audit_and_repair_authenticated_zakura_header_store(
+        &self,
+    ) -> Result<Option<ZakuraStoreRepair>, ZakuraStoreRepairError> {
+        self.audit_and_repair_zakura_header_store_inner(true)
+    }
+
+    fn audit_and_repair_zakura_header_store_inner(
+        &self,
+        audit_commitment_roots: bool,
+    ) -> Result<Option<ZakuraStoreRepair>, ZakuraStoreRepairError> {
         // Databases opened through `ZakuraDb::new` without the zakura column
         // families have no header store to audit.
         let (Some(header_cf), Some(hash_cf), Some(height_by_hash_cf), Some(body_size_cf), true) = (
@@ -186,6 +218,9 @@ impl ZakuraDb {
         };
 
         let finalized_tip = self.tip();
+        let root_state_without_tip = audit_commitment_roots
+            && finalized_tip.is_none()
+            && (self.has_commitment_root_rows() || self.has_header_root_auth_frontier_row());
 
         // The roots column family also holds verified rows at committed
         // heights (written by body commits, kept through pruning); those are
@@ -193,15 +228,18 @@ impl ZakuraDb {
         // rows above the finalized tip are provisional header-sync data.
         let provisional_roots_start =
             finalized_tip.and_then(|(tip_height, _)| tip_height.next().ok());
-        let provisional_roots_empty = match (finalized_tip, provisional_roots_start) {
-            // The finalized tip is at the maximum height: no frontier can
-            // exist above it.
-            (Some(_), None) => true,
-            (Some(_), Some(start)) => self.commitment_root_heights_for_repair(start, 1).is_empty(),
-            // No finalized tip: roots rows can be committed history whose
-            // tip index is missing, and header sync cannot restore them.
-            (None, _) => true,
-        };
+        let provisional_roots_empty = !audit_commitment_roots
+            || match (finalized_tip, provisional_roots_start) {
+                // The finalized tip is at the maximum height: no frontier can
+                // exist above it.
+                (Some(_), None) => true,
+                (Some(_), Some(start)) => {
+                    self.commitment_root_heights_for_repair(start, 1).is_empty()
+                }
+                // No finalized tip: roots rows can be committed history whose
+                // tip index is missing, and header sync cannot restore them.
+                (None, _) => !root_state_without_tip,
+            };
 
         if self.db.zs_is_empty(&header_cf)
             && self.db.zs_is_empty(&hash_cf)
@@ -219,6 +257,9 @@ impl ZakuraDb {
         }
 
         let mut violations = Vec::new();
+        if root_state_without_tip {
+            violations.push(ZakuraStoreViolation::AuthenticatedStateWithoutFinalizedTip);
+        }
 
         // Walk the linked chain upward from the finalized tip, verifying at
         // each height that the hash and header rows agree, the header links
@@ -383,11 +424,14 @@ impl ZakuraDb {
         // Provisional roots above the window are part of the stranded suffix.
         // If the finalized tip is missing, roots rows are not auditable: they
         // might be committed history whose tip index was damaged.
-        if let Some(start) = match (finalized_tip, provisional_roots_start) {
-            (Some(_), None) => None,
-            (Some(_), Some(start)) => Some(start),
-            (None, _) => None,
-        } {
+        let root_audit_start = audit_commitment_roots
+            .then_some(match (finalized_tip, provisional_roots_start) {
+                (Some(_), None) => None,
+                (Some(_), Some(start)) => Some(start),
+                (None, _) => None,
+            })
+            .flatten();
+        if let Some(start) = root_audit_start {
             audit_commitment_root_rows(
                 self,
                 &committed,
@@ -423,7 +467,17 @@ impl ZakuraDb {
              truncating to the last coherent height so header sync re-downloads the rest"
         );
 
-        flush_repair_batch(&self.db, &mut batch, &mut pending_deletes)?;
+        if audit_commitment_roots {
+            if let Some((body_tip, _body_hash)) = finalized_tip {
+                batch.truncate_commitment_roots_after(self, body_tip);
+                self.prepare_header_root_auth_frontier_from_body_tip(&mut batch)?;
+            } else {
+                batch.truncate_all_commitment_roots(self);
+                batch.delete_header_root_auth_frontier(self);
+            }
+        }
+
+        self.db.write(std::mem::take(&mut batch))?;
 
         Ok(Some(ZakuraStoreRepair {
             last_coherent,

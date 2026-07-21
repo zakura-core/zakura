@@ -19,7 +19,7 @@ use zakura_chain::{parameters::Network, serialization::DateTime32};
 use crate::{
     constants::{self, ADDR_RESPONSE_LIMIT_DENOMINATOR, MAX_ADDRS_IN_MESSAGE},
     meta_addr::MetaAddrChange,
-    protocol::external::{canonical_peer_addr, canonical_socket_addr},
+    protocol::external::{canonical_ip, canonical_peer_addr, canonical_socket_addr},
     types::{MetaAddr, PeerServices},
     AddressBookPeers, PeerAddrState, PeerSocketAddr,
 };
@@ -46,6 +46,8 @@ struct BanList {
 impl BanList {
     /// Inserts `ip`, evicting the oldest IP when the list exceeds its bound.
     fn insert(&mut self, ip: IpAddr) {
+        let ip = canonical_ip(ip);
+
         if !self.ips.insert(ip) {
             return;
         }
@@ -66,6 +68,8 @@ impl BanList {
 impl BannedIps {
     /// Returns whether `ip` is currently banned.
     pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = canonical_ip(ip);
+
         self.inner
             .read()
             .expect("ban list lock should not be poisoned")

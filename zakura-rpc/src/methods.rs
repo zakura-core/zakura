@@ -1535,7 +1535,10 @@ where
             let zakura_state::ReadResponse::SaplingTree(sapling_tree) = self
                 .read_state
                 .clone()
-                .oneshot(zakura_state::ReadRequest::SaplingTree(hash_or_height))
+                // Use the resolved hash so a reorg cannot combine this header
+                // with the Sapling tree from a different block at the same
+                // height.
+                .oneshot(zakura_state::ReadRequest::SaplingTree(hash.into()))
                 .await
                 .map_misc_error()?
             else {

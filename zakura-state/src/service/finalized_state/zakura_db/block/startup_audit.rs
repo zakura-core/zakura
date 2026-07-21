@@ -30,9 +30,8 @@ use super::{
 };
 use crate::service::finalized_state::{
     disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
-    disk_format::{shielded::CommitmentRootsByHeight, FromDisk, IntoDisk},
-    zakura_db::ZakuraDb,
-    COMMITMENT_ROOTS_BY_HEIGHT,
+    disk_format::{FromDisk, IntoDisk},
+    zakura_db::{commitment_roots_db::COMMITMENT_ROOTS_BY_HEIGHT, ZakuraDb},
 };
 
 /// How many violations are included in the repair log line. The full list can
@@ -176,20 +175,13 @@ impl ZakuraDb {
     ) -> Result<Option<ZakuraStoreRepair>, rocksdb::Error> {
         // Databases opened through `ZakuraDb::new` without the zakura column
         // families have no header store to audit.
-        let (
-            Some(header_cf),
-            Some(hash_cf),
-            Some(height_by_hash_cf),
-            Some(body_size_cf),
-            Some(roots_cf),
-        ) = (
+        let (Some(header_cf), Some(hash_cf), Some(height_by_hash_cf), Some(body_size_cf), true) = (
             self.db.cf_handle(ZAKURA_HEADER_BY_HEIGHT),
             self.db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT),
             self.db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH),
             self.db.cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT),
-            self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT),
-        )
-        else {
+            self.has_commitment_roots_index(),
+        ) else {
             return Ok(None);
         };
 
@@ -205,11 +197,7 @@ impl ZakuraDb {
             // The finalized tip is at the maximum height: no frontier can
             // exist above it.
             (Some(_), None) => true,
-            (Some(_), Some(start)) => self
-                .db
-                .zs_forward_range_iter::<_, Height, CommitmentRootsByHeight, _>(&roots_cf, start..)
-                .next()
-                .is_none(),
+            (Some(_), Some(start)) => self.commitment_root_heights_for_repair(start, 1).is_empty(),
             // No finalized tip: roots rows can be committed history whose
             // tip index is missing, and header sync cannot restore them.
             (None, _) => true,
@@ -400,10 +388,8 @@ impl ZakuraDb {
             (Some(_), Some(start)) => Some(start),
             (None, _) => None,
         } {
-            audit_height_keyed_rows::<CommitmentRootsByHeight>(
-                &self.db,
-                &roots_cf,
-                COMMITMENT_ROOTS_BY_HEIGHT,
+            audit_commitment_root_rows(
+                self,
                 &committed,
                 &in_window,
                 &mut violations,
@@ -479,6 +465,60 @@ where
             .take(AUDIT_BATCH_ROWS)
             .collect(),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_commitment_root_rows(
+    db: &ZakuraDb,
+    committed: &impl Fn(Height) -> bool,
+    in_window: &impl Fn(Height) -> bool,
+    violations: &mut Vec<ZakuraStoreViolation>,
+    batch: &mut DiskWriteBatch,
+    pending_deletes: &mut usize,
+    deleted_rows: &mut usize,
+    start: Option<Height>,
+) -> Result<usize, rocksdb::Error> {
+    let mut next_start = start.unwrap_or(Height::MIN);
+    let mut scanned_rows = 0;
+
+    loop {
+        let heights = db.commitment_root_heights_for_repair(next_start, AUDIT_BATCH_ROWS);
+        let Some(&last_height) = heights.last() else {
+            break;
+        };
+        scanned_rows += heights.len();
+        next_start = match last_height.next() {
+            Ok(next_height) => next_height,
+            Err(_) => break,
+        };
+
+        for height in heights {
+            if in_window(height) {
+                continue;
+            }
+
+            violations.push(if committed(height) {
+                ZakuraStoreViolation::StaleRowAtCommittedHeight {
+                    cf: COMMITMENT_ROOTS_BY_HEIGHT,
+                    height,
+                }
+            } else {
+                ZakuraStoreViolation::RowAboveLastCoherent {
+                    cf: COMMITMENT_ROOTS_BY_HEIGHT,
+                    height,
+                }
+            });
+
+            batch.delete_commitment_root_for_repair(db, height);
+            *pending_deletes += 1;
+            if *pending_deletes >= AUDIT_BATCH_ROWS {
+                flush_repair_batch(&db.db, batch, pending_deletes)?;
+            }
+            *deleted_rows += 1;
+        }
+    }
+
+    Ok(scanned_rows)
 }
 
 #[allow(clippy::too_many_arguments)]

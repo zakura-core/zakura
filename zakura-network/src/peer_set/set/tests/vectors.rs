@@ -561,6 +561,127 @@ fn remove_unready_peer_clears_cancel_handle_and_updates_counts() {
     });
 }
 
+/// A dual-stack listener reports an inbound IPv4 peer as an IPv4-mapped IPv6 address
+/// (`::ffff:A.B.C.D`). The per-IP connection accounting must treat that mapped form and
+/// its canonical IPv4 form as the **same host**, so `max_conns_per_ip` can't be evaded by
+/// alternating the two forms.
+#[test]
+fn per_ip_accounting_treats_mapped_and_canonical_as_same_host() {
+    let peer_versions = PeerVersions {
+        peer_versions: vec![Version::min_specified_for_upgrade(
+            &Network::Mainnet,
+            NetworkUpgrade::Nu6_2,
+        )],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, _handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version.clone())
+            .build();
+
+        let canonical_ip: IpAddr = Ipv4Addr::new(203, 0, 113, 7).into();
+        let mapped_ip: IpAddr = Ipv4Addr::new(203, 0, 113, 7).to_ipv6_mapped().into();
+        assert_ne!(
+            canonical_ip, mapped_ip,
+            "the two forms are distinct IpAddrs"
+        );
+
+        // Insert a single connection keyed by the canonical form...
+        let canonical_addr: PeerSocketAddr = SocketAddr::new(canonical_ip, 8233).into();
+        let (tx, _rx) =
+            crate::peer_set::set::oneshot::channel::<crate::peer_set::set::CancelClientWork>();
+        peer_set.cancel_handles.insert(canonical_addr, tx);
+
+        // ...both address forms must see that one connection.
+        assert_eq!(peer_set.num_peers_with_ip(canonical_ip), 1);
+        assert_eq!(
+            peer_set.num_peers_with_ip(mapped_ip),
+            1,
+            "mapped-form query must find the canonically-keyed peer"
+        );
+
+        // Reverse the key/query roles: key the connection by the mapped form instead.
+        peer_set.cancel_handles.clear();
+        let mapped_addr: PeerSocketAddr = SocketAddr::new(mapped_ip, 8233).into();
+        let (tx, _rx) =
+            crate::peer_set::set::oneshot::channel::<crate::peer_set::set::CancelClientWork>();
+        peer_set.cancel_handles.insert(mapped_addr, tx);
+
+        assert_eq!(peer_set.num_peers_with_ip(mapped_ip), 1);
+        assert_eq!(
+            peer_set.num_peers_with_ip(canonical_ip),
+            1,
+            "canonical-form query must find the mapped-keyed peer"
+        );
+    });
+}
+
+/// The peer-set ban re-checks key on the **canonical** IP. A banned peer reconnecting as
+/// its IPv4-mapped IPv6 form (`::ffff:A.B.C.D`, as seen on a dual-stack listener) must
+/// still be treated as banned even though the ban map holds the canonical `A.B.C.D`.
+///
+/// This drives the ban filter in `broadcast_all_queued`; all three peer-set ban re-checks
+/// (`poll_unready`, `poll_ready_peer_errors`, and this filter) share the same `canonical_ip`
+/// canonicalization, so this exercises that shared path.
+#[test]
+fn broadcast_all_queued_bans_mapped_ipv6_against_canonical_ban() {
+    let peer_versions = PeerVersions {
+        peer_versions: vec![Version::min_specified_for_upgrade(
+            &Network::Mainnet,
+            NetworkUpgrade::Nu6_2,
+        )],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, _handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version.clone())
+            .build();
+
+        // The ban map holds the canonical IPv4 address.
+        let canonical_ip: IpAddr = Ipv4Addr::new(203, 0, 113, 7).into();
+        peer_set.bans = BannedIps::with_banned_ip(canonical_ip);
+
+        // The banned peer reconnects in its IPv4-mapped IPv6 form.
+        let mapped_ip: IpAddr = Ipv4Addr::new(203, 0, 113, 7).to_ipv6_mapped().into();
+        let mapped_addr: PeerSocketAddr = SocketAddr::new(mapped_ip, 8233).into();
+        let mut remaining_peers = HashSet::new();
+        remaining_peers.insert(mapped_addr);
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        peer_set.queued_broadcast_all = Some((Request::Peers, sender, remaining_peers));
+
+        peer_set.broadcast_all_queued();
+
+        // The mapped-form peer must be dropped by the (canonical) ban filter, so no peers
+        // remain queued for the re-send. On un-canonicalized code the mapped peer would
+        // survive the filter and this assertion would fail.
+        if let Some((_req, _sender, remaining_peers)) = peer_set.queued_broadcast_all.take() {
+            assert!(
+                remaining_peers.is_empty(),
+                "banned mapped-IPv6 peer must be filtered by the canonical ban"
+            );
+        } else {
+            assert!(receiver.try_recv().is_ok());
+        }
+    });
+}
+
 /// Check that a peer set routes inventory requests to a peer that has advertised that inventory.
 #[test]
 fn peer_set_route_inv_advertised_registry() {

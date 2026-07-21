@@ -40,16 +40,14 @@ use crate::{
     request::FinalizedBlock,
     service::check,
     service::finalized_state::{
-        disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk},
+        disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
         disk_format::{
             block::TransactionLocation,
-            shielded::CommitmentRootsByHeight,
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
         },
         vct::VctWriteData,
         zakura_db::{metrics::block_precommit_metrics, ZakuraDb},
-        FromDisk, IntoDisk, RawBytes, COMMITMENT_ROOTS_BY_HEIGHT, PRUNING_METADATA,
-        VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
+        FromDisk, IntoDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
     },
     HashOrHeight,
 };
@@ -186,31 +184,6 @@ impl ZakuraDb {
         self.db
             .zs_get(&body_size_by_height, &height)
             .map(AdvertisedBodySize::get)
-    }
-
-    /// Returns provisional header-sync commitment roots for a contiguous height range.
-    pub fn zakura_header_commitment_roots_by_height_range(
-        &self,
-        range: impl RangeBounds<block::Height>,
-    ) -> Vec<BlockCommitmentRoots> {
-        let roots_by_height = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
-
-        self.db
-            .zs_forward_range_iter::<_, block::Height, CommitmentRootsByHeight, _>(
-                &roots_by_height,
-                range,
-            )
-            .map(|(height, value)| BlockCommitmentRoots {
-                height,
-                sapling_root: value.sapling,
-                orchard_root: value.orchard,
-                ironwood_root: value.ironwood,
-                sapling_tx: value.sapling_tx,
-                orchard_tx: value.orchard_tx,
-                ironwood_tx: value.ironwood_tx,
-                auth_data_root: value.auth_data_root,
-            })
-            .collect()
     }
 
     /// Returns finalized commitment roots for a contiguous height range.
@@ -684,44 +657,6 @@ impl ZakuraDb {
     pub(crate) fn zakura_header(&self, height: block::Height) -> Option<Arc<block::Header>> {
         let header_by_height = self.db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
         self.db.zs_get(&header_by_height, &height)
-    }
-
-    /// Persist provisional header-ahead roots supplied by Zakura header sync.
-    pub fn insert_zakura_header_commitment_roots(
-        &self,
-        roots: impl IntoIterator<Item = BlockCommitmentRoots>,
-    ) -> Result<(), rocksdb::Error> {
-        let cf = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
-        let mut batch = DiskWriteBatch::new();
-        for roots in roots {
-            batch.zs_insert(
-                &cf,
-                roots.height,
-                CommitmentRootsByHeight {
-                    sapling: roots.sapling_root,
-                    orchard: roots.orchard_root,
-                    ironwood: roots.ironwood_root,
-                    sapling_tx: roots.sapling_tx,
-                    orchard_tx: roots.orchard_tx,
-                    ironwood_tx: roots.ironwood_tx,
-                    auth_data_root: roots.auth_data_root,
-                },
-            );
-        }
-        self.write_batch(batch)
-    }
-
-    /// Delete provisional header-ahead roots by height.
-    pub fn delete_zakura_header_commitment_roots(
-        &self,
-        heights: impl IntoIterator<Item = Height>,
-    ) -> Result<(), rocksdb::Error> {
-        let cf = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
-        let mut batch = DiskWriteBatch::new();
-        for height in heights {
-            batch.zs_delete(&cf, height);
-        }
-        self.write_batch(batch)
     }
 
     // The header readers below resolve from the consensus header column families
@@ -1330,7 +1265,7 @@ impl ZakuraDb {
         block: &Arc<block::Block>,
     ) -> Result<(), CommitHeaderRangeError> {
         let mut batch = DiskWriteBatch::new();
-        batch.prepare_zakura_header_from_committed_block(&self.db, height, block)?;
+        batch.prepare_zakura_header_from_committed_block(self, height, block)?;
         self.db
             .write(batch)
             .map_err(|error| CommitHeaderRangeError::StorageWriteError {
@@ -1642,9 +1577,7 @@ impl DiskWriteBatch {
             store_raw_transactions,
             precomputed_raw_txs,
         )?;
-        let zakura_header_commitment_roots_by_height =
-            zakura_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
-        self.zs_delete(&zakura_header_commitment_roots_by_height, finalized.height);
+        self.delete_legacy_header_commitment_root(zakura_db, finalized.height);
 
         // The consensus rules are silent on shielded transactions in the genesis block,
         // because there aren't any in the mainnet or testnet genesis blocks.
@@ -1801,7 +1734,7 @@ impl DiskWriteBatch {
         // heights with no committed body (the frontier above the body tip).
         // This is unconditional so it also cleans up rows left by a prior run
         // that had `enable_zakura_header_seed_from_committed_blocks` enabled.
-        self.prepare_zakura_header_release_from_committed_block(db, *height, block)?;
+        self.prepare_zakura_header_release_from_committed_block(zakura_db, *height, block)?;
 
         // Index the block header, hash, and height. This also restores the
         // verified full block row after any provisional cleanup above.
@@ -1872,15 +1805,15 @@ impl DiskWriteBatch {
     #[allow(clippy::unwrap_in_result)]
     pub fn prepare_zakura_header_from_committed_block(
         &mut self,
-        db: &DiskDb,
+        zakura_db: &ZakuraDb,
         height: block::Height,
         block: &Arc<block::Block>,
     ) -> Result<(), CommitHeaderRangeError> {
+        let db = &zakura_db.db;
         let zakura_header_by_height = db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
         let zakura_hash_by_height = db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
         let zakura_height_by_hash = db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
         let zakura_body_size_by_height = db.cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT).unwrap();
-        let zakura_roots_by_height = db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
         let tx_by_loc = db.cf_handle("tx_by_loc").unwrap();
 
         let hash = block.hash();
@@ -1940,8 +1873,9 @@ impl DiskWriteBatch {
                     self.zs_delete(&zakura_hash_by_height, old_height);
                     self.zs_delete(&zakura_header_by_height, old_height);
                     self.zs_delete(&zakura_body_size_by_height, old_height);
-                    self.zs_delete(&zakura_roots_by_height, old_height);
                 }
+
+                self.delete_header_reorg_commitment_roots(zakura_db, height, best_header_tip);
             }
         } else if let Some(old_hash) =
             db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &height)
@@ -1974,15 +1908,15 @@ impl DiskWriteBatch {
     #[allow(clippy::unwrap_in_result)]
     pub fn prepare_zakura_header_release_from_committed_block(
         &mut self,
-        db: &DiskDb,
+        zakura_db: &ZakuraDb,
         height: block::Height,
         block: &Arc<block::Block>,
     ) -> Result<(), CommitHeaderRangeError> {
+        let db = &zakura_db.db;
         let zakura_header_by_height = db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
         let zakura_hash_by_height = db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
         let zakura_height_by_hash = db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
         let zakura_body_size_by_height = db.cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT).unwrap();
-        let zakura_roots_by_height = db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
         let tx_by_loc = db.cf_handle("tx_by_loc").unwrap();
 
         let existing_zakura_header: Option<Arc<block::Header>> =
@@ -2021,7 +1955,14 @@ impl DiskWriteBatch {
                     self.zs_delete(&zakura_hash_by_height, descendant);
                     self.zs_delete(&zakura_header_by_height, descendant);
                     self.zs_delete(&zakura_body_size_by_height, descendant);
-                    self.zs_delete(&zakura_roots_by_height, descendant);
+                }
+
+                if let Ok(first_descendant) = height.next() {
+                    self.delete_header_reorg_commitment_roots(
+                        zakura_db,
+                        first_descendant,
+                        zakura_tip,
+                    );
                 }
             }
         }
@@ -2033,7 +1974,7 @@ impl DiskWriteBatch {
         self.zs_delete(&zakura_hash_by_height, height);
         self.zs_delete(&zakura_header_by_height, height);
         self.zs_delete(&zakura_body_size_by_height, height);
-        self.zs_delete(&zakura_roots_by_height, height);
+        self.delete_legacy_header_commitment_root(zakura_db, height);
 
         Ok(())
     }
@@ -2100,7 +2041,6 @@ impl DiskWriteBatch {
             .db
             .cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
             .unwrap();
-        let roots_by_height = zakura_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
 
         let anchor_height = zakura_db
             .header_height(anchor)
@@ -2279,8 +2219,13 @@ impl DiskWriteBatch {
                 self.zs_delete(&hash_by_height, height);
                 self.zs_delete(&header_by_height, height);
                 self.zs_delete(&body_size_by_height, height);
-                self.zs_delete(&roots_by_height, height);
             }
+
+            self.delete_header_reorg_commitment_roots(
+                zakura_db,
+                first_conflicting_height,
+                best_header_tip,
+            );
         }
 
         for (index, (height, hash, header, body_size)) in validated_headers.into_iter().enumerate()
@@ -2313,19 +2258,7 @@ impl DiskWriteBatch {
                 self.zs_delete(&body_size_by_height, height);
             }
             let roots = &tree_aux_roots[index];
-            self.zs_insert(
-                &roots_by_height,
-                height,
-                CommitmentRootsByHeight {
-                    sapling: roots.sapling_root,
-                    orchard: roots.orchard_root,
-                    ironwood: roots.ironwood_root,
-                    sapling_tx: roots.sapling_tx,
-                    orchard_tx: roots.orchard_tx,
-                    ironwood_tx: roots.ironwood_tx,
-                    auth_data_root: roots.auth_data_root,
-                },
-            );
+            self.insert_legacy_header_commitment_roots(zakura_db, roots);
         }
 
         Ok(block::Hash::from(

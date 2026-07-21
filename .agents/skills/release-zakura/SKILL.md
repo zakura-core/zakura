@@ -80,7 +80,7 @@ Update:
 - the README `cargo install --git ... --tag` example
 - `zakurad/tests/common/configs/<version>.toml`
 - `ESTIMATED_RELEASE_HEIGHT` from the current chain tip and expected tag date
-- affected root and crate changelogs according to project policy
+- the root changelog according to project policy
 - examples in release documentation only when they are intended to track the
   current release
 
@@ -125,8 +125,8 @@ checks and why.
   prove crates.io packaging.
 - Post-1.0.0 releases only: confirm the root changelog or a separate draft
   contains concrete release notes for every user-visible change since the
-  previous release. Through 1.0.0 the changelogs are frozen — 1.0.0 ships
-  "Initial release" only, for the root and every crate changelog.
+  previous release. Through 1.0.0 the changelog is frozen — 1.0.0 ships
+  "Initial release" only in the root changelog.
 - Audit the checklist against `docs/release-tag-protection.md`.
 - Wait for required human approval and all enabled CI checks.
 

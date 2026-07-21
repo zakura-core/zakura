@@ -20,11 +20,25 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   committed checkpoint/frontier/provenance coupling (rejecting pre-pipeline
   bootstrap state unless explicitly overridden).
 
+### Changed
+
+- Update the embedded zcashd-compat binary and default split-container image to
+  valargroup/zcashd v1.1.0.
+
 ### Fixed
 
-- Fix a permanent block-sync stall after a no-progress peer cooldown by
-  re-offering the block-sync session on the existing healthy connection
+- Re-admit deferred or ended ordered service streams on existing healthy
+  connections. Block sync resumes after no-progress cooldowns when body work
+  exists, header sync wakes when advisory backoff expires, retry scheduling is
+  bounded, and negotiated streams respect aggregate inbound queue limits
   ([#166](https://github.com/zakura-core/zakura/pull/166)).
+- Treat IPv4 and IPv4-mapped IPv6 peer addresses as the same address when
+  enforcing bans, preventing banned peers from reconnecting through the
+  alternate representation
+  ([#314](https://github.com/zakura-core/zakura/pull/314)).
+- Prevent RPC read-secondary synchronization races, stale stream retries, and
+  finalized-state gaps from interrupting RPC and indexer availability
+  ([#118](https://github.com/zakura-core/zakura/pull/118)).
 - Keep valid internal-miner work running across mempool-only block template
   updates ([#226](https://github.com/zakura-core/zakura/pull/226)).
 - Honor `disable_pow = true` during native header sync on configured Testnets,
@@ -33,6 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Make retained peer-ban insertion and eviction O(1) rather than O(N),
   preventing ban-list maintenance from slowing as the 20,000-IP bound fills
   ([#286](https://github.com/zakura-core/zakura/pull/286)).
+- Canonicalize IPv4-mapped IPv6 inbound peer addresses on dual-stack listeners so
+  bans, the recent-inbound rate limiter, and `max_connections_per_ip` can no longer
+  be evaded. On a dual-stack bind (`[::]` with `IPV6_V6ONLY=false`), Linux reports an
+  inbound IPv4 peer as `::ffff:A.B.C.D`, but the ban map and address book are keyed on
+  the canonical `A.B.C.D`. The inbound accept path and the peer set compared the raw
+  mapped address, so a banned or rate-limited peer could bypass enforcement by
+  reconnecting in the other address form. The accept path now canonicalizes at the
+  boundary, and the peer-set ban re-checks and per-IP accounting canonicalize before
+  comparing. Nodes that bind `0.0.0.0` are unaffected.
 
 ## [1.0.2] - 2026-07-20
 

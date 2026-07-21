@@ -174,7 +174,6 @@ cargo nextest run --profile sync-large-checkpoints-empty
 ## Changelog
 
 - Update `CHANGELOG.md` under `[Unreleased]` for user-visible changes
-- Update crate `CHANGELOG.md` for library-consumer-visible changes
 - Apply the appropriate PR label (`C-feature`, `C-bug`, `C-security`, etc.)
 - See `CHANGELOG_GUIDELINES.md` for detailed formatting rules
 

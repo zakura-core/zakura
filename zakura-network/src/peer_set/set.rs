@@ -136,7 +136,7 @@ use crate::{
         InventoryChange, InventoryRegistry,
     },
     protocol::{
-        external::{canonical_socket_addr, InventoryHash},
+        external::{canonical_ip, canonical_socket_addr, InventoryHash},
         internal::{Request, Response},
     },
     BannedIps, BoxError, Config, PeerError, PeerSocketAddr, SharedPeerError,
@@ -593,7 +593,7 @@ where
                         "service became ready"
                     );
 
-                    if self.bans.contains(key.ip()) {
+                    if self.bans.contains(canonical_ip(key.ip())) {
                         warn!(
                             peer = %key.addr_label(self.expose_peer_addresses),
                             "service is banned, dropping service"
@@ -677,7 +677,7 @@ where
             match peer_readiness {
                 // Still ready, add it back to the list.
                 Ok(()) => {
-                    if self.bans.contains(key.ip()) {
+                    if self.bans.contains(canonical_ip(key.ip())) {
                         debug!(
                             peer = %key.addr_label(self.expose_peer_addresses),
                             "service ip is banned, dropping service"
@@ -714,10 +714,11 @@ where
     /// This method is `O(connected peers)`, so it should not be called from a loop
     /// that is already iterating through the peer set.
     fn num_peers_with_ip(&self, ip: IpAddr) -> usize {
+        let ip = canonical_ip(ip);
         self.ready_services
             .keys()
             .chain(self.cancel_handles.keys())
-            .filter(|addr| addr.ip() == ip)
+            .filter(|addr| canonical_ip(addr.ip()) == ip)
             .count()
     }
 
@@ -1391,7 +1392,7 @@ where
             return;
         };
 
-        remaining_peers.retain(|addr| !self.bans.contains(addr.ip()));
+        remaining_peers.retain(|addr| !self.bans.contains(canonical_ip(addr.ip())));
 
         let Ok(reserved_send_slot) = sender.try_reserve() else {
             self.queued_broadcast_all = Some((req, sender, remaining_peers));

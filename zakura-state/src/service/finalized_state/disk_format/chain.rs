@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use bincode::Options;
 use serde_big_array::BigArray;
+use thiserror::Error;
 
 use zakura_chain::{
     amount::NonNegative,
@@ -21,6 +22,37 @@ use zakura_chain::{
 };
 
 use crate::service::finalized_state::disk_format::{FromDisk, IntoDisk};
+
+/// An error decoding a persisted history-tree snapshot.
+#[derive(Debug, Error)]
+pub enum HistoryTreeDecodeError {
+    /// The snapshot does not use either supported serialization format.
+    #[error(
+        "history tree snapshot is neither the current nor legacy format: \
+         current format error: {current}; legacy format error: {legacy}"
+    )]
+    InvalidEncoding {
+        /// The current-width decoding error.
+        current: bincode::Error,
+        /// The legacy-width decoding error.
+        legacy: bincode::Error,
+    },
+
+    /// The snapshot was created for a different network kind.
+    #[error(
+        "history tree snapshot network kind {stored:?} does not match configured network kind {configured:?}"
+    )]
+    NetworkMismatch {
+        /// The network kind stored in the snapshot.
+        stored: NetworkKind,
+        /// The configured network kind.
+        configured: NetworkKind,
+    },
+
+    /// The decoded snapshot does not contain a valid history tree.
+    #[error("invalid history tree snapshot: {0}")]
+    HistoryTree(#[from] HistoryTreeError),
+}
 
 impl IntoDisk for ValueBalance<NonNegative> {
     type Bytes = [u8; 48];
@@ -52,18 +84,46 @@ pub struct HistoryTreeParts {
 }
 
 impl HistoryTreeParts {
+    /// Decodes current-width or legacy-width history-tree snapshot bytes.
+    pub(crate) fn try_from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self, HistoryTreeDecodeError> {
+        let bytes = bytes.as_ref();
+        let options = bincode::DefaultOptions::new();
+
+        // Try the current entry width first. Databases written before NU6.3 widened
+        // `zcash_history::Entry` store narrower entries that fail to parse at the current width,
+        // so fall back to the legacy width and zero-pad each entry up to the current width.
+        //
+        // Legacy-width rows can fail the current-width decoder with errors other than
+        // `UnexpectedEof`, because the wider entry can read into the next legacy entry and
+        // interpret arbitrary entry bytes as bincode control bytes.
+        match options.deserialize::<HistoryTreeParts>(bytes) {
+            Ok(parts) => Ok(parts),
+            Err(current) => options
+                .deserialize::<LegacyHistoryTreeParts>(bytes)
+                .map(HistoryTreeParts::from)
+                .map_err(|legacy| HistoryTreeDecodeError::InvalidEncoding { current, legacy }),
+        }
+    }
+
     /// Converts [`HistoryTreeParts`] to a [`NonEmptyHistoryTree`].
     pub(crate) fn with_network(
         self,
         network: &Network,
-    ) -> Result<NonEmptyHistoryTree, HistoryTreeError> {
-        assert_eq!(
-            self.network_kind,
-            network.kind(),
-            "history tree network kind should match current network"
-        );
+    ) -> Result<NonEmptyHistoryTree, HistoryTreeDecodeError> {
+        let configured = network.kind();
+        if self.network_kind != configured {
+            return Err(HistoryTreeDecodeError::NetworkMismatch {
+                stored: self.network_kind,
+                configured,
+            });
+        }
 
-        NonEmptyHistoryTree::from_cache(network, self.size, self.peaks, self.current_height)
+        Ok(NonEmptyHistoryTree::from_cache(
+            network,
+            self.size,
+            self.peaks,
+            self.current_height,
+        )?)
     }
 }
 
@@ -130,23 +190,7 @@ impl From<LegacyHistoryTreeParts> for HistoryTreeParts {
 
 impl FromDisk for HistoryTreeParts {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        let bytes = bytes.as_ref();
-        let options = bincode::DefaultOptions::new();
-
-        // Try the current entry width first. Databases written before NU6.3 widened
-        // `zcash_history::Entry` store narrower entries that fail to parse at the current width,
-        // so fall back to the legacy width and zero-pad each entry up to the current width.
-        //
-        // Legacy-width rows can fail the current-width decoder with errors other than
-        // `UnexpectedEof`, because the wider entry can read into the next legacy entry and
-        // interpret arbitrary entry bytes as bincode control bytes.
-        options
-            .deserialize::<HistoryTreeParts>(bytes)
-            .or_else(|_| {
-                options
-                    .deserialize::<LegacyHistoryTreeParts>(bytes)
-                    .map(HistoryTreeParts::from)
-            })
+        HistoryTreeParts::try_from_bytes(bytes)
             .expect("deserialization format should match the serialization format used by IntoDisk")
     }
 }

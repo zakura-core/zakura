@@ -6,7 +6,6 @@
 //! This file is only for test library code.
 
 use std::{
-    env,
     fmt::Debug,
     net::SocketAddr,
     path::{Path, PathBuf},

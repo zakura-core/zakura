@@ -889,3 +889,24 @@ fn state_commit_duplicate_errors_are_duplicate_requests() {
     assert!(err.is_duplicate_request());
     assert_eq!(err.misbehavior_score(), 0);
 }
+
+/// Checkpoint commit failures can depend on auxiliary roots supplied by a
+/// different peer, so they must not be attributed to the block supplier.
+#[test]
+fn state_checkpoint_commit_context_errors_are_unscored() {
+    let invalid_auxiliary_root = zs::CommitBlockError::ValidateContextError(Box::new(
+        zs::ValidateContextError::InvalidBlockCommitment(
+            zakura_chain::block::CommitmentError::InvalidPreNu5OrchardRoot {
+                expected: [0; 32],
+                actual: [1; 32],
+            },
+        ),
+    ));
+    let source: BoxError = Box::new(zs::CommitCheckpointVerifiedError::from(
+        invalid_auxiliary_root,
+    ));
+
+    let err = VerifyCheckpointError::CommitCheckpointVerified(source);
+
+    assert_eq!(err.misbehavior_score(), 0);
+}

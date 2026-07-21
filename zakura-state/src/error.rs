@@ -193,9 +193,10 @@ impl CommitBlockError {
 
     /// Returns a suggested misbehaviour score increment for a certain error.
     ///
-    /// Contextual failures only score when they prove that the supplied block
-    /// violates consensus relative to its declared parent. Transient and local
-    /// state failures remain unscored.
+    /// Callers must only apply this score when the failure is attributable to
+    /// the peer supplying a fully verified block. Checkpoint commit failures
+    /// can depend on auxiliary roots from another peer and must remain
+    /// unscored by checkpoint verification.
     pub fn misbehavior_score(&self) -> u32 {
         match self {
             CommitBlockError::ValidateContextError(error)

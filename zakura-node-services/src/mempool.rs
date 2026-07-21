@@ -92,6 +92,11 @@ pub enum Request {
         limit: usize,
     },
 
+    /// Restore transaction IDs after their peer-set advertisement failed.
+    ///
+    /// The mempool ignores IDs that are no longer stored.
+    RequeuePendingGossipTransactionIds(HashSet<UnminedTxId>),
+
     /// Query matching [`UnminedTx`] in the mempool,
     /// using a unique set of [`UnminedTxId`]s.
     TransactionsById(HashSet<UnminedTxId>),
@@ -186,6 +191,12 @@ pub enum Request {
 pub enum Response {
     /// Returns all [`UnminedTxId`]s from the mempool.
     TransactionIds(HashSet<UnminedTxId>),
+
+    /// Returns transaction IDs awaiting proactive peer advertisement.
+    PendingGossipTransactionIds(HashSet<UnminedTxId>),
+
+    /// Confirms that stored transaction IDs were restored to the pending set.
+    RequeuedPendingGossipTransactionIds,
 
     /// Returns matching [`UnminedTx`] from the mempool.
     ///

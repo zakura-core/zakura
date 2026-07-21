@@ -2,11 +2,9 @@
 //!
 //! This module is just a function [`run_mempool_transaction_id_gossip`] that
 //! treats mempool insertion events received in a channel as wakeup signals,
-//! drains the transaction IDs that still need gossip from the mempool service,
-//! and advertises them to peers. Draining from the mempool service lets the task
-//! recover the IDs behind any wakeups dropped by a lagged channel.
-
-use std::collections::HashSet;
+//! takes the transaction IDs that still need gossip from the mempool service,
+//! and advertises them to peers. Failed advertisements restore IDs that remain
+//! in the mempool, allowing retries without reintroducing removed transactions.
 
 use tokio::sync::broadcast::{
     self,
@@ -16,7 +14,6 @@ use tower::{timeout::Timeout, Service, ServiceExt};
 
 use zakura_network::MAX_TX_INV_IN_SENT_MESSAGE;
 
-use zakura_chain::transaction::UnminedTxId;
 use zakura_network as zn;
 use zakura_node_services::mempool::{MempoolChange, Request, Response};
 
@@ -86,7 +83,8 @@ where
                             ?skip_count,
                             "dropped mempool changes before gossiping, draining pending transaction IDs"
                         );
-                        metrics::counter!("mempool.gossip.lagged.events.total")
+                        metrics::counter!("mempool.gossip.lagged.events.total").increment(1);
+                        metrics::counter!("mempool.gossip.lagged.messages.total")
                             .increment(skip_count);
                         // Exit the wait loop to re-advertise the pending transaction IDs.
                         break;
@@ -110,7 +108,8 @@ where
                             ?skip_count,
                             "dropped mempool changes before gossiping, draining pending transaction IDs"
                         );
-                        metrics::counter!("mempool.gossip.lagged.events.total")
+                        metrics::counter!("mempool.gossip.lagged.events.total").increment(1);
+                        metrics::counter!("mempool.gossip.lagged.messages.total")
                             .increment(skip_count);
                     }
                     Err(closed @ TryRecvError::Closed) => Err(closed)?,
@@ -122,20 +121,20 @@ where
             drain_pending_without_wakeup = false;
         }
 
-        let advertised_count = advertise_pending_mempool_transaction_ids(
+        let (attempted_count, should_retry) = advertise_pending_mempool_transaction_ids(
             &mut mempool,
             &mut broadcast_network,
             combined_changes,
         )
         .await?;
 
-        if advertised_count == 0 {
+        if attempted_count == 0 {
             continue;
         }
 
-        // A full batch means more transaction IDs may still be pending, so
-        // drain again after the delay instead of waiting for another wakeup.
-        drain_pending_without_wakeup = advertised_count == MAX_TX_INV_IN_SENT_MESSAGE;
+        // Retry failed advertisements, and keep draining after a full batch
+        // because more transaction IDs may still be pending.
+        drain_pending_without_wakeup = should_retry;
 
         // wait for at least the network timeout between gossips
         //
@@ -150,14 +149,14 @@ async fn advertise_pending_mempool_transaction_ids<ZN, ZM>(
     mempool: &mut ZM,
     broadcast_network: &mut Timeout<ZN>,
     combined_changes: usize,
-) -> Result<u64, BoxError>
+) -> Result<(u64, bool), BoxError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
     ZN::Future: Send,
     ZM: Service<Request, Response = Response, Error = BoxError> + Send + Clone + 'static,
     ZM::Future: Send + 'static,
 {
-    let Response::TransactionIds(tx_ids) = mempool
+    let Response::PendingGossipTransactionIds(tx_ids) = mempool
         .ready()
         .await?
         .call(Request::TakePendingGossipTransactionIds {
@@ -171,47 +170,23 @@ where
         .into());
     };
 
-    let mut advertised_count = 0;
-    let mut chunk = HashSet::<UnminedTxId>::new();
-
-    for tx_id in tx_ids {
-        chunk.insert(tx_id);
-
-        if chunk.len() >= MAX_TX_INV_IN_SENT_MESSAGE_USIZE {
-            advertised_count +=
-                advertise_transaction_id_chunk(broadcast_network, &mut chunk, combined_changes)
-                    .await?;
-        }
+    if tx_ids.is_empty() {
+        return Ok((0, false));
     }
 
-    if !chunk.is_empty() {
-        advertised_count +=
-            advertise_transaction_id_chunk(broadcast_network, &mut chunk, combined_changes).await?;
+    if tx_ids.len() > MAX_TX_INV_IN_SENT_MESSAGE_USIZE {
+        return Err(std::io::Error::other(
+            "mempool returned more pending gossip IDs than requested",
+        )
+        .into());
     }
 
-    if advertised_count > 0 {
-        metrics::counter!("mempool.gossip.pending.transactions.total").increment(advertised_count);
-        metrics::counter!("mempool.gossiped.transactions.total").increment(advertised_count);
-    }
-
-    Ok(advertised_count)
-}
-
-/// Advertise a single bounded transaction ID chunk and clear it for reuse.
-async fn advertise_transaction_id_chunk<ZN>(
-    broadcast_network: &mut Timeout<ZN>,
-    chunk: &mut HashSet<UnminedTxId>,
-    combined_changes: usize,
-) -> Result<u64, BoxError>
-where
-    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
-    ZN::Future: Send,
-{
-    let txs_len: u64 = chunk
+    let txs_len: u64 = tx_ids
         .len()
         .try_into()
-        .expect("transaction ID chunk length fits in u64");
-    let request = zn::Request::AdvertiseTransactionIds(std::mem::take(chunk), None);
+        .expect("bounded pending transaction ID count fits in u64");
+    let retry_tx_ids = tx_ids.clone();
+    let request = zn::Request::AdvertiseTransactionIds(tx_ids, None);
 
     info!(%request, changes = %combined_changes, "sending pending mempool transaction broadcast");
     debug!(
@@ -220,9 +195,38 @@ where
         "full list of pending mempool transactions in broadcast"
     );
 
-    let _ = broadcast_network.ready().await?.call(request).await;
+    let broadcast_result = match broadcast_network.ready().await {
+        Ok(network) => network.call(request).await,
+        Err(error) => Err(error),
+    };
 
-    Ok(txs_len)
+    if let Err(error) = broadcast_result {
+        warn!(
+            ?error,
+            transactions = txs_len,
+            "failed to advertise pending mempool transactions, retrying"
+        );
+        metrics::counter!("mempool.gossip.failed.broadcasts.total").increment(1);
+
+        let response = mempool
+            .ready()
+            .await?
+            .call(Request::RequeuePendingGossipTransactionIds(retry_tx_ids))
+            .await?;
+        if !matches!(response, Response::RequeuedPendingGossipTransactionIds) {
+            return Err(std::io::Error::other(
+                "requeue pending transaction IDs request returned a different response variant",
+            )
+            .into());
+        }
+
+        return Ok((txs_len, true));
+    }
+
+    metrics::counter!("mempool.gossip.pending.transactions.total").increment(txs_len);
+    metrics::counter!("mempool.gossiped.transactions.total").increment(txs_len);
+
+    Ok((txs_len, txs_len == MAX_TX_INV_IN_SENT_MESSAGE))
 }
 
 #[cfg(test)]
@@ -236,7 +240,7 @@ mod tests {
     use tokio::sync::{broadcast, mpsc};
     use tower::service_fn;
 
-    use zakura_chain::transaction;
+    use zakura_chain::transaction::{self, UnminedTxId};
 
     use super::*;
 
@@ -271,7 +275,7 @@ mod tests {
                     Request::TakePendingGossipTransactionIds { limit } => {
                         assert_eq!(
                             limit, MAX_TX_INV_IN_SENT_MESSAGE_USIZE,
-                            "gossip task should bound each pending drain to one inv"
+                            "gossip task should bound each pending take to one inv"
                         );
                         limit_sender
                             .send(limit)
@@ -284,7 +288,15 @@ mod tests {
                             .pop_front()
                             .unwrap_or_default();
 
-                        Ok(Response::TransactionIds(tx_ids))
+                        Ok(Response::PendingGossipTransactionIds(tx_ids))
+                    }
+                    Request::RequeuePendingGossipTransactionIds(tx_ids) => {
+                        let mut pending_batches = pending_batches
+                            .lock()
+                            .expect("pending batch mutex should not be poisoned");
+                        pending_batches.push_front(tx_ids);
+
+                        Ok(Response::RequeuedPendingGossipTransactionIds)
                     }
                     unexpected_request => {
                         panic!("unexpected mempool request: {unexpected_request:?}")
@@ -479,6 +491,69 @@ mod tests {
         );
 
         gossip_task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_broadcast_keeps_transaction_ids_pending_for_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _init_guard = zakura_test::init();
+
+        let pending_tx_ids = test_tx_ids(2, 1);
+        let (mut mempool, _limit_receiver) = mempool_service(vec![pending_tx_ids.clone()]);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let peer_set = service_fn({
+            let attempts = Arc::clone(&attempts);
+            move |_request| {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(std::io::Error::other("transient peer-set failure").into())
+                    } else {
+                        Ok(zn::Response::Nil)
+                    }
+                }
+            }
+        });
+        let mut peer_set = Timeout::new(peer_set, Duration::from_secs(1));
+        let pending_count: u64 = pending_tx_ids
+            .len()
+            .try_into()
+            .expect("test transaction count fits in u64");
+
+        let (attempted_count, should_retry) =
+            advertise_pending_mempool_transaction_ids(&mut mempool, &mut peer_set, 1)
+                .await
+                .expect("failed advertisements should remain retryable");
+        assert_eq!(attempted_count, pending_count);
+        assert!(should_retry, "failed advertisements should be retried");
+
+        let (advertised_count, should_retry) =
+            advertise_pending_mempool_transaction_ids(&mut mempool, &mut peer_set, 0)
+                .await
+                .expect("the retry should succeed");
+        assert_eq!(advertised_count, pending_count);
+        assert!(
+            !should_retry,
+            "a successful partial batch should wait for another wakeup"
+        );
+
+        let response = mempool
+            .ready()
+            .await
+            .expect("mempool should be ready")
+            .call(Request::TakePendingGossipTransactionIds {
+                limit: MAX_TX_INV_IN_SENT_MESSAGE_USIZE,
+            })
+            .await
+            .expect("pending gossip query should succeed");
+        let Response::PendingGossipTransactionIds(remaining_tx_ids) = response else {
+            panic!("pending gossip query returned a different response variant");
+        };
+        assert!(
+            remaining_tx_ids.is_empty(),
+            "successfully advertised transaction IDs should be acknowledged"
+        );
     }
 
     #[tokio::test]

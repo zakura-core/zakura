@@ -917,13 +917,42 @@ async fn mempool_cancel_mined() -> Result<(), Report> {
         .call(Request::TakePendingGossipTransactionIds { limit: 1 })
         .await
         .unwrap();
-    let Response::TransactionIds(pending_gossip_tx_ids) = pending_gossip_tx_ids else {
-        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    let Response::PendingGossipTransactionIds(pending_gossip_tx_ids) = pending_gossip_tx_ids else {
+        panic!("wrong response from mempool to PendingGossipTransactionIds request");
     };
 
     assert!(
         pending_gossip_tx_ids.is_empty(),
         "invalidated transaction IDs should be removed from pending gossip",
+    );
+
+    let response = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::RequeuePendingGossipTransactionIds(
+            [txid].into_iter().collect(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        response,
+        Response::RequeuedPendingGossipTransactionIds
+    ));
+
+    let response = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TakePendingGossipTransactionIds { limit: 1 })
+        .await
+        .unwrap();
+    let Response::PendingGossipTransactionIds(pending_gossip_tx_ids) = response else {
+        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    };
+    assert!(
+        pending_gossip_tx_ids.is_empty(),
+        "requeue should ignore transaction IDs that are no longer stored",
     );
 
     Ok(())
@@ -1634,14 +1663,14 @@ async fn mempool_responds_to_await_output() -> Result<(), Report> {
         .call(Request::TakePendingGossipTransactionIds { limit: 1 })
         .await
         .unwrap();
-    let Response::TransactionIds(pending_gossip_tx_ids) = pending_gossip_tx_ids else {
-        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    let Response::PendingGossipTransactionIds(pending_gossip_tx_ids) = pending_gossip_tx_ids else {
+        panic!("wrong response from mempool to PendingGossipTransactionIds request");
     };
 
     assert_eq!(
         pending_gossip_tx_ids,
         [unmined_tx_id].into_iter().collect(),
-        "pending gossip transaction IDs should contain the verified transaction once",
+        "pending gossip transaction IDs should contain the verified transaction",
     );
 
     let pending_gossip_tx_ids = mempool
@@ -1651,13 +1680,13 @@ async fn mempool_responds_to_await_output() -> Result<(), Report> {
         .call(Request::TakePendingGossipTransactionIds { limit: 1 })
         .await
         .unwrap();
-    let Response::TransactionIds(pending_gossip_tx_ids) = pending_gossip_tx_ids else {
-        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    let Response::PendingGossipTransactionIds(pending_gossip_tx_ids) = pending_gossip_tx_ids else {
+        panic!("wrong response from mempool to PendingGossipTransactionIds request");
     };
 
     assert!(
         pending_gossip_tx_ids.is_empty(),
-        "pending gossip transaction IDs should be cleared after being drained",
+        "pending gossip transaction IDs should be cleared after successful advertisement",
     );
 
     Ok(())
@@ -1701,13 +1730,13 @@ async fn pending_gossip_transaction_ids_are_bounded() -> Result<(), Report> {
         .call(Request::TakePendingGossipTransactionIds { limit: 0 })
         .await
         .unwrap();
-    let Response::TransactionIds(zero_limit_drain) = response else {
-        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    let Response::PendingGossipTransactionIds(zero_limit_query) = response else {
+        panic!("wrong response from mempool to PendingGossipTransactionIds request");
     };
 
     assert!(
-        zero_limit_drain.is_empty(),
-        "zero-limit pending gossip drain should return no txids",
+        zero_limit_query.is_empty(),
+        "zero-limit pending gossip query should return no txids",
     );
 
     let response = service
@@ -1717,14 +1746,14 @@ async fn pending_gossip_transaction_ids_are_bounded() -> Result<(), Report> {
         .call(Request::TakePendingGossipTransactionIds { limit: 1 })
         .await
         .unwrap();
-    let Response::TransactionIds(first_drain) = response else {
-        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    let Response::PendingGossipTransactionIds(first_batch) = response else {
+        panic!("wrong response from mempool to PendingGossipTransactionIds request");
     };
 
     assert_eq!(
-        first_drain.len(),
+        first_batch.len(),
         1,
-        "bounded pending gossip drain should return at most the requested limit",
+        "bounded pending gossip query should return at most the requested limit",
     );
 
     let response = service
@@ -1734,21 +1763,21 @@ async fn pending_gossip_transaction_ids_are_bounded() -> Result<(), Report> {
         .call(Request::TakePendingGossipTransactionIds { limit: 1 })
         .await
         .unwrap();
-    let Response::TransactionIds(second_drain) = response else {
-        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    let Response::PendingGossipTransactionIds(second_batch) = response else {
+        panic!("wrong response from mempool to PendingGossipTransactionIds request");
     };
 
     assert_eq!(
-        second_drain.len(),
+        second_batch.len(),
         1,
-        "bounded pending gossip drain should leave excess txids pending",
+        "bounded pending gossip query should leave excess txids pending",
     );
 
-    let drained_tx_ids: HashSet<_> = first_drain.union(&second_drain).copied().collect();
+    let advertised_tx_ids: HashSet<_> = first_batch.union(&second_batch).copied().collect();
     assert_eq!(
-        drained_tx_ids,
+        advertised_tx_ids,
         tx_ids.into_iter().collect(),
-        "bounded drains should eventually return all pending txids",
+        "bounded queries should eventually return all pending txids",
     );
 
     let response = service
@@ -1758,13 +1787,13 @@ async fn pending_gossip_transaction_ids_are_bounded() -> Result<(), Report> {
         .call(Request::TakePendingGossipTransactionIds { limit: 1 })
         .await
         .unwrap();
-    let Response::TransactionIds(third_drain) = response else {
-        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    let Response::PendingGossipTransactionIds(third_batch) = response else {
+        panic!("wrong response from mempool to PendingGossipTransactionIds request");
     };
 
     assert!(
-        third_drain.is_empty(),
-        "pending gossip transaction IDs should be empty after bounded drains",
+        third_batch.is_empty(),
+        "pending gossip transaction IDs should be empty after successful advertisements",
     );
 
     Ok(())
@@ -1886,8 +1915,8 @@ async fn evicted_transaction_ids_are_removed_from_pending_gossip() -> Result<(),
         .call(Request::TakePendingGossipTransactionIds { limit: 2 })
         .await
         .unwrap();
-    let Response::TransactionIds(pending_gossip_tx_ids) = response else {
-        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    let Response::PendingGossipTransactionIds(pending_gossip_tx_ids) = response else {
+        panic!("wrong response from mempool to PendingGossipTransactionIds request");
     };
 
     assert!(
@@ -1928,8 +1957,8 @@ async fn disabled_mempool_pending_gossip_drain_is_empty() -> Result<(), Report> 
         .call(Request::TakePendingGossipTransactionIds { limit: 1 })
         .await
         .unwrap();
-    let Response::TransactionIds(pending_gossip_tx_ids) = response else {
-        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    let Response::PendingGossipTransactionIds(pending_gossip_tx_ids) = response else {
+        panic!("wrong response from mempool to PendingGossipTransactionIds request");
     };
 
     assert!(

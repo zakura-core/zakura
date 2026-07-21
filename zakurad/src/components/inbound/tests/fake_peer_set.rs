@@ -649,6 +649,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Use `Request::MempoolTransactionIds` to check the transaction was inserted to mempool
+    tokio::time::resume();
     let mempool_response = inbound_service
         .clone()
         .oneshot(Request::MempoolTransactionIds)
@@ -659,6 +660,17 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         Response::TransactionIds(vec![tx1_id]),
         "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`",
     );
+
+    // Transaction gossip starts when the mempool processes the verified
+    // transaction, so acknowledge it before pausing time again.
+    let mut hs = HashSet::new();
+    hs.insert(tx1_id);
+    peer_set
+        .expect_request(Request::AdvertiseTransactionIds(hs, None))
+        .await
+        .respond(Response::Nil);
+    tokio::task::yield_now().await;
+    tokio::time::pause();
 
     // Add a new block to the state (make the chain tip advance)
     let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
@@ -672,45 +684,10 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         .await
         .unwrap();
 
-    // Test transaction 1 is gossiped
-    let mut hs = HashSet::new();
-    hs.insert(tx1_id);
-
-    // Transaction and Block IDs are gossipped, in any order, after waiting for the gossip delay
+    // Block gossip waits for the multi-gossip delay.
     tokio::time::sleep(PEER_GOSSIP_DELAY).await;
-    let possible_requests = &mut [
-        Request::AdvertiseTransactionIds(hs, None),
-        Request::AdvertiseBlock(block_two.hash(), None),
-    ]
-    .to_vec();
-
     peer_set
-        .expect_request_that(|request| {
-            let is_possible = possible_requests.contains(request);
-
-            *possible_requests = possible_requests
-                .clone()
-                .into_iter()
-                .filter(|possible| possible != request)
-                .collect();
-
-            is_possible
-        })
-        .await
-        .respond(Response::Nil);
-
-    peer_set
-        .expect_request_that(|request| {
-            let is_possible = possible_requests.contains(request);
-
-            *possible_requests = possible_requests
-                .clone()
-                .into_iter()
-                .filter(|possible| possible != request)
-                .collect();
-
-            is_possible
-        })
+        .expect_request(Request::AdvertiseBlock(block_two.hash(), None))
         .await
         .respond(Response::Nil);
 
@@ -790,6 +767,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Use `Request::MempoolTransactionIds` to check the transaction was inserted to mempool
+    tokio::time::resume();
     let mempool_response = inbound_service
         .clone()
         .oneshot(Request::MempoolTransactionIds)
@@ -801,6 +779,16 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         Response::TransactionIds(vec![tx2_id]),
         "`MempoolTransactionIds` requests should always respond `Ok(Vec<UnminedTxId> | Nil)`",
     );
+
+    // Test transaction 2 is gossiped.
+    let mut hs = HashSet::new();
+    hs.insert(tx2_id);
+    peer_set
+        .expect_request(Request::AdvertiseTransactionIds(hs, None))
+        .await
+        .respond(Response::Nil);
+    tokio::task::yield_now().await;
+    tokio::time::pause();
 
     // Check if tx1 was added to the rejected list as well
     let response = mempool
@@ -823,16 +811,6 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
             .unbox_mempool_error(),
         MempoolError::StorageEffectsChain(SameEffectsChainRejectionError::Expired)
     );
-
-    // Test transaction 2 is gossiped, after waiting for the multi-gossip delay
-    tokio::time::sleep(PEER_GOSSIP_DELAY).await;
-
-    let mut hs = HashSet::new();
-    hs.insert(tx2_id);
-    peer_set
-        .expect_request(Request::AdvertiseTransactionIds(hs, None))
-        .await
-        .respond(Response::Nil);
 
     // Add all the rest of the continuous blocks we have to test tx2 will never expire.
     let more_blocks: Vec<Arc<Block>> = vec![

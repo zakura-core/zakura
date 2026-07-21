@@ -920,7 +920,16 @@ impl Service<Request> for Mempool {
 
                     trace!(?req, res_count = ?res.len(), "answered mempool request");
 
-                    async move { Ok(Response::TransactionIds(res)) }.boxed()
+                    async move { Ok(Response::PendingGossipTransactionIds(res)) }.boxed()
+                }
+
+                Request::RequeuePendingGossipTransactionIds(ref tx_ids) => {
+                    trace!(?req, "got mempool request");
+
+                    let stored_tx_ids: HashSet<_> = storage.tx_ids().collect();
+                    pending_gossip_tx_ids.extend(tx_ids.intersection(&stored_tx_ids).copied());
+
+                    async move { Ok(Response::RequeuedPendingGossipTransactionIds) }.boxed()
                 }
 
                 Request::TransactionsById(ref ids) => {
@@ -1168,8 +1177,12 @@ impl Service<Request> for Mempool {
 
                 let resp = match req {
                     // Return empty responses for queries.
-                    Request::TransactionIds | Request::TakePendingGossipTransactionIds { .. } => {
-                        Response::TransactionIds(Default::default())
+                    Request::TransactionIds => Response::TransactionIds(Default::default()),
+                    Request::TakePendingGossipTransactionIds { .. } => {
+                        Response::PendingGossipTransactionIds(Default::default())
+                    }
+                    Request::RequeuePendingGossipTransactionIds(_) => {
+                        Response::RequeuedPendingGossipTransactionIds
                     }
 
                     Request::TransactionsById(_) => Response::Transactions(Default::default()),

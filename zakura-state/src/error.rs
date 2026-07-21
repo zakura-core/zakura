@@ -953,7 +953,7 @@ mod tests {
     use zakura_chain::{
         block::{CommitmentError, Height},
         parameters::Network,
-        work::difficulty::INVALID_COMPACT_DIFFICULTY,
+        work::difficulty::{ParameterDifficulty, INVALID_COMPACT_DIFFICULTY},
     };
 
     #[test]

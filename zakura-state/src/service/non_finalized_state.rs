@@ -130,6 +130,25 @@ impl NonFinalizedState {
         }
     }
 
+    /// Performs initial and chain-specific contextual validation of a
+    /// [`SemanticallyVerifiedBlock`], then commits it to this state.
+    ///
+    /// The block starts a new chain if its parent is the [`ZakuraDb`] finalized
+    /// tip, or extends or forks an existing non-finalized chain otherwise.
+    pub fn validate_and_commit_block(
+        &mut self,
+        prepared: SemanticallyVerifiedBlock,
+        finalized_state: &ZakuraDb,
+    ) -> Result<(), ValidateContextError> {
+        crate::service::check::initial_contextual_validity(finalized_state, self, &prepared)?;
+
+        if finalized_state.finalized_tip_hash() == prepared.block.header.previous_block_hash {
+            self.commit_new_chain(prepared, finalized_state)
+        } else {
+            self.commit_block(prepared, finalized_state)
+        }
+    }
+
     /// Writes the current non-finalized state to the backup directory at `backup_dir_path`.
     ///
     /// Reads the existing backup directory contents, writes any blocks that are in the

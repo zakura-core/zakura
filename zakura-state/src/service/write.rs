@@ -23,7 +23,6 @@ use crate::{
     constants::MAX_BLOCK_REORG_HEIGHT,
     error::CommitHeaderRangeError,
     service::{
-        check,
         finalized_state::{FinalizedState, ZakuraDb},
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
@@ -98,16 +97,7 @@ pub(crate) fn validate_and_commit_non_finalized(
     non_finalized_state: &mut NonFinalizedState,
     prepared: SemanticallyVerifiedBlock,
 ) -> Result<(), ValidateContextError> {
-    check::initial_contextual_validity(finalized_state, non_finalized_state, &prepared)?;
-    let parent_hash = prepared.block.header.previous_block_hash;
-
-    if finalized_state.finalized_tip_hash() == parent_hash {
-        non_finalized_state.commit_new_chain(prepared, finalized_state)?;
-    } else {
-        non_finalized_state.commit_block(prepared, finalized_state)?;
-    }
-
-    Ok(())
+    non_finalized_state.validate_and_commit_block(prepared, finalized_state)
 }
 
 /// Update the [`LatestChainTip`], [`ChainTipChange`], and `non_finalized_state_sender`

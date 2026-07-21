@@ -444,10 +444,13 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
             insert_peer(row, hs_trace::PEER, peer);
             trace_header_sync_message_fields(row, msg);
         }
-        HeaderSyncEvent::WireHeaders { peer, headers, .. } => {
+        HeaderSyncEvent::WireHeaders {
+            wire_request,
+            entries,
+        } => {
             insert_optional_str(row, hs_trace::KIND, Some("wire_headers"));
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
+            insert_peer(row, hs_trace::PEER, &wire_request.peer);
+            insert_u64(row, hs_trace::RANGE_COUNT, entries.len() as u64);
         }
         HeaderSyncEvent::WireGetHeaders {
             peer,
@@ -814,7 +817,9 @@ pub(super) fn header_sync_wire_error_kind(error: &HeaderSyncWireError) -> &'stat
     match error {
         HeaderSyncWireError::OversizedPayload { .. } => "oversized_payload",
         HeaderSyncWireError::HeaderCountLimit { .. } => "header_count_limit",
-        HeaderSyncWireError::InvalidRangeGeometry { .. } => "invalid_range_geometry",
+        HeaderSyncWireError::InvalidRange { .. } => "invalid_range",
+        HeaderSyncWireError::EmptyHeaderRangePayload => "empty_header_range_payload",
+        HeaderSyncWireError::EntryHeightMismatch { .. } => "entry_height_mismatch",
         HeaderSyncWireError::BodySizeCountMismatch { .. } => "body_size_count_mismatch",
         HeaderSyncWireError::TreeAuxRootCountMismatch { .. } => "tree_aux_root_count_mismatch",
         HeaderSyncWireError::TreeAuxRootHeightMismatch { .. } => "tree_aux_root_height_mismatch",
@@ -939,7 +944,7 @@ mod tests {
         header_sync::{
             events::HeaderSyncFrontiers, service::HeaderSyncPeerSession, state::RangePriority,
         },
-        HeaderRangePayload, HeaderSyncOperationIdentity, HeaderSyncOperationKind,
+        HeaderRangeEntry, HeaderRangePayload, HeaderSyncOperationIdentity, HeaderSyncOperationKind,
         HeaderSyncServiceSummary, HeaderSyncWireRequestIdentity,
     };
 
@@ -1085,12 +1090,17 @@ mod tests {
                 msg: HeaderSyncMessage::Status(status()),
             },
             HeaderSyncEvent::WireHeaders {
-                peer: peer.clone(),
-                session_id: 7,
-                request_id: request_id(),
-                headers: vec![header.clone()],
-                body_sizes: vec![1],
-                tree_aux_roots: Vec::new(),
+                wire_request: HeaderSyncWireRequestIdentity {
+                    peer: peer.clone(),
+                    session_id: 7,
+                    request_id: request_id(),
+                },
+                entries: vec![HeaderRangeEntry {
+                    height: block::Height(1),
+                    header: header.clone(),
+                    body_size: 1,
+                    tree_aux_root: None,
+                }],
             },
             HeaderSyncEvent::WireGetHeaders {
                 peer: peer.clone(),
@@ -1192,8 +1202,13 @@ mod tests {
                 HeaderSyncAction::CommitHeaderRange {
                     operation: operation(peer.clone()),
                     anchor: block::Hash([0; 32]),
-                    payload: HeaderRangePayload::new(block::Height(1), vec![header], vec![1], None)
-                        .expect("test payload is aligned"),
+                    payload: HeaderRangePayload::new(vec![HeaderRangeEntry {
+                        height: block::Height(1),
+                        header,
+                        body_size: 1,
+                        tree_aux_root: None,
+                    }])
+                    .expect("test payload is aligned"),
                     finalized: false,
                 },
                 "commit_header_range",
@@ -1350,6 +1365,18 @@ mod tests {
             (
                 HeaderSyncWireError::HeaderCountLimit { actual: 2, max: 1 },
                 "header_count_limit",
+            ),
+            (
+                HeaderSyncWireError::EmptyHeaderRangePayload,
+                "empty_header_range_payload",
+            ),
+            (
+                HeaderSyncWireError::EntryHeightMismatch {
+                    offset: 1,
+                    expected_height: block::Height(2),
+                    entry_height: block::Height(3),
+                },
+                "entry_height_mismatch",
             ),
             (
                 HeaderSyncWireError::BodySizeCountMismatch {

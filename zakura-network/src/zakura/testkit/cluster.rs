@@ -152,11 +152,12 @@ mod tests {
             block_sync::{MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC},
             spawn_header_sync_reactor, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,
             BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage,
-            BlockSyncStatus, DiscoveryMessage, Frame, FramedRecv, FramedSend, HeaderSyncAction,
-            HeaderSyncCommitFailureKind, HeaderSyncDecodeContext, HeaderSyncEvent,
-            HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMessage, HeaderSyncMisbehavior,
-            HeaderSyncOperationIdentity, HeaderSyncPeerSession, HeaderSyncRequestId,
-            HeaderSyncStartup, HeaderSyncStatus, Peer, Service, ServicePeerLimits, Stream,
+            BlockSyncStatus, DiscoveryMessage, Frame, FramedRecv, FramedSend, HeaderRangeEntry,
+            HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncDecodeContext,
+            HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMessage,
+            HeaderSyncMisbehavior, HeaderSyncOperationIdentity, HeaderSyncPeerSession,
+            HeaderSyncRequestId, HeaderSyncStartup, HeaderSyncStatus,
+            HeaderSyncWireRequestIdentity, Peer, Service, ServicePeerLimits, Stream,
             ZakuraBlockSyncConfig, ZakuraConnId, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
             ZakuraTrace, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
             ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
@@ -733,6 +734,7 @@ mod tests {
             node: usize,
             peer: ZakuraPeerId,
             request_id: HeaderSyncRequestId,
+            start_height: block::Height,
             msg: HeaderSyncMessage,
         ) {
             let HeaderSyncMessage::Headers {
@@ -747,12 +749,18 @@ mod tests {
                 .view
                 .handle
                 .send(HeaderSyncEvent::WireHeaders {
-                    peer,
-                    session_id: E2E_SESSION_ID,
-                    request_id,
-                    headers,
-                    body_sizes,
-                    tree_aux_roots,
+                    wire_request: HeaderSyncWireRequestIdentity {
+                        peer,
+                        session_id: E2E_SESSION_ID,
+                        request_id,
+                    },
+                    entries: HeaderRangeEntry::from_parallel(
+                        start_height,
+                        headers,
+                        body_sizes,
+                        tree_aux_roots,
+                    )
+                    .expect("test response vectors align"),
                 })
                 .await
                 .unwrap();
@@ -999,13 +1007,19 @@ mod tests {
                         let _ = nodes[*target]
                             .handle
                             .send(HeaderSyncEvent::WireHeaders {
-                                peer: local.peer_id.clone(),
-                                session_id: E2E_SESSION_ID,
-                                // Echo the requester's ID, exactly as the wire does.
-                                request_id,
-                                headers,
-                                body_sizes,
-                                tree_aux_roots,
+                                wire_request: HeaderSyncWireRequestIdentity {
+                                    peer: local.peer_id.clone(),
+                                    session_id: E2E_SESSION_ID,
+                                    // Echo the requester's ID, exactly as the wire does.
+                                    request_id,
+                                },
+                                entries: HeaderRangeEntry::from_parallel(
+                                    start,
+                                    headers,
+                                    body_sizes,
+                                    tree_aux_roots,
+                                )
+                                .expect("test response vectors align"),
                             })
                             .await;
                         let _ = local
@@ -3464,7 +3478,12 @@ mod tests {
                 victim,
                 out_of_range,
                 request_id,
-                headers_message(vec![mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone()]),
+                block::Height(1),
+                HeaderSyncMessage::Headers {
+                    headers: vec![mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone()],
+                    body_sizes: vec![0],
+                    tree_aux_roots: roots_from_height(block::Height(1), 1),
+                },
             )
             .await;
         cluster
@@ -3506,6 +3525,7 @@ mod tests {
                 victim,
                 response_too_long,
                 request_id,
+                block::Height(1),
                 headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
@@ -3545,6 +3565,7 @@ mod tests {
                 bad_continuity_victim,
                 bad_continuity,
                 request_id,
+                block::Height(1),
                 headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     Arc::new(non_contiguous),
@@ -3578,6 +3599,7 @@ mod tests {
                 bad_pow_victim,
                 bad_pow,
                 request_id,
+                block::Height(1),
                 headers_message(vec![Arc::new(bad_pow_header)]),
             )
             .await;
@@ -3612,6 +3634,7 @@ mod tests {
                 bad_daa_victim,
                 bad_daa,
                 request_id,
+                block::Height(1),
                 headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),

@@ -1067,15 +1067,34 @@ async fn send_headers(
     else {
         panic!("send_headers requires a Headers message");
     };
+    let entries = if !headers.is_empty() && tree_aux_roots.is_empty() {
+        headers
+            .into_iter()
+            .zip(body_sizes)
+            .map(|(header, body_size)| HeaderRangeEntry {
+                height: test_header_height(header.as_ref()),
+                header,
+                body_size,
+                tree_aux_root: None,
+            })
+            .collect()
+    } else {
+        let start = tree_aux_roots
+            .first()
+            .map(|root| root.height)
+            .unwrap_or(block::Height(0));
+        HeaderRangeEntry::from_parallel(start, headers, body_sizes, tree_aux_roots)
+            .expect("test response vectors align")
+    };
     fixture
         .handle
         .send(HeaderSyncEvent::WireHeaders {
-            peer: peer.clone(),
-            session_id: 0,
-            request_id,
-            headers,
-            body_sizes,
-            tree_aux_roots,
+            wire_request: HeaderSyncWireRequestIdentity {
+                peer: peer.clone(),
+                session_id: 0,
+                request_id,
+            },
+            entries,
         })
         .await
         .unwrap();
@@ -2028,7 +2047,7 @@ async fn vct_repair_bypasses_covered_range_and_commits_exact_h_and_successor() {
                 assert_eq!(operation.wire_request.peer, peer_id);
                 assert_eq!(payload.range().start(), block::Height(1));
                 assert_eq!(payload.headers().len(), 2);
-                assert_eq!(payload.tree_aux_roots().map(<[_]>::len), Some(2),);
+                assert_eq!(payload.tree_aux_roots().map(|roots| roots.len()), Some(2));
                 assert!(
                     !finalized,
                     "repair ranges are canonical but not checkpoint-terminating"
@@ -5056,24 +5075,36 @@ async fn replacement_session_ignores_old_wire_response_with_reused_id() {
     fixture
         .handle
         .send(HeaderSyncEvent::WireHeaders {
-            peer: peer_id.clone(),
-            session_id: 1,
-            request_id,
-            headers: headers.clone(),
-            body_sizes: vec![0],
-            tree_aux_roots: roots_from_height(block::Height(4), 1),
+            wire_request: HeaderSyncWireRequestIdentity {
+                peer: peer_id.clone(),
+                session_id: 1,
+                request_id,
+            },
+            entries: HeaderRangeEntry::from_parallel(
+                block::Height(4),
+                headers.clone(),
+                vec![0],
+                roots_from_height(block::Height(4), 1),
+            )
+            .expect("test response vectors align"),
         })
         .await
         .unwrap();
     fixture
         .handle
         .send(HeaderSyncEvent::WireHeaders {
-            peer: peer_id.clone(),
-            session_id: 2,
-            request_id,
-            headers,
-            body_sizes: vec![0],
-            tree_aux_roots: roots_from_height(block::Height(4), 1),
+            wire_request: HeaderSyncWireRequestIdentity {
+                peer: peer_id.clone(),
+                session_id: 2,
+                request_id,
+            },
+            entries: HeaderRangeEntry::from_parallel(
+                block::Height(4),
+                headers,
+                vec![0],
+                roots_from_height(block::Height(4), 1),
+            )
+            .expect("test response vectors align"),
         })
         .await
         .unwrap();
@@ -5931,10 +5962,15 @@ async fn partial_coverage_trims_and_commits_an_already_buffered_suffix() {
             next_non_query_action(&mut fixture.actions).await
         {
             assert_eq!(payload.range().start(), block::Height(4));
-            assert_eq!(payload.headers(), [mainnet_header(&BLOCK_MAINNET_4_BYTES)]);
-            assert_eq!(payload.body_sizes(), [44]);
             assert_eq!(
-                payload.tree_aux_roots().map(|roots| roots[0].height),
+                payload.headers().cloned().collect::<Vec<_>>(),
+                [mainnet_header(&BLOCK_MAINNET_4_BYTES)]
+            );
+            assert_eq!(payload.body_sizes().collect::<Vec<_>>(), [44]);
+            assert_eq!(
+                payload
+                    .tree_aux_roots()
+                    .and_then(|mut roots| roots.next().map(|root| root.height)),
                 Some(block::Height(4))
             );
             break;
@@ -5997,7 +6033,10 @@ async fn loaded_best_tip_reconciles_outstanding_and_buffered_work() {
             next_non_query_action(&mut fixture.actions).await
         {
             assert_eq!(payload.range().start(), block::Height(4));
-            assert_eq!(payload.headers(), [mainnet_header(&BLOCK_MAINNET_4_BYTES)]);
+            assert_eq!(
+                payload.headers().cloned().collect::<Vec<_>>(),
+                [mainnet_header(&BLOCK_MAINNET_4_BYTES)]
+            );
             break;
         }
     }

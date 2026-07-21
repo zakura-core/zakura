@@ -773,10 +773,11 @@ mod tests {
     use crate::zakura::{
         framed_channel, spawn_block_sync_reactor, spawn_header_sync_reactor, BlockSyncFrontiers,
         BlockSyncStartup, HeaderSyncAction, HeaderSyncFrontiers, HeaderSyncMessage,
-        HeaderSyncPeerSession, HeaderSyncStartup, HeaderSyncStatus, ServicePeerLimits,
-        ZakuraBlockSyncConfig, ZakuraDiscoveryConfig, ZakuraDiscoveryLocalConfig,
-        ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, LOCAL_MAX_MESSAGE_BYTES,
-        MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+        HeaderSyncPeerSession, HeaderSyncStartup, HeaderSyncStatus, HeaderSyncWireRequestIdentity,
+        ServicePeerLimits, ZakuraBlockSyncConfig, ZakuraDiscoveryConfig,
+        ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig,
+        LOCAL_MAX_MESSAGE_BYTES, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
     };
     use zakura_chain::{block, parameters::Network};
 
@@ -1082,12 +1083,12 @@ mod tests {
         fixture
             .header_sync
             .send(HeaderSyncEvent::WireHeaders {
-                peer: fixture.peer_id.clone(),
-                session_id: 0,
-                request_id,
-                headers: Vec::new(),
-                body_sizes: Vec::new(),
-                tree_aux_roots: Vec::new(),
+                wire_request: HeaderSyncWireRequestIdentity {
+                    peer: fixture.peer_id.clone(),
+                    session_id: 0,
+                    request_id,
+                },
+                entries: Vec::new(),
             })
             .await?;
         tokio::time::sleep(Duration::from_millis(20)).await;

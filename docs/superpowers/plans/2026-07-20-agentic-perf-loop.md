@@ -501,6 +501,9 @@ for d in json.load(sys.stdin) or []:
 cmd_provision() {
   local name="${NAME_PREFIX}-${1:-$(date +%m%d%H%M)}"
   ensure_key
+  # hard rule (design §5): concurrent perf-lab droplets <= MAX_DROPLETS
+  local count; count="$(droplet_json | python3 -c 'import json,sys; print(len(json.load(sys.stdin) or []))')"
+  [ "$count" -lt "$MAX_DROPLETS" ] || die "refusing: $count perf-lab droplet(s) exist (MAX_DROPLETS=$MAX_DROPLETS)"
   local image; image="$(golden_image)"
   if [ -n "$image" ]; then echo "using golden image $image"
   else image="$DO_FALLBACK_IMAGE"; echo "WARN: no ${GOLDEN_IMAGE_PREFIX}* image; falling back to $image (slow bootstrap)"; fi
@@ -610,10 +613,13 @@ DOCTL_LOG=$(mktemp) DOCTL_BIN=perf-lab/tests/doctl_stub.sh bash perf-lab/droplet
   && echo "FAIL" || echo "PASS: untagged destroy refused"
 DOCTL_LOG=$(mktemp) DOCTL_BIN=perf-lab/tests/doctl_stub.sh bash perf-lab/droplet.sh destroy other-droplet \
   && echo "FAIL" || echo "PASS: bad prefix refused"
+DOCTL_LOG=$(mktemp) DOCTL_BIN=perf-lab/tests/doctl_stub.sh MAX_DROPLETS=0 \
+  bash perf-lab/droplet.sh provision capped \
+  && echo "FAIL" || echo "PASS: MAX_DROPLETS cap refused provision"
 shellcheck perf-lab/droplet.sh perf-lab/tests/doctl_stub.sh
 ```
 
-Expected: both `PASS` lines (the stub's `droplet list` returns `[]`, so the tag check fails closed); shellcheck clean (annotate any deliberate ignores inline).
+Expected: all three `PASS` lines (the stub's `droplet list` returns `[]`, so the tag check fails closed and, with `MAX_DROPLETS=0`, the cap check refuses); shellcheck clean (annotate any deliberate ignores inline).
 
 - [ ] **Step 4: DRYRUN provision prints, creates nothing**
 
@@ -1046,6 +1052,24 @@ metric (default: checkpoint-zone post-commit blk/s), re-ranked top-5 backlog.
    simplicity, promising, proposals, incidents, spend). Commit + push the
    orchestration branch.
 
+## state.json protocol (crash recovery depends on this)
+
+Write `perf-lab/state.json` at every transition and commit it with the ledger:
+
+- session start: set `session` = N; `droplets` gains
+  `{"<name>": {"ip": "...", "created_at": "..."}}` on every provision, entry
+  removed on destroy/reap.
+- `bench.sh start` fired: `in_flight["<label>"] = {"droplet": "...",
+  "build_ref": "...", "baseline_ref": "...", "exp": "EXP-NNN",
+  "started_at": "..."}`.
+- `bench.sh collect` done (or the run abandoned): delete `in_flight["<label>"]`
+  and increment `batch_runs_used` (reset to 0 at each batch boundary).
+- experiment id allocated: increment `next_exp_id`.
+- calibration: `noise_band_pct` mirrors config.env.
+
+A fresh session must be able to reconstruct everything it needs from
+state.json + LEDGER.md alone.
+
 ## Budget & halts (D3/D6)
 
 - `BATCH_SIZE=8` bench runs per batch; at each boundary write `## BATCH`
@@ -1119,7 +1143,7 @@ git add perf-lab/LEDGER.md && git commit -m "perf-lab: EXP-000 dry-run verdict (
 
 - [ ] **Step 1: Self-review the tooling against the spec** — walk spec §3–§7 and confirm each requirement maps to a script/skill feature (droplet lifecycle §3 ↔ droplet.sh; measurement §4 ↔ bench.sh+verdict.py+calibration; safety §5 ↔ guards+allowlist+SKILL rails; ideas §6 ↔ BACKLOG; reporting §7 ↔ LEDGER/REPORT+SKILL step 8). Fix gaps inline.
 
-- [ ] **Step 2: Update `perf-lab/README.md`** with the "start a session" one-liner (invoke the `perf-lab` skill), measured timings from Tasks 6–9, and the calibrated noise band.
+- [ ] **Step 2: Update `perf-lab/README.md`** with the "start a session" one-liner (invoke the `perf-lab` skill), measured timings from Tasks 6–9, the calibrated noise band, and one-line bullets for `state.json`, `BACKLOG.md`, `LEDGER.md`, and `REPORT.md` (the scaffold README omits them).
 
 - [ ] **Step 3: Commit + push the orchestration branch**
 

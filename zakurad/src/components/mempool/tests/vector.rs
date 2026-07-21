@@ -847,6 +847,15 @@ async fn mempool_cancel_mined() -> Result<(), Report> {
 
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
 
+    let crate::components::mempool::ActiveState::Enabled {
+        pending_gossip_tx_ids,
+        ..
+    } = &mut mempool.active_state
+    else {
+        panic!("mempool should be enabled");
+    };
+    pending_gossip_tx_ids.insert(txid);
+
     // Push block 2 to the state
     state_service
         .oneshot(zakura_state::Request::CommitCheckpointVerifiedBlock(
@@ -899,6 +908,22 @@ async fn mempool_cancel_mined() -> Result<(), Report> {
     assert_eq!(
         mempool_change,
         MempoolChange::invalidated([txid].into_iter().collect())
+    );
+
+    let pending_gossip_tx_ids = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TakePendingGossipTransactionIds { limit: 1 })
+        .await
+        .unwrap();
+    let Response::TransactionIds(pending_gossip_tx_ids) = pending_gossip_tx_ids else {
+        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    };
+
+    assert!(
+        pending_gossip_tx_ids.is_empty(),
+        "invalidated transaction IDs should be removed from pending gossip",
     );
 
     Ok(())
@@ -1600,6 +1625,316 @@ async fn mempool_responds_to_await_output() -> Result<(), Report> {
     assert_eq!(
         mempool_change,
         MempoolChange::added([unmined_tx_id].into_iter().collect())
+    );
+
+    let pending_gossip_tx_ids = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TakePendingGossipTransactionIds { limit: 1 })
+        .await
+        .unwrap();
+    let Response::TransactionIds(pending_gossip_tx_ids) = pending_gossip_tx_ids else {
+        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    };
+
+    assert_eq!(
+        pending_gossip_tx_ids,
+        [unmined_tx_id].into_iter().collect(),
+        "pending gossip transaction IDs should contain the verified transaction once",
+    );
+
+    let pending_gossip_tx_ids = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TakePendingGossipTransactionIds { limit: 1 })
+        .await
+        .unwrap();
+    let Response::TransactionIds(pending_gossip_tx_ids) = pending_gossip_tx_ids else {
+        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    };
+
+    assert!(
+        pending_gossip_tx_ids.is_empty(),
+        "pending gossip transaction IDs should be cleared after being drained",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_gossip_transaction_ids_are_bounded() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, 100_000, true).await;
+
+    service.enable(&mut recent_syncs).await;
+
+    let tx_ids = [
+        zakura_chain::transaction::UnminedTxId::Legacy(zakura_chain::transaction::Hash([1; 32])),
+        zakura_chain::transaction::UnminedTxId::Legacy(zakura_chain::transaction::Hash([2; 32])),
+    ];
+
+    let crate::components::mempool::ActiveState::Enabled {
+        pending_gossip_tx_ids,
+        ..
+    } = &mut service.active_state
+    else {
+        panic!("mempool should be enabled");
+    };
+
+    pending_gossip_tx_ids.extend(tx_ids);
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TakePendingGossipTransactionIds { limit: 0 })
+        .await
+        .unwrap();
+    let Response::TransactionIds(zero_limit_drain) = response else {
+        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    };
+
+    assert!(
+        zero_limit_drain.is_empty(),
+        "zero-limit pending gossip drain should return no txids",
+    );
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TakePendingGossipTransactionIds { limit: 1 })
+        .await
+        .unwrap();
+    let Response::TransactionIds(first_drain) = response else {
+        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    };
+
+    assert_eq!(
+        first_drain.len(),
+        1,
+        "bounded pending gossip drain should return at most the requested limit",
+    );
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TakePendingGossipTransactionIds { limit: 1 })
+        .await
+        .unwrap();
+    let Response::TransactionIds(second_drain) = response else {
+        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    };
+
+    assert_eq!(
+        second_drain.len(),
+        1,
+        "bounded pending gossip drain should leave excess txids pending",
+    );
+
+    let drained_tx_ids: HashSet<_> = first_drain.union(&second_drain).copied().collect();
+    assert_eq!(
+        drained_tx_ids,
+        tx_ids.into_iter().collect(),
+        "bounded drains should eventually return all pending txids",
+    );
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TakePendingGossipTransactionIds { limit: 1 })
+        .await
+        .unwrap();
+    let Response::TransactionIds(third_drain) = response else {
+        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    };
+
+    assert!(
+        third_drain.is_empty(),
+        "pending gossip transaction IDs should be empty after bounded drains",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn evicted_transaction_ids_are_removed_from_pending_gossip() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let mut transactions = network.unmined_transactions_in_blocks(1..=10);
+    let first_tx = transactions
+        .next()
+        .expect("at least one unmined transaction");
+    let second_tx = transactions
+        .next()
+        .expect("at least two unmined transactions");
+    let first_tx_id = first_tx.transaction.id;
+    let second_tx_id = second_tx.transaction.id;
+    let tx_cost_limit = first_tx.cost().max(second_tx.cost());
+
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        mut mempool_transaction_receiver,
+    ) = setup(&network, tx_cost_limit, true).await;
+
+    mempool.enable(&mut recent_syncs).await;
+
+    let request = Request::Queue(vec![
+        Gossip::Tx(first_tx.transaction.clone()),
+        Gossip::Tx(second_tx.transaction.clone()),
+    ]);
+    let queue_response_fut = mempool.ready().await.unwrap().call(request);
+    let verify_txs_fut = async {
+        let verified_txs = [first_tx, second_tx];
+
+        for _ in 0..verified_txs.len() {
+            tx_verifier
+                .expect_request_that(|_| true)
+                .map(|responder| {
+                    let requested_tx = responder
+                        .request()
+                        .clone()
+                        .mempool_transaction()
+                        .expect("unexpected non-mempool request");
+                    let verified_tx = verified_txs
+                        .iter()
+                        .find(|tx| tx.transaction.id == requested_tx.id)
+                        .expect("unexpected transaction verification request")
+                        .clone();
+
+                    responder.respond(transaction::Response::Mempool {
+                        transaction: verified_tx,
+                        spent_mempool_outpoints: Vec::new(),
+                    });
+                })
+                .await;
+        }
+    };
+
+    let (response, _) = futures::join!(queue_response_fut, verify_txs_fut);
+    let Response::Queued(results) = response.expect("response should be Ok") else {
+        panic!("wrong response from mempool to Queued request");
+    };
+
+    let result_rxs: Vec<_> = results
+        .into_iter()
+        .map(|result| result.expect("queued transaction should pass initial checks"))
+        .collect();
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    mempool
+        .ready()
+        .await
+        .expect("polling mempool should succeed");
+
+    for result_rx in result_rxs {
+        let _insert_result = tokio::time::timeout(Duration::from_secs(10), result_rx)
+            .await
+            .expect("should not time out")
+            .expect("mempool tx verification result channel should not be closed");
+    }
+
+    let mut added_ids = HashSet::new();
+    let mut invalidated_ids = HashSet::new();
+
+    while added_ids.is_empty() || invalidated_ids.is_empty() {
+        let mempool_change = timeout(Duration::from_secs(3), mempool_transaction_receiver.recv())
+            .await
+            .expect("should not timeout")
+            .expect("recv should return Ok");
+
+        match mempool_change.kind() {
+            zakura_node_services::mempool::MempoolChangeKind::Added => {
+                added_ids.extend(mempool_change.into_tx_ids());
+            }
+            zakura_node_services::mempool::MempoolChangeKind::Invalidated => {
+                invalidated_ids.extend(mempool_change.into_tx_ids());
+            }
+            zakura_node_services::mempool::MempoolChangeKind::Mined => {
+                panic!("unexpected mined mempool change");
+            }
+        }
+    }
+
+    assert!(
+        invalidated_ids.contains(&first_tx_id) || invalidated_ids.contains(&second_tx_id),
+        "ZIP-401 evicted transaction should be reported as invalidated",
+    );
+
+    let response = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TakePendingGossipTransactionIds { limit: 2 })
+        .await
+        .unwrap();
+    let Response::TransactionIds(pending_gossip_tx_ids) = response else {
+        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    };
+
+    assert!(
+        pending_gossip_tx_ids.is_disjoint(&invalidated_ids),
+        "evicted transaction IDs should not remain pending for gossip",
+    );
+    assert_eq!(
+        pending_gossip_tx_ids, added_ids,
+        "pending gossip should only contain transactions still reported as added",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disabled_mempool_pending_gossip_drain_is_empty() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        _recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, 100_000, true).await;
+
+    assert!(
+        !service.is_enabled(),
+        "mempool should start disabled before sync reaches tip",
+    );
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TakePendingGossipTransactionIds { limit: 1 })
+        .await
+        .unwrap();
+    let Response::TransactionIds(pending_gossip_tx_ids) = response else {
+        panic!("wrong response from mempool to TakePendingGossipTransactionIds request");
+    };
+
+    assert!(
+        pending_gossip_tx_ids.is_empty(),
+        "disabled mempool should have no pending gossip transaction IDs",
     );
 
     Ok(())

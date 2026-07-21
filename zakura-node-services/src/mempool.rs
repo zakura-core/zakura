@@ -69,6 +69,16 @@ pub enum Request {
     /// Query all [`UnminedTxId`]s in the mempool.
     TransactionIds,
 
+    /// Return and clear up to `limit` transaction IDs awaiting proactive
+    /// advertisement through the peer set.
+    ///
+    /// This pending set is separate from the full mempool inventory returned
+    /// by [`Request::TransactionIds`] in response to peer `mempool` requests.
+    TakePendingGossipTransactionIds {
+        /// Maximum number of transaction IDs to return.
+        limit: usize,
+    },
+
     /// Query matching [`UnminedTx`] in the mempool,
     /// using a unique set of [`UnminedTxId`]s.
     TransactionsById(HashSet<UnminedTxId>),

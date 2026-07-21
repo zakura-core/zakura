@@ -2,7 +2,11 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::{iter, net::SocketAddr};
+use std::{
+    io, iter,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use futures::FutureExt;
 use indexmap::IndexSet;
@@ -10,6 +14,7 @@ use tokio::{sync::oneshot, task::JoinHandle};
 use tower::{
     buffer::Buffer, builder::ServiceBuilder, load_shed::LoadShed, util::BoxService, ServiceExt,
 };
+use tracing::instrument::WithSubscriber;
 
 use zakura_chain::{
     block::{self, Height},
@@ -32,13 +37,38 @@ use zakura_test::mock_service::{MockService, PanicAssertion};
 use crate::{
     components::{
         inbound::{downloads::MAX_INBOUND_CONCURRENCY, Inbound, InboundSetupData},
-        mempool::{gossip_mempool_transaction_id, Config as MempoolConfig, Mempool},
+        mempool::{run_mempool_transaction_id_gossip, Config as MempoolConfig, Mempool},
         sync::{self, BlockGossipError, SyncStatus},
     },
     BoxError,
 };
 
 use InventoryResponse::*;
+
+/// An in-memory writer for assertions on test-local tracing output.
+struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for TestWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("log buffer lock should not be poisoned"))?
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Return whether `logs` contains `expected`.
+fn captured_logs_contain(logs: &Arc<Mutex<Vec<u8>>>, expected: &str) -> bool {
+    let logs = logs
+        .lock()
+        .expect("log buffer is only locked by non-panicking writer operations");
+    String::from_utf8_lossy(&logs).contains(expected)
+}
 
 /// Check that a network stack with an empty address book only contains the local listener port,
 /// by querying the inbound service via a local TCP connection.
@@ -288,9 +318,16 @@ async fn inbound_block_empty_state_notfound() -> Result<(), crate::BoxError> {
 ///
 /// Uses a real Zebra network stack, with an isolated Zebra inbound TCP connection.
 #[tokio::test(flavor = "multi_thread")]
-#[tracing_test::traced_test]
 async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
 ) -> Result<(), crate::BoxError> {
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let log_sink = Arc::clone(&logs);
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || TestWriter(Arc::clone(&log_sink)))
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
     // `setup` configures checkpoint retention against `Height::MAX`, so block 1 is committed
     // to the retained chain indexes without storing its transaction bytes. Genesis is retained.
     let state_config = StateConfig {
@@ -381,7 +418,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         "an unknown hash maps to missing inventory"
     );
     assert!(
-        !logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        !captured_logs_contain(&logs, super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
         "an unknown hash must not log a pruning error"
     );
 
@@ -395,7 +432,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         "inbound maps the unavailable block body to missing inventory"
     );
     assert!(
-        !logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        !captured_logs_contain(&logs, super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
         "an ordinary peer must not log a zcashd-compat pruning error"
     );
 
@@ -416,7 +453,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         "an unconfigured legacy peer still receives missing inventory"
     );
     assert!(
-        !logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        !captured_logs_contain(&logs, super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
         "an unconfigured legacy peer must not log a zcashd-compat pruning error"
     );
 
@@ -438,7 +475,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         )
     }
     assert!(
-        logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        captured_logs_contain(&logs, super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
         "the configured zcashd-compat peer must log the pruning error"
     );
 
@@ -911,6 +948,14 @@ async fn setup(
         protected_peer_ips.clone(),
         setup_rx,
     );
+    let test_dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let inbound_service = ServiceBuilder::new()
+        .map_future(
+            move |future: <Inbound as tower::Service<Request>>::Future| {
+                future.with_subscriber(test_dispatch.clone())
+            },
+        )
+        .service(inbound_service);
     // TODO: add a timeout just above the service, if needed
     let inbound_service = ServiceBuilder::new()
         .load_shed()
@@ -1025,9 +1070,10 @@ async fn setup(
         Some(submitblock_channel.receiver()),
     ));
 
-    let tx_gossip_task_handle = tokio::spawn(gossip_mempool_transaction_id(
+    let tx_gossip_task_handle = tokio::spawn(run_mempool_transaction_id_gossip(
         transaction_subscriber.subscribe(),
         peer_set.clone(),
+        mempool_service.clone(),
     ));
 
     // Set up the inbound service response for the isolated peer
@@ -1078,8 +1124,6 @@ async fn setup(
 }
 
 mod submitblock_test {
-    use std::io;
-    use std::sync::{Arc, Mutex};
     use tracing::{Instrument, Level};
     use tracing_subscriber::fmt;
     use zakura_rpc::SubmitBlockChannel;
@@ -1087,22 +1131,6 @@ mod submitblock_test {
     use super::*;
 
     use crate::components::sync::PEER_GOSSIP_DELAY;
-
-    // Custom in-memory writer to capture logs
-    struct TestWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for TestWriter {
-        #[allow(clippy::unwrap_in_result)]
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            let mut logs = self.0.lock().unwrap();
-            logs.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
 
     #[tokio::test]
     async fn submitblock_channel() -> Result<(), crate::BoxError> {

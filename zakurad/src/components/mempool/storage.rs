@@ -403,8 +403,9 @@ impl Storage {
     /// prevent this transaction from being inserted.
     /// These errors should not be propagated to peers, because the transactions are valid.
     ///
-    /// If inserting this transaction evicts other transactions, they will be tracked
-    /// as [`SameEffectsChainRejectionError::RandomlyEvicted`].
+    /// If inserting this transaction evicts other transactions, the selected
+    /// ZIP-401 victims will be tracked as
+    /// [`SameEffectsChainRejectionError::RandomlyEvicted`].
     #[allow(clippy::unwrap_in_result)]
     pub fn insert(
         &mut self,
@@ -412,6 +413,21 @@ impl Storage {
         spent_mempool_outpoints: Vec<transparent::OutPoint>,
         height: Option<Height>,
     ) -> Result<UnminedTxId, MempoolError> {
+        self.insert_with_evicted_ids(tx, spent_mempool_outpoints, height)
+            .0
+    }
+
+    /// Insert a transaction and return all IDs removed by ZIP-401 eviction.
+    ///
+    /// The returned IDs include dependents of the selected eviction victim and
+    /// the inserted transaction if it is selected for eviction.
+    #[allow(clippy::unwrap_in_result)]
+    pub(super) fn insert_with_evicted_ids(
+        &mut self,
+        tx: VerifiedUnminedTx,
+        spent_mempool_outpoints: Vec<transparent::OutPoint>,
+        height: Option<Height>,
+    ) -> (Result<UnminedTxId, MempoolError>, HashSet<UnminedTxId>) {
         // # Security
         //
         // This method must call `reject`, rather than modifying the rejection lists directly.
@@ -427,7 +443,7 @@ impl Storage {
                 "returning cached error for transaction",
             );
 
-            return Err(error);
+            return (Err(error), HashSet::new());
         }
 
         // If `tx` is already in the mempool, we don't change anything.
@@ -441,14 +457,17 @@ impl Storage {
                 "returning InMempool error for transaction that is already in the mempool",
             );
 
-            return Err(MempoolError::InMempool);
+            return (Err(MempoolError::InMempool), HashSet::new());
         }
 
         // Check that the transaction is standard.
-        self.reject_if_non_standard_tx(&tx)?;
+        if let Err(error) = self.reject_if_non_standard_tx(&tx) {
+            return (Err(error), HashSet::new());
+        }
 
         // Then, we try to insert into the pool. If this fails the transaction is rejected.
         let mut result = Ok(unmined_tx_id);
+        let mut evicted_ids = HashSet::new();
         if let Err(rejection_error) = self.verified.insert(
             tx,
             spent_mempool_outpoints,
@@ -483,25 +502,34 @@ impl Storage {
             // > EvictTransaction MUST do the following:
             // > Select a random transaction to evict, with probability in direct proportion to
             // > eviction weight. (...) Remove it from the mempool.
-            let victim_tx = self
+            // > Add the txid and the current time to RecentlyEvicted, dropping
+            // > the oldest entry in RecentlyEvicted if necessary to keep it to
+            // > at most `eviction_memory_entries entries`.
+            let victim_txs = self
                 .verified
                 .evict_one()
                 .expect("mempool is empty, but was expected to be full");
 
-            // > Add the txid and the current time to RecentlyEvicted, dropping the oldest entry in
-            // > RecentlyEvicted if necessary to keep it to at most `eviction_memory_entries entries`.
+            let victim_tx_id = victim_txs
+                .last()
+                .expect("eviction removes at least the selected transaction")
+                .transaction
+                .id;
+
             self.reject(
-                victim_tx.transaction.id,
+                victim_tx_id,
                 SameEffectsChainRejectionError::RandomlyEvicted.into(),
             );
 
             // If this transaction gets evicted, set its result to the same error
-            if victim_tx.transaction.id == unmined_tx_id {
+            if victim_tx_id == unmined_tx_id {
                 result = Err(SameEffectsChainRejectionError::RandomlyEvicted.into());
             }
+
+            evicted_ids.extend(victim_txs.into_iter().map(|tx| tx.transaction.id));
         }
 
-        result
+        (result, evicted_ids)
     }
 
     /// Remove transactions from the mempool via exact [`UnminedTxId`].

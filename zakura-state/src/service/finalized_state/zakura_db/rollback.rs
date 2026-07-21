@@ -1100,11 +1100,11 @@ struct RetainedShieldedRoots {
 fn retained_shielded_roots(db: &ZakuraDb, target_height: Height) -> RetainedShieldedRoots {
     let mut retained = RetainedShieldedRoots::default();
 
-    for (_height, roots) in db.commitment_roots_for_migration(..=target_height) {
+    db.visit_commitment_roots_for_migration(..=target_height, |_height, roots| {
         retained.sapling.insert(roots.sapling_root);
         retained.orchard.insert(roots.orchard_root);
         retained.ironwood.insert(roots.ironwood_root);
-    }
+    });
 
     for (_height, tree) in db.sapling_tree_by_height_range(..=target_height) {
         retained.sapling.insert(tree.root());
@@ -1127,22 +1127,23 @@ fn prune_fast_commitment_anchors_from_index(
     target_height: Height,
     retained_roots: &RetainedShieldedRoots,
 ) {
-    let rolled_back_roots = db.commitment_roots_for_migration((
-        std::ops::Bound::Excluded(target_height),
-        std::ops::Bound::Unbounded,
-    ));
-
-    for (_height, roots) in rolled_back_roots {
-        if !retained_roots.sapling.contains(&roots.sapling_root) {
-            batch.delete_sapling_anchor(db, &roots.sapling_root);
-        }
-        if !retained_roots.orchard.contains(&roots.orchard_root) {
-            batch.delete_orchard_anchor(db, &roots.orchard_root);
-        }
-        if !retained_roots.ironwood.contains(&roots.ironwood_root) {
-            batch.delete_ironwood_anchor(db, &roots.ironwood_root);
-        }
-    }
+    db.visit_commitment_roots_for_migration(
+        (
+            std::ops::Bound::Excluded(target_height),
+            std::ops::Bound::Unbounded,
+        ),
+        |_height, roots| {
+            if !retained_roots.sapling.contains(&roots.sapling_root) {
+                batch.delete_sapling_anchor(db, &roots.sapling_root);
+            }
+            if !retained_roots.orchard.contains(&roots.orchard_root) {
+                batch.delete_orchard_anchor(db, &roots.orchard_root);
+            }
+            if !retained_roots.ironwood.contains(&roots.ironwood_root) {
+                batch.delete_ironwood_anchor(db, &roots.ironwood_root);
+            }
+        },
+    );
 }
 
 fn clear_backup_dir(path: &PathBuf) -> Result<(), std::io::Error> {

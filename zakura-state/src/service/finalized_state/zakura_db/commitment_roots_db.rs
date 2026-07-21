@@ -156,15 +156,15 @@ impl ZakuraDb {
             .collect()
     }
 
-    /// Returns root rows in `range` for rollback and migration bookkeeping.
-    pub(super) fn commitment_roots_for_migration(
+    /// Visits root rows in `range` for rollback and migration bookkeeping.
+    pub(super) fn visit_commitment_roots_for_migration(
         &self,
         range: impl RangeBounds<Height>,
-    ) -> Vec<(Height, BlockCommitmentRoots)> {
-        self.commitment_roots_cf()
-            .zs_forward_range_iter(range)
-            .map(|(height, row)| (height, domain_roots(height, row)))
-            .collect()
+        mut visit: impl FnMut(Height, BlockCommitmentRoots),
+    ) {
+        for (height, row) in self.commitment_roots_cf().zs_forward_range_iter(range) {
+            visit(height, domain_roots(height, row));
+        }
     }
 }
 

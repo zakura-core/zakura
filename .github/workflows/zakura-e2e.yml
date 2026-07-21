@@ -125,7 +125,10 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.16.1 # zizmor: ignore[cache-poisoning] -- CI e2e job; uploads only diagnostic traces and builds a throwaway debug binary, nothing published/released
         with:
           toolchain: stable
-          cache-key: zakura-regtest-e2e-pr-gate
+          # The two regtest-e2e jobs share one debug `cargo test --no-run` build
+          # (default features, distinct from the `default-release-binaries` group
+          # above), so they share a cache with each other but not with that group.
+          cache-shared-key: zakura-e2e-debug
           cache-on-failure: true
       - uses: ./.github/actions/setup-zakura-build
       # Compile the e2e once. `cargo test --no-run` builds both the integration
@@ -192,7 +195,9 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.16.1 # zizmor: ignore[cache-poisoning] -- CI integration job; uploads only diagnostic test traces
         with:
           toolchain: stable
-          cache-key: zakura-testkit
+          # Same debug + default-release-binaries workspace build as the unit
+          # acceptance jobs, so it shares their consolidated build cache.
+          cache-shared-key: zakura-drb-debug
           cache-on-failure: true
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 #v2.83.2
         with:
@@ -233,7 +238,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.16.1 # zizmor: ignore[cache-poisoning] -- CI fuzz-scenario job; uploads only diagnostic test traces
         with:
           toolchain: stable
-          cache-key: zakura-blocksync-fuzz
+          cache-shared-key: zakura-drb-debug
           cache-on-failure: true
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 #v2.83.2
         with:
@@ -277,7 +282,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.16.1 # zizmor: ignore[cache-poisoning] -- CI e2e job; uploads only diagnostic traces and builds a throwaway debug binary, nothing published/released
         with:
           toolchain: stable
-          cache-key: zakura-regtest-e2e
+          cache-shared-key: zakura-e2e-debug
           cache-on-failure: true
       - uses: ./.github/actions/setup-zakura-build
       # Build once (see the pr-gate job for the ROCKSDB_LIB_DIR / static-link

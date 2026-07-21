@@ -173,7 +173,12 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
           toolchain: stable
-          cache-key: zakura-config
+          # These acceptance jobs all do the same debug build of the workspace
+          # with the same features, so they share one build cache instead of each
+          # keeping its own multi-GB copy. `cache-shared-key` (unlike `cache-key`,
+          # which only appends to a per-job key and never shares) is stable across
+          # jobs, so the first to run warms the cache and the rest restore it.
+          cache-shared-key: zakura-drb-debug
           cache-on-failure: true
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 #v2.83.2
         with:
@@ -197,7 +202,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
           toolchain: stable
-          cache-key: network-dependent
+          cache-shared-key: zakura-drb-debug
           cache-on-failure: true
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 #v2.83.2
         with:
@@ -222,7 +227,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
           toolchain: stable
-          cache-key: pruned-storage
+          cache-shared-key: zakura-drb-debug
           cache-on-failure: true
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 #v2.83.2
         with:

@@ -33,6 +33,7 @@ pub(crate) mod add_ironwood_tree;
 pub(crate) mod add_subtrees;
 pub(crate) mod block_info_and_address_received;
 pub(crate) mod cache_genesis_roots;
+pub(crate) mod completed_checkpoint_frontier;
 pub(crate) mod fix_tree_key_type;
 pub(crate) mod header_root_auth_frontier;
 pub(crate) mod no_migration;
@@ -128,7 +129,8 @@ fn format_upgrades(
         Box::new(add_ironwood_tree::Upgrade),
         Box::new(repair_vct_sprout_history::Upgrade::new(prepared_vct_repair)),
         Box::new(header_root_auth_frontier::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 11])
+        Box::new(completed_checkpoint_frontier::Upgrade),
+    ] as [Box<dyn DiskFormatUpgrade>; 12])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -1080,15 +1082,16 @@ fn fast_sync_metadata_cf_upgrade_is_no_migration() {
 }
 
 #[test]
-fn vct_format_changes_include_ironwood_then_sprout_repair() {
+fn vct_format_changes_include_root_auth_metadata_migrations() {
     use crate::constants::state_database_format_version_in_code;
 
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0)), None).collect();
 
-    assert_eq!(upgrades.len(), 3);
+    assert_eq!(upgrades.len(), 4);
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
     assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
     assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
+    assert_eq!(upgrades[3].version(), Version::new(28, 0, 3));
     assert_eq!(
         upgrades.last().expect("repair is registered").version(),
         state_database_format_version_in_code()

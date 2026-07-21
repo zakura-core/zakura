@@ -24,7 +24,10 @@ use crate::{
     error::CommitHeaderRangeError,
     service::{
         check,
-        finalized_state::{FinalizedState, ZakuraDb},
+        finalized_state::{
+            AuthenticateHeaderRootsError, AuthenticatedHeaderRoots, FinalizedState,
+            HeaderRootAuthState, ZakuraDb,
+        },
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
@@ -168,10 +171,9 @@ fn commit_header_range(
     headers: Vec<Arc<block::Header>>,
     body_sizes: Vec<u32>,
     tree_aux_roots: Vec<BlockCommitmentRoots>,
-    rsp_tx: oneshot::Sender<Result<block::Hash, CommitHeaderRangeError>>,
-) {
+) -> Result<block::Hash, CommitHeaderRangeError> {
     let mut batch = crate::service::finalized_state::DiskWriteBatch::new();
-    let result = batch
+    batch
         .prepare_header_range_batch_with_roots(
             &finalized_state.db,
             anchor,
@@ -191,9 +193,48 @@ fn commit_header_range(
                         error: error.to_string(),
                     }
                 })
-        });
+        })
+}
 
+#[allow(clippy::too_many_arguments)]
+fn authenticate_header_roots(
+    finalized_state: &FinalizedState,
+    header_root_auth_sender: &watch::Sender<Option<HeaderRootAuthState>>,
+    expected_state: HeaderRootAuthState,
+    anchor: block::Hash,
+    start: Height,
+    headers: Vec<Arc<block::Header>>,
+    roots: Vec<BlockCommitmentRoots>,
+    rsp_tx: oneshot::Sender<Result<AuthenticatedHeaderRoots, AuthenticateHeaderRootsError>>,
+) {
+    let result = finalized_state.db.authenticate_header_roots(
+        expected_state,
+        anchor,
+        start,
+        &headers,
+        &roots,
+    );
+    if let Ok(success) = &result {
+        let _ = header_root_auth_sender.send(Some(success.state));
+    }
     let _ = rsp_tx.send(result);
+}
+
+fn publish_header_root_auth_state(
+    finalized_state: &FinalizedState,
+    sender: &watch::Sender<Option<HeaderRootAuthState>>,
+) {
+    match finalized_state.db.validate_header_root_auth_state() {
+        Ok(frontier) => {
+            let _ = sender.send(frontier.map(|frontier| frontier.state()));
+        }
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                "durable header-root authentication state failed validation after write"
+            );
+        }
+    }
 }
 
 /// A worker task that reads, validates, and writes blocks to the
@@ -216,6 +257,7 @@ struct WriteBlockWorkerTask {
     chain_tip_sender: ChainTipSender,
     non_finalized_state_sender: watch::Sender<NonFinalizedState>,
     vct_root_repair_sender: watch::Sender<VctRootRepairStatus>,
+    header_root_auth_sender: watch::Sender<Option<HeaderRootAuthState>>,
     /// If `Some`, the non-finalized state is written to this backup directory
     /// synchronously before each channel update, instead of via the async backup task.
     backup_dir_path: Option<PathBuf>,
@@ -234,6 +276,15 @@ pub enum NonFinalizedWriteMessage {
         body_sizes: Vec<u32>,
         tree_aux_roots: Vec<BlockCommitmentRoots>,
         rsp_tx: oneshot::Sender<Result<block::Hash, CommitHeaderRangeError>>,
+    },
+    /// Canonical supplied roots queued behind all other state writes.
+    AuthenticateHeaderRoots {
+        expected_state: HeaderRootAuthState,
+        anchor: block::Hash,
+        start: Height,
+        headers: Vec<Arc<block::Header>>,
+        roots: Vec<BlockCommitmentRoots>,
+        rsp_tx: oneshot::Sender<Result<AuthenticatedHeaderRoots, AuthenticateHeaderRootsError>>,
     },
     /// The hash of a block that should be invalidated and removed from
     /// the non-finalized state, if present.
@@ -293,6 +344,7 @@ impl BlockWriteSender {
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
         watch::Receiver<VctRootRepairStatus>,
+        watch::Receiver<Option<HeaderRootAuthState>>,
         Option<Arc<std::thread::JoinHandle<()>>>,
     ) {
         // Security: The number of blocks in these channels is limited by
@@ -307,6 +359,13 @@ impl BlockWriteSender {
             tokio::sync::mpsc::unbounded_channel();
         let (vct_root_repair_sender, vct_root_repair_receiver) =
             watch::channel(VctRootRepairStatus::default());
+        let initial_header_root_auth_state = finalized_state
+            .db
+            .validate_header_root_auth_state()
+            .expect("authenticated header-root state was validated during database startup")
+            .map(|frontier| frontier.state());
+        let (header_root_auth_sender, header_root_auth_receiver) =
+            watch::channel(initial_header_root_auth_state);
 
         let seed_zakura_header_from_best_chain_commits = finalized_state
             .db
@@ -327,6 +386,7 @@ impl BlockWriteSender {
                     chain_tip_sender,
                     non_finalized_state_sender,
                     vct_root_repair_sender,
+                    header_root_auth_sender,
                     backup_dir_path,
                 }
                 .run()
@@ -342,6 +402,7 @@ impl BlockWriteSender {
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
             vct_root_repair_receiver,
+            header_root_auth_receiver,
             Some(Arc::new(task)),
         )
     }
@@ -369,6 +430,7 @@ impl WriteBlockWorkerTask {
             chain_tip_sender,
             non_finalized_state_sender,
             vct_root_repair_sender,
+            header_root_auth_sender,
             seed_zakura_header_from_best_chain_commits,
             backup_dir_path,
         } = &mut self;
@@ -391,12 +453,35 @@ impl WriteBlockWorkerTask {
                     tree_aux_roots,
                     rsp_tx,
                 }) => {
-                    commit_header_range(
+                    let result = commit_header_range(
                         finalized_state,
                         anchor,
                         headers,
                         body_sizes,
                         tree_aux_roots,
+                    );
+                    if result.is_ok() {
+                        publish_header_root_auth_state(finalized_state, header_root_auth_sender);
+                    }
+                    let _ = rsp_tx.send(result);
+                    continue;
+                }
+                Ok(NonFinalizedWriteMessage::AuthenticateHeaderRoots {
+                    expected_state,
+                    anchor,
+                    start,
+                    headers,
+                    roots,
+                    rsp_tx,
+                }) => {
+                    authenticate_header_roots(
+                        finalized_state,
+                        header_root_auth_sender,
+                        expected_state,
+                        anchor,
+                        start,
+                        headers,
+                        roots,
                         rsp_tx,
                     );
                     continue;
@@ -511,6 +596,7 @@ impl WriteBlockWorkerTask {
 
                     let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
+                    publish_header_root_auth_state(finalized_state, header_root_auth_sender);
                     chain_tip_sender.set_finalized_tip(tip_block);
                 }
                 Err((ordered_block, error)) => {
@@ -587,12 +673,35 @@ impl WriteBlockWorkerTask {
                     tree_aux_roots,
                     rsp_tx,
                 } => {
-                    commit_header_range(
+                    let result = commit_header_range(
                         finalized_state,
                         anchor,
                         headers,
                         body_sizes,
                         tree_aux_roots,
+                    );
+                    if result.is_ok() {
+                        publish_header_root_auth_state(finalized_state, header_root_auth_sender);
+                    }
+                    let _ = rsp_tx.send(result);
+                    continue;
+                }
+                NonFinalizedWriteMessage::AuthenticateHeaderRoots {
+                    expected_state,
+                    anchor,
+                    start,
+                    headers,
+                    roots,
+                    rsp_tx,
+                } => {
+                    authenticate_header_roots(
+                        finalized_state,
+                        header_root_auth_sender,
+                        expected_state,
+                        anchor,
+                        start,
+                        headers,
+                        roots,
                         rsp_tx,
                     );
                     continue;

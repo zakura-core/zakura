@@ -19,7 +19,7 @@ impl Upgrade {
         let mut batch = DiskWriteBatch::new();
         if let Some(body_tip) = db.finalized_tip_height() {
             batch.truncate_commitment_roots_after(db, body_tip);
-            db.prepare_header_root_auth_frontier_from_body_tip(&mut batch)?;
+            db.prepare_legacy_header_root_auth_frontier_from_body_tip(&mut batch)?;
         } else {
             batch.truncate_all_commitment_roots(db);
             batch.delete_header_root_auth_frontier(db);

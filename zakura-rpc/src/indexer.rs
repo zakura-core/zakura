@@ -13,6 +13,12 @@ mod tests;
 pub mod methods;
 pub mod server;
 
+/// The byte length of a block hash in indexer RPC requests.
+const BLOCK_HASH_BYTE_LEN: usize = 32;
+
+/// The byte length of a big-endian block height in indexer RPC requests.
+const BLOCK_HEIGHT_BYTE_LEN: usize = std::mem::size_of::<u32>();
+
 // The generated indexer proto
 tonic::include_proto!("zebra.indexer.rpc");
 

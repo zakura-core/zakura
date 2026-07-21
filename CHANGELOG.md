@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   enforcing bans, preventing banned peers from reconnecting through the
   alternate representation
   ([#314](https://github.com/zakura-core/zakura/pull/314)).
+- Prevent RPC read-secondary synchronization races, stale stream retries, and
+  finalized-state gaps from interrupting RPC and indexer availability
+  ([#118](https://github.com/zakura-core/zakura/pull/118)).
 - Keep valid internal-miner work running across mempool-only block template
   updates ([#226](https://github.com/zakura-core/zakura/pull/226)).
 - Honor `disable_pow = true` during native header sync on configured Testnets,

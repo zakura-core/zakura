@@ -98,7 +98,10 @@ ARTIFACT_ROOT="$HOME/zakura-perf-lab"
 BENCH_STOP_HEIGHT="${BENCH_STOP_HEIGHT:-1827210}"
 BATCH_SIZE=8                                   # D3/D6: bench runs per batch
 WIN_THRESHOLD_PCT="3.0"                        # floor; effective = max(this, 2*NOISE_BAND_PCT)
-NOISE_BAND_PCT=""                              # set by Task 7 A/A calibration
+# max of the clean pinned long-window A/A samples (0.401 / 8.383 / 8.653,
+# 2026-07-21, single pinned feed peer). Dominated by peer delivery variance —
+# see B-15. Effective single-run threshold = max(3%, 2x band).
+NOISE_BAND_PCT="${NOISE_BAND_PCT:-8.7}"
 ```
 
 - [ ] **Step 4: Write `perf-lab/BACKLOG.md`** (seeded from spec §6; EV/cost are the orchestrator's running estimates)
@@ -152,6 +155,14 @@ READY | BLOCKED(<why>) | DONE(EXP-NNN) | DROPPED(<why>).
   scripts/checkpoint-sync-bench.sh). Each leg's fork grows to ~116 GB
   hardlink-unique on the 200 GB c-16 disk; aa2 filled the disk to 0 and
   stalled RocksDB into the wall cap. Upstreamable.
+
+- B-15 READY — Reduce live-peer download variance: pin a small multi-peer
+  set (peerset_size 2-3 with pinned peers) or port the frozen-cohort
+  determinism to perf-lab droplets. Clean pinned A/A deltas measured 0.4%,
+  8.4%, 8.7% — leg throughput drifts ~9% on 30-60 min timescales (aa4
+  evidence: reorder buffer 540 vs 365 MB, download-HOL both legs), so the
+  single-run sensitivity floor is peer delivery, not the harness. Until this
+  lands, only large effects or multi-run medians clear the band.
 
 ## Structural-class (yellow)
 

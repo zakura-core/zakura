@@ -48,6 +48,14 @@ READY | BLOCKED(<why>) | DONE(EXP-NNN) | DROPPED(<why>).
   hardlink-unique on the 200 GB c-16 disk; aa2 filled the disk to 0 and
   stalled RocksDB into the wall cap. Upstreamable.
 
+- B-15 READY — Reduce live-peer download variance: pin a small multi-peer
+  set (peerset_size 2-3 with pinned peers) or port the frozen-cohort
+  determinism to perf-lab droplets. Clean pinned A/A deltas measured 0.4%,
+  8.4%, 8.7% — leg throughput drifts ~9% on 30-60 min timescales (aa4
+  evidence: reorder buffer 540 vs 365 MB, download-HOL both legs), so the
+  single-run sensitivity floor is peer delivery, not the harness. Until this
+  lands, only large effects or multi-run medians clear the band.
+
 ## Structural-class (yellow)
 
 - B-09 READY — `FromDisk` TODO at

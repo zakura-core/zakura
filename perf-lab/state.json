@@ -1,9 +1,14 @@
 {
   "schema": 1,
-  "session": null,
-  "batch_runs_used": 0,
+  "session": 0,
+  "batch_runs_used": 7,
   "next_exp_id": 1,
-  "droplets": {},
+  "droplets": {
+    "perf-lab-cal": {
+      "ip": "134.209.44.208",
+      "created_at": "2026-07-21T15:47:00Z"
+    }
+  },
   "in_flight": {},
-  "noise_band_pct": null
+  "noise_band_pct": 8.7
 }

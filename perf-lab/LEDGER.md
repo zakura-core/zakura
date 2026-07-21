@@ -17,3 +17,19 @@ This file is the sole reporting channel (design D5). Entry template:
     - attribution: dominant bottleneck class from verdict-*.json
     - simplicity: 1–5 (1 = config constant, 5 = pipeline restructure)
     - follow-ups: ...
+
+## SESSION 0 — calibration (2026-07-21)
+
+- origin/main during calibration: `ea979e11a` → `4784aca68` (pinned SHA for all clean runs)
+- droplet: perf-lab-cal (c-16, nyc3, golden image zakura-pr-node-20260720-2311, ip 134.209.44.208); provision→ready 77 s
+- runs (bench collects: 7 incl. the pending exp000):
+  - aa1 SHORT window (30k blocks, ~5 min/leg): |delta| 13.0% — window too short; download variance dominates. Superseded.
+  - aa2 LONG window, UNPINNED refs: origin/main moved mid-run so the legs built different commits; leftover ~116 GB/leg forks filled the 200 GB disk to 0, stalling RocksDB into the 2000 s wall cap and crashing the harness's trace zip. Post-mortem produced: SHA pinning, per-start fork cleanup, post-collect remote purge, 600 s collect timeouts.
+  - aa3 clean pinned: |delta| 0.401% (legs 1295/1291 s)
+  - aa4 clean pinned: |delta| 8.383% (legs 1321/1221 s; both download-HOL, reorder buffer 540 vs 365 MB — feed-peer delivery variance)
+  - aa5 EXCLUDED: primary leg ran through a ≤1 GB disk squeeze and wall-capped at 83k/120k blocks (bogus 56% delta). Led to the verdict.py coverage guard (unequal block ranges now exit 2) and the B-14 harness patch (baseline fork auto-freed after its summary row; validated live on aa6 with 63 GB free mid-run, no manual rescue).
+  - aa6 clean pinned, B-14-patched: |delta| 8.653% (legs 1200/1311 s)
+- **NOISE_BAND_PCT = 8.7** (max of clean samples, rounded up). Effective single-run threshold = max(3%, 2×8.7) = 17.4%. Single-run verdicts below that are noise-indistinguishable; confirmation runs and multi-run medians are mandatory, and B-15 (multi-peer pinning or frozen-cohort port) is campaign-1-critical to restore sensitivity.
+- Attribution at the standard window (1707210→1827210): download head-of-line dominant; commit single-writer 22-26% busy. State/commit-path experiments will NOT register here — campaign 1 must target the download path, raise the window into heavier blocks, or land B-15 first.
+- Timings: snapshot download ~10 min (once per droplet; one transient HTTP/2 mid-stream failure observed — retry succeeded); featured build ~3-20 min (golden cargo cache, features differ from bake); leg ~20-22 min at ~90-100 blk/s.
+- Cost so far: ~US$4-5 droplet time. perf-lab skill registration verified (appears in session skill lists).

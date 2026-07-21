@@ -63,6 +63,35 @@ fn should_replace_mining_template(
     current_header != Some(new_header) && (current_header.is_none() || submit_old != Some(true))
 }
 
+/// Cancels mining when the current template changes or becomes unavailable.
+fn cancel_if_mining_template_changed(
+    template_receiver: &mut WatchReceiver<Option<Arc<Block>>>,
+    old_header: block::Header,
+) -> Result<(), SolverCancelled> {
+    match template_receiver.has_changed() {
+        // Guard against `get_block_template()` providing an identical header.
+        // This could happen if something irrelevant to the block data changes,
+        // the time was within 1 second, or there is a spurious channel change.
+        Ok(has_changed) => {
+            template_receiver.mark_as_seen();
+
+            // We only need to check header equality, because the block data is
+            // bound to the header. An unavailable template has no header, so it
+            // also cancels current work.
+            if has_changed
+                && Some(old_header) != template_receiver.cloned_watch_data().map(|b| *b.header)
+            {
+                Err(SolverCancelled)
+            } else {
+                Ok(())
+            }
+        }
+        // If the sender was dropped, we're likely shutting down, so cancel the
+        // solver.
+        Err(_sender_dropped) => Err(SolverCancelled),
+    }
+}
+
 /// Initialize the miner based on its config, and spawn a task for it.
 ///
 /// This method is CPU and memory-intensive. It uses 144 MB of RAM and one CPU core per configured
@@ -302,9 +331,19 @@ where
 
         // Wait for the chain to sync so we get a valid template.
         let Ok(template) = template else {
+            let active_template_invalidated = template_sender.send_if_modified(|template| {
+                if template.is_none() {
+                    return false;
+                }
+
+                *template = None;
+                true
+            });
+
             warn!(
                 ?BLOCK_TEMPLATE_WAIT_TIME,
                 ?template,
+                ?active_template_invalidated,
                 "waiting for a valid block template",
             );
 
@@ -476,26 +515,7 @@ where
         // Set up the cancellation conditions for the miner.
         let mut cancel_receiver = template_receiver.clone();
         let old_header = *template.header;
-        let cancel_fn = move || match cancel_receiver.has_changed() {
-            // Guard against get_block_template() providing an identical header. This could happen
-            // if something irrelevant to the block data changes, the time was within 1 second, or
-            // there is a spurious channel change.
-            Ok(has_changed) => {
-                cancel_receiver.mark_as_seen();
-
-                // We only need to check header equality, because the block data is bound to the
-                // header.
-                if has_changed
-                    && Some(old_header) != cancel_receiver.cloned_watch_data().map(|b| *b.header)
-                {
-                    Err(SolverCancelled)
-                } else {
-                    Ok(())
-                }
-            }
-            // If the sender was dropped, we're likely shutting down, so cancel the solver.
-            Err(_sender_dropped) => Err(SolverCancelled),
-        };
+        let cancel_fn = move || cancel_if_mining_template_changed(&mut cancel_receiver, old_header);
 
         // Mine at least one block using the equihash solver.
         let Ok(blocks) = mine_a_block(solver_id, template, cancel_fn).await else {
@@ -645,7 +665,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use zakura_chain::serialization::ZcashDeserializeInto;
+    use tower::buffer::Buffer;
+    use zakura_chain::{
+        chain_sync_status::MockSyncStatus, chain_tip::mock::MockChainTip, parameters::Network,
+        serialization::ZcashDeserializeInto,
+    };
+    use zakura_network::address_book_peers::MockAddressBookPeers;
+    use zakura_rpc::config::mining::{default_miner_address, MinerAddressType};
+    use zakura_test::mock_service::MockService;
 
     use super::*;
 
@@ -679,5 +706,120 @@ mod tests {
             changed_header,
             None,
         ));
+    }
+
+    #[test]
+    fn unavailable_mining_template_cancels_current_work() {
+        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .expect("block 1 deserializes");
+        let old_header = *block.header;
+        let (template_sender, template_receiver) = watch::channel(Some(block.clone()));
+        let mut template_receiver = WatchReceiver::new(template_receiver);
+
+        template_sender
+            .send(Some(block))
+            .expect("template receiver remains open");
+        assert!(cancel_if_mining_template_changed(&mut template_receiver, old_header).is_ok());
+
+        template_sender
+            .send(None)
+            .expect("template receiver remains open");
+        assert!(matches!(
+            cancel_if_mining_template_changed(&mut template_receiver, old_header),
+            Err(SolverCancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn template_generation_failure_invalidates_current_template() {
+        let network = Network::Mainnet;
+        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .expect("block 1 deserializes");
+        let (template_sender, mut template_receiver) = watch::channel(Some(block.clone()));
+
+        let mining_config = zakura_rpc::config::mining::Config {
+            miner_address: Some(
+                default_miner_address(network.kind(), &MinerAddressType::Transparent)
+                    .parse()
+                    .expect("default Mainnet miner address is valid"),
+            ),
+            internal_miner: true,
+            ..Default::default()
+        };
+
+        let (chain_tip, chain_tip_sender) = MockChainTip::new();
+        chain_tip_sender.send_best_tip_height(block::Height(1));
+        chain_tip_sender.send_best_tip_hash(block.hash());
+        chain_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+
+        let mut sync_status = MockSyncStatus::default();
+        sync_status.set_is_close_to_tip(false);
+
+        let mempool = Buffer::new(
+            MockService::build().for_unit_tests::<
+                mempool::Request,
+                mempool::Response,
+                zakura_node_services::BoxError,
+            >(),
+            1,
+        );
+        let state = Buffer::new(
+            MockService::build().for_unit_tests::<
+                zakura_state::Request,
+                zakura_state::Response,
+                zakura_state::BoxError,
+            >(),
+            1,
+        );
+        let read_state = Buffer::new(
+            MockService::build().for_unit_tests::<
+                zakura_state::ReadRequest,
+                zakura_state::ReadResponse,
+                zakura_state::BoxError,
+            >(),
+            1,
+        );
+        let block_verifier = Buffer::new(
+            MockService::build().for_unit_tests::<
+                zakura_consensus::Request,
+                block::Hash,
+                zakura_consensus::BoxError,
+            >(),
+            1,
+        );
+        let (_last_log_sender, last_log_receiver) = watch::channel(None);
+
+        let (rpc, rpc_queue_task) = RpcImpl::new(
+            network,
+            mining_config,
+            false,
+            "0.0.1",
+            "miner test",
+            mempool,
+            state,
+            read_state,
+            block_verifier,
+            sync_status,
+            chain_tip,
+            MockAddressBookPeers::default(),
+            last_log_receiver,
+            None,
+        );
+
+        let template_generator = tokio::spawn(generate_block_templates(rpc, template_sender));
+
+        tokio::time::timeout(Duration::from_secs(1), template_receiver.changed())
+            .await
+            .expect("template generation failure invalidates promptly")
+            .expect("template sender remains open");
+        assert!(
+            template_receiver.borrow().is_none(),
+            "an unsynced node must not retain its last valid mining template"
+        );
+
+        template_generator.abort();
+        rpc_queue_task.abort();
     }
 }

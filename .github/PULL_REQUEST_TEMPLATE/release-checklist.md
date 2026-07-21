@@ -132,17 +132,17 @@ sed "s#$HOME/.zakura#identity_dir#g" \
   > zakurad/tests/common/configs/v<version>.toml
 ```
 
-      The replacements are global path-string substitutions, mirroring
-      `last_config_is_stored` — the default cache path also appears in
-      fields other than `cache_dir` (for example `cookie_dir`), so
-      per-field rewrites produce a snapshot the test rejects.
+The replacements are global path-string substitutions, mirroring
+`last_config_is_stored` — the default cache path also appears in fields other
+than `cache_dir` (for example `cookie_dir`), so per-field rewrites produce a
+snapshot the test rejects.
 
 - [ ] On the release commit, run the pre-release checks for the tag you are
       about to create, using the previous release tag as the base:
       `make pre-release RELEASE_TAG=v<version> BASE_TAG=v<previous-release-tag>`
       For example: `make pre-release RELEASE_TAG=v1.0.0 BASE_TAG=v1.0.0-rc5`
 
-## Update Crate Versions and Crate Change Logs
+## Update Crate Versions
 
 If you're publishing crates for the first time, [log in to crates.io](https://github.com/zakura-core/zakura/dev/crate-owners.html#logging-in-to-cratesio),
 and make sure you're a member of owners group.
@@ -163,20 +163,9 @@ Check that the release will work:
         whether a new API was added. Note that `semver-checks` won't work
         if the previous realase was yanked; you will have to determine the
         type of release manually.
-  - [ ] Update the crate `CHANGELOG.md` listing the API changes or other
-        relevant information for a crate consumer, per
-        [`CHANGELOG_GUIDELINES.md`](https://github.com/zakura-core/zakura/blob/main/CHANGELOG_GUIDELINES.md)
-        (crate changelogs move on the crate's own release cadence; for `v1.0.0`
-        they are a single "Initial release" entry). Use `public-api` to list all
-        API changes: `cargo public-api diff latest -p <crate> -sss`. You can use
-        e.g. copilot to turn it into a human-readable list, e.g. (write the output
-        to `api.txt` beforehand):
-        <!-- markdownlint-disable MD038 -->
-        ```
-        copilot -p "Transform @api.txt which is a API diff into a human-readable description of the API changes. Be terse. Write output api-readable.txt. Use backtick quotes for identifiers. Use '### Breaking Changes' header for changes and removals, and '### Added' for additions. Make each item start with a verb e.g, Added, Changed" --allow-tool write
-        ```
-        <!-- markdownlint-enable MD038 -->
-        It might also make sense to copy entries from the `zakurad` changelog.
+  - [ ] Review `cargo public-api diff latest -p <crate> -sss` alongside
+        `cargo semver-checks` when choosing the bump. Per-crate changelogs are
+        not maintained.
   - [ ] Update crate versions:
 
 ```sh

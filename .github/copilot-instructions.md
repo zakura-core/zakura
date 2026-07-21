@@ -95,7 +95,6 @@ When the PR adds abstraction, flags, generics, or refactors:
 ### Changelog & Release Process
 
 - User-visible changes need a `CHANGELOG.md` entry under `[Unreleased]`
-- Library-consumer-visible changes need the crate's `CHANGELOG.md` updated
 - PR labels must match the intended changelog category (`C-bug`, `C-feature`, `C-security`, etc.)
 - PR title follows conventional commits (squash-merged to main)
 

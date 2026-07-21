@@ -51,6 +51,8 @@ for d in json.load(sys.stdin) or []:
 
 cmd_provision() {
   local name="${NAME_PREFIX}-${1:-$(date +%m%d%H%M%S)}"
+  # names must stay shell- and doctl-safe (the cleanup trap re-uses them)
+  case "$name" in *[!A-Za-z0-9._-]*) die "bad droplet name: $name";; esac
   # hard rule (design §5): concurrent perf-lab droplets <= MAX_DROPLETS.
   # Checked before ensure_key so a refused provision has zero side effects.
   local count; count="$(droplet_json | python3 -c 'import json,sys; print(len(json.load(sys.stdin) or []))')"
@@ -66,10 +68,11 @@ cmd_provision() {
   [ -n "${DRYRUN:-}" ] && return 0
   # Self-clean: from here on a failure would orphan a paid droplet that also
   # counts against MAX_DROPLETS — destroy it on the way out. EXIT (not ERR):
-  # `|| die` failure paths bypass ERR traps. The delete still passes the
-  # assert_ours guard.
-  # shellcheck disable=SC2064  # intentional: bake $name now, not at signal time
-  trap "echo 'provision failed; destroying orphan $name' >&2; cmd_destroy '$name' || true" EXIT
+  # `|| die` failure paths bypass ERR traps. ORPHAN is global so the
+  # single-quoted trap resolves it safely at fire time; the subshell contains
+  # cmd_destroy's `exit`, so `|| true` really does absorb a guard refusal.
+  ORPHAN="$name"
+  trap 'echo "provision failed; destroying orphan $ORPHAN" >&2; ( cmd_destroy "$ORPHAN" ) || true' EXIT
   local ip; ip="$(droplet_ip "$name")"; [ -n "$ip" ] || die "no ip for $name"
   echo "waiting for ssh on $ip ..."
   for _ in $(seq 1 30); do
@@ -140,7 +143,8 @@ for d in json.load(sys.stdin) or []:
     if (now-created).total_seconds() > max_age: print(d["name"])
 ' "$max" | while read -r name; do
     echo "reaping stale droplet $name"
-    cmd_destroy "$name" || echo "reap skipped (guard refused): $name" >&2
+    # subshell contains die's `exit`, so the loop survives a guard refusal
+    ( cmd_destroy "$name" ) || echo "reap skipped (guard refused): $name" >&2
   done
 }
 

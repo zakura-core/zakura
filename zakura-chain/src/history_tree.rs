@@ -36,6 +36,9 @@ pub enum HistoryTreeError {
 
     #[error("I/O error: {0}")]
     IOError(#[from] io::Error),
+
+    #[error("invalid cached history tree: {reason}")]
+    InvalidCachedTree { reason: &'static str },
 }
 
 impl PartialEq for HistoryTreeError {
@@ -89,6 +92,12 @@ impl NonEmptyHistoryTree {
         peaks: BTreeMap<u32, Entry>,
         current_height: Height,
     ) -> Result<Self, HistoryTreeError> {
+        if peaks.is_empty() {
+            return Err(HistoryTreeError::InvalidCachedTree {
+                reason: "a non-empty history tree must have at least one peak",
+            });
+        }
+
         let network_upgrade = NetworkUpgrade::current(network, current_height);
         let inner = match network_upgrade {
             NetworkUpgrade::Genesis
@@ -96,7 +105,9 @@ impl NonEmptyHistoryTree {
             | NetworkUpgrade::Overwinter
             | NetworkUpgrade::Sapling
             | NetworkUpgrade::Blossom => {
-                panic!("HistoryTree does not exist for pre-Heartwood upgrades")
+                return Err(HistoryTreeError::InvalidCachedTree {
+                    reason: "history trees do not exist before Heartwood",
+                });
             }
             NetworkUpgrade::Heartwood | NetworkUpgrade::Canopy => {
                 let tree = Tree::<PreOrchard>::new_from_cache(

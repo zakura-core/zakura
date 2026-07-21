@@ -217,7 +217,10 @@ fn history_tree_parts_round_trips_current_width() {
 
 #[test]
 fn malformed_history_tree_parts_return_both_decode_errors() {
-    let error = HistoryTreeParts::try_from_bytes([0xFF]).expect_err("malformed bytes must fail");
+    let error = match HistoryTreeParts::try_from_bytes([0xFF]) {
+        Ok(_) => panic!("malformed bytes must fail"),
+        Err(error) => error,
+    };
 
     assert!(matches!(
         error,
@@ -253,13 +256,32 @@ fn history_tree_parts_reject_invalid_tree_structure() {
     let parts = HistoryTreeParts {
         network_kind: NetworkKind::Mainnet,
         size: 1,
-        peaks: BTreeMap::from([(0, zcash_history::Entry::from_raw_bytes_padded(&[]))]),
+        peaks: BTreeMap::new(),
         current_height: height,
     };
 
     let error = parts
         .with_network(&Network::Mainnet)
         .expect_err("invalid cached entry must fail reconstruction");
+
+    assert!(matches!(error, HistoryTreeDecodeError::HistoryTree(_)));
+}
+
+#[test]
+fn history_tree_parts_reject_pre_heartwood_height() {
+    let parts = HistoryTreeParts {
+        network_kind: NetworkKind::Mainnet,
+        size: 1,
+        peaks: BTreeMap::from([(
+            0,
+            zcash_history::Entry::from_raw_bytes_padded(&[0; LEGACY_MAX_ENTRY_SIZE]),
+        )]),
+        current_height: Height(1),
+    };
+
+    let error = parts
+        .with_network(&Network::Mainnet)
+        .expect_err("pre-Heartwood snapshot must fail reconstruction");
 
     assert!(matches!(error, HistoryTreeDecodeError::HistoryTree(_)));
 }
@@ -290,7 +312,7 @@ fn try_history_tree_reads_legacy_snapshot() {
         .expect("legacy serialization succeeds");
     write_raw_history_tree(
         &db,
-        RawBytes::new_raw_bytes(Height(1).as_bytes().as_ref().to_vec()),
+        RawBytes::new_raw_bytes(Height(1).as_bytes().to_vec()),
         legacy_bytes,
     );
 

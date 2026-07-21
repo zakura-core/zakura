@@ -41,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Removed unused public `zakura-chain` errors, constants, and helper methods
   ([#361](https://github.com/zakura-core/zakura/pull/361)).
 
+### Security
+
+- Authenticate peer-supplied VCT commitment roots against checkpoint-covered
+  canonical headers before persisting or serving them, and remove unauthenticated
+  roots from existing databases during upgrade
+  ([#323](https://github.com/zakura-core/zakura/pull/323)).
+
 ### Fixed
 
 - Treat IPv4 and IPv4-mapped IPv6 peer addresses as the same address when

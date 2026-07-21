@@ -60,6 +60,15 @@ cmd_start() {
   # shellcheck disable=SC2087  # client-side expansion of label/refs is intended
   $SSH "${SSH_OPTS[@]}" "root@$ip" bash -s <<REMOTE
 set -euo pipefail
+# refuse to start while another bench is live on this droplet — the fork
+# cleanup below would rip its state out from under it
+for p in ${BENCH_OUT_REMOTE}/*.pid; do
+  [ -f "\$p" ] || continue
+  [ -f "\${p%.pid}.exit" ] && continue
+  if kill -0 "\$(cat "\$p")" 2>/dev/null; then
+    echo "BUSY: live bench \$(basename "\$p" .pid) on this droplet" >&2; exit 7
+  fi
+done
 # fresh per-label output: the bench script APPENDS to summary.md, so a stale
 # same-label dir would leave two tables in one file
 rm -rf ${BENCH_OUT_REMOTE}/${label} ${BENCH_OUT_REMOTE}/${label}.log ${BENCH_OUT_REMOTE}/${label}.pid ${BENCH_OUT_REMOTE}/${label}.exit
@@ -74,10 +83,10 @@ cd ${CTL_CLONE_REMOTE}
 # crashes or PID reuse.
 ( nohup env \
     BUILD_REF='${build_ref}' BASELINE_REF='${baseline_ref}' \
-    TARGET_P2P_STACK=zakura BASELINE_P2P_STACK=zakura \
     BENCH_HOME='${BENCH_HOME_REMOTE}' \
     STOP_HEIGHT='${BENCH_STOP_HEIGHT}' \
     OUT_DIR='${BENCH_OUT_REMOTE}/${label}' DASHBOARD=1${env_str} \
+    TARGET_P2P_STACK=zakura BASELINE_P2P_STACK=zakura \
     bash scripts/checkpoint-sync-bench.sh
   echo \$? > ${BENCH_OUT_REMOTE}/${label}.exit
 ) > ${BENCH_OUT_REMOTE}/${label}.log 2>&1 < /dev/null &

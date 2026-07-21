@@ -77,7 +77,7 @@ PERF_TAG="zakura-perf-lab"                     # every perf-lab resource carries
 NAME_PREFIX="perf-lab"                         # ...and this name prefix
 SSH_KEY_NAME="perf-lab-claude"
 SSH_KEY_FILE="$HOME/.ssh/perf-lab-claude"
-MAX_DROPLETS=2
+MAX_DROPLETS="${MAX_DROPLETS:-2}"
 REAP_MAX_AGE_HOURS=24
 
 # --- remote layout ---
@@ -109,7 +109,7 @@ NOISE_BAND_PCT="${NOISE_BAND_PCT:-8.7}"
 ```markdown
 # perf-lab backlog
 
-Ranked queue. The campaign-target memo (SKILL.md step 0) re-ranks this list
+Ranked queue. The campaign-target memo (SKILL.md, campaign-target-memo section) re-ranks this list
 against measured attribution before experiment 001. Statuses:
 READY | BLOCKED(<why>) | DONE(EXP-NNN) | DROPPED(<why>).
 
@@ -278,7 +278,7 @@ The bench writes `summary.md` (writer at `scripts/checkpoint-sync-bench.sh` on `
 
 ```python
 # perf-lab/tests/test_verdict.py
-import json, subprocess, sys, unittest
+import json, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -300,10 +300,10 @@ FIXTURE = """## Checkpoint-sync benchmark
 """
 
 def run(args, summary_text):
-    d = HERE / "_tmp"; d.mkdir(exist_ok=True)
-    f = d / "summary.md"; f.write_text(summary_text)
-    p = subprocess.run([sys.executable, str(VERDICT), str(f), *args],
-                       capture_output=True, text=True)
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "summary.md"; f.write_text(summary_text)
+        p = subprocess.run([sys.executable, str(VERDICT), str(f), *args],
+                           capture_output=True, text=True)
     return p, (json.loads(p.stdout) if p.returncode == 0 else None)
 
 class TestVerdict(unittest.TestCase):
@@ -345,6 +345,40 @@ class TestVerdict(unittest.TestCase):
     def test_missing_baseline_row_errors(self):
         p, _ = run([], FIXTURE.replace("(baseline)", "(nope)"))
         self.assertNotEqual(p.returncode, 0)
+
+    def test_banner_rows_ignored(self):
+        # the real bench appends 2-column bottleneck-verdict banners below the
+        # throughput table; they must not perturb parsing
+        with_banners = FIXTURE + """
+### Bottleneck verdict (baseline)
+
+| stage | utilization |
+|-------|------------:|
+| commit | 0.91 |
+| download | 0.44 |
+
+### Bottleneck verdict (primary)
+
+| stage | utilization |
+|-------|------------:|
+| commit | 0.88 |
+| download | 0.47 |
+"""
+        p, out = run(["--threshold-pct", "3.0", "--noise-band-pct", "0.8"], with_banners)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertAlmostEqual(out["baseline_pc_bps"], 26.00)
+        self.assertAlmostEqual(out["primary_pc_bps"], 27.30)
+        self.assertEqual(out["verdict"], "WIN_CANDIDATE")
+
+    def test_threshold_boundary_is_inclusive(self):
+        exact_win = FIXTURE.replace("| 1250s | 24.00 | 26.00 |", "| 1250s | 24.00 | 100.00 |") \
+                           .replace("| 1190s | 25.21 | 27.30 |", "| 1190s | 25.21 | 103.00 |")
+        _, out = run(["--threshold-pct", "3.0", "--noise-band-pct", "0.0"], exact_win)
+        self.assertEqual(out["verdict"], "WIN_CANDIDATE")
+        exact_loss = FIXTURE.replace("| 1250s | 24.00 | 26.00 |", "| 1250s | 24.00 | 100.00 |") \
+                            .replace("| 1190s | 25.21 | 27.30 |", "| 1190s | 25.21 | 97.00 |")
+        _, out = run(["--threshold-pct", "3.0", "--noise-band-pct", "0.0"], exact_loss)
+        self.assertEqual(out["verdict"], "LOSS")
 
 if __name__ == "__main__":
     unittest.main()
@@ -450,7 +484,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `python3 perf-lab/tests/test_verdict.py -v`
-Expected: `OK` (6 tests).
+Expected: `OK` (9 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -623,6 +657,8 @@ fi
 if ! grep -q "perf-lab B-14" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh; then
   sed -i '/summary_row "\$BASELINE_SPEC (baseline)"/s/$/; rm -rf "$CUR_FORK"  # perf-lab B-14: free baseline fork before primary leg/' \
     ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh
+  grep -q "perf-lab B-14" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
+    || echo "WARN: perf-lab B-14 patch no longer applies upstream — disk-fill risk is back" >&2
 fi
 mkdir -p ${BENCH_OUT_REMOTE}
 echo "remote prep done"
@@ -786,6 +822,15 @@ cmd_start() {
   # shellcheck disable=SC2087  # client-side expansion of label/refs is intended
   $SSH "${SSH_OPTS[@]}" "root@$ip" bash -s <<REMOTE
 set -euo pipefail
+# refuse to start while another bench is live on this droplet — the fork
+# cleanup below would rip its state out from under it
+for p in ${BENCH_OUT_REMOTE}/*.pid; do
+  [ -f "\$p" ] || continue
+  [ -f "\${p%.pid}.exit" ] && continue
+  if kill -0 "\$(cat "\$p")" 2>/dev/null; then
+    echo "BUSY: live bench \$(basename "\$p" .pid) on this droplet" >&2; exit 7
+  fi
+done
 # fresh per-label output: the bench script APPENDS to summary.md, so a stale
 # same-label dir would leave two tables in one file
 rm -rf ${BENCH_OUT_REMOTE}/${label} ${BENCH_OUT_REMOTE}/${label}.log ${BENCH_OUT_REMOTE}/${label}.pid ${BENCH_OUT_REMOTE}/${label}.exit
@@ -800,10 +845,10 @@ cd ${CTL_CLONE_REMOTE}
 # crashes or PID reuse.
 ( nohup env \
     BUILD_REF='${build_ref}' BASELINE_REF='${baseline_ref}' \
-    TARGET_P2P_STACK=zakura BASELINE_P2P_STACK=zakura \
     BENCH_HOME='${BENCH_HOME_REMOTE}' \
     STOP_HEIGHT='${BENCH_STOP_HEIGHT}' \
     OUT_DIR='${BENCH_OUT_REMOTE}/${label}' DASHBOARD=1${env_str} \
+    TARGET_P2P_STACK=zakura BASELINE_P2P_STACK=zakura \
     bash scripts/checkpoint-sync-bench.sh
   echo \$? > ${BENCH_OUT_REMOTE}/${label}.exit
 ) > ${BENCH_OUT_REMOTE}/${label}.log 2>&1 < /dev/null &
@@ -997,7 +1042,15 @@ Expected: ends with `L0 PASS (zakura-chain)` (first clippy build is slow; later 
       "Bash(cargo nextest:*)",
       "Bash(cargo bench:*)",
       "Bash(codex exec:*)",
-      "Bash(shellcheck:*)"
+      "Bash(shellcheck:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git diff:*)",
+      "Bash(git -C /tmp/perf-exp-:*)",
+      "Bash(git -C /tmp/perf-base:*)",
+      "Bash(git branch -D adam/perf-exp/:*)",
+      "Bash(mkdir:*)",
+      "Bash(git ls-remote:*)"
     ],
     "deny": [
       "Bash(doctl compute droplet delete:*)",
@@ -1135,7 +1188,13 @@ description: Run or resume the unattended Zakura perf-experiment loop — provis
 
 Design + resolved decisions: `docs/superpowers/2026-07-20-agentic-perf-workflow-design.md`.
 All primitives live in `perf-lab/` (see its README). You are the state machine;
-the scripts are deliberately dumb.
+the scripts are deliberately dumb. Launch sessions with permission mode
+acceptEdits (the Bash allowlist in the MAIN checkout's
+`.claude/settings.local.json` covers the loop's command shapes; never
+bypassPermissions — the deny rules and prompt fallback are load-bearing).
+Run `bench.sh collect` and `droplet.sh provision` with a 600000 ms Bash
+timeout: collect pulls multi-GB trace artifacts and provision can sit in
+apt/ssh waits.
 
 ## Session start (every time, in order)
 
@@ -1175,7 +1234,10 @@ Read `verdict-*.json` + summary, run the `zakura-trace-plots` skill
 (`.agents/skills/zakura-trace-plots/`) over the traces if deeper attribution
 is needed, and
 write `## CAMPAIGN` in the ledger: dominant bottleneck class, chosen target
-metric (default: checkpoint-zone post-commit blk/s), re-ranked top-5 backlog.
+metric (default: checkpoint-zone post-commit blk/s), **one pinned
+campaign-baseline number** (median `primary_pc_bps` of the clean pinned legs,
+or one fresh `base` run) that every absolute sweep comparison uses, and the
+re-ranked top-5 backlog.
 
 ## Per experiment (state machine)
 

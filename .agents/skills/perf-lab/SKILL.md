@@ -7,7 +7,13 @@ description: Run or resume the unattended Zakura perf-experiment loop — provis
 
 Design + resolved decisions: `docs/superpowers/2026-07-20-agentic-perf-workflow-design.md`.
 All primitives live in `perf-lab/` (see its README). You are the state machine;
-the scripts are deliberately dumb.
+the scripts are deliberately dumb. Launch sessions with permission mode
+acceptEdits (the Bash allowlist in the MAIN checkout's
+`.claude/settings.local.json` covers the loop's command shapes; never
+bypassPermissions — the deny rules and prompt fallback are load-bearing).
+Run `bench.sh collect` and `droplet.sh provision` with a 600000 ms Bash
+timeout: collect pulls multi-GB trace artifacts and provision can sit in
+apt/ssh waits.
 
 ## Session start (every time, in order)
 
@@ -47,7 +53,10 @@ Read `verdict-*.json` + summary, run the `zakura-trace-plots` skill
 (`.agents/skills/zakura-trace-plots/`) over the traces if deeper attribution
 is needed, and
 write `## CAMPAIGN` in the ledger: dominant bottleneck class, chosen target
-metric (default: checkpoint-zone post-commit blk/s), re-ranked top-5 backlog.
+metric (default: checkpoint-zone post-commit blk/s), **one pinned
+campaign-baseline number** (median `primary_pc_bps` of the clean pinned legs,
+or one fresh `base` run) that every absolute sweep comparison uses, and the
+re-ranked top-5 backlog.
 
 ## Per experiment (state machine)
 

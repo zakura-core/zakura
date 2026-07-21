@@ -1,6 +1,6 @@
 # perf-lab backlog
 
-Ranked queue. The campaign-target memo (SKILL.md step 0) re-ranks this list
+Ranked queue. The campaign-target memo (SKILL.md, campaign-target-memo section) re-ranks this list
 against measured attribution before experiment 001. Statuses:
 READY | BLOCKED(<why>) | DONE(EXP-NNN) | DROPPED(<why>).
 

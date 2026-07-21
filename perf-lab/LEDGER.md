@@ -22,7 +22,7 @@ This file is the sole reporting channel (design D5). Entry template:
 
 - origin/main during calibration: `ea979e11a` → `4784aca68` (pinned SHA for all clean runs)
 - droplet: perf-lab-cal (c-16, nyc3, golden image zakura-pr-node-20260720-2311, ip 134.209.44.208); provision→ready 77 s
-- runs (bench collects: 7 incl. the pending exp000):
+- runs (bench collects: 7 incl. exp000, recorded below):
   - aa1 SHORT window (30k blocks, ~5 min/leg): |delta| 13.0% — window too short; download variance dominates. Superseded.
   - aa2 LONG window, UNPINNED refs: origin/main moved mid-run so the legs built different commits; leftover ~116 GB/leg forks filled the 200 GB disk to 0, stalling RocksDB into the 2000 s wall cap and crashing the harness's trace zip. Post-mortem produced: SHA pinning, per-start fork cleanup, post-collect remote purge, 600 s collect timeouts.
   - aa3 clean pinned: |delta| 0.401% (legs 1295/1291 s)
@@ -32,6 +32,7 @@ This file is the sole reporting channel (design D5). Entry template:
 - **NOISE_BAND_PCT = 8.7** (max of clean samples, rounded up). Effective single-run threshold = max(3%, 2×8.7) = 17.4%. Single-run verdicts below that are noise-indistinguishable; confirmation runs and multi-run medians are mandatory, and B-15 (multi-peer pinning or frozen-cohort port) is campaign-1-critical to restore sensitivity.
 - Attribution at the standard window (1707210→1827210): download head-of-line dominant; commit single-writer 22-26% busy. State/commit-path experiments will NOT register here — campaign 1 must target the download path, raise the window into heavier blocks, or land B-15 first.
 - Timings: snapshot download ~10 min (once per droplet; one transient HTTP/2 mid-stream failure observed — retry succeeded); featured build ~3-20 min (golden cargo cache, features differ from bake); leg ~20-22 min at ~90-100 blk/s.
+- Droplets: perf-lab-smoke and perf-lab-cal both created and destroyed this session (list-empty verified).
 - Cost so far: ~US$4-5 droplet time. perf-lab skill registration verified (appears in session skill lists).
 
 ## EXP-000 noop-dry-run

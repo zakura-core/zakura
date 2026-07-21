@@ -119,6 +119,8 @@ fi
 if ! grep -q "perf-lab B-14" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh; then
   sed -i '/summary_row "\$BASELINE_SPEC (baseline)"/s/$/; rm -rf "$CUR_FORK"  # perf-lab B-14: free baseline fork before primary leg/' \
     ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh
+  grep -q "perf-lab B-14" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
+    || echo "WARN: perf-lab B-14 patch no longer applies upstream — disk-fill risk is back" >&2
 fi
 mkdir -p ${BENCH_OUT_REMOTE}
 echo "remote prep done"

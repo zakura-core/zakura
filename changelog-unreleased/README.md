@@ -19,7 +19,7 @@ Valid categories are `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, and
 preparation uses semver and public-API checks to choose crate version bumps.
 
 Write complete Keep a Changelog list items, including the PR link. Multiple
-targets and categories belong in the same fragment. Parameter changes still
+changes and categories belong in the same fragment. Parameter changes still
 need a row in `CHANGELOG_PARAMS.md`.
 
 For an internal-only PR, use an explicit marker and explain the exclusion:
@@ -33,4 +33,6 @@ effect.
 
 Run `./scripts/changelog.py check` to validate pending fragments. Release PRs
 run `make prepare-release-changelog RELEASE_TAG=vX.Y.Z` after version bumps;
-that command consumes the fragments into the root changelog.
+that command consumes the fragments into the root changelog. Stable assembly
+also combines and replaces all matching `X.Y.Z-rc*` sections with one `X.Y.Z`
+section.

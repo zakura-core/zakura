@@ -129,6 +129,77 @@ class ChangelogTests(unittest.TestCase):
         with self.assertRaisesRegex(changelog.ChangelogError, "Unreleased is empty"):
             changelog.release_plan(self.root, "v1.1.0", "2026-07-21")
 
+    def test_stable_release_combines_and_removes_release_candidates(self):
+        first = self.root / "changelog-unreleased" / "101.md"
+        first.write_text("## Added\n\n- Added the first feature.\n")
+
+        writes, removals = changelog.release_plan(self.root, "v1.1.0-rc1", "2026-07-21")
+        for target, rendered in writes.items():
+            target.write_text(rendered)
+        for target in removals:
+            target.unlink()
+
+        second = self.root / "changelog-unreleased" / "102.md"
+        second.write_text("## Added\n\n- Added the second feature.\n")
+
+        writes, removals = changelog.release_plan(self.root, "v1.1.0-rc2", "2026-07-22")
+        for target, rendered in writes.items():
+            target.write_text(rendered)
+        for target in removals:
+            target.unlink()
+
+        writes, removals = changelog.release_plan(self.root, "v1.1.0", "2026-07-23")
+
+        self.assertEqual(removals, [])
+        rendered = writes[self.root / "CHANGELOG.md"]
+        self.assertIn("## [1.1.0] - 2026-07-23", rendered)
+        self.assertIn("- Added the first feature.", rendered)
+        self.assertIn("- Added the second feature.", rendered)
+        self.assertLess(
+            rendered.index("- Added the first feature."),
+            rendered.index("- Added the second feature."),
+        )
+        self.assertNotIn("## [1.1.0-rc1]", rendered)
+        self.assertNotIn("## [1.1.0-rc2]", rendered)
+
+    def test_stable_release_appends_changes_made_after_release_candidates(self):
+        path = self.root / "CHANGELOG.md"
+        path.write_text(
+            """# Changelog
+
+## [Unreleased]
+
+### Added
+
+- Added after the release candidates.
+
+## [1.1.0-rc2] - 2026-07-22
+
+### Added
+
+- Added in the second release candidate.
+
+## [1.1.0-rc1] - 2026-07-21
+
+### Added
+
+- Added in the first release candidate.
+
+## [1.0.0] - 2026-07-20
+
+- Previous release.
+"""
+        )
+
+        writes, _ = changelog.release_plan(self.root, "v1.1.0", "2026-07-23")
+        rendered = writes[path]
+
+        first = rendered.index("- Added in the first release candidate.")
+        second = rendered.index("- Added in the second release candidate.")
+        after = rendered.index("- Added after the release candidates.")
+        self.assertLess(first, second)
+        self.assertLess(second, after)
+
     def test_release_rejects_current_version_with_unreleased_entries(self):
         path = self.root / "CHANGELOG.md"
         path.write_text(

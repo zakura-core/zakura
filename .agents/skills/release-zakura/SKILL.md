@@ -97,6 +97,9 @@ make prepare-release-changelog RELEASE_TAG=<tag>
 ```
 
 Review and commit the generated root changelog and fragment deletions.
+For a stable release, confirm the generated section combines and replaces all
+matching release-candidate sections; no `X.Y.Z-rc*` section for that stable
+version should remain in the root changelog.
 
 ## Verify before opening or approving the PR
 

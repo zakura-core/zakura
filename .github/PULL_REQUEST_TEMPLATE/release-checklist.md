@@ -58,6 +58,7 @@ PR. To prepare them for assembly:
 
 Do not copy GitHub draft release notes or edit the shared `[Unreleased]`
 section. The version-aware assembly runs after all package version bumps below.
+Release Drafter remains responsible for the separate GitHub release-note draft.
 
 ## README
 
@@ -178,6 +179,8 @@ make prepare-release-changelog RELEASE_TAG=v<version>
 
 - [ ] Review the generated root changelog and confirm every
       `changelog-unreleased/<PR-number>.md` file was consumed.
+- [ ] For a stable release, confirm the generated section combines and replaces
+      every matching `v<version>-rc*` changelog section.
 - [ ] Commit the generated changelog and fragment deletions.
 - [ ] On that release commit, run the complete pre-release gate with the
       previous release tag as the base:

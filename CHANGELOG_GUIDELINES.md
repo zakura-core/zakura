@@ -102,8 +102,11 @@ make prepare-release-changelog RELEASE_TAG=vX.Y.Z
 
 The command validates and consumes all pending fragments, merges their entries
 by category, and creates the new root changelog version section. Review and
-commit the generated changelog and fragment deletions. Then run the full
-release gate:
+commit the generated changelog and fragment deletions. Release candidates get
+temporary version sections. When the matching stable version is assembled,
+the tool combines those sections from oldest to newest with any later
+unreleased entries, removes the release-candidate sections, and creates one
+stable section. Then run the full release gate:
 
 ```sh
 make pre-release RELEASE_TAG=vX.Y.Z BASE_TAG=v<previous>

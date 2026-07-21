@@ -150,7 +150,7 @@ def split_unreleased(text: str, path: Path) -> tuple[str, str, str]:
     return prefix, body, suffix
 
 
-def parse_unreleased_body(body: str, path: Path) -> dict[str, str]:
+def parse_category_body(body: str, path: Path, section: str) -> dict[str, str]:
     if not body:
         return {}
 
@@ -164,7 +164,7 @@ def parse_unreleased_body(body: str, path: Path) -> dict[str, str]:
             return
         rendered = "\n".join(lines).strip()
         if not rendered:
-            raise ChangelogError(f"{path}: empty Unreleased / {category} section")
+            raise ChangelogError(f"{path}: empty {section} / {category} section")
         categories[category] = rendered
         lines = []
 
@@ -174,25 +174,60 @@ def parse_unreleased_body(body: str, path: Path) -> dict[str, str]:
             store_body()
             category = match.group(1)
             if category not in STANDARD_CATEGORIES:
-                raise ChangelogError(
-                    f"{path}: invalid Unreleased category {category!r}"
-                )
+                raise ChangelogError(f"{path}: invalid {section} category {category!r}")
             if category in categories:
                 raise ChangelogError(
-                    f"{path}: duplicate Unreleased / {category} section"
+                    f"{path}: duplicate {section} / {category} section"
                 )
         elif line.startswith("## ") or line.startswith("### "):
-            raise ChangelogError(f"{path}: malformed Unreleased heading: {line}")
+            raise ChangelogError(f"{path}: malformed {section} heading: {line}")
         elif category is None:
             if line.strip():
                 raise ChangelogError(
-                    f"{path}: Unreleased content must be in category sections"
+                    f"{path}: {section} content must be in category sections"
                 )
         else:
             lines.append(line)
 
     store_body()
     return categories
+
+
+def parse_unreleased_body(body: str, path: Path) -> dict[str, str]:
+    return parse_category_body(body, path, "Unreleased")
+
+
+def promote_release_candidates(
+    suffix: str, stable_version: str, path: Path
+) -> tuple[dict[str, str], str]:
+    matches = list(VERSION_HEADING.finditer(suffix))
+    candidate_sections: list[dict[str, str]] = []
+    kept: list[str] = []
+    cursor = 0
+    candidate_prefix = f"{stable_version}-rc"
+
+    for index, match in enumerate(matches):
+        section_end = (
+            matches[index + 1].start() if index + 1 < len(matches) else len(suffix)
+        )
+        version = match.group(1)
+        if version.startswith(candidate_prefix) and version != candidate_prefix:
+            body = suffix[match.end() : section_end].strip()
+            candidate_sections.append(
+                parse_category_body(body, path, f"release {version}")
+            )
+            kept.append(suffix[cursor : match.start()])
+            cursor = section_end
+
+    kept.append(suffix[cursor:])
+
+    additions: dict[str, list[str]] = defaultdict(list)
+    for categories in reversed(candidate_sections):
+        for category, body in categories.items():
+            additions[category].append(body)
+
+    promoted = {category: "\n".join(bodies) for category, bodies in additions.items()}
+    return promoted, "".join(kept).lstrip("\n")
 
 
 def render_categories(categories: dict[str, str]) -> str:
@@ -262,16 +297,23 @@ def release_plan(
     root_version = tag_match.group(1)
     fragments = load_fragments(repo_root)
 
-    additions: dict[str, list[str]] = defaultdict(list)
-    for fragment in fragments:
-        for category, body in fragment.entries.items():
-            additions[category].append(body)
-
     path = repo_root / ROOT_CHANGELOG
     original = path.read_text()
     prefix, unreleased, suffix = split_unreleased(original, path)
     current = parse_unreleased_body(unreleased, path)
-    merged = merge_entries(current, additions)
+
+    promoted: dict[str, str] = {}
+    if "-" not in root_version:
+        promoted, suffix = promote_release_candidates(suffix, root_version, path)
+
+    additions: dict[str, list[str]] = defaultdict(list)
+    for category, body in current.items():
+        additions[category].append(body)
+    for fragment in fragments:
+        for category, body in fragment.entries.items():
+            additions[category].append(body)
+
+    merged = merge_entries(promoted, additions)
     body = render_categories(merged)
     latest = latest_changelog_version(suffix, path)
 

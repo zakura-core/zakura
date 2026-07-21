@@ -35,6 +35,8 @@ pub(super) struct HeaderSyncCore {
     pub(super) verified_block_hash: block::Hash,
     pub(super) best_header_tip: block::Height,
     pub(super) best_header_hash: block::Hash,
+    pub(super) header_root_auth: Option<HeaderRootAuthState>,
+    pub(super) root_auth_waiting_for_watch: bool,
     pub(super) last_header_progress_at: Instant,
     pub(super) peers: HashMap<ZakuraPeerId, PeerHeaderState>,
     pub(super) parked_peers: HashSet<ZakuraPeerId>,
@@ -76,6 +78,8 @@ impl HeaderSyncCore {
             verified_block_hash: startup.frontiers.verified_block_hash,
             best_header_tip,
             best_header_hash,
+            header_root_auth: startup.header_root_auth,
+            root_auth_waiting_for_watch: false,
             last_header_progress_at: Instant::now(),
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
@@ -168,6 +172,75 @@ impl HeaderSyncCore {
             };
             batch_start = next_start;
             anchor_hash = None;
+        }
+    }
+
+    pub(super) fn refresh_root_auth_range(&mut self, startup: &HeaderSyncStartup) {
+        if self.root_auth_waiting_for_watch {
+            return;
+        }
+        let Some(auth) = self.header_root_auth else {
+            return;
+        };
+        let Some(start) = next_height(auth.authenticated_height) else {
+            return;
+        };
+        let end = auth.completed_checkpoint_height.min(self.best_header_tip);
+        let Some(range) = CheckedHeaderRange::from_bounds(start, end) else {
+            return;
+        };
+        if range.count() < 2 {
+            return;
+        }
+        let count = range
+            .count()
+            .min(startup.config.advertised_max_headers_per_response());
+        if count < 2 {
+            return;
+        }
+        let range = CheckedHeaderRange::from_count(start, count)
+            .expect("root authentication request count is checked and non-zero");
+        self.schedule.ensure(
+            RangeRequest {
+                range,
+                anchor_hash: Some(auth.authenticated_hash),
+                finalized: true,
+                want_tree_aux_roots: true,
+                priority: RangePriority::AuthenticateRoots,
+            },
+            RangePriority::AuthenticateRoots,
+        );
+    }
+
+    pub(super) fn retire_peer_session_auth(
+        &mut self,
+        peer: &ZakuraPeerId,
+        session_id: Option<u64>,
+    ) {
+        let mut retired = Vec::new();
+        for (operation, pending) in &mut self.pending_operations {
+            if &operation.wire_request.peer != peer
+                || session_id.is_some_and(|session| operation.wire_request.session_id != session)
+            {
+                continue;
+            }
+            if operation.op_kind == HeaderSyncOperationKind::AuthenticateRoots {
+                retired.push((operation.clone(), pending.range));
+            } else if operation.op_kind == HeaderSyncOperationKind::CommitHeaders {
+                pending.reusable_payload = None;
+            }
+        }
+        for (operation, range) in retired {
+            self.pending_operations.remove(&operation);
+            self.schedule.retire_operation(&operation, range);
+            self.schedule.retry(range);
+        }
+    }
+
+    pub(super) fn retire_stale_auth_operation(&mut self, operation: &HeaderSyncOperationIdentity) {
+        if let Some(pending) = self.pending_operations.remove(operation) {
+            self.schedule.retire_operation(operation, pending.range);
+            self.schedule.retry(pending.range);
         }
     }
 }
@@ -555,10 +628,12 @@ pub(super) struct BufferedHeaderRange {
     pub(super) payload: HeaderRangePayload,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PendingOperation {
     pub(super) range: RangeRequest,
     pub(super) purpose: RangePurpose,
+    pub(super) reusable_payload: Option<HeaderRangePayload>,
+    pub(super) completion_observed: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
@@ -605,6 +680,7 @@ impl RangeRequest {
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) enum RangePriority {
     Forward,
+    AuthenticateRoots,
     Repair,
 }
 
@@ -612,6 +688,7 @@ impl RangePriority {
     pub(super) fn label(self) -> &'static str {
         match self {
             RangePriority::Forward => "forward",
+            RangePriority::AuthenticateRoots => "authenticate_roots",
             RangePriority::Repair => "repair",
         }
     }
@@ -620,6 +697,7 @@ impl RangePriority {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum RangePurpose {
     Sync,
+    AuthenticateRoots,
     VctRepair {
         height: block::Height,
         generation: u64,

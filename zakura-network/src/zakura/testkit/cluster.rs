@@ -153,15 +153,15 @@ mod tests {
             spawn_header_sync_reactor, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,
             BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage,
             BlockSyncStatus, DiscoveryMessage, Frame, FramedRecv, FramedSend, HeaderRangeEntry,
-            HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncDecodeContext,
-            HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMessage,
-            HeaderSyncMisbehavior, HeaderSyncOperationIdentity, HeaderSyncPeerSession,
-            HeaderSyncRequestId, HeaderSyncStartup, HeaderSyncStatus,
-            HeaderSyncWireRequestIdentity, Peer, Service, ServicePeerLimits, Stream,
-            ZakuraBlockSyncConfig, ZakuraConnId, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
-            ZakuraTrace, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
-            ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
+            HeaderRootAuthState, HeaderRootAuthenticationFailureKind, HeaderSyncAction,
+            HeaderSyncCommitFailureKind, HeaderSyncDecodeContext, HeaderSyncEvent,
+            HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMessage, HeaderSyncMisbehavior,
+            HeaderSyncOperationIdentity, HeaderSyncPeerSession, HeaderSyncRequestId,
+            HeaderSyncStartup, HeaderSyncStatus, HeaderSyncWireRequestIdentity, Peer, Service,
+            ServicePeerLimits, Stream, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraHeaderSyncConfig,
+            ZakuraLocalLimits, ZakuraTrace, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY,
+            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
     };
@@ -1079,6 +1079,41 @@ mod tests {
                         }
                     }
                 }
+                HeaderSyncAction::AuthenticateHeaderRoots {
+                    operation,
+                    expected_state,
+                    payload,
+                    ..
+                } => {
+                    let authenticated_height = block::Height(
+                        payload
+                            .range()
+                            .end()
+                            .0
+                            .checked_sub(1)
+                            .expect("authentication payload includes a successor witness"),
+                    );
+                    let authenticated_hash = payload
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.height == authenticated_height)
+                        .map(|entry| block::Hash::from(entry.header.as_ref()))
+                        .expect("authenticated entry is present before its witness");
+                    let _ = local
+                        .handle
+                        .send(HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation })
+                        .await;
+                    let _ = local
+                        .handle
+                        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(
+                            HeaderRootAuthState {
+                                authenticated_height,
+                                authenticated_hash,
+                                ..expected_state
+                            },
+                        )))
+                        .await;
+                }
                 HeaderSyncAction::QueryBestHeaderTip => {
                     let (tip_height, tip_hash) = local
                         .store
@@ -1564,6 +1599,17 @@ mod tests {
                             .send(HeaderSyncEvent::HeaderRangeOperationFailed {
                                 operation,
                                 kind: HeaderSyncCommitFailureKind::Local,
+                            })
+                            .await;
+                    }
+                    HeaderSyncAction::AuthenticateHeaderRoots { operation, .. } => {
+                        let Some(handle) = endpoint.header_sync() else {
+                            continue;
+                        };
+                        let _ = handle
+                            .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+                                operation,
+                                kind: HeaderRootAuthenticationFailureKind::Local,
                             })
                             .await;
                     }

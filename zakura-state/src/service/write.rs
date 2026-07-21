@@ -207,17 +207,30 @@ fn authenticate_header_roots(
     roots: Vec<BlockCommitmentRoots>,
     rsp_tx: oneshot::Sender<Result<AuthenticatedHeaderRoots, AuthenticateHeaderRootsError>>,
 ) {
-    let result = finalized_state.db.authenticate_header_roots(
-        expected_state,
-        anchor,
-        start,
-        &headers,
-        &roots,
-    );
-    if let Ok(success) = &result {
-        let _ = header_root_auth_sender.send(Some(success.state));
+    respond_if_requested(rsp_tx, || {
+        let result = finalized_state.db.authenticate_header_roots(
+            expected_state,
+            anchor,
+            start,
+            &headers,
+            &roots,
+        );
+        if let Ok(success) = &result {
+            let _ = header_root_auth_sender.send(Some(success.state));
+        }
+        result
+    });
+}
+
+fn respond_if_requested<T, E>(
+    rsp_tx: oneshot::Sender<Result<T, E>>,
+    work: impl FnOnce() -> Result<T, E>,
+) {
+    if rsp_tx.is_closed() {
+        metrics::counter!("state.write.cancelled_before_start").increment(1);
+        return;
     }
-    let _ = rsp_tx.send(result);
+    let _ = rsp_tx.send(work());
 }
 
 fn publish_header_root_auth_state(
@@ -892,7 +905,10 @@ fn should_seed_zakura_header_from_non_finalized_commit(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     use zakura_chain::{
         parameters::Network, serialization::ZcashDeserializeInto, value_balance::ValueBalance,
@@ -904,13 +920,27 @@ mod tests {
             finalized_state::{DiskWriteBatch, FinalizedState, WriteDisk},
             non_finalized_state::NonFinalizedState,
             write::{
-                seed_zakura_header_from_committed_block,
+                respond_if_requested, seed_zakura_header_from_committed_block,
                 should_seed_zakura_header_from_non_finalized_commit,
             },
         },
         tests::FakeChainHelper,
         Config,
     };
+
+    #[test]
+    fn cancelled_response_skips_serialized_write_work() {
+        let (rsp_tx, rsp_rx) = tokio::sync::oneshot::channel();
+        drop(rsp_rx);
+        let ran = AtomicBool::new(false);
+
+        respond_if_requested(rsp_tx, || {
+            ran.store(true, Ordering::SeqCst);
+            Ok::<_, ()>(())
+        });
+
+        assert!(!ran.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn side_chain_commit_does_not_seed_zakura_headers() {

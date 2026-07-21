@@ -15,11 +15,11 @@ use crate::{
     zakura::{
         discovery::build_discovery_handle, service_registry, spawn_block_sync_reactor,
         spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
-        BlockSyncStartup, DiscoveryService, HeaderSyncAction, HeaderSyncFrontiers,
-        HeaderSyncHandle, HeaderSyncStartup, Service, ZakuraBlockSyncConfig, ZakuraDiscoveryHandle,
-        ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
-        ZakuraPeerId, ZakuraProtocolHandler, ZakuraServiceId, ZakuraSupervisorHandle, ZakuraTrace,
-        P2P_V2_ALPN,
+        BlockSyncStartup, DiscoveryService, HeaderRootAuthState, HeaderSyncAction,
+        HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncStartup, Service, ZakuraBlockSyncConfig,
+        ZakuraDiscoveryHandle, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig,
+        ZakuraLocalLimits, ZakuraPeerId, ZakuraProtocolHandler, ZakuraServiceId,
+        ZakuraSupervisorHandle, ZakuraTrace, P2P_V2_ALPN,
     },
     BoxError, Config,
 };
@@ -225,6 +225,7 @@ struct TestHeaderSyncStartup {
     frontiers: HeaderSyncFrontiers,
     best_header_tip: Option<(block::Height, block::Hash)>,
     verified_block_tip_hash: block::Hash,
+    header_root_auth: Option<HeaderRootAuthState>,
 }
 
 impl fmt::Debug for ZakuraTestNodeBuilder {
@@ -354,7 +355,16 @@ impl ZakuraTestNodeBuilder {
             frontiers,
             best_header_tip,
             verified_block_tip_hash: anchor.1,
+            header_root_auth: None,
         });
+        self
+    }
+
+    /// Supply compact durable header-root authentication progress to the test reactor.
+    pub fn header_root_auth_state(mut self, state: HeaderRootAuthState) -> Self {
+        if let Some(header_sync) = self.header_sync.as_mut() {
+            header_sync.header_root_auth = Some(state);
+        }
         self
     }
 
@@ -430,6 +440,7 @@ impl ZakuraTestNodeBuilder {
                 frontiers,
                 best_header_tip,
                 verified_block_tip_hash,
+                header_root_auth,
             } = header_sync;
             let mut startup = HeaderSyncStartup::new(
                 network,
@@ -443,6 +454,7 @@ impl ZakuraTestNodeBuilder {
                 startup.request_timeout = request_timeout;
             }
             startup.range_state_actions_enabled = true;
+            startup.header_root_auth = header_root_auth;
             startup.inbound_new_block_acceptance_enabled = true;
             startup.status_refresh_interval = Duration::from_millis(200);
             let shutdown = CancellationToken::new();

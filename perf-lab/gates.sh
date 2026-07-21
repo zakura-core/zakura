@@ -25,11 +25,18 @@ cmd_l0() {
 
 cmd_micro_mockbs() {
   local wt="${1:?}" runs="${2:-3}"
-  cd "$wt"
+  [[ "$runs" =~ ^[1-9][0-9]*$ ]] || die "runs must be a positive integer: $runs"
+  cd "$wt"; mkdir -p "$ARTIFACT_ROOT"
+  # stderr goes to a log so an unattended failure is diagnosable; a nonzero
+  # exit from any run means: discard every sample from this invocation
+  local log; log="$ARTIFACT_ROOT/micro-mockbs-$(date +%Y%m%dT%H%M%S).log"
+  local i
   for i in $(seq 1 "$runs"); do
-    ZAKURA_MOCK_BS_RUN=1 cargo test -p zakura-network --release \
-      zakura_mock_blocksync_throughput -- --ignored --nocapture 2>/dev/null \
-      | grep -E "^throughput:" | sed "s/^/run $i /"
+    if ! ZAKURA_MOCK_BS_RUN=1 cargo test -p zakura-network --release \
+        zakura_mock_blocksync_throughput -- --ignored --nocapture 2>>"$log" \
+      | grep -E "^throughput:" | sed "s/^/run $i /"; then
+      die "micro-mockbs run $i: no throughput / cargo failed — see $log"
+    fi
   done
 }
 

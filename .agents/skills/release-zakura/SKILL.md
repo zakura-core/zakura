@@ -3,8 +3,8 @@ name: release-zakura
 description: >-
   Prepare, review, and publish Zakura releases and release candidates. Use when
   bumping Zakura versions, preparing a release PR, validating the crates.io
-  package graph, updating installer metadata, reviewing release readiness, or
-  running the protected Create release workflow.
+  package graph, reviewing release readiness, or running the protected Create
+  release workflow.
 ---
 
 # Release Zakura
@@ -87,31 +87,6 @@ Update:
 Generate the stored config from the release branch; do not copy it blindly when
 config defaults or fields changed.
 
-### Installer metadata
-
-Keep these four assignments in `scripts/install-zakura.sh` coherent:
-
-```text
-ZAKURA_RELEASE_TAG
-ZAKURA_ARCHIVE_SHA256
-ZAKURA_DOCKER_IMAGE
-ZAKURA_COMPAT_DOCKER_IMAGE
-```
-
-Normally leave the complete metadata for the latest published release intact
-until the next release exists. The raw-main installer is a documented install
-route, and an all-zero or mismatched checksum breaks it. Caveat: when the
-pinned release is itself scheduled for deletion (the pre-1.0.0 release
-candidates), an intact pin still ends up dangling — staging placeholder
-metadata with a clean failure mode is the better trade there.
-
-The release workflow does not need source placeholders: it rewrites all four
-values in the published installer and opens a follow-up PR with the real
-metadata. Review and merge that PR after the release. If a release process
-explicitly stages source metadata beforehand, update all four assignments
-together and call out that raw-main installation remains unavailable until the
-new artifacts exist.
-
 ## Verify before opening or approving the PR
 
 Run:
@@ -119,7 +94,6 @@ Run:
 ```bash
 cargo metadata --no-deps --format-version 1 --locked
 ./scripts/check-release-version.sh <tag>
-bash -n scripts/install-zakura.sh
 ./scripts/check-crate-packaging.sh --verify
 ```
 
@@ -181,12 +155,11 @@ still has the previous package version.
 
 ## Post-release verification
 
-- Verify both `zakurad-<tag>` archives, the manifest, installer, and
-  `SHA256SUMS.txt` are present.
-- Verify checksums and installer pins.
+- Verify both `zakurad-<tag>` archives, the manifest, and `SHA256SUMS.txt` are
+  present.
+- Verify release checksums.
 - Verify the standard Docker image has amd64 and arm64; verify the
   zcashd-compat image has amd64.
-- Review and merge the installer metadata update PR.
 - Publish only changed crates, preserving dependency order.
 - Install the exact version from crates.io and run `zakurad --version`.
 - Replace the boilerplate GitHub release body with concrete notes from the final

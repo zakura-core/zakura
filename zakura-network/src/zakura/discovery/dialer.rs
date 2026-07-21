@@ -1,6 +1,6 @@
 //! Bootstrap and candidate dial entry points for native discovery.
 
-use std::{net::SocketAddr, str::FromStr};
+use std::{collections::HashMap, net::SocketAddr, str::FromStr};
 
 use iroh::{NodeAddr, NodeId};
 
@@ -34,15 +34,33 @@ pub(crate) fn spawn_native_bootstrap_dialer(
         DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
     );
 
-    let mut tasks = Vec::with_capacity(bootstrap_peers.len());
+    let local_node_id = endpoint.local_node_id();
+    let mut direct_addrs_by_node = HashMap::<NodeId, Vec<SocketAddr>>::new();
     for entry in bootstrap_peers {
+        let node_addr = match parse_bootstrap_peer(&entry) {
+            Ok(node_addr) => node_addr,
+            Err(error) => {
+                tracing::warn!(?error, ?entry, "invalid Zakura bootstrap peer");
+                continue;
+            }
+        };
+        if node_addr.node_id == local_node_id {
+            tracing::debug!(?entry, "ignoring local Zakura bootstrap peer");
+            continue;
+        }
+        direct_addrs_by_node
+            .entry(node_addr.node_id)
+            .or_default()
+            .extend(node_addr.direct_addresses().copied());
+    }
+
+    let mut tasks = Vec::with_capacity(direct_addrs_by_node.len());
+    for (node_id, direct_addrs) in direct_addrs_by_node {
         let endpoint = endpoint.clone();
         let limits = limits.clone();
+        let node_addr = NodeAddr::new(node_id).with_direct_addresses(direct_addrs);
         tasks.push(tokio::spawn(async move {
-            match parse_bootstrap_peer(&entry) {
-                Ok(node_addr) => native_dial_supervised(endpoint, node_addr, limits, policy).await,
-                Err(error) => tracing::warn!(?error, ?entry, "invalid Zakura bootstrap peer"),
-            }
+            native_dial_supervised(endpoint, node_addr, limits, policy).await
         }));
     }
     tasks

@@ -19,7 +19,9 @@ ensure_key() {
   if [ ! -f "$SSH_KEY_FILE" ]; then
     run ssh-keygen -t ed25519 -N "" -C "$SSH_KEY_NAME" -f "$SSH_KEY_FILE"
   fi
-  if ! $DOCTL compute ssh-key list --format Name --no-header | grep -qx "$SSH_KEY_NAME"; then
+  # awk field-match: doctl's columnar output can pad lines, defeating grep -qx
+  if ! $DOCTL compute ssh-key list --format Name --no-header \
+      | awk -v n="$SSH_KEY_NAME" '$1==n{found=1} END{exit !found}'; then
     run $DOCTL compute ssh-key import "$SSH_KEY_NAME" --public-key-file "$SSH_KEY_FILE.pub"
   fi
   # In real mode the run-wrapped keygen above guarantees the pubkey exists; in

@@ -22,7 +22,15 @@ ensure_key() {
   if ! $DOCTL compute ssh-key list --format Name --no-header | grep -qx "$SSH_KEY_NAME"; then
     run $DOCTL compute ssh-key import "$SSH_KEY_NAME" --public-key-file "$SSH_KEY_FILE.pub"
   fi
-  FP=$(ssh-keygen -lf "$SSH_KEY_FILE.pub" -E md5 | awk '{print $2}' | sed 's/^MD5://')
+  # In real mode the run-wrapped keygen above guarantees the pubkey exists; in
+  # DRYRUN it may not, so substitute a placeholder instead of failing.
+  if [ -f "$SSH_KEY_FILE.pub" ]; then
+    FP=$(ssh-keygen -lf "$SSH_KEY_FILE.pub" -E md5 | awk '{print $2}' | sed 's/^MD5://')
+  elif [ -n "${DRYRUN:-}" ]; then
+    FP="dryrun-fp-placeholder"
+  else
+    die "ssh public key missing after keygen: $SSH_KEY_FILE.pub"
+  fi
 }
 
 golden_image() {  # newest zakura-pr-node-* image id, empty if none (pr-node recipe)

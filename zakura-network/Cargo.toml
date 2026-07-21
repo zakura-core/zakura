@@ -94,7 +94,7 @@ proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
 zakura-chain = { path = "../zakura-chain", version = "1.2.1-rc0", features = ["async-error"] }
-zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.0.0" }
+zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.0.1-rc0" }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -107,7 +107,7 @@ tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 toml = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "1.2.1-rc0", features = ["proptest-impl"] }
-zakura-test = { path = "../zakura-test/", version = "1.0.0" }
+zakura-test = { path = "../zakura-test/", version = "1.0.1-rc0" }
 
 [lints]
 workspace = true

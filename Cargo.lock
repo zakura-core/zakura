@@ -8978,7 +8978,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-jsonl-trace"
-version = "1.0.0"
+version = "1.0.1-rc0"
 dependencies = [
  "tempfile",
  "tokio",
@@ -9191,7 +9191,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-test"
-version = "1.0.0"
+version = "1.0.1-rc0"
 dependencies = [
  "color-eyre",
  "futures",
@@ -9218,7 +9218,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-tower-batch-control"
-version = "1.0.0"
+version = "1.0.1-rc0"
 dependencies = [
  "color-eyre",
  "ed25519-zebra",
@@ -9240,7 +9240,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-tower-fallback"
-version = "1.0.0"
+version = "1.0.1-rc0"
 dependencies = [
  "futures-core",
  "pin-project",

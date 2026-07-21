@@ -525,6 +525,7 @@ cmd_provision() {
   # counts against MAX_DROPLETS — destroy it on the way out. EXIT (not ERR):
   # `|| die` failure paths bypass ERR traps. The delete still passes the
   # assert_ours guard.
+  # shellcheck disable=SC2064  # intentional: bake $name now, not at signal time
   trap "echo 'provision failed; destroying orphan $name' >&2; cmd_destroy '$name' || true" EXIT
   local ip; ip="$(droplet_ip "$name")"; [ -n "$ip" ] || die "no ip for $name"
   echo "waiting for ssh on $ip ..."

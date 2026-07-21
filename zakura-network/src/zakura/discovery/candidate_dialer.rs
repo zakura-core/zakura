@@ -220,18 +220,26 @@ async fn spawn_discovery_dial_candidates(
             ))
             .catch_unwind()
             .map(move |result| {
-                result.unwrap_or_else(|_| {
-                    metrics::counter!("zakura.p2p.discovery.dial.worker_panicked").increment(1);
-                    tracing::error!(?node_id, "Zakura discovery dial worker panicked");
-                    DiscoveryDialWorkerResult {
-                        node_id,
-                        reserved_ips: reserved_ips_on_panic,
-                        result: DiscoveryDialResult::Failed,
-                    }
-                })
+                recover_discovery_dial_worker_panic(node_id, reserved_ips_on_panic, result)
             })
         });
     }
+}
+
+fn recover_discovery_dial_worker_panic(
+    node_id: NodeId,
+    reserved_ips: Vec<IpAddr>,
+    result: std::thread::Result<DiscoveryDialWorkerResult>,
+) -> DiscoveryDialWorkerResult {
+    result.unwrap_or_else(|_| {
+        metrics::counter!("zakura.p2p.discovery.dial.worker_panicked").increment(1);
+        tracing::error!(?node_id, "Zakura discovery dial worker panicked");
+        DiscoveryDialWorkerResult {
+            node_id,
+            reserved_ips,
+            result: DiscoveryDialResult::Failed,
+        }
+    })
 }
 
 async fn discovery_node_addr_with_reserved_ip_capacity(
@@ -552,6 +560,29 @@ mod tests {
 
     fn peer_id(byte: u8) -> ZakuraPeerId {
         ZakuraPeerId::new(vec![byte; 32]).expect("32-byte test peer id is valid")
+    }
+
+    #[test]
+    fn panicked_worker_returns_metadata_needed_to_release_reservations() {
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let ip = IpAddr::from([93, 184, 216, 34]);
+        let mut in_flight = HashSet::from([node_id]);
+        let mut in_flight_by_ip = HashMap::new();
+        reserve_discovery_in_flight_ips(&mut in_flight_by_ip, &[ip]);
+
+        let worker_result = recover_discovery_dial_worker_panic(
+            node_id,
+            vec![ip],
+            Err(Box::new("test worker panic")),
+        );
+        assert_eq!(worker_result.node_id, node_id);
+        assert_eq!(worker_result.reserved_ips, vec![ip]);
+        assert_eq!(worker_result.result, DiscoveryDialResult::Failed);
+
+        in_flight.remove(&worker_result.node_id);
+        release_discovery_in_flight_ips(&mut in_flight_by_ip, &worker_result.reserved_ips);
+        assert!(in_flight.is_empty());
+        assert!(in_flight_by_ip.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

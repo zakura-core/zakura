@@ -30,8 +30,6 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 | `docs-check.yml` | markdownlint, codespell, and lychee link checking over all Markdown. | PR/push on Markdown paths |
 | `coverage.yml` | llvm-cov + nextest coverage uploaded to Codecov. A 120-minute instrumented build, kept off the PR path. | Push to `main`/`release/**`, nightly, manual |
 | `benchmarks.yml` | Criterion benchmarks. Runs on PRs carrying the `C-benchmark` label; results publish to the dashboard data on `gh-pages/dev/bench`. | Labeled PRs, manual |
-| `book.yml` | Builds the mdBook and internal rustdoc as a merge gate, and snapshots the benchmark dashboard into the docs output. | Push to `main` on docs/Rust paths |
-| `gitbook.yml` | Validates and deploys the static Valarbook site (`book/valarbook/`) to GitHub Pages. | PR/push on `book/valarbook/**`, manual |
 | `zcashd-compat-regtest.yml` | zcashd interoperability regtest suite (spawns fresh `zakurad` + `zcashd`, no external infrastructure). **Temporarily manual-only**: see the workflow header for the sidecar-zcashd re-enable condition. | Manual |
 
 ## Release pipeline
@@ -43,7 +41,7 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 
 ## Fleet operations (DigitalOcean)
 
-Deploys are manual, SSH-based, and run from self-hosted deployer runners; there are no cloud-managed instance groups. See the [Continuous Delivery](../../book/src/dev/continuous-delivery.md) book page for the operational model.
+Deploys are manual, SSH-based, and run from self-hosted deployer runners; there are no cloud-managed instance groups.
 
 - **`zakura-mainnet-deploy.yml`** — manual, binary-only deploy across the mainnet fleet. Builds `zakurad` natively on the `zakura-mainnet-deployer` runner, then installs it host-by-host with `deploy/deployer/deploy.py`. Node configs, identities, and chain state are deliberately left untouched; the previous binary is kept as `.bak`.
 - **`zakura-testnet-deploy.yml`** — the same for the testnet fleet, from the `zakura-testnet-deployer` runner. Includes the zcashd-compat host, where Zakura runs alongside a sidecar `zcashd`.
@@ -66,4 +64,4 @@ These workflows use the helper scripts in `.github/workflows/scripts/` (`pr-node
 - **Patch workflows.** When a required check is skipped by path filters, GitHub leaves it "Expected" forever. The `.patch.yml` pattern provides an empty job with the same name on the inverse path set. If you change `paths` in a gating workflow, update `status-checks.patch.yml` to match.
 - **Label-gated heavy jobs.** `C-benchmark` runs benchmarks on a PR; `run-zakura-e2e` forces the e2e suite on a PR that wouldn't otherwise trigger it.
 - **Fork PRs.** Repository secrets and variables are not available to workflows on PRs from forks, so fleet and PR-node workflows are dispatch-only from this repository.
-- **Checkpoints are updated manually.** The upstream automated checkpoint pipeline depended on the removed GCP integration tests. Until a replacement exists, follow [Generating Zakura Checkpoints](../../book/src/dev/zakura-checkpoints.md); checkpoint PRs remain consensus-critical and need careful review.
+- **Checkpoints are updated manually.** The upstream automated checkpoint pipeline depended on the removed GCP integration tests. Until a replacement exists, follow the [`zakura-checkpoints` instructions](../../zakura-utils/README.md#zakura-checkpoints); checkpoint PRs remain consensus-critical and need careful review.

@@ -48,7 +48,6 @@ exclude_path = [
     "node_modules",
     "target",
     ".git",
-    "book/mermaid.min.js",
     "zakura-rpc/qa/rpc-tests",
     "supply-chain",
     # Contains intentionally unresolved ADR filename placeholders.

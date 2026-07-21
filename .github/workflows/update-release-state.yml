@@ -193,12 +193,17 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
+      - name: Choose the dated update branch
+        if: steps.import.outputs.has_changes == 'true'
+        id: update-branch
+        run: echo "name=release/checkpoint-update-$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
       - name: Open or update the draft pull request
         if: steps.import.outputs.has_changes == 'true'
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 #v8.1.1
         with:
           token: ${{ steps.app-token.outputs.token }}
-          branch: adam/update-release-state
+          branch: ${{ steps.update-branch.outputs.name }}
           base: main
           title: "chore(chain): update Mainnet checkpoints and VCT frontier"
           body: |

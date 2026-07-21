@@ -23,9 +23,8 @@ Docker Compose setup for running a Zcash mining pool with Zebra and S-NOMP.
 - **Redis**: Stores share counts and pool statistics
 
 The included full node explicitly uses the legacy TCP P2P stack. Native Zakura
-QUIC transport, which is [experimental](../../book/src/user/p2p.md), is
-disabled, matching the single TCP peer port published by the Compose
-configuration.
+QUIC transport, which is experimental, is disabled, matching the single TCP
+peer port published by the Compose configuration.
 
 All block rewards go to the address configured in `MINER_ADDRESS`.
 

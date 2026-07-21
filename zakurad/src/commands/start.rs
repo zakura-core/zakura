@@ -141,7 +141,7 @@ pub struct StartCmd {
 /// Warns if Linux TCP slow-start-after-idle is enabled, which significantly
 /// reduces single-peer throughput for block propagation.
 ///
-/// See `book/src/user/troubleshooting.md`.
+/// Use `--help` to inspect the available troubleshooting flags.
 #[cfg(target_os = "linux")]
 fn check_tcp_slow_start_after_idle() {
     const PATH: &str = "/proc/sys/net/ipv4/tcp_slow_start_after_idle";

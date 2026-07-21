@@ -120,8 +120,8 @@ jobs:
   docs:
     name: docs
     # A full `--all-features --document-private-items` doc build is expensive and
-    # not a correctness gate (book.yml builds docs on push to main). Run it
-    # nightly / on demand only, keeping it off the PR critical path.
+    # not a correctness gate. Run it nightly / on demand only, keeping it off the
+    # PR critical path.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
@@ -139,7 +139,6 @@ jobs:
       - uses: ./.github/actions/setup-zakura-build
       - run: cargo doc --no-deps --workspace --all-features --document-private-items --target-dir "$(pwd)"/target/internal
         env:
-          # Keep in sync with ./book.yml:jobs.build
           # The -A and -W settings must be the same as the `rustdocflags` in:
           # https://github.com/ZcashFoundation/zebra/blob/main/.cargo/config.toml#L87
           RUSTDOCFLAGS: --html-in-header katex-header.html -A rustdoc::private_intra_doc_links -D warnings

@@ -8,8 +8,8 @@
 
 ## Running and Debugging
 
-See the [user documentation](book/src/user.md) for details on
-how to build, run, and instrument Zakura.
+See the [getting started guide](README.md#getting-started) for details on how to
+build and run Zakura.
 
 ## Bug Reports
 

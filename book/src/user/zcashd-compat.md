@@ -1,7 +1,7 @@
 # zcashd-compat Mode (`zakurad start --zcashd-compat`)
 
 zcashd-compat mode is for operators — typically exchanges and custodial
-services whi want to migrate to Zakura while keeping the `zcashd` wallet and
+services who want to migrate to Zakura while keeping the `zcashd` wallet and
 RPC surface their integration already depends on. Zakura faces the Zcash P2P
 network and is the consensus node; `zcashd` runs as a **P2P sidecar** that
 makes a single outbound peer connection to the local Zakura node and listens
@@ -215,8 +215,8 @@ block_gossip_peer_ips = ["127.0.0.1"]
 zcashd only connects to Zakura using the legacy Zcash P2P protocol. The fronting
 Zakura must therefore use `network.p2p_stack = "legacy"` or `"dual"`; Zakura
 refuses to start zcashd-compat mode with the `"zakura"`-only setting. The
-`"dual"` setting also enables the [experimental Zakura P2P v2 stack](./p2p.md),
-but the zcashd sidecar still connects over Zakura's legacy listener.
+`"dual"` setting also enables the experimental Zakura P2P v2 stack, but the
+zcashd sidecar still connects over Zakura's legacy listener.
 
 Pruned storage is supported for the fronting Zakura. When zcashd-compat is
 enabled, Zakura advertises `NODE_NETWORK` even in pruned mode so that the
@@ -292,8 +292,8 @@ miner_address = "t1YourTransparentOrShieldedAddress"
 ```
 
 Zakura's `getblocktemplate` and `submitblock` are always compiled in; no
-special build is needed. See [Mining](mining.md) for details. The sidecar
-zcashd returns `Method not found` for all template and submission RPCs, so a
+special build is needed. The sidecar zcashd returns `Method not found` for all
+template and submission RPCs, so a
 misconfigured miner fails loudly instead of building on a lagging view.
 
 ## Wallet shielded-pool support (Orchard & Ironwood)

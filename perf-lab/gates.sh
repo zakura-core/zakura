@@ -16,7 +16,9 @@ cmd_l0() {
   cargo fmt --all -- --check
   for c in "$@"; do cargo clippy -p "$c" --all-targets -- -D warnings; done
   if command -v cargo-nextest >/dev/null 2>&1; then
-    for c in "$@"; do cargo nextest run -p "$c" --no-fail-fast; done
+    # --no-tests=pass: a crate whose tests are all feature-gated (e.g.
+    # zakura-utils) must not fail the gate; clippy already proved it compiles
+    for c in "$@"; do cargo nextest run -p "$c" --no-fail-fast --no-tests=pass; done
   else
     for c in "$@"; do cargo test -p "$c"; done
   fi

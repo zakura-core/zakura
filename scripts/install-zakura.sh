@@ -41,10 +41,10 @@ ZAKURA_DOCKER_IDENTITY_DIR="/home/zebra/.zakura"
 
 MANIFEST_PATH="$REPO_ROOT/zakurad/zcashd-compat-manifest.json"
 TARGET_TRIPLE="x86_64-pc-linux-gnu"
-ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v1.0.1/zcashd-zebra-compat-v1.0.1-linux-x86_64.tar.gz"
-ZCASHD_RUNTIME_ARCHIVE_SHA256="92bdb38ce3c602ebefda0ba9afb47130f9eb034012c811d0f5d159d10db247e9"
+ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v1.1.0/zcashd-zebra-compat-v1.1.0-linux-x86_64.tar.gz"
+ZCASHD_RUNTIME_ARCHIVE_SHA256="b131e901fb05782e047b9faa593a9da897092915eaa8f7a6cf2438c7634d2f06"
 ZCASHD_RUNTIME_ARCHIVE_MEMBER_BINARY_PATH="./bin/zcashd"
-ZCASHD_DEFAULT_DOCKER_IMAGE="zakuracore/zcashd:v1.0.1"
+ZCASHD_DEFAULT_DOCKER_IMAGE="zakuracore/zcashd:v1.1.0"
 
 INSTALL_PROFILE=""
 MODE=""

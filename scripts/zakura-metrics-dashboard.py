@@ -533,7 +533,7 @@ def list_runs(archive):
 COLLECTOR = None
 ARCHIVE = None
 
-PAGE = r"""<!doctype html><html><head><meta charset=utf-8><title>Zebra metrics</title>
+PAGE = r"""<!doctype html><html><head><meta charset=utf-8><title>Zakura metrics</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2"></script>
@@ -571,7 +571,7 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8><title>Zebra metrics</
  #ovwrap{flex:1;min-height:0;margin-top:8px}
  #ovcanvas{width:100%!important;height:100%!important;max-height:none}
 </style></head><body>
-<header><h1>Zebra observability</h1><div id=status>connecting…</div>
+<header><h1>Zakura observability</h1><div id=status>connecting…</div>
 <div id=verdict class=idle>—</div>
 <div class=toolbar>
  <span class=grp><button id=x_time class=on onclick="setXMode('time')">Time</button><button id=x_height onclick="setXMode('height')">Height</button></span>

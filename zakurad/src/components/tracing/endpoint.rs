@@ -90,7 +90,7 @@ impl TracingEndpoint {
                         panic!(
                             "Opening tracing endpoint listener {addr:?} failed: {err:?}. \
                             Hint: Check if another zakurad or zcashd process is running. \
-                            Try changing the tracing endpoint_addr in the Zebra config.",
+                            Try changing the tracing endpoint_addr in the Zakura config.",
                         );
                     }
                 };

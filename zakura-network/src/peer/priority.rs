@@ -141,7 +141,7 @@ pub fn address_is_valid_for_inbound_listeners(
     // Ignore ports used by potentially compatible nodes: other coins and unsupported Zcash regtest.
     if listener_addr.port() == 18344 {
         return Err(
-            "invalid peer port: port is for Regtest, but Zebra does not support that network",
+            "invalid peer port: port is for Regtest, but Zakura does not support that network",
         );
     } else if [8033, 18033, 16125, 26125].contains(&listener_addr.port()) {
         // These coins use the same network magic numbers as Zcash, so we have to reject them by port:

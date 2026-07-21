@@ -80,7 +80,7 @@ impl From<&Transaction> for Hash {
         let hasher = TxIdBuilder::new(transaction);
         hasher
             .txid()
-            .expect("zcash_primitives and Zebra transaction formats must be compatible")
+            .expect("zcash_primitives and Zakura transaction formats must be compatible")
     }
 }
 

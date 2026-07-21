@@ -631,7 +631,7 @@ where
     let span = Span::current();
     let solved_headers =
         tokio::task::spawn_blocking(move || span.in_scope(move || {
-            let miner_thread_handle = ThreadBuilder::default().name("zebra-miner").priority(ThreadPriority::Min).spawn(move |priority_result| {
+            let miner_thread_handle = ThreadBuilder::default().name("zakura-miner").priority(ThreadPriority::Min).spawn(move |priority_result| {
                 if let Err(error) = priority_result {
                     info!(?error, "could not set miner to run at a low priority: running at default priority");
                 }

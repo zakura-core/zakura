@@ -206,7 +206,7 @@ pub fn reject_peer_selection_extra_args(extra_args: &[String]) -> Result<(), Rep
         if PEER_SELECTION_OPTIONS.contains(&name) {
             return Err(eyre!(
                 "zcashd_compat.zcashd_extra_args contains {arg:?}: peer-selection options are not \
-                 allowed because the zcashd P2P sidecar must connect only to the local Zebra node"
+                 allowed because the zcashd P2P sidecar must connect only to the local Zakura node"
             ));
         }
     }

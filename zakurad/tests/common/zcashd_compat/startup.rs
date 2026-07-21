@@ -78,7 +78,7 @@ pub async fn sidecar_follows_tip() -> Result<()> {
 
         assert_eq!(
             zcashd_best, zebra_best,
-            "zcashd should follow Zebra's best block over P2P"
+            "zcashd should follow Zakura's best block over P2P"
         );
     }
 
@@ -91,12 +91,12 @@ pub async fn sidecar_follows_tip() -> Result<()> {
     assert_eq!(
         peers.len(),
         1,
-        "the sidecar zcashd must peer with exactly one node (Zebra), got: {peers:?}"
+        "the sidecar zcashd must peer with exactly one node (Zakura), got: {peers:?}"
     );
     assert_eq!(
         peers[0]["inbound"].as_bool(),
         Some(false),
-        "the sidecar's single peer must be an outbound -connect to Zebra: {:?}",
+        "the sidecar's single peer must be an outbound -connect to Zakura: {:?}",
         peers[0]
     );
 

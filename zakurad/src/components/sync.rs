@@ -1574,7 +1574,7 @@ where
                     } else {
                         info!(
                             "task error during obtain tips task: {e:?},\
-                     is Zebra shutting down?"
+                     is Zakura shutting down?"
                         );
                         Err(e.into())
                     }

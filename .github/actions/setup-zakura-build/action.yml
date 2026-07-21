@@ -1,4 +1,4 @@
-name: 'Setup Zebra Build Environment'
+name: 'Setup Zakura Build Environment'
 description: 'Install protoc and RocksDB as system libraries'
 runs:
   using: 'composite'

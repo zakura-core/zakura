@@ -394,7 +394,7 @@ impl StateService {
             .map(CheckpointVerifiedBlock::from)
             .map(ChainTipBlock::from);
 
-        tracing::info!(chain_tip = ?initial_tip.as_ref().map(|tip| (tip.hash, tip.height)), "loaded Zebra state cache");
+        tracing::info!(chain_tip = ?initial_tip.as_ref().map(|tip| (tip.hash, tip.height)), "loaded Zakura state cache");
 
         let (chain_tip_sender, latest_chain_tip, chain_tip_change) =
             ChainTipSender::new(initial_tip, network);
@@ -607,7 +607,7 @@ impl StateService {
         match self.invalid_block_write_reset_receiver.try_recv() {
             Ok(reset_tip_hash) => self.finalized_block_write_last_sent_hash = reset_tip_hash,
             Err(TryRecvError::Disconnected) => {
-                info!("Block commit task closed the block reset channel. Is Zebra shutting down?");
+                info!("Block commit task closed the block reset channel. Is Zakura shutting down?");
                 return;
             }
             // There are no errors, so we can just use the last block hash we sent
@@ -668,7 +668,7 @@ impl StateService {
                 Err(TryRecvError::Disconnected) => {
                     info!(
                         "Block commit task closed the non-finalized rejected hash channel. \
-                         Is Zebra shutting down?"
+                         Is Zakura shutting down?"
                     );
                     break;
                 }
@@ -2137,7 +2137,7 @@ impl Service<ReadRequest> for ReadStateService {
                     read::best_tip(&latest_non_finalized_state, &state.db)
                 else {
                     return Err(
-                        "state is empty: wait for Zebra to sync before submitting a proposal"
+                        "state is empty: wait for Zakura to sync before submitting a proposal"
                             .into(),
                     );
                 };

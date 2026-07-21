@@ -70,7 +70,7 @@ pub fn validate_address(
         tracing::info!(
             ?network,
             address_network = ?address.network(),
-            "invalid address in validateaddress RPC: Zebra's configured network must match address network"
+            "invalid address in validateaddress RPC: Zakura's configured network must match address network"
         );
         return Ok(validate_address::ValidateAddressResponse::invalid());
     }

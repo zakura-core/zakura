@@ -141,7 +141,7 @@ pub(super) async fn run_backup_task(
 
     tracing::warn!(
         ?err,
-        "got recv error waiting on non-finalized state change, is Zebra shutting down?"
+        "got recv error waiting on non-finalized state change, is Zakura shutting down?"
     )
 }
 

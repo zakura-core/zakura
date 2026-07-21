@@ -100,7 +100,7 @@ impl From<crate::Error> for SerializationError {
             crate::Error::MissingNetworkUpgrade => Self::Parse("missing network upgrade"),
             crate::Error::Amount(_) => Self::BadTransactionBalance,
             crate::Error::Conversion(_) => {
-                Self::Parse("Zebra's type could not be converted to its librustzcash equivalent")
+                Self::Parse("Zakura's type could not be converted to its librustzcash equivalent")
             }
         }
     }

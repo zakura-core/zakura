@@ -70,7 +70,7 @@ pub async fn equal_work_race() -> Result<()> {
 
     assert_eq!(
         zcashd_tip_now, old_zcashd_tip,
-        "zcashd should keep the first-seen equal-work tip until Zebra extends"
+        "zcashd should keep the first-seen equal-work tip until Zakura extends"
     );
     assert_ne!(
         zcashd_tip_now.1, zakura_tip.1,
@@ -291,7 +291,7 @@ pub async fn zakura_tip_behind_local() -> Result<()> {
     let zcashd_tip_now = zcashd_tip(&setup.zcashd_client).await?;
     assert_eq!(
         zcashd_tip_now, old_zcashd_tip,
-        "zcashd must hold its chain while Zebra's tip is behind"
+        "zcashd must hold its chain while Zakura's tip is behind"
     );
 
     // Once Zebra mines a strictly-more-work replacement branch, zcashd follows.

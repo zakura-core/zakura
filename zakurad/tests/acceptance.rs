@@ -2019,11 +2019,12 @@ fn lwd_integration_test(test_type: TestType) -> Result<()> {
     let state_version_message = wait_for_state_version_message(&mut zakurad)?;
 
     if test_type.needs_zakura_cached_state() {
-        zakurad
-            .expect_stdout_line_matches(r"loaded Zebra state cache .*tip.*=.*Height\([0-9]{7}\)")?;
+        zakurad.expect_stdout_line_matches(
+            r"loaded Zakura state cache .*tip.*=.*Height\([0-9]{7}\)",
+        )?;
     } else {
         // Timeout the test if we're somehow accidentally using a cached state
-        zakurad.expect_stdout_line_matches("loaded Zebra state cache .*tip.*=.*None")?;
+        zakurad.expect_stdout_line_matches("loaded Zakura state cache .*tip.*=.*None")?;
     }
 
     // Wait for the state to upgrade and the RPC port, if the upgrade is short.
@@ -2397,11 +2398,11 @@ fn zakura_state_conflict() -> Result<()> {
         ));
         dir_conflict_full.push(config.network.network.to_string().to_lowercase());
         format!(
-            "Opened Zebra state cache at {}",
+            "Opened Zakura state cache at {}",
             dir_conflict_full.display()
         )
     } else {
-        String::from("Opened Zebra state cache at ")
+        String::from("Opened Zakura state cache at ")
     };
 
     check_config_conflict(
@@ -2763,7 +2764,7 @@ async fn state_format_test(
     tracing::info!(?network, "running {test_name} using zakurad");
 
     zakurad.expect_stdout_line_matches("creating new database with the current format")?;
-    zakurad.expect_stdout_line_matches("loaded Zebra state cache")?;
+    zakurad.expect_stdout_line_matches("loaded Zakura state cache")?;
 
     // Give Zebra enough time to actually write the database to disk.
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -2849,7 +2850,7 @@ async fn state_format_test(
             zakurad.expect_stdout_line_matches("marked database format as downgraded")?;
         } else {
             zakurad.expect_stdout_line_matches("trying to open current database format")?;
-            zakurad.expect_stdout_line_matches("loaded Zebra state cache")?;
+            zakurad.expect_stdout_line_matches("loaded Zakura state cache")?;
         }
 
         // Give Zebra enough time to actually write the database to disk.
@@ -3448,7 +3449,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
     let indexer_listen_addr = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
 
-    tracing::info!("waiting for Zebra state cache to be opened");
+    tracing::info!("waiting for Zakura state cache to be opened");
 
     tokio::time::sleep(LAUNCH_DELAY).await;
 
@@ -3502,12 +3503,12 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
             .get_block(height.0 as i32)
             .await
             .map_err(|err| eyre!(err))?
-            .expect("Zebra test child should have the expected block");
+            .expect("Zakura test child should have the expected block");
 
         assert_eq!(
             zebra_block,
             Arc::new(expected_block),
-            "Zebra should have the same block"
+            "Zakura should have the same block"
         );
 
         let ReadResponse::Block(read_state_block) = read_state
@@ -3567,7 +3568,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
                     .bytes_in_serialized_order()
             }
             _ => Err(eyre!(
-                "Zebra does not support generating pre-Canopy block templates"
+                "Zakura does not support generating pre-Canopy block templates"
             ))?,
         }
         .into();
@@ -3628,12 +3629,12 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
             .get_block(height.0 as i32)
             .await
             .map_err(|err| eyre!(err))?
-            .expect("Zebra test child should have the expected block");
+            .expect("Zakura test child should have the expected block");
 
         assert_eq!(
             zebra_block,
             Arc::new(expected_block),
-            "Zebra should have the same block"
+            "Zakura should have the same block"
         );
 
         let ReadResponse::Block(read_state_block) = read_state
@@ -3652,7 +3653,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         );
     }
 
-    tracing::info!("restarting Zebra on Regtest");
+    tracing::info!("restarting Zakura on Regtest");
 
     child.kill(false)?;
     let output = child.wait_with_output()?;
@@ -3671,7 +3672,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
     let _rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
     let indexer_listen_addr = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
 
-    tracing::info!("waiting for Zebra state cache to be opened");
+    tracing::info!("waiting for Zakura state cache to be opened");
 
     tokio::time::sleep(LAUNCH_DELAY).await;
 
@@ -3794,7 +3795,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         mining_conf,
         false,
         "0.0.1",
-        "Zebra tests",
+        "Zakura tests",
         mempool.clone(),
         state.clone(),
         read_state.clone(),
@@ -4214,7 +4215,7 @@ async fn invalidate_and_reconsider_block() -> Result<()> {
     let mut child = test_dir.spawn_child(args!["start"])?;
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
 
-    tracing::info!("waiting for Zebra state cache to be opened");
+    tracing::info!("waiting for Zakura state cache to be opened");
 
     tokio::time::sleep(LAUNCH_DELAY).await;
 
@@ -4234,12 +4235,12 @@ async fn invalidate_and_reconsider_block() -> Result<()> {
             .get_block(height.0 as i32)
             .await
             .map_err(|err| eyre!(err))?
-            .expect("Zebra test child should have the expected block");
+            .expect("Zakura test child should have the expected block");
 
         assert_eq!(
             zebra_block,
             Arc::new(expected_block),
-            "Zebra should have the same block"
+            "Zakura should have the same block"
         );
     }
 
@@ -4312,7 +4313,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
 
     // Start Zebra and generate some blocks.
 
-    tracing::info!("starting Zebra and generating some blocks");
+    tracing::info!("starting Zakura and generating some blocks");
     let mut child = test_dir.spawn_child(args!["start"])?;
     // Avoid dropping the test directory and cleanup of the state cache needed by the next zakurad instance.
     let test_dir = child.dir.take().expect("should have test directory");
@@ -4339,7 +4340,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     // Check that Zebra will restore its non-finalized state from backup when the finalized tip is past the
     // max checkpoint height and that it can still commit more blocks to its state.
 
-    tracing::info!("restarting Zebra to check that non-finalized state is restored");
+    tracing::info!("restarting Zakura to check that non-finalized state is restored");
     let mut child = test_dir.spawn_child(args!["start"])?;
     let test_dir = child.dir.take().expect("should have test directory");
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
@@ -4350,7 +4351,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     let blockchain_info = rpc_client.blockchain_info().await?;
     tracing::info!(
         ?blockchain_info,
-        "got blockchain info after restarting Zebra"
+        "got blockchain info after restarting Zakura"
     );
 
     assert_eq!(
@@ -4359,7 +4360,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
         "tip block hash should match tip hash of previous zakurad instance"
     );
 
-    tracing::info!("checking that Zebra can commit blocks after restoring non-finalized state");
+    tracing::info!("checking that Zakura can commit blocks after restoring non-finalized state");
     rpc_client
         .generate(1)
         .await
@@ -4381,7 +4382,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     };
 
     tracing::info!(
-        "restarting Zebra to check that non-finalized state is _not_ restored when \
+        "restarting Zakura to check that non-finalized state is _not_ restored when \
          the finalized tip is below the max checkpoint height"
     );
     child.kill(true)?;
@@ -4393,7 +4394,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     // Check that the non-finalized state is not restored from backup when the finalized tip height is below the
     // max checkpoint height and that it can still commit more blocks to its state
 
-    tracing::info!("restarting Zebra with configured checkpoints to check that non-finalized state is not restored");
+    tracing::info!("restarting Zakura with configured checkpoints to check that non-finalized state is not restored");
     let network = Network::new_regtest(RegtestParameters {
         checkpoints: Some(configured_checkpoints),
         ..Default::default()
@@ -4412,7 +4413,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     assert_eq!(
         rpc_client.blockchain_info().await?.best_block_hash(),
         network.genesis_hash(),
-        "Zebra should not restore blocks from non-finalized backup if \
+        "Zakura should not restore blocks from non-finalized backup if \
          its finalized tip is below the max checkpoint height"
     );
 
@@ -4444,7 +4445,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     // and the non-finalized backup cache is disabled or empty.
 
     tracing::info!(
-        "restarting Zebra to check that blocks are committed when the non-finalized state \
+        "restarting Zakura to check that blocks are committed when the non-finalized state \
          is initially empty and the finalized tip is past the max checkpoint height"
     );
     config.state.should_backup_non_finalized_state = false;
@@ -4457,7 +4458,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     // Wait for Zebra to load its state cache
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    tracing::info!("checking that Zebra commits blocks with empty non-finalized state");
+    tracing::info!("checking that Zakura commits blocks with empty non-finalized state");
     rpc_client
         .generate(1)
         .await
@@ -4644,7 +4645,7 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
 
     tokio::time::sleep(Duration::from_secs(30)).await;
 
-    tracing::info!("calling getpeerinfo to confirm Zebra has dropped the peer connection");
+    tracing::info!("calling getpeerinfo to confirm Zakura has dropped the peer connection");
 
     // Call `getpeerinfo` to check that the zakurad instances have disconnected
     for i in 0..600 {

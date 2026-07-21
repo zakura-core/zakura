@@ -77,7 +77,7 @@ pub enum Error {
     Amount(#[from] BalanceError),
 
     /// Zebra's type could not be converted to its librustzcash equivalent.
-    #[error("Zebra's type could not be converted to its librustzcash equivalent: {0}")]
+    #[error("Zakura's type could not be converted to its librustzcash equivalent: {0}")]
     Conversion(String),
 }
 

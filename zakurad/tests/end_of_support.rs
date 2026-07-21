@@ -81,7 +81,7 @@ async fn end_of_support_task() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(15), eos_future)
         .await
         .expect_err(
-            "end of support task unexpectedly exited: it should keep running until Zebra exits",
+            "end of support task unexpectedly exited: it should keep running until Zakura exits",
         );
 
     assert!(logs_contain(

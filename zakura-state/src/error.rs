@@ -151,7 +151,7 @@ pub enum CommitBlockError {
     HeaderCommitError(#[from] Box<CommitHeaderRangeError>),
 
     /// The write task exited (likely during shutdown).
-    #[error("block commit task exited. Is Zebra shutting down?")]
+    #[error("block commit task exited. Is Zakura shutting down?")]
     #[non_exhaustive]
     WriteTaskExited,
 }

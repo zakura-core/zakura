@@ -1001,7 +1001,7 @@ impl StartCmd {
             }
         };
 
-        info!("exiting Zebra: asking other tasks to stop");
+        info!("exiting Zakura: asking other tasks to stop");
 
         // ongoing tasks
         rpc_task_handle.abort();
@@ -1052,7 +1052,7 @@ impl StartCmd {
         old_databases_task_handle.abort();
 
         info!(
-            "exiting Zebra: all tasks have been asked to stop, waiting for remaining tasks to finish"
+            "exiting Zakura: all tasks have been asked to stop, waiting for remaining tasks to finish"
         );
 
         exit_status

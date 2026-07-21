@@ -501,7 +501,7 @@ impl DbFormatChange {
                 // the database format should be valid. This check is done below.
                 info!(
                     %running_version,
-                    "checking database format produced by a previous zebra instance \
+                    "checking database format produced by a previous Zakura instance \
                      is current and valid"
                 );
             }
@@ -684,7 +684,7 @@ impl DbFormatChange {
             // database is marked, so the upgrade MUST be complete at this point.
             info!(
                 newer_running_version = ?upgrade.version(),
-                "Zebra automatically upgraded the database format"
+                "Zakura automatically upgraded the database format"
             );
             Self::mark_as_upgraded_to(db, &upgrade.version());
         }
@@ -821,7 +821,7 @@ impl DbFormatChange {
 
         assert!(
             running_version > disk_version,
-            "can't upgrade a database that is being opened by an older or the same Zebra version:\n\
+            "can't upgrade a database that is being opened by an older or the same Zakura version:\n\
              disk: {disk_version}\n\
              upgrade: {format_upgrade_version}\n\
              running: {running_version}"
@@ -837,7 +837,7 @@ impl DbFormatChange {
 
         assert!(
             format_upgrade_version <= &running_version,
-            "can't upgrade to a newer version than the running Zebra version:\n\
+            "can't upgrade to a newer version than the running Zakura version:\n\
              disk: {disk_version}\n\
              upgrade: {format_upgrade_version}\n\
              running: {running_version}"
@@ -880,7 +880,7 @@ impl DbFormatChange {
 
         assert!(
             disk_version >= running_version,
-            "can't downgrade a database that is being opened by a newer Zebra version:\n\
+            "can't downgrade a database that is being opened by a newer Zakura version:\n\
              disk: {disk_version}\n\
              running: {running_version}"
         );

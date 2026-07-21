@@ -295,10 +295,11 @@ struct HeaderRootAuthState {
 }
 ```
 
-The root scheduler requests from `authenticated.confirmed_height + 1` and does not
-schedule promotable roots above `completed_checkpoint.height`. It may request the
-single additional successor witness needed to confirm the root at that upper bound.
-Neither frontier is inferred from a network request flag or a successful response.
+The root scheduler requests from `authenticated.confirmed_height + 1`. Both every
+promoted root and its successor witness must be at or below
+`completed_checkpoint.height`, so the highest promotable root is strictly below that
+frontier. Neither frontier is inferred from a network request flag or a successful
+response.
 
 State validates all of the following before promotion:
 
@@ -591,10 +592,12 @@ serialized, this requires no network-side lazy rebuild.
 Root authentication is required only through the last checkpoint used by VCT fast
 sync.
 
-To authenticate the last checkpoint root at height `C`, the root lane requests header
-`C + 1` as the successor witness. The embedded final frontier remains an independent
-handoff check: its Sapling, Orchard, and Ironwood roots must equal the authenticated
-roots at `C` before the frontier is written.
+To authenticate the last VCT checkpoint root at height `C`, state must first publish a
+later completed checkpoint bracket that canonically covers successor header `C + 1`.
+An uncheckpointed successor is insufficient: a competing valid successor can commit
+to different parent auxiliary inputs. The embedded final frontier remains an
+independent handoff check: its Sapling, Orchard, and Ironwood roots must equal the
+authenticated roots at `C` before the frontier is written.
 
 Above `C`, ordinary semantic verification and tree updates resume. Header sync stops
 requesting tree-aux roots unless another feature requires them.
@@ -808,6 +811,9 @@ Complete on `main`:
 
 ### Phase 1: establish the persistence boundary
 
+Implemented in draft
+[PR #323](https://github.com/zakura-core/zakura/pull/323).
+
 1. Add the database format transition from Section 6.1.
 2. Add the minimal durable `HeaderRootAuthFrontier` representation needed by that
    transition.
@@ -824,6 +830,9 @@ Complete on `main`:
 
 ### Phase 2: add the state-owned frontier
 
+Implemented in draft
+[PR #323](https://github.com/zakura-core/zakura/pull/323).
+
 1. Add `CompletedCheckpointFrontier`.
 2. Advance the completed-checkpoint frontier only after a durable bracket-closing
    header commit.
@@ -834,6 +843,9 @@ Complete on `main`:
 
 ### Phase 3: add root authentication requests
 
+Implemented in draft
+[PR #323](https://github.com/zakura-core/zakura/pull/323).
+
 1. Add `AuthenticateHeaderRoots`.
 2. Validate canonical stored header hashes before cryptographic verification.
 3. Call `verify_supplied_roots_from_parts`.
@@ -842,14 +854,16 @@ Complete on `main`:
 
 ### Phase 4: schedule overlap
 
+Implemented in draft
+[PR #323](https://github.com/zakura-core/zakura/pull/323).
+
 1. Add a root-authentication work priority or lane.
 2. Request from `confirmed_height + 1`.
 3. Include one successor witness.
 4. Start the next request at the previous response's final header.
 5. Share responses with header discovery when their frontiers align.
 6. Gate promotion on the state-published `CompletedCheckpointFrontier`.
-7. Permit one canonical successor witness above that frontier without promoting its
-   root.
+7. Require the successor witness itself to be covered by that frontier.
 
 ### Phase 5: integrate VCT consumption
 
@@ -927,8 +941,7 @@ Complete on `main`:
 - Root authentication waits for the contiguous canonical prefix.
 - A completed checkpoint bracket authenticates strictly upward.
 - `RangeRequest.finalized` never authorizes root promotion.
-- A successor witness above the completed checkpoint frontier can confirm the
-  frontier root but is not itself promoted.
+- A successor witness above the completed checkpoint frontier confirms no root.
 - Forward header progress does not move the root frontier past a gap.
 
 ### Restart and handoff
@@ -936,7 +949,8 @@ Complete on `main`:
 - Restart resumes at `confirmed_height + 1`.
 - The first post-restart request overlaps the correct canonical header.
 - No unverified tip root survives restart.
-- The last checkpoint root is confirmed by its successor.
+- The last VCT checkpoint root is confirmed only after a later completed checkpoint
+  covers its successor.
 - The embedded frontier must match the authenticated last-checkpoint roots.
 
 ## 22. Metrics and diagnostics

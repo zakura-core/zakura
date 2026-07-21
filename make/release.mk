@@ -22,7 +22,10 @@ pre-release:
 
 pre-release-changelog:
 	@test -n "$(RELEASE_TAG)" || { echo "RELEASE_TAG is required, e.g. make pre-release-changelog RELEASE_TAG=v1.0.0" >&2; exit 1; }
-	./scripts/changelog.py release "$(RELEASE_TAG)" --check
+	@./scripts/changelog.py release "$(RELEASE_TAG)" --check || { \
+		echo "WARNING: release changelog is stale; run make prepare-release-changelog RELEASE_TAG=$(RELEASE_TAG), review the diff, and commit it." >&2; \
+		exit 1; \
+	}
 
 pre-release-version:
 	@test -n "$(RELEASE_TAG)" || { echo "RELEASE_TAG is required, e.g. make pre-release-version RELEASE_TAG=v1.0.0" >&2; exit 1; }

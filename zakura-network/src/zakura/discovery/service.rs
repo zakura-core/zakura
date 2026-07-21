@@ -420,12 +420,17 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
                 other_service_owner =
                     peer_has_other_service_owner(&connection_owners, &peer_id, conn_id);
             }
-            if exchanged && !other_service_owner {
+            let closes_discovery_only_connection = exchanged
+                && !other_service_owner
+                && handle
+                    .is_current_session(&peer_id, conn_id, session_id)
+                    .await;
+            if closes_discovery_only_connection {
                 handle.mark_short_lived_exchange(&peer_node_id).await;
             }
             service_cancel.cancel();
             handle.remove_session(&peer_id, conn_id, session_id).await;
-            if exchanged && !other_service_owner {
+            if closes_discovery_only_connection {
                 source_close_cause.record("discovery_exchange_complete");
                 connection_cancel.cancel();
             }
@@ -662,11 +667,13 @@ impl DiscoverySource {
         let cancel = self.session.cancel_token();
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => {}
+            _ = cancel.cancelled() => return false,
             _ = self.progress.wait_complete() => {}
             _ = tokio::time::sleep(DISCOVERY_EXCHANGE_SETTLE_TIMEOUT) => {}
         }
-        true
+        self.handle
+            .is_current_session(self.session.peer_id(), self.conn_id, self.session_id)
+            .await
     }
 
     async fn refresh_after_interval(&self) -> Result<(), ()> {
@@ -1693,6 +1700,69 @@ mod tests {
                 .is_err(),
             "a replaced discovery stream must not emit another exchange"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovery_source_replaced_during_settle_does_not_complete_exchange(
+    ) -> Result<(), crate::BoxError> {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: SecretKey::from_bytes(&[48u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let peer_node_id = SecretKey::from_bytes(&[49u8; 32]).public();
+        let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
+        assert_eq!(
+            handle
+                .admit_peer_session(2, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+
+        let (send, mut recv) = framed_channel(4);
+        let progress = Arc::new(DiscoveryExchangeProgress::default());
+        let source = DiscoverySource {
+            handle: handle.clone(),
+            session: DiscoveryPeerSession {
+                peer_id: peer_id.clone(),
+                direction: ServicePeerDirection::Inbound,
+                send,
+                cancel: CancellationToken::new(),
+            },
+            conn_id: 2,
+            session_id: 1,
+            progress: progress.clone(),
+        };
+        let source_task = tokio::spawn(async move { source.run_initial_exchange().await });
+        for _ in 0..3 {
+            recv.recv()
+                .await
+                .expect("initial discovery request is sent");
+        }
+
+        assert_eq!(
+            handle
+                .admit_peer_session(2, 2, peer_id, ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+        progress.mark_hello();
+        progress.mark_peers();
+        progress.mark_services();
+
+        assert!(!source_task.await?);
         Ok(())
     }
 

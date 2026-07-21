@@ -755,8 +755,8 @@ The embedded Mainnet frontier is a release artifact coupled to the terminal Main
 whenever `main-checkpoints.txt`'s max height advances, the matching
 `zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin` must be regenerated from a
 synced Zakura state at the new max height, and both must land in the same PR. The offline
-exporter below produces that coupled pair; the follow-up release-state pipeline PR adds the
-publisher, refresh workflow, and release gate that consume it.
+exporter below produces that coupled pair; the publisher, refresh workflow, and release gate
+below consume it.
 
 ### 16.1 Offline export (`zakura-checkpoints --state-cache-dir`)
 
@@ -798,7 +798,27 @@ zakura-checkpoints \
 - Checkpoint lines go to stdout; all status goes to stderr. RPC mode remains for Testnet
   updates and diagnostics.
 
-### 16.2 Committed provenance
+### 16.2 Bundle, pointer, and refresh workflow
+
+The publisher (`deploy/release-state/`) uploads each export to R2 as an immutable bundle
+`release-state/v1/<height>/{meta.json, main-checkpoints.txt, mainnet-frontier.bin}` — where
+`meta.json` binds the network, terminal height/hash, an RFC 3339 generation time, and each
+file's size and SHA-256 — then atomically replaces the mutable `release-state/latest.json`
+pointer (height, hash, `meta_url`, `meta_sha256`), keeping the newest few bundles.
+
+The `update-release-state.yml` workflow (manual dispatch plus a weekly cron) resolves the
+pointer once over a pinned HTTPS host with no redirects, bounded reads, digest verification
+at every hop, and a maximum bundle age. It exits green without changes when the bundle does
+not advance the committed list. Otherwise it verifies the committed `main-checkpoints.txt` is
+a byte-identical prefix of the bundle's list, replaces the checkpoint file and frontier,
+writes `vct/mainnet-frontier.json` provenance (source `release-state-bundle`, heights,
+digests, bundle binding), floors `ESTIMATED_RELEASE_HEIGHT`, validates everything —
+including `cargo test -p zakura-state --lib -- frontier` — restricts the diff to exactly
+those four files, and opens a signed **draft PR** for human review. Checkpoints are
+consensus-critical: the reviewed, committed files are the trust root, and the pipeline's
+digests only prove faithful transport from our own publisher.
+
+### 16.3 Committed provenance and the release gate
 
 `vct/mainnet-frontier.json` is committed next to the frontier. The
 `embedded_mainnet_final_frontiers_parse` unit test re-derives its digests from the embedded
@@ -806,10 +826,14 @@ checkpoint list and frontier bytes on every PR, so a desynced checkpoint/frontie
 combination fails ordinary CI. The current frontier predates the pipeline and is recorded
 honestly as `source: legacy-bootstrap`.
 
-The pipeline PR adds a release gate over this record, so a release cannot ship
-`legacy-bootstrap` state once the pipeline is live.
+`make pre-release` runs `scripts/check-release-state.sh`, which re-verifies the pairing
+without cargo and rejects `legacy-bootstrap` provenance so a release cannot ship bootstrap
+state once the pipeline is live; `ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=1` (or the
+`allow_bootstrap_release_state` input on `create-release.yml`) is the documented emergency
+override. Release creation never consults the moving R2 pointer — it validates only
+committed source.
 
-### 16.3 Local test contract
+### 16.4 Local test contract
 
 Byte compatibility with the node loader is proven by the `zakura-state` frontier tests: they
 produce frontier bytes from a small generated `FinalizedState`, load them through the same

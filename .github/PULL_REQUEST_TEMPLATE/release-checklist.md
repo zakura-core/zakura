@@ -8,11 +8,14 @@ assignees: ""
 
 # Prepare for the Release
 
-# Checkpoints
+# Mainnet Release State
 
-For performance and security, we want to update the Zakura checkpoints in every release.
+For performance and security, every release should carry a current Mainnet checkpoint list and its matching VCT frontier.
 
-- [ ] You can copy the latest checkpoints from CI by following [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/zakura-utils/README.md#zakura-checkpoints).
+- [ ] Run the [Update Mainnet release state workflow](https://github.com/zakura-core/zakura/actions/workflows/update-release-state.yml) from `main`. It imports the newest publisher bundle and opens or updates a draft PR (it exits green with no PR when the committed state is already current).
+- [ ] Review and merge that draft PR: the diff is append-only over the committed checkpoint list; spot-check a few new heights and the terminal hash against an independent node or explorer.
+- [ ] `make pre-release` verifies the committed pairing and rejects pre-pipeline `legacy-bootstrap` state; for an emergency release with a broken publisher, export `ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=1` locally, check the `allow_bootstrap_release_state` input when dispatching the Create release workflow, and note it in the release PR.
+- [ ] Testnet checkpoints are still updated manually when needed, per [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/zakura-utils/README.md#zakura-checkpoints).
 
 # Missed Dependency Updates
 
@@ -189,7 +192,7 @@ cargo release replace --verbose --execute --allow-branch '*' -p zakura
 The end of support height is calculated from the current blockchain height:
 
 - [ ] Find where the Zcash blockchain tip is now by using a [Zcash Block Explorer](https://mainnet.zcashexplorer.app/) or other tool.
-- [ ] Replace `ESTIMATED_RELEASE_HEIGHT` in [`end_of_support.rs`](https://github.com/zakura-core/zakura/blob/main/zakurad/src/components/sync/end_of_support.rs) with the height you estimate the release will be tagged.
+- [ ] Replace `ESTIMATED_RELEASE_HEIGHT` in [`end_of_support.rs`](https://github.com/zakura-core/zakura/blob/main/zakurad/src/components/sync/end_of_support.rs) with the height you estimate the release will be tagged. (The release-state PR floors this value near its bundle height, but this manual estimate is authoritative — with an 18-day support window, days matter.)
 
 <details>
 

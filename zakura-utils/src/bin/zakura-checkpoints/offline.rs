@@ -384,7 +384,6 @@ mod tests {
             "rows must start immediately above the base height"
         );
     }
-
     #[test]
     fn header_links_must_extend_the_preceding_canonical_hash() {
         let expected_parent = test_hash(10);

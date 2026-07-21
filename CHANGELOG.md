@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   (`vct/mainnet-frontier.json`) that CI verifies against the embedded
   checkpoint list and frontier on every PR. Groundwork for automated
   release-state updates.
+- Automate Mainnet checkpoint and VCT frontier refreshes: the
+  `update-release-state.yml` workflow imports digest-verified publisher bundles
+  from R2 into reviewable draft PRs, and `make pre-release` now verifies the
+  committed checkpoint/frontier/provenance coupling (rejecting pre-pipeline
+  bootstrap state unless explicitly overridden).
 
 ### Fixed
 

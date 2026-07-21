@@ -43,7 +43,7 @@ use crate::{
     },
     peer_cache_updater::peer_cache_updater,
     peer_set::{set::MorePeers, ActiveConnectionCounter, CandidateSet, ConnectionTracker, PeerSet},
-    protocol::external::{canonical_socket_addr, types::PeerServices},
+    protocol::external::{canonical_peer_addr, canonical_socket_addr, types::PeerServices},
     AddressBook, BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
 };
 
@@ -775,7 +775,14 @@ where
         };
 
         if let Ok((tcp_stream, addr)) = inbound_result {
-            let addr: PeerSocketAddr = addr.into();
+            // Canonicalize IPv4-mapped IPv6 (`::ffff:A.B.C.D`) from dual-stack sockets so the
+            // ban check, the recent-inbound limiter, and the PeerSet key all match the
+            // canonical form used by the ban map and address book.
+            //
+            // TODO(test): this async accept loop over a real `TcpListener` isn't unit-tested
+            // directly; the equivalence of mapped and canonical forms is covered by the
+            // peer-set tests in `peer_set::set::tests`.
+            let addr: PeerSocketAddr = canonical_peer_addr(addr);
             let addr_label = addr.addr_label(config.expose_peer_addresses);
 
             if bans.contains(addr.ip()) {

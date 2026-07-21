@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Make retained peer-ban insertion and eviction O(1) rather than O(N),
   preventing ban-list maintenance from slowing as the 20,000-IP bound fills
   ([#286](https://github.com/zakura-core/zakura/pull/286)).
+- Canonicalize IPv4-mapped IPv6 inbound peer addresses on dual-stack listeners so
+  bans, the recent-inbound rate limiter, and `max_connections_per_ip` can no longer
+  be evaded. On a dual-stack bind (`[::]` with `IPV6_V6ONLY=false`), Linux reports an
+  inbound IPv4 peer as `::ffff:A.B.C.D`, but the ban map and address book are keyed on
+  the canonical `A.B.C.D`. The inbound accept path and the peer set compared the raw
+  mapped address, so a banned or rate-limited peer could bypass enforcement by
+  reconnecting in the other address form. The accept path now canonicalizes at the
+  boundary, and the peer-set ban re-checks and per-IP accounting canonicalize before
+  comparing. Nodes that bind `0.0.0.0` are unaffected.
 
 ## [1.0.2] - 2026-07-20
 

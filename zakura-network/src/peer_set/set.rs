@@ -162,6 +162,16 @@ pub struct CancelClientWork;
 
 type ResponseFuture = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send + 'static>>;
 
+/// Canonicalizes an [`IpAddr`] so an IPv4-mapped IPv6 address (`::ffff:A.B.C.D`) compares
+/// equal to its canonical IPv4 form.
+///
+/// The ban map and address book are keyed on canonical IPs, but a dual-stack listener reports
+/// inbound IPv4 peers as IPv4-mapped IPv6. Canonicalizing before comparing keeps ban re-checks
+/// and per-IP connection accounting from treating the two forms as different hosts.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    canonical_socket_addr(SocketAddr::new(ip, 0)).ip()
+}
+
 /// Classification of a `FindBlocks`/`FindHeaders` response, sent from a
 /// response-wrapping future to [`PeerSet::poll_ready`] via an mpsc channel so
 /// the stall tracker can be updated and the peer disconnected if needed.
@@ -593,7 +603,7 @@ where
                         "service became ready"
                     );
 
-                    if self.bans.contains(key.ip()) {
+                    if self.bans.contains(canonical_ip(key.ip())) {
                         warn!(
                             peer = %key.addr_label(self.expose_peer_addresses),
                             "service is banned, dropping service"
@@ -677,7 +687,7 @@ where
             match peer_readiness {
                 // Still ready, add it back to the list.
                 Ok(()) => {
-                    if self.bans.contains(key.ip()) {
+                    if self.bans.contains(canonical_ip(key.ip())) {
                         debug!(
                             peer = %key.addr_label(self.expose_peer_addresses),
                             "service ip is banned, dropping service"
@@ -714,10 +724,11 @@ where
     /// This method is `O(connected peers)`, so it should not be called from a loop
     /// that is already iterating through the peer set.
     fn num_peers_with_ip(&self, ip: IpAddr) -> usize {
+        let ip = canonical_ip(ip);
         self.ready_services
             .keys()
             .chain(self.cancel_handles.keys())
-            .filter(|addr| addr.ip() == ip)
+            .filter(|addr| canonical_ip(addr.ip()) == ip)
             .count()
     }
 
@@ -1391,7 +1402,7 @@ where
             return;
         };
 
-        remaining_peers.retain(|addr| !self.bans.contains(addr.ip()));
+        remaining_peers.retain(|addr| !self.bans.contains(canonical_ip(addr.ip())));
 
         let Ok(reserved_send_slot) = sender.try_reserve() else {
             self.queued_broadcast_all = Some((req, sender, remaining_peers));

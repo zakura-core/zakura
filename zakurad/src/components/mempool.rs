@@ -475,19 +475,6 @@ impl Mempool {
         }
     }
 
-    /// Remove transaction ids that no longer need gossip, such as expired or
-    /// evicted ones, from a given list of inserted ids.
-    fn remove_from_peer_list(
-        send_to_peers_ids: &HashSet<UnminedTxId>,
-        remove_ids: &HashSet<UnminedTxId>,
-    ) -> HashSet<UnminedTxId> {
-        send_to_peers_ids
-            .iter()
-            .filter(|id| !remove_ids.contains(id))
-            .copied()
-            .collect()
-    }
-
     /// Update metrics for the mempool.
     fn update_metrics(&mut self) {
         // Shutdown if needed
@@ -723,8 +710,7 @@ impl Service<Request> for Mempool {
                             }
 
                             if !evicted_ids.is_empty() {
-                                send_to_peers_ids =
-                                    Self::remove_from_peer_list(&send_to_peers_ids, &evicted_ids);
+                                send_to_peers_ids.retain(|id| !evicted_ids.contains(id));
                                 invalidated_ids.extend(evicted_ids);
                             }
 
@@ -821,9 +807,7 @@ impl Service<Request> for Mempool {
             // So we don't need to check them here.
             if let Some(tip_height) = best_tip_height {
                 let expired_transactions = storage.remove_expired_transactions(tip_height);
-                // Remove transactions that are expired from the peers list
-                send_to_peers_ids =
-                    Self::remove_from_peer_list(&send_to_peers_ids, &expired_transactions);
+                send_to_peers_ids.retain(|id| !expired_transactions.contains(id));
 
                 if !expired_transactions.is_empty() {
                     tracing::debug!(

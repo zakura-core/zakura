@@ -112,6 +112,14 @@ if [ ! -d ${CTL_CLONE_REMOTE} ]; then
 else
   git -C ${CTL_CLONE_REMOTE} fetch --depth 1 origin main && git -C ${CTL_CLONE_REMOTE} checkout -f origin/main
 fi
+# B-14 local patch: each leg's fork grows ~116 GB and the harness keeps the
+# baseline fork alive through the primary leg, which filled the disk to 0
+# twice; free it as soon as its summary row is written (banner-safe, proven
+# live). Idempotent; reapplied after every checkout. Upstream PR pending.
+if ! grep -q "perf-lab B-14" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh; then
+  sed -i '/summary_row "\$BASELINE_SPEC (baseline)"/s/$/; rm -rf "$CUR_FORK"  # perf-lab B-14: free baseline fork before primary leg/' \
+    ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh
+fi
 mkdir -p ${BENCH_OUT_REMOTE}
 echo "remote prep done"
 REMOTE

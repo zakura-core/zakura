@@ -817,7 +817,7 @@ pub(super) fn header_sync_wire_error_kind(error: &HeaderSyncWireError) -> &'stat
     match error {
         HeaderSyncWireError::OversizedPayload { .. } => "oversized_payload",
         HeaderSyncWireError::HeaderCountLimit { .. } => "header_count_limit",
-        HeaderSyncWireError::InvalidRangeGeometry { .. } => "invalid_range_geometry",
+        HeaderSyncWireError::InvalidRange { .. } => "invalid_range",
         HeaderSyncWireError::EmptyHeaderRangePayload => "empty_header_range_payload",
         HeaderSyncWireError::EntryHeightMismatch { .. } => "entry_height_mismatch",
         HeaderSyncWireError::BodySizeCountMismatch { .. } => "body_size_count_mismatch",

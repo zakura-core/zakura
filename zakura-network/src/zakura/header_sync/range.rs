@@ -34,7 +34,7 @@ impl HeaderRangeEntry {
             })?;
         if count != 0 {
             CheckedHeaderRange::from_count(start, count)
-                .ok_or(HeaderSyncWireError::InvalidRangeGeometry { start, count })?;
+                .ok_or(HeaderSyncWireError::InvalidRange { start, count })?;
         }
         let mut roots = if tree_aux_roots.is_empty() {
             None
@@ -147,7 +147,7 @@ impl HeaderRangePayload {
                 max: usize::try_from(u32::MAX).unwrap_or(usize::MAX),
             })?;
         CheckedHeaderRange::from_count(first.height, count).ok_or(
-            HeaderSyncWireError::InvalidRangeGeometry {
+            HeaderSyncWireError::InvalidRange {
                 start: first.height,
                 count,
             },
@@ -159,7 +159,7 @@ impl HeaderRangePayload {
                 .0
                 .checked_add(1)
                 .map(block::Height)
-                .ok_or(HeaderSyncWireError::InvalidRangeGeometry {
+                .ok_or(HeaderSyncWireError::InvalidRange {
                     start: first.height,
                     count,
                 })?;

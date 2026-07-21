@@ -52,7 +52,7 @@ pub enum HeaderSyncWireError {
     #[error(
         "Zakura header-sync range starting at {start:?} has invalid or overflowing count {count}"
     )]
-    InvalidRangeGeometry {
+    InvalidRange {
         /// First requested or delivered height.
         start: block::Height,
         /// Number of heights.

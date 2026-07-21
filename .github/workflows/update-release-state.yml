@@ -158,7 +158,10 @@ jobs:
 
       - name: Re-prove the checkpoint/frontier pairing in cargo
         if: steps.import.outputs.has_changes == 'true'
-        run: cargo test -p zakura-state --lib -- frontier sprout_change
+        run: |
+          cargo test -p zakura-state --lib -- frontier sprout_change
+          cargo test -p zakura-state --lib -- \
+            embedded_mainnet_artifact_matches_frozen_identity_and_current_sprout_root
 
       - name: Restrict the generated diff to release-state files
         if: steps.import.outputs.has_changes == 'true'

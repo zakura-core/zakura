@@ -16,6 +16,17 @@ die() { echo "bench.sh: $*" >&2; exit 1; }
 # guard as droplet.sh names
 check_label() { case "$1" in *[!A-Za-z0-9._-]*) die "bad label: $1";; esac; }
 
+# Pin symbolic refs to a SHA at start time: origin/main can move mid-run, and
+# the harness re-resolves the ref per leg — an unpinned A/B could build two
+# different commits (seen live 2026-07-21).
+resolve_sha() {
+  local ref="$1"
+  if [[ "$ref" =~ ^[0-9a-f]{7,40}$ ]]; then printf '%s\n' "$ref"; return; fi
+  git ls-remote --exit-code origin "refs/heads/$ref" 2>/dev/null | awk '{print $1}' \
+    || git rev-parse --verify --quiet "$ref^{commit}" \
+    || die "cannot resolve ref: $ref"
+}
+
 ip_of() { bash "$DIR/droplet.sh" ip "$1"; }
 
 cmd_start() {
@@ -43,6 +54,8 @@ cmd_start() {
     case "$k" in [!A-Za-z_]*|*[!A-Za-z0-9_]*) die "bad env key: $k";; esac
     env_str+=" $k='${v//\'/\'\\\'\'}'"
   done
+  build_ref="$(resolve_sha "$build_ref")"
+  baseline_ref="$(resolve_sha "$baseline_ref")"
   local ip; ip="$(ip_of "$name")"; [ -n "$ip" ] || die "no droplet $name"
   # shellcheck disable=SC2087  # client-side expansion of label/refs is intended
   $SSH "${SSH_OPTS[@]}" "root@$ip" bash -s <<REMOTE
@@ -50,6 +63,10 @@ set -euo pipefail
 # fresh per-label output: the bench script APPENDS to summary.md, so a stale
 # same-label dir would leave two tables in one file
 rm -rf ${BENCH_OUT_REMOTE}/${label} ${BENCH_OUT_REMOTE}/${label}.log ${BENCH_OUT_REMOTE}/${label}.pid ${BENCH_OUT_REMOTE}/${label}.exit
+# the harness never deletes its per-leg forks (~25-85 GB each) and a full disk
+# stalls RocksDB into the wall cap (seen live 2026-07-21); one bench per
+# droplet makes clearing them at start safe
+rm -rf ${BENCH_HOME_REMOTE}/forks/*
 mkdir -p ${BENCH_OUT_REMOTE}/${label}
 cd ${CTL_CLONE_REMOTE}
 # the subshell records the true exit code; nohup+disown+detached stdio survive
@@ -103,6 +120,9 @@ cmd_collect() {
     > "$dest/verdict.json"
   echo "$dest/verdict.json"
   cat "$dest/verdict.json"
+  # artifacts are safely local now; free the droplet's copy (kept on failed
+  # collects for forensics, since the die paths above skip this)
+  $SSH "${SSH_OPTS[@]}" "root@$ip" "rm -rf ${BENCH_OUT_REMOTE}/${label} ${BENCH_OUT_REMOTE}/${label}.log ${BENCH_OUT_REMOTE}/${label}.pid ${BENCH_OUT_REMOTE}/${label}.exit" || true
 }
 
 case "${1:-}" in

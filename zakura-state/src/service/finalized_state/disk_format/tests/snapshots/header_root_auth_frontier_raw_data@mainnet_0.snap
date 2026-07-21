@@ -1,0 +1,11 @@
+---
+source: zakura-state/src/service/finalized_state/disk_format/tests/snapshot.rs
+assertion_line: 150
+expression: cf_data
+---
+[
+  KV(
+    k: "",
+    v: "010000000008ce3d9731b000c08338455c8a4a6bd05da16e26b11daa1b917184ece80f040000",
+  ),
+]

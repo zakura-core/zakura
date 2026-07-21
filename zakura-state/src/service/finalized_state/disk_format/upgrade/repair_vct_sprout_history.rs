@@ -1034,7 +1034,7 @@ mod tests {
         assert_eq!(
             db.format_version_on_disk()
                 .expect("version remains readable"),
-            Some(REPAIR_VERSION)
+            Some(state_database_format_version_in_code())
         );
         assert_eq!(db.hash(first_height), Some(first_hash));
         assert_eq!(db.height(first_hash), Some(first_height));
@@ -1290,7 +1290,7 @@ mod tests {
         assert_eq!(
             db.format_version_on_disk()
                 .expect("version remains readable"),
-            Some(REPAIR_VERSION)
+            Some(state_database_format_version_in_code())
         );
     }
 
@@ -1416,7 +1416,7 @@ mod tests {
         assert_eq!(
             db.format_version_on_disk()
                 .expect("version remains readable"),
-            Some(REPAIR_VERSION)
+            Some(state_database_format_version_in_code())
         );
     }
 
@@ -1550,7 +1550,7 @@ mod tests {
                 .db
                 .format_version_on_disk()
                 .expect("version remains readable"),
-            Some(REPAIR_VERSION)
+            Some(state_database_format_version_in_code())
         );
         drop(repaired);
 
@@ -1670,8 +1670,8 @@ mod tests {
                 .db
                 .format_version_on_disk()
                 .expect("version is readable"),
-            Some(REPAIR_VERSION),
-            "normal continuation preserves the completed repair version"
+            Some(state_database_format_version_in_code()),
+            "normal continuation preserves the completed database version"
         );
     }
 
@@ -1736,7 +1736,14 @@ mod tests {
     #[test]
     fn custom_network_does_not_consume_mainnet_repair_input() {
         let (_cache, config) = persistent_config();
-        let network = Network::new_regtest(Default::default());
+        let network = Network::new_regtest(zakura_chain::parameters::testnet::RegtestParameters {
+            activation_heights: zakura_chain::parameters::testnet::ConfiguredActivationHeights {
+                heartwood: Some(10_000),
+                canopy: Some(10_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
         let handoff = Height(1);
         let hash = block::Hash([1; 32]);
         let path = seed_repair_db(&config, &network, handoff, &[(handoff, hash)]);
@@ -1759,7 +1766,7 @@ mod tests {
         assert_eq!(
             db.format_version_on_disk()
                 .expect("version remains readable"),
-            Some(REPAIR_VERSION)
+            Some(state_database_format_version_in_code())
         );
         assert!(!db.contains_sprout_anchor(&roots[0]));
     }

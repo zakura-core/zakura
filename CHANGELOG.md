@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Advance legacy sync from a state restarted 1-2 blocks behind the network
+  tip: when `FindBlocks` responses are too short to survive the zcashd
+  trailing-hash guard, the syncer now falls back to `FindHeaders` and
+  downloads the blocks whose header parent links anchor in its own chain,
+  instead of repeatedly exhausting the prospective tip set without progress.
 - Keep valid internal-miner work running across mempool-only block template
   updates ([#226](https://github.com/zakura-core/zakura/pull/226)).
 - Honor `disable_pow = true` during native header sync on configured Testnets,

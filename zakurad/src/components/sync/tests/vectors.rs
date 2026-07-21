@@ -92,6 +92,55 @@ fn oversized_find_blocks_response_is_rejected() {
     assert!(sync::has_valid_tips_response_hash_count(stripped));
 }
 
+#[test]
+fn malformed_find_headers_responses_are_rejected() -> Result<(), crate::BoxError> {
+    let block1: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let block2: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+
+    let mut foreign_header = *block2.header;
+    foreign_header.previous_block_hash = block::Hash([0xff; 32]);
+
+    let block1_header = block::CountedHeader {
+        header: block1.header.clone(),
+    };
+    let block2_header = block::CountedHeader {
+        header: block2.header.clone(),
+    };
+    let cases = [
+        (
+            "foreign fork",
+            vec![block::CountedHeader {
+                header: Arc::new(foreign_header),
+            }],
+        ),
+        (
+            "unknown header followed by a known header",
+            vec![block2_header.clone(), block1_header],
+        ),
+        (
+            // An anchored first header followed by an unknown header that does
+            // not link to it: the run must not survive a broken parent chain.
+            "gapped run",
+            vec![block2_header.clone(), block2_header.clone()],
+        ),
+        (
+            "oversized response",
+            vec![block2_header; sync::MAX_TIPS_RESPONSE_HASH_COUNT + 1],
+        ),
+    ];
+
+    let known_hashes = HashSet::from([block1.hash()]);
+    for (name, headers) in cases {
+        let hashes = sync::anchored_header_hashes(headers, &known_hashes);
+
+        assert!(hashes.is_empty(), "{name} must contribute no hashes");
+    }
+
+    Ok(())
+}
+
 /// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and blocks 3-4 using extend_tips.
 ///
 /// This test also makes sure that the syncer downloads blocks in order.
@@ -326,6 +375,147 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
     );
 
     // Check that nothing unexpected happened.
+    block_verifier_router.expect_no_requests().await;
+    state_service.expect_no_requests().await;
+
+    let chain_sync_result = chain_sync_task_handle.now_or_never();
+    assert!(
+        chain_sync_result.is_none(),
+        "unexpected error or panic in chain sync task: {chain_sync_result:?}",
+    );
+
+    Ok(())
+}
+
+/// A node restarted exactly one block behind the network must still advance.
+///
+/// Peers answer `FindBlocks` with a single hash, which the zcashd trailing-hash
+/// strip discards, so `obtain_tips` alone can never extend the chain (the
+/// near-tip sync dead zone). The syncer must fall back to `FindHeaders`, verify
+/// that the offered header anchors at our tip via its parent link, and download
+/// the block.
+#[tokio::test]
+async fn sync_near_tip_one_block_uses_header_fallback() -> Result<(), crate::BoxError> {
+    // Get services
+    let (
+        chain_sync_future,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        mut state_service,
+        _mock_chain_tip_sender,
+    ) = setup();
+
+    // Get blocks: the local chain already has blocks 0-1, the network has block 2.
+    let block0: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into()?;
+    let block0_hash = block0.hash();
+
+    let block1: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let block1_hash = block1.hash();
+
+    let block2: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    let block2_hash = block2.hash();
+
+    // Start the syncer
+    let chain_sync_task_handle = tokio::spawn(chain_sync_future);
+
+    // ChainSync::request_genesis: genesis is already in the state.
+    state_service
+        .expect_request(zs::Request::KnownBlock(block0_hash))
+        .await
+        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
+
+    // ChainSync::obtain_tips
+
+    // State is asked for a block locator.
+    state_service
+        .expect_request(zs::Request::BlockLocator)
+        .await
+        .respond(zs::Response::BlockLocator(vec![block1_hash]));
+
+    // A peer one block ahead answers with a single hash. Stripping the
+    // possibly-appended trailing hash discards the entire response, so this
+    // response alone must trigger the header fallback.
+    peer_set
+        .expect_request(zn::Request::FindBlocks {
+            known_blocks: vec![block1_hash],
+            stop: None,
+        })
+        .await
+        .respond(zn::Response::BlockHashes(vec![block2_hash]));
+
+    // Clear remaining block locator requests
+    for _ in 0..(sync::FANOUT - 1) {
+        peer_set
+            .expect_request(zn::Request::FindBlocks {
+                known_blocks: vec![block1_hash],
+                stop: None,
+            })
+            .await
+            .respond(Err(zn::BoxError::from("synthetic test obtain tips error")));
+    }
+
+    // ChainSync::headers_anchored_download_set
+
+    // The fallback asks peers for headers with the same locator.
+    peer_set
+        .expect_request(zn::Request::FindHeaders {
+            known_blocks: vec![block1_hash],
+            stop: None,
+        })
+        .await
+        .respond(zn::Response::BlockHeaders(vec![block::CountedHeader {
+            header: block2.header.clone(),
+        }]));
+
+    // Block 2's header is unknown, and its parent link anchors at our tip.
+    state_service
+        .expect_request(zs::Request::KnownBlock(block2_hash))
+        .await
+        .respond(zs::Response::KnownBlock(None));
+    state_service
+        .expect_request(zs::Request::KnownBlock(block1_hash))
+        .await
+        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
+
+    // Clear remaining header requests
+    for _ in 0..(sync::FANOUT - 1) {
+        peer_set
+            .expect_request(zn::Request::FindHeaders {
+                known_blocks: vec![block1_hash],
+                stop: None,
+            })
+            .await
+            .respond(Err(zn::BoxError::from(
+                "synthetic test header fallback error",
+            )));
+    }
+
+    // The queued download is re-checked against the state.
+    state_service
+        .expect_request(zs::Request::KnownBlock(block2_hash))
+        .await
+        .respond(zs::Response::KnownBlock(None));
+
+    // Block 2 is fetched and committed.
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((
+            block2.clone(),
+            None,
+        ))]));
+
+    block_verifier_router
+        .expect_request(zakura_consensus::Request::Commit(block2))
+        .await
+        .respond(block2_hash);
+
+    // Check that nothing unexpected happened.
+    peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;
     state_service.expect_no_requests().await;
 

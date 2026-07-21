@@ -3437,6 +3437,8 @@ fn is_discovery_dialable_addr(addr: &SocketAddr) -> bool {
                     && !is_ipv6_unicast_link_local(&ip)
                     && !is_ipv6_unique_local(&ip)
                     && !is_ipv6_site_local(&ip)
+                    && !is_ipv6_ipv4_compatible(&ip)
+                    && !is_ipv6_nat64_translation(&ip)
             },
             |mapped| is_discovery_dialable_ipv4(&mapped),
         ),
@@ -3445,12 +3447,16 @@ fn is_discovery_dialable_addr(addr: &SocketAddr) -> bool {
 
 fn is_discovery_dialable_ipv4(ip: &Ipv4Addr) -> bool {
     !ip.is_unspecified()
+        && ip.octets()[0] != 0
         && !ip.is_loopback()
         && !ip.is_multicast()
         && !ip.is_broadcast()
         && !ip.is_link_local()
         && !ip.is_private()
         && !is_ipv4_shared(ip)
+        && !is_ipv4_protocol_assignment(ip)
+        && !is_ipv4_benchmarking(ip)
+        && !is_ipv4_reserved(ip)
 }
 
 fn is_static_discovery_configured_addr_usable(addr: &SocketAddr) -> bool {
@@ -3474,6 +3480,20 @@ fn ipv6_mapped_ipv4(ip: &Ipv6Addr) -> Option<Ipv4Addr> {
         .then(|| Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]))
 }
 
+fn is_ipv4_protocol_assignment(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 192 && octets[1] == 0 && octets[2] == 0
+}
+
+fn is_ipv4_benchmarking(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 198 && matches!(octets[1], 18 | 19)
+}
+
+fn is_ipv4_reserved(ip: &Ipv4Addr) -> bool {
+    ip.octets()[0] >= 240
+}
+
 // `Ipv4Addr::is_shared` is still unstable, so match the RFC 6598 100.64.0.0/10 range directly,
 // mirroring `is_ipv6_unicast_link_local`.
 fn is_ipv4_shared(ip: &Ipv4Addr) -> bool {
@@ -3490,6 +3510,15 @@ fn is_ipv6_unique_local(ip: &Ipv6Addr) -> bool {
 // the modern RFC 4193 unique-local range.
 fn is_ipv6_site_local(ip: &Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfec0
+}
+
+fn is_ipv6_ipv4_compatible(ip: &Ipv6Addr) -> bool {
+    ip.octets()[..12] == [0; 12]
+}
+
+fn is_ipv6_nat64_translation(ip: &Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x0064 && segments[1] == 0xff9b && (segments[2..6] == [0; 4] || segments[2] == 1)
 }
 
 // Import accepts records inside the clock-skew window, but runtime liveness is strict.
@@ -5705,13 +5734,17 @@ mod tests {
         // direct addresses. Untrusted gossip must therefore be restricted to globally routable
         // targets; otherwise an authenticated discovery peer could seed signed records pointing at
         // the honest node's private/internal network and turn the candidate dialer into an internal
-        // SSRF/scanner. RFC 1918 private, RFC 6598 shared (CGNAT), and RFC 4193 unique-local ranges
-        // are neither loopback nor link-local, so the original filter let them through.
+        // SSRF/scanner. Private, shared, special-purpose, IPv4-embedded, NAT64 translation, and
+        // unique/site-local ranges are not all covered by the standard loopback/link-local checks.
         let bad_addrs = [
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 8233),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 5, 5)), 8233),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8233),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 1, 2, 3)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1)), 8233),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)), 8233),
             SocketAddr::new(
                 IpAddr::V6(Ipv6Addr::new(0xfd12, 0x3456, 0, 0, 0, 0, 0, 1)),
@@ -5723,6 +5756,15 @@ mod tests {
             ),
             SocketAddr::new(
                 IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 1)),
+                8233,
+            ),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0a00, 1)), 8233),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x0a00, 1)),
+                8233,
+            ),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0x0a00, 1)),
                 8233,
             ),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1)), 8233),

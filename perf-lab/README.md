@@ -18,6 +18,10 @@ recorded in LEDGER.md.
 
 ## Measured timings
 
+- Droplet smoke (2026-07-21): provision→ready **77 s** from golden image
+  `zakura-pr-node-20260720-2311` (c-16, nyc3) — warm-cache symlinks verified,
+  prebuilt release `zakurad` present, 186 GiB free (bench floor is 45),
+  destroy+list-empty clean.
 - Mac mock-blocksync baseline (M4 Max, 3 runs, 2026-07-21):
   - run 1: throughput: 17517.87 blocks/sec, 43.58 MiB/sec, elapsed=5.708s
   - run 2: throughput: 24828.31 blocks/sec, 61.76 MiB/sec, elapsed=4.028s

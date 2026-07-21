@@ -48,10 +48,10 @@ Everything under `perf-lab/` + the skill is committed on `adam/zakura-agentic-pe
 ```bash
 cd /Users/czar/Documents/zakura/.claude/worktrees/zakura-sighash-optimization-5328f4
 git fetch origin main
-git rebase origin/main
+git rebase --onto origin/main 2998771df adam/zakura-agentic-perf-5667cc
 ```
 
-Expected: the 3–4 `docs(superpowers)` commits replay cleanly (docs/superpowers/ does not exist on origin/main). `ls` now shows `zakura-*` crates. If the rebase conflicts, stop and report — do not force anything.
+The `--onto` form deliberately **drops** `2998771df` ("ci: align Zakura workflows with main"): that commit was inherited from the stale local `main` tip, is not an ancestor of `origin/main` (the shared ancestor is `1c34ceaa7`), and conflicts with — and would partially revive — workflow files `origin/main` has since rewritten or deleted. Only the `docs(superpowers)` commits are ours; they replay cleanly (docs/superpowers/ does not exist on origin/main). `ls` now shows `zakura-*` crates. If this still conflicts, stop and report — do not force anything.
 
 - [ ] **Step 2: Sanity-build check (warm the shared target dir)**
 

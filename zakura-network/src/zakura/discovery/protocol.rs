@@ -3355,12 +3355,17 @@ fn effective_live_summary_expiry(
     now_unix_secs: u64,
     clock_skew_tolerance: Duration,
 ) -> Option<u64> {
+    let local_expiry = now_unix_secs.saturating_add(DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs());
+    if declared_expires_at > now_unix_secs {
+        return Some(declared_expires_at.min(local_expiry));
+    }
     if declared_expires_at.saturating_add(clock_skew_tolerance.as_secs()) <= now_unix_secs {
         return None;
     }
-    // This response arrived on the authenticated live stream. Use a bounded local receipt TTL so
-    // ordinary clock skew cannot make an honest peer's summary expire before the next exchange.
-    Some(now_unix_secs.saturating_add(DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs()))
+    // This response arrived on the authenticated live stream but is already expired locally. Use
+    // a bounded receipt TTL only inside the accepted skew window; future expiries still honor a
+    // peer's intentionally shorter lifetime.
+    Some(local_expiry)
 }
 
 fn header_sync_candidate_preference(
@@ -6860,10 +6865,7 @@ mod tests {
             .expect("updated live summary entry exists");
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].observed_at_unix_secs, now + 1);
-        assert_eq!(
-            cached[0].expires_at_unix_secs,
-            now + 1 + DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs()
-        );
+        assert_eq!(cached[0].expires_at_unix_secs, now + 10);
         assert_eq!(
             cached[0].summary,
             ZakuraLiveServiceSummary::Discovery(updated_summary)
@@ -7252,7 +7254,7 @@ mod tests {
             .import_connected_peer_services_at(
                 first_party_services(
                     preferred_id,
-                    now,
+                    now.saturating_sub(DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs()),
                     vec![ServiceSummaryEnvelope::header_sync(&preferred_summary)
                         .expect("test header summary encodes")],
                 ),
@@ -7260,7 +7262,7 @@ mod tests {
                 now,
             )
             .await
-            .expect("expired first-party header summary is dropped");
+            .expect("stale first-party header summary is dropped");
 
         assert_eq!(
             handle
@@ -7817,7 +7819,7 @@ mod tests {
                 .import_connected_peer_services_at(
                     first_party_services(
                         node_id,
-                        now,
+                        now.saturating_sub(DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs()),
                         vec![ServiceSummaryEnvelope {
                             service_id: service.clone(),
                             summary_tag: 999,
@@ -7828,7 +7830,7 @@ mod tests {
                     now,
                 )
                 .await
-                .expect("expired first-party live summary is dropped");
+                .expect("stale first-party live summary is dropped");
         }
 
         assert_eq!(handle.active_services(live_only_node_id).await, None);

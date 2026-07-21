@@ -790,8 +790,10 @@ async fn rpc_getblock_includes_empty_ironwood_tree_after_nu6_3_activation() {
             next_block_hash: None,
         });
 
+    // The header was requested by height, but follow-up reads must use its
+    // resolved hash so a reorg cannot substitute another block at this height.
     read_state
-        .expect_request(ReadRequest::SaplingTree(hash_or_height))
+        .expect_request(ReadRequest::SaplingTree(hash.into()))
         .await
         .respond(ReadResponse::SaplingTree(Some(Arc::new(
             zakura_chain::sapling::tree::NoteCommitmentTree::default(),

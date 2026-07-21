@@ -30,7 +30,10 @@ use crate::{
     request::FinalizedBlock,
     service::finalized_state::{
         disk_db::DiskWriteBatch,
-        disk_format::{chain::HistoryTreeParts, RawBytes},
+        disk_format::{
+            chain::{HistoryTreeDecodeError, HistoryTreeParts},
+            RawBytes,
+        },
         zakura_db::{metrics::value_pool_metrics, ZakuraDb},
         TypedColumnFamily,
     },
@@ -54,7 +57,7 @@ pub type LegacyHistoryTreePartsCf<'cf> = TypedColumnFamily<'cf, Height, HistoryT
 
 /// A generic raw key type for reading history trees from the database, regardless of the database version.
 /// This type should not be used in new code.
-pub type RawHistoryTreePartsCf<'cf> = TypedColumnFamily<'cf, RawBytes, HistoryTreeParts>;
+pub type RawHistoryTreePartsCf<'cf> = TypedColumnFamily<'cf, RawBytes, RawBytes>;
 
 /// The name of the tip-only chain value pools column family.
 ///
@@ -120,7 +123,16 @@ impl ZakuraDb {
     /// If history trees have not been activated yet (pre-Heartwood), or the state is empty,
     /// returns an empty history tree.
     pub fn history_tree(&self) -> Arc<HistoryTree> {
-        let history_tree_cf = self.history_tree_cf();
+        self.try_history_tree()
+            .expect("stored history tree snapshots must be valid")
+    }
+
+    /// Tries to return the ZIP-221 history tree of the finalized tip.
+    ///
+    /// If history trees have not been activated yet (pre-Heartwood), or the state is empty,
+    /// returns an empty history tree.
+    pub fn try_history_tree(&self) -> Result<Arc<HistoryTree>, HistoryTreeDecodeError> {
+        let raw_history_tree_cf = self.raw_history_tree_cf();
 
         // # Backwards Compatibility
         //
@@ -136,40 +148,52 @@ impl ZakuraDb {
         //
         // So we use the empty key `()`. Since the key has a constant value, we will always read
         // the latest tree.
-        let mut history_tree_parts = history_tree_cf.zs_get(&());
+        let empty_key = RawBytes::new_raw_bytes(Vec::new());
+        let mut history_tree_bytes = raw_history_tree_cf.zs_get(&empty_key);
 
-        if history_tree_parts.is_none() {
-            let legacy_history_tree_cf = self.legacy_history_tree_cf();
-
+        if history_tree_bytes.is_none() {
             // In Zebra 1.4.0 and later, we only update the history tip tree when it has changed (for every block after heartwood).
             // But we write with a `()` key, not a height key.
             // So we need to look for the most recent update height if the `()` key has never been written.
-            history_tree_parts = legacy_history_tree_cf
+            history_tree_bytes = raw_history_tree_cf
                 .zs_last_key_value()
-                .map(|(_height_key, tree_value)| tree_value);
+                .map(|(_raw_key, tree_value)| tree_value);
         }
 
-        let history_tree = history_tree_parts.map(|parts| {
-            parts.with_network(&self.db.network()).expect(
-                "deserialization format should match the serialization format used by IntoDisk",
-            )
-        });
-        Arc::new(HistoryTree::from(history_tree))
+        let history_tree = history_tree_bytes
+            .map(|bytes| {
+                HistoryTreeParts::try_from_bytes(bytes.raw_bytes())?
+                    .with_network(&self.db.network())
+            })
+            .transpose()?;
+
+        Ok(Arc::new(HistoryTree::from(history_tree)))
     }
 
     /// Returns all the history tip trees.
     /// We only store the history tree for the tip, so this method is only used in tests and
     /// upgrades.
     pub(crate) fn history_trees_full_tip(&self) -> BTreeMap<RawBytes, Arc<HistoryTree>> {
+        self.try_history_trees_full_tip()
+            .expect("stored history tree snapshots must be valid")
+    }
+
+    /// Tries to return all the history tip trees.
+    ///
+    /// We only store the history tree for the tip, so this method is only used in tests and
+    /// upgrades.
+    pub(crate) fn try_history_trees_full_tip(
+        &self,
+    ) -> Result<BTreeMap<RawBytes, Arc<HistoryTree>>, HistoryTreeDecodeError> {
         let raw_history_tree_cf = self.raw_history_tree_cf();
 
         raw_history_tree_cf
             .zs_forward_range_iter(..)
-            .map(|(raw_key, history_tree_parts)| {
-                let history_tree = history_tree_parts.with_network(&self.db.network()).expect(
-                    "deserialization format should match the serialization format used by IntoDisk",
-                );
-                (raw_key, Arc::new(HistoryTree::from(history_tree)))
+            .map(|(raw_key, history_tree_bytes)| {
+                let history_tree =
+                    HistoryTreeParts::try_from_bytes(history_tree_bytes.raw_bytes())?
+                        .with_network(&self.db.network())?;
+                Ok((raw_key, Arc::new(HistoryTree::from(history_tree))))
             })
             .collect()
     }

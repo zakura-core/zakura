@@ -9,9 +9,11 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr},
+    panic::AssertUnwindSafe,
     time::Duration,
 };
 
+use futures::FutureExt;
 use iroh::{NodeAddr, NodeId};
 use tokio::{task::JoinSet, time::Instant};
 use tracing::debug;
@@ -207,13 +209,28 @@ async fn spawn_discovery_dial_candidates(
 
         discovery.mark_dial_attempt(&node_id).await;
         metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
-        workers.spawn(run_discovery_dial_once(
-            endpoint.clone(),
-            node_addr,
-            limits.clone(),
-            node_id,
-            reserved_ips,
-        ));
+        workers.spawn({
+            let reserved_ips_on_panic = reserved_ips.clone();
+            AssertUnwindSafe(run_discovery_dial_once(
+                endpoint.clone(),
+                node_addr,
+                limits.clone(),
+                node_id,
+                reserved_ips,
+            ))
+            .catch_unwind()
+            .map(move |result| {
+                result.unwrap_or_else(|_| {
+                    metrics::counter!("zakura.p2p.discovery.dial.worker_panicked").increment(1);
+                    tracing::error!(?node_id, "Zakura discovery dial worker panicked");
+                    DiscoveryDialWorkerResult {
+                        node_id,
+                        reserved_ips: reserved_ips_on_panic,
+                        result: DiscoveryDialResult::Failed,
+                    }
+                })
+            })
+        });
     }
 }
 

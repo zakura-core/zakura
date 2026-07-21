@@ -1870,8 +1870,7 @@ impl ZakuraDiscoveryHandle {
             services.expires_at_unix_secs,
             now,
             inner.config.clock_skew_tolerance,
-        )
-        else {
+        ) else {
             if let Some(entry) = inner.active_services.get_mut(&peer_node_id) {
                 entry.live_summaries.clear();
                 if entry.record.is_none() {

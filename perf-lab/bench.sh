@@ -15,8 +15,13 @@ die() { echo "bench.sh: $*" >&2; exit 1; }
 ip_of() { bash "$DIR/droplet.sh" ip "$1"; }
 
 cmd_start() {
-  local name="${1:?}" label="${2:?}" build_ref="${3:?}" baseline_ref="${4:-main}"
-  shift 4 || die "usage: bench.sh start NAME LABEL BUILD_REF [BASELINE_REF] [KEY=VAL...]"
+  local name="${1:?}" label="${2:?}"
+  local build_ref="${3:?usage: bench.sh start NAME LABEL BUILD_REF [BASELINE_REF] [KEY=VAL...]}"
+  shift 3
+  # optional 4th positional is BASELINE_REF; KEY=VAL args are extra env either
+  # way (refs never contain '=', env pairs always do)
+  local baseline_ref="main"
+  if [ $# -gt 0 ] && [[ "$1" != *=* ]]; then baseline_ref="$1"; shift; fi
   local extra_env=("$@")
   local ip; ip="$(ip_of "$name")"; [ -n "$ip" ] || die "no droplet $name"
   # shellcheck disable=SC2087  # client-side expansion of label/refs is intended

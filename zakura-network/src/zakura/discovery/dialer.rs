@@ -12,9 +12,9 @@ use crate::zakura::{
 
 /// Spawn supervised dials for configured native bootstrap peers.
 ///
-/// Returns one task handle per configured peer so the caller can track them
-/// under the endpoint shutdown owner; each maintained dial also observes the
-/// endpoint shutdown token directly via [`native_dial_supervised`].
+/// Returns one task per unique remote identity after merging its configured addresses and removing
+/// the local identity, so the caller can track each maintained dial under the endpoint shutdown
+/// owner. Every dial also observes the shutdown token directly via [`native_dial_supervised`].
 pub(crate) fn spawn_native_bootstrap_dialer(
     endpoint: ZakuraEndpoint,
     bootstrap_peers: Vec<String>,
@@ -34,7 +34,22 @@ pub(crate) fn spawn_native_bootstrap_dialer(
         DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
     );
 
-    let local_node_id = endpoint.local_node_id();
+    let node_addrs = grouped_remote_bootstrap_peers(bootstrap_peers, endpoint.local_node_id());
+    let mut tasks = Vec::with_capacity(node_addrs.len());
+    for node_addr in node_addrs {
+        let endpoint = endpoint.clone();
+        let limits = limits.clone();
+        tasks.push(tokio::spawn(async move {
+            native_dial_supervised(endpoint, node_addr, limits, policy).await
+        }));
+    }
+    tasks
+}
+
+fn grouped_remote_bootstrap_peers(
+    bootstrap_peers: Vec<String>,
+    local_node_id: NodeId,
+) -> Vec<NodeAddr> {
     let mut direct_addrs_by_node = HashMap::<NodeId, Vec<SocketAddr>>::new();
     for entry in bootstrap_peers {
         let node_addr = match parse_bootstrap_peer(&entry) {
@@ -54,16 +69,14 @@ pub(crate) fn spawn_native_bootstrap_dialer(
             .extend(node_addr.direct_addresses().copied());
     }
 
-    let mut tasks = Vec::with_capacity(direct_addrs_by_node.len());
-    for (node_id, direct_addrs) in direct_addrs_by_node {
-        let endpoint = endpoint.clone();
-        let limits = limits.clone();
-        let node_addr = NodeAddr::new(node_id).with_direct_addresses(direct_addrs);
-        tasks.push(tokio::spawn(async move {
-            native_dial_supervised(endpoint, node_addr, limits, policy).await
-        }));
-    }
-    tasks
+    direct_addrs_by_node
+        .into_iter()
+        .map(|(node_id, mut direct_addrs)| {
+            direct_addrs.sort_unstable();
+            direct_addrs.dedup();
+            NodeAddr::new(node_id).with_direct_addresses(direct_addrs)
+        })
+        .collect()
 }
 
 pub(crate) async fn native_bootstrap_dial(
@@ -106,5 +119,29 @@ mod tests {
         {
             parse_bootstrap_peer(peer).expect("default Zakura bootstrap peer should parse");
         }
+    }
+
+    #[test]
+    fn bootstrap_peers_skip_self_and_merge_duplicate_remote_identities() {
+        let local_id = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let remote_id = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let first_addr: SocketAddr = "127.0.0.1:8234".parse().expect("test address parses");
+        let second_addr: SocketAddr = "127.0.0.1:8235".parse().expect("test address parses");
+        let grouped = grouped_remote_bootstrap_peers(
+            vec![
+                format!("{local_id}@{first_addr}"),
+                format!("{remote_id}@{first_addr}"),
+                format!("{remote_id}@{second_addr}"),
+                format!("{remote_id}@{second_addr}"),
+            ],
+            local_id,
+        );
+
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].node_id, remote_id);
+        assert_eq!(
+            grouped[0].direct_addresses().copied().collect::<Vec<_>>(),
+            vec![first_addr, second_addr]
+        );
     }
 }

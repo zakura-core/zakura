@@ -1078,25 +1078,26 @@ the scripts are deliberately dumb.
    `state.json.in_flight`; note anything reaped in the ledger as an incident.
 4. Refresh exclusions: `gh pr list --limit 50` → update BACKLOG.md's
    Exclusions section; drop/block any backlog item that now collides.
-5. Noise-band gate: `config.env`'s `NOISE_BAND_PCT` must be non-empty. If it
+5. Droplet: reuse a healthy droplet already in `state.json.droplets` if one
+   exists; otherwise `bash perf-lab/droplet.sh provision s<N>`. `<droplet>`
+   below always means the full `perf-lab-…` name from `list`/state.json. Add
+   a second droplet only when two L2-ready experiments are queued and
+   MAX_DROPLETS allows. (This precedes the noise-band gate because the gate
+   may need to run a bench.)
+6. Noise-band gate: `config.env`'s `NOISE_BAND_PCT` must be non-empty. If it
    is empty, or the droplet size/region/image changed since it was measured,
    or its ledger date is >7 days old, run an A/A first
    (`bench.sh start <droplet> aa-recal main main`, collect, then
    `python3 perf-lab/verdict.py <summary.md> --aa`) and write the observed
    value into config.env and state.json before trusting any verdict.
-6. Append `## SESSION N` to LEDGER.md (date, origin/main SHA, plan for the
+7. Append `## SESSION N` to LEDGER.md (date, origin/main SHA, plan for the
    session). Commit ledger updates as you go:
    `git add perf-lab && git commit -m "perf-lab: session N ledger"` and
    `git push origin adam/zakura-agentic-perf-5667cc`.
-7. Droplet: reuse a healthy droplet already in `state.json.droplets` if one
-   exists; otherwise `bash perf-lab/droplet.sh provision s<N>`. `<droplet>`
-   below always means the full `perf-lab-…` name from `list`/state.json. Add
-   a second droplet only when two L2-ready experiments are queued and
-   MAX_DROPLETS allows.
 
 ## Campaign-target memo (once, before EXP-001)
 
-If fresh A/A artifacts already exist from calibration or session-start step 5,
+If fresh A/A artifacts already exist from calibration or session-start step 6,
 reuse their summary/verdicts instead of running again; otherwise run a
 baseline bench (`bench.sh start <droplet> base main main`, collect). All
 calibration/campaign/confirmation collects count toward the batch budget.
@@ -1127,7 +1128,11 @@ metric (default: checkpoint-zone post-commit blk/s), re-ranked top-5 backlog.
 5. **L1** (only if a micro lane applies): for block-sync-layer diffs run
    `gates.sh micro-mockbs` with **4 runs per side and compare the median of
    runs 2–4** (run 1 is a consistent ~30% cold-start outlier on the Mac
-   baseline). A nonzero exit means discard every sample from that invocation.
+   baseline). Base side: once per session,
+   `git worktree add /tmp/perf-base origin/main` then
+   `bash perf-lab/gates.sh micro-mockbs /tmp/perf-base 4`; the base median is
+   its runs 2–4. A nonzero exit means discard every sample from that
+   invocation.
    Kill the experiment only on a clear regression — candidate median ≥10%
    below base median (warm noise is ~1–2%; anything smaller passes through to
    L2 for the authoritative verdict). For crypto/serialization diffs use
@@ -1159,7 +1164,11 @@ metric (default: checkpoint-zone post-commit blk/s), re-ranked top-5 backlog.
    WIN.
 7. **Verdict**: `bench.sh collect` → verdict.json (the A/B decision from
    verdict.py; distinct from the harness's `verdict-*.json` bottleneck
-   classifier).
+   classifier). **Env-knob sweeps are decided by step 6's absolute rule
+   instead** — skip the WIN_CANDIDATE/worktree/branch handling below; confirm
+   a promising point under label `expNNN-pX-c`, and record a sweep WIN as a
+   PROPOSAL to adopt the new default (there is no branch; optionally file a
+   follow-up code experiment to codify the default).
    - WIN_CANDIDATE → one confirmation run under label `expNNN-c` (NEVER reuse
      the original label — `start` clears same-label artifacts); record both
      deltas. Two above-threshold runs = **WIN**: run full workspace tests in

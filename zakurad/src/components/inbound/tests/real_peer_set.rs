@@ -62,14 +62,6 @@ impl io::Write for TestWriter {
     }
 }
 
-/// Return whether `logs` contains `expected`.
-fn captured_logs_contain(logs: &Arc<Mutex<Vec<u8>>>, expected: &str) -> bool {
-    let logs = logs
-        .lock()
-        .expect("log buffer is only locked by non-panicking writer operations");
-    String::from_utf8_lossy(&logs).contains(expected)
-}
-
 /// Check that a network stack with an empty address book only contains the local listener port,
 /// by querying the inbound service via a local TCP connection.
 ///
@@ -320,13 +312,12 @@ async fn inbound_block_empty_state_notfound() -> Result<(), crate::BoxError> {
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
 ) -> Result<(), crate::BoxError> {
-    let logs = Arc::new(Mutex::new(Vec::new()));
-    let log_sink = Arc::clone(&logs);
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || TestWriter(Arc::clone(&log_sink)))
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    // `tracing_test::traced_test` can't be used here: it sets a second process-wide
+    // subscriber, which races with the one set by `zakura_test::init()` in the other
+    // tests in this binary. Capture logs from the `zakura_test` subscriber instead.
+    // Only this test configures zcashd-compat pruning retention, so no other test in
+    // this binary can log the pruned block error message.
+    let captured_logs = zakura_test::log_capture::LogCapture::new();
 
     // `setup` configures checkpoint retention against `Height::MAX`, so block 1 is committed
     // to the retained chain indexes without storing its transaction bytes. Genesis is retained.
@@ -418,7 +409,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         "an unknown hash maps to missing inventory"
     );
     assert!(
-        !captured_logs_contain(&logs, super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        !captured_logs.contains(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
         "an unknown hash must not log a pruning error"
     );
 
@@ -432,7 +423,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         "inbound maps the unavailable block body to missing inventory"
     );
     assert!(
-        !captured_logs_contain(&logs, super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        !captured_logs.contains(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
         "an ordinary peer must not log a zcashd-compat pruning error"
     );
 
@@ -453,7 +444,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         "an unconfigured legacy peer still receives missing inventory"
     );
     assert!(
-        !captured_logs_contain(&logs, super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        !captured_logs.contains(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
         "an unconfigured legacy peer must not log a zcashd-compat pruning error"
     );
 
@@ -475,7 +466,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         )
     }
     assert!(
-        captured_logs_contain(&logs, super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        captured_logs.contains(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
         "the configured zcashd-compat peer must log the pruning error"
     );
 

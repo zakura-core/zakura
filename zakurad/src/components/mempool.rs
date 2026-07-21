@@ -710,6 +710,8 @@ impl Service<Request> for Mempool {
                             }
 
                             if !evicted_ids.is_empty() {
+                                // A later insertion can evict a transaction accepted earlier in
+                                // this `poll_ready` pass, so do not advertise it.
                                 send_to_peers_ids.retain(|id| !evicted_ids.contains(id));
                                 invalidated_ids.extend(evicted_ids);
                             }

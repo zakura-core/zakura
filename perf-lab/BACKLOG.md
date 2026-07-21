@@ -7,9 +7,11 @@ READY | BLOCKED(<why>) | DONE(EXP-NNN) | DROPPED(<why>).
 ## Tuning-class (green)
 
 - B-01 READY — Sweep `CKPT_LIMIT` (checkpoint_verify_concurrency_limit).
-  Hypothesis: default 1500 was hand-picked; the knee may sit elsewhere on
-  dedicated CPU. Lane: bench env var only (no code change). Cost: 1 bench
-  run per point, 3 points (500/1500/3000).
+  Node default is 1000 (`DEFAULT_CHECKPOINT_CONCURRENCY_LIMIT` = 500*2 in
+  zakurad/src/components/sync.rs); the bench harness pins CKPT_LIMIT=1500 on
+  every run, so 1500-point data accrues free from baselines. Hypothesis: the
+  knee sits elsewhere on dedicated CPU. Lane: bench env var only (no code
+  change). Cost: 1 bench run per point, 3 points (500/1000/3000).
 - B-02 READY — Sweep `DL_LIMIT` (download_concurrency_limit) 50/150/400.
   Same shape as B-01.
 - B-03 READY — Block-sync knob sweep: `max_blocks_per_response`, request

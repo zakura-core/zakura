@@ -39,6 +39,7 @@ command -v rclone >/dev/null 2>&1 || {
     say "installing rclone for the publisher rehearsal"
     apt-get update -qq && apt-get install -y -qq rclone
 }
+command -v flock >/dev/null 2>&1 || die "install flock (normally provided by util-linux)"
 WORK=$(mktemp -d)
 restore() {
     git checkout --quiet -- "$CHECKPOINTS" "$FRONTIER" "$PROVENANCE" "$EOS_FILE" || true
@@ -86,6 +87,18 @@ say "[3/4] Publisher rehearsal (local rclone backend)"
 export RELEASE_STATE_R2_REMOTE="$WORK/fake-r2"
 export RELEASE_STATE_PUBLIC_BASE="https://zakura-release.valargroup.dev/release-state"
 export ZAKURA_CHECKPOINTS_BIN="$BIN"
+export RELEASE_STATE_LOCK_FILE="$WORK/publish.lock"
+
+exec 8>"$RELEASE_STATE_LOCK_FILE"
+flock -n 8 || die "could not acquire the rehearsal publisher lock"
+if deploy/release-state/publish-release-state.sh "$STATE_DIR" 2> "$WORK/lock-contention.log"; then
+    die "publisher did not reject a concurrent host-local run"
+fi
+flock -u 8
+exec 8>&-
+grep -q "another release-state publisher is already running" "$WORK/lock-contention.log" \
+    || die "publisher lock contention did not report its cause"
+
 deploy/release-state/publish-release-state.sh "$STATE_DIR"
 BUNDLE="$WORK/fake-r2/release-state/v1/$LAST"
 for f in meta.json main-checkpoints.txt mainnet-frontier.bin; do

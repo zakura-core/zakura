@@ -17,6 +17,8 @@
 #   ZAKURA_CHECKPOINTS_BIN    zakura-checkpoints binary (default: on PATH),
 #                             built with --features zakura-checkpoints-offline
 #   RELEASE_STATE_KEEP        immutable bundles to retain (default 4)
+#   RELEASE_STATE_LOCK_FILE   host-local publisher lock
+#                             (default: /tmp/zakura-release-state-publish.lock)
 
 set -euo pipefail
 
@@ -25,6 +27,7 @@ STATE_DIR=${1:?usage: publish-release-state.sh <quiesced-zakura-cache-dir>}
 : "${RELEASE_STATE_PUBLIC_BASE:?set RELEASE_STATE_PUBLIC_BASE to the public HTTPS base URL}"
 BIN=${ZAKURA_CHECKPOINTS_BIN:-zakura-checkpoints}
 KEEP=${RELEASE_STATE_KEEP:-4}
+LOCK_FILE=${RELEASE_STATE_LOCK_FILE:-/tmp/zakura-release-state-publish.lock}
 # A zero or malformed KEEP would make `head -n -"$KEEP"` select every bundle,
 # purging the one latest.json points at.
 if ! [[ "$KEEP" =~ ^[1-9][0-9]*$ ]]; then
@@ -32,6 +35,21 @@ if ! [[ "$KEEP" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 REMOTE_PREFIX="${RELEASE_STATE_R2_REMOTE%/}/release-state"
+
+# The publisher is intentionally single-host. Serializing the complete
+# export/upload/pointer/retention transaction prevents overlapping snapshot or
+# manual runs from regressing latest.json or racing same-height meta uploads.
+# Multiple publisher hosts require object-store conditional writes, not this
+# host-local lock.
+if ! command -v flock >/dev/null 2>&1; then
+    echo "release-state publication requires flock (normally provided by util-linux)" >&2
+    exit 1
+fi
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "another release-state publisher is already running (lock: $LOCK_FILE)" >&2
+    exit 1
+fi
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT

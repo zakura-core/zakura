@@ -32,21 +32,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Create release GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 #v3.2.0
-        with:
-          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          permission-contents: write
-          permission-pull-requests: write
-
       - name: Checkout main
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
         with:
           persist-credentials: false
           ref: main
-          token: ${{ steps.app-token.outputs.token }}
 
       - name: Self-test the bundle fetcher
         run: python3 .github/scripts/fetch-release-state.py --self-test
@@ -192,6 +182,16 @@ jobs:
             exit 1
           fi
           git diff --stat HEAD
+
+      - name: Create release GitHub App token
+        if: steps.import.outputs.has_changes == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 #v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
 
       - name: Open or update the draft pull request
         if: steps.import.outputs.has_changes == 'true'

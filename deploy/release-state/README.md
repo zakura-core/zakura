@@ -26,7 +26,8 @@ Design: `docs/design/verified-commitment-trees.md`, section 16.
      --git https://github.com/zakura-core/zakura zakura-utils
    ```
 
-2. Configure an rclone remote with R2 credentials that can write the bucket
+2. Install `rclone` and `flock` (normally provided by `util-linux`), then
+   configure an rclone remote with R2 credentials that can write the bucket
    (for example remote `r2`, bucket `zakura-artifacts`), and make sure the
    bucket's `release-state/` prefix is served on a public HTTPS domain that is
    in the fetch script's allowed-host list
@@ -50,6 +51,9 @@ Design: `docs/design/verified-commitment-trees.md`, section 16.
   re-run); different contents at the same height abort loudly.
 - Data files upload before `meta.json`, and `latest.json` moves last, so a
   partial upload is never resolvable.
+- A host-local lock serializes export, upload, pointer replacement, and
+  retention. Run exactly one publisher host; multiple hosts require
+  object-store conditional writes rather than the local lock.
 - Exports continue the deterministic checkpoint selection grid from the
   binary's embedded list. Never hand-edit the Mainnet checkpoint file or
   publish RPC-mode Mainnet output: off-grid lines make every later bundle fail
@@ -76,3 +80,5 @@ against the mounted state clone.
   grid passes that block.
 - `existing bundle at this height has different contents`: determinism broke
   (or the bucket was tampered with) — investigate before deleting anything.
+- `another release-state publisher is already running`: wait for the active
+  snapshot/manual publication to finish before retrying.

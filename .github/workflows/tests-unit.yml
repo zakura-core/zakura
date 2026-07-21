@@ -8,6 +8,9 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      - zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+      - zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
+      - zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
       - .config/nextest.toml
       - .github/workflows/tests-unit.yml
 
@@ -17,6 +20,9 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      - zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+      - zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
+      - zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
       - .config/nextest.toml
       - .github/workflows/tests-unit.yml
 

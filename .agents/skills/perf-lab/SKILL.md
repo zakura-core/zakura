@@ -29,8 +29,7 @@ the scripts are deliberately dumb.
 ## Campaign-target memo (once, before EXP-001)
 
 Run a baseline bench (`bench.sh start <droplet> base main main` reuses A/A
-artifacts if fresh), read `verdict-*.json` + summary, skim
-`analysis/zakura_trace_analysis/` output if deeper attribution is needed, and
+artifacts if fresh), read `verdict-*.json` + summary, run the `zakura-trace-plots` skill (`.agents/skills/zakura-trace-plots/`) over the traces if deeper attribution is needed, and
 write `## CAMPAIGN` in the ledger: dominant bottleneck class, chosen target
 metric (default: checkpoint-zone post-commit blk/s), re-ranked top-5 backlog.
 

@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   committed checkpoint/frontier/provenance coupling (rejecting pre-pipeline
   bootstrap state unless explicitly overridden).
 
+### Changed
+
+- Update the embedded zcashd-compat binary and default split-container image to
+  valargroup/zcashd v1.1.0.
+
 ### Fixed
 
 - Keep valid internal-miner work running across mempool-only block template

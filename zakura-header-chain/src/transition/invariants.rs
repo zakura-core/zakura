@@ -410,12 +410,14 @@ fn verify_generations(
     let verified_changed = verified.last().copied() != Some(old_verified)
         || !plan.change_set.verified_projection.put.is_empty()
         || plan.change_set.verified_projection.remove_from.is_some();
+    let alarm_changed = plan.before.alarms != plan.change_set.metadata.alarms;
     let effects = !plan.change_set.put_nodes.is_empty()
         || !plan.change_set.delete_nodes.is_empty()
         || !plan.change_set.aux_changes.is_empty()
         || plan.change_set.finality_append.is_some()
         || selected_changed
-        || verified_changed;
+        || verified_changed
+        || alarm_changed;
     let expected_state = if effects {
         plan.before.state_version.checked_next().ok()
     } else {

@@ -14,12 +14,13 @@ use tokio::sync::watch;
 use zakura_chain::block;
 use zakura_header_chain::{
     apply_transition, audit_store, ApplyResult, AuxDelivery, AuxDelta, ChainScore, ChangeSet,
-    CommittedTransition, EligibilityReason, EngineConfig, EngineMetadata, EngineSnapshot,
-    EvidenceId, FinalityRecord, Frontier, FullStateEvidenceAuthority, FullStateFinalized,
-    HeaderNode, NoChangeReceipt, RecoveryFailure, RecoveryPlan, RecoveryRepair, StaleReceipt,
-    StoreAuditRead, StoreError, StoreRead, SystemClock, TransitionContext, TransitionEvent,
-    TransitionFailure, TransitionRequest, ValidationContextRecord, ValidationLease,
-    VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
+    CommittedTransition, CounterExhausted, EligibilityReason, EngineConfig, EngineMetadata,
+    EngineMode, EngineSnapshot, EvidenceId, FinalityRecord, FinalitySource, Frontier,
+    FullStateEvidenceAuthority, FullStateFinalized, HeaderNode, NoChangeReceipt, RecoveryFailure,
+    RecoveryPlan, RecoveryRepair, StaleReceipt, StoreAuditRead, StoreError, StoreRead, SystemClock,
+    TransitionContext, TransitionEvent, TransitionFailure, TransitionRequest,
+    ValidationContextRecord, ValidationLease, VerifiedChainChanged, VerifiedChangeCause,
+    VerifiedHeaderRef,
 };
 
 use super::{
@@ -81,6 +82,17 @@ pub enum HeaderChainStoreError {
     /// Exhaustive startup audit or deterministic reconstruction failed.
     #[error(transparent)]
     Recovery(#[from] RecoveryFailure),
+    /// A monotonic durable counter was exhausted during an explicit store migration.
+    #[error(transparent)]
+    Counter(#[from] CounterExhausted),
+    /// An imported headers-only trust pin was refuted; this store must be destroyed and resynced.
+    #[error(
+        "header_chain_migrated_pin_refuted at {pin:?}; delete the migrated header store and resync"
+    )]
+    MigratedPinRefuted {
+        /// Exact preserved pin contradicted by deterministic body validation.
+        pin: Frontier,
+    },
     /// A test crash was injected at a named durable/publication boundary.
     #[cfg(test)]
     #[error("injected header-chain crash at {0:?}")]
@@ -245,6 +257,9 @@ impl HeaderChainRuntime {
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
         let before = self.store.snapshot()?;
+        if let Some(pin) = before.alarms.migrated_pin_refuted {
+            return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
+        }
         fault(FaultPoint::AfterSnapshot)?;
         let event = request.event.idempotency_key();
         let branch = request.event.work_owner().map(|owner| owner.branch);
@@ -287,12 +302,16 @@ impl HeaderChainRuntime {
         }
 
         let durable_tx_id = plan.change_set().metadata.state_version.get();
+        let migrated_pin_refuted = plan.change_set().metadata.alarms.migrated_pin_refuted;
         let batch =
             self.store
                 .batch_for_with_fault(plan.change_set(), full_state_batch, &mut fault)?;
         fault(FaultPoint::BeforeDbCommit)?;
         self.store.db.write(batch)?;
         fault(FaultPoint::AfterDbCommit)?;
+        if let Some(pin) = migrated_pin_refuted {
+            return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
+        }
         fault(FaultPoint::BeforeMemorySwap)?;
         memory_swap();
         let receipt = plan.into_committed_receipt(durable_tx_id);
@@ -351,12 +370,100 @@ impl HeaderChainStore {
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
         let plan = audit_store(&self, config)?;
+        if let Some(pin) = plan.metadata.alarms.migrated_pin_refuted {
+            return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
+        }
         let previous = plan.before.clone();
         let repairs = plan.repairs.clone();
         if !plan.is_clean() {
             self.db.write(self.recovery_batch(&plan)?)?;
         }
         let current = plan.metadata.snapshot();
+        let report = StartupReport {
+            previous,
+            current: current.clone(),
+            repairs,
+            publication_allowed: true,
+        };
+        let publisher = Publisher::new(current);
+        drop(writer);
+        Ok((
+            HeaderChainRuntime {
+                store: self,
+                publisher,
+            },
+            report,
+        ))
+    }
+
+    /// Explicitly preserve a headers-only store's pins while changing its durable mode.
+    pub fn migrate_headers_only_to_integrated(
+        self,
+        integrated_config: &EngineConfig,
+        full_state_verified: Frontier,
+    ) -> Result<(HeaderChainRuntime, StartupReport), HeaderChainStoreError> {
+        if integrated_config.mode != EngineMode::Integrated {
+            return Err(HeaderChainStoreError::Incoherent(
+                "mode migration target is not integrated",
+            ));
+        }
+        let mut headers_only_config = integrated_config.clone();
+        headers_only_config.mode = EngineMode::HeadersOnly;
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let source = audit_store(&self, &headers_only_config)?;
+        if let Some(pin) = source.metadata.alarms.migrated_pin_refuted {
+            return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
+        }
+        if source.metadata.frontiers.finalized != full_state_verified {
+            return Err(HeaderChainStoreError::Incoherent(
+                "integrated migration requires full-state verification through the preserved pin",
+            ));
+        }
+        let previous = source.before.clone();
+        let mut repairs = source.repairs.clone();
+        if !source.is_clean() {
+            self.db.write(self.recovery_batch(&source)?)?;
+        }
+
+        let history = self.finality_history()?;
+        let mut metadata = self.metadata()?;
+        metadata.mode = EngineMode::Integrated;
+        metadata.state_version = metadata.state_version.checked_next()?;
+        metadata.header_generation = metadata.header_generation.checked_next()?;
+        metadata.verified_generation = metadata.verified_generation.checked_next()?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-header-chain-mode-migration-v1");
+        hasher.update(metadata.state_version.get().to_be_bytes());
+        hasher.update(metadata.frontiers.finalized.height.0.to_be_bytes());
+        hasher.update(metadata.frontiers.finalized.hash.0);
+        metadata.last_transition_id = EvidenceId::from_digest(hasher.finalize().into());
+
+        let mut batch = DiskWriteBatch::new();
+        for record in history.into_iter().map(preserve_headers_only_pin) {
+            self.put_value(
+                &mut batch,
+                HEADER_FINALITY_HISTORY,
+                HeaderFinalityKey(record.epoch).as_bytes(),
+                &HeaderFinalityRecordDisk(record),
+            )?;
+        }
+        self.put_value(
+            &mut batch,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            &HeaderEngineMetadataDisk(metadata),
+        )?;
+        self.db.write(batch)?;
+
+        let target = audit_store(&self, integrated_config)?;
+        repairs.extend(target.repairs.iter().copied());
+        if !target.is_clean() {
+            self.db.write(self.recovery_batch(&target)?)?;
+        }
+        let current = target.metadata.snapshot();
         let report = StartupReport {
             previous,
             current: current.clone(),
@@ -395,6 +502,9 @@ impl HeaderChainStore {
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
         let initial = audit_store(&self, config)?;
+        if let Some(pin) = initial.metadata.alarms.migrated_pin_refuted {
+            return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
+        }
         let previous = initial.before.clone();
         let mut repairs = initial.repairs.clone();
         if !initial.is_clean() {
@@ -1058,6 +1168,13 @@ impl HeaderChainStore {
     }
 }
 
+fn preserve_headers_only_pin(mut record: FinalityRecord) -> FinalityRecord {
+    if matches!(record.source, FinalitySource::HeadersOnlyDepth { .. }) {
+        record.source = FinalitySource::MigratedHeadersOnly;
+    }
+    record
+}
+
 impl StoreRead for HeaderChainStore {
     fn snapshot(&self) -> Result<EngineSnapshot, StoreError> {
         Ok(self.metadata()?.snapshot())
@@ -1694,6 +1811,121 @@ mod tests {
                 .expect("advanced projection is readable"),
             vec![finalized_child]
         );
+    }
+
+    #[test]
+    fn migrated_headers_only_pin_refutation_is_durable_and_fail_closed() {
+        let cache = tempfile::tempdir().expect("the test cache directory is created");
+        let db_config = Config {
+            cache_dir: cache.path().to_owned(),
+            ephemeral: false,
+            debug_skip_non_finalized_state_backup_task: true,
+            ..Config::default()
+        };
+        let (integrated_config, anchor, mut metadata) = fixture();
+        let mut headers_only_config = integrated_config.clone();
+        headers_only_config.mode = EngineMode::HeadersOnly;
+        metadata.mode = EngineMode::HeadersOnly;
+        let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+        let db = open(&db_config, &integrated_config.network);
+        let store = HeaderChainStore::new(db.clone());
+        store
+            .initialize(metadata, anchor.clone())
+            .expect("the headers-only schema initializes");
+        let record = FinalityRecord {
+            previous: anchor_frontier,
+            current: anchor_frontier,
+            source: FinalitySource::MigratedHeadersOnly,
+            epoch: FinalityEpoch::new(0),
+        };
+        let mut batch = DiskWriteBatch::new();
+        store
+            .put_value(
+                &mut batch,
+                HEADER_FINALITY_HISTORY,
+                HeaderFinalityKey(record.epoch).as_bytes(),
+                &HeaderFinalityRecordDisk(record),
+            )
+            .expect("the finality record encodes");
+        db.write(batch).expect("the headers-only record commits");
+        audit_store(&store, &headers_only_config).expect("the source store is coherent");
+        assert!(matches!(
+            preserve_headers_only_pin(FinalityRecord {
+                previous: anchor_frontier,
+                current: Frontier::new(block::Height(1), block::Hash([89; 32])),
+                source: FinalitySource::HeadersOnlyDepth {
+                    selected_tip: Frontier::new(block::Height(1_001), block::Hash([90; 32])),
+                },
+                epoch: FinalityEpoch::new(1),
+            })
+            .source,
+            FinalitySource::MigratedHeadersOnly
+        ));
+        assert!(matches!(
+            store.clone().migrate_headers_only_to_integrated(
+                &integrated_config,
+                Frontier::new(anchor.height, block::Hash([99; 32])),
+            ),
+            Err(HeaderChainStoreError::Incoherent(
+                "integrated migration requires full-state verification through the preserved pin"
+            ))
+        ));
+
+        let (runtime, report) = store
+            .migrate_headers_only_to_integrated(&integrated_config, anchor_frontier)
+            .expect("the explicit mode migration succeeds before publication");
+        assert_eq!(report.current.mode, EngineMode::Integrated);
+        assert!(matches!(
+            runtime.store.finality_history().as_deref(),
+            Ok([FinalityRecord {
+                source: FinalitySource::MigratedHeadersOnly,
+                ..
+            }])
+        ));
+
+        let evidence = EvidenceId::from_digest([77; 32]);
+        let authority = Authority(evidence);
+        let snapshot = runtime.publisher().snapshot();
+        let context = TransitionContext {
+            config: &integrated_config,
+            clock: &SystemClock,
+            full_state_authority: Some(&authority),
+            startup_capability: None,
+        };
+        let result = runtime.apply(
+            TransitionRequest {
+                expected_version: snapshot.state_version,
+                event: TransitionEvent::MigratedPinRefutation(
+                    zakura_header_chain::MigratedPinRefutation {
+                        full_state_transition_id: evidence,
+                        pin: anchor_frontier,
+                        invalid_header: anchor_frontier,
+                        rule: BodyRuleId::new("migrated-pin-refutation"),
+                    },
+                ),
+            },
+            &context,
+        );
+        assert!(matches!(
+            result,
+            Err(HeaderChainStoreError::MigratedPinRefuted { pin }) if pin == anchor_frontier
+        ));
+        assert_eq!(runtime.publisher().snapshot(), snapshot);
+        assert_eq!(
+            runtime
+                .store
+                .metadata()
+                .expect("incident metadata is readable")
+                .alarms
+                .migrated_pin_refuted,
+            Some(anchor_frontier)
+        );
+
+        drop(runtime);
+        assert!(matches!(
+            HeaderChainStore::new(db).startup(&integrated_config),
+            Err(HeaderChainStoreError::MigratedPinRefuted { pin }) if pin == anchor_frontier
+        ));
     }
 
     #[test]

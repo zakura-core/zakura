@@ -134,7 +134,7 @@ pub fn apply_transition<S: StoreRead>(
     context: &TransitionContext<'_>,
 ) -> Result<TransitionPlan, TransitionFailure> {
     let before = store.snapshot()?;
-    let metadata = store.metadata()?;
+    let mut metadata = store.metadata()?;
     validate_snapshot(&before, &metadata, context)?;
     if metadata.last_transition_id
         == request
@@ -175,6 +175,7 @@ pub fn apply_transition<S: StoreRead>(
     let mut aux_changes = Vec::new();
     let mut finality = None;
     let operator_reason_changed = operator_reason_will_change(&graph, &request.event)?;
+    let migrated_pin_refuted = migrated_pin_refuted(store, &request.event)?;
 
     apply_event(
         store,
@@ -185,6 +186,9 @@ pub fn apply_transition<S: StoreRead>(
         context,
     )?;
     graph.recompute_all_eligibility()?;
+    if let Some(pin) = migrated_pin_refuted {
+        metadata.alarms.migrated_pin_refuted = Some(pin);
+    }
     if operator_reason_changed {
         verified = select_fully_verified_path(&graph)?;
     }
@@ -319,6 +323,23 @@ fn operator_reason_will_change(
         .direct_reasons
         .contains(&reason);
     Ok(if inserting { !present } else { present })
+}
+
+fn migrated_pin_refuted<S: StoreRead>(
+    store: &S,
+    event: &TransitionEvent,
+) -> Result<Option<Frontier>, StoreError> {
+    let TransitionEvent::MigratedPinRefutation(event) = event else {
+        return Ok(None);
+    };
+    Ok(store
+        .finality_history()?
+        .into_iter()
+        .find(|record| {
+            record.current == event.pin
+                && matches!(record.source, FinalitySource::MigratedHeadersOnly)
+        })
+        .map(|record| record.current))
 }
 
 fn select_fully_verified_path(graph: &MemHeaderStore) -> Result<Vec<Frontier>, TransitionFailure> {
@@ -589,6 +610,19 @@ fn apply_event<S: StoreRead>(
                 ));
             }
         }
+        TransitionEvent::MigratedPinRefutation(event) => {
+            if event.invalid_header.height > event.pin.height
+                || migrated_pin_refuted(
+                    store,
+                    &TransitionEvent::MigratedPinRefutation(event.clone()),
+                )?
+                .is_none()
+            {
+                return Err(TransitionFailure::InvalidEvidence(
+                    "full-state refutation does not name an imported pin ancestor",
+                ));
+            }
+        }
         TransitionEvent::AdvanceLocalCheckpoint(event) => {
             if event.authenticated_config_digest != context.config.trust_anchor_digest()
                 || context
@@ -717,12 +751,14 @@ fn derive_plan(
     eligibility_changes.sort_unstable_by_key(|delta| delta.hash.0);
     let selected_changed = selected != old_selected;
     let verified_changed = verified != old_verified;
+    let alarm_changed = metadata.alarms != before.alarms;
     let changed = !put_nodes.is_empty()
         || !delete_nodes.is_empty()
         || !aux_changes.is_empty()
         || finality_append.is_some()
         || selected_changed
-        || verified_changed;
+        || verified_changed
+        || alarm_changed;
     if changed {
         metadata.state_version = metadata.state_version.checked_next()?;
         if selected_changed || !eligibility_changes.is_empty() || finality_append.is_some() {
@@ -1601,6 +1637,64 @@ mod tests {
             plan.change_set.finality_append.expect("full-state finality is recorded").source,
             FinalitySource::FullState { evidence } if evidence == finality_id
         ));
+    }
+
+    #[test]
+    fn migrated_pin_refutation_requires_full_state_authority_and_exact_pin() {
+        let (mut store, config) = TestStore::new(EngineMode::Integrated);
+        let clock = ManualClock(Utc::now());
+        let authority = Authority;
+        let pin = store.graph.finalized();
+        store.finality.push(FinalityRecord {
+            previous: pin,
+            current: pin,
+            source: FinalitySource::MigratedHeadersOnly,
+            epoch: FinalityEpoch::new(0),
+        });
+        let evidence = EvidenceId::from_digest([0x61; 32]);
+        let request = |pin| TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::MigratedPinRefutation(crate::MigratedPinRefutation {
+                full_state_transition_id: evidence,
+                pin,
+                invalid_header: Frontier::new(block::Height(0), block::Hash([0x62; 32])),
+                rule: crate::BodyRuleId::new("body.imported-history"),
+            }),
+        };
+
+        assert!(matches!(
+            apply_transition(&store, request(pin), &context(&config, &clock, None)),
+            Err(TransitionFailure::Authority)
+        ));
+        assert!(matches!(
+            apply_transition(
+                &store,
+                request(Frontier::new(pin.height, block::Hash([0x63; 32]))),
+                &context(&config, &clock, Some(&authority)),
+            ),
+            Err(TransitionFailure::InvalidEvidence(_))
+        ));
+
+        let plan = apply_transition(
+            &store,
+            request(pin),
+            &context(&config, &clock, Some(&authority)),
+        )
+        .expect("full state can persist a refuted imported pin incident");
+        assert_eq!(
+            plan.change_set.metadata.alarms.migrated_pin_refuted,
+            Some(pin)
+        );
+        assert_eq!(
+            plan.change_set.metadata.state_version,
+            store
+                .metadata
+                .state_version
+                .checked_next()
+                .expect("the fixture version has capacity")
+        );
+        assert!(plan.change_set.put_nodes.is_empty());
+        assert!(plan.change_set.delete_nodes.is_empty());
     }
 
     #[test]

@@ -25,6 +25,8 @@ pub struct AlarmSet {
     pub resource_stalled: bool,
     /// The selected branch has exhausted its current body suppliers/retry episode.
     pub header_best_body_unavailable: Option<BodyUnavailableSummary>,
+    /// An imported headers-only trust pin was refuted by deterministic body validation.
+    pub migrated_pin_refuted: Option<Frontier>,
 }
 
 /// Atomic read snapshot published only after durable commit.
@@ -486,6 +488,19 @@ pub struct FullStateFinalized {
     pub verified_path_proof: Vec<block::Hash>,
 }
 
+/// Deterministic full-state evidence that refutes an imported headers-only trust pin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigratedPinRefutation {
+    /// Stable internal full-state transition identity.
+    pub full_state_transition_id: EvidenceId,
+    /// Exact preserved headers-only pin whose ancestry was refuted.
+    pub pin: Frontier,
+    /// Exact body-invalid header on the imported path at or below `pin`.
+    pub invalid_header: Frontier,
+    /// Exact deterministic full-state rule.
+    pub rule: BodyRuleId,
+}
+
 /// Authenticated local checkpoint advancement.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct AdvanceLocalCheckpoint {
@@ -532,6 +547,8 @@ pub enum TransitionEvent {
     OperatorReconsider(OperatorReconsider),
     /// Integrated full-state finality advancement.
     FullStateFinalized(FullStateFinalized),
+    /// Integrated full state refuted an imported headers-only pin.
+    MigratedPinRefutation(MigratedPinRefutation),
     /// Authenticated local checkpoint advancement.
     AdvanceLocalCheckpoint(AdvanceLocalCheckpoint),
     /// Hash-scoped auxiliary evidence.
@@ -564,6 +581,7 @@ impl TransitionEvent {
             | Self::VerifiedChainChanged(_)
             | Self::BodyEvidence(_)
             | Self::FullStateFinalized(_)
+            | Self::MigratedPinRefutation(_)
             | Self::AuxEvidence(_) => EventAdmission::IntegratedFullState,
             Self::Recover(_) => EventAdmission::StartupOnly,
             Self::InsertHeaders(_)
@@ -586,6 +604,7 @@ impl TransitionEvent {
             Self::OperatorInvalidate(event) => Some(event.evidence),
             Self::OperatorReconsider(event) => Some(event.evidence),
             Self::FullStateFinalized(event) => Some(event.full_state_transition_id),
+            Self::MigratedPinRefutation(event) => Some(event.full_state_transition_id),
             Self::AdvanceLocalCheckpoint(event) => Some(event.evidence),
             Self::AuxEvidence(event) => Some(event.delivery.delivery_id),
             Self::Recover(event) => Some(event.evidence),
@@ -828,6 +847,16 @@ mod tests {
         assert_eq!(recovery.admission(), EventAdmission::StartupOnly);
         assert_eq!(recovery.idempotency_key(), Some(evidence));
 
+        let refutation = TransitionEvent::MigratedPinRefutation(MigratedPinRefutation {
+            full_state_transition_id: evidence,
+            pin: Frontier::new(block::Height(2), block::Hash([4; 32])),
+            invalid_header: Frontier::new(block::Height(1), block::Hash([5; 32])),
+            rule: BodyRuleId::new("body.rule"),
+        });
+        assert_eq!(refutation.admission(), EventAdmission::IntegratedFullState);
+        assert_eq!(refutation.idempotency_key(), Some(evidence));
+        assert_eq!(refutation.work_owner(), None);
+
         assert_eq!(
             TransitionEvent::ReevaluateDeferred.admission(),
             EventAdmission::AnyMode
@@ -892,6 +921,7 @@ mod tests {
             "OperatorInvalidate(OperatorInvalidate)",
             "OperatorReconsider(OperatorReconsider)",
             "FullStateFinalized(FullStateFinalized)",
+            "MigratedPinRefutation(MigratedPinRefutation)",
             "AdvanceLocalCheckpoint(AdvanceLocalCheckpoint)",
             "AuxEvidence(AuxEvidence)",
             "ReevaluateDeferred",

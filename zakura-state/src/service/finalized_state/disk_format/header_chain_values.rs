@@ -881,6 +881,10 @@ impl HeaderChainValue for HeaderEngineMetadataDisk {
             encoder.bool(summary.alarmed);
         }
         encoder.fixed(&value.last_transition_id.digest());
+        encoder.bool(value.alarms.migrated_pin_refuted.is_some());
+        if let Some(pin) = value.alarms.migrated_pin_refuted {
+            put_frontier(&mut encoder, pin);
+        }
         Ok(encoder.0)
     }
 
@@ -940,6 +944,14 @@ impl HeaderChainValue for HeaderEngineMetadataDisk {
             })
             .transpose()?;
         let last_transition_id = EvidenceId::from_digest(decoder.array()?);
+        let migrated_pin_refuted = if decoder.remaining.is_empty() {
+            None
+        } else {
+            decoder
+                .bool()?
+                .then(|| get_frontier(&mut decoder))
+                .transpose()?
+        };
         decoder.finish()?;
         Ok(Self(EngineMetadata {
             disk_format,
@@ -957,6 +969,7 @@ impl HeaderChainValue for HeaderEngineMetadataDisk {
             alarms: AlarmSet {
                 resource_stalled,
                 header_best_body_unavailable,
+                migrated_pin_refuted,
             },
             last_transition_id,
         }))
@@ -1123,12 +1136,29 @@ mod tests {
                     suppliers: 8,
                     alarmed: true,
                 }),
+                migrated_pin_refuted: Some(frontier(1, 2)),
             },
             last_transition_id: EvidenceId::from_digest([14; 32]),
         });
         let bytes = metadata.encode().expect("metadata encodes");
         assert_eq!(&bytes[..6], &[0, 0, 0, 1, 1, 2]);
-        assert_eq!(HeaderEngineMetadataDisk::decode(&bytes), Ok(metadata));
+        assert_eq!(
+            HeaderEngineMetadataDisk::decode(&bytes),
+            Ok(metadata.clone())
+        );
+        let mut legacy_bytes = bytes.clone();
+        legacy_bytes.truncate(
+            legacy_bytes
+                .len()
+                .checked_sub(37)
+                .expect("the optional alarm is one tag plus one frontier"),
+        );
+        let mut legacy_metadata = metadata.clone();
+        legacy_metadata.0.alarms.migrated_pin_refuted = None;
+        assert_eq!(
+            HeaderEngineMetadataDisk::decode(&legacy_bytes),
+            Ok(legacy_metadata)
+        );
         assert_eq!(
             [
                 digest(&aux.encode().expect("aux encodes")),
@@ -1138,7 +1168,7 @@ mod tests {
             [
                 "329b695b06b38c807523cbc452661423cb0ead8df60d641d635d516c3ee3dd33",
                 "b887bf384510dfb1a255221a8c97066617cb145eaf3e272ad70dc94cd17a3802",
-                "4fa8b62bb9f61576fb353725eecc62607c4235260e8397c4ab3d57f258d308ce",
+                "a07e697728327c41b90f4ff71890e737d20f32337b2ce84a059659957fa3b483",
             ]
         );
     }

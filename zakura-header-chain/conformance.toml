@@ -363,7 +363,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-FINAL-04"
 name = "Mode and finality provenance"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::HeaderChainStore::migrate_headers_only_to_integrated"
+tests = ["DG-07::migrated_pin_refutation_requires_full_state_authority_and_exact_pin", "DG-07::migrated_headers_only_pin_refutation_is_durable_and_fail_closed"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-RETAIN-01"

@@ -184,7 +184,7 @@ pub fn audit_store<S: StoreAuditRead>(
     check_nodes(&source_nodes, &by_hash, &metadata, &mut violations);
     check_finalized_connectivity(&source_nodes, finalized, &mut violations);
     check_trust_pins(&source_nodes, config, &mut violations);
-    check_authoritative_rows(store, &source_nodes, &metadata, &mut violations)?;
+    check_authoritative_rows(store, &source_nodes, &metadata, config, &mut violations)?;
     if source_nodes.len().saturating_sub(1) > config.limits.max_non_finalized_nodes.get()
         && !metadata.alarms.resource_stalled
     {
@@ -439,6 +439,7 @@ fn check_authoritative_rows<S: StoreAuditRead>(
     store: &S,
     nodes: &[HeaderNode],
     metadata: &EngineMetadata,
+    config: &EngineConfig,
     violations: &mut Vec<AuditViolation>,
 ) -> Result<(), StoreError> {
     let mut expected: Vec<_> = nodes
@@ -523,7 +524,7 @@ fn check_authoritative_rows<S: StoreAuditRead>(
     }
     if history
         .iter()
-        .any(|record| !source_matches_mode(record, metadata.mode))
+        .any(|record| !source_matches_mode(record, metadata.mode, config))
         || history.last().is_some_and(|record| {
             record.current != metadata.frontiers.finalized
                 || record.epoch != metadata.finality_epoch
@@ -535,16 +536,20 @@ fn check_authoritative_rows<S: StoreAuditRead>(
     Ok(())
 }
 
-fn source_matches_mode(record: &FinalityRecord, mode: EngineMode) -> bool {
-    matches!(
-        (mode, record.source),
+fn source_matches_mode(record: &FinalityRecord, mode: EngineMode, config: &EngineConfig) -> bool {
+    match (mode, record.source) {
         (EngineMode::Integrated, FinalitySource::FullState { .. })
-            | (
-                EngineMode::HeadersOnly,
-                FinalitySource::HeadersOnlyDepth { .. }
-            )
-            | (_, FinalitySource::MigratedHeadersOnly)
-    )
+        | (_, FinalitySource::MigratedHeadersOnly) => true,
+        (EngineMode::HeadersOnly, FinalitySource::HeadersOnlyDepth { selected_tip }) => {
+            record.current.height > record.previous.height
+                && selected_tip
+                    .height
+                    .0
+                    .saturating_sub(record.current.height.0)
+                    == config.limits.local_finality_depth.get()
+        }
+        _ => false,
+    }
 }
 
 fn verified_path(
@@ -1024,6 +1029,21 @@ mod tests {
         store.metadata.finality_epoch = FinalityEpoch::new(1);
         store.snapshot = store.metadata.snapshot();
         assert!(violations(&store, &config).contains(&AuditViolation::Finality));
+
+        let mut headers_only = config.clone();
+        headers_only.mode = EngineMode::HeadersOnly;
+        let mut store = base.clone();
+        store.metadata.mode = EngineMode::HeadersOnly;
+        store.snapshot = store.metadata.snapshot();
+        store.finality.push(FinalityRecord {
+            previous: store.metadata.frontiers.finalized,
+            current: store.metadata.frontiers.finalized,
+            source: FinalitySource::HeadersOnlyDepth {
+                selected_tip: store.metadata.frontiers.header_best,
+            },
+            epoch: FinalityEpoch::new(0),
+        });
+        assert!(violations(&store, &headers_only).contains(&AuditViolation::Finality));
 
         let mut limited = config.clone();
         limited.limits.max_non_finalized_nodes = NonZeroUsize::new(1).expect("one is nonzero");

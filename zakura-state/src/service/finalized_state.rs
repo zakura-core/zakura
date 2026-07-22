@@ -143,6 +143,19 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "zakura_header_height_by_hash",
     "zakura_header_by_height",
     ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+    // Fork-aware header-chain engine v1
+    HEADER_NODE_BY_HASH,
+    HEADER_CHILD,
+    HEADER_HEIGHT_HASH,
+    HEADER_SELECTED,
+    HEADER_VERIFIED,
+    HEADER_CANDIDATE,
+    HEADER_ELIGIBILITY_ROOT,
+    HEADER_AUX_DELIVERY,
+    HEADER_DEFERRED,
+    HEADER_FINALITY_HISTORY,
+    HEADER_VALIDATION_CONTEXT,
+    HEADER_ENGINE_META,
     // Transactions
     "tx_by_loc",
     "hash_by_tx_loc",
@@ -183,6 +196,31 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     VCT_SYNC_METADATA,
     VCT_UPGRADE_METADATA,
 ];
+
+/// Fork-aware header-chain node rows keyed by canonical hash.
+pub const HEADER_NODE_BY_HASH: &str = "header_node_by_hash_v1";
+/// Parent/child adjacency index.
+pub const HEADER_CHILD: &str = "header_child_v1";
+/// Height/hash multimap index.
+pub const HEADER_HEIGHT_HASH: &str = "header_height_hash_v1";
+/// Reconstructible selected-header projection.
+pub const HEADER_SELECTED: &str = "header_selected_v1";
+/// Reconstructible verified-header projection.
+pub const HEADER_VERIFIED: &str = "header_verified_v1";
+/// Ordered candidate score index.
+pub const HEADER_CANDIDATE: &str = "header_candidate_v1";
+/// Direct eligibility reason roots.
+pub const HEADER_ELIGIBILITY_ROOT: &str = "header_eligibility_root_v1";
+/// Hash-keyed auxiliary deliveries.
+pub const HEADER_AUX_DELIVERY: &str = "header_aux_delivery_v1";
+/// Ordered future-time deferral index.
+pub const HEADER_DEFERRED: &str = "header_deferred_v1";
+/// Authoritative append-only finality history.
+pub const HEADER_FINALITY_HISTORY: &str = "header_finality_history_v1";
+/// Immutable validation-context rows.
+pub const HEADER_VALIDATION_CONTEXT: &str = "header_validation_context_v1";
+/// Singleton header-engine metadata root.
+pub const HEADER_ENGINE_META: &str = "header_engine_meta_v1";
 
 /// The name of the column family that records pruning progress.
 ///

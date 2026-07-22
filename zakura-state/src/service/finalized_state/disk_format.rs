@@ -9,6 +9,7 @@ use std::{io::Write, sync::Arc};
 
 pub mod block;
 pub mod chain;
+pub mod header_chain;
 pub mod shielded;
 pub mod transparent;
 pub mod upgrade;

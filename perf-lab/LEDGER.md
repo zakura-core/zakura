@@ -139,3 +139,40 @@ This file is the sole reporting channel (design D5). Entry template:
   changes nothing → concurrency is not the constraint at this window; the
   floor-body HOL (banner: writer 23-24%, reorder ~430-460 MB) gates progress
   regardless of parallelism.
+
+### exp001-p400 (DL_LIMIT=400, 2026-07-22)
+
+- legs 93.60 / 94.27 pc blk/s (within-run 0.72% — valid), SHA 8862004e (main
+  drifted from base1's 847f6085 → absolute comparison to 85.37 is confounded;
+  the ~94 level matches the faster network phases seen all day). Directional
+  evidence only.
+
+## EXP-001 — DL_LIMIT sweep: NEUTRAL with evidence (2026-07-22)
+
+- points: 50 (flat, -0.9% within-SHA vs base1), 150 (the default, every
+  baseline run), 400 (drift-confounded, same envelope). Verdict: **download
+  concurrency is not the lever** in the checkpoint-zone window — throughput
+  is gated by per-peer delivery of the floor body (HOL), unchanged from 50 to
+  400 concurrent downloads.
+- consequence: the download-path levers that could matter are (a) B-15
+  frozen-cohort (also unlocks tight thresholds), (b) request-shape /
+  blocks-per-response work — PROPOSAL-blocked on PRs 166/217, (c) a
+  heavier-blocks window campaign where commit-side work becomes visible.
+
+## SESSION 1 close — HALTED per rule (2026-07-22, ~05:40Z)
+
+- collects this session: aa-seed1 (closed batch 1), aa-seed2, base1,
+  exp001-p50, exp001-p400 (batch 2: 4 of 8 used).
+- findings: (1) seeder mode narrows worst-case A/A noise to 5.8% but misses
+  the ≤3% adoption bar — B-15-full (frozen cohort) is the real fix and needs
+  Adam's droplet-cap decision (3 concurrent, ~$0.5/h per frozen server);
+  (2) DL_LIMIT flat 50→400 (EXP-001); (3) main drifted twice mid-session —
+  SHA pinning caught both; cross-SHA/phase comparisons confounded by design
+  awareness, within-run measurements stayed clean throughout.
+- halt rationale: zero runs at/above the 17.4% threshold and no READY item
+  clears it under current rails (sweep space measured flat; knob code work
+  blocked on PRs 166/217; commit-side invisible at this window; B-15-full
+  awaiting decision). Unlocks: B-15 approval OR PRs 166/217 landing OR a
+  heavier-window campaign.
+- spend: ~US$2.75 this session (perf-lab-s1, ~5.5 h); droplet destroyed at
+  close.

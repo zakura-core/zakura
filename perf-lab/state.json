@@ -1,22 +1,9 @@
 {
   "schema": 1,
   "session": 1,
-  "batch_runs_used": 3,
+  "batch_runs_used": 4,
   "next_exp_id": 2,
-  "droplets": {
-    "perf-lab-s1": {
-      "ip": "104.131.188.233",
-      "created_at": "2026-07-22T00:05:00Z"
-    }
-  },
-  "in_flight": {
-    "exp001-p400": {
-      "droplet": "perf-lab-s1",
-      "build_ref": "847f6085-expected",
-      "baseline_ref": "same",
-      "exp": "EXP-001 DL_LIMIT sweep p400",
-      "started_at": "2026-07-22T04:40:00Z"
-    }
-  },
+  "droplets": {},
+  "in_flight": {},
   "noise_band_pct": 8.7
 }

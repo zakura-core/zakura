@@ -54,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Replace outdated Zebra branding in Zakura logs, errors, RPC responses, CLI
   help, and operator tooling
   ([#335](https://github.com/zakura-core/zakura/pull/335)).
+- Stop advertising dependent transactions after their expired parent is removed
+  from the mempool
+  ([#342](https://github.com/zakura-core/zakura/pull/342)).
 
 ## [1.0.2] - 2026-07-20
 

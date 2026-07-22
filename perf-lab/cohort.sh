@@ -97,7 +97,8 @@ peers = sys.argv[1]
 import re
 path = "perf-lab/config.env"
 s = open(path).read()
-s = re.sub(r'COHORT_PEERS="[^"]*"', f'COHORT_PEERS="{peers}"', s)
+s = re.sub(r'COHORT_PEERS="[^"]*"',
+           'COHORT_PEERS="' + chr(36) + '{COHORT_PEERS:-' + peers + '}"', s)
 open(path, "w").write(s)
 print(f"COHORT_PEERS={peers}")
 PYEOF

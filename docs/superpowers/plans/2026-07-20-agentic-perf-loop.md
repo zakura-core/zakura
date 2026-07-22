@@ -99,7 +99,7 @@ BENCH_STOP_HEIGHT="${BENCH_STOP_HEIGHT:-1827210}"
 # --- B-15 frozen cohort (approved 2026-07-22) ---
 COHORT_TAG="${COHORT_TAG:-perf-lab-cohort-1}"
 COHORT_SEED_STOP="${COHORT_SEED_STOP:-1836000}"   # window end 1827210 + margin
-COHORT_PEERS=""                                    # id@ip:8234 pairs, set by cohort.sh peers
+COHORT_PEERS="${COHORT_PEERS:-}"                   # id@ip:8234 pairs, set by cohort.sh peers
 
 BATCH_SIZE=8                                   # D3/D6: bench runs per batch
 WIN_THRESHOLD_PCT="3.0"                        # floor; effective = max(this, 2*NOISE_BAND_PCT)

@@ -1590,7 +1590,7 @@ impl ZakuraDiscoveryHandle {
     ) -> ServiceAdmissionDecision {
         let mut inner = self.inner.lock().await;
         if let Some(peer) = inner.admitted_peers.get_mut(&peer_id) {
-            if (conn_id, session_id) < (peer.conn_id, peer.session_id) {
+            if (conn_id, session_id) <= (peer.conn_id, peer.session_id) {
                 return ServiceAdmissionDecision::RejectNotUseful;
             }
 
@@ -8034,6 +8034,12 @@ mod tests {
                 .admit_peer_session(2, 2, peer.clone(), ServicePeerDirection::Inbound)
                 .await,
             ServiceAdmissionDecision::Admit
+        );
+        assert_eq!(
+            handle
+                .admit_peer_session(2, 2, peer.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::RejectNotUseful
         );
 
         handle.remove_session(&peer, 2, 1).await;

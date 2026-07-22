@@ -702,6 +702,32 @@ PYPATCH
   bash -n ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
     || echo "WARN: cohort patch broke harness syntax — cohort mode unusable" >&2
 fi
+# keepfork: the harness's EXIT-trap cleanup deletes CUR_FORK on every exit,
+# which would destroy a cohort seed's served state; guard it behind
+# KEEP_CUR_FORK (set only by cohort.sh seed). B-14's summary_row rm is
+# untouched (that line does not start with [[ and never runs in seed mode).
+if ! grep -q "perf-lab keepfork" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh; then
+  python3 - ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh <<'PYKEEP'
+import sys
+path = sys.argv[1]
+lines = open(path).read().split(chr(10))
+q, d = chr(34), chr(36)
+frag = "rm -rf " + q + d + "CUR_FORK" + q
+cond = "[[ -n " + q + d + "CUR_FORK" + q + " ]]"
+newcond = ("[[ -n " + q + d + "CUR_FORK" + q + " && " + q + d
+           + "{KEEP_CUR_FORK:-0}" + q + " != " + q + "1" + q + " ]]")
+done = False
+for i, line in enumerate(lines):
+    if not done and frag in line and line.lstrip().startswith("[[") and cond in line:
+        lines[i] = line.replace(cond, newcond) + "  # perf-lab keepfork"
+        done = True
+assert done, "keepfork anchor"
+open(path, "w").write(chr(10).join(lines))
+print("keepfork patch applied")
+PYKEEP
+  bash -n ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
+    || echo "WARN: keepfork patch broke harness syntax" >&2
+fi
 mkdir -p ${BENCH_OUT_REMOTE}
 echo "remote prep done"
 REMOTE
@@ -734,6 +760,8 @@ for d in json.load(sys.stdin) or []:
     created=datetime.datetime.fromisoformat(d["created_at"].replace("Z","+00:00"))
     if (now-created).total_seconds() > max_age: print(d["name"])
 ' "$max" | while read -r name; do
+    # long-lived frozen cohort servers are exempt (B-15; Adam-approved)
+    case "$name" in "${NAME_PREFIX}"-serve-*) echo "keeping cohort server $name"; continue;; esac
     echo "reaping stale droplet $name"
     # subshell contains die's `exit`, so the loop survives a guard refusal
     ( cmd_destroy "$name" ) || echo "reap skipped (guard refused): $name" >&2
@@ -1253,7 +1281,9 @@ apt/ssh waits.
    resume any `in_flight` bench (status → collect → verdict → ledger) before
    any reaping, so a live bench's droplet is never destroyed under it.
 3. `bash perf-lab/droplet.sh list` then `reap` — never reap a droplet named in
-   `state.json.in_flight`; note anything reaped in the ledger as an incident.
+   `state.json.in_flight`, and `perf-lab-serve-*` cohort servers are exempt by
+   code (long-lived, Adam-approved); note anything reaped in the ledger as an
+   incident.
 4. Refresh exclusions: `gh pr list --limit 50` → update BACKLOG.md's
    Exclusions section; drop/block any backlog item that now collides.
 5. Droplet: reuse a healthy droplet already in `state.json.droplets` if one
@@ -1531,8 +1561,9 @@ COHORT_PEERS=""                                    # captured by cohort.sh peers
 - `freeze NAME` — write `/root/serve.toml` (Mainnet, `p2p_stack="zakura"`,
   `dev_network=$COHORT_TAG`, empty `bootstrap_peers`, `listen 0.0.0.0:8234`,
   `cache_dir=/opt/zakura-bench/serve-state`, no debug_stop) and start the
-  seeded zakurad under nohup with a pid/log; the iroh identity persists in the
-  cache dir, so node_id survives restarts.
+  seeded zakurad under nohup with a pid/log; the iroh identity persists in
+  `identity_dir` (default `~/.zakura`, deliberately outside cache_dir), so
+  node_id survives restarts and even re-seeds.
 - `peers` — grep each serve log for `node_id=`, emit `id@ip:8234` pairs, and
   write them into config.env's COHORT_PEERS (space-separated).
 - `status|stop NAME` — pid/log inspection and shutdown.

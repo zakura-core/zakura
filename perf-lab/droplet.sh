@@ -159,6 +159,32 @@ PYPATCH
   bash -n ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
     || echo "WARN: cohort patch broke harness syntax — cohort mode unusable" >&2
 fi
+# keepfork: the harness's EXIT-trap cleanup deletes CUR_FORK on every exit,
+# which would destroy a cohort seed's served state; guard it behind
+# KEEP_CUR_FORK (set only by cohort.sh seed). B-14's summary_row rm is
+# untouched (that line does not start with [[ and never runs in seed mode).
+if ! grep -q "perf-lab keepfork" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh; then
+  python3 - ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh <<'PYKEEP'
+import sys
+path = sys.argv[1]
+lines = open(path).read().split(chr(10))
+q, d = chr(34), chr(36)
+frag = "rm -rf " + q + d + "CUR_FORK" + q
+cond = "[[ -n " + q + d + "CUR_FORK" + q + " ]]"
+newcond = ("[[ -n " + q + d + "CUR_FORK" + q + " && " + q + d
+           + "{KEEP_CUR_FORK:-0}" + q + " != " + q + "1" + q + " ]]")
+done = False
+for i, line in enumerate(lines):
+    if not done and frag in line and line.lstrip().startswith("[[") and cond in line:
+        lines[i] = line.replace(cond, newcond) + "  # perf-lab keepfork"
+        done = True
+assert done, "keepfork anchor"
+open(path, "w").write(chr(10).join(lines))
+print("keepfork patch applied")
+PYKEEP
+  bash -n ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
+    || echo "WARN: keepfork patch broke harness syntax" >&2
+fi
 mkdir -p ${BENCH_OUT_REMOTE}
 echo "remote prep done"
 REMOTE
@@ -191,6 +217,8 @@ for d in json.load(sys.stdin) or []:
     created=datetime.datetime.fromisoformat(d["created_at"].replace("Z","+00:00"))
     if (now-created).total_seconds() > max_age: print(d["name"])
 ' "$max" | while read -r name; do
+    # long-lived frozen cohort servers are exempt (B-15; Adam-approved)
+    case "$name" in "${NAME_PREFIX}"-serve-*) echo "keeping cohort server $name"; continue;; esac
     echo "reaping stale droplet $name"
     # subshell contains die's `exit`, so the loop survives a guard refusal
     ( cmd_destroy "$name" ) || echo "reap skipped (guard refused): $name" >&2

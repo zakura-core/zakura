@@ -23,7 +23,9 @@ apt/ssh waits.
    resume any `in_flight` bench (status → collect → verdict → ledger) before
    any reaping, so a live bench's droplet is never destroyed under it.
 3. `bash perf-lab/droplet.sh list` then `reap` — never reap a droplet named in
-   `state.json.in_flight`; note anything reaped in the ledger as an incident.
+   `state.json.in_flight`, and `perf-lab-serve-*` cohort servers are exempt by
+   code (long-lived, Adam-approved); note anything reaped in the ledger as an
+   incident.
 4. Refresh exclusions: `gh pr list --limit 50` → update BACKLOG.md's
    Exclusions section; drop/block any backlog item that now collides.
 5. Droplet: reuse a healthy droplet already in `state.json.droplets` if one

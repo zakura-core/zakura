@@ -30,7 +30,7 @@ rm -rf ${BENCH_HOME_REMOTE}/forks/*
 mkdir -p ${BENCH_OUT_REMOTE}/seed
 cd ${CTL_CLONE_REMOTE}
 ( nohup env \
-    BUILD_REF='main' SKIP_BASELINE=1 \
+    BUILD_REF='main' SKIP_BASELINE=1 KEEP_CUR_FORK=1 \
     TARGET_P2P_STACK=zakura \
     BENCH_HOME='${BENCH_HOME_REMOTE}' \
     STOP_HEIGHT='${COHORT_SEED_STOP}' WALL_CAP=3600 \
@@ -54,6 +54,11 @@ set -euo pipefail
 [ "\$(cat ${BENCH_OUT_REMOTE}/seed.exit)" = "0" ] || { echo "seed failed: exit \$(cat ${BENCH_OUT_REMOTE}/seed.exit) — see seed.log"; exit 1; }
 fork=\$(ls -d ${BENCH_HOME_REMOTE}/forks/primary-* 2>/dev/null | head -1)
 [ -n "\$fork" ] || { echo "no primary fork found to serve from"; exit 1; }
+# a wall-capped seed exits 0 but stops short; the served state must cover the
+# bench window
+last_h=\$(tail -1 ${BENCH_OUT_REMOTE}/seed/samples-primary.csv 2>/dev/null | cut -d, -f3)
+[ -n "\$last_h" ] && [ "\$last_h" -ge ${BENCH_STOP_HEIGHT} ] \
+  || { echo "seed stopped short: height \${last_h:-unknown} < ${BENCH_STOP_HEIGHT}"; exit 1; }
 rm -rf ${BENCH_HOME_REMOTE}/serve-state
 mv "\$fork" ${BENCH_HOME_REMOTE}/serve-state
 cat > /root/serve.toml <<TOML
@@ -71,7 +76,7 @@ bootstrap_peers = []
 [state]
 cache_dir = "${BENCH_HOME_REMOTE}/serve-state"
 TOML
-bin=\$(ls ${BENCH_HOME_REMOTE}/bins/*/zakurad | head -1)
+bin=\$(ls -t ${BENCH_HOME_REMOTE}/bins/*/zakurad | head -1)
 [ -n "\$bin" ] || { echo "no cached zakurad binary"; exit 1; }
 pkill -F /root/serve.pid 2>/dev/null || true
 ( nohup "\$bin" -c /root/serve.toml start > /root/serve.log 2>&1 < /dev/null & echo \$! > /root/serve.pid )
@@ -91,11 +96,11 @@ cmd_peers() {
     out="$out $id@$ip:8234"
   done
   out="${out# }"
-  python3 - "$out" <<'PYEOF'
+  python3 - "$out" "$DIR/config.env" <<'PYEOF'
 import sys
 peers = sys.argv[1]
 import re
-path = "perf-lab/config.env"
+path = sys.argv[2]
 s = open(path).read()
 s = re.sub(r'COHORT_PEERS="[^"]*"',
            'COHORT_PEERS="' + chr(36) + '{COHORT_PEERS:-' + peers + '}"', s)
@@ -111,6 +116,8 @@ cmd_status() {
   $SSH "${SSH_OPTS[@]}" "root@$ip" bash -s <<REMOTE
 if [ -f /root/serve.pid ] && kill -0 "\$(cat /root/serve.pid)" 2>/dev/null; then
   echo "SERVING (pid \$(cat /root/serve.pid))"; tail -1 /root/serve.log
+elif [ -f /root/serve.pid ]; then
+  echo "SERVE DEAD (crashed?)"; tail -3 /root/serve.log
 elif [ -f ${BENCH_OUT_REMOTE}/seed.exit ]; then
   echo "SEED DONE:\$(cat ${BENCH_OUT_REMOTE}/seed.exit)"
 elif [ -f ${BENCH_OUT_REMOTE}/seed.pid ] && kill -0 "\$(cat ${BENCH_OUT_REMOTE}/seed.pid)" 2>/dev/null; then

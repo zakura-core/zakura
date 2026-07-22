@@ -39,6 +39,7 @@ mod service;
 mod state;
 #[cfg(test)]
 mod tests;
+mod v8;
 mod validation;
 mod wire;
 mod work_queue;
@@ -59,6 +60,12 @@ pub use reactor::spawn_header_sync_reactor;
 pub use service::HeaderSyncPeerSession;
 pub(crate) use service::{
     drive_header_sync_actions, HeaderSyncPassthroughService, HeaderSyncService,
+};
+pub use v8::{
+    AuxSchemaV8, GetHeadersV8, HeaderEntryV8, HeaderSyncMessageV8, HeaderSyncV8Codec,
+    HeaderSyncV8DecodeContext, HeaderSyncV8WireError, HeadersOutcomeCodeV8, HeadersOutcomeV8,
+    HeadersV8, StatusV8, TreeAuxRecordV1, MSG_HS_V8_GET_HEADERS, MSG_HS_V8_HEADERS,
+    MSG_HS_V8_HEADERS_OUTCOME, MSG_HS_V8_STATUS, TREE_AUX_SCHEMA_V1_BYTES,
 };
 pub use validation::{
     validate_header_range_links, validate_headers_stateless, validate_new_block_stateless,

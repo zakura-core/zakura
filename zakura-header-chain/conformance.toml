@@ -423,7 +423,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-V8-01"
 name = "Bounded v8 decoding"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::HeaderSyncV8Codec::decode"
+tests = ["P8-01::bounded_decode_rejects_discriminants_ids_bools_heights_and_trailing_bytes", "P8-01::decode_rejects_each_vector_hint_schema_and_byte_boundary"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-V8-02"
@@ -458,7 +461,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-V8-15"
 name = "Immutable schema evolution"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::AuxSchemaV8"
+tests = ["P8-01::request_bounds_and_schema_advertisement_are_enforced", "P8-01::body_hints_completion_and_aux_defaults_are_enforced"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-V8-16"

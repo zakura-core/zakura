@@ -9,8 +9,8 @@ pub(super) mod artifact;
 pub use artifact::{generate_mainnet_from_archive, GeneratorError};
 
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
 };
 
 use thiserror::Error;
@@ -322,12 +322,21 @@ pub(crate) struct VctCommitState {
     /// block commitment. At NU5 and later it stays paired with the header hash,
     /// so a same-header body with different authorizing data cannot reuse the
     /// earlier prevalidation.
-    prevalidated_next: Option<(block::Height, block::Hash, Option<AuthDataRoot>)>,
+    ///
+    /// This cache is shared across [`super::FinalizedState`] clones. The
+    /// production node has one finalized writer, but the public state type is
+    /// cloneable and its clone contract requires mutable commit safety state to
+    /// remain coherent across clones.
+    prevalidated_next: Arc<Mutex<Option<(block::Height, block::Hash, Option<AuthDataRoot>)>>>,
 
     /// `true` while a vct sync is in-progress below the last checkpoint height.
     /// During this time, we do not reconstruct per-height note-commitment trees.
     /// As a result, the frontier is unknown.
-    is_vct_sync_below_last_checkpoint: bool,
+    ///
+    /// This flag is shared across [`super::FinalizedState`] clones so a clone
+    /// cannot miss that another clone has frozen the frontier and then
+    /// incorrectly fall back to legacy recomputation.
+    is_vct_sync_below_last_checkpoint: Arc<AtomicBool>,
 }
 
 impl VctCommitState {
@@ -339,8 +348,10 @@ impl VctCommitState {
     ) -> Self {
         VctCommitState {
             source,
-            prevalidated_next: None,
-            is_vct_sync_below_last_checkpoint,
+            prevalidated_next: Arc::new(Mutex::new(None)),
+            is_vct_sync_below_last_checkpoint: Arc::new(AtomicBool::new(
+                is_vct_sync_below_last_checkpoint,
+            )),
         }
     }
 
@@ -352,50 +363,68 @@ impl VctCommitState {
     /// `true` while the note-commitment frontier is below the last checkpoint height.
     pub(super) fn is_below_last_checkpoint(&self) -> bool {
         self.is_vct_sync_below_last_checkpoint
+            .load(Ordering::Acquire)
     }
 
     /// The cached successor prevalidation, if any.
     pub(super) fn prevalidated_next(
         &self,
     ) -> Option<(block::Height, block::Hash, Option<AuthDataRoot>)> {
-        self.prevalidated_next
+        *self
+            .prevalidated_next
+            .lock()
+            .expect("VCT prevalidation lock is not poisoned because commit panics are fatal")
     }
 
     /// Caches the next header as already validated by this fast commit's look-ahead.
     pub(super) fn mark_prevalidated(
-        &mut self,
+        &self,
         height: block::Height,
         hash: block::Hash,
         auth_data_root: Option<AuthDataRoot>,
     ) {
-        self.prevalidated_next = Some((height, hash, auth_data_root));
+        *self
+            .prevalidated_next
+            .lock()
+            .expect("VCT prevalidation lock is not poisoned because commit panics are fatal") =
+            Some((height, hash, auth_data_root));
     }
 
     /// Clears any cached successor prevalidation.
-    pub(super) fn clear_prevalidated_next(&mut self) {
-        self.prevalidated_next = None;
+    pub(super) fn clear_prevalidated_next(&self) {
+        *self
+            .prevalidated_next
+            .lock()
+            .expect("VCT prevalidation lock is not poisoned because commit panics are fatal") =
+            None;
     }
 
     /// Test-only: overwrites the cached successor prevalidation, so tests can
     /// install a stale or forged entry to exercise the dedup's guard checks.
     #[cfg(test)]
     pub(super) fn set_prevalidated_next(
-        &mut self,
+        &self,
         next: Option<(block::Height, block::Hash, Option<AuthDataRoot>)>,
     ) {
-        self.prevalidated_next = next;
+        *self
+            .prevalidated_next
+            .lock()
+            .expect("VCT prevalidation lock is not poisoned because commit panics are fatal") =
+            next;
     }
 
     /// Starts a VCT sync below the last checkpoint height: below the last checkpoint height,
     /// the frontier is unknown as we are not reconstructing the trees every height.
-    pub(super) fn start_vct_sync_below_last_checkpoint(&mut self) {
-        self.is_vct_sync_below_last_checkpoint = true;
+    pub(super) fn start_vct_sync_below_last_checkpoint(&self) {
+        self.is_vct_sync_below_last_checkpoint
+            .store(true, Ordering::Release);
     }
 
     /// Stops a VCT sync at the last checkpoint height: the last checkpoint wrote the
     /// real final frontier as the tip treestate.
-    pub(super) fn stop_vct_sync_at_last_checkpoint(&mut self) {
-        self.is_vct_sync_below_last_checkpoint = false;
+    pub(super) fn stop_vct_sync_at_last_checkpoint(&self) {
+        self.is_vct_sync_below_last_checkpoint
+            .store(false, Ordering::Release);
     }
 
     /// Test-only: installs an arbitrary [`CommitmentRootSource`] as fast-mode
@@ -661,6 +690,43 @@ mod tests {
         assert!(
             bounded.vct_roots_at_height(after_handoff).is_none(),
             "roots above the handoff are ignored even when the source has them"
+        );
+    }
+
+    #[test]
+    fn cloned_commit_state_shares_frozen_frontier_and_prevalidation() {
+        let state = VctCommitState::new(None, false);
+        let clone = state.clone();
+        let prevalidated = (
+            block::Height(7),
+            block::Hash([7; 32]),
+            Some(AuthDataRoot::from([7; 32])),
+        );
+
+        state.start_vct_sync_below_last_checkpoint();
+        state.mark_prevalidated(prevalidated.0, prevalidated.1, prevalidated.2);
+
+        assert!(
+            clone.is_below_last_checkpoint(),
+            "a clone must observe that another clone froze the frontier"
+        );
+        assert_eq!(
+            clone.prevalidated_next(),
+            Some(prevalidated),
+            "a clone must observe the shared successor prevalidation cache"
+        );
+
+        clone.stop_vct_sync_at_last_checkpoint();
+        clone.clear_prevalidated_next();
+
+        assert!(
+            !state.is_below_last_checkpoint(),
+            "unfreezing through one clone must update every clone"
+        );
+        assert_eq!(
+            state.prevalidated_next(),
+            None,
+            "clearing prevalidation through one clone must update every clone"
         );
     }
 

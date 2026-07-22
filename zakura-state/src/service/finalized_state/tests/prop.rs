@@ -8,7 +8,6 @@ use tokio::sync::oneshot;
 use zakura_chain::{
     amount::Amount,
     block::{Block, Height},
-    parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{
         testnet::{ConfiguredActivationHeights, ParametersBuilder},
         NetworkUpgrade,
@@ -59,71 +58,6 @@ fn vct_successor_header(block: Arc<Block>) -> NextVctBlock {
 
 fn next_vct_block(block: Arc<Block>) -> Option<NextVctBlock> {
     Some(vct_successor_header(block))
-}
-
-#[test]
-fn vct_successor_witness_uses_stored_header_without_body() {
-    let _init_guard = zakura_test::init();
-    let network = zakura_chain::parameters::Network::Mainnet;
-    let mut state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral finalized state succeeds");
-    let genesis = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-        .zcash_deserialize_into::<Arc<Block>>()
-        .expect("genesis block deserializes");
-    let block1 = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into::<Arc<Block>>()
-        .expect("block 1 deserializes");
-
-    state
-        .commit_finalized_direct(
-            CheckpointVerifiedBlock::from(genesis.clone()).into(),
-            None,
-            None,
-            "header-only VCT successor test genesis",
-        )
-        .expect("genesis commits");
-
-    let roots = BlockCommitmentRoots {
-        height: Height(1),
-        sapling_root: zakura_chain::sapling::tree::NoteCommitmentTree::default().root(),
-        orchard_root: zakura_chain::orchard::tree::NoteCommitmentTree::default().root(),
-        ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-        sapling_tx: 0,
-        orchard_tx: 0,
-        ironwood_tx: 0,
-        auth_data_root: block1.auth_data_root(),
-    };
-    let mut batch = DiskWriteBatch::new();
-    batch
-        .prepare_header_range_batch_with_roots(
-            &state.db,
-            genesis.hash(),
-            std::slice::from_ref(&block1.header),
-            &[0],
-            &[roots],
-        )
-        .expect("block 1 header is contextually valid");
-    state
-        .db
-        .write_batch(batch)
-        .expect("header range batch writes");
-
-    assert!(
-        state.db.block(Height(1).into()).is_none(),
-        "the successor body must remain absent"
-    );
-    let witness = state
-        .vct_successor_from_header_store(Height(0), genesis.hash())
-        .expect("the stored header and auth-data root form a successor witness");
-    assert_eq!(witness.header, block1.header);
-    assert_eq!(witness.height, Height(1));
-    assert_eq!(witness.hash, block1.hash());
-    assert_eq!(witness.auth_data_root, Some(block1.auth_data_root()));
 }
 
 /// A handoff frontier over empty trees at `height`, for sources whose test does not
@@ -987,7 +921,7 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
             // uses, and the peer source reads them back from that database.
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
             fast.db
-                .insert_zakura_header_commitment_roots(peer_roots)
+                .insert_supplied_commitment_roots(peer_roots)
                 .expect("writing header-sync roots to an ephemeral database succeeds");
             let source = PeerSource::new(fast.db.clone(), test_handoff_frontiers(Height::MAX));
             fast.enable_vct_fast_source(Box::new(source), true);
@@ -1202,7 +1136,7 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
 
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
             fast.db
-                .insert_zakura_header_commitment_roots(peer_roots)
+                .insert_supplied_commitment_roots(peer_roots)
                 .expect("writing header-sync roots to an ephemeral database succeeds");
             let source = PeerSource::new(fast.db.clone(), test_handoff_frontiers(Height::MAX));
             fast.enable_vct_fast_source(Box::new(source), true);
@@ -1234,7 +1168,7 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
             // Simulate the `tree_aux` driver refilling the evicted height from another peer:
             // header sync persists the replacement through the same database write path.
             fast.db
-                .insert_zakura_header_commitment_roots([correct_target_root])
+                .insert_supplied_commitment_roots([correct_target_root])
                 .expect("refilling the evicted height succeeds");
 
             let cv = CheckpointVerifiedBlock::from(blocks[target].block.clone());
@@ -2119,43 +2053,15 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
                 "the hostile body must have a different auth-data root",
             );
 
-            // Store the canonical successor header and its precomputed auth-data root,
-            // as header sync does before body sync. The separately constructed malformed
-            // same-hash body must not supply this witness. Using only the stored header
-            // preserves the valid root at `seed + 2` and the prevalidation dedup.
-            let header_heights =
-                Height((seed + 2) as u32)..=Height((seed + 3) as u32);
-            let header_roots =
-                commitment_aux::produce_block_roots(&legacy.db, header_heights);
-            for prepared in &blocks[(seed + 2)..=(seed + 3)] {
-                fast.db
-                    .seed_zakura_header_from_committed_block(
-                        prepared
-                            .block
-                            .coinbase_height()
-                            .expect("prepared successor blocks have a coinbase height"),
-                        &prepared.block,
-                    )
-                    .expect("the canonical successor header is stored");
-            }
-            fast.db
-                .insert_zakura_header_commitment_roots(header_roots)
-                .expect("the canonical successor roots are stored");
-
             let cv = CheckpointVerifiedBlock::from(blocks[seed + 2].block.clone());
-            let stored_successor = fast
-                .vct_successor_from_header_store(
-                    Height((seed + 2) as u32),
-                    blocks[seed + 2].hash,
-                )
-                .expect("header sync stored the canonical successor witness");
+            let successor = vct_successor_header(blocks[seed + 3].block.clone());
             fast.commit_finalized_direct(
                 cv.into(),
                 None,
-                Some(stored_successor),
-                "vct header-only successor with malformed body available",
+                Some(successor),
+                "vct canonical successor with malformed body available",
             )
-            .expect("the stored successor witness preserves the valid current root");
+            .expect("the authenticated successor preserves the valid current root");
             prop_assert_eq!(fast.vct_prevalidated_count(), 1, "the second fast block skips its redundant own commitment check");
 
             let mismatched = CheckpointVerifiedBlock::from(hostile_block.clone());
@@ -2537,7 +2443,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
 /// sync persists provisional root ranges when they arrive from peers) drives the fast
 /// path to byte-identical consensus state. Same harness as the DB-produced round-trip,
 /// but the produced roots are written into `commitment_roots_by_height` in two chunks
-/// via [`ZakuraDb::insert_zakura_header_commitment_roots`] — proving the DB-backed,
+/// via [`ZakuraDb::insert_supplied_commitment_roots`] — proving the DB-backed,
 /// header-sync-fed source is a drop-in for the fixture.
 #[test]
 #[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] (the look-ahead) and by height
@@ -2607,10 +2513,10 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
             // them back from that database.
             let split = produced_roots.len() / 2;
             fast.db
-                .insert_zakura_header_commitment_roots(produced_roots[..split].iter().cloned())
+                .insert_supplied_commitment_roots(produced_roots[..split].iter().cloned())
                 .expect("writing the first header-sync root chunk succeeds");
             fast.db
-                .insert_zakura_header_commitment_roots(produced_roots[split..].iter().cloned())
+                .insert_supplied_commitment_roots(produced_roots[split..].iter().cloned())
                 .expect("writing the second header-sync root chunk succeeds");
             let peer_source =
                 commitment_aux::PeerSource::new(fast.db.clone(), test_handoff_frontiers(Height::MAX));

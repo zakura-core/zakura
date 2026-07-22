@@ -324,16 +324,6 @@ impl ZakuraDb {
             )
         }
 
-        // Optionally audit the zakura header store's on-disk invariants and
-        // truncate any incoherent suffix. This can scan a large header frontier
-        // while syncing from genesis, so operators opt in when they need a
-        // startup repair. Read-only instances cannot repair; the audit is left
-        // to an explicit writable reopen.
-        if !read_only && config.repair_zakura_header_store_on_startup {
-            db.audit_and_repair_zakura_header_store()
-                .expect("startup header-store repair write failed: RocksDB is unavailable");
-        }
-
         db.run_startup_format_change(format_change, prepared_vct_repair);
 
         Ok(db)

@@ -3,17 +3,9 @@
 //! These helpers are used by both the fixed test vectors (`vectors.rs`) and the
 //! header-store coherence harness (`header_store_coherence`).
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
-use zakura_chain::{
-    block::{self, Block, Height},
-    orchard,
-    parallel::commitment_aux::BlockCommitmentRoots,
-    parameters::{testnet, Network, Network::Mainnet},
-    sapling,
-    serialization::ZcashDeserializeInto,
-    work::difficulty::ParameterDifficulty,
-};
+use zakura_chain::{block::Block, parameters::Network, serialization::ZcashDeserializeInto};
 use zakura_test::vectors::MAINNET_BLOCKS;
 
 use crate::{
@@ -47,54 +39,6 @@ pub(super) fn state_with_genesis_config(
     state
 }
 
-/// Returns a persistent state config rooted at `cache_dir`, for close-and-reopen tests.
-pub(super) fn persistent_config(cache_dir: &Path) -> Config {
-    Config {
-        cache_dir: cache_dir.to_owned(),
-        ephemeral: false,
-        debug_skip_non_finalized_state_backup_task: true,
-        ..Config::default()
-    }
-}
-
-/// Opens (or reopens) a persistent state database from `config`.
-pub(super) fn persistent_state(config: &Config, network: &Network) -> ZakuraDb {
-    ZakuraDb::new(
-        config,
-        STATE_DATABASE_KIND,
-        &state_database_format_version_in_code(),
-        network,
-        true,
-        STATE_COLUMN_FAMILIES_IN_CODE
-            .iter()
-            .map(ToString::to_string),
-        false,
-    )
-    .expect("opening the finalized state database should succeed")
-}
-
-/// Returns a configured testnet with only the implicit genesis checkpoint, so header
-/// commits above genesis take the contextual validation path.
-pub(super) fn no_extra_checkpoint_test_network(genesis_hash: block::Hash) -> Network {
-    testnet::Parameters::build()
-        .with_network_name("HeaderReorgTest")
-        .expect("test network name is valid")
-        .with_genesis_hash(genesis_hash)
-        .expect("test genesis hash is valid")
-        .with_target_difficulty_limit(Mainnet.target_difficulty_limit())
-        .expect("mainnet difficulty limit is valid for test network")
-        .with_activation_heights(testnet::ConfiguredActivationHeights {
-            canopy: Some(1),
-            ..Default::default()
-        })
-        .expect("test activation heights are valid")
-        .clear_funding_streams()
-        .clear_checkpoints()
-        .expect("genesis-only checkpoints are valid")
-        .to_network()
-        .expect("test network is valid")
-}
-
 /// Deserializes the mainnet test vector block at `height`.
 pub(super) fn mainnet_block(height: u32) -> Arc<Block> {
     MAINNET_BLOCKS
@@ -102,38 +46,6 @@ pub(super) fn mainnet_block(height: u32) -> Arc<Block> {
         .expect("test vector exists")
         .zcash_deserialize_into::<Arc<Block>>()
         .expect("mainnet test block deserializes")
-}
-
-/// Fabricates provisional commitment roots for `height`, with the zeroed
-/// auth-data root marking them as unverified.
-pub(super) fn root_at(height: Height) -> BlockCommitmentRoots {
-    BlockCommitmentRoots {
-        height,
-        sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
-        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-        ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-        sapling_tx: 0,
-        orchard_tx: 0,
-        ironwood_tx: 0,
-        auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
-    }
-}
-
-/// Commits a header range through the production write path, panicking on rejection.
-pub(super) fn commit_header_range(
-    state: &ZakuraDb,
-    anchor: block::Hash,
-    headers: &[Arc<block::Header>],
-) -> block::Hash {
-    let mut batch = DiskWriteBatch::new();
-    let body_sizes = vec![0; headers.len()];
-    let committed_hash = batch
-        .prepare_header_range_batch(state, anchor, headers, &body_sizes)
-        .expect("header range is valid");
-    state
-        .write_batch(batch)
-        .expect("header range batch writes successfully");
-    committed_hash
 }
 
 /// Commits `block`'s header and transaction data (the body-commit batch shape),

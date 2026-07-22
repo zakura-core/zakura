@@ -102,23 +102,6 @@ pub struct Config {
     ///       Zebra's last non-finalized state before it shut down.
     pub should_backup_non_finalized_state: bool,
 
-    /// Whether to audit and repair the Zakura header store when the state database opens.
-    ///
-    /// Set to `false` by default. When this is `true`, writable state opens scan
-    /// the full Zakura header-store frontier and delete any incoherent suffix or
-    /// stale committed-height rows so header sync can re-download them. This can
-    /// be expensive while syncing from genesis, because the header frontier can
-    /// contain millions of rows above the finalized tip.
-    pub repair_zakura_header_store_on_startup: bool,
-
-    /// Whether committed full blocks should seed the Zakura header-only store.
-    ///
-    /// This is enabled by zakurad only for the Zakura v2 path. It is skipped in
-    /// serde so the generic Zebra state config does not expose a Zakura-specific
-    /// user setting.
-    #[serde(skip)]
-    pub enable_zakura_header_seed_from_committed_blocks: bool,
-
     /// Mirror of `consensus.checkpoint_sync`, set by zakurad at startup.
     ///
     /// When `true` (the default), a node syncing under checkpoint trust uses the fast
@@ -440,8 +423,6 @@ impl Default for Config {
             cache_dir: default_cache_dir(),
             ephemeral: false,
             should_backup_non_finalized_state: true,
-            repair_zakura_header_store_on_startup: false,
-            enable_zakura_header_seed_from_committed_blocks: false,
             checkpoint_sync: true,
             vct_fast_sync: true,
             delete_old_database: true,
@@ -469,10 +450,6 @@ mod tests {
             Config::default().vct_fast_sync,
             "VCT fast sync is enabled by default when checkpoint sync and embedded frontiers are available"
         );
-        assert!(
-            !Config::default().repair_zakura_header_store_on_startup,
-            "Zakura header-store startup repair is opt-in because it scans the full header frontier"
-        );
 
         let archive: Config = toml::from_str(r#"storage_mode = "archive""#)
             .expect("archive storage mode deserializes from a string");
@@ -496,11 +473,6 @@ mod tests {
             .is_err(),
             "archive mode must not silently ignore pruned-only or misspelled settings"
         );
-
-        let repair_enabled: Config =
-            toml::from_str(r#"repair_zakura_header_store_on_startup = true"#)
-                .expect("startup repair config deserializes from a bool");
-        assert!(repair_enabled.repair_zakura_header_store_on_startup);
 
         let pruned: Config = toml::from_str(r#"storage_mode = "pruned""#)
             .expect("pruned storage mode deserializes from a string");

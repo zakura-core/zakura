@@ -12,13 +12,10 @@ use zakura_chain::{
     history_tree::HistoryTreeError,
     ironwood, orchard, sapling, sprout, transaction, transparent,
     value_balance::{ValueBalance, ValueBalanceError},
-    work::difficulty::{CompactDifficulty, U256},
+    work::difficulty::CompactDifficulty,
 };
 
-use crate::{
-    constants::{MAX_HEADER_SYNC_HEIGHT_RANGE, MIN_TRANSPARENT_COINBASE_MATURITY},
-    HashOrHeight, KnownBlock,
-};
+use crate::{constants::MIN_TRANSPARENT_COINBASE_MATURITY, HashOrHeight, KnownBlock};
 
 /// A wrapper for type erased errors that is itself clonable and implements the
 /// Error trait
@@ -146,10 +143,6 @@ pub enum CommitBlockError {
     #[error("could not contextually validate semantically verified block")]
     ValidateContextError(#[from] Box<ValidateContextError>),
 
-    /// Header-only commit validation failed.
-    #[error("could not commit header range")]
-    HeaderCommitError(#[from] Box<CommitHeaderRangeError>),
-
     /// The body mutation could not commit its matching fork-aware header transition.
     #[error("could not commit matching header-chain transition: {error}")]
     HeaderChainError {
@@ -204,12 +197,6 @@ impl CommitBlockError {
     }
 }
 
-impl From<CommitHeaderRangeError> for CommitBlockError {
-    fn from(value: CommitHeaderRangeError) -> Self {
-        Self::HeaderCommitError(Box::new(value))
-    }
-}
-
 /// An error describing why a `CommitSemanticallyVerified` request failed.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("could not commit semantically-verified block")]
@@ -230,12 +217,6 @@ impl CommitSemanticallyVerifiedError {
 impl From<ValidateContextError> for CommitSemanticallyVerifiedError {
     fn from(value: ValidateContextError) -> Self {
         Self(CommitBlockError::ValidateContextError(Box::new(value)))
-    }
-}
-
-impl From<CommitHeaderRangeError> for CommitSemanticallyVerifiedError {
-    fn from(value: CommitHeaderRangeError) -> Self {
-        Self(CommitBlockError::HeaderCommitError(Box::new(value)))
     }
 }
 
@@ -288,239 +269,6 @@ impl CommitCheckpointVerifiedError {
 impl From<ValidateContextError> for CommitCheckpointVerifiedError {
     fn from(value: ValidateContextError) -> Self {
         Self(CommitBlockError::ValidateContextError(Box::new(value)))
-    }
-}
-
-impl From<CommitHeaderRangeError> for CommitCheckpointVerifiedError {
-    fn from(value: CommitHeaderRangeError) -> Self {
-        Self(CommitBlockError::HeaderCommitError(Box::new(value)))
-    }
-}
-
-/// An internal invariant of the zakura header store was found violated while
-/// reading it.
-///
-/// This is a **local storage fault**, never evidence about a peer: readers
-/// return it instead of feeding rows from more than one branch (or from beside
-/// a gap) into consensus validation, where the corruption would otherwise
-/// surface as a misleading validation failure (`InvalidDifficultyThreshold`,
-/// `UnknownAnchor`) attributed to whoever supplied the input being validated.
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum StoreIncoherentError {
-    /// The header row at `height` does not link to the stored row below it.
-    #[error(
-        "header store incoherent: header at {height:?} links to {expected_parent} but the stored row below is {actual_below}"
-    )]
-    BrokenLinkage {
-        /// Height of the header whose parent link failed to resolve.
-        height: block::Height,
-        /// The parent hash the header claims (`previous_block_hash`).
-        expected_parent: block::Hash,
-        /// The hash actually stored at `height - 1`.
-        actual_below: block::Hash,
-    },
-
-    /// A header row exists at `height` but the row below it is missing.
-    #[error(
-        "header store incoherent: no stored row at {missing:?} below the header at {height:?}"
-    )]
-    Gap {
-        /// Height of the stored header above the gap.
-        height: block::Height,
-        /// The missing height (`height - 1`).
-        missing: block::Height,
-    },
-
-    /// The header row at `height` is not the block its hash row names.
-    #[error(
-        "header store incoherent: header stored at {height:?} hashes to {computed} but the hash row names {indexed}"
-    )]
-    HeaderHashMismatch {
-        /// Height of the divergent rows.
-        height: block::Height,
-        /// The hash the height→hash index names.
-        indexed: block::Hash,
-        /// The stored header's actual hash.
-        computed: block::Hash,
-    },
-
-    /// The hash→height and height→hash indexes disagree about a hash.
-    #[error(
-        "header store incoherent: hash {hash} is indexed at {height:?} but that height stores {stored:?}"
-    )]
-    BijectionMismatch {
-        /// The hash whose round-trip failed.
-        hash: block::Hash,
-        /// The height the hash→height index reports for it.
-        height: block::Height,
-        /// What the height→hash index stores there instead.
-        stored: Option<block::Hash>,
-    },
-}
-
-/// An error describing why a header-only range could not be committed.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CommitHeaderRangeError {
-    /// The request did not contain any headers.
-    #[error("header range is empty")]
-    EmptyRange,
-
-    /// The request exceeded the native header-sync range cap.
-    #[error(
-        "header range contains {actual} headers, exceeding the maximum {MAX_HEADER_SYNC_HEIGHT_RANGE}"
-    )]
-    RangeTooLong {
-        /// Number of headers in the request.
-        actual: usize,
-    },
-
-    /// The request supplied a different number of body-size hints than headers.
-    #[error("header range body-size count {body_sizes} does not match header count {headers}")]
-    BodySizeCountMismatch {
-        /// Header count.
-        headers: usize,
-        /// Body-size hint count.
-        body_sizes: usize,
-    },
-
-    /// The request supplied a different number of roots than headers.
-    #[error("header range tree-aux root count {roots} does not match header count {headers}")]
-    TreeAuxRootCountMismatch {
-        /// Header count.
-        headers: usize,
-        /// Tree-aux root count.
-        roots: usize,
-    },
-
-    /// A supplied tree-aux root did not match the inferred header height.
-    #[error("header range tree-aux root height {root_height:?} does not match expected height {expected_height:?}")]
-    TreeAuxRootHeightMismatch {
-        /// Expected root height.
-        expected_height: block::Height,
-        /// Actual root height.
-        root_height: block::Height,
-    },
-
-    /// The supplied anchor is not known to state.
-    #[error("header range anchor {anchor} is not known")]
-    UnknownAnchor {
-        /// The supplied anchor hash.
-        anchor: block::Hash,
-    },
-
-    /// The supplied anchor is the network genesis hash, but the genesis block has not been
-    /// committed to state yet.
-    #[error("header range genesis anchor {anchor} is not committed to state yet")]
-    MissingGenesisAnchor {
-        /// The supplied genesis anchor hash.
-        anchor: block::Hash,
-    },
-
-    /// The inferred header height overflowed the valid block height range.
-    #[error("header height overflow")]
-    HeightOverflow,
-
-    /// A header in the range does not link to the anchor or to its predecessor,
-    /// so committing it would break the header store's linkage invariant.
-    #[error(
-        "header at {height:?} links to {actual_parent} instead of its predecessor {expected_parent}"
-    )]
-    UnlinkedRange {
-        /// Height of the first header that fails to link.
-        height: block::Height,
-        /// The hash of the row the header must link to (the anchor, or the
-        /// previous header in the range).
-        expected_parent: block::Hash,
-        /// The header's actual `previous_block_hash`.
-        actual_parent: block::Hash,
-    },
-
-    /// A committed immutable header conflicts with the requested header.
-    #[error("header at finalized height {height:?} conflicts with an existing header")]
-    ImmutableConflict {
-        /// The conflicting height.
-        height: block::Height,
-    },
-
-    /// A provisional reorg tried to overwrite too far behind the best header tip.
-    #[error(
-        "header reorg at {height:?} is deeper than the maximum reorg window from best header tip {best_header_tip:?}"
-    )]
-    ReorgTooDeep {
-        /// Height of the conflicting header.
-        height: block::Height,
-        /// Current best header tip.
-        best_header_tip: block::Height,
-    },
-
-    /// A conflicting header range carried no more cumulative work than the existing
-    /// header chain it would replace, so it was rejected to keep the most-work chain.
-    #[error(
-        "conflicting header range at {height:?} has cumulative work {new_work} <= existing work {existing_work}"
-    )]
-    LowerWorkConflict {
-        /// Height where the new range first conflicts with the stored chain.
-        height: block::Height,
-        /// Cumulative work of the existing conflicting suffix.
-        existing_work: U256,
-        /// Cumulative work of the new conflicting suffix.
-        new_work: U256,
-    },
-
-    /// A header conflicts with a trusted checkpoint hash.
-    #[error("checkpoint conflict at {height:?}: expected {expected}, got {actual}")]
-    CheckpointConflict {
-        /// Checkpoint height.
-        height: block::Height,
-        /// Expected checkpoint hash.
-        expected: block::Hash,
-        /// Actual header hash.
-        actual: block::Hash,
-    },
-
-    /// The requested header conflicts with a full block already stored at the same height.
-    #[error("header at height {height:?} conflicts with an already stored full block")]
-    ConflictingFullBlockHeader {
-        /// The conflicting height.
-        height: block::Height,
-    },
-
-    /// The local header store was found internally incoherent while reading
-    /// the context needed to validate the range.
-    ///
-    /// This is a local storage fault, not a peer validation failure: the range
-    /// was rejected because the store cannot supply trustworthy context, not
-    /// because the range itself was shown invalid.
-    #[error("header store incoherent while validating range: {0}")]
-    StoreIncoherent(#[from] StoreIncoherentError),
-
-    /// Contextual header validation failed.
-    #[error("could not contextually validate header")]
-    ValidateContextError(#[from] Box<ValidateContextError>),
-
-    /// Local storage failed while writing a validated header range.
-    ///
-    /// This is a local resource/storage failure, not a peer validation failure.
-    #[error("failed to write validated header range to disk: {error}")]
-    StorageWriteError {
-        /// RocksDB error details.
-        error: String,
-    },
-
-    /// Sending the commit request to the write task failed.
-    #[error("failed to send header range commit request to block write task")]
-    SendCommitRequestFailed,
-
-    /// The commit request was dropped before processing.
-    #[error("header range commit request was unexpectedly dropped")]
-    CommitResponseDropped,
-}
-
-impl From<ValidateContextError> for CommitHeaderRangeError {
-    fn from(value: ValidateContextError) -> Self {
-        Self::ValidateContextError(Box::new(value))
     }
 }
 

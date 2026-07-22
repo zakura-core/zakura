@@ -59,9 +59,8 @@ use crate::{
         read::find,
         watch_receiver::WatchReceiver,
     },
-    BoxError, CheckpointVerifiedBlock, CommitHeaderRangeError, CommitSemanticallyVerifiedError,
-    Config, KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
-    StateInitError,
+    BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config, KnownBlock,
+    ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock, StateInitError,
 };
 
 pub mod block_iter;
@@ -1015,39 +1014,6 @@ impl StateService {
         rsp_rx
     }
 
-    fn send_header_range(
-        &self,
-        anchor: block::Hash,
-        headers: Vec<Arc<block::Header>>,
-        body_sizes: Vec<u32>,
-        tree_aux_roots: Vec<BlockCommitmentRoots>,
-    ) -> oneshot::Receiver<Result<block::Hash, CommitHeaderRangeError>> {
-        let (rsp_tx, rsp_rx) = oneshot::channel();
-
-        let Some(sender) = &self.block_write_sender.non_finalized else {
-            let _ = rsp_tx.send(Err(CommitHeaderRangeError::SendCommitRequestFailed));
-            return rsp_rx;
-        };
-
-        if let Err(tokio::sync::mpsc::error::SendError(error)) =
-            sender.send(NonFinalizedWriteMessage::CommitHeaderRange {
-                anchor,
-                headers,
-                body_sizes,
-                tree_aux_roots,
-                rsp_tx,
-            })
-        {
-            let NonFinalizedWriteMessage::CommitHeaderRange { rsp_tx, .. } = error else {
-                unreachable!("should return the same CommitHeaderRange message could not be sent");
-            };
-
-            let _ = rsp_tx.send(Err(CommitHeaderRangeError::SendCommitRequestFailed));
-        }
-
-        rsp_rx
-    }
-
     /// Assert some assumptions about the semantically verified `block` before it is queued.
     fn assert_block_can_be_validated(&self, block: &SemanticallyVerifiedBlock) {
         // required by `Request::CommitSemanticallyVerifiedBlock` call
@@ -1291,31 +1257,6 @@ impl Service<Request> for StateService {
                 .boxed()
             }
 
-            Request::CommitHeaderRange {
-                anchor,
-                headers,
-                body_sizes,
-                tree_aux_roots,
-            } => {
-                let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| {
-                        self.send_header_range(anchor, headers, body_sizes, tree_aux_roots)
-                    })
-                });
-
-                let span = Span::current();
-                async move {
-                    rsp_rx
-                        .await
-                        .map_err(|_recv_error| CommitHeaderRangeError::CommitResponseDropped)
-                        .and_then(|result| result)
-                        .map_err(BoxError::from)
-                        .map(Response::Committed)
-                }
-                .instrument(span)
-                .boxed()
-            }
-
             // Uses pending_utxos and non_finalized_state_queued_blocks in the StateService.
             // If the UTXO isn't in the queued blocks, runs concurrently using the ReadStateService.
             Request::AwaitUtxo(outpoint) => {
@@ -1497,60 +1438,27 @@ impl Service<Request> for StateService {
     }
 }
 
-fn headers_by_height_range<C>(
-    chain: Option<C>,
-    db: &ZakuraDb,
-    start: block::Height,
-    count: u32,
-) -> Vec<(block::Height, block::Hash, Arc<block::Header>)>
-where
-    C: AsRef<Chain> + Clone,
-{
-    let capped_count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
-    let mut headers = Vec::with_capacity(
-        usize::try_from(capped_count).expect("capped header count fits in usize"),
-    );
-    let mut height = start;
-
-    for _ in 0..capped_count {
-        let next_header = read::hash_by_height(chain.clone(), db, height)
-            .and_then(|hash| {
-                read::block_header(chain.clone(), db, height.into())
-                    .map(|header| (height, hash, header))
-            })
-            .or_else(|| db.headers_by_height_range(height, 1).into_iter().next());
-
-        let Some(header) = next_header else {
-            break;
-        };
-
-        headers.push(header);
-
-        let Ok(next_height) = height.next() else {
-            break;
-        };
-        height = next_height;
-    }
-
-    headers
-}
-
 fn missing_block_body_metadata<C>(
     chain: Option<C>,
     db: &ZakuraDb,
+    header_chain: Option<&finalized_state::header_chain::HeaderChainReader>,
     from: block::Height,
     limit: u32,
-) -> Vec<(block::Height, block::Hash, Option<u32>)>
+) -> Result<
+    Vec<(block::Height, block::Hash, Option<u32>)>,
+    finalized_state::header_chain::HeaderChainStoreError,
+>
 where
     C: AsRef<Chain> + Clone,
 {
     let verified_block_tip = read::tip_height(chain.clone(), db);
-    let best_header_tip = db
-        .best_header_tip()
-        .map(|(height, _)| height)
+    let best_header_tip = header_chain
+        .map(|reader| reader.selected_tip())
+        .transpose()?
+        .map(|tip| tip.height)
         .max(verified_block_tip);
     let Some(best_header_tip) = best_header_tip else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let start = verified_block_tip
@@ -1558,7 +1466,7 @@ where
         .map_or(from, |first_missing| first_missing.max(from));
 
     if start > best_header_tip {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let count = limit
@@ -1568,16 +1476,28 @@ where
         .into_iter()
         .collect();
 
-    (0..count)
-        .filter_map(|offset| start.0.checked_add(offset).map(block::Height))
-        .filter(|height| !db.contains_body_at_height(*height))
-        .filter_map(|height| {
-            read::hash_by_height(chain.clone(), db, height)
-                .or_else(|| db.header_hash(height))
-                .map(|hash| (height, hash, size_hints.get(&height).copied().flatten()))
-        })
-        .take(usize::try_from(limit).expect("u32 limit fits in usize on supported targets"))
-        .collect()
+    let mut metadata = Vec::new();
+    for offset in 0..count {
+        let Some(height) = start.0.checked_add(offset).map(block::Height) else {
+            break;
+        };
+        if db.contains_body_at_height(height) {
+            continue;
+        }
+        let hash = match read::hash_by_height(chain.clone(), db, height) {
+            Some(hash) => Some(hash),
+            None => header_chain
+                .map(|reader| reader.selected_hash(height))
+                .transpose()?
+                .flatten(),
+        };
+        let Some(hash) = hash else {
+            continue;
+        };
+        metadata.push((height, hash, size_hints.get(&height).copied().flatten()));
+    }
+
+    Ok(metadata)
 }
 
 fn block_roots_by_height_range<C>(
@@ -1655,7 +1575,7 @@ where
                 _ => None,
             }
         } else {
-            db.zakura_header_commitment_roots_by_height_range(height..=height)
+            db.supplied_commitment_roots_by_height_range(height..=height)
                 .into_iter()
                 .next()
         };
@@ -1903,10 +1823,6 @@ impl Service<ReadRequest> for ReadStateService {
                 .collect(),
             )),
 
-            ReadRequest::HeadersByHeightRange { start, count } => Ok(ReadResponse::Headers(
-                headers_by_height_range(state.latest_best_chain(), &state.db, start, count),
-            )),
-
             ReadRequest::HeaderLocator => {
                 let reader = state.header_chain_reader_receiver.borrow().clone();
                 let locator = reader.map(|reader| reader.selected_locator()).transpose()?;
@@ -1985,7 +1901,13 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::BestHeaderTip => {
-                let best_disk_header_tip = state.db.best_header_tip();
+                let best_disk_header_tip = state
+                    .header_chain_reader_receiver
+                    .borrow()
+                    .clone()
+                    .map(|reader| reader.selected_tip())
+                    .transpose()?
+                    .map(|tip| (tip.height, tip.hash));
                 let verified_block_tip = read::tip(state.latest_best_chain(), &state.db);
 
                 Ok(ReadResponse::BestHeaderTip(
@@ -2002,9 +1924,12 @@ impl Service<ReadRequest> for ReadStateService {
             ReadRequest::MissingBlockBodies { from, limit } => {
                 let verified_block_tip = read::tip_height(state.latest_best_chain(), &state.db);
                 let best_header_tip = state
-                    .db
-                    .best_header_tip()
-                    .map(|(height, _)| height)
+                    .header_chain_reader_receiver
+                    .borrow()
+                    .clone()
+                    .map(|reader| reader.selected_tip())
+                    .transpose()?
+                    .map(|tip| tip.height)
                     .max(verified_block_tip);
 
                 Ok(ReadResponse::MissingBlockBodies(
@@ -2015,8 +1940,15 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::MissingBlockBodyMetadata { from, limit } => {
+                let reader = state.header_chain_reader_receiver.borrow().clone();
                 Ok(ReadResponse::MissingBlockBodyMetadata(
-                    missing_block_body_metadata(state.latest_best_chain(), &state.db, from, limit),
+                    missing_block_body_metadata(
+                        state.latest_best_chain(),
+                        &state.db,
+                        reader.as_ref(),
+                        from,
+                        limit,
+                    )?,
                 ))
             }
 

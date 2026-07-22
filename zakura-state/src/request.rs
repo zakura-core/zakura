@@ -955,27 +955,6 @@ pub enum Request {
     /// [0]: (crate::error::CommitCheckpointVerifiedError)
     CommitCheckpointVerifiedBlock(CheckpointVerifiedBlock),
 
-    /// Persist a validated, contiguous run of Zakura headers that links to `anchor`.
-    ///
-    /// Header-only commits write separate header-sync indexes, not finalized block
-    /// indexes. They do not write transaction/body rows and therefore do not make
-    /// the block known to body-serving APIs.
-    CommitHeaderRange {
-        /// Hash of the held parent header for the first header in `headers`.
-        anchor: block::Hash,
-        /// Contiguous headers in ascending height order.
-        headers: Vec<Arc<block::Header>>,
-        /// Advisory serialized body sizes, parallel to `headers`.
-        ///
-        /// A `0` value means unknown. These hints are not consensus data.
-        body_sizes: Vec<u32>,
-        /// Tree-aux roots, parallel to `headers`.
-        ///
-        /// Every non-empty Zakura header range must provide one root per header.
-        /// Roots are advisory until verified during block commit.
-        tree_aux_roots: Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>,
-    },
-
     /// Computes the depth in the current best chain of the block identified by the given hash.
     ///
     /// Returns
@@ -1188,7 +1167,6 @@ impl Request {
         match self {
             Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
-            Request::CommitHeaderRange { .. } => "commit_header_range",
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Depth(_) => "depth",
             Request::Tip => "tip",
@@ -1422,21 +1400,10 @@ pub enum ReadRequest {
         stop: Option<block::Hash>,
     },
 
-    /// Returns contiguous headers by height, in ascending order.
-    ///
-    /// The response stops before the first missing height and is capped by
-    /// [`MAX_HEADER_SYNC_HEIGHT_RANGE`](crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE).
-    HeadersByHeightRange {
-        /// First height to read.
-        start: block::Height,
-        /// Maximum number of headers to return.
-        count: u32,
-    },
-
     /// Returns the exact committed selected-header locator after semantic handoff.
     HeaderLocator,
 
-    /// Acquire one immutable retained path for an exact v8 target.
+    /// Acquire one immutable retained path for an exact header-sync target.
     AcquireRetainedHeaderPath {
         /// Stable requesting peer identity.
         peer: zakura_header_chain::SourceId,
@@ -1718,7 +1685,6 @@ impl ReadRequest {
             ReadRequest::BlockLocator => "block_locator",
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
-            ReadRequest::HeadersByHeightRange { .. } => "headers_by_height_range",
             ReadRequest::HeaderLocator => "header_locator",
             ReadRequest::AcquireRetainedHeaderPath { .. } => "acquire_retained_header_path",
             ReadRequest::ReadRetainedHeaderPath { .. } => "read_retained_header_path",
@@ -1804,7 +1770,6 @@ impl TryFrom<Request> for ReadRequest {
 
             Request::CommitSemanticallyVerifiedBlock(_)
             | Request::CommitCheckpointVerifiedBlock(_)
-            | Request::CommitHeaderRange { .. }
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),
 

@@ -138,6 +138,7 @@ where
 /// Check that a header is contextually valid for `network`, using the previous
 /// header height and recent held header data.
 #[tracing::instrument(skip(candidate_header, network, relevant_headers))]
+#[cfg(test)]
 pub(crate) fn header_is_valid_for_recent_chain<C>(
     candidate_header: &block::Header,
     previous_block_height: block::Height,

@@ -284,6 +284,51 @@ impl RetainedPathLeaseRegistry {
 }
 
 impl HeaderChainReader {
+    pub(crate) fn selected_tip(&self) -> Result<Frontier, HeaderChainStoreError> {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        Ok(self.store.snapshot()?.frontiers.header_best)
+    }
+
+    pub(crate) fn selected_hash(
+        &self,
+        height: block::Height,
+    ) -> Result<Option<block::Hash>, HeaderChainStoreError> {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        self.store
+            .selected_hash(height)
+            .map_err(HeaderChainStoreError::Store)
+    }
+
+    pub(crate) fn selected_successor(
+        &self,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> Result<Option<HeaderNode>, HeaderChainStoreError> {
+        let Ok(successor_height) = height.next() else {
+            return Ok(None);
+        };
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let Some(successor_hash) = self.store.selected_hash(successor_height)? else {
+            return Ok(None);
+        };
+        let Some(successor) = self.store.node(successor_hash)? else {
+            return Ok(None);
+        };
+        Ok((successor.parent_hash == hash).then_some(successor))
+    }
+
     pub(crate) fn selected_locator(&self) -> Result<HeaderLocator, HeaderChainStoreError> {
         let _writer = self
             .store

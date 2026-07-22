@@ -453,9 +453,6 @@ pub enum ReadResponse {
     /// The response to a `FindBlockHeaders` request.
     BlockHeaders(Vec<block::CountedHeader>),
 
-    /// Response to [`ReadRequest::HeadersByHeightRange`].
-    Headers(Vec<(block::Height, block::Hash, Arc<block::Header>)>),
-
     /// Response to [`ReadRequest::HeaderLocator`], absent before semantic handoff.
     HeaderLocator(Option<zakura_header_chain::HeaderLocator>),
 
@@ -668,7 +665,6 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::AddressesTransactionIds(_)
             | ReadResponse::AddressUtxos(_)
             | ReadResponse::ChainInfo(_)
-            | ReadResponse::Headers(_)
             | ReadResponse::HeaderLocator(_)
             | ReadResponse::RetainedHeaderPathLease(_)
             | ReadResponse::RetainedHeaderPathPage(_)

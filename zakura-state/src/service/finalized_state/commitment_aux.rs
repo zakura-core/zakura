@@ -443,7 +443,7 @@ impl CommitmentRootSource for FixtureSource {
 /// A [`CommitmentRootSource`] backed by provisional header-ahead roots in `db`.
 ///
 /// Header sync persists peer-supplied roots into `db` ahead of body commit
-/// ([`ZakuraDb::insert_zakura_header_commitment_roots`]); the committer reads them per
+/// ([`ZakuraDb::insert_supplied_commitment_roots`]); the committer reads them per
 /// height through the [`CommitmentRootSource`] seam, and tests fill roots through the
 /// same database write path. The handoff frontier is embedded in the binary, held
 /// immutably here and never fetched over the network — a peer source always has one,
@@ -473,7 +473,7 @@ impl CommitmentRootSource for PeerSource {
         ironwood::tree::Root,
     )> {
         self.db
-            .zakura_header_commitment_roots_by_height_range(height..=height)
+            .supplied_commitment_roots_by_height_range(height..=height)
             .into_iter()
             .next()
             .map(|roots| (roots.sapling_root, roots.orchard_root, roots.ironwood_root))
@@ -484,7 +484,7 @@ impl CommitmentRootSource for PeerSource {
     fn invalidate(&self, height: block::Height) {
         // Drop the rejected root so the next read misses; header sync can then deliver a
         // verifiable replacement for this height from another peer.
-        if let Err(error) = self.db.delete_zakura_header_commitment_roots([height]) {
+        if let Err(error) = self.db.delete_supplied_commitment_roots([height]) {
             tracing::debug!(?error, ?height, "failed to delete rejected VCT root");
         }
     }
@@ -1463,7 +1463,7 @@ mod tests {
     #[test]
     fn peer_source_reads_and_invalidates_header_sync_roots() {
         let db = ephemeral_mainnet_db();
-        db.insert_zakura_header_commitment_roots([BlockCommitmentRoots {
+        db.insert_supplied_commitment_roots([BlockCommitmentRoots {
             height: block::Height(42),
             sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
             orchard_root: orchard::tree::NoteCommitmentTree::default().root(),

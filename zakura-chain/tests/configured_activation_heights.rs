@@ -1,9 +1,9 @@
-#![cfg(not(feature = "zakura-test"))]
-
 //! Checks activation-height validation in production feature builds.
 
+#[cfg(not(feature = "zakura-test"))]
 use zakura_chain::parameters::testnet::{ConfiguredActivationHeights, Parameters};
 
+#[cfg(not(feature = "zakura-test"))]
 #[test]
 fn nu7_activation_requires_consensus_branch_id() {
     let Err(error) = Parameters::build().with_activation_heights(ConfiguredActivationHeights {

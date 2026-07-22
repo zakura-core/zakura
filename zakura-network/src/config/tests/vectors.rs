@@ -645,6 +645,32 @@ fn configured_regtest_checkpoints_preserve_regtest_identity() {
 }
 
 #[test]
+fn configured_regtest_builder_errors_are_deserialization_errors() {
+    let _init_guard = zakura_test::init();
+
+    for config in [
+        r#"network = { params = { activation_heights = { NU5 = 2, NU6 = 1 } } }"#,
+        r#"
+        network = "Regtest"
+
+        [testnet_parameters.activation_heights]
+        NU5 = 2
+        NU6 = 1
+        "#,
+    ] {
+        let error = toml::from_str::<Config>(config)
+            .expect_err("out-of-order Regtest activations must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("network upgrades must be activated in order specified by the protocol"),
+            "unexpected invalid Regtest activation error for {config:?}: {error}",
+        );
+    }
+}
+
+#[test]
 fn zakura_bootstrap_peers_parse_in_nested_config() {
     let _init_guard = zakura_test::init();
 

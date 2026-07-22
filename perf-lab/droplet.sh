@@ -185,6 +185,35 @@ PYKEEP
   bash -n ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
     || echo "WARN: keepfork patch broke harness syntax" >&2
 fi
+# bsknob: PERF_BS_MAX_BLOCKS_PER_RESPONSE emits a [network.zakura.block_sync]
+# section in the generated bench config — request-shape experiments without
+# touching Zakura code defaults (supply-bound attribution, 2026-07-22).
+if ! grep -q "perf-lab bsknob" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh; then
+  python3 - ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh <<'PYBSK'
+import sys
+path = sys.argv[1]
+lines = open(path).read().split(chr(10))
+q, d = chr(34), chr(36)
+done = False
+for i, line in enumerate(lines):
+    if (not done and line.strip() == "echo " + chr(39) + "]" + chr(39)
+            and any("bootstrap_peers = [" in l for l in lines[max(0, i-12):i])):
+        ind = line[:len(line) - len(line.lstrip())]
+        lines[i] = line + chr(10) + chr(10).join([
+            ind + "if [ -n " + q + d + "{PERF_BS_MAX_BLOCKS_PER_RESPONSE:-}" + q + " ]; then  # perf-lab bsknob",
+            ind + "  echo " + chr(39) + chr(39),
+            ind + "  echo " + chr(39) + "[network.zakura.block_sync]" + chr(39),
+            ind + "  echo " + q + "max_blocks_per_response = " + d + "{PERF_BS_MAX_BLOCKS_PER_RESPONSE}" + q,
+            ind + "fi",
+        ])
+        done = True
+assert done, "bsknob anchor"
+open(path, "w").write(chr(10).join(lines))
+print("bsknob patch applied")
+PYBSK
+  bash -n ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
+    || echo "WARN: bsknob patch broke harness syntax" >&2
+fi
 mkdir -p ${BENCH_OUT_REMOTE}
 echo "remote prep done"
 REMOTE
@@ -202,23 +231,7 @@ sys.exit(0 if ok else 1)
 }
 
 cmd_destroy() {
-  local name="${1:?usage: droplet.sh destroy NAME|ID}"
-  # numeric arg = droplet ID (needed when DO duplicate names make name-based
-  # deletion ambiguous); still guarded: the ID must belong to a tagged,
-  # prefix-named droplet
-  if [[ "$name" =~ ^[0-9]+$ ]]; then
-    local owner
-    owner="$(droplet_json | python3 -c '
-import json,sys
-did=int(sys.argv[1])
-for d in json.load(sys.stdin) or []:
-    if d["id"]==did and d["name"].startswith(sys.argv[2]): print(d["name"]); break
-' "$name" "$NAME_PREFIX")"
-    [ -n "$owner" ] || die "refusing: id $name is not a tagged ${NAME_PREFIX}-* droplet"
-    run $DOCTL compute droplet delete "$name" -f
-    echo "destroyed $owner (id $name)"
-    return
-  fi
+  local name="${1:?usage: droplet.sh destroy NAME}"
   assert_ours "$name"
   run $DOCTL compute droplet delete "$name" -f
   echo "destroyed $name"

@@ -733,6 +733,35 @@ PYKEEP
   bash -n ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
     || echo "WARN: keepfork patch broke harness syntax" >&2
 fi
+# bsknob: PERF_BS_MAX_BLOCKS_PER_RESPONSE emits a [network.zakura.block_sync]
+# section in the generated bench config — request-shape experiments without
+# touching Zakura code defaults (supply-bound attribution, 2026-07-22).
+if ! grep -q "perf-lab bsknob" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh; then
+  python3 - ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh <<'PYBSK'
+import sys
+path = sys.argv[1]
+lines = open(path).read().split(chr(10))
+q, d = chr(34), chr(36)
+done = False
+for i, line in enumerate(lines):
+    if (not done and line.strip() == "echo " + chr(39) + "]" + chr(39)
+            and any("bootstrap_peers = [" in l for l in lines[max(0, i-12):i])):
+        ind = line[:len(line) - len(line.lstrip())]
+        lines[i] = line + chr(10) + chr(10).join([
+            ind + "if [ -n " + q + d + "{PERF_BS_MAX_BLOCKS_PER_RESPONSE:-}" + q + " ]; then  # perf-lab bsknob",
+            ind + "  echo " + chr(39) + chr(39),
+            ind + "  echo " + chr(39) + "[network.zakura.block_sync]" + chr(39),
+            ind + "  echo " + q + "max_blocks_per_response = " + d + "{PERF_BS_MAX_BLOCKS_PER_RESPONSE}" + q,
+            ind + "fi",
+        ])
+        done = True
+assert done, "bsknob anchor"
+open(path, "w").write(chr(10).join(lines))
+print("bsknob patch applied")
+PYBSK
+  bash -n ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
+    || echo "WARN: bsknob patch broke harness syntax" >&2
+fi
 mkdir -p ${BENCH_OUT_REMOTE}
 echo "remote prep done"
 REMOTE

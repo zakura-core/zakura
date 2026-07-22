@@ -61,8 +61,8 @@ jobs:
   # `cargo nextest run`, so each recompiled the full workspace + all dependencies
   # from scratch — the same ~5m compile floor paid three times in parallel, and
   # three jobs racing to save one shared build cache (only one save ever wins).
-  # Building once removes two of the three compile passes and takes compilation
-  # off the critical path of every shard.
+  # Building once removes two of the three compile passes while preserving
+  # parallel test execution across the shard jobs.
   build-tests:
     name: build test binaries (${{ github.event_name == 'pull_request' && 'debug' || 'release' }})
     permissions:
@@ -177,7 +177,7 @@ jobs:
           # with the same features, so they share one build cache instead of each
           # keeping its own multi-GB copy. `cache-shared-key` (unlike `cache-key`,
           # which only appends to a per-job key and never shares) is stable across
-          # jobs, so the first to run warms the cache and the rest restore it.
+          # jobs, consolidating their cache entries across workflow runs.
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 #v2.83.2

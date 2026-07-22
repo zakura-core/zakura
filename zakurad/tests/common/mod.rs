@@ -34,7 +34,7 @@ pub mod zcashd_compat;
 /// they are run from a `cargo nextest` archive on a different job than the one
 /// that built them. Falls back to the path Cargo bakes in at compile time for
 /// ordinary in-tree `cargo test` runs, where the run-time variable is absent.
-pub fn zakurad_exe_path() -> String {
+fn zakurad_exe_path() -> String {
     std::env::var("CARGO_BIN_EXE_zakurad")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_zakurad").to_string())
 }

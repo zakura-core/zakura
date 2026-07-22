@@ -249,6 +249,10 @@ pub struct ReadStateService {
     highest_completed_checkpoint_receiver:
         tokio::sync::watch::Receiver<Option<finalized_state::HighestCompletedCheckpoint>>,
 
+    /// Keeps the completed-checkpoint watch open in read-only services.
+    _highest_completed_checkpoint_sender:
+        Option<tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>>,
+
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
     vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
 }
@@ -427,6 +431,7 @@ impl StateService {
             block_write_task,
             non_finalized_state_receiver,
             highest_completed_checkpoint_receiver,
+            None,
             vct_root_repair_receiver,
         );
 
@@ -1067,6 +1072,9 @@ impl ReadStateService {
         highest_completed_checkpoint_receiver: tokio::sync::watch::Receiver<
             Option<finalized_state::HighestCompletedCheckpoint>,
         >,
+        highest_completed_checkpoint_sender: Option<
+            tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>,
+        >,
         vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
     ) -> Self {
         let read_service = Self {
@@ -1075,6 +1083,7 @@ impl ReadStateService {
             non_finalized_state_receiver,
             block_write_task,
             highest_completed_checkpoint_receiver,
+            _highest_completed_checkpoint_sender: highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
         };
 
@@ -2288,8 +2297,9 @@ pub fn init_read_only(
         tokio::sync::watch::channel(NonFinalizedState::new(network));
     let (_vct_root_repair_sender, vct_root_repair_receiver) =
         tokio::sync::watch::channel(VctRootRepairStatus::default());
-    let (_highest_completed_checkpoint, highest_completed_checkpoint_receiver) =
+    let (highest_completed_checkpoint, highest_completed_checkpoint_receiver) =
         finalized_state::HighestCompletedCheckpointTracker::open(&finalized_state.db)?;
+    let highest_completed_checkpoint_sender = Some(highest_completed_checkpoint.keepalive_sender());
 
     Ok((
         ReadStateService::new(
@@ -2297,6 +2307,7 @@ pub fn init_read_only(
             None,
             WatchReceiver::new(non_finalized_state_receiver),
             highest_completed_checkpoint_receiver,
+            highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
         ),
         finalized_state.db.clone(),

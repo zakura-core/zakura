@@ -28,8 +28,8 @@ use crate::{
     arbitrary::Prepare,
     init_test,
     service::{
-        arbitrary::populated_state, chain_tip::TipAction, headers_by_height_range,
-        non_finalized_state::Chain, read, StateService,
+        arbitrary::populated_state, chain_tip::TipAction, finalized_state::FinalizedState,
+        headers_by_height_range, non_finalized_state::Chain, read, StateService,
     },
     tests::{
         setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
@@ -1223,6 +1223,37 @@ fn read_only_open_with_no_database_returns_error() {
         Err(other) => panic!("expected ReadOnlyDatabaseNotFound, got: {other:?}"),
         Ok(_) => panic!("expected an error when opening a read-only state with no database"),
     }
+}
+
+#[test]
+fn read_only_completed_checkpoint_subscription_stays_open() {
+    let network = Network::Mainnet;
+    let cache_dir =
+        tempfile::tempdir().expect("creating a temporary cache directory should succeed");
+    let config = Config {
+        cache_dir: cache_dir.path().to_path_buf(),
+        ephemeral: false,
+        ..Config::default()
+    };
+
+    let mut finalized_state = FinalizedState::new(
+        &config,
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    )
+    .expect("writable state creates the database");
+    finalized_state.db.shutdown(true);
+    drop(finalized_state);
+
+    let (read_service, _db, _non_finalized_sender) =
+        super::init_read_only(config, &network).expect("read-only state opens");
+    let receiver = read_service.subscribe_highest_completed_checkpoint();
+
+    assert_eq!(*receiver.borrow(), None);
+    assert!(!receiver.has_changed().expect("subscription remains open"));
+    drop(read_service);
+    assert!(receiver.has_changed().is_err());
 }
 
 /// Opening a read-only state against a missing or unreadable cache directory must fail with a

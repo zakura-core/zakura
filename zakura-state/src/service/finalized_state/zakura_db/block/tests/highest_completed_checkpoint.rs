@@ -38,7 +38,7 @@ fn advances_after_disk_commit_and_reconstructs_after_restart() {
     let (genesis, headers, network) = checkpoint_chain(&[2, 4]);
     let config = persistent_config(cache_dir.path());
     let mut state = state_with_genesis_config(&network, genesis.clone(), config.clone());
-    let (mut tracker, receiver) =
+    let (mut tracker, mut receiver) =
         HighestCompletedCheckpointTracker::open(&state).expect("tracker opens");
     let genesis_checkpoint = checkpoint(Height(0), genesis.hash());
 
@@ -62,7 +62,9 @@ fn advances_after_disk_commit_and_reconstructs_after_restart() {
     tracker.commit_success(proposal);
     let checkpoint_two = checkpoint(Height(2), block::Hash::from(headers[1].as_ref()));
     assert_eq!(tracker.current(), Some(checkpoint_two));
-    assert_eq!(*receiver.borrow(), Some(checkpoint_two));
+    assert!(receiver.has_changed().expect("tracker sender remains open"));
+    assert_eq!(*receiver.borrow_and_update(), Some(checkpoint_two));
+    assert!(!receiver.has_changed().expect("tracker sender remains open"));
 
     let mut batch = DiskWriteBatch::new();
     batch
@@ -78,6 +80,7 @@ fn advances_after_disk_commit_and_reconstructs_after_restart() {
 
     let checkpoint_four = checkpoint(Height(4), block::Hash::from(headers[3].as_ref()));
     assert_eq!(tracker.current(), Some(checkpoint_four));
+    assert!(receiver.has_changed().expect("tracker sender remains open"));
     drop(tracker);
     drop(receiver);
     state.shutdown(true);
@@ -131,6 +134,30 @@ fn failed_write_proposal_has_no_side_effects() {
         HighestCompletedCheckpointTracker::open(&state).expect("tracker reconstructs");
     assert_eq!(reconstructed.current(), initial);
     assert_eq!(*reconstructed_receiver.borrow(), initial);
+}
+
+#[test]
+fn reconstruction_error_clears_published_checkpoint() {
+    let _init_guard = zakura_test::init();
+    let (genesis, headers, network) = checkpoint_chain(&[2]);
+    let state = state_with_genesis_config(&network, genesis, Config::ephemeral());
+    store_header(&state, Height(1), &headers[0]);
+    store_header(&state, Height(2), &headers[1]);
+    let (mut tracker, mut receiver) =
+        HighestCompletedCheckpointTracker::open(&state).expect("tracker reconstructs");
+
+    let checkpoint_two = checkpoint(Height(2), block::Hash::from(headers[1].as_ref()));
+    assert_eq!(tracker.current(), Some(checkpoint_two));
+    assert_eq!(*receiver.borrow_and_update(), Some(checkpoint_two));
+
+    let mut conflicting = *headers[1].as_ref();
+    conflicting.nonce.0[0] = conflicting.nonce.0[0].wrapping_add(1);
+    store_header(&state, Height(2), &Arc::new(conflicting));
+
+    assert!(tracker.rebind_from_db(&state).is_err());
+    assert_eq!(tracker.current(), None);
+    assert!(receiver.has_changed().expect("tracker sender remains open"));
+    assert_eq!(*receiver.borrow_and_update(), None);
 }
 
 #[test]

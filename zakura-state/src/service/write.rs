@@ -883,6 +883,9 @@ mod tests {
             .expect("fake child block has a coinbase height");
 
         let mut non_finalized_state = NonFinalizedState::new(&network);
+        let (mut completed_checkpoint, _receiver) =
+            HighestCompletedCheckpointTracker::open(&finalized_state.db)
+                .expect("empty checkpoint tracker opens");
 
         // The seed path refuses rows that do not link to the stored header row
         // below them, and the fake chain's parent block is not otherwise
@@ -914,9 +917,6 @@ mod tests {
             best_height,
             best_block.hash(),
         ));
-        let (mut completed_checkpoint, _receiver) =
-            HighestCompletedCheckpointTracker::open(&finalized_state.db)
-                .expect("checkpoint tracker opens");
         seed_zakura_header_from_committed_block(
             &finalized_state.db,
             &mut completed_checkpoint,

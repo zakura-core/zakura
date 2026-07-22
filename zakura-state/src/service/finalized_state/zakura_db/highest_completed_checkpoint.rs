@@ -49,7 +49,7 @@ pub enum HighestCompletedCheckpointError {
     HeightOverflow,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 struct TrackerState {
     current: Option<HighestCompletedCheckpoint>,
     /// The first configured checkpoint strictly above `current`.
@@ -210,10 +210,26 @@ impl HighestCompletedCheckpointTracker {
     ///
     /// Hints with the prior state (path A) so body progress can fast-forward via
     /// path C without rescanning checkpoints from genesis.
+    ///
+    /// Clears the published checkpoint before returning a reconstruction error.
     pub fn rebind_from_db(&mut self, db: &ZakuraDb) -> Result<(), HighestCompletedCheckpointError> {
-        let state = TrackerState::reconstruct(db, &[], Some((self.state, None)))?;
-        self.replace_state(state);
-        Ok(())
+        match TrackerState::reconstruct(db, &[], Some((self.state, None))) {
+            Ok(state) => {
+                self.replace_state(state);
+                Ok(())
+            }
+            Err(error) => {
+                // A stale completed checkpoint could authorize data that the durable
+                // header store no longer justifies, so reconstruction errors fail closed.
+                self.replace_state(TrackerState::default());
+                Err(error)
+            }
+        }
+    }
+
+    /// Returns a sender clone that keeps subscriptions open without retaining the tracker.
+    pub(crate) fn keepalive_sender(&self) -> watch::Sender<Option<HighestCompletedCheckpoint>> {
+        self.sender.clone()
     }
 
     fn replace_state(&mut self, state: TrackerState) {

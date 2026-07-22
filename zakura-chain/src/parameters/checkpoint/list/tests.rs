@@ -83,6 +83,10 @@ fn checkpoint_list_neighbor_lookups() -> Result<(), BoxError> {
         Some(checkpoints[1])
     );
     assert_eq!(
+        list.checkpoint_at_or_before(block::Height(10)),
+        Some(checkpoints[1])
+    );
+    assert_eq!(
         list.checkpoint_at_or_before(block::Height(0)),
         Some(checkpoints[0])
     );
@@ -96,6 +100,10 @@ fn checkpoint_list_neighbor_lookups() -> Result<(), BoxError> {
     );
     assert_eq!(
         list.checkpoint_after(block::Height(10)),
+        Some(checkpoints[2])
+    );
+    assert_eq!(
+        list.checkpoint_after(block::Height(15)),
         Some(checkpoints[2])
     );
     assert_eq!(list.checkpoint_after(block::Height(20)), None);

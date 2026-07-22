@@ -54,7 +54,10 @@ use Network::*;
 /// The amount of time to run the crawler, before testing what it has done.
 ///
 /// Using a very short time can make the crawler not run at all.
-const CRAWLER_TEST_DURATION: Duration = Duration::from_secs(10);
+const CRAWLER_RUN_DURATION: Duration = Duration::from_secs(10);
+
+/// The maximum wall-clock time to wait for expected crawler test progress.
+const CRAWLER_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A crawler peer limit large enough to exercise multi-peer behavior without
 /// flooding the test runtime with hundreds of immediate fake handshakes.
@@ -65,9 +68,7 @@ const CRAWLER_MANY_PEER_LIMIT_FOR_TESTS: usize = 15;
 /// Using a very short time can make the peer cache updater not run at all.
 const PEER_CACHE_UPDATER_TEST_DURATION: Duration = Duration::from_secs(25);
 
-/// The amount of time to run the listener, before testing what it has done.
-///
-/// Using a very short time can make the listener not run at all.
+/// The maximum time to wait for the listener tests to make expected progress.
 const LISTENER_TEST_DURATION: Duration = Duration::from_secs(10);
 
 /// The amount of time to run zcashd-compat listener tests.
@@ -276,7 +277,7 @@ async fn peer_limit_one_mainnet() {
     let _ = init_with_peer_limit(1, nil_inbound_service, Mainnet, None, None).await;
 
     // Let the crawler run for a while.
-    tokio::time::sleep(CRAWLER_TEST_DURATION).await;
+    tokio::time::sleep(CRAWLER_RUN_DURATION).await;
 
     // Any number of address book peers is valid here, because some peers might have failed.
 }
@@ -302,7 +303,7 @@ async fn peer_limit_one_testnet() {
     .await;
 
     // Let the crawler run for a while.
-    tokio::time::sleep(CRAWLER_TEST_DURATION).await;
+    tokio::time::sleep(CRAWLER_RUN_DURATION).await;
 
     // Any number of address book peers is valid here, because some peers might have failed.
 }
@@ -321,7 +322,7 @@ async fn peer_limit_two_mainnet() {
     let _ = init_with_peer_limit(2, nil_inbound_service, Mainnet, None, None).await;
 
     // Let the crawler run for a while.
-    tokio::time::sleep(CRAWLER_TEST_DURATION).await;
+    tokio::time::sleep(CRAWLER_RUN_DURATION).await;
 
     // Any number of address book peers is valid here, because some peers might have failed.
 }
@@ -347,7 +348,7 @@ async fn peer_limit_two_testnet() {
     .await;
 
     // Let the crawler run for a while.
-    tokio::time::sleep(CRAWLER_TEST_DURATION).await;
+    tokio::time::sleep(CRAWLER_RUN_DURATION).await;
 
     // Any number of address book peers is valid here, because some peers might have failed.
 }
@@ -431,7 +432,7 @@ async fn written_peer_cache_is_automatically_read_on_startup() {
         init_with_peer_limit(1, nil_inbound_service, Mainnet, None, config.clone()).await;
 
     // Let the peer cache reader fill the address book.
-    tokio::time::sleep(CRAWLER_TEST_DURATION).await;
+    tokio::time::sleep(CRAWLER_RUN_DURATION).await;
 
     assert!(
         address_book
@@ -462,7 +463,7 @@ fn add_cacheable_peer(address_book: &Arc<std::sync::Mutex<AddressBook>>) -> Peer
 }
 
 /// Test the crawler with an outbound peer limit of zero peers, and a connector that panics.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn crawler_peer_limit_zero_connect_panic() {
     let _init_guard = zakura_test::init();
 
@@ -473,20 +474,21 @@ async fn crawler_peer_limit_zero_connect_panic() {
         unreachable!("outbound connector should never be called with a zero peer limit")
     });
 
-    let (_config, mut peerset_rx) =
-        spawn_crawler_with_peer_limit(0, unreachable_outbound_connector).await;
+    let (_config, discovered_peers) = spawn_crawler_with_peer_limit(
+        0,
+        ExpectedCrawlerConnections::None,
+        unreachable_outbound_connector,
+    )
+    .await;
 
-    let peer_result = peerset_rx.try_recv();
     assert!(
-        // `Err(TryRecvError::Empty)` means no peers are available and the channel is still open.
-        // `Err(TryRecvError::Closed)` means the channel is closed.
-        peer_result.is_err(),
-        "unexpected peer when outbound limit is zero: {peer_result:?}",
+        discovered_peers.is_empty(),
+        "unexpected peer when outbound limit is zero: {discovered_peers:?}",
     );
 }
 
 /// Test the crawler with an outbound peer limit of one peer, and a connector that always errors.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn crawler_peer_limit_one_connect_error() {
     let _init_guard = zakura_test::init();
 
@@ -496,21 +498,22 @@ async fn crawler_peer_limit_one_connect_error() {
     let error_outbound_connector =
         service_fn(|_| async { Err("test outbound connector always returns errors".into()) });
 
-    let (_config, mut peerset_rx) =
-        spawn_crawler_with_peer_limit(1, error_outbound_connector).await;
+    let (_config, discovered_peers) = spawn_crawler_with_peer_limit(
+        1,
+        ExpectedCrawlerConnections::OverLimit,
+        error_outbound_connector,
+    )
+    .await;
 
-    let peer_result = peerset_rx.try_recv();
     assert!(
-        // `Err(TryRecvError::Empty)` means no peers are available and the channel is still open.
-        // `Err(TryRecvError::Closed)` means the channel is closed.
-        peer_result.is_err(),
-        "unexpected peer when all connections error: {peer_result:?}",
+        discovered_peers.is_empty(),
+        "unexpected peer when all connections error: {discovered_peers:?}",
     );
 }
 
 /// Test the crawler with an outbound peer limit of one peer,
 /// and a connector that returns success then disconnects the peer.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn crawler_peer_limit_one_connect_ok_then_drop() {
     let _init_guard = zakura_test::init();
 
@@ -535,19 +538,14 @@ async fn crawler_peer_limit_one_connect_ok_then_drop() {
             Ok((addr, fake_client))
         });
 
-    let (config, mut peerset_rx) =
-        spawn_crawler_with_peer_limit(1, success_disconnect_outbound_connector).await;
+    let (config, discovered_peers) = spawn_crawler_with_peer_limit(
+        1,
+        ExpectedCrawlerConnections::OverLimit,
+        success_disconnect_outbound_connector,
+    )
+    .await;
 
-    let mut peer_count: usize = 0;
-    loop {
-        let peer_result = peerset_rx.try_recv();
-        match peer_result {
-            // A peer handshake succeeded.
-            Ok(_peer_change) => peer_count += 1,
-            // The channel is closed or there are no messages left in the channel.
-            Err(_) => break,
-        }
-    }
+    let peer_count = discovered_peers.len();
 
     assert!(
         peer_count > config.peerset_outbound_connection_limit(),
@@ -559,7 +557,7 @@ async fn crawler_peer_limit_one_connect_ok_then_drop() {
 
 /// Test the crawler with an outbound peer limit of one peer,
 /// and a connector that returns success then holds the peer open.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn crawler_peer_limit_one_connect_ok_stay_open() {
     let _init_guard = zakura_test::init();
 
@@ -587,19 +585,14 @@ async fn crawler_peer_limit_one_connect_ok_stay_open() {
         }
     });
 
-    let (config, mut peerset_rx) =
-        spawn_crawler_with_peer_limit(1, success_stay_open_outbound_connector).await;
+    let (config, discovered_peers) = spawn_crawler_with_peer_limit(
+        1,
+        ExpectedCrawlerConnections::AtLimit,
+        success_stay_open_outbound_connector,
+    )
+    .await;
 
-    let mut peer_change_count: usize = 0;
-    loop {
-        let peer_change_result = peerset_rx.try_recv();
-        match peer_change_result {
-            // A peer handshake succeeded.
-            Ok(_peer_change) => peer_change_count += 1,
-            // The channel is closed or there are no messages left in the channel.
-            Err(_) => break,
-        }
-    }
+    let peer_change_count = discovered_peers.len();
 
     let mut peer_tracker_count: usize = 0;
     loop {
@@ -634,7 +627,7 @@ async fn crawler_peer_limit_one_connect_ok_stay_open() {
 }
 
 /// Test the crawler with a multi-peer outbound limit, and a connector that always errors.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn crawler_peer_limit_many_connect_error() {
     let _init_guard = zakura_test::init();
 
@@ -644,22 +637,22 @@ async fn crawler_peer_limit_many_connect_error() {
     let error_outbound_connector =
         service_fn(|_| async { Err("test outbound connector always returns errors".into()) });
 
-    let (_config, mut peerset_rx) =
-        spawn_crawler_with_peer_limit(CRAWLER_MANY_PEER_LIMIT_FOR_TESTS, error_outbound_connector)
-            .await;
+    let (_config, discovered_peers) = spawn_crawler_with_peer_limit(
+        CRAWLER_MANY_PEER_LIMIT_FOR_TESTS,
+        ExpectedCrawlerConnections::OverLimit,
+        error_outbound_connector,
+    )
+    .await;
 
-    let peer_result = peerset_rx.try_recv();
     assert!(
-        // `Err(TryRecvError::Empty)` means no peers are available and the channel is still open.
-        // `Err(TryRecvError::Closed)` means the channel is closed.
-        peer_result.is_err(),
-        "unexpected peer when all connections error: {peer_result:?}",
+        discovered_peers.is_empty(),
+        "unexpected peer when all connections error: {discovered_peers:?}",
     );
 }
 
 /// Test the crawler with a multi-peer outbound limit,
 /// and a connector that returns success then disconnects the peer.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn crawler_peer_limit_many_connect_ok_then_drop() {
     let _init_guard = zakura_test::init();
 
@@ -684,24 +677,14 @@ async fn crawler_peer_limit_many_connect_ok_then_drop() {
             Ok((addr, fake_client))
         });
 
-    // TODO: tweak the crawler timeouts and rate-limits so we get over the actual limit
-    //       (currently, getting over the limit can take 30 seconds or more)
-    let (config, mut peerset_rx) = spawn_crawler_with_peer_limit(
+    let (config, discovered_peers) = spawn_crawler_with_peer_limit(
         CRAWLER_MANY_PEER_LIMIT_FOR_TESTS,
+        ExpectedCrawlerConnections::OverLimit,
         success_disconnect_outbound_connector,
     )
     .await;
 
-    let mut peer_count: usize = 0;
-    loop {
-        let peer_result = peerset_rx.try_recv();
-        match peer_result {
-            // A peer handshake succeeded.
-            Ok(_peer_change) => peer_count += 1,
-            // The channel is closed or there are no messages left in the channel.
-            Err(_) => break,
-        }
-    }
+    let peer_count = discovered_peers.len();
 
     assert!(
         peer_count > config.peerset_outbound_connection_limit(),
@@ -713,7 +696,7 @@ async fn crawler_peer_limit_many_connect_ok_then_drop() {
 
 /// Test the crawler with a multi-peer outbound limit,
 /// and a connector that returns success then holds the peer open.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn crawler_peer_limit_many_connect_ok_stay_open() {
     let _init_guard = zakura_test::init();
 
@@ -741,22 +724,14 @@ async fn crawler_peer_limit_many_connect_ok_stay_open() {
         }
     });
 
-    let (config, mut peerset_rx) = spawn_crawler_with_peer_limit(
+    let (config, discovered_peers) = spawn_crawler_with_peer_limit(
         CRAWLER_MANY_PEER_LIMIT_FOR_TESTS,
+        ExpectedCrawlerConnections::AtLimit,
         success_stay_open_outbound_connector,
     )
     .await;
 
-    let mut peer_change_count: usize = 0;
-    loop {
-        let peer_change_result = peerset_rx.try_recv();
-        match peer_change_result {
-            // A peer handshake succeeded.
-            Ok(_peer_change) => peer_change_count += 1,
-            // The channel is closed or there are no messages left in the channel.
-            Err(_) => break,
-        }
-    }
+    let peer_change_count = discovered_peers.len();
 
     let mut peer_tracker_count: usize = 0;
     loop {
@@ -804,15 +779,12 @@ async fn listener_peer_limit_zero_handshake_panic() {
         unreachable!("inbound handshaker should never be called with a zero peer limit")
     });
 
-    let (_config, mut peerset_rx) =
+    let (_config, discovered_peers) =
         spawn_inbound_listener_with_peer_limit(0, None, unreachable_inbound_handshaker).await;
 
-    let peer_result = peerset_rx.try_recv();
     assert!(
-        // `Err(TryRecvError::Empty)` means no peers are available and the channel is still open.
-        // `Err(TryRecvError::Closed)` means the channel is closed.
-        peer_result.is_err(),
-        "unexpected peer when inbound limit is zero: {peer_result:?}",
+        discovered_peers.is_empty(),
+        "unexpected peer when inbound limit is zero: {discovered_peers:?}",
     );
 }
 
@@ -829,15 +801,12 @@ async fn listener_peer_limit_one_handshake_error() {
     let error_inbound_handshaker =
         service_fn(|_| async { Err("test inbound handshaker always returns errors".into()) });
 
-    let (_config, mut peerset_rx) =
+    let (_config, discovered_peers) =
         spawn_inbound_listener_with_peer_limit(1, None, error_inbound_handshaker).await;
 
-    let peer_result = peerset_rx.try_recv();
     assert!(
-        // `Err(TryRecvError::Empty)` means no peers are available and the channel is still open.
-        // `Err(TryRecvError::Closed)` means the channel is closed.
-        peer_result.is_err(),
-        "unexpected peer when all handshakes error: {peer_result:?}",
+        discovered_peers.is_empty(),
+        "unexpected peer when all handshakes error: {discovered_peers:?}",
     );
 }
 
@@ -872,23 +841,14 @@ async fn listener_peer_limit_one_handshake_ok_then_drop() {
             Ok(fake_client)
         });
 
-    let (config, mut peerset_rx) = spawn_inbound_listener_with_peer_limit(
+    let (config, discovered_peers) = spawn_inbound_listener_with_peer_limit(
         1,
         usize::MAX,
         success_disconnect_inbound_handshaker,
     )
     .await;
 
-    let mut peer_count: usize = 0;
-    loop {
-        let peer_result = peerset_rx.try_recv();
-        match peer_result {
-            // A peer handshake succeeded.
-            Ok(_peer_change) => peer_count += 1,
-            // The channel is closed or there are no messages left in the channel.
-            Err(_) => break,
-        }
-    }
+    let peer_count = discovered_peers.len();
 
     assert!(
         peer_count > config.peerset_inbound_connection_limit(),
@@ -932,19 +892,10 @@ async fn listener_peer_limit_one_handshake_ok_stay_open() {
             }
         });
 
-    let (config, mut peerset_rx) =
+    let (config, discovered_peers) =
         spawn_inbound_listener_with_peer_limit(1, None, success_stay_open_inbound_handshaker).await;
 
-    let mut peer_change_count: usize = 0;
-    loop {
-        let peer_change_result = peerset_rx.try_recv();
-        match peer_change_result {
-            // A peer handshake succeeded.
-            Ok(_peer_change) => peer_change_count += 1,
-            // The channel is closed or there are no messages left in the channel.
-            Err(_) => break,
-        }
-    }
+    let peer_change_count = discovered_peers.len();
 
     let mut peer_tracker_count: usize = 0;
     loop {
@@ -1222,15 +1173,12 @@ async fn listener_peer_limit_default_handshake_error() {
     let error_inbound_handshaker =
         service_fn(|_| async { Err("test inbound handshaker always returns errors".into()) });
 
-    let (_config, mut peerset_rx) =
+    let (_config, discovered_peers) =
         spawn_inbound_listener_with_peer_limit(None, None, error_inbound_handshaker).await;
 
-    let peer_result = peerset_rx.try_recv();
     assert!(
-        // `Err(TryRecvError::Empty)` means no peers are available and the channel is still open.
-        // `Err(TryRecvError::Closed)` means the channel is closed.
-        peer_result.is_err(),
-        "unexpected peer when all handshakes error: {peer_result:?}",
+        discovered_peers.is_empty(),
+        "unexpected peer when all handshakes error: {discovered_peers:?}",
     );
 }
 
@@ -1269,23 +1217,14 @@ async fn listener_peer_limit_default_handshake_ok_then_drop() {
             Ok(fake_client)
         });
 
-    let (config, mut peerset_rx) = spawn_inbound_listener_with_peer_limit(
+    let (config, discovered_peers) = spawn_inbound_listener_with_peer_limit(
         None,
         usize::MAX,
         success_disconnect_inbound_handshaker,
     )
     .await;
 
-    let mut peer_count: usize = 0;
-    loop {
-        let peer_result = peerset_rx.try_recv();
-        match peer_result {
-            // A peer handshake succeeded.
-            Ok(_peer_change) => peer_count += 1,
-            // The channel is closed or there are no messages left in the channel.
-            Err(_) => break,
-        }
-    }
+    let peer_count = discovered_peers.len();
 
     assert!(
         peer_count > config.peerset_inbound_connection_limit(),
@@ -1329,20 +1268,11 @@ async fn listener_peer_limit_default_handshake_ok_stay_open() {
             }
         });
 
-    let (config, mut peerset_rx) =
+    let (config, discovered_peers) =
         spawn_inbound_listener_with_peer_limit(None, None, success_stay_open_inbound_handshaker)
             .await;
 
-    let mut peer_change_count: usize = 0;
-    loop {
-        let peer_change_result = peerset_rx.try_recv();
-        match peer_change_result {
-            // A peer handshake succeeded.
-            Ok(_peer_change) => peer_change_count += 1,
-            // The channel is closed or there are no messages left in the channel.
-            Err(_) => break,
-        }
-    }
+    let peer_change_count = discovered_peers.len();
 
     let mut peer_tracker_count: usize = 0;
     loop {
@@ -1792,16 +1722,65 @@ where
     address_book
 }
 
+/// The number of connector calls a crawler peer-limit test expects to observe.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ExpectedCrawlerConnections {
+    /// A zero connection limit must prevent every connector call.
+    None,
+    /// Held-open connections must stop at the configured limit.
+    AtLimit,
+    /// Failed or dropped connections must be replaced beyond the limit.
+    OverLimit,
+}
+
+/// Wait for `event_count` crawler test events while advancing mocked time.
+///
+/// The crawler can keep runnable tasks queued, so Tokio's automatic paused-time
+/// advancement is not sufficient for its connection rate-limit sleeps. It also
+/// uses [`tokio::task::spawn_blocking`] in [`CandidateSet::next`], so each time
+/// advance is paired with a blocking-pool round trip. The round trip is only a
+/// progress aid; correctness comes from the observed events, not FIFO task
+/// scheduling.
+async fn wait_for_crawler_events<T>(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
+    event_count: usize,
+    timeout_message: &str,
+) -> Vec<T> {
+    let deadline = Instant::now() + CRAWLER_TEST_TIMEOUT;
+    let mut received_events = Vec::with_capacity(event_count);
+
+    while received_events.len() < event_count {
+        while let Ok(event) = events.try_recv() {
+            received_events.push(event);
+            if received_events.len() == event_count {
+                return received_events;
+            }
+        }
+
+        assert!(!events.is_closed(), "{timeout_message}: channel closed");
+        assert!(Instant::now() < deadline, "{timeout_message}");
+
+        tokio::time::advance(constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL).await;
+        tokio::task::spawn_blocking(|| {})
+            .await
+            .expect("crawler test blocking-task synchronization should not panic");
+        tokio::task::yield_now().await;
+    }
+
+    received_events
+}
+
 /// Run a peer crawler with `peerset_initial_target_size` and `outbound_connector`.
 ///
 /// Uses the default values for all other config fields.
 /// Does not bind a local listener.
 ///
-/// Returns the generated [`Config`], and the peer set receiver.
+/// Returns the generated [`Config`], and the discovered peers.
 async fn spawn_crawler_with_peer_limit<C>(
     peerset_initial_target_size: impl Into<Option<usize>>,
+    expected_connections: ExpectedCrawlerConnections,
     outbound_connector: C,
-) -> (Config, mpsc::Receiver<DiscoveredPeer>)
+) -> (Config, Vec<DiscoveredPeer>)
 where
     C: Service<
             OutboundConnectorRequest,
@@ -1847,20 +1826,34 @@ where
             .update(addr);
     }
 
-    // Create a fake peer set.
-    let nil_peer_set = service_fn(move |req| async move {
-        let rsp = match req {
-            // Return the correct response variant for Peers requests,
-            // reusing one of the peers we already provided.
-            Request::Peers => Response::Peers(vec![fake_peer.unwrap()]),
-            _ => unreachable!("unexpected request: {:?}", req),
-        };
+    // Create a fake peer set. The notification proves the crawler has started
+    // an observable crawl action before this helper stops it. The zero-limit
+    // response stays pending so its timer crawl cannot enqueue more demand
+    // while the test closes the demand channel to establish a drain barrier.
+    let (crawl_observed_tx, mut crawl_observed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let nil_peer_set = service_fn(move |req| {
+        let crawl_observed_tx = crawl_observed_tx.clone();
 
-        Ok(rsp)
+        async move {
+            let rsp = match req {
+                // Return the correct response variant for Peers requests,
+                // reusing one of the peers we already provided.
+                Request::Peers => Response::Peers(vec![fake_peer.unwrap()]),
+                _ => unreachable!("unexpected request: {:?}", req),
+            };
+
+            let _ = crawl_observed_tx.send(());
+
+            if expected_connections == ExpectedCrawlerConnections::None {
+                std::future::pending::<Result<Response, BoxError>>().await
+            } else {
+                Ok(rsp)
+            }
+        }
     });
 
     // Make the channels large enough to hold all the peers.
-    let (peerset_tx, peerset_rx) = mpsc::channel::<DiscoveredPeer>(over_limit_peers);
+    let (peerset_tx, mut peerset_rx) = mpsc::channel::<DiscoveredPeer>(over_limit_peers);
     let (mut demand_tx, demand_rx) = mpsc::channel::<MorePeers>(over_limit_peers);
 
     let candidates = CandidateSet::new(address_book.clone(), nil_peer_set);
@@ -1873,6 +1866,27 @@ where
     for _ in 0..over_limit_peers {
         let _ = demand_tx.try_send(MorePeers);
     }
+    let mut demand_shutdown_tx = demand_tx.clone();
+
+    // Observe connector completion rather than sleeping for a fixed duration.
+    let (connection_finished_tx, mut connection_finished_rx) =
+        tokio::sync::mpsc::unbounded_channel();
+    let outbound_connector = service_fn(move |request| {
+        let connector = outbound_connector.clone();
+        let connection_finished_tx = connection_finished_tx.clone();
+
+        async move {
+            let result = connector.oneshot(request).await;
+            let _ = connection_finished_tx.send(result.is_ok());
+            result
+        }
+    });
+
+    let expected_connection_count = match expected_connections {
+        ExpectedCrawlerConnections::None => 0,
+        ExpectedCrawlerConnections::AtLimit => config.peerset_outbound_connection_limit(),
+        ExpectedCrawlerConnections::OverLimit => config.peerset_outbound_connection_limit() + 1,
+    };
 
     // Start the crawler.
     let crawl_fut = crawl_and_dial(
@@ -1887,19 +1901,101 @@ where
     );
     let crawl_task_handle = tokio::spawn(crawl_fut);
 
-    // Let the crawler run for a while.
-    tokio::time::sleep(CRAWLER_TEST_DURATION).await;
+    wait_for_crawler_events(
+        &mut crawl_observed_rx,
+        1,
+        "peer crawler should attempt a crawl before the timeout",
+    )
+    .await;
 
-    // Stop the crawler and let it finish.
-    crawl_task_handle.abort();
-    tokio::task::yield_now().await;
+    let connection_results = wait_for_crawler_events(
+        &mut connection_finished_rx,
+        expected_connection_count,
+        "peer crawler should make the expected connections before the timeout",
+    )
+    .await;
+    let expected_discovered_peers = connection_results
+        .into_iter()
+        .filter(|connection_succeeded| *connection_succeeded)
+        .count();
 
-    // Check for panics or errors in the crawler.
-    let crawl_result = crawl_task_handle.now_or_never();
-    assert!(
-        crawl_result.is_none() || matches!(crawl_result, Some(Err(ref e)) if e.is_cancelled()),
-        "unexpected error or panic in peer crawler task: {crawl_result:?}",
-    );
+    let peer_deadline = Instant::now() + CRAWLER_TEST_TIMEOUT;
+    let mut discovered_peers = Vec::with_capacity(expected_discovered_peers);
+    while discovered_peers.len() < expected_discovered_peers {
+        while let Ok(peer) = peerset_rx.try_recv() {
+            discovered_peers.push(peer);
+            if discovered_peers.len() == expected_discovered_peers {
+                break;
+            }
+        }
+
+        if discovered_peers.len() < expected_discovered_peers {
+            assert!(
+                Instant::now() < peer_deadline,
+                "successful crawler connections should reach the peer set"
+            );
+            tokio::time::advance(constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL).await;
+            tokio::task::spawn_blocking(|| {})
+                .await
+                .expect("crawler test blocking-task synchronization should not panic");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    if matches!(
+        expected_connections,
+        ExpectedCrawlerConnections::None | ExpectedCrawlerConnections::AtLimit
+    ) {
+        // Closing demand after the expected connections makes the crawler drain
+        // every queued excess signal before it observes channel shutdown. This
+        // is a deterministic barrier proving zero-limit and held-open cases do
+        // not start an additional connection.
+        demand_shutdown_tx.close_channel();
+
+        let shutdown_deadline = Instant::now() + CRAWLER_TEST_TIMEOUT;
+        while !crawl_task_handle.is_finished() {
+            assert!(
+                Instant::now() < shutdown_deadline,
+                "peer crawler should drain queued demand before the timeout"
+            );
+            tokio::task::spawn_blocking(|| {})
+                .await
+                .expect("crawler test blocking-task synchronization should not panic");
+            tokio::task::yield_now().await;
+        }
+
+        let crawl_result = crawl_task_handle.await;
+        match crawl_result {
+            Ok(Err(error)) => assert!(
+                error.to_string().contains("demand stream closed"),
+                "unexpected peer crawler shutdown error: {error:?}"
+            ),
+            other => panic!("unexpected peer crawler shutdown result: {other:?}"),
+        }
+
+        assert!(
+            connection_finished_rx.is_closed(),
+            "queued excess demand must not leave a peer connection in flight"
+        );
+        assert!(
+            connection_finished_rx.try_recv().is_err(),
+            "queued excess demand must not start another peer connection"
+        );
+    } else {
+        // Error and disconnected-connection tests only need to prove that
+        // replacement attempts exceed the configured connection limit.
+        crawl_task_handle.abort();
+
+        let crawl_result = crawl_task_handle.await;
+        assert!(
+            matches!(crawl_result, Err(ref error) if error.is_cancelled()),
+            "unexpected error or panic in peer crawler task: {crawl_result:?}",
+        );
+    }
+
+    while let Ok(peer) = peerset_rx.try_recv() {
+        discovered_peers.push(peer);
+    }
 
     // Check the final address book contents.
     assert_eq!(
@@ -1910,7 +2006,7 @@ where
         address_book.lock().unwrap().address_metrics(Utc::now())
     );
 
-    (config, peerset_rx)
+    (config, discovered_peers)
 }
 
 async fn connect_from(source_ip: Ipv4Addr, listen_addr: SocketAddr) -> TcpStream {
@@ -1965,12 +2061,12 @@ fn assert_listener_task_cancelled(listen_task_handle: JoinHandle<Result<(), BoxE
 /// Binds the local listener to an unused localhost port.
 /// Uses the default values for all other config fields.
 ///
-/// Returns the generated [`Config`], and the peer set receiver.
+/// Returns the generated [`Config`], and the discovered peers.
 async fn spawn_inbound_listener_with_peer_limit<S>(
     peerset_initial_target_size: impl Into<Option<usize>>,
     max_connections_per_ip: impl Into<Option<usize>>,
     listen_handshaker: S,
-) -> (Config, mpsc::Receiver<DiscoveredPeer>)
+) -> (Config, Vec<DiscoveredPeer>)
 where
     S: Service<peer::HandshakeRequest<TcpStream>, Response = peer::Client, Error = BoxError>
         + Clone
@@ -1999,7 +2095,21 @@ where
     // Make enough inbound connections to go over the limit, even if the limit is zero.
     // Make the channels large enough to hold all the connections.
     let over_limit_connections = config.peerset_inbound_connection_limit() * 2 + 1;
-    let (peerset_tx, peerset_rx) = mpsc::channel::<DiscoveredPeer>(over_limit_connections);
+    let (peerset_tx, mut peerset_rx) = mpsc::channel::<DiscoveredPeer>(over_limit_connections);
+
+    // Observe completed handshakes so the helper can deterministically wait for
+    // every spawned handshake task before inspecting the peer set channel.
+    let (handshake_finished_tx, mut handshake_finished_rx) = tokio::sync::mpsc::unbounded_channel();
+    let listen_handshaker = service_fn(move |request| {
+        let handshaker = listen_handshaker.clone();
+        let handshake_finished_tx = handshake_finished_tx.clone();
+
+        async move {
+            let result = handshaker.oneshot(request).await;
+            let _ = handshake_finished_tx.send(());
+            result
+        }
+    });
 
     let bans = BannedIps::default();
 
@@ -2009,15 +2119,18 @@ where
         tcp_listener,
         MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
         listen_handshaker,
-        peerset_tx.clone(),
+        peerset_tx,
         bans,
         Vec::new(),
     );
     let listen_task_handle = tokio::spawn(listen_fut);
 
     // Open inbound connections.
+    let (connection_finished_tx, mut connection_finished_rx) =
+        tokio::sync::mpsc::unbounded_channel();
     let mut outbound_task_handles = Vec::new();
     for _ in 0..over_limit_connections {
+        let connection_finished_tx = connection_finished_tx.clone();
         let outbound_fut = async move {
             let outbound_result = TcpStream::connect(listen_addr).await;
             // Let other tasks run before we block on reading.
@@ -2039,30 +2152,85 @@ where
                     "outbound connection error in inbound listener test"
                 );
             }
+
+            let _ = connection_finished_tx.send(());
         };
 
         let outbound_task_handle = tokio::spawn(outbound_fut);
         outbound_task_handles.push(outbound_task_handle);
     }
+    std::mem::drop(connection_finished_tx);
 
-    // Let the listener run for a while.
-    tokio::time::sleep(LISTENER_TEST_DURATION).await;
+    // All test connections use the same IP, so at most this many connections
+    // can stay open. Once every other connection has closed, the listener has
+    // exercised both its accepted and over-limit paths.
+    let maximum_open_connections = config
+        .peerset_inbound_connection_limit()
+        .min(config.max_connections_per_ip);
+    let expected_closed_connections = over_limit_connections - maximum_open_connections;
 
-    // Stop the listener and outbound tasks, and let them finish.
+    tokio::time::timeout(LISTENER_TEST_DURATION, async {
+        for _ in 0..expected_closed_connections {
+            connection_finished_rx
+                .recv()
+                .await
+                .expect("inbound connection tasks remain active until they report completion");
+        }
+    })
+    .await
+    .expect("inbound listener should process the test connections before the timeout");
+
+    // Stop the listener and outbound tasks, and wait for their cancellation.
     listen_task_handle.abort();
-    for outbound_task_handle in outbound_task_handles {
+    for outbound_task_handle in &outbound_task_handles {
         outbound_task_handle.abort();
     }
-    tokio::task::yield_now().await;
 
-    // Check for panics or errors in the listener.
-    let listen_result = listen_task_handle.now_or_never();
+    let listen_result = listen_task_handle.await;
     assert!(
-        listen_result.is_none() || matches!(listen_result, Some(Err(ref e)) if e.is_cancelled()),
+        matches!(listen_result, Err(ref error) if error.is_cancelled()),
         "unexpected error or panic in inbound peer listener task: {listen_result:?}",
     );
 
-    (config, peerset_rx)
+    for outbound_task_handle in outbound_task_handles {
+        let outbound_result = outbound_task_handle.await;
+        assert!(
+            outbound_result.is_ok()
+                || matches!(outbound_result, Err(ref error) if error.is_cancelled()),
+            "unexpected panic in inbound test connection task: {outbound_result:?}",
+        );
+    }
+
+    let handshake_count = tokio::time::timeout(LISTENER_TEST_DURATION, async move {
+        let mut handshake_count = 0;
+        while handshake_finished_rx.recv().await.is_some() {
+            handshake_count += 1;
+        }
+        handshake_count
+    })
+    .await
+    .expect("inbound handshake tasks should finish before the timeout");
+
+    if config.peerset_inbound_connection_limit() == 0 {
+        assert_eq!(
+            handshake_count, 0,
+            "the handshaker must not run when the inbound peer limit is zero"
+        );
+    } else {
+        assert!(
+            handshake_count > 0,
+            "the listener must exercise the configured handshaker"
+        );
+    }
+
+    let discovered_peers = tokio::time::timeout(
+        LISTENER_TEST_DURATION,
+        peerset_rx.by_ref().collect::<Vec<_>>(),
+    )
+    .await
+    .expect("inbound handshake peer changes should finish before the timeout");
+
+    (config, discovered_peers)
 }
 
 /// Initialize a task that connects to `peer_count` initial peers using the

@@ -852,13 +852,15 @@ fn modern_rollback_does_not_rebuild_note_trees_from_genesis() -> Result<()> {
 
     proptest!(
         ProptestConfig::with_cases(proptest_cases()),
-        |((chain, _count, network, _history_tree) in PreparedChain::default()
-            .with_ledger_strategy(ledger_strategy)
-            .with_valid_commitments()
+        |((chain, network) in super::valid_commitment_chain(ledger_strategy, target_index + 2)
             .no_shrink())
             | {
-            let synced: Vec<SemanticallyVerifiedBlock> = chain.iter().cloned().collect();
-            prop_assume!(synced.len() > target_index + 1);
+            let synced = chain;
+            prop_assert_eq!(
+                synced.len(),
+                target_index + 2,
+                "generated chain must contain the target and one removed block"
+            );
             prop_assert!(
                 !synced[target_index + 1..]
                     .iter()

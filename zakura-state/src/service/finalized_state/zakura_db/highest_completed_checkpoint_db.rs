@@ -572,6 +572,59 @@ mod tests {
         );
     }
 
+    /// Fully synced nodes often have an empty provisional header frontier while
+    /// still holding a durable completed-checkpoint row. The empty-frontier
+    /// audit fast path must still repair that independent row before format
+    /// validation fails closed.
+    #[test]
+    fn empty_frontier_startup_audit_repairs_stale_checkpoint() {
+        let (db, _block1, block2) = checkpoint_fixture(&Config::ephemeral());
+
+        // Fixture tip is genesis with empty zakura header CFs. Plant a stale
+        // Height(2) completed checkpoint that is not durable on disk.
+        let mut batch = DiskWriteBatch::new();
+        batch.set_highest_completed_checkpoint(
+            &db,
+            HighestCompletedCheckpoint {
+                height: Height(2),
+                hash: block2.hash(),
+            },
+        );
+        db.write_batch(batch).expect("stale checkpoint writes");
+
+        assert!(matches!(
+            db.validate_highest_completed_checkpoint(),
+            Err(HighestCompletedCheckpointError::Mismatch { .. })
+        ));
+
+        assert!(
+            db.audit_and_repair_zakura_header_store()
+                .expect("empty-frontier audit succeeds")
+                .is_some(),
+            "stale checkpoint on an empty frontier must be repaired"
+        );
+        assert_eq!(
+            db.try_highest_completed_checkpoint()
+                .expect("repaired checkpoint decodes")
+                .expect("genesis checkpoint remains"),
+            HighestCompletedCheckpoint {
+                height: Height::MIN,
+                hash: db
+                    .network()
+                    .checkpoint_list()
+                    .hash(Height::MIN)
+                    .expect("genesis checkpoint is configured"),
+            }
+        );
+        assert_eq!(
+            db.validate_highest_completed_checkpoint()
+                .expect("repaired highest completed checkpoint validates")
+                .expect("genesis highest completed checkpoint remains")
+                .height,
+            Height::MIN
+        );
+    }
+
     #[test]
     fn malformed_row_fails_closed() {
         let (db, _block1, _block2) = checkpoint_fixture(&Config::ephemeral());

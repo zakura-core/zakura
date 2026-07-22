@@ -219,13 +219,48 @@ impl ZakuraDb {
             && self.db.zs_is_empty(&body_size_cf)
             && provisional_roots_empty
         {
-            // Log the pass so operators can verify the audit ran on this boot.
-            tracing::info!(
+            // An empty provisional frontier is common on fully synced nodes, but
+            // the durable completed-checkpoint row is independent of those CFs
+            // and can still be stale, missing, or set to another configured
+            // checkpoint. Repair it here before returning so format validation
+            // does not fail closed on an otherwise repairable mismatch.
+            let mut violations = Vec::new();
+            let mut batch = DiskWriteBatch::new();
+            let mut pending_writes = 0;
+            queue_highest_completed_checkpoint_repair(
+                self,
+                finalized_tip,
+                &mut violations,
+                &mut batch,
+                &mut pending_writes,
+            )?;
+            if violations.is_empty() {
+                // Log the pass so operators can verify the audit ran on this boot.
+                tracing::info!(
+                    ?finalized_tip,
+                    frontier_rows = 0,
+                    "zakura header store passed its startup coherence audit (empty frontier)"
+                );
+                return Ok(None);
+            }
+
+            metrics::counter!("state.zakura.header_store.incoherent").increment(1);
+            tracing::warn!(
                 ?finalized_tip,
-                frontier_rows = 0,
-                "zakura header store passed its startup coherence audit (empty frontier)"
+                last_coherent = ?finalized_tip,
+                deleted_rows = 0,
+                violation_count = violations.len(),
+                first_violations = ?&violations[..violations.len().min(LOGGED_VIOLATIONS)],
+                "zakura header store failed its startup coherence audit; \
+                 repairing the durable highest completed checkpoint"
             );
-            return Ok(None);
+            flush_repair_batch(&self.db, &mut batch, &mut pending_writes)?;
+
+            return Ok(Some(ZakuraStoreRepair {
+                last_coherent: finalized_tip,
+                deleted_rows: 0,
+                violations,
+            }));
         }
 
         let mut violations = Vec::new();
@@ -410,23 +445,13 @@ impl ZakuraDb {
             )?;
         }
 
-        let stored_checkpoint = self.try_highest_completed_checkpoint()?;
-        let reconstructed_checkpoint = last_coherent.map(|(height, _)| {
-            self.highest_completed_checkpoint_for_tip(height, &[])
-                .expect("the configured genesis checkpoint and coherent height range are valid")
-        });
-        if stored_checkpoint != reconstructed_checkpoint {
-            violations.push(ZakuraStoreViolation::HighestCompletedCheckpointMismatch {
-                stored: stored_checkpoint,
-                reconstructed: reconstructed_checkpoint,
-            });
-            if let Some(reconstructed_checkpoint) = reconstructed_checkpoint {
-                batch.set_highest_completed_checkpoint(self, reconstructed_checkpoint);
-            } else {
-                batch.clear_highest_completed_checkpoint(self);
-            }
-            pending_deletes += 1;
-        }
+        queue_highest_completed_checkpoint_repair(
+            self,
+            last_coherent,
+            &mut violations,
+            &mut batch,
+            &mut pending_deletes,
+        )?;
 
         if violations.is_empty() {
             // Log the pass so operators can verify the audit ran on this boot
@@ -459,6 +484,35 @@ impl ZakuraDb {
             violations,
         }))
     }
+}
+
+/// Compares the durable highest-completed-checkpoint row with a reconstruction
+/// through `last_coherent`, queuing a write or clear on mismatch.
+fn queue_highest_completed_checkpoint_repair(
+    db: &ZakuraDb,
+    last_coherent: Option<(Height, block::Hash)>,
+    violations: &mut Vec<ZakuraStoreViolation>,
+    batch: &mut DiskWriteBatch,
+    pending_writes: &mut usize,
+) -> Result<(), BoxError> {
+    let stored_checkpoint = db.try_highest_completed_checkpoint()?;
+    let reconstructed_checkpoint = last_coherent.map(|(height, _)| {
+        db.highest_completed_checkpoint_for_tip(height, &[])
+            .expect("the configured genesis checkpoint and coherent height range are valid")
+    });
+    if stored_checkpoint != reconstructed_checkpoint {
+        violations.push(ZakuraStoreViolation::HighestCompletedCheckpointMismatch {
+            stored: stored_checkpoint,
+            reconstructed: reconstructed_checkpoint,
+        });
+        if let Some(reconstructed_checkpoint) = reconstructed_checkpoint {
+            batch.set_highest_completed_checkpoint(db, reconstructed_checkpoint);
+        } else {
+            batch.clear_highest_completed_checkpoint(db);
+        }
+        *pending_writes += 1;
+    }
+    Ok(())
 }
 
 fn height_keyed_batch<V>(

@@ -29,6 +29,17 @@ pub const SLOW_START_SHIFT: Height = Height(SLOW_START_INTERVAL.0 / 2);
 // TODO: change to HeightDiff
 pub const MAX_BLOCK_REORG_HEIGHT: u32 = 1000;
 
+/// The maximum number of non-finalized chain forks Zakura will track.
+/// When this limit is reached, we drop the chain with the lowest work.
+///
+/// When the network is under heavy transaction load, there are around 5 active forks in the last
+/// 100 blocks. (1 fork per 20 blocks.) When block propagation is efficient, there is around
+/// 1 fork per 300 blocks.
+///
+/// This limits non-finalized chain memory, in the worst case, to around:
+/// `10 forks * 1000 blocks * 2 MB per block = 20 GB`
+pub const MAX_NON_FINALIZED_CHAIN_FORKS: usize = 10;
+
 /// Magic numbers used to identify different Zcash networks.
 pub mod magics {
     use crate::parameters::network::magic::Magic;

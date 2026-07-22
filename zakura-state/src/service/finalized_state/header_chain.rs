@@ -116,12 +116,16 @@ pub struct StartupReport {
 #[derive(Clone, Debug)]
 pub struct Publisher {
     sender: watch::Sender<EngineSnapshot>,
+    mirrors: Arc<Mutex<Vec<watch::Sender<Option<EngineSnapshot>>>>>,
 }
 
 impl Publisher {
     fn new(snapshot: EngineSnapshot) -> Self {
         let (sender, _) = watch::channel(snapshot);
-        Self { sender }
+        Self {
+            sender,
+            mirrors: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     /// Return the latest durable snapshot.
@@ -134,8 +138,28 @@ impl Publisher {
         self.sender.subscribe()
     }
 
+    /// Mirror committed snapshots into a channel that can predate runtime attachment.
+    pub(crate) fn mirror_to(&self, sender: watch::Sender<Option<EngineSnapshot>>) {
+        sender.send_replace(Some(self.snapshot()));
+        self.mirrors
+            .lock()
+            .expect("header-chain publisher mirror mutex is never poisoned")
+            .push(sender);
+    }
+
     fn publish(&self, snapshot: EngineSnapshot) {
-        self.sender.send_replace(snapshot);
+        self.sender.send_replace(snapshot.clone());
+        self.mirrors
+            .lock()
+            .expect("header-chain publisher mirror mutex is never poisoned")
+            .retain(|mirror| {
+                if mirror.receiver_count() == 0 {
+                    false
+                } else {
+                    mirror.send_replace(Some(snapshot.clone()));
+                    true
+                }
+            });
     }
 }
 
@@ -1722,6 +1746,24 @@ mod tests {
             last_transition_id: EvidenceId::from_digest([0; 32]),
         };
         (config, node, metadata)
+    }
+
+    #[test]
+    fn publisher_mirror_stays_absent_until_attachment_then_tracks_commits() {
+        let (_, _, metadata) = fixture();
+        let initial = metadata.snapshot();
+        let publisher = Publisher::new(initial.clone());
+        let (mirror_sender, mirror_receiver) = watch::channel(None);
+
+        assert_eq!(*mirror_receiver.borrow(), None);
+
+        publisher.mirror_to(mirror_sender);
+        assert_eq!(*mirror_receiver.borrow(), Some(initial.clone()));
+
+        let mut committed = initial;
+        committed.state_version = StateVersion::new(2);
+        publisher.publish(committed.clone());
+        assert_eq!(*mirror_receiver.borrow(), Some(committed));
     }
 
     #[test]

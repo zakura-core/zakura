@@ -247,6 +247,10 @@ pub struct ReadStateService {
 
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
     vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
+
+    /// Committed header-engine snapshots, absent until the semantic handoff audit succeeds.
+    header_chain_snapshot_receiver:
+        tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
 }
 
 impl Drop for StateService {
@@ -402,6 +406,8 @@ impl StateService {
         let finalized_state_for_writing = finalized_state.clone();
         let should_use_finalized_block_write_sender = non_finalized_state.is_chain_set_empty();
         let sync_backup_dir_path = backup_dir_path.filter(|_| skip_backup_task);
+        let (header_chain_snapshot_sender, header_chain_snapshot_receiver) =
+            tokio::sync::watch::channel(None);
         let (
             block_write_sender,
             invalid_block_write_reset_receiver,
@@ -415,6 +421,7 @@ impl StateService {
             non_finalized_state_sender,
             should_use_finalized_block_write_sender,
             sync_backup_dir_path,
+            header_chain_snapshot_sender,
         );
 
         let read_service = ReadStateService::new(
@@ -422,6 +429,7 @@ impl StateService {
             block_write_task,
             non_finalized_state_receiver,
             vct_root_repair_receiver,
+            header_chain_snapshot_receiver,
         );
 
         let full_verifier_utxo_lookahead = max_checkpoint_height
@@ -1059,6 +1067,9 @@ impl ReadStateService {
         block_write_task: Option<Arc<std::thread::JoinHandle<()>>>,
         non_finalized_state_receiver: WatchReceiver<NonFinalizedState>,
         vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
+        header_chain_snapshot_receiver: tokio::sync::watch::Receiver<
+            Option<zakura_header_chain::EngineSnapshot>,
+        >,
     ) -> Self {
         let read_service = Self {
             network: finalized_state.network(),
@@ -1066,6 +1077,7 @@ impl ReadStateService {
             non_finalized_state_receiver,
             block_write_task,
             vct_root_repair_receiver,
+            header_chain_snapshot_receiver,
         };
 
         tracing::debug!("created new read-only state service");
@@ -1081,6 +1093,13 @@ impl ReadStateService {
     /// Subscribe to VCT supplied-root repair needs discovered by the finalized writer.
     pub fn subscribe_vct_root_repairs(&self) -> tokio::sync::watch::Receiver<VctRootRepairStatus> {
         self.vct_root_repair_receiver.clone()
+    }
+
+    /// Subscribe to snapshots published only after a durable header-engine commit.
+    pub fn subscribe_header_chain_snapshots(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>> {
+        self.header_chain_snapshot_receiver.clone()
     }
 
     /// Gets a clone of the latest non-finalized state from the `non_finalized_state_receiver`
@@ -2271,6 +2290,8 @@ pub fn init_read_only(
         tokio::sync::watch::channel(NonFinalizedState::new(network));
     let (_vct_root_repair_sender, vct_root_repair_receiver) =
         tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let (_header_chain_snapshot_sender, header_chain_snapshot_receiver) =
+        tokio::sync::watch::channel(None);
 
     Ok((
         ReadStateService::new(
@@ -2278,6 +2299,7 @@ pub fn init_read_only(
             None,
             WatchReceiver::new(non_finalized_state_receiver),
             vct_root_repair_receiver,
+            header_chain_snapshot_receiver,
         ),
         finalized_state.db.clone(),
         non_finalized_state_sender,

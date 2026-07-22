@@ -22,10 +22,10 @@ use zakura_chain::{
 };
 use zakura_header_chain::{
     ApplyResult, BodyEvidence, CheckpointSet, EngineConfig, EngineConfigError, EngineMode,
-    EvidenceId, Frontier, FullStateEvidenceAuthority, FullStateFinalized, OperatorInvalidate,
-    OperatorInvalidationId, OperatorReconsider, StateVersion, StoreError, StoreRead, SystemClock,
-    TransitionContext, TransitionEvent, TransitionRequest, TrustedAnchor, VerifiedBodyEvidence,
-    VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
+    EngineSnapshot, EvidenceId, Frontier, FullStateEvidenceAuthority, FullStateFinalized,
+    OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, StateVersion, StoreError,
+    StoreRead, SystemClock, TransitionContext, TransitionEvent, TransitionRequest, TrustedAnchor,
+    VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -758,6 +758,7 @@ struct WriteBlockWorkerTask {
     backup_dir_path: Option<PathBuf>,
     header_chain: Option<HeaderChainWriter>,
     attach_header_chain_at_handoff: bool,
+    header_chain_snapshot_sender: watch::Sender<Option<EngineSnapshot>>,
 }
 
 /// The message type for the non-finalized block write task channel.
@@ -827,6 +828,7 @@ impl BlockWriteSender {
         non_finalized_state_sender: watch::Sender<NonFinalizedState>,
         should_use_finalized_block_write_sender: bool,
         backup_dir_path: Option<PathBuf>,
+        header_chain_snapshot_sender: watch::Sender<Option<EngineSnapshot>>,
     ) -> (
         Self,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
@@ -843,6 +845,7 @@ impl BlockWriteSender {
             backup_dir_path,
             None,
             true,
+            header_chain_snapshot_sender,
         )
     }
 
@@ -856,6 +859,7 @@ impl BlockWriteSender {
         backup_dir_path: Option<PathBuf>,
         header_chain: Option<HeaderChainWriter>,
         attach_header_chain_at_handoff: bool,
+        header_chain_snapshot_sender: watch::Sender<Option<EngineSnapshot>>,
     ) -> (
         Self,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
@@ -898,6 +902,7 @@ impl BlockWriteSender {
                     backup_dir_path,
                     header_chain,
                     attach_header_chain_at_handoff,
+                    header_chain_snapshot_sender,
                 }
                 .run()
             })
@@ -943,6 +948,7 @@ impl WriteBlockWorkerTask {
             backup_dir_path,
             header_chain,
             attach_header_chain_at_handoff,
+            header_chain_snapshot_sender,
         } = &mut self;
 
         let mut prev_finalized_note_commitment_trees: Option<NoteCommitmentTrees> = None;
@@ -1150,6 +1156,12 @@ impl WriteBlockWorkerTask {
                         "header-chain startup reconciliation must succeed before semantic writes",
                     ),
             );
+        }
+        if let Some(writer) = header_chain {
+            writer
+                .runtime
+                .publisher()
+                .mirror_to(header_chain_snapshot_sender.clone());
         }
 
         // Save any errors to propagate down to queued child blocks

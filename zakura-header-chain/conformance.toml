@@ -187,7 +187,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-VAL-06"
 name = "Contextual difficulty validation"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::AdjustedDifficulty"
+tests = ["HV-04::difficulty_windows_upgrades_testnet_minimum_and_partitions_match", "HV-04::difficulty_damping_bounds_are_exact", "DF-01::header_daa_accepts_valid_threshold_with_full_context", "DF-01::header_daa_rejects_bad_threshold_with_full_context"]
+networks = ["mainnet", "testnet"]
 
 [[rule]]
 id = "LC-POW-01"
@@ -200,7 +203,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-VAL-07"
 name = "Median and maximum time"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::validate_contextual_difficulty_and_time"
+tests = ["HV-05::median_and_production_max_time_boundaries_are_exact", "HV-05::height_one_header_skips_max_time_limit_but_later_mainnet_headers_do_not"]
+networks = ["mainnet", "testnet"]
 
 [[rule]]
 id = "LC-TIME-01"

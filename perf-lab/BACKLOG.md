@@ -56,6 +56,11 @@ READY | BLOCKED(<why>) | DONE(EXP-NNN) | DROPPED(<why>).
   single-run sensitivity floor is peer delivery, not the harness. Until this
   lands, only large effects or multi-run medians clear the band.
 
+- B-16 READY — Harness snapshot fetch resilience: curl HTTP/2 mid-stream
+  INTERNAL_ERROR (err 92) killed first-download attempts on two different
+  fresh droplets (aa1 2026-07-21, aa-cohort1 2026-07-22); force --http1.1
+  and add -C - resumable retries to the snapshot curl. Upstreamable.
+
 ## Structural-class (yellow)
 
 - B-09 READY — `FromDisk` TODO at

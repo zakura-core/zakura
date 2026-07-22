@@ -22,6 +22,12 @@
       "role": "bench"
     }
   },
-  "in_flight": {},
+  "in_flight": {
+    "exp002-base": {
+      "droplet": "perf-lab-s2",
+      "exp": "EXP-002 request-shape baseline (knob=1 default)",
+      "started_at": "2026-07-22T20:05:00Z"
+    }
+  },
   "noise_band_pct": 7.6
 }

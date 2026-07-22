@@ -28,7 +28,7 @@ use zakura_test::args;
 
 use crate::common::{
     config::{os_assigned_rpc_port_config, read_listen_addr_from_logs, testdir},
-    launch::{ZakuradTestDirExt, LAUNCH_DELAY},
+    launch::{ZakuradTestDirExt, EXTENDED_LAUNCH_DELAY},
 };
 
 /// Number of blocks that should be submitted before the test is considered successful.
@@ -49,11 +49,11 @@ pub(crate) async fn submit_blocks_test() -> Result<()> {
 
     let mut zakurad = testdir()?
         .with_config(&mut config)?
-        .spawn_child(args!["start"])?;
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
 
     let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
-
-    tokio::time::sleep(LAUNCH_DELAY).await;
+    zakurad.expect_stdout_line_matches("activating mempool")?;
 
     let client = RpcRequestClient::new(rpc_address);
 

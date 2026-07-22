@@ -25,8 +25,9 @@ Goals:
 
 1. Develop and validate the fix entirely in private — in a private staging
    repo with CI, plus a soak on nodes we operate — before anything is public.
-2. At a chosen time (**T-0**), go from private to public tag + GitHub release
-   + crates.io release with a minimal, well-understood exposure window.
+2. At a chosen time (**T-0**), go from private to a public tag, GitHub
+   release, and crates.io release with a minimal, well-understood exposure
+   window.
 3. Keep the existing release protections: `v*` tags are created only by the
    release App via the `Create release` workflow (with a break-glass org-owner
    bypass), tags stay immutable, and binaries are always built and
@@ -118,7 +119,7 @@ Everything the public T-0 run gates on can be rehearsed in the staging repo:
 | Crates publishability | `./scripts/check-crate-packaging.sh --verify`, plus the no-git-dependencies check |
 
 **The tag dress rehearsal.** Once the branch is final, push the real
-`vX.Y.Z` tag *to the staging repo*. Nothing collides — it is a separate
+`vX.Y.Z` tag _to the staging repo_. Nothing collides — it is a separate
 repository with no tag rulesets — and the push triggers
 `release-binaries.yml` exactly as the public T-0 tag will: version checks,
 both release binaries, Docker images (build-only, under the repo guards), and
@@ -198,7 +199,7 @@ T-0 involves zero authoring — only pushing and clicking. The branch carries:
 
 Release state (checkpoints + VCT frontier): staleness beyond 14 days only
 warns, so a hotfix normally ships whatever the base already has. If it's
-badly stale, refreshing it runs the *public* `update-release-state.yml`
+badly stale, refreshing it runs the _public_ `update-release-state.yml`
 workflow and merges a public draft PR — a mild, deniable timing signal. If
 that PR floors `ESTIMATED_RELEASE_HEIGHT` upward, drop that hunk: hotfixes
 never move end-of-support. The `allow_bootstrap_release_state` override exists
@@ -334,7 +335,7 @@ time-to-source when it matters.
 Zakura is a Zebra fork; incidents come in three shapes:
 
 - **Inherited from Zebra**: `SECURITY.md` obliges responsible disclosure with
-  the Zcash Foundation and ECC; T-0 is then chosen *jointly* (expect the
+  the Zcash Foundation and ECC; T-0 is then chosen _jointly_ (expect the
   slower party to set it).
 - **Zebra ships a fix first**: the clock is already running — this process
   executes compressed (base decision, port, soak as severity allows, release;

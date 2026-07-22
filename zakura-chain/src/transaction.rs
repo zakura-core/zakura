@@ -345,10 +345,6 @@ impl Transaction {
     /// transactions ignore it because ZIP-244 commits to the spent output's
     /// `scriptPubKey` instead.
     ///
-    /// This method only calculates a digest. For V5 and later transactions,
-    /// callers must separately reject `SIGHASH_SINGLE` when the transparent
-    /// input does not have a corresponding output.
-    ///
     /// # Panics
     ///
     /// - if `hash_type` is not one of the six canonical signature hash types
@@ -356,6 +352,8 @@ impl Transaction {
     /// - if called on a v1 or v2 transaction
     /// - if the input index points to a transparent::Input::CoinBase
     /// - if the input index is out of bounds for self.inputs()
+    /// - if a V5 or later `SIGHASH_SINGLE` transparent input does not have a
+    ///   corresponding output
     /// - if the tx contains `nConsensusBranchId` field and `nu` doesn't match it
     /// - if the tx is not convertible to its `librustzcash` equivalent
     /// - if `nu` doesn't contain a consensus branch id convertible to its `librustzcash`

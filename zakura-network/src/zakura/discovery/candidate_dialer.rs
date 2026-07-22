@@ -8,7 +8,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, Ipv4Addr},
+    net::IpAddr,
     panic::AssertUnwindSafe,
     time::Duration,
 };
@@ -22,6 +22,7 @@ use super::dialer::native_bootstrap_dial;
 use super::protocol::{ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
 use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
 use crate::zakura::{
+    canonical_ip,
     trace::{discovery_trace as d_trace, peer_label, DISCOVERY_TABLE},
     ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId,
 };
@@ -252,7 +253,7 @@ async fn discovery_node_addr_with_reserved_ip_capacity(
     let mut direct_addrs = Vec::new();
     let mut reserved_ips = Vec::new();
     for addr in &candidate.direct_addrs {
-        let dial_ip = canonical_discovery_dial_ip(addr.ip());
+        let dial_ip = canonical_ip(addr.ip());
         if !discovery_ip_is_in_backoff(dial_backoff_by_ip, dial_ip, now)
             && can_accept_discovery_dial_ip(endpoint, dial_ip, in_flight_by_ip).await
         {
@@ -269,20 +270,6 @@ async fn discovery_node_addr_with_reserved_ip_capacity(
             reserved_ips,
         )
     })
-}
-
-fn canonical_discovery_dial_ip(ip: IpAddr) -> IpAddr {
-    let IpAddr::V6(ipv6) = ip else {
-        return ip;
-    };
-    let octets = ipv6.octets();
-    if octets[..10] == [0; 10] && octets[10..12] == [0xff; 2] {
-        IpAddr::V4(Ipv4Addr::new(
-            octets[12], octets[13], octets[14], octets[15],
-        ))
-    } else {
-        ip
-    }
 }
 
 async fn can_accept_discovery_dial_ip(
@@ -591,7 +578,15 @@ mod tests {
         let mapped_ip: IpAddr = "::ffff:93.184.216.34"
             .parse()
             .expect("mapped test address parses");
-        assert_eq!(canonical_discovery_dial_ip(mapped_ip), ip);
+        let six_to_four_ip: IpAddr = "2002:5db8:d822::"
+            .parse()
+            .expect("6to4 test address parses");
+        let teredo_ip: IpAddr = "2001:0:c000:22d::a247:27dd"
+            .parse()
+            .expect("Teredo test address parses");
+        assert_eq!(canonical_ip(mapped_ip), ip);
+        assert_eq!(canonical_ip(six_to_four_ip), ip);
+        assert_eq!(canonical_ip(teredo_ip), ip);
         let now = Instant::now();
         let dial_backoff = (Duration::from_secs(60), Duration::from_secs(3_600));
         let mut backoff_by_ip = HashMap::new();
@@ -606,7 +601,7 @@ mod tests {
         assert!(discovery_ip_is_in_backoff(&backoff_by_ip, ip, now));
         assert!(discovery_ip_is_in_backoff(
             &backoff_by_ip,
-            canonical_discovery_dial_ip(mapped_ip),
+            canonical_ip(mapped_ip),
             now
         ));
         assert!(!discovery_ip_is_in_backoff(

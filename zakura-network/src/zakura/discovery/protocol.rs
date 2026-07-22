@@ -21,9 +21,9 @@ use zakura_chain::{
 };
 
 use crate::zakura::{
-    BlockSyncStatus, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerLimits,
-    ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId, MAX_BS_BLOCKS_PER_REQUEST,
-    MAX_BS_RESPONSE_BYTES,
+    canonical_ip, BlockSyncStatus, ServiceAdmissionDecision, ServicePeerDirection,
+    ServicePeerLimits, ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId,
+    MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES,
 };
 
 /// Native discovery stream kind.
@@ -3427,21 +3427,17 @@ fn is_discovery_dialable_addr(addr: &SocketAddr) -> bool {
         return false;
     }
 
-    match addr.ip() {
+    match canonical_ip(addr.ip()) {
         IpAddr::V4(ip) => is_discovery_dialable_ipv4(&ip),
-        IpAddr::V6(ip) => ipv6_mapped_ipv4(&ip).map_or_else(
-            || {
-                !ip.is_unspecified()
-                    && !ip.is_loopback()
-                    && !ip.is_multicast()
-                    && !is_ipv6_unicast_link_local(&ip)
-                    && !is_ipv6_unique_local(&ip)
-                    && !is_ipv6_site_local(&ip)
-                    && !is_ipv6_ipv4_compatible(&ip)
-                    && !is_ipv6_nat64_translation(&ip)
-            },
-            |mapped| is_discovery_dialable_ipv4(&mapped),
-        ),
+        IpAddr::V6(ip) => {
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_multicast()
+                && !is_ipv6_unicast_link_local(&ip)
+                && !is_ipv6_unique_local(&ip)
+                && !is_ipv6_site_local(&ip)
+                && !is_ipv6_nat64_translation(&ip)
+        }
     }
 }
 
@@ -3464,7 +3460,7 @@ fn is_static_discovery_configured_addr_usable(addr: &SocketAddr) -> bool {
         return false;
     }
 
-    match addr.ip() {
+    match canonical_ip(addr.ip()) {
         IpAddr::V4(ip) => !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast(),
         IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_multicast(),
     }
@@ -3472,12 +3468,6 @@ fn is_static_discovery_configured_addr_usable(addr: &SocketAddr) -> bool {
 
 fn is_ipv6_unicast_link_local(ip: &Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
-}
-
-fn ipv6_mapped_ipv4(ip: &Ipv6Addr) -> Option<Ipv4Addr> {
-    let octets = ip.octets();
-    (octets[..10] == [0; 10] && octets[10..12] == [0xff; 2])
-        .then(|| Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]))
 }
 
 fn is_ipv4_protocol_assignment(ip: &Ipv4Addr) -> bool {
@@ -3510,10 +3500,6 @@ fn is_ipv6_unique_local(ip: &Ipv6Addr) -> bool {
 // the modern RFC 4193 unique-local range.
 fn is_ipv6_site_local(ip: &Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfec0
-}
-
-fn is_ipv6_ipv4_compatible(ip: &Ipv6Addr) -> bool {
-    ip.octets()[..12] == [0; 12]
 }
 
 fn is_ipv6_nat64_translation(ip: &Ipv6Addr) -> bool {
@@ -5756,6 +5742,18 @@ mod tests {
             ),
             SocketAddr::new(
                 IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 1)),
+                8233,
+            ),
+            // 6to4 embeds 10.0.0.1 in bits 16..48.
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2002, 0x0a00, 1, 0, 0, 0, 0, 0)),
+                8233,
+            ),
+            // Teredo stores the client IPv4 address bitwise-inverted in the final 32 bits.
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0, 0xc000, 0x022d, 0, 0, 0xf5ff, 0xfffe,
+                )),
                 8233,
             ),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0a00, 1)), 8233),

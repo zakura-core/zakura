@@ -48,7 +48,7 @@ use super::{
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        direct_endpoint_builder, drive_header_sync_actions, spawn_block_sync_reactor,
+        canonical_ip, direct_endpoint_builder, drive_header_sync_actions, spawn_block_sync_reactor,
         spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
         BlockSyncService, BlockSyncStartup, Clock, CloseCause, Frame, FramedRecv, FramedSend,
         Frontier, FrontierChange, FrontierUpdate, HeaderSyncAction, HeaderSyncFrontiers,
@@ -1103,6 +1103,7 @@ impl ZakuraSupervisorHandle {
         disconnect_token: CancellationToken,
         _accepted_capabilities: u64,
     ) -> ZakuraRegistration {
+        let remote_ip = remote_ip.map(canonical_ip);
         let mut state = self.inner.lock().await;
         // A re-registration for a peer id that is already active from the same
         // IP is a duplicate redial, not a new per-IP allocation: the incumbent
@@ -1242,6 +1243,7 @@ impl ZakuraSupervisorHandle {
         remote_ip: IpAddr,
         in_flight_count: usize,
     ) -> bool {
+        let remote_ip = canonical_ip(remote_ip);
         let state = self.inner.lock().await;
         let active_count = state
             .active_by_ip
@@ -6630,6 +6632,66 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipv4_embedded_ipv6_addresses_share_the_supervisor_ip_bucket() {
+        async fn register_from_ip(
+            supervisor: &ZakuraSupervisorHandle,
+            peer: ZakuraPeerId,
+            ip: IpAddr,
+        ) -> ZakuraRegistration {
+            let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+            let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
+            supervisor
+                .register(
+                    test_conn_id(),
+                    peer.clone(),
+                    Some(ip),
+                    [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
+                    outbound_handle,
+                    CancellationToken::new(),
+                    ZAKURA_CAP_DISCOVERY,
+                )
+                .await
+        }
+
+        let ipv4: IpAddr = "93.184.216.34".parse().expect("IPv4 test address parses");
+        let mapped: IpAddr = "::ffff:93.184.216.34"
+            .parse()
+            .expect("mapped test address parses");
+        let compatible: IpAddr = "::93.184.216.34"
+            .parse()
+            .expect("compatible test address parses");
+        let six_to_four: IpAddr = "2002:5db8:d822::"
+            .parse()
+            .expect("6to4 test address parses");
+        let teredo: IpAddr = "2001:0:c000:22d::a247:27dd"
+            .parse()
+            .expect("Teredo test address parses");
+        let nat64: IpAddr = "64:ff9b::5db8:d822"
+            .parse()
+            .expect("NAT64 test address parses");
+        let supervisor = ZakuraSupervisorHandle::new(1);
+
+        assert!(matches!(
+            register_from_ip(&supervisor, test_peer(60), six_to_four).await,
+            ZakuraRegistration::Registered { .. }
+        ));
+
+        for alias in [ipv4, mapped, compatible, six_to_four, teredo, nat64] {
+            assert!(
+                !supervisor
+                    .can_accept_remote_ip_with_in_flight(alias, 0)
+                    .await,
+                "{alias} must share the occupied IPv4 identity bucket"
+            );
+        }
+
+        assert!(matches!(
+            register_from_ip(&supervisor, test_peer(61), ipv4).await,
+            ZakuraRegistration::Rejected(ZakuraRejectReason::ResourceLimit)
+        ));
     }
 
     // A restarted or resyncing peer redials from its stable IP while its previous

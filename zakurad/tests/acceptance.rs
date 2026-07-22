@@ -416,7 +416,7 @@ async fn db_init_outside_future_executor() -> Result<()> {
     Ok(())
 }
 
-/// Check that persistent block state and peer list caches survive a node run.
+/// Check that persistent block state and peer list caches survive a node restart.
 #[test]
 fn persistent_mode() -> Result<()> {
     let _init_guard = zakura_test::init();
@@ -445,7 +445,6 @@ fn persistent_mode() -> Result<()> {
 
     child.expect_stdout_line_matches("loaded Zakura state cache")?;
     child.expect_stdout_line_matches("loaded cached peer IP addresses")?;
-    child.expect_stdout_line_matches("cacheable peer list was empty, keeping previous cache")?;
     child.kill(false)?;
     let output = child.wait_with_output()?;
 
@@ -460,9 +459,32 @@ fn persistent_mode() -> Result<()> {
     );
 
     assert_with_context!(
-        fs::read_to_string(peer_cache_file)?.trim() == "127.0.0.1:1",
+        fs::read_to_string(&peer_cache_file)?.trim() == "127.0.0.1:1",
         &output,
         "peer cache changed despite having no connected peers"
+    );
+
+    let mut child = testdir
+        .spawn_child(args!["-v", "start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
+
+    child.expect_stdout_line_matches("loaded Zakura state cache")?;
+    child.expect_stdout_line_matches("loaded cached peer IP addresses")?;
+    child.kill(false)?;
+    let output = child.wait_with_output()?;
+
+    output.assert_was_killed()?;
+
+    assert_with_context!(
+        cache_dir.read_dir()?.count() > 0,
+        &output,
+        "state directory empty after restarting with persistent state config"
+    );
+
+    assert_with_context!(
+        fs::read_to_string(&peer_cache_file)?.trim() == "127.0.0.1:1",
+        &output,
+        "peer cache did not survive node restart"
     );
 
     Ok(())

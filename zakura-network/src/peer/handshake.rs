@@ -1069,6 +1069,7 @@ where
             nonces,
             local_node_id,
             local_direct_addresses,
+            ResponderRegistrationWait::Production,
         )
         .await?
     } else {
@@ -1223,6 +1224,27 @@ where
     Ok(ZakuraUpgradeOutcome::Upgraded { peer_id })
 }
 
+/// Selects the registration wait used by the responder upgrade path.
+enum ResponderRegistrationWait {
+    Production,
+    #[cfg(test)]
+    TestTimeout(Duration),
+}
+
+impl ResponderRegistrationWait {
+    async fn wait(self, connector: &ZakuraHandshakeConnector, peer_id: &ZakuraPeerId) -> bool {
+        match self {
+            Self::Production => connector.wait_for_zakura_registration(peer_id).await,
+            #[cfg(test)]
+            Self::TestTimeout(timeout) => {
+                tokio::time::timeout(timeout, connector.wait_for_zakura_registration(peer_id))
+                    .await
+                    .unwrap_or(false)
+            }
+        }
+    }
+}
+
 /// The TCP responder side of the legacy Zakura upgrade prelude exchange.
 ///
 /// Reads the initiator's [`P2pV2UpgradeInit`] and replies with our
@@ -1235,6 +1257,7 @@ async fn run_responder_upgrade<PeerTransport>(
     nonces: ZakuraLegacyNonces,
     local_node_id: Vec<u8>,
     local_direct_addresses: Vec<Vec<u8>>,
+    registration_wait: ResponderRegistrationWait,
 ) -> Result<ZakuraUpgradeOutcome, HandshakeError>
 where
     PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1294,7 +1317,7 @@ where
     // and then never completes the native dial would make us discard a working
     // legacy connection with no Zakura replacement. This mirrors the initiator's
     // `spawn_zakura_dial_to_hints_and_wait` hand-off wait.
-    if !connector.wait_for_zakura_registration(&peer_id).await {
+    if !registration_wait.wait(connector, &peer_id).await {
         return Ok(neutral_upgrade_fallback());
     }
 

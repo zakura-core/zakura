@@ -115,7 +115,7 @@ async fn setup_gossip_test() -> GossipTestSetup {
 
 /// After a successful mined block broadcast, the gossip task marks the tip as seen and does not
 /// send a duplicate committed-tip gossip for the same hash.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn mined_block_marks_tip_after_successful_broadcast() {
     let GossipTestSetup {
         mut peer_set,
@@ -158,7 +158,7 @@ async fn mined_block_marks_tip_after_successful_broadcast() {
 
 /// A successful mined-block broadcast still suppresses the committed-tip fallback for that hash
 /// even when another mined-block notification is already queued.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn mined_block_mark_survives_pending_submit_queue() {
     let GossipTestSetup {
         mut peer_set,
@@ -219,7 +219,7 @@ async fn mined_block_mark_survives_pending_submit_queue() {
 
 /// If a mined block broadcast times out, the committed tip gossip path should still advertise the
 /// hash as a fallback.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
     let GossipTestSetup {
         mut peer_set,

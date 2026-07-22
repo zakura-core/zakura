@@ -24,6 +24,7 @@ use crate::{
         },
         Magic, Network, NetworkKind, NetworkUpgrade,
     },
+    serialization::ZcashSerialize,
     transaction::{LockTime, Transaction},
     transparent,
     work::difficulty::{ExpandedDifficulty, U256},
@@ -92,6 +93,16 @@ pub struct GeneratedLocalTestnet {
     pub funded_keys: Vec<FundedKey>,
     /// Height/hash pairs for every generated block (suitable for checkpoint config).
     pub checkpoints: Vec<(Height, block::Hash)>,
+}
+
+impl GeneratedLocalTestnet {
+    /// Serialize the genesis block to hex.
+    pub fn genesis_hex(&self) -> Result<String, crate::BoxError> {
+        let genesis = self.blocks.first().ok_or("no genesis block")?;
+        let mut bytes = Vec::new();
+        genesis.zcash_serialize(&mut bytes)?;
+        Ok(hex::encode(&bytes))
+    }
 }
 
 /// Generate a local testnet chain with funded transparent addresses for each miner.

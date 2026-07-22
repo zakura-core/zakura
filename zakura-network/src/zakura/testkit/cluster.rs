@@ -157,13 +157,14 @@ mod tests {
             HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMessage,
             HeaderSyncMisbehavior, HeaderSyncOperationIdentity, HeaderSyncPeerSession,
             HeaderSyncRequestId, HeaderSyncStartup, HeaderSyncStatus,
-            HeaderSyncWireRequestIdentity, Peer, Service, ServicePeerLimits, Stream,
-            ZakuraBlockSyncConfig, ZakuraConnId, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
-            ZakuraTrace, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+            HeaderSyncWireRequestIdentity, LegacyGossipFrame, LegacyGossipSink, LegacyRequestFrame,
+            Peer, Service, ServicePeerLimits, Stream, ZakuraBlockSyncConfig, ZakuraConnId,
+            ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace, MAX_BS_RESPONSE_BYTES,
+            MSG_RESPONSE_TRANSACTION_IDS, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
             ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
-            ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
+            ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC, ZAKURA_STREAM_LEGACY_REQUESTS,
         },
-        Config,
+        BoxError, Config, Request, Response,
     };
     use std::{
         collections::{BTreeMap, HashMap, HashSet},
@@ -2270,6 +2271,104 @@ mod tests {
 
         zero_cap_peer.shutdown().await;
         discovery_peer.shutdown().await;
+        victim.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admitted_legacy_service_keeps_discovery_connection_alive() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let (legacy_requests_tx, mut legacy_requests_rx) = mpsc::unbounded_channel();
+        let victim = ZakuraTestNode::builder(33601)
+            .supported_capabilities(ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_LEGACY_GOSSIP)
+            .service_from_supervisor(move |supervisor| {
+                Arc::new(LegacyGossipSink::spawn(
+                    tower::service_fn(move |request: Request| {
+                        let legacy_requests_tx = legacy_requests_tx.clone();
+                        async move {
+                            let response = if matches!(&request, Request::MempoolTransactionIds) {
+                                Response::TransactionIds(Vec::new())
+                            } else {
+                                Response::Nil
+                            };
+                            let _ = legacy_requests_tx.send(request);
+                            Ok::<_, BoxError>(response)
+                        }
+                    }),
+                    supervisor,
+                ))
+            })
+            .spawn()
+            .await?;
+        let registered = victim.supervisor().subscribe();
+        let peer = HostilePeer::connect_native_with_capabilities(
+            &victim,
+            33602,
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_LEGACY_GOSSIP,
+        )
+        .await?;
+        let peer_id = peer.id()?;
+
+        await_until("legacy peer registered", Duration::from_secs(5), || {
+            contains_peer(&registered.borrow(), peer_id.as_bytes())
+        })
+        .await?;
+        peer.send_raw_frame(
+            ZAKURA_STREAM_GOSSIP,
+            LegacyGossipFrame::AdvertiseBlock(block::Hash([91; 32])).encode_frame()?,
+        )
+        .await?;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), legacy_requests_rx.recv())
+                .await?
+                .is_some(),
+            "the real legacy service admits and handles the gossip stream"
+        );
+
+        peer.send_raw_frame(ZAKURA_STREAM_DISCOVERY, discovery_get_peers_frame())
+            .await?;
+        await_until("discovery peer admitted", Duration::from_secs(5), || {
+            victim.discovery().peer_snapshot().inbound_peers == 1
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            contains_peer(&registered.borrow(), peer_id.as_bytes()),
+            "discovery must not disconnect a connection owned by the admitted legacy service"
+        );
+        assert_eq!(
+            victim.discovery().peer_snapshot().inbound_peers,
+            0,
+            "the one-shot discovery session is released after settling"
+        );
+
+        peer.send_raw_frame(
+            ZAKURA_STREAM_GOSSIP,
+            LegacyGossipFrame::AdvertiseBlock(block::Hash([92; 32])).encode_frame()?,
+        )
+        .await?;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), legacy_requests_rx.recv())
+                .await?
+                .is_some(),
+            "legacy gossip remains usable after the discovery exchange settles"
+        );
+        let response = peer
+            .request_frame(
+                ZAKURA_STREAM_LEGACY_REQUESTS,
+                336,
+                LegacyRequestFrame::MempoolTransactionIds.encode_frame()?,
+            )
+            .await?;
+        assert_eq!(response.message_type, MSG_RESPONSE_TRANSACTION_IDS);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), legacy_requests_rx.recv())
+                .await?
+                .is_some(),
+            "legacy request-response remains usable after discovery settles"
+        );
+
+        peer.shutdown().await;
         victim.shutdown().await;
         Ok(())
     }

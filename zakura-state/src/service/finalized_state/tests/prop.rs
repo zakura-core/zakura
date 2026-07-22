@@ -35,6 +35,30 @@ use super::super::{
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
 
+/// A testnet with every network upgrade activated early, so tests can exercise
+/// every transition without committing most of a generated partial chain.
+fn early_upgrade_network() -> zakura_chain::parameters::Network {
+    ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu6_2: Some(10),
+            nu6_3: Some(11),
+            nu7: Some(12),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network")
+}
+
 type TestRootMap = HashMap<
     u32,
     (
@@ -371,38 +395,22 @@ fn blocks_with_v5_transactions() -> Result<()> {
 fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            // These are dummy values. The particular values don't matter much,
-            // as long as the nu5 one is smaller than the chains being generated
-            // (MAX_PARTIAL_CHAIN_BLOCKS) to make sure that upgrade is exercised
-            // in the test below. (The test will fail if that does not happen.)
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
+    let nu7_height = NetworkUpgrade::Nu7
+        .activation_height(&network)
+        .expect("NU7 activation height is configured");
+    let tested_block_count =
+        usize::try_from(nu7_height.0 + 1).expect("test activation height fits in usize");
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
 
-    // Use no_shrink() because we're ignoring _count and there is nothing to actually shrink.
+    // Every generated block is needed to reach NU7, so there is nothing useful
+    // to shrink.
     proptest!(ProptestConfig::with_cases(env::var("PROPTEST_CASES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES)),
-        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy).with_valid_commitments().no_shrink())| {
+        |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
 
             let mut state = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
             let mut height = Height(0);
@@ -410,10 +418,11 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
             let heartwood_height_plus1 = (heartwood_height + 1).unwrap();
             let nu5_height = NetworkUpgrade::Nu5.activation_height(&network).unwrap();
             let nu5_height_plus1 = (nu5_height + 1).unwrap();
+            prop_assert_eq!(chain.len(), tested_block_count);
 
             let mut failure_count = 0;
             let mut bad_auth_root_failure_count = 0;
-            for block in chain.iter() {
+            for block in &chain {
                 let block_hash = block.hash;
                 let current_height = block.block.coinbase_height().unwrap();
                 // For some specific heights, try to commit a block with
@@ -480,6 +489,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
             // Make sure the failure path was triggered
             prop_assert_eq!(failure_count, 4);
             prop_assert_eq!(bad_auth_root_failure_count, 1);
+            prop_assert_eq!(state.finalized_tip_height(), Some(nu7_height));
     });
 
     Ok(())
@@ -497,25 +507,12 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
 fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("NU5 activation height is configured");
+    let tested_block_count =
+        usize::try_from(nu5_height.0 + 5).expect("test activation height fits in usize");
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -523,16 +520,15 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES)),
-        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+        |((chain, network) in super::valid_commitment_chain(ledger_strategy.clone(), tested_block_count).no_shrink())| {
 
             let blocks: Vec<_> = chain.iter().collect();
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
             let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
 
-            // Process a bounded prefix [0, last] spanning the Heartwood (history-tree
-            // creation) and NU5 (V1->V2) boundaries plus a couple of V2 blocks; `last` is
-            // the tip we compare at. Chains are far longer than this
-            // (MAX_PARTIAL_CHAIN_BLOCKS), so this is a plain assertion, not a discard.
+            // Process [0, last] across the Heartwood (history-tree creation) and NU5
+            // (V1->V2) boundaries plus a few V2 blocks. The final generated block is
+            // the successor used to verify the commitment at `last`.
             let last = (nu5 + 3) as usize;
             prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
 

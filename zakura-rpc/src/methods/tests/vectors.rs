@@ -32,8 +32,7 @@ use zakura_network::{
 };
 use zakura_node_services::BoxError;
 use zakura_state::{
-    GetBlockTemplateChainInfo, IntoDisk, LatestChainTip, ReadRequest, ReadResponse,
-    ReadStateService,
+    GetBlockTemplateChainInfo, IntoDisk, ReadRequest, ReadResponse, ReadStateService,
 };
 use zakura_test::mock_service::MockService;
 
@@ -1512,6 +1511,7 @@ async fn rpc_getaddresstxids_invalid_arguments() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getaddresstxids_response() {
     let _init_guard = zakura_test::init();
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
 
     for network in Network::iter() {
         let blocks: Vec<Arc<Block>> = network
@@ -1535,31 +1535,63 @@ async fn rpc_getaddresstxids_response() {
         let (_, read_state, latest_chain_tip, _chain_tip_change) =
             zakura_state::populated_state(blocks.to_owned(), &network).await;
 
+        let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (rpc, rpc_tx_queue) = RpcImpl::new(
+            network.clone(),
+            Default::default(),
+            Default::default(),
+            "0.0.1",
+            "RPC test",
+            Buffer::new(mempool.clone(), 1),
+            state,
+            Buffer::new(read_state, 1),
+            MockService::build().for_unit_tests(),
+            MockSyncStatus::default(),
+            latest_chain_tip,
+            MockAddressBookPeers::default(),
+            rx,
+            None,
+        );
+
+        let address = address.to_string();
+        let assert_response = |start, end, expected_response_len| {
+            let rpc = rpc.clone();
+            let address = address.clone();
+
+            async move {
+                let response = rpc
+                    .get_address_tx_ids(GetAddressTxIdsRequest {
+                        addresses: vec![address],
+                        start,
+                        end,
+                    })
+                    .await
+                    .expect("arguments are valid so no error can happen here");
+
+                // One founders reward output per coinbase transaction, and no
+                // other transactions.
+                assert_eq!(response.len(), expected_response_len);
+            }
+        };
+
         if network == Mainnet {
             // Exhaustively test possible block ranges for mainnet.
             for start in 1..=10 {
                 for end in start..=10 {
-                    rpc_getaddresstxids_response_with(
-                        &network,
+                    assert_response(
                         Some(start),
                         Some(end),
-                        &address,
-                        &read_state,
-                        &latest_chain_tip,
-                        (end - start + 1) as usize,
+                        usize::try_from(end - start + 1).expect("test range length fits in usize"),
                     )
                     .await;
                 }
             }
         } else {
             // Just test the full range for testnet.
-            rpc_getaddresstxids_response_with(
-                &network,
-                Some(1),
-                Some(10),
-                &address,
-                &read_state,
-                &latest_chain_tip,
+            assert_response(
+                Some(1u32),
+                Some(10u32),
                 // response should be limited to the chain size.
                 10,
             )
@@ -1567,129 +1599,38 @@ async fn rpc_getaddresstxids_response() {
         }
 
         // No range arguments should be equivalent to the full range.
-        rpc_getaddresstxids_response_with(
-            &network,
-            None,
-            None,
-            &address,
-            &read_state,
-            &latest_chain_tip,
-            10,
-        )
-        .await;
+        assert_response(None, None, 10).await;
 
         // Range of 0s should be equivalent to the full range.
-        rpc_getaddresstxids_response_with(
-            &network,
-            Some(0),
-            Some(0),
-            &address,
-            &read_state,
-            &latest_chain_tip,
-            10,
-        )
-        .await;
+        assert_response(Some(0), Some(0), 10).await;
 
         // Start and outside of the range should use the chain tip.
-        rpc_getaddresstxids_response_with(
-            &network,
-            Some(11),
-            Some(11),
-            &address,
-            &read_state,
-            &latest_chain_tip,
-            1,
-        )
-        .await;
+        assert_response(Some(11), Some(11), 1).await;
 
         // End outside the range should use the chain tip.
-        rpc_getaddresstxids_response_with(
-            &network,
-            None,
-            Some(11),
-            &address,
-            &read_state,
-            &latest_chain_tip,
-            10,
-        )
-        .await;
+        assert_response(None, Some(11), 10).await;
 
         // Start outside the range should use the chain tip.
-        rpc_getaddresstxids_response_with(
-            &network,
-            Some(11),
-            None,
-            &address,
-            &read_state,
-            &latest_chain_tip,
-            1,
-        )
-        .await;
+        assert_response(Some(11), None, 1).await;
+
+        // Shut down the queue task, to close the state's file descriptors.
+        rpc_tx_queue.abort();
+
+        // The queue task should not have panicked or exited by itself.
+        // It can still be running, or it can have exited due to the abort.
+        let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
+        assert!(
+            rpc_tx_queue_task_result.is_none()
+                || rpc_tx_queue_task_result
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled()
+        );
     }
-}
 
-async fn rpc_getaddresstxids_response_with(
-    network: &Network,
-    start: Option<u32>,
-    end: Option<u32>,
-    address: &transparent::Address,
-    read_state: &ReadStateService,
-    tip: &LatestChainTip,
-    expected_response_len: usize,
-) {
-    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-
-    let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, rpc_tx_queue) = RpcImpl::new(
-        network.clone(),
-        Default::default(),
-        Default::default(),
-        "0.0.1",
-        "RPC test",
-        Buffer::new(mempool.clone(), 1),
-        state,
-        Buffer::new(read_state.clone(), 1),
-        MockService::build().for_unit_tests(),
-        MockSyncStatus::default(),
-        tip.clone(),
-        MockAddressBookPeers::default(),
-        rx,
-        None,
-    );
-
-    // call the method with valid arguments
-    let addresses = vec![address.to_string()];
-    let response = rpc
-        .get_address_tx_ids(GetAddressTxIdsRequest {
-            addresses,
-            start,
-            end,
-        })
-        .await
-        .expect("arguments are valid so no error can happen here");
-
-    // One founders reward output per coinbase transactions, no other transactions.
-    assert_eq!(response.len(), expected_response_len);
-
+    // All range and network variants use the same RPC path, so a single
+    // observer catches an unexpected mempool request from any case.
     mempool.expect_no_requests().await;
-
-    // Shut down the queue task, to close the state's file descriptors.
-    // (If we don't, opening ~100 simultaneous states causes process file descriptor limit errors.)
-    //
-    // TODO: abort all the join handles in all the tests, except one?
-    rpc_tx_queue.abort();
-
-    // The queue task should not have panicked or exited by itself.
-    // It can still be running, or it can have exited due to the abort.
-    let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
-    assert!(
-        rpc_tx_queue_task_result.is_none()
-            || rpc_tx_queue_task_result
-                .unwrap()
-                .unwrap_err()
-                .is_cancelled()
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -439,16 +439,18 @@ fn persistent_mode() -> Result<()> {
     fs::write(&peer_cache_file, "127.0.0.1:1\n")?;
     let testdir = &testdir;
 
-    let mut child = testdir.spawn_child(args!["-v", "start"])?;
+    let mut child = testdir
+        .spawn_child(args!["-v", "start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
 
-    // Run the program and kill it after a few seconds
-    std::thread::sleep(EXTENDED_LAUNCH_DELAY);
+    child.expect_stdout_line_matches("loaded Zakura state cache")?;
+    child.expect_stdout_line_matches("loaded cached peer IP addresses")?;
+    child.expect_stdout_line_matches("cacheable peer list was empty, keeping previous cache")?;
     child.kill(false)?;
     let output = child.wait_with_output()?;
 
     // Make sure the command was killed
     output.assert_was_killed()?;
-    output.stdout_line_contains("loaded cached peer IP addresses")?;
 
     let cache_dir = testdir.path().join("state");
     assert_with_context!(
@@ -2634,21 +2636,16 @@ async fn rpc_submit_block() -> Result<()> {
 fn end_of_support_is_checked_at_start() -> Result<()> {
     let _init_guard = zakura_test::init();
     let testdir = testdir()?.with_config(&mut default_test_config(&Mainnet))?;
-    let mut child = testdir.spawn_child(args!["start"])?;
+    let mut child = testdir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
 
-    // Give enough time to start up the eos task.
-    std::thread::sleep(Duration::from_secs(30));
-
+    child.expect_stdout_line_matches("Starting zakurad")?;
+    child.expect_stdout_line_matches("Starting end of support task")?;
     child.kill(false)?;
 
     let output = child.wait_with_output()?;
     let output = output.assert_failure()?;
-
-    // Zebra started
-    output.stdout_line_contains("Starting zakurad")?;
-
-    // End of support task started.
-    output.stdout_line_contains("Starting end of support task")?;
 
     // Make sure the command was killed
     output.assert_was_killed()?;
@@ -2756,9 +2753,6 @@ async fn state_format_test(
     zakurad.expect_stdout_line_matches("creating new database with the current format")?;
     zakurad.expect_stdout_line_matches("loaded Zakura state cache")?;
 
-    // Give Zebra enough time to actually write the database to disk.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
     let logs = zakurad.kill_and_return_output(false)?;
 
     assert!(
@@ -2803,9 +2797,6 @@ async fn state_format_test(
         )
         .expect("can't write fake database version to disk");
 
-        // Give zakura_state enough time to actually write the database version to disk.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
         let running_version = state_database_format_version_in_code();
 
         match fake_version.cmp(&running_version) {
@@ -2842,9 +2833,6 @@ async fn state_format_test(
             zakurad.expect_stdout_line_matches("trying to open current database format")?;
             zakurad.expect_stdout_line_matches("loaded Zakura state cache")?;
         }
-
-        // Give Zebra enough time to actually write the database to disk.
-        tokio::time::sleep(Duration::from_secs(1)).await;
 
         let logs = zakurad.kill_and_return_output(false)?;
 

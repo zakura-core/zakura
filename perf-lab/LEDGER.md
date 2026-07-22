@@ -279,3 +279,17 @@ This file is the sole reporting channel (design D5). Entry template:
   warm-regime prediction ~150+; cold-steady prediction ~110. Either outcome
   fixes the protocol (warmup pass before measuring, or re-baseline at the
   cold-steady level).
+
+## COHORT CACHE REGIME — resolved (2026-07-22)
+
+- aa-cohort4 (back-to-back after regcheck): legs 105.26 / 105.17 pc, |delta|
+  0.086%, durations 1163/1164 s. COLD-STEADY CONFIRMED at ~105 pc blk/s.
+- full picture: ~185-190 was the post-seed RAM-warm transient (state >> RAM,
+  reads evict as they load, so ordinary benching cannot re-warm it); the
+  steady disk-read regime is ~105 and deterministic to ~0.1% in cadence.
+  Every anomaly today maps onto the warm→cold transition.
+- PROTOCOL: measure in cadence (back-to-back runs; after >30 min cohort idle,
+  run one settling run before measuring). Two-run confirmation stays. Steady
+  regime still ~15% above live-peer throughput with vastly better precision.
+- EXP-002 restart: aa-cohort4 doubles as the default-knob baseline on SHA
+  41368ad4 — only k8/k32 needed, back-to-back, now.

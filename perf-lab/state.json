@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "session": 1,
-  "batch_runs_used": 3,
+  "batch_runs_used": 4,
   "next_exp_id": 3,
   "droplets": {
     "perf-lab-serve-a": {
@@ -23,10 +23,10 @@
     }
   },
   "in_flight": {
-    "aa-cohort4": {
+    "exp002-k8": {
       "droplet": "perf-lab-s2",
-      "exp": "cache-regime discriminator",
-      "started_at": "2026-07-22T21:25:00Z"
+      "exp": "EXP-002 request-shape k=8 (steady regime)",
+      "started_at": "2026-07-22T22:13:00Z"
     }
   },
   "noise_band_pct": 7.6

@@ -182,7 +182,9 @@ jobs:
           persist-credentials: false
 
       - name: Run shellcheck
-        run: shellcheck scripts/*.sh
+        # .github/workflows/scripts/*.sh included: those run on provisioned
+        # droplets, where a shell bug costs a full provisioning cycle to find.
+        run: shellcheck scripts/*.sh .github/workflows/scripts/*.sh
 
   ci-python-tests:
     name: ci python tests

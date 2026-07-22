@@ -376,7 +376,10 @@ jobs:
         if: always()
         env:
           DROPLET_ID: ${{ steps.droplet.outputs.id }}
-          TEARDOWN: ${{ inputs.teardown_after_run == false && 'false' || 'true' }}
+          # Explicit event check: on a push `inputs.teardown_after_run` is
+          # empty, and an empty value compares equal to `false` in GitHub
+          # expressions -- which silently left the smoke-run droplet alive.
+          TEARDOWN: ${{ github.event_name == 'push' && 'true' || (inputs.teardown_after_run && 'true' || 'false') }}
           SSH_FAILED: ${{ steps.sshwait.outcome == 'failure' }}
         run: |
           set +e

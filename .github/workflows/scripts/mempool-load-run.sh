@@ -83,7 +83,12 @@ echo "kresko: ${KRESKO_SHA}"
 # ---------------------------------------------------------------------------- #
 
 run_leg() {
-  local label="$1" commit="$2" leg_out="$OUT_DIR/$label"
+  # Separate `local` statements on purpose: bash declares every name in a
+  # single `local` before assigning any of them, so referring to $label in the
+  # same statement that defines it is an unbound-variable error under `set -u`.
+  local label="$1"
+  local commit="$2"
+  local leg_out="$OUT_DIR/$label"
   mkdir -p "$leg_out"
 
   echo "=== leg ${label}: building ${commit} ==="

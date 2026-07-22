@@ -109,7 +109,7 @@ message_rate_per_second = 2048
 stream_open_rate_per_second = 32
 
 [rpc]
-cookie_dir = "cache_dir"
+cookie_dir = "/Users/roman/Library/Caches/zakura"
 cookie_file_name = ".cookie"
 debug_force_finished_sync = false
 enable_cookie_auth = true
@@ -117,7 +117,7 @@ max_response_body_size = 52428800
 parallel_cpu_threads = 0
 
 [state]
-cache_dir = "cache_dir"
+cache_dir = "/Users/roman/Library/Caches/zakura"
 debug_skip_non_finalized_state_backup_task = false
 delete_old_database = true
 ephemeral = false
@@ -149,3 +149,4 @@ shutdown_grace_period = "5m"
 startup_delay = "1s"
 zcashd_extra_args = []
 zcashd_source = "path"
+

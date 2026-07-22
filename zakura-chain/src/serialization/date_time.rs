@@ -71,15 +71,6 @@ impl DateTime32 {
     }
 
     /// Returns the duration elapsed since this time,
-    /// or if this time is in the future, returns `None`.
-    #[allow(clippy::unwrap_in_result)]
-    pub fn checked_elapsed(&self, now: chrono::DateTime<Utc>) -> Option<Duration32> {
-        DateTime32::try_from(now)
-            .expect("unexpected out of range chrono::DateTime")
-            .checked_duration_since(*self)
-    }
-
-    /// Returns the duration elapsed since this time,
     /// or if this time is in the future, returns zero.
     pub fn saturating_elapsed(&self, now: chrono::DateTime<Utc>) -> Duration32 {
         DateTime32::try_from(now)

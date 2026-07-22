@@ -290,33 +290,6 @@ impl Input {
             self.value_from_outputs(&HashMap::new())
         }
     }
-
-    /// Get the value spent by this input, by looking up its [`OutPoint`] in
-    /// [`OrderedUtxo`]s.
-    ///
-    /// See [`Self::value`] for details.
-    ///
-    /// # Panics
-    ///
-    /// If the provided [`OrderedUtxo`]s don't have this input's [`OutPoint`].
-    pub fn value_from_ordered_utxos(
-        &self,
-        ordered_utxos: &HashMap<OutPoint, utxo::OrderedUtxo>,
-    ) -> Amount<NonNegative> {
-        if let Some(outpoint) = self.outpoint() {
-            // look up the specific Output and convert it to the expected format
-            let output = ordered_utxos
-                .get(&outpoint)
-                .expect("provided Utxos don't have spent OutPoint")
-                .utxo
-                .output
-                .clone();
-            self.value_from_outputs(&iter::once((outpoint, output)).collect())
-        } else {
-            // coinbase inputs don't need any UTXOs
-            self.value_from_outputs(&HashMap::new())
-        }
-    }
 }
 
 /// A transparent output from a transaction.

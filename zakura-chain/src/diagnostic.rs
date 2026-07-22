@@ -82,11 +82,6 @@ impl CodeTimer {
         self.finish_inner(Some(location.file()), Some(location.line()), description);
     }
 
-    /// Ignore this timer: it will not check the elapsed time or log any warnings.
-    pub fn ignore(mut self) {
-        self.has_finished = true;
-    }
-
     /// Finish timing the execution of a function, method, or other code region.
     pub fn finish_inner(
         &mut self,

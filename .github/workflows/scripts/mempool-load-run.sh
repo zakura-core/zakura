@@ -14,13 +14,33 @@
 #   BASELINE_REF              optional second commit to A/B against ("" to skip)
 set -euo pipefail
 
-OUT_DIR=/root/out
-LAB_DIR=/root/mempool-lab
-SCRIPTS=/root
+# Paths are overridable so this script can be exercised outside a droplet.
+# Every bug found on the droplet path so far has been in this file, precisely
+# because the local rehearsal drove the Python directly and never ran it.
+#
+# Deliberately not named ZAKURA_*: zakurad maps ZAKURA_<FIELD> environment
+# variables onto config fields, so an exported ZAKURA_DIR is read as a
+# top-level `dir` key and the node refuses to start with
+# "unknown field `dir`". Nothing here may share that prefix.
+NODE_SRC_DIR=${NODE_SRC_DIR:-/root/zakura}
+LOADGEN_DIR=${LOADGEN_DIR:-/root/kresko}
+OUT_DIR=${OUT_DIR:-/root/out}
+LAB_DIR=${LAB_DIR:-/root/mempool-lab}
+SCRIPTS=${SCRIPTS:-/root}
+CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/root/cargo-target}
+# Set when the caller has already prepared the source tree and kresko binary
+# (the local rehearsal), so the fetch/build phases are skipped.
+SKIP_SOURCE_FETCH=${SKIP_SOURCE_FETCH:-0}
+SKIP_KRESKO_BUILD=${SKIP_KRESKO_BUILD:-0}
 # How long the blast may spend proving its initial Orchard lane inventory
 # before the measured window opens. Observed at ~25s for 24 lanes on a small
 # box; this leaves headroom without stalling a failed bootstrap forever.
 BOOTSTRAP_BUDGET_SECS=300
+# Initial Orchard lane inventory. Kresko's own default is 384, which is far
+# more than a bounded run can use: every lane is proved up front, so a 2-minute
+# workload spends its whole window bootstrapping and submits nothing. Lanes are
+# recycled as transactions confirm, so a few dozen sustain a run of any length.
+ORCHARD_LANES=${ORCHARD_LANES:-32}
 mkdir -p "$OUT_DIR"
 
 cloud-init status --wait >/dev/null 2>&1 || true
@@ -29,9 +49,10 @@ cloud-init status --wait >/dev/null 2>&1 || true
 # Source: fetch the target ref into the baked clone
 # ---------------------------------------------------------------------------- #
 
-cd /root/zakura
+cd "$NODE_SRC_DIR"
 # git-over-HTTPS wants basic auth (the bearer form is API-only); this is the
 # same header actions/checkout configures.
+if [ "$SKIP_SOURCE_FETCH" != "1" ]; then
 GIT_AUTH=$(printf 'x-access-token:%s' "${GH_CLONE_TOKEN}" | base64 -w0)
 git -c http.extraheader="AUTHORIZATION: basic ${GIT_AUTH}" \
   fetch --no-tags origin "${REFSPEC}"
@@ -39,10 +60,11 @@ if [ -n "${BASELINE_REF}" ]; then
   git -c http.extraheader="AUTHORIZATION: basic ${GIT_AUTH}" \
     fetch --no-tags origin "${BASELINE_REF}"
 fi
-rm -f /root/run.env
+rm -f "${SCRIPTS}/run.env"
 unset GH_CLONE_TOKEN GIT_AUTH
+fi
 
-export CARGO_TARGET_DIR=/root/cargo-target
+export CARGO_TARGET_DIR
 
 # ---------------------------------------------------------------------------- #
 # Load generator: Kresko, built against this repo's crates
@@ -57,29 +79,29 @@ export CARGO_TARGET_DIR=/root/cargo-target
 # silently generate the chain, which is exactly the kind of thing that makes an
 # A/B result untrustworthy.
 WANT_SHA=""
-if [ -d /root/kresko ]; then
-  git -C /root/kresko fetch --no-tags origin "${KRESKO_REF}" 2>/dev/null || true
-  WANT_SHA=$(git -C /root/kresko rev-parse FETCH_HEAD 2>/dev/null || true)
+if [ -d "$LOADGEN_DIR" ]; then
+  git -C "$LOADGEN_DIR" fetch --no-tags origin "${KRESKO_REF}" 2>/dev/null || true
+  WANT_SHA=$(git -C "$LOADGEN_DIR" rev-parse FETCH_HEAD 2>/dev/null || true)
 fi
-BAKED_SHA=$(cat /root/kresko/.baked-ref 2>/dev/null || true)
+BAKED_SHA=$(cat "${LOADGEN_DIR}/.baked-ref" 2>/dev/null || true)
 
-if [ -x /root/kresko/target/release/kresko ] && [ -n "$WANT_SHA" ] && [ "$BAKED_SHA" = "$WANT_SHA" ]; then
+if [ -x "${LOADGEN_DIR}/target/release/kresko" ] && [ -n "$WANT_SHA" ] && [ "$BAKED_SHA" = "$WANT_SHA" ]; then
   echo "reusing baked kresko at ${BAKED_SHA}"
 else
   echo "building kresko at ${KRESKO_REF} (baked: ${BAKED_SHA:-none}, want: ${WANT_SHA:-unknown})"
-  git clone "${KRESKO_REPO}" /root/kresko 2>/dev/null || true
-  git -C /root/kresko fetch --no-tags origin "${KRESKO_REF}"
-  git -C /root/kresko checkout --detach FETCH_HEAD
+  git clone "${KRESKO_REPO}" "$LOADGEN_DIR" 2>/dev/null || true
+  git -C "$LOADGEN_DIR" fetch --no-tags origin "${KRESKO_REF}"
+  git -C "$LOADGEN_DIR" checkout --detach FETCH_HEAD
   # No patch step: Kresko builds against the zakura crates upstream.
   # Own target dir: CARGO_TARGET_DIR is exported for the zakura build, and
   # inheriting it puts the binary somewhere KRESKO_BIN does not point --
   # and makes kresko and zakurad thrash one cache built from different
   # versions of the same crates.
-  ( cd /root/kresko && CARGO_TARGET_DIR=/root/kresko/target cargo build --release )
-  git -C /root/kresko rev-parse HEAD > /root/kresko/.baked-ref
+  ( cd "$LOADGEN_DIR" && CARGO_TARGET_DIR="${LOADGEN_DIR}/target" cargo build --release )
+  git -C "$LOADGEN_DIR" rev-parse HEAD > "${LOADGEN_DIR}/.baked-ref"
 fi
 
-KRESKO_BIN=/root/kresko/target/release/kresko
+KRESKO_BIN="${LOADGEN_DIR}/target/release/kresko"
 # Fail here rather than at first use: a build that lands the binary somewhere
 # else still "succeeds", and the next error is an opaque FileNotFoundError from
 # inside the Python driver several steps later.
@@ -87,7 +109,7 @@ if [ ! -x "$KRESKO_BIN" ]; then
   echo "kresko build produced no binary at ${KRESKO_BIN}" >&2
   exit 1
 fi
-KRESKO_SHA=$(git -C /root/kresko rev-parse HEAD)
+KRESKO_SHA=$(git -C "$LOADGEN_DIR" rev-parse HEAD)
 echo "kresko: ${KRESKO_SHA}"
 
 # ---------------------------------------------------------------------------- #
@@ -109,13 +131,13 @@ run_leg() {
   # sites below are. Without these guards a failed checkout or build would fall
   # through and the leg would silently measure whatever binary was already on
   # disk -- reporting a green result for code that was never built.
-  git -C /root/zakura checkout --detach "${commit}" || {
+  git -C "$NODE_SRC_DIR" checkout --detach "${commit}" || {
     echo "leg ${label}: checkout of ${commit} failed" >&2
     return 90
   }
   # The metrics endpoint carries the mempool backpressure counters, and the
   # internal miner produces the blocks that let the workload drain.
-  ( cd /root/zakura && cargo build --release \
+  ( cd "$NODE_SRC_DIR" && cargo build --release \
       --features internal-miner,prometheus --package zakura --bin zakurad ) || {
     echo "leg ${label}: build of ${commit} failed" >&2
     return 91
@@ -134,7 +156,8 @@ run_leg() {
   python3 "$SCRIPTS/mempool-load-lab.py" \
     --lab-dir "$LAB_DIR" --zakurad-binary "$zakurad_bin" \
     --kresko-binary "$KRESKO_BIN" --node-count "$NODE_COUNT" \
-    genesis --chain-id "mempool-load-${label}" || {
+    genesis --chain-id "mempool-load-${label}" \
+    --orchard-lanes-per-miner "${ORCHARD_LANES}" || {
     echo "leg ${label}: genesis failed" >&2
     return 93
   }

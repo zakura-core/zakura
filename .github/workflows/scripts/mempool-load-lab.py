@@ -412,6 +412,21 @@ def set_toml_arrays(text: str, arrays: dict[str, list[str]], *, require: bool = 
 # ---------------------------------------------------------------------------- #
 
 
+# zakurad maps ZAKURA_<FIELD> environment variables onto config fields, so any
+# stray one in the environment is read as a config key and the node refuses to
+# start ("unknown field `dir`"). The lab always passes an explicit config file,
+# so nothing of ours belongs in that namespace.
+def node_env() -> dict:
+    hijacked = sorted(k for k in os.environ if k.startswith("ZAKURA_"))
+    if hijacked:
+        print(
+            "dropping ZAKURA_* vars that zakurad would read as config: "
+            + ", ".join(hijacked),
+            file=sys.stderr,
+        )
+    return {k: v for k, v in os.environ.items() if not k.startswith("ZAKURA_")}
+
+
 def spawn_node(lab: Path, args, index: int, *, bootstrap: bool) -> subprocess.Popen:
     name = node_name(index)
     node_dir = lab / "nodes" / name
@@ -425,6 +440,7 @@ def spawn_node(lab: Path, args, index: int, *, bootstrap: bool) -> subprocess.Po
         stderr=subprocess.STDOUT,
         # Own process group, so stopping a node never signals the whole lab.
         start_new_session=True,
+        env=node_env(),
     )
     print(f"started {name} ({suffix}) pid={proc.pid} log={log_path}", flush=True)
     return proc
@@ -881,7 +897,9 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--experiment", default="mempool-load")
     gen.add_argument("--block-time-secs", type=int, default=5)
     gen.add_argument("--maturity-padding-blocks", type=int, default=125)
-    gen.add_argument("--orchard-lanes-per-miner", type=int, default=384)
+    # 32, not Kresko's 384: every lane is proved during bootstrap, so a large
+    # inventory means a bounded run never reaches steady state.
+    gen.add_argument("--orchard-lanes-per-miner", type=int, default=32)
     gen.add_argument("--orchard-lane-value-zats", type=int, default=100_000)
     gen.set_defaults(func=cmd_genesis)
 

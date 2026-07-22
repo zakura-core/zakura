@@ -370,6 +370,26 @@ class PeeringCheck(unittest.TestCase):
         self.assertFalse(lab.wait_for_peers(2, timeout_secs=0.5, poll_secs=0.01))
 
 
+class NodeEnvironment(unittest.TestCase):
+    """zakurad reads ZAKURA_* env vars as config keys."""
+
+    def test_zakura_prefixed_vars_are_dropped(self):
+        # A real failure: exporting ZAKURA_DIR made the node reject its config
+        # with "unknown field `dir`" -- the env var, not the file, was the
+        # problem, which is a genuinely confusing thing to debug.
+        os.environ["ZAKURA_DIR"] = "/tmp/should-not-reach-the-node"
+        self.addCleanup(lambda: os.environ.pop("ZAKURA_DIR", None))
+        env = lab.node_env()
+        self.assertNotIn("ZAKURA_DIR", env)
+
+    def test_unrelated_vars_are_preserved(self):
+        os.environ["MEMPOOL_LOAD_PROBE"] = "keep-me"
+        self.addCleanup(lambda: os.environ.pop("MEMPOOL_LOAD_PROBE", None))
+        env = lab.node_env()
+        self.assertEqual(env.get("MEMPOOL_LOAD_PROBE"), "keep-me")
+        self.assertIn("PATH", env)
+
+
 class StartupConvergence(unittest.TestCase):
     """Peer counts are too weak a gate; a mined block must actually arrive."""
 

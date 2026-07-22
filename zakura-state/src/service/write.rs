@@ -237,7 +237,7 @@ fn publish_header_root_auth_state(
     finalized_state: &FinalizedState,
     sender: &watch::Sender<Option<HeaderRootAuthState>>,
 ) {
-    match finalized_state.db.validate_header_root_auth_state() {
+    match finalized_state.db.load_header_root_auth_frontier() {
         Ok(frontier) => {
             let _ = sender.send(frontier.map(|frontier| frontier.state()));
         }

@@ -765,14 +765,17 @@ impl ZakuraDb {
         })
     }
 
-    /// Validates and restores the complete durable authenticated-root state.
-    pub(crate) fn validate_header_root_auth_state(
+    /// Loads and checks the durable frontier without auditing its historical prefix.
+    ///
+    /// Full prefix reconstruction is performed by [`Self::validate_header_root_auth_state`]
+    /// during startup and explicit disk-format validation.
+    pub(crate) fn load_header_root_auth_frontier(
         &self,
     ) -> Result<Option<HeaderRootAuthFrontier>, HeaderRootAuthFrontierError> {
-        let has_roots = self.has_commitment_root_rows();
-        let has_headers = self.has_zakura_header_rows();
-        let has_frontier = self.has_header_root_auth_frontier_row();
         let Some((body_tip, _body_hash)) = self.tip() else {
+            let has_roots = self.has_commitment_root_rows();
+            let has_headers = self.has_zakura_header_rows();
+            let has_frontier = self.has_header_root_auth_frontier_row();
             if has_roots || has_headers || has_frontier {
                 return Err(HeaderRootAuthFrontierError::StateWithoutFinalizedTip {
                     has_roots,
@@ -786,13 +789,48 @@ impl ZakuraDb {
         let frontier = self
             .try_header_root_auth_frontier()?
             .ok_or(HeaderRootAuthFrontierError::MissingFrontier)?;
-        self.validate_completed_checkpoint(frontier.completed_checkpoint)?;
+        if self
+            .network()
+            .checkpoint_list()
+            .hash(frontier.completed_checkpoint.height)
+            != Some(frontier.completed_checkpoint.hash)
+        {
+            return Err(HeaderRootAuthFrontierError::InvalidCompletedCheckpoint {
+                height: frontier.completed_checkpoint.height,
+                hash: frontier.completed_checkpoint.hash,
+            });
+        }
         if frontier.confirmed_height < body_tip {
             return Err(HeaderRootAuthFrontierError::FrontierBehindBodyTip {
                 frontier_height: frontier.confirmed_height,
                 body_tip,
             });
         }
+
+        if let Ok(first_above) = frontier.confirmed_height.next() {
+            if let Some((height, _row)) = self
+                .commitment_roots_cf()
+                .zs_next_key_value_from(&first_above)
+            {
+                return Err(HeaderRootAuthFrontierError::RootAboveFrontier { height });
+            }
+        }
+
+        Ok(Some(frontier))
+    }
+
+    /// Validates and restores the complete durable authenticated-root state.
+    pub(crate) fn validate_header_root_auth_state(
+        &self,
+    ) -> Result<Option<HeaderRootAuthFrontier>, HeaderRootAuthFrontierError> {
+        let Some(frontier) = self.load_header_root_auth_frontier()? else {
+            return Ok(None);
+        };
+
+        self.validate_completed_checkpoint(frontier.completed_checkpoint)?;
+        let (body_tip, _body_hash) = self
+            .tip()
+            .expect("the lightweight frontier check requires a finalized tip");
 
         if let Ok(mut expected) = body_tip.next() {
             for (height, _row) in self
@@ -809,15 +847,6 @@ impl ZakuraDb {
             }
             if expected <= frontier.confirmed_height {
                 return Err(HeaderRootAuthFrontierError::MissingRoot { height: expected });
-            }
-        }
-
-        if let Ok(first_above) = frontier.confirmed_height.next() {
-            if let Some((height, _row)) = self
-                .commitment_roots_cf()
-                .zs_next_key_value_from(&first_above)
-            {
-                return Err(HeaderRootAuthFrontierError::RootAboveFrontier { height });
             }
         }
 
@@ -858,7 +887,7 @@ impl ZakuraDb {
         let confirmed_hashes = verified.confirmed_hashes();
         let Some(first_roots) = confirmed_roots.first() else {
             return self
-                .validate_header_root_auth_state()?
+                .load_header_root_auth_frontier()?
                 .map(|frontier| frontier.state())
                 .ok_or(HeaderRootAuthFrontierError::MissingFrontier);
         };
@@ -872,7 +901,7 @@ impl ZakuraDb {
         }
 
         let frontier = self
-            .validate_header_root_auth_state()?
+            .load_header_root_auth_frontier()?
             .ok_or(HeaderRootAuthFrontierError::MissingFrontier)?;
         let expected_start = frontier
             .confirmed_height
@@ -939,7 +968,7 @@ impl ZakuraDb {
         roots: &[BlockCommitmentRoots],
     ) -> Result<AuthenticatedHeaderRoots, AuthenticateHeaderRootsError> {
         let frontier = self
-            .validate_header_root_auth_state()?
+            .load_header_root_auth_frontier()?
             .ok_or(HeaderRootAuthFrontierError::MissingFrontier)?;
         let current = frontier.state();
         if expected_state != current {
@@ -1926,6 +1955,16 @@ mod tests {
             },
             "steady-state writes must not rescan completed checkpoint brackets"
         );
+        assert_eq!(
+            db.load_header_root_auth_frontier()
+                .expect("steady-state load trusts the startup-validated checkpoint prefix")
+                .expect("frontier exists")
+                .completed_checkpoint,
+            CompletedCheckpointFrontier {
+                height: Height(2),
+                hash: block2.hash(),
+            }
+        );
         assert!(matches!(
             db.validate_header_root_auth_state(),
             Err(HeaderRootAuthFrontierError::CompletedCheckpointMismatch {
@@ -1935,6 +1974,54 @@ mod tests {
                 },
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn steady_state_frontier_load_does_not_audit_authenticated_root_prefix() {
+        let db = ephemeral_mainnet_db();
+        let (verified, roots, hash) = verified_activation_root();
+        let base = roots
+            .height
+            .previous()
+            .expect("activation has a predecessor");
+        seed_frontier_and_headers(&db, base, &[(roots.height, hash)]);
+        let expected_state = db
+            .write_verified_header_commitment_roots(verified)
+            .expect("canonical verified prefix promotes");
+
+        let mut batch = DiskWriteBatch::new();
+        let _ = db
+            .commitment_roots_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_delete(&roots.height);
+        db.write_batch(batch).expect("root gap fixture writes");
+
+        assert_eq!(
+            db.load_header_root_auth_frontier()
+                .expect("steady-state load trusts the atomically written root prefix")
+                .expect("frontier exists")
+                .confirmed_height(),
+            roots.height
+        );
+        let frontier = db
+            .load_header_root_auth_frontier()
+            .expect("steady-state frontier loads")
+            .expect("frontier exists");
+        let empty_verified = verify_supplied_roots_from_parts(
+            &db.network(),
+            frontier.history_tree,
+            std::iter::empty(),
+        )
+        .expect("empty delivery preserves the verified frontier");
+        assert_eq!(
+            db.write_verified_header_commitment_roots(empty_verified)
+                .expect("steady-state write does not audit the historical root prefix"),
+            expected_state
+        );
+        assert!(matches!(
+            db.validate_header_root_auth_state(),
+            Err(HeaderRootAuthFrontierError::MissingRoot { height }) if height == roots.height
         ));
     }
 

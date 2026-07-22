@@ -60,12 +60,6 @@ pub struct MissingSproutTipTree {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StateInitError {
-    /// The canonical header store could not reconstruct completed checkpoint progress.
-    #[error("could not reconstruct the highest completed checkpoint: {0}")]
-    HighestCompletedCheckpoint(
-        #[from] crate::service::finalized_state::HighestCompletedCheckpointError,
-    ),
-
     /// A read-only state was requested, but the configured cache directory is
     /// missing or unreadable.
     ///

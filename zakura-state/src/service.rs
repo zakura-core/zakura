@@ -2298,7 +2298,7 @@ pub fn init_read_only(
     let (_vct_root_repair_sender, vct_root_repair_receiver) =
         tokio::sync::watch::channel(VctRootRepairStatus::default());
     let (highest_completed_checkpoint, highest_completed_checkpoint_receiver) =
-        finalized_state::HighestCompletedCheckpointTracker::open(&finalized_state.db)?;
+        finalized_state::HighestCompletedCheckpointTracker::open(&finalized_state.db);
     let highest_completed_checkpoint_sender = Some(highest_completed_checkpoint.keepalive_sender());
 
     Ok((

@@ -78,15 +78,23 @@ impl HighestCompletedCheckpointTracker {
     ///
     /// Cold open: no `start_hint`, so reconstruct uses the trusted body base (path B)
     /// then walks any headers above the body tip (path D).
-    pub fn open(
-        db: &ZakuraDb,
-    ) -> Result<
-        (Self, watch::Receiver<Option<HighestCompletedCheckpoint>>),
-        HighestCompletedCheckpointError,
-    > {
-        let state = TrackerState::reconstruct(db, &[], None)?;
+    ///
+    /// If durable headers are inconsistent, logs the error and clears progress so startup
+    /// remains recoverable. No checkpoint is published until a later successful write
+    /// reconstructs progress from the durable canonical headers.
+    pub fn open(db: &ZakuraDb) -> (Self, watch::Receiver<Option<HighestCompletedCheckpoint>>) {
+        let state = match TrackerState::reconstruct(db, &[], None) {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::error!(
+                    ?error,
+                    "could not reconstruct the highest completed checkpoint; clearing checkpoint progress"
+                );
+                TrackerState::default()
+            }
+        };
         let (sender, receiver) = watch::channel(state.current);
-        Ok((Self { state, sender }, receiver))
+        (Self { state, sender }, receiver)
     }
 
     /// Returns the latest checkpoint made durable by a successful write.

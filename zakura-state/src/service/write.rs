@@ -328,9 +328,7 @@ impl BlockWriteSender {
         let (vct_root_repair_sender, vct_root_repair_receiver) =
             watch::channel(VctRootRepairStatus::default());
         let (highest_completed_checkpoint, highest_completed_checkpoint_receiver) =
-            HighestCompletedCheckpointTracker::open(&finalized_state.db).expect(
-                "highest completed checkpoint reconstructs after startup header-store audit",
-            );
+            HighestCompletedCheckpointTracker::open(&finalized_state.db);
 
         let seed_zakura_header_from_best_chain_commits = finalized_state
             .db
@@ -884,8 +882,7 @@ mod tests {
 
         let mut non_finalized_state = NonFinalizedState::new(&network);
         let (mut completed_checkpoint, _receiver) =
-            HighestCompletedCheckpointTracker::open(&finalized_state.db)
-                .expect("empty checkpoint tracker opens");
+            HighestCompletedCheckpointTracker::open(&finalized_state.db);
 
         // The seed path refuses rows that do not link to the stored header row
         // below them, and the fake chain's parent block is not otherwise

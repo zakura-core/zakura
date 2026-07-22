@@ -7,6 +7,7 @@ expression: empty_column_families
   "block_header_by_height: no entries",
   "block_info: no entries",
   "commitment_roots_by_height: no entries",
+  "highest_completed_checkpoint: no entries",
   "hash_by_height: no entries",
   "hash_by_tx_loc: no entries",
   "height_by_hash: no entries",

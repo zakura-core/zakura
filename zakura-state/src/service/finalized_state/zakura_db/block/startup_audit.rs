@@ -33,6 +33,7 @@ use crate::service::finalized_state::{
     disk_format::{FromDisk, IntoDisk},
     zakura_db::{commitment_roots_db::COMMITMENT_ROOTS_BY_HEIGHT, ZakuraDb},
 };
+use crate::BoxError;
 
 /// How many violations are included in the repair log line. The full list can
 /// be as long as the stranded suffix; the first few identify the fault shape.
@@ -50,6 +51,15 @@ const AUDIT_BATCH_ROWS: usize = 100_000;
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) enum ZakuraStoreViolation {
+    /// Durable checkpoint metadata disagrees with the coherent canonical prefix.
+    HighestCompletedCheckpointMismatch {
+        /// Stored highest completed checkpoint, if a decodable row exists.
+        stored: Option<super::super::highest_completed_checkpoint_db::HighestCompletedCheckpoint>,
+        /// Highest completed checkpoint reconstructed through the last coherent height.
+        reconstructed:
+            Option<super::super::highest_completed_checkpoint_db::HighestCompletedCheckpoint>,
+    },
+
     /// A zakura row at a height with a committed block (`contains_height`).
     ///
     /// Committed heights have authoritative full-block rows, and the zakura
@@ -172,7 +182,7 @@ impl ZakuraDb {
     /// startup.
     pub(crate) fn audit_and_repair_zakura_header_store(
         &self,
-    ) -> Result<Option<ZakuraStoreRepair>, rocksdb::Error> {
+    ) -> Result<Option<ZakuraStoreRepair>, BoxError> {
         // Databases opened through `ZakuraDb::new` without the zakura column
         // families have no header store to audit.
         let (Some(header_cf), Some(hash_cf), Some(height_by_hash_cf), Some(body_size_cf), true) = (
@@ -398,6 +408,24 @@ impl ZakuraDb {
                 &mut deleted_rows,
                 Some(start),
             )?;
+        }
+
+        let stored_checkpoint = self.try_highest_completed_checkpoint()?;
+        let reconstructed_checkpoint = last_coherent.map(|(height, _)| {
+            self.highest_completed_checkpoint_for_tip(height, &[])
+                .expect("the configured genesis checkpoint and coherent height range are valid")
+        });
+        if stored_checkpoint != reconstructed_checkpoint {
+            violations.push(ZakuraStoreViolation::HighestCompletedCheckpointMismatch {
+                stored: stored_checkpoint,
+                reconstructed: reconstructed_checkpoint,
+            });
+            if let Some(reconstructed_checkpoint) = reconstructed_checkpoint {
+                batch.set_highest_completed_checkpoint(self, reconstructed_checkpoint);
+            } else {
+                batch.clear_highest_completed_checkpoint(self);
+            }
+            pending_deletes += 1;
         }
 
         if violations.is_empty() {

@@ -31,6 +31,7 @@ use zakura_chain::{
 use zakura_db::{
     block::{RetentionPlan, ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT},
     chain::BLOCK_INFO,
+    highest_completed_checkpoint_db::HIGHEST_COMPLETED_CHECKPOINT,
     transparent::{BALANCE_BY_TRANSPARENT_ADDR, TX_LOC_BY_SPENT_OUT_LOC},
 };
 
@@ -178,6 +179,8 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     BLOCK_INFO,
     // Verified-commitment-trees serving index
     COMMITMENT_ROOTS_BY_HEIGHT,
+    // Header-sync checkpoint progress
+    HIGHEST_COMPLETED_CHECKPOINT,
     // Storage policy
     PRUNING_METADATA,
     VCT_SYNC_METADATA,

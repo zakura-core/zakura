@@ -489,6 +489,13 @@ pub enum CommitHeaderRangeError {
     #[error("header store incoherent while validating range: {0}")]
     StoreIncoherent(#[from] StoreIncoherentError),
 
+    /// Durable highest-completed-checkpoint metadata was invalid or could not be updated.
+    #[error("highest completed checkpoint failure: {reason}")]
+    HighestCompletedCheckpoint {
+        /// Error details.
+        reason: String,
+    },
+
     /// Contextual header validation failed.
     #[error("could not contextually validate header")]
     ValidateContextError(#[from] Box<ValidateContextError>),

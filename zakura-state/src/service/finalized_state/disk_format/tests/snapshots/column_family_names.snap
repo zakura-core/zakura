@@ -8,6 +8,7 @@ expression: cf_names
   "block_header_by_height",
   "block_info",
   "commitment_roots_by_height",
+  "highest_completed_checkpoint",
   "default",
   "hash_by_height",
   "hash_by_tx_loc",

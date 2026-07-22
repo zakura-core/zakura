@@ -35,6 +35,7 @@ use super::disk_format::upgrade::restorable_db_versions;
 pub mod block;
 pub mod chain;
 pub(crate) mod commitment_roots_db;
+pub(crate) mod highest_completed_checkpoint_db;
 pub mod metrics;
 
 /// Minimum number of transactions in a block before the per-transaction batch
@@ -326,7 +327,7 @@ impl ZakuraDb {
         // to an explicit writable reopen.
         if !read_only && config.repair_zakura_header_store_on_startup {
             db.audit_and_repair_zakura_header_store()
-                .expect("startup header-store repair write failed: RocksDB is unavailable");
+                .expect("startup header-store repair failed because local state is incoherent");
         }
 
         db.run_startup_format_change(format_change, prepared_vct_repair);

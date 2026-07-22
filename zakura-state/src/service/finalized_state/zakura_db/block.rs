@@ -676,7 +676,10 @@ impl ZakuraDb {
             .or_else(|| self.zakura_header_height(hash))
     }
 
-    fn header_by_height(&self, height: block::Height) -> Option<(block::Hash, Arc<block::Header>)> {
+    pub(crate) fn header_by_height(
+        &self,
+        height: block::Height,
+    ) -> Option<(block::Hash, Arc<block::Header>)> {
         if let Some(hash) = self.hash(height) {
             return self
                 .block_header(height.into())
@@ -1741,6 +1744,13 @@ impl DiskWriteBatch {
         self.zs_insert(&block_header_by_height, height, &block.header);
         self.zs_insert(&hash_by_height, height, hash);
         self.zs_insert(&height_by_hash, hash, height);
+        self.advance_highest_completed_checkpoint_for_header_range(
+            zakura_db,
+            &[(*height, *hash, block.header.clone())],
+        )
+        .map_err(|error| CommitHeaderRangeError::HighestCompletedCheckpoint {
+            reason: error.to_string(),
+        })?;
 
         // Serialize the raw transaction bytes up front: on heavy shielded blocks
         // this serialization dominates the per-block write cost, and each
@@ -2065,6 +2075,12 @@ impl DiskWriteBatch {
         let finalized_height = zakura_db.finalized_tip_height();
         let best_header_tip = zakura_db.best_header_tip().map(|(height, _)| height);
         let checkpoints = zakura_db.network().checkpoint_list();
+        let highest_completed_checkpoint_height = zakura_db
+            .try_highest_completed_checkpoint()
+            .map_err(|error| CommitHeaderRangeError::HighestCompletedCheckpoint {
+                reason: error.to_string(),
+            })?
+            .map(|checkpoint| checkpoint.height);
 
         let mut recent_headers = zakura_db.recent_header_context(anchor_height)?;
         if recent_headers.is_empty() {
@@ -2122,6 +2138,11 @@ impl DiskWriteBatch {
 
             if let Some((_existing_hash, existing_header)) = zakura_db.header_by_height(height) {
                 if existing_header != *header {
+                    if highest_completed_checkpoint_height
+                        .is_some_and(|highest_completed| height <= highest_completed)
+                    {
+                        return Err(CommitHeaderRangeError::ImmutableConflict { height });
+                    }
                     if finalized_height.is_some_and(|finalized_height| height <= finalized_height) {
                         return Err(CommitHeaderRangeError::ImmutableConflict { height });
                     }
@@ -2157,6 +2178,11 @@ impl DiskWriteBatch {
 
             validated_headers.push((height, hash, header, body_size));
         }
+
+        let canonical_range = validated_headers
+            .iter()
+            .map(|(height, hash, header, _)| (*height, *hash, (*header).clone()))
+            .collect::<Vec<_>>();
 
         // Before overwriting a conflicting header suffix, require the new range to
         // carry strictly more cumulative work than the chain it would replace. The
@@ -2260,6 +2286,10 @@ impl DiskWriteBatch {
             let roots = &tree_aux_roots[index];
             self.insert_legacy_header_commitment_roots(zakura_db, roots);
         }
+        self.advance_highest_completed_checkpoint_for_header_range(zakura_db, &canonical_range)
+            .map_err(|error| CommitHeaderRangeError::HighestCompletedCheckpoint {
+                reason: error.to_string(),
+            })?;
 
         Ok(block::Hash::from(
             &**headers.last().expect("headers is non-empty"),

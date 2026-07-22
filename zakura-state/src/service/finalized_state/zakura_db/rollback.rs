@@ -246,6 +246,13 @@ pub enum RollbackFinalizedStateError {
     #[error("failed to write rollback batch")]
     RocksDb(#[from] rocksdb::Error),
 
+    /// Highest-completed-checkpoint metadata could not be reconstructed for the rollback target.
+    #[error("failed to rebase highest completed checkpoint: {reason}")]
+    HighestCompletedCheckpoint {
+        /// Error details.
+        reason: String,
+    },
+
     /// Non-finalized backup file I/O failed.
     #[error("failed to update non-finalized backup cache")]
     BackupIo(#[from] std::io::Error),
@@ -508,6 +515,14 @@ fn prepare_rollback(
         options.target_height,
         &target_treestate.retained_sprout_roots,
     );
+    let highest_completed_checkpoint = db
+        .highest_completed_checkpoint_for_tip(options.target_height, &[])
+        .map_err(
+            |error| RollbackFinalizedStateError::HighestCompletedCheckpoint {
+                reason: error.to_string(),
+            },
+        )?;
+    batch.set_highest_completed_checkpoint(db, highest_completed_checkpoint);
 
     Ok(PreparedRollback {
         bounds,

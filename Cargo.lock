@@ -8967,6 +8967,7 @@ dependencies = [
  "tracing-futures",
  "tracing-subscriber",
  "zakura-chain",
+ "zakura-header-chain",
  "zakura-node-services",
  "zakura-script",
  "zakura-state",
@@ -8984,6 +8985,7 @@ dependencies = [
 name = "zakura-header-chain"
 version = "1.0.0-rc0"
 dependencies = [
+ "chrono",
  "proptest",
  "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",

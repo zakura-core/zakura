@@ -33,7 +33,7 @@ pub const MAX_BLOCK_BYTES: u64 = 2_000_000;
 ///
 /// All other blocks are deserialized when we receive them, and never modified,
 /// so the deserialisation would pick up any errors.
-fn check_version(version: u32) -> Result<(), &'static str> {
+pub(crate) fn validate_header_version(version: u32) -> Result<(), &'static str> {
     match version {
         // The Zcash specification says that:
         // "The current and only defined block version number for Zcash is 4."
@@ -64,7 +64,7 @@ fn check_version(version: u32) -> Result<(), &'static str> {
 impl ZcashSerialize for Header {
     #[allow(clippy::unwrap_in_result)]
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        check_version(self.version).map_err(io::Error::other)?;
+        validate_header_version(self.version).map_err(io::Error::other)?;
 
         writer.write_u32::<LittleEndian>(self.version)?;
         self.previous_block_hash.zcash_serialize(&mut writer)?;
@@ -86,7 +86,7 @@ impl ZcashSerialize for Header {
 impl ZcashDeserialize for Header {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
         let version = reader.read_u32::<LittleEndian>()?;
-        check_version(version).map_err(SerializationError::Parse)?;
+        validate_header_version(version).map_err(SerializationError::Parse)?;
 
         Ok(Header {
             version,

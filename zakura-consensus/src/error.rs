@@ -524,6 +524,9 @@ mod tests {
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum BlockError {
+    #[error(transparent)]
+    InvalidHeaderEncoding(#[from] zakura_header_chain::HeaderEncodingError),
+
     #[error("block contains invalid transactions")]
     Transaction(#[from] TransactionError),
 
@@ -622,7 +625,8 @@ impl BlockError {
         use BlockError::*;
 
         match self {
-            MissingHeight(_)
+            InvalidHeaderEncoding(_)
+            | MissingHeight(_)
             | MaxHeight(_, _, _)
             | InvalidDifficulty(_, _)
             | TargetDifficultyLimit(_, _, _, _, _)

@@ -12,6 +12,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+chrono = { workspace = true }
 thiserror = { workspace = true }
 zakura-chain = { path = "../zakura-chain", version = "1.2.1-rc0" }
 

@@ -7,6 +7,7 @@ mod config;
 mod error;
 mod frontier;
 mod ids;
+mod validation;
 
 pub use config::{
     EngineLimits, MAX_CANDIDATE_TIPS_V1, MAX_NON_FINALIZED_NODES_V1, MAX_STAGED_TARGETS_V1,
@@ -18,6 +19,12 @@ pub use frontier::{
 pub use ids::{
     BranchId, CounterExhausted, EvidenceId, FinalityEpoch, HeaderGeneration, HeaderId,
     OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration, WorkOwner,
+};
+pub use validation::{
+    infer_height, validate_commitment_structure, validate_compact_target,
+    validate_encoding_version_hash, validate_future_time, validate_hash_filter, validate_link,
+    CompactTargetError, HashFilterError, HeaderEncodingError, HeaderHeightError, HeaderLinkError,
+    PowPolicy, PowPolicyError,
 };
 
 #[cfg(test)]

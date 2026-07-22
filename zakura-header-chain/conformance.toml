@@ -137,17 +137,26 @@ status = "unimplemented"
 [[rule]]
 id = "LC-VAL-02"
 name = "Canonical header and version"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::validate_encoding_version_hash"
+tests = ["HV-02::canonical_version_hash_link_and_height_boundaries"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-VAL-03"
 name = "Parent-link continuity"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::validate_link"
+tests = ["HV-02::canonical_version_hash_link_and_height_boundaries"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-HEIGHT-01"
 name = "Authenticated height inference"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::infer_height"
+tests = ["HV-02::canonical_version_hash_link_and_height_boundaries"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-COMMIT-01"
@@ -162,12 +171,18 @@ status = "unimplemented"
 [[rule]]
 id = "LC-VAL-05"
 name = "Target and hash validation"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::validate_compact_target"
+tests = ["HV-03::difficulty_validation_failure", "HV-03::hash_filter_accepts_equality_and_rejects_one_above"]
+networks = ["mainnet", "testnet"]
 
 [[rule]]
 id = "LC-VAL-04"
 name = "Equihash verification"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::PowPolicy::validate_solution"
+tests = ["HV-03::equihash_is_valid_for_historical_blocks", "HV-03::pow_policy_waiver_is_derived_only_from_custom_network_identity"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-VAL-06"
@@ -177,7 +192,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-POW-01"
 name = "Configured proof-of-work waiver"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::PowPolicy::for_network"
+tests = ["HV-03::pow_policy_waiver_is_derived_only_from_custom_network_identity", "DF-01::difficulty_is_valid_for_historical_blocks"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-VAL-07"

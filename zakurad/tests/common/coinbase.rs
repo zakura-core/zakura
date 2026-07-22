@@ -3,8 +3,6 @@
 use std::sync::Arc;
 
 use color_eyre::eyre::{self, Context};
-use futures::future::try_join_all;
-use strum::IntoEnumIterator;
 
 use zakura_chain::{
     amount::Amount,
@@ -31,7 +29,14 @@ use super::{
     regtest::MiningRpcMethods,
 };
 
-/// Tests that Zebra can mine blocks with valid coinbase transactions on Regtest.
+/// Tests shielded coinbase construction through a live Regtest node.
+///
+/// A node configured with a Sapling or Unified mining address must return a
+/// shielded coinbase through `getblocktemplate`. The resulting block must be
+/// accepted by the production `submitblock`, consensus, and state path.
+///
+/// Detailed address routing and upgrade-matrix behavior is tested by
+/// `shielded_coinbase_paths`.
 pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
     async fn regtest_coinbase(addr_type: MinerAddressType) -> eyre::Result<()> {
         let _init_guard = zakura_test::init();
@@ -72,26 +77,24 @@ pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
         )?);
         zakurad.expect_stdout_line_matches("activating mempool")?;
 
-        for _ in 0..2 {
-            let (mut block, height) = client.block_from_template(&net).await?;
+        let (mut block, height) = client.block_from_template(&net).await?;
 
-            // If the network requires PoW, find a valid nonce.
-            if !net.disable_pow() {
-                let header = Arc::make_mut(&mut block.header);
+        // If the network requires PoW, find a valid nonce.
+        if !net.disable_pow() {
+            let header = Arc::make_mut(&mut block.header);
 
-                loop {
-                    let hash = header.hash();
+            loop {
+                let hash = header.hash();
 
-                    if difficulty_is_valid(header, &net, &height, &hash).is_ok() {
-                        break;
-                    }
-
-                    increment_big_endian(header.nonce.as_mut());
+                if difficulty_is_valid(header, &net, &height, &hash).is_ok() {
+                    break;
                 }
-            }
 
-            client.submit_block(block).await?;
+                increment_big_endian(header.nonce.as_mut());
+            }
         }
+
+        client.submit_block(block).await?;
 
         zakurad.kill(false)?;
 
@@ -102,7 +105,10 @@ pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
             .wrap_err("possible port conflict with another zakurad instance")
     }
 
-    try_join_all(MinerAddressType::iter().map(regtest_coinbase))
-        .await
-        .map(|_| ())
+    tokio::try_join!(
+        regtest_coinbase(MinerAddressType::Sapling),
+        regtest_coinbase(MinerAddressType::Unified),
+    )?;
+
+    Ok(())
 }

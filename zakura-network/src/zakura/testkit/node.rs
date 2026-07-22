@@ -498,9 +498,9 @@ impl ZakuraTestNodeBuilder {
                 discovery.clone(),
                 header_sync.clone(),
                 block_sync_handle.clone(),
-            )) as Arc<dyn Service>
+            ))
         } else {
-            Arc::new(DiscoveryService::new(discovery.clone())) as Arc<dyn Service>
+            Arc::new(DiscoveryService::new(discovery.clone()))
         };
         let registry = service_registry(
             &supervisor,

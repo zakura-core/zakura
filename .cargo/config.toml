@@ -1,8 +1,5 @@
 # Zebra cargo configuration
 
-[alias]
-xtask = "run --package xtask --"
-
 [build]
 rustdocflags = [
     # Keep shared rustdoc lint levels synchronized with the book and lint

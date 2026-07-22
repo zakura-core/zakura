@@ -496,10 +496,13 @@ fn queue_highest_completed_checkpoint_repair(
     pending_writes: &mut usize,
 ) -> Result<(), BoxError> {
     let stored_checkpoint = db.try_highest_completed_checkpoint()?;
-    let reconstructed_checkpoint = last_coherent.map(|(height, _)| {
+    let Some((height, _)) = last_coherent else {
+        return Ok(());
+    };
+    let reconstructed_checkpoint = Some(
         db.highest_completed_checkpoint_for_tip(height, &[])
-            .expect("the configured genesis checkpoint and coherent height range are valid")
-    });
+            .expect("the configured genesis checkpoint and coherent height range are valid"),
+    );
     if stored_checkpoint != reconstructed_checkpoint {
         violations.push(ZakuraStoreViolation::HighestCompletedCheckpointMismatch {
             stored: stored_checkpoint,

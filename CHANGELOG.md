@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Prevent stale RPC read-secondary finalized-tip updates from regressing the
+  reported tip, fully validate blocks received from the primary, and reject
+  invalid or non-advancing finalized-gap responses
+  ([#326](https://github.com/zakura-core/zakura/pull/326)).
 - Treat IPv4 and IPv4-mapped IPv6 peer addresses as the same address when
   enforcing bans, inbound rate limits, and per-IP connection limits, preventing
   peers from bypassing them through the alternate representation

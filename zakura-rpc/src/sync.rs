@@ -1,19 +1,30 @@
 //! Syncer task for maintaining a non-finalized [`ReadStateService`] and updating
 //! [`ChainTipSender`] via RPCs.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    future,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use tokio::task::JoinHandle;
 use tonic::{Status, Streaming};
-use tower::BoxError;
+use tower::{buffer::Buffer, util::BoxService, BoxError, Service, ServiceExt};
 use zakura_chain::{
     block::{self, Block, Height},
     parameters::Network,
     serialization::BytesInDisplayOrder,
 };
+use zakura_consensus::{
+    transaction, Request as VerifyBlockRequest, SemanticBlockVerifier, VerifyBlockError,
+};
+use zakura_node_services::mempool;
 use zakura_state::{
     spawn_init_read_only, ChainTipBlock, ChainTipChange, ChainTipSender, CheckpointVerifiedBlock,
-    HashOrHeight, LatestChainTip, NonFinalizedState, ReadStateService, SemanticallyVerifiedBlock,
+    HashOrHeight, KnownBlock, LatestChainTip, NonFinalizedState, ReadStateService,
+    Request as StateRequest, Response as StateResponse, SemanticallyVerifiedBlock,
     ValidateContextError, ZakuraDb,
 };
 
@@ -74,6 +85,9 @@ pub struct TrustedChainSync {
     non_finalized_state: NonFinalizedState,
     /// The chain tip sender for updating [`LatestChainTip`] and [`ChainTipChange`].
     chain_tip_sender: ChainTipSender,
+    /// Publishes finalized tips without allowing stale snapshots to regress the
+    /// active tip.
+    finalized_tip_publisher: FinalizedTipPublisher,
     /// The non-finalized state sender, for updating the [`ReadStateService`]
     /// when the non-finalized best chain changes.
     non_finalized_state_sender: tokio::sync::watch::Sender<NonFinalizedState>,
@@ -85,6 +99,57 @@ pub struct TrustedChainSync {
     /// The finalized-tip updater, retained so `sync()` can wait for any in-flight
     /// secondary database catch-up before committing a streamed block.
     finalized_tip_updater: Option<JoinHandle<()>>,
+}
+
+/// Serializes finalized-tip publication and ignores stale lower snapshots.
+///
+/// The finalized-tip updater and the initial stream sync can read different
+/// secondary database snapshots concurrently. Tracking the highest published
+/// height under the same lock as the send prevents an older snapshot from
+/// overwriting a newer one. Non-finalized publications do not use this guard,
+/// because a valid best-chain reorg can reduce their height.
+#[derive(Clone, Debug)]
+struct FinalizedTipPublisher {
+    inner: Arc<Mutex<FinalizedTipPublisherInner>>,
+}
+
+#[derive(Debug)]
+struct FinalizedTipPublisherInner {
+    sender: ChainTipSender,
+    highest_published_height: Option<Height>,
+}
+
+impl FinalizedTipPublisher {
+    fn new(sender: ChainTipSender) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(FinalizedTipPublisherInner {
+                sender,
+                highest_published_height: None,
+            })),
+        }
+    }
+
+    fn publish(&self, tip: ChainTipBlock) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("finalized tip publication does not panic while holding the lock");
+
+        if inner
+            .highest_published_height
+            .is_some_and(|published_height| tip.height < published_height)
+        {
+            tracing::debug!(
+                stale_height = ?tip.height,
+                highest_published_height = ?inner.highest_published_height,
+                "ignoring stale finalized tip update"
+            );
+            return;
+        }
+
+        inner.highest_published_height = Some(tip.height);
+        inner.sender.set_finalized_tip(tip);
+    }
 }
 
 /// Signals the finalized-tip updater to stop, then waits for it to finish.
@@ -113,10 +178,162 @@ enum CommitOutcome {
     AlreadyFinalized,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum FinalizedGapBlockError {
+    MissingHeight,
+    UnexpectedHeight {
+        expected: Height,
+        actual: Height,
+    },
+    UnexpectedParentHash {
+        expected: block::Hash,
+        actual: block::Hash,
+    },
+    UnexpectedBlockHash {
+        advertised: block::Hash,
+        computed: block::Hash,
+    },
+}
+
+/// Provides the state queries used by semantic block verification and captures
+/// the resulting prepared block without mutating the syncer's live state.
+#[derive(Clone, Debug)]
+struct TrustedSyncVerifierState {
+    db: ZakuraDb,
+    non_finalized_state: NonFinalizedState,
+    prepared_block: Arc<Mutex<Option<SemanticallyVerifiedBlock>>>,
+}
+
+impl Service<StateRequest> for TrustedSyncVerifierState {
+    type Response = StateResponse;
+    type Error = BoxError;
+    type Future = future::Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: StateRequest) -> Self::Future {
+        let response = match request {
+            StateRequest::KnownBlock(hash) => {
+                let location = if self.non_finalized_state.any_chain_contains(&hash) {
+                    Some(KnownBlock::BestChain)
+                } else if self.db.block(hash.into()).is_some() {
+                    Some(KnownBlock::Finalized)
+                } else {
+                    None
+                };
+
+                Ok(StateResponse::KnownBlock(location))
+            }
+            StateRequest::AwaitUtxo(outpoint) => self
+                .non_finalized_state
+                .any_utxo(&outpoint)
+                .or_else(|| self.db.utxo(&outpoint).map(|ordered| ordered.utxo))
+                .map(StateResponse::Utxo)
+                .ok_or_else(|| "trusted sync block spends an unknown UTXO".into()),
+            StateRequest::CommitSemanticallyVerifiedBlock(block) => {
+                let hash = block.hash;
+                self.prepared_block
+                    .lock()
+                    .expect("semantic verification does not panic while storing its block")
+                    .replace(block);
+                Ok(StateResponse::Committed(hash))
+            }
+            _ => Err("unexpected state request during trusted sync block verification".into()),
+        };
+
+        future::ready(response)
+    }
+}
+
+/// Performs the normal semantic checks without mutating the syncer's live
+/// non-finalized state.
+async fn verify_trusted_sync_block(
+    network: &Network,
+    db: &ZakuraDb,
+    non_finalized_state: &NonFinalizedState,
+    block: Arc<Block>,
+) -> Result<SemanticallyVerifiedBlock, VerifyBlockError> {
+    let prepared_block = Arc::new(Mutex::new(None));
+    let state = TrustedSyncVerifierState {
+        db: db.clone(),
+        non_finalized_state: non_finalized_state.clone(),
+        prepared_block: prepared_block.clone(),
+    };
+
+    let unused_mempool = tower::service_fn(|_request: mempool::Request| async {
+        Err::<mempool::Response, BoxError>(
+            "trusted sync block verification does not query the mempool".into(),
+        )
+    });
+    let (mempool_sender, mempool_receiver) = tokio::sync::oneshot::channel();
+    let _ = mempool_sender.send(unused_mempool);
+    let transaction_verifier = transaction::Verifier::new(network, state.clone(), mempool_receiver);
+    let transaction_verifier = Buffer::new(BoxService::new(transaction_verifier), 1);
+    let verifier = SemanticBlockVerifier::new(network, state, transaction_verifier);
+
+    let expected_hash = block.hash();
+    let verified_hash = verifier.oneshot(VerifyBlockRequest::Commit(block)).await?;
+    assert_eq!(
+        verified_hash, expected_hash,
+        "semantic verifier returns the verified block's hash"
+    );
+
+    let block = prepared_block
+        .lock()
+        .expect("semantic verification does not panic while returning its block")
+        .take()
+        .expect("successful semantic verification stores its prepared block");
+
+    Ok(block)
+}
+
+fn validate_finalized_gap_block(
+    expected_height: Height,
+    expected_parent_hash: block::Hash,
+    actual_height: Option<Height>,
+    actual_parent_hash: block::Hash,
+    advertised_hash: block::Hash,
+    computed_hash: block::Hash,
+) -> Result<(), FinalizedGapBlockError> {
+    let actual_height = actual_height.ok_or(FinalizedGapBlockError::MissingHeight)?;
+
+    if actual_height != expected_height {
+        return Err(FinalizedGapBlockError::UnexpectedHeight {
+            expected: expected_height,
+            actual: actual_height,
+        });
+    }
+
+    if actual_parent_hash != expected_parent_hash {
+        return Err(FinalizedGapBlockError::UnexpectedParentHash {
+            expected: expected_parent_hash,
+            actual: actual_parent_hash,
+        });
+    }
+
+    if advertised_hash != computed_hash {
+        return Err(FinalizedGapBlockError::UnexpectedBlockHash {
+            advertised: advertised_hash,
+            computed: computed_hash,
+        });
+    }
+
+    Ok(())
+}
+
+fn gap_fill_reached_expected_tip(
+    actual_tip: Option<(Height, block::Hash)>,
+    expected_tip: (Height, block::Hash),
+) -> bool {
+    actual_tip == Some(expected_tip)
+}
+
 async fn update_finalized_chain_tip(
     db: ZakuraDb,
     mut indexer_rpc_client: IndexerClient<tonic::transport::Channel>,
-    mut finalized_chain_tip_sender: ChainTipSender,
+    finalized_tip_publisher: FinalizedTipPublisher,
     mut started_sync_receiver: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut chain_tip_change_stream = None;
@@ -228,7 +445,7 @@ async fn update_finalized_chain_tip(
                 return;
             }
 
-            finalized_chain_tip_sender.set_finalized_tip(tip_block);
+            finalized_tip_publisher.publish(tip_block);
         }
     }
 }
@@ -268,7 +485,8 @@ impl TrustedChainSync {
                 .connect()
                 .await?;
         let indexer_rpc_client = IndexerClient::new(channel);
-        let finalized_chain_tip_sender = chain_tip_sender.finalized_sender();
+        let finalized_tip_publisher =
+            FinalizedTipPublisher::new(chain_tip_sender.finalized_sender());
 
         // `sync()` flips this after receiving its first parseable non-finalized
         // block. This stops `update_finalized_chain_tip`, making `sync()` the
@@ -279,11 +497,12 @@ impl TrustedChainSync {
         // finalized-state catch-up to finish.
         let finalized_tip_updater_db = db.clone();
         let finalized_tip_updater_client = indexer_rpc_client.clone();
+        let finalized_tip_updater_publisher = finalized_tip_publisher.clone();
         let finalized_tip_updater = tokio::spawn(async move {
             update_finalized_chain_tip(
                 finalized_tip_updater_db,
                 finalized_tip_updater_client,
-                finalized_chain_tip_sender,
+                finalized_tip_updater_publisher,
                 started_sync_receiver,
             )
             .await
@@ -294,6 +513,7 @@ impl TrustedChainSync {
             db,
             non_finalized_state,
             chain_tip_sender,
+            finalized_tip_publisher,
             non_finalized_state_sender,
             started_sync_sender,
             finalized_tip_updater: Some(finalized_tip_updater),
@@ -328,7 +548,7 @@ impl TrustedChainSync {
         let mut last_failed_commit_hash = None;
         self.try_catch_up_with_primary().await;
         if let Some(finalized_tip_block) = finalized_chain_tip_block(&self.db).await {
-            self.chain_tip_sender.set_finalized_tip(finalized_tip_block);
+            self.finalized_tip_publisher.publish(finalized_tip_block);
         }
 
         loop {
@@ -378,6 +598,17 @@ impl TrustedChainSync {
                 continue;
             };
 
+            let computed_hash = block.hash();
+            if hash != computed_hash {
+                tracing::warn!(
+                    advertised_hash = ?hash,
+                    ?computed_hash,
+                    "non-finalized state change advertised the wrong block hash"
+                );
+                non_finalized_blocks_listener = None;
+                continue;
+            }
+
             // We have a parseable block from the stream, so take over finalized
             // tip updates. Waiting for the updater is a barrier against an
             // in-flight secondary database catch-up.
@@ -394,8 +625,7 @@ impl TrustedChainSync {
                 continue;
             }
 
-            let block = SemanticallyVerifiedBlock::with_hash(Arc::new(block), hash);
-            match self.try_commit(block).await {
+            match self.try_commit(Arc::new(block), hash).await {
                 Ok(CommitOutcome::Committed) => {
                     last_failed_commit_hash = None;
                 }
@@ -426,13 +656,18 @@ impl TrustedChainSync {
 
     async fn try_commit(
         &mut self,
-        block: SemanticallyVerifiedBlock,
-    ) -> Result<CommitOutcome, ValidateContextError> {
+        block: Arc<Block>,
+        hash: block::Hash,
+    ) -> Result<CommitOutcome, BoxError> {
         self.try_catch_up_with_primary().await;
 
-        if block_height_is_finalized(self.db.finalized_tip_height(), block.height) {
+        let height = block
+            .coinbase_height()
+            .ok_or_else(|| BoxError::from("trusted sync block is missing its coinbase height"))?;
+
+        if block_height_is_finalized(self.db.finalized_tip_height(), height) {
             tracing::debug!(
-                height = ?block.height,
+                ?height,
                 "skipping block finalized while the secondary caught up"
             );
             self.publish_current_state().await;
@@ -445,22 +680,34 @@ impl TrustedChainSync {
         // blocks above ours. Fetch the missing finalized blocks so the incoming
         // block has a contiguous chain to commit onto.
         if self.non_finalized_state.best_chain().is_none()
-            && self.db.finalized_tip_hash() != block.block.header.previous_block_hash
+            && self.db.finalized_tip_hash() != block.header.previous_block_hash
         {
-            self.fill_finalized_gap(block.height).await;
+            self.fill_finalized_gap(height).await;
         }
 
         // Gap filling catches up the secondary before each fetch. Re-check the
         // target because the primary might have finalized it while the gap was
         // being bridged.
-        if block_height_is_finalized(self.db.finalized_tip_height(), block.height) {
+        if block_height_is_finalized(self.db.finalized_tip_height(), height) {
             tracing::debug!(
-                height = ?block.height,
+                ?height,
                 "skipping block finalized while bridging the finalized gap"
             );
             self.publish_current_state().await;
             return Ok(CommitOutcome::AlreadyFinalized);
         }
+
+        let block = verify_trusted_sync_block(
+            &self.non_finalized_state.network,
+            &self.db,
+            &self.non_finalized_state,
+            block,
+        )
+        .await?;
+        assert_eq!(
+            block.hash, hash,
+            "advertised hash was checked against the block before verification"
+        );
 
         self.commit(block)?;
 
@@ -474,11 +721,16 @@ impl TrustedChainSync {
     /// Updating the channels here means bridge blocks committed by
     /// [`Self::fill_finalized_gap`] also advance the published chain tip.
     fn commit(&mut self, block: SemanticallyVerifiedBlock) -> Result<(), ValidateContextError> {
-        if self.db.finalized_tip_hash() == block.block.header.previous_block_hash {
+        let starts_new_chain =
+            self.db.finalized_tip_hash() == block.block.header.previous_block_hash;
+        if starts_new_chain {
             let _ = self.prune_finalized();
-            self.non_finalized_state.commit_new_chain(block, &self.db)?;
-        } else {
-            self.non_finalized_state.commit_block(block, &self.db)?;
+        }
+
+        self.non_finalized_state
+            .validate_and_commit_block(block, &self.db)?;
+
+        if !starts_new_chain {
             let _ = self.prune_finalized();
         }
 
@@ -506,16 +758,11 @@ impl TrustedChainSync {
 
             // The next height is above the highest block we have: the
             // non-finalized tip after bridge commits, or the finalized tip.
-            let Some(highest) = self
-                .non_finalized_state
-                .best_tip()
-                .map(|(height, _hash)| height)
-                .max(self.db.finalized_tip_height())
-            else {
+            let Some((highest_height, highest_hash)) = self.highest_local_tip() else {
                 return;
             };
 
-            let Ok(next_height) = highest.next() else {
+            let Ok(next_height) = highest_height.next() else {
                 return;
             };
 
@@ -538,7 +785,44 @@ impl TrustedChainSync {
                 }
             };
 
-            let block = SemanticallyVerifiedBlock::with_hash(Arc::new(block), hash);
+            if let Err(error) = validate_finalized_gap_block(
+                next_height,
+                highest_hash,
+                block.coinbase_height(),
+                block.header.previous_block_hash,
+                hash,
+                block.hash(),
+            ) {
+                tracing::warn!(
+                    ?error,
+                    ?next_height,
+                    ?hash,
+                    "primary returned an invalid finalized-gap block; will retry on the next \
+                     subscription"
+                );
+                return;
+            }
+
+            let block = match verify_trusted_sync_block(
+                &self.non_finalized_state.network,
+                &self.db,
+                &self.non_finalized_state,
+                Arc::new(block),
+            )
+            .await
+            {
+                Ok(block) => block,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        ?next_height,
+                        ?hash,
+                        "primary returned an invalid finalized-gap block; will retry on the next \
+                         subscription"
+                    );
+                    return;
+                }
+            };
             if let Err(error) = self.commit(block) {
                 tracing::warn!(
                     ?error,
@@ -548,6 +832,33 @@ impl TrustedChainSync {
                 );
                 return;
             }
+
+            let actual_tip = self.highest_local_tip();
+            if !gap_fill_reached_expected_tip(actual_tip, (next_height, hash)) {
+                tracing::warn!(
+                    ?actual_tip,
+                    ?next_height,
+                    ?hash,
+                    "finalized-gap commit did not advance to the requested block; will retry on \
+                     the next subscription"
+                );
+                return;
+            }
+        }
+    }
+
+    /// Returns the highest local non-finalized or finalized chain tip.
+    fn highest_local_tip(&self) -> Option<(Height, block::Hash)> {
+        match (self.non_finalized_state.best_tip(), self.db.tip()) {
+            (Some(non_finalized_tip), Some(finalized_tip))
+                if non_finalized_tip.0 >= finalized_tip.0 =>
+            {
+                Some(non_finalized_tip)
+            }
+            (Some(_non_finalized_tip), Some(finalized_tip)) => Some(finalized_tip),
+            (Some(non_finalized_tip), None) => Some(non_finalized_tip),
+            (None, Some(finalized_tip)) => Some(finalized_tip),
+            (None, None) => None,
         }
     }
 
@@ -654,9 +965,7 @@ impl TrustedChainSync {
             .send(self.non_finalized_state.clone());
 
         if let Some(finalized_tip_block) = finalized_chain_tip_block(&self.db).await {
-            self.chain_tip_sender
-                .finalized_sender()
-                .set_finalized_tip(finalized_tip_block);
+            self.finalized_tip_publisher.publish(finalized_tip_block);
         }
     }
 
@@ -725,6 +1034,22 @@ pub fn init_read_state_with_syncer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zakura_chain::{
+        chain_tip::ChainTip, serialization::ZcashDeserialize,
+        work::difficulty::INVALID_COMPACT_DIFFICULTY,
+    };
+    use zakura_consensus::BlockError;
+
+    fn test_chain_tip(height: Height, hash_byte: u8) -> ChainTipBlock {
+        ChainTipBlock {
+            hash: block::Hash([hash_byte; 32]),
+            height,
+            time: chrono::Utc::now(),
+            transactions: Vec::new(),
+            transaction_hashes: Arc::from([]),
+            previous_block_hash: block::Hash([hash_byte.saturating_sub(1); 32]),
+        }
+    }
 
     #[test]
     fn finalized_height_check_includes_the_tip() {
@@ -734,6 +1059,189 @@ mod tests {
         assert!(block_height_is_finalized(Some(finalized_tip), Height(9)));
         assert!(block_height_is_finalized(Some(finalized_tip), Height(10)));
         assert!(!block_height_is_finalized(Some(finalized_tip), Height(11)));
+    }
+
+    #[test]
+    fn finalized_tip_publisher_ignores_stale_lower_tip() {
+        let (sender, latest_chain_tip, _chain_tip_change) =
+            ChainTipSender::new(None, &Network::Mainnet);
+        let publisher = FinalizedTipPublisher::new(sender.finalized_sender());
+        let newer_tip = test_chain_tip(Height(11), 11);
+
+        publisher.publish(newer_tip.clone());
+        publisher.publish(test_chain_tip(Height(10), 10));
+
+        assert_eq!(
+            latest_chain_tip.best_tip_height_and_hash(),
+            Some((newer_tip.height, newer_tip.hash))
+        );
+    }
+
+    #[test]
+    fn finalized_gap_block_must_match_request_and_chain() {
+        let expected_height = Height(11);
+        let expected_parent = block::Hash([10; 32]);
+        let expected_hash = block::Hash([11; 32]);
+
+        assert_eq!(
+            validate_finalized_gap_block(
+                expected_height,
+                expected_parent,
+                Some(expected_height),
+                expected_parent,
+                expected_hash,
+                expected_hash,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_finalized_gap_block(
+                expected_height,
+                expected_parent,
+                None,
+                expected_parent,
+                expected_hash,
+                expected_hash,
+            ),
+            Err(FinalizedGapBlockError::MissingHeight)
+        );
+        assert_eq!(
+            validate_finalized_gap_block(
+                expected_height,
+                expected_parent,
+                Some(Height(12)),
+                expected_parent,
+                expected_hash,
+                expected_hash,
+            ),
+            Err(FinalizedGapBlockError::UnexpectedHeight {
+                expected: expected_height,
+                actual: Height(12),
+            })
+        );
+        assert_eq!(
+            validate_finalized_gap_block(
+                expected_height,
+                expected_parent,
+                Some(expected_height),
+                block::Hash([9; 32]),
+                expected_hash,
+                expected_hash,
+            ),
+            Err(FinalizedGapBlockError::UnexpectedParentHash {
+                expected: expected_parent,
+                actual: block::Hash([9; 32]),
+            })
+        );
+        assert_eq!(
+            validate_finalized_gap_block(
+                expected_height,
+                expected_parent,
+                Some(expected_height),
+                expected_parent,
+                expected_hash,
+                block::Hash([12; 32]),
+            ),
+            Err(FinalizedGapBlockError::UnexpectedBlockHash {
+                advertised: expected_hash,
+                computed: block::Hash([12; 32]),
+            })
+        );
+    }
+
+    #[test]
+    fn finalized_gap_fill_requires_expected_tip() {
+        let expected_tip = (Height(11), block::Hash([11; 32]));
+
+        assert!(gap_fill_reached_expected_tip(
+            Some(expected_tip),
+            expected_tip
+        ));
+        assert!(!gap_fill_reached_expected_tip(None, expected_tip));
+        assert!(!gap_fill_reached_expected_tip(
+            Some((Height(10), expected_tip.1)),
+            expected_tip
+        ));
+        assert!(!gap_fill_reached_expected_tip(
+            Some((expected_tip.0, block::Hash([12; 32]))),
+            expected_tip
+        ));
+    }
+
+    #[tokio::test]
+    async fn trusted_sync_rejects_invalid_difficulty_and_pow_without_panicking() {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let genesis =
+            Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+                .expect("mainnet genesis block should deserialize");
+        let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+            zakura_state::populated_state([genesis], &network).await;
+        let db = read_state.db().clone();
+        let non_finalized_state = NonFinalizedState::new(&network);
+        let context_block =
+            Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..])
+                .expect("mainnet block 1 should deserialize");
+        let semantic_block =
+            Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES[..])
+                .expect("modern mainnet block should deserialize");
+
+        let mut invalid_difficulty = semantic_block.as_ref().clone();
+        Arc::make_mut(&mut invalid_difficulty.header).difficulty_threshold =
+            INVALID_COMPACT_DIFFICULTY;
+        let invalid_difficulty = Arc::new(invalid_difficulty);
+        let invalid_difficulty_hash = invalid_difficulty.hash();
+
+        let error = verify_trusted_sync_block(
+            &network,
+            &db,
+            &non_finalized_state,
+            invalid_difficulty.clone(),
+        )
+        .await
+        .expect_err("invalid compact difficulty must fail semantic verification");
+        assert!(matches!(
+            error,
+            VerifyBlockError::Block {
+                source: BlockError::InvalidDifficulty(Height(1_687_107), hash),
+            } if hash == invalid_difficulty_hash
+        ));
+
+        let mut invalid_context_difficulty = context_block.as_ref().clone();
+        Arc::make_mut(&mut invalid_context_difficulty.header).difficulty_threshold =
+            INVALID_COMPACT_DIFFICULTY;
+        let invalid_context_difficulty = Arc::new(invalid_context_difficulty);
+        let prepared = SemanticallyVerifiedBlock::with_hash(
+            invalid_context_difficulty.clone(),
+            invalid_context_difficulty.hash(),
+        );
+        let error = non_finalized_state
+            .clone()
+            .validate_and_commit_block(prepared, &db)
+            .expect_err("invalid compact difficulty must fail before chain work is updated");
+        assert!(matches!(
+            error,
+            ValidateContextError::InvalidDifficultyThreshold { .. }
+        ));
+
+        let mut invalid_pow = semantic_block.as_ref().clone();
+        Arc::make_mut(&mut invalid_pow.header).nonce = [0; 32].into();
+        let invalid_pow = Arc::new(invalid_pow);
+        let invalid_pow_hash = invalid_pow.hash();
+        let error = verify_trusted_sync_block(&network, &db, &non_finalized_state, invalid_pow)
+            .await
+            .expect_err("insufficient proof of work must fail semantic verification");
+        assert!(matches!(
+            error,
+            VerifyBlockError::Block {
+                source: BlockError::DifficultyFilter(
+                    Height(1_687_107),
+                    hash,
+                    _,
+                    Network::Mainnet,
+                ),
+            } if hash == invalid_pow_hash
+        ));
     }
 
     #[tokio::test]

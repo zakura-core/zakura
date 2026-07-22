@@ -1,9 +1,11 @@
 # Fork-aware headers-only chain engine specification
 
 Status: normative design oracle for the replacement of PR #229<br>
-Version: 1.3<br>
-Date: 2026-07-21<br>
-Scope: Zakura native header sync and its integration with Zakura full state
+Version: 1.4<br>
+Date: 2026-07-22<br>
+Scope: Zakura native (v2 P2P) header sync and its integration with Zakura full state
+
+Version 1.4 removes every backward-compatibility surface from this engine. There is exactly one header-sync message set, one codec, one status message, and one supported stream version. The previous native stream version 7, its dual-version negotiation, and the legacy Zcash `getheaders` fallback are not implemented, not served, and not tested. The legacy Zcash P2P stack is out of scope entirely: this engine neither reads, writes, nor changes it.
 
 ## Document overview
 
@@ -46,15 +48,15 @@ Explains how body validation, operator actions, retries, and metadata updates fe
 - **MUST** keep retrying unavailable bodies with bounded backoff and raise a persistent alarm instead of silently selecting a lower-work chain.
 - **MUST** authenticate auxiliary metadata and scope it to the exact hash, branch, generation, and supplier.
 
-**5. Fork-discovery protocol v8**
+**5. Native fork-discovery protocol**
 
-Defines how Zakura peers advertise and exchange competing header chains. Requests are tied to an exact target and snapshot, responses are bounded and validated, and failures use explicit outcomes rather than ambiguous empty responses.
+Defines how Zakura peers advertise and exchange competing header chains over the Zakura v2 P2P stack. Requests are tied to an exact target and snapshot, responses are bounded and validated, and failures use explicit outcomes rather than ambiguous empty responses.
 
-- **MUST** negotiate v8 before decoding its messages and enforce all message, count, and allocation bounds.
+- **MUST** implement exactly one header-sync message set and codec, and enforce all message, count, and allocation bounds.
 - **MUST** treat advertised height and work as hints until the corresponding headers are downloaded and validated locally.
 - **MUST** bind every request and continuation to one exact target snapshot; a server may not silently substitute a newer chain.
 - **MUST** validate request correlation, locator ancestry, header linkage, and the completed target before admitting a response.
-- **SHOULD** prefer v8 or legacy Zcash `getheaders` when v7 cannot connect an advertised fork; stale or unavailable history alone is not peer misbehavior.
+- **MUST NOT** implement a fallback, compatibility, or predecessor header-exchange path; a peer that does not speak this protocol is simply not a header-sync peer, and stale or unavailable history alone is not peer misbehavior.
 
 **6. Consensus parity and intentional limits**
 
@@ -119,13 +121,15 @@ The **correct tip** for this engine is the deterministic greatest-work eligible 
 
 ### 1.3 Included and excluded work
 
-Version 1 includes linear download and verification of all headers, a bounded fork DAG, full-state feedback, durable recovery, and the native v8 discovery protocol.
+Version 1 includes linear download and verification of all headers, a bounded fork DAG, full-state feedback, durable recovery, and the native fork-discovery protocol.
 
 **LC-SCOPE-04 [LS] — Wallet features excluded.** Version 1 MUST NOT implement ZIP 307 wallet payment discovery, compact-block scanning, trial decryption, note witnesses, or wallet state.
 
 **LC-SCOPE-05 [LS] — FlyClient proofs excluded.** Version 1 MUST NOT claim or implement ZIP 221 FlyClient logarithmic sampling or succinct chain proofs. It validates every retained header on a candidate suffix. ZIP 221 history-tree data is covered only as auxiliary metadata used by the integrated node.
 
 **LC-SCOPE-06 [LS] — Block-sync concerns excluded.** Block-sync token-bucket connection eviction and readiness/accounting defects unrelated to header-chain selection are outside this engine and MUST NOT be coupled to its fork-choice state.
+
+**LC-SCOPE-09 [LS] — Single protocol, no compatibility surface.** This engine MUST expose exactly one header-exchange protocol on the Zakura v2 P2P stack: one message set, one codec, one status message, and one supported stream version. It MUST NOT implement version negotiation between header-sync codecs, a frozen predecessor codec, a legacy Zcash `getheaders` request/serve path, or any other fallback header-exchange path. It MUST NOT read, write, serve, or otherwise modify the legacy Zcash P2P stack, which remains outside this specification. Identifiers, modules, metrics, configuration fields, and test names MUST NOT carry protocol-version suffixes, because there is only one of each thing to name.
 
 **LC-SCOPE-07 [ZW] — Auxiliary-evidence boundary.** ZIP 221/ZIP 244 commitments and VCT metadata MAY be consumed by the integrated node only under the authentication and generation rules in section 4.7; they MUST NOT become unauthenticated header-validity or fork-choice evidence.
 
@@ -197,7 +201,7 @@ The durable metadata contains monotonically increasing unsigned counters. Counte
 
 Validation proceeds in the following order so cheap bounds precede CPU work and no contextual result can be detached from its branch:
 
-**LC-VAL-01 [ZW] — Bounded response decoding.** An inbound response MUST pass framing, negotiated version, nonzero request correlation, message and count bounds, allocation bounds, parallel-vector length checks, and exact payload consumption before header admission. No allocation may be derived from an unbounded peer count.
+**LC-VAL-01 [ZW] — Bounded response decoding.** An inbound response MUST pass framing, stream-version admission, nonzero request correlation, message and count bounds, allocation bounds, parallel-vector length checks, and exact payload consumption before header admission. No allocation may be derived from an unbounded peer count.
 
 **LC-VAL-02 [ZC] — Canonical header and version.** Each header MUST canonically deserialize using the network’s Equihash solution encoding. Its version, interpreted with the high bit as the signed bit used by zcashd, MUST have the high bit clear and be at least 4. The canonical hash MUST be computed from the entire serialized header.
 
@@ -252,7 +256,7 @@ The Zcash protocol requires the settled activation hash when a full validator ri
 
 These values MUST come from the release-authenticated manifest rather than peer status or the optional checkpoint files.
 
-Non-normative implementation warning: at version 1.3 publication, `main-checkpoints.txt` ends at height 3,358,006 and `test-checkpoints.txt` ends at 4,023,200, both below their NU6.2 activation height. Those files therefore cannot satisfy LC-ANCHOR-04 without the independent settled-upgrade manifest.
+Non-normative implementation warning: at version 1.4 publication, `main-checkpoints.txt` ends at height 3,358,006 and `test-checkpoints.txt` ends at 4,023,200, both below their NU6.2 activation height. Those files therefore cannot satisfy LC-ANCHOR-04 without the independent settled-upgrade manifest.
 
 **LC-ANCHOR-05 [LS] — Atomic settled-pin updates.** A release that changes which upgrade is most recently settled or changes a settled activation tuple MUST update the manifest and both-network conformance vectors atomically. Runtime peer claims, candidate-upgrade configuration such as NU6.3/NU7, and mere passage of an activation height MUST NOT create, supersede, or mutate a settled-upgrade pin.
 
@@ -334,7 +338,7 @@ Body feedback is keyed by requested header hash and verifier rule identity. The 
 
 **LC-WORK-02 [LS] — Safe finalized-coverage reuse.** Finalized/backward coverage MAY survive a header-generation change only if every retained interval is at or below `finalized` and authenticated by the unchanged finalized hash ancestry.
 
-**LC-WORK-03 [LS] — Stale-anchor recovery.** A stale `UnknownAnchor` from a local v7-style commit MUST trigger a bounded durable reload/reanchor and status refresh. It MUST NOT cause a hot retry of the same impossible anchor or peer punishment.
+**LC-WORK-03 [LS] — Stale-anchor recovery.** A stale `UnknownAnchor` raised by a local commit whose anchor has moved MUST trigger a bounded durable reload/reanchor and status refresh. It MUST NOT cause a hot retry of the same impossible anchor or peer punishment.
 
 ### 4.6 Error taxonomy and attribution
 
@@ -355,7 +359,7 @@ Every terminal or retry result is one of the following typed categories:
 
 **LC-ERR-01 [ZW] — Error-category preservation.** Implementations MUST preserve these distinctions across service, driver, reactor, metrics, and peer-scoring boundaries. A generic error conversion MUST NOT turn a local or stale category into peer misbehavior.
 
-**LC-ERR-02 [ZW] — Peer-fault boundary.** Only `MalformedProtocol` and `InvalidHeader` automatically justify header-peer misbehavior. `UnknownAnchor` is local except when a v8 response violates the explicit locator/common-ancestor contract sent by that peer.
+**LC-ERR-02 [ZW] — Peer-fault boundary.** Only `MalformedProtocol` and `InvalidHeader` automatically justify header-peer misbehavior. `UnknownAnchor` is local except when a header-sync response violates the explicit locator/common-ancestor contract sent by that peer.
 
 ### 4.7 VCT and tree-aux metadata
 
@@ -369,28 +373,28 @@ VCT/tree-aux records are execution assistance. They can help reconstruct and aut
 
 **LC-AUX-04 [ZW] — Cryptographic metadata authentication.** Auxiliary roots MAY be marked authenticated only after the existing integrated verifier reconstructs the relevant ZIP 221 history-tree inputs and checks them against the appropriate checkpoint/header commitment, including the one-header-later authentication boundary. Proven bad metadata MAY score its supplier but MUST NOT invalidate the header.
 
-## 5. Native fork-discovery protocol v8
+## 5. Native fork-discovery protocol
 
-### 5.1 Negotiation and common codec
+### 5.1 Stream version and codec
 
-Native stream version 8 is a breaking successor to v7. Negotiation advertises supported versions and selects exactly one codec for a stream. Integers below are unsigned little-endian. Hashes are 32 raw internal bytes. Heights are `u32` constrained to `block::Height::MAX`; request IDs are nonzero `u64`; work is an unsigned 256-bit integer encoded as exactly 32 little-endian bytes. All messages retain the negotiated application frame limit and the local 2 MiB hard message cap.
+Header sync runs on one ordered Zakura v2 P2P stream at exactly one supported stream version, `8`. That number is a compatibility barrier, not a selector: it exists so that a node speaking the obsolete predecessor format (native stream version 7, or the draft version 1.2 16-byte work field) cannot open a header-sync stream at all. There is no negotiation among header-sync codecs, no per-stream codec enum, and no fallback path.
 
-Version 1.3 replaces the draft version 1.2 16-byte work field before v8 deployment. Implementations of that obsolete draft encoding are incompatible with this specification.
+Integers below are unsigned little-endian. Hashes are 32 raw internal bytes. Heights are `u32` constrained to `block::Height::MAX`; request IDs are nonzero `u64`; work is an unsigned 256-bit integer encoded as exactly 32 little-endian bytes. All messages retain the stream's application frame limit and the local 2 MiB hard message cap.
 
-**LC-V8-01 [ZW] — Bounded v8 decoding.** A v8 decoder MUST reject unknown discriminants, zero request IDs, invalid booleans, out-of-range heights, count/vector disagreement, trailing bytes, arithmetic overflow, and messages exceeding either negotiated or hard byte/count limits before allocation or CPU-heavy validation. A version 1.3 implementation MUST NOT negotiate v8 with a peer known to implement the obsolete draft 16-byte work encoding.
+**LC-WIRE-01 [ZW] — Bounded decoding.** The header-sync decoder MUST reject unknown discriminants, zero request IDs, invalid booleans, out-of-range heights, count/vector disagreement, trailing bytes, arithmetic overflow, and messages exceeding either the stream frame limit or hard byte/count limits before allocation or CPU-heavy validation. A peer that does not offer stream version 8 MUST NOT be given a header-sync stream, and its messages MUST NOT be decoded by any other header-sync codec.
 
 ### 5.2 Messages
 
-The v8 message discriminants are:
+The message discriminants are:
 
 | Code | Message |
 | ---: | --- |
-| `1` | `StatusV8` |
-| `2` | `GetHeadersV8` |
-| `3` | `HeadersV8` |
-| `4` | `HeadersOutcomeV8` |
+| `1` | `Status` |
+| `2` | `GetHeaders` |
+| `3` | `Headers` |
+| `4` | `HeadersOutcome` |
 
-`StatusV8` is encoded in this order:
+`Status` is encoded in this order:
 
 ```text
 work_anchor_height        u32
@@ -405,7 +409,7 @@ max_message_bytes         u32
 tree_aux_schema_mask      u32
 ```
 
-`GetHeadersV8` is encoded as:
+`GetHeaders` is encoded as:
 
 ```text
 request_id                nonzero u64
@@ -416,7 +420,7 @@ max_header_count          u32 (>0 and locally/peer capped)
 tree_aux_schema           u8 (0, or 1..=32 advertised by the server)
 ```
 
-`HeadersV8` is encoded as:
+`Headers` is encoded as:
 
 ```text
 request_id                nonzero u64
@@ -450,7 +454,7 @@ auth_data_root            [u8; 32]
 
 Each schema-1 height must equal its parallel header’s inferred height. Root decoders must apply their canonical field encodings. Orchard fields use the empty/default root and count zero below NU5; Ironwood fields use the empty/default root and count zero before the configured NU7 activation; `auth_data_root` is all zero below NU5. These defaults are syntactic schema values only and do not authenticate the metadata.
 
-`HeadersOutcomeV8` contains `request_id`, `target_tip_hash`, and one outcome byte:
+`HeadersOutcome` contains `request_id`, `target_tip_hash`, and one outcome byte:
 
 | Code | Outcome | Meaning |
 | ---: | --- | --- |
@@ -459,51 +463,45 @@ Each schema-1 height must equal its parallel header’s inferred height. Root de
 | `3` | `HistoryPruned` | an intersection may exist below the server’s retained boundary but cannot be served |
 | `4` | `Busy` | bounded temporary concurrency/resource refusal |
 
-**LC-V8-02 [ZW] — Atomic status snapshot.** `StatusV8` MUST describe one atomic durable snapshot: the selected `header_best`, the finalized/work anchor it descends from, locally recomputed suffix work exclusive of the anchor and inclusive of the selected tip, retention floor, and effective serving caps. A receiver MUST treat height and work as advisory until it downloads and validates headers.
+**LC-WIRE-02 [ZW] — Atomic status snapshot.** `Status` MUST describe one atomic durable snapshot: the selected `header_best`, the finalized/work anchor it descends from, locally recomputed suffix work exclusive of the anchor and inclusive of the selected tip, retention floor, and effective serving caps. A receiver MUST treat height and work as advisory until it downloads and validates headers.
 
-**LC-V8-17 [ZW] — Status publication cadence.** `StatusV8` is unsolicited and v8 defines no status request. Each side MUST send its current status immediately after v8 negotiation completes, MUST send an updated snapshot after any committed transition that changes its selected tip, work anchor, retention floor, or advertised serving caps, and MUST refresh at least once per configured status-refresh interval (default 30 seconds, matching the existing v7 `status_refresh_interval`) as a liveness signal. Rapid successive changes MAY be coalesced, but the newest snapshot MUST be sent within 2 seconds of its commit, and a peer is never required to send more than one snapshot per second. Status silence or staleness is grounds for bounded rescheduling and deprioritization, never automatic misbehavior. Header-tip announcement inside a v8 session is carried entirely by these status updates; full-block relay remains on the paths in LC-V8-16.
+**LC-WIRE-17 [ZW] — Status publication cadence.** `Status` is unsolicited and the protocol defines no status request. Each side MUST send its current status immediately after the header-sync stream opens, MUST send an updated snapshot after any committed transition that changes its selected tip, work anchor, retention floor, or advertised serving caps, and MUST refresh at least once per configured `status_refresh_interval` (default 30 seconds) as a liveness signal. Rapid successive changes MAY be coalesced, but the newest snapshot MUST be sent within 2 seconds of its commit, and a peer is never required to send more than one snapshot per second. Status silence or staleness is grounds for bounded rescheduling and deprioritization, never automatic misbehavior. Header-tip announcement inside a header-sync session is carried entirely by these status updates; full-block relay remains on the paths in LC-WIRE-16.
 
-**LC-V8-03 [ZW] — Locator construction.** The requester MUST build its locator from the current local selected tip, then ancestors at offsets `1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1000`, and finally `finalized`; it MUST preserve that order, deduplicate hashes, and cap the list at 13. A continuation of an incomplete response instead uses the continuation locator defined in section 5.2, whose first entry is the returned suffix tip; every fresh target pursuit MUST use the locator above.
+**LC-WIRE-03 [ZW] — Locator construction.** The requester MUST build its locator from the current local selected tip, then ancestors at offsets `1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1000`, and finally `finalized`; it MUST preserve that order, deduplicate hashes, and cap the list at 13. A continuation of an incomplete response instead uses the continuation locator defined in section 5.2, whose first entry is the returned suffix tip; every fresh target pursuit MUST use the locator above.
 
-**LC-V8-04 [ZW] — Advertised-target scheduling.** `target_tip_hash` MUST come from the status snapshot being pursued. The requester MUST enforce the per-peer and global staged-target limits in LC-RETAIN-04. A newer status MAY supersede an older unstarted target from that peer.
+**LC-WIRE-04 [ZW] — Advertised-target scheduling.** `target_tip_hash` MUST come from the status snapshot being pursued. The requester MUST enforce the per-peer and global staged-target limits in LC-RETAIN-04. A newer status MAY supersede an older unstarted target from that peer.
 
-**LC-V8-13 [ZW] — Body-size hint safety.** `HeadersV8` body-size hints MUST obey the zero sentinel, 2,000,000-byte maximum, parallel count, and no-hint-based-allocation rules above. Invalid hints make the response malformed protocol data and prevent admission from that response, but do not make any independently obtained header invalid. Legal hints remain unauthenticated scheduling metadata and MUST NOT affect header validity or fork choice.
+**LC-WIRE-13 [ZW] — Body-size hint safety.** `Headers` body-size hints MUST obey the zero sentinel, 2,000,000-byte maximum, parallel count, and no-hint-based-allocation rules above. Invalid hints make the response malformed protocol data and prevent admission from that response, but do not make any independently obtained header invalid. Legal hints remain unauthenticated scheduling metadata and MUST NOT affect header validity or fork choice.
 
-**LC-V8-14 [ZW] — Auxiliary-schema validation.** Tree-aux negotiation and schema-1 records MUST use the exact mask, selector, length, field order, encoding, height correspondence, and activation-dependent defaults above. An unknown, unadvertised, mismatched, malformed, or wrong-length schema is `MalformedProtocol`: the response MUST be rejected before any of its headers or records are admitted, but no independently obtained header becomes invalid. A structurally valid record that later fails cryptographic authentication invalidates only that metadata delivery under LC-AUX-02.
+**LC-WIRE-14 [ZW] — Auxiliary-schema validation.** Tree-aux negotiation and schema-1 records MUST use the exact mask, selector, length, field order, encoding, height correspondence, and activation-dependent defaults above. An unknown, unadvertised, mismatched, malformed, or wrong-length schema is `MalformedProtocol`: the response MUST be rejected before any of its headers or records are admitted, but no independently obtained header becomes invalid. A structurally valid record that later fails cryptographic authentication invalidates only that metadata delivery under LC-AUX-02.
 
-**LC-V8-15 [ZW] — Immutable schema evolution.** Auxiliary schema meanings are immutable. NU6.3, NU7, or any later upgrade MUST be handled by the existing schema’s explicitly defined activation semantics or by assigning a new advertised schema bit; an implementation MUST NOT reinterpret schema 1 based on a candidate-upgrade name. Adding, removing, resizing, or reordering fields requires a new schema, and exhausting the 32-bit mask or changing message framing requires a successor stream version.
+**LC-WIRE-15 [ZW] — Immutable schema evolution.** Auxiliary schema meanings are immutable. NU6.3, NU7, or any later upgrade MUST be handled by the existing schema’s explicitly defined activation semantics or by assigning a new advertised schema bit; an implementation MUST NOT reinterpret schema 1 based on a candidate-upgrade name. Adding, removing, resizing, or reordering fields requires a new schema, and exhausting the 32-bit mask or changing message framing requires a successor stream version.
 
-**LC-V8-16 [ZW] — Version-scoped discriminants.** v8 removes the v7 `NewBlock` message. Discriminant `4` means `HeadersOutcomeV8` only on a negotiated v8 stream; it continues to mean `NewBlock` only on a negotiated v7 stream. A v8 session MUST use the ordinary Zcash block-announcement/download path or the separately negotiated Zakura block-sync facility for full blocks, and MUST reject a v7 `NewBlock` payload presented as v8. Version negotiation occurs before discriminant decoding, so no decoder may guess a version from payload shape.
+**LC-WIRE-16 [ZW] — Fixed discriminants and no block relay.** The four discriminants above are the complete message set. There is no `NewBlock` message and no other block-relay message in header sync; a payload claiming one MUST be rejected as an unknown discriminant. A header-sync session MUST use the ordinary Zcash block-announcement/download path or the separately negotiated Zakura block-sync facility for full blocks. No decoder may infer a message type, protocol variant, or version from payload shape.
 
 ### 5.3 Server snapshot contract
 
-**LC-V8-05 [ZW] — Snapshot-bound path serving.** On accepting a request, the server MUST acquire a retained-path snapshot for the exact target hash. It MUST select the first locator entry, in requester order, that lies on that target’s ancestor path, and serve only the contiguous path after that ancestor toward that target.
+**LC-WIRE-05 [ZW] — Snapshot-bound path serving.** On accepting a request, the server MUST acquire a retained-path snapshot for the exact target hash. It MUST select the first locator entry, in requester order, that lies on that target’s ancestor path, and serve only the contiguous path after that ancestor toward that target.
 
-**LC-V8-06 [ZW] — No target substitution.** The accepted target MUST remain snapshot-bound even if the server’s selected tip changes concurrently. The server MUST either complete that exact path through one or more responses/continuations or return one explicit `HeadersOutcomeV8`; it MUST NOT silently substitute its new selected path.
+**LC-WIRE-06 [ZW] — No target substitution.** The accepted target MUST remain snapshot-bound even if the server’s selected tip changes concurrently. The server MUST either complete that exact path through one or more responses/continuations or return one explicit `HeadersOutcome`; it MUST NOT silently substitute its new selected path.
 
-**LC-V8-07 [ZW] — Explicit response outcomes.** If the target is not retained, no locator intersects, required history was pruned, or resources are temporarily unavailable, the server MUST return the corresponding explicit outcome and no partial ambiguous success.
+**LC-WIRE-07 [ZW] — Explicit response outcomes.** If the target is not retained, no locator intersects, required history was pruned, or resources are temporarily unavailable, the server MUST return the corresponding explicit outcome and no partial ambiguous success.
 
 ### 5.4 Requester validation and discovery
 
-**LC-V8-08 [ZW] — Correlated response validation.** The requester MUST correlate request and target, verify that the returned common ancestor was in the exact sent locator, verify its local height/hash, validate every parent link and header rule, and require a completed sequence to end at the requested target hash.
+**LC-WIRE-08 [ZW] — Correlated response validation.** The requester MUST correlate request and target, verify that the returned common ancestor was in the exact sent locator, verify its local height/hash, validate every parent link and header rule, and require a completed sequence to end at the requested target hash.
 
-**LC-V8-09 [ZW] — Continuation target integrity.** Continuations MUST remain bound to the same target. The requester MUST NOT count advertised target work, unvalidated partial work, or a claimed common-ancestor height in fork choice.
+**LC-WIRE-09 [ZW] — Continuation target integrity.** Continuations MUST remain bound to the same target. The requester MUST NOT count advertised target work, unvalidated partial work, or a claimed common-ancestor height in fork choice.
 
-**LC-V8-10 [ZW] — Non-punitive retry outcomes.** `TargetNotRetained`, `HistoryPruned`, and `Busy` MUST cause bounded status refresh/rescheduling without peer punishment. `NoLocatorIntersection` is non-punitive unless the response contradicts a locator membership fact cryptographically known from the same peer snapshot.
+**LC-WIRE-10 [ZW] — Non-punitive retry outcomes.** `TargetNotRetained`, `HistoryPruned`, and `Busy` MUST cause bounded status refresh/rescheduling without peer punishment. `NoLocatorIntersection` is non-punitive unless the response contradicts a locator membership fact cryptographically known from the same peer snapshot.
 
-**LC-V8-11 [ZW] — Peer-attributable violations.** Unsolicited/mismatched request IDs, a common ancestor not in the sent locator, broken returned ancestry, a completed sequence with the wrong target hash, malformed bounds, or an invalid header MUST be peer-attributable evidence.
+**LC-WIRE-11 [ZW] — Peer-attributable violations.** Unsolicited/mismatched request IDs, a common ancestor not in the sent locator, broken returned ancestry, a completed sequence with the wrong target hash, malformed bounds, or an invalid header MUST be peer-attributable evidence.
 
-**LC-V8-12 [ZW] — Unknown-fork discovery.** A same-height/different-hash status, a shorter tip claiming more work, or any unknown target hash MUST be eligible for discovery scheduling. Locally validated complete suffixes, never advertised heights or work, determine whether selection changes. Advertised suffix work is commensurable with local work only when both snapshots name the same work anchor or one anchor is a retained ancestor of the other, in which case the requester MAY rebase the claim across the locally known per-block work between the anchors. When the anchors are not comparable, an unknown target remains discovery-eligible on hash evidence alone, and the incomparable work claim MUST NOT be used to suppress or deprioritize discovery below its normal scheduling.
+**LC-WIRE-12 [ZW] — Unknown-fork discovery.** A same-height/different-hash status, a shorter tip claiming more work, or any unknown target hash MUST be eligible for discovery scheduling. Locally validated complete suffixes, never advertised heights or work, determine whether selection changes. Advertised suffix work is commensurable with local work only when both snapshots name the same work anchor or one anchor is a retained ancestor of the other, in which case the requester MAY rebase the claim across the locally known per-block work between the anchors. When the anchors are not comparable, an unknown target remains discovery-eligible on hash evidence alone, and the incomparable work claim MUST NOT be used to suppress or deprioritize discovery below its normal scheduling.
 
-### 5.5 v7 compatibility
+### 5.5 Peers without this protocol
 
-**LC-V7-01 [ZW] — Retained-ancestry compatibility.** A dual-version node SHOULD continue serving v7’s selected height projection and MAY accept a v7 range only when its first parent hash is already retained, its implicit anchor still identifies the current branch, and every header validates.
-
-**LC-V7-02 [ZW] — Stale-anchor handling.** A v7 range whose implicit height anchor no longer matches MUST be classified as stale discovery, not peer misbehavior. v7-only operation MUST NOT claim deterministic unknown-fork discovery or same-height convergence.
-
-**LC-V7-03 [ZW] — Disconnected-fork fallback.** When an advertised fork cannot connect through retained v7 ancestry, the scheduler SHOULD prefer v8 or legacy locator-based Zcash `getheaders`; it MUST NOT overwrite the selected projection by height to manufacture connectivity.
-
-**LC-V7-04 [ZW] — ZIP 204 `getheaders` conformance.** When Zakura uses or serves the standard Zcash `getheaders` fallback, it MUST use the negotiated Zcash P2P codec and ZIP 204 semantics. A server MUST return headers after the first locator hash found on its best chain, stopping at `hash_stop` or 160 headers, whichever comes first. A requester MUST reject a response containing more than 160 headers and MUST require canonical header encodings, exact payload consumption, and one contiguous `hashPrevBlock` sequence before admission. Both sides MUST enforce canonical CompactSize encoding, the P2P message checksum, and the 2 MiB payload limit. Over-limit, malformed, or non-contiguous responses are peer-attributable protocol violations; an empty response alone is not proof that the peer advertised an invalid chain.
+A peer that does not offer stream version 8 has no header-sync relationship with this node. There is no compatibility codec, no height-range predecessor path, and no legacy Zcash `getheaders` fallback (LC-SCOPE-09). Such a peer is not scored, not probed for headers, and not counted as a header supplier; it may still participate in every other Zakura or legacy Zcash facility, none of which this engine changes. Fork connectivity that cannot be established through this protocol is a discovery limitation to be solved with more header-sync peers, never by manufacturing connectivity through a weaker exchange.
 
 ## 6. Consensus parity and intentional limits
 
@@ -533,7 +531,7 @@ Each schema-1 height must equal its parallel header’s inferred height. Root de
 
 **LC-PARITY-02 [LS] — Typed intentional differences.** Intentional differences MUST be represented as typed states and explicit differential tests; they MUST NOT appear as unexplained mismatches or be papered over by selecting `verified_best`.
 
-**LC-PARITY-03 [ZF] — Tie-break policy isolation.** Equal-work ordering MUST be differential-tested separately against Zakura’s raw-tip-hash comparator; neither this Zakura policy nor any v8 discovery behavior may be described or tested as a Zcash header-validity rule.
+**LC-PARITY-03 [ZF] — Tie-break policy isolation.** Equal-work ordering MUST be differential-tested separately against Zakura’s raw-tip-hash comparator; neither this Zakura policy nor any header-sync discovery behavior may be described or tested as a Zcash header-validity rule.
 
 ## 7. Executable conformance and acceptance matrix
 
@@ -555,7 +553,7 @@ Each named test below is a deterministic test target or parameterized suite. Mod
 - **HV-04 `difficulty_differential`:** every upgrade boundary, first 28 heights, 17/28-header window edges, damping/bounds, ZIP 205/208 Testnet minimum difficulty, response partition permutations, and differential calls against `AdjustedDifficulty`.
 - **HV-05 `mtp_and_future_time`:** 1–11 predecessor medians, equality/one-second boundaries, Mainnet height 1/2, Testnet height 653,605/653,606, Regtest/custom activation schedules with PoW enabled and disabled, two-hour equality, deferred reevaluation, clock advancement, and restart while deferred.
 - **HV-06 `checkpoint_anchor_context`:** genesis, each configured checkpoint fixture, conflicting ancestry, observable checkpoint checks, trusted later-start context of 28 headers, bad backward linkage, and normal first post-anchor validation.
-- **HV-07 `work_vectors`:** compact target to exact 256-bit work vectors, values above `u128::MAX`, 256-bit suffix sums, overflow fail-close at the `2^256` boundary, locally recomputed versus advertised work, 32-byte little-endian v8 work encoding, and the raw-hash equal-work comparator.
+- **HV-07 `work_vectors`:** compact target to exact 256-bit work vectors, values above `u128::MAX`, 256-bit suffix sums, overflow fail-close at the `2^256` boundary, locally recomputed versus advertised work, the 32-byte little-endian wire work encoding, and the raw-hash equal-work comparator.
 - **HV-08 `commitment_field_structure`:** every production activation boundary, malformed and canonical Sapling-root encodings, zero/nonzero Heartwood activation reserved fields, Canopy-at-Heartwood overlapping activation, NU5-and-later opaque commitment structure, and Regtest/custom activation schedules differential-tested against `Header::commitment(network, height)`.
 - **HV-09 `settled_upgrade_pins`:** Mainnet NU6.2 at 3,364,600 and Testnet NU6.2 at 4,052,000 with correct/wrong/missing hashes; absent, malformed, duplicate-conflicting, stale, and peer-supplied-only manifests; optional checkpoints disabled or ending below activation; candidate-upgrade non-promotion; and fail-closed startup before publication on both networks and in both engine modes.
 
@@ -574,18 +572,18 @@ Each named test below is a deterministic test target or parameterized suite. Mod
 - **IN-04 `operator_reasons`:** nested operator invalidations, reconsider of one reason, permanent reason preservation, atomic reselection, and restart.
 - **IN-05 `generation_permutations`:** stale success/failure after reset, generation CAS conflict, request/pending-owner mismatch, old coverage/retry/body task, sole publisher, and absence of peer-score effects.
 - **IN-06 `vct_branch_phases`:** reset while VCT repair is scheduled, on-wire, buffered, capacity-waiting, state-dispatched, and completed late; metadata authentication boundary and bad supplier provenance.
-- **IN-07 `unknown_anchor_recovery`:** local v7 stale anchor reload/reanchor, bounded retry, no score, coherent publication, and explicit v8 ancestry-contract violation.
+- **IN-07 `unknown_anchor_recovery`:** local stale-anchor reload/reanchor, bounded retry, no score, coherent publication, and explicit peer-attributable ancestry-contract violation.
 
 #### Protocol and differential behavior
 
-- **P8-01 `v8_codec_and_fuzz`:** every message/outcome, exact integer/hash encoding including 32-byte little-endian work, zero IDs, booleans, bounds, trailing bytes, oversized payloads, vector lengths, version-selected discriminant 4, v7 `NewBlock` rejection as v8, and mutation fuzzing.
-- **P8-02 `locator_vectors`:** tips from heights 0 through 2,000, exact exponential offsets, 1,000 offset, final anchor, deduplication, order, and 13-entry cap.
-- **P8-03 `target_snapshot_and_continuation`:** target changes during serve, selection changes during serve, count/byte continuations, same target across pages, exact completed tip, and no silent substitution.
-- **P8-04 `outcomes_and_attribution`:** all four explicit outcomes, stale refresh, busy backoff, malformed ancestor, mismatched target/ID, invalid header, and score/no-score assertions.
-- **P8-05 `multipeer_fork_discovery`:** shorter-higher-work, longer-lower-work, same-height equal-work, same-height greater-work, unknown fork, same-height status trigger, and permutation-independent convergence.
-- **P8-06 `aux_schema_and_body_hints`:** schema mask/selector negotiation, exact schema-1 156-byte golden vectors, every field and root encoding, height mismatch, preactivation defaults, NU5/NU6.3/NU7 boundaries, all-or-none parallel counts, unavailable metadata fallback, unknown/future schemas, `0`/`1`/`2,000,000`/`2,000,001` body hints, and proof that hints cannot drive allocation or admission credit.
-- **P8-07 `status_propagation`:** initial status immediately after negotiation, change-driven updates for tip/anchor/retention/cap changes, burst coalescing with the two-second freshness and one-per-second floor, configured periodic refresh, snapshot atomicity against concurrent selection changes, and non-punitive handling of silent or stale-status peers.
-- **P7-01 `v7_compatibility`:** selected projection serving, retained-parent acceptance, stale implicit anchor, no false score, unknown fork limitation, and v7-only `NewBlock` discriminant behavior; standard Zcash fallback with ZIP 204 locator selection, `hash_stop`, the 160-header response bound, canonical CompactSize and header encodings, checksum and 2 MiB framing, contiguous responses, malformed-response attribution, and non-punitive empty responses.
+- **PW-01 `codec_and_fuzz`:** every message/outcome, exact integer/hash encoding including 32-byte little-endian work, zero IDs, booleans, bounds, trailing bytes, oversized payloads, vector lengths, rejection of every discriminant outside 1–4 (including a predecessor `NewBlock` payload), and mutation fuzzing.
+- **PW-02 `locator_vectors`:** tips from heights 0 through 2,000, exact exponential offsets, 1,000 offset, final anchor, deduplication, order, and 13-entry cap.
+- **PW-03 `target_snapshot_and_continuation`:** target changes during serve, selection changes during serve, count/byte continuations, same target across pages, exact completed tip, and no silent substitution.
+- **PW-04 `outcomes_and_attribution`:** all four explicit outcomes, stale refresh, busy backoff, malformed ancestor, mismatched target/ID, invalid header, and score/no-score assertions.
+- **PW-05 `multipeer_fork_discovery`:** shorter-higher-work, longer-lower-work, same-height equal-work, same-height greater-work, unknown fork, same-height status trigger, and permutation-independent convergence.
+- **PW-06 `aux_schema_and_body_hints`:** schema mask/selector negotiation, exact schema-1 156-byte golden vectors, every field and root encoding, height mismatch, preactivation defaults, NU5/NU6.3/NU7 boundaries, all-or-none parallel counts, unavailable metadata fallback, unknown/future schemas, `0`/`1`/`2,000,000`/`2,000,001` body hints, and proof that hints cannot drive allocation or admission credit.
+- **PW-07 `status_propagation`:** initial status immediately after the stream opens, change-driven updates for tip/anchor/retention/cap changes, burst coalescing with the two-second freshness and one-per-second floor, configured periodic refresh, snapshot atomicity against concurrent selection changes, and non-punitive handling of silent or stale-status peers.
+- **PW-08 `single_protocol_surface`:** a peer without stream version 8 is given no header-sync stream and no score; no compatibility, predecessor, or legacy `getheaders` code path exists in the header-sync module tree or its public API; and the legacy Zcash P2P message handlers are byte-identical to their pre-engine behavior.
 - **DF-01 `header_full_state_parity`:** body-valid generated fork graphs fed to the integrated header engine and full state from the same finalized anchor; require identical observable-header acceptance, work, raw-hash tie order, and selected tip before a full-state finalization event.
 - **DF-02 `intentional_difference_vectors`:** coinbase height, Merkle/body mismatch, transaction/proof/script failure, nullifier/anchor/value-pool/state-transition failure, local future time, and header-valid/body-invalid outcomes, each with an asserted typed explanation.
 
@@ -608,8 +606,8 @@ The following matrix supersedes the old audit invariant that the verified chain 
 | Latest settled activation is only an optional/stale checkpoint | independent release-authenticated settled-upgrade pin and fail-closed startup | HV-09 |
 | Incumbent-relative 1,000-block rule makes arrival order select an unreplaceable fork | eligibility relative only to `finalized`; explicit integrated and headers-only finality sources | DG-05, DG-07 |
 | Header commitment field is not structurally interpreted at inferred height | mandatory `Header::commitment(network, height)` parity | HV-08, DF-01 |
-| v8 auxiliary records, body hints, and discriminant 4 are underspecified | exact schema/hint codec, immutable schema evolution, and explicit removal of v8 `NewBlock` | P8-01, P8-06, P7-01 |
-| Legacy `getheaders` fallback can drift from Zcash P2P semantics | explicit ZIP 204 codec, locator, count, framing, and continuity requirements | P7-01 |
+| Auxiliary records, body hints, and discriminant 4 are underspecified | exact schema/hint codec, immutable schema evolution, and a fixed four-message set with no block relay | PW-01, PW-06 |
+| Compatibility and fallback paths multiply the trusted surface and rot untested | one protocol, one codec, one status, one stream version; no predecessor or legacy header exchange | PW-08 |
 | Consensus authority is mixed with custom/checkpoint/Zakura policy | separate ZC, ZP, ZF, ZW, and LS rules and parity assertions | HV-03, HV-06, HV-09, DF-01, conformance-manifest self-test |
 
 The 15 named audit scenarios are executable cases, not prose-only acceptance examples:
@@ -642,14 +640,15 @@ Every normative rule is mapped here. A range such as `LC-SCOPE-01..03` includes 
 | LC-SCOPE-04..06 | DF-02, architecture dependency check |
 | LC-SCOPE-07 | IN-06, DF-02 |
 | LC-SCOPE-08 | DG-07, DF-02 |
+| LC-SCOPE-09 | PW-08, architecture dependency check |
 | LC-DAG-01..03 | DG-01, DG-04, DG-06 |
 | LC-FRONTIER-01..04 | DG-02, DG-03, IN-01, AUD-15 |
 | LC-GEN-01..05 | DG-03, IN-05, AUD-05..09, AUD-13..14 |
 | LC-TXN-01..02 | DG-03, IN-01, IN-04, IN-06, AUD-10..14 |
 | LC-RECOVER-01..03 | DG-04, AUD-14 |
-| LC-VAL-01 | HV-01, P8-01 |
+| LC-VAL-01 | HV-01, PW-01 |
 | LC-VAL-02..03 | HV-02 |
-| LC-HEIGHT-01 | HV-02, P8-03 |
+| LC-HEIGHT-01 | HV-02, PW-03 |
 | LC-COMMIT-01..02 | HV-08, DF-01 |
 | LC-VAL-04..05 | HV-03 |
 | LC-VAL-06 | HV-04, DF-01 |
@@ -664,22 +663,21 @@ Every normative rule is mapped here. A range such as `LC-SCOPE-01..03` includes 
 | LC-ANCHOR-04..05 | HV-09, DG-04 |
 | LC-SELECT-01..04 | DG-01, HV-07, DF-01, AUD-01..03 |
 | LC-REORG-01, LC-FINAL-01..04 | DG-05, DG-07, AUD-13 |
-| LC-RETAIN-01..04 | DG-06, P8-05 |
+| LC-RETAIN-01..04 | DG-06, PW-05 |
 | LC-INT-01..04 | IN-01, IN-04, IN-06, AUD-04, AUD-10..15 |
 | LC-BODY-01..04 | IN-02, DF-02 |
 | LC-OP-01..02 | IN-04, AUD-10..12 |
 | LC-AVAIL-01..03 | IN-03 |
 | LC-WORK-01..03 | IN-05, IN-07, AUD-04..09, AUD-INCIDENT |
-| LC-ERR-01..02 | IN-02, IN-05, IN-07, P8-04 |
+| LC-ERR-01..02 | IN-02, IN-05, IN-07, PW-04 |
 | LC-AUX-01..04 | IN-06 |
-| LC-V8-01 | P8-01 |
-| LC-V8-02 | P8-01, P8-05, HV-07 |
-| LC-V8-03..04 | P8-02, P8-05 |
-| LC-V8-05..07 | P8-03, P8-04 |
-| LC-V8-08..12 | P8-03, P8-04, P8-05 |
-| LC-V8-13..16 | P8-01, P8-06, P7-01 |
-| LC-V8-17 | P8-05, P8-07 |
-| LC-V7-01..04 | P7-01, IN-07 |
+| LC-WIRE-01 | PW-01 |
+| LC-WIRE-02 | PW-01, PW-05, HV-07 |
+| LC-WIRE-03..04 | PW-02, PW-05 |
+| LC-WIRE-05..07 | PW-03, PW-04 |
+| LC-WIRE-08..12 | PW-03, PW-04, PW-05 |
+| LC-WIRE-13..16 | PW-01, PW-06 |
+| LC-WIRE-17 | PW-05, PW-07 |
 | LC-PARITY-01..03 | HV-03, HV-08, DF-01, DF-02 |
 | LC-TEST-01..02 | conformance-manifest self-test |
 | LC-ACCEPT-01..05 | conformance-manifest self-test, all suites in sections 7.2 and 7.3 |
@@ -696,7 +694,7 @@ The “architecture dependency check” asserts that wallet scanning, FlyClient 
 
 **LC-ACCEPT-04 [LS] — Terminating body-failure handling.** Body-invalid and body-unavailable cases MUST terminate each retry episode in either deterministic reselection or an explicit persistent alarm; neither may produce an infinite silent retry.
 
-**LC-ACCEPT-05 [LS] — Explained parity differences.** The full-state/header differential suite MUST enumerate and explain every intentional difference. Version 1.3 acceptance MUST contain no unresolved design placeholders.
+**LC-ACCEPT-05 [LS] — Explained parity differences.** The full-state/header differential suite MUST enumerate and explain every intentional difference. Version 1.4 acceptance MUST contain no unresolved design placeholders.
 
 ## 8. Implementation oracle and source authority
 
@@ -715,7 +713,7 @@ The implementation must share code with or remain differential-test equivalent t
 | Local 1,000-block finality horizon | `zakura-chain/src/parameters/constants.rs`, `zakura-state/src/constants.rs` |
 | Shared non-finalized fork cap | `MAX_NON_FINALIZED_CHAIN_FORKS` (today `zakura-state/src/constants.rs`; the redesign MUST hoist one shared definition into `zakura-chain::parameters` consumed by both full state and the header engine) |
 | Checkpoint hashes and verification | `zakura-chain/src/parameters/checkpoint/`, `zakura-consensus/src/checkpoint.rs` |
-| Existing v7 framing/bounds/correlation | `zakura-network/src/zakura/header_sync/wire.rs`, `config.rs`, `validation.rs` |
+| Existing header-sync framing/bounds/correlation, as the parity target for frame caps and request correlation only | `zakura-network/src/zakura/header_sync/wire.rs`, `config.rs`, `validation.rs` |
 | Existing reactor, scheduling, coverage, and repair ownership | `zakura-network/src/zakura/header_sync/reactor.rs`, `state.rs`, `work_queue.rs`, `events.rs` |
 | Current provisional persistence/startup audit | `zakura-state/src/service/finalized_state/zakura_db/block.rs`, `.../block/tests/header_store_coherence/` |
 | ZIP 221/244 auxiliary authentication | `zakura-chain/src/parallel/commitment_aux.rs`, `commitment_aux_verify.rs`, `block/commitment.rs` |
@@ -724,8 +722,8 @@ Non-normative provenance: the production failure evidence that motivated the aud
 
 ### 8.2 Official protocol sources
 
-- [Zcash Protocol Specification](https://zips.z.cash/protocol/protocol.pdf), version `v2026.7.0-33-gc55edc [NU6.2]` dated 2026-07-12 for the version 1.3 settled hashes, and especially its block-header, difficulty-adjustment, work, and best-chain rules.
-- [ZIP 204: Zcash P2P Network Protocol](https://zips.z.cash/zip-0204), for bounded framing, locators, and contiguous header responses. Native v8 remains Zakura-specific.
+- [Zcash Protocol Specification](https://zips.z.cash/protocol/protocol.pdf), version `v2026.7.0-33-gc55edc [NU6.2]` dated 2026-07-12 for the version 1.4 settled hashes, and especially its block-header, difficulty-adjustment, work, and best-chain rules.
+- [ZIP 204: Zcash P2P Network Protocol](https://zips.z.cash/zip-0204), cited only as the design ancestry for bounded framing, locators, and contiguous header responses. This engine implements no ZIP 204 message path: the native protocol is Zakura-specific and runs on the Zakura v2 P2P stack, and the legacy Zcash P2P stack is untouched (LC-SCOPE-09).
 - [ZIP 205](https://zips.z.cash/zip-0205) and [ZIP 208](https://zips.z.cash/zip-0208), for Testnet difficulty and Blossom target-spacing behavior.
 - [ZIP 221: FlyClient consensus-layer changes](https://zips.z.cash/zip-0221), for history-tree commitments and work metadata. Its logarithmic proof protocol is explicitly excluded from v1.
 - [ZIP 244: transaction identifier non-malleability](https://zips.z.cash/zip-0244), for `hashAuthDataRoot` and `hashBlockCommitments` semantics.
@@ -741,8 +739,8 @@ Non-normative provenance: the production failure evidence that motivated the aud
 | Protocol section 7.6, Block Header Encoding and Consensus | signed version, canonical solution encoding, MTP, exact Mainnet/Testnet maximum-time activation heights, and upgrade-specific commitment semantics | LC-VAL-02..08, LC-COMMIT-01; HV-02..05, HV-08, DF-01 |
 | Protocol sections 7.7.1–7.7.2, Equihash and difficulty filter | Equihash parameters/solution and little-endian header-hash target filter | LC-VAL-04..05; HV-03, DF-01 |
 | Protocol sections 7.7.3–7.7.4; ZIP 205; ZIP 208 | 17-block averaging, 11-block medians, compact-target conversion, Testnet minimum difficulty, and Blossom spacing | LC-VAL-06; HV-04, DF-01 |
-| Protocol section 7.7.5; ZIP 221 work metadata | exact per-block work and ecosystem 256-bit cumulative-work bound | LC-VAL-10, LC-WORKCALC-01, LC-SELECT-02, LC-V8-02; HV-07, P8-01, DF-01 |
-| ZIP 204 | negotiated P2P framing, canonical CompactSize, `getheaders` locator/`hash_stop` behavior, 160-header cap, and contiguous responses | LC-VAL-01, LC-V7-03..04; HV-01, P7-01 |
+| Protocol section 7.7.5; ZIP 221 work metadata | exact per-block work and ecosystem 256-bit cumulative-work bound | LC-VAL-10, LC-WORKCALC-01, LC-SELECT-02, LC-WIRE-02; HV-07, PW-01, DF-01 |
+| ZIP 204 | bounded framing and contiguous-response discipline, adopted as design ancestry only; no `getheaders`/`headers` message path is implemented or served | LC-VAL-01, LC-SCOPE-09; HV-01, PW-08 |
 | ZIP 221 | Heartwood activation zero, history-tree commitment semantics, and one-header-later authentication boundary | LC-COMMIT-01, LC-AUX-01..04; HV-08, IN-06 |
 | ZIP 244 | NU5 `hashBlockCommitments` and `hashAuthDataRoot` semantics | LC-COMMIT-01, LC-AUX-01..04; HV-08, IN-02, IN-06 |
 | ZIP 307 | wallet scanning and payment detection, explicitly outside this engine | LC-SCOPE-04; architecture dependency check |
@@ -751,6 +749,6 @@ This table covers every part of the cited Zcash sources that this engine impleme
 
 ### 8.4 Fixed design decisions
 
-This version fixes the following choices: one integrated reusable engine; linear verification of all candidate headers; native v8 fork discovery with limited v7 compatibility and ZIP 204-conformant fallback; independent `header_best`, `verified_best`, and `finalized`; exact 256-bit work with 32-byte little-endian v8 encoding; Zakura’s greater-raw-tip-hash equal-work policy; integrated finality sourced only from fully verified state; headers-only automatic local finality 1,000 descendants behind `header_best`; an eligible-candidate-tip cap equal to the shared non-finalized fork-cap constant, currently 10; 65,536 non-finalized DAG nodes; body-invalid branch disqualification; body-unavailable selection plus alarm; independent mandatory settled-upgrade pins in every deployment mode as a deliberate strengthening of the Zcash deployment requirement; absolute local checkpoint pins with observable header checks; v8 auxiliary schema 1 and no v8 `NewBlock`; and authenticated-only use of VCT/tree-aux metadata.
+This version fixes the following choices: one integrated reusable engine; linear verification of all candidate headers; exactly one native fork-discovery protocol at one supported stream version, with no predecessor compatibility, no fallback header exchange, and no change to the legacy Zcash P2P stack; independent `header_best`, `verified_best`, and `finalized`; exact 256-bit work with 32-byte little-endian wire encoding; Zakura’s greater-raw-tip-hash equal-work policy; integrated finality sourced only from fully verified state; headers-only automatic local finality 1,000 descendants behind `header_best`; an eligible-candidate-tip cap equal to the shared non-finalized fork-cap constant, currently 10; 65,536 non-finalized DAG nodes; body-invalid branch disqualification; body-unavailable selection plus alarm; independent mandatory settled-upgrade pins in every deployment mode as a deliberate strengthening of the Zcash deployment requirement; absolute local checkpoint pins with observable header checks; auxiliary schema 1 and no block-relay message in header sync; and authenticated-only use of VCT/tree-aux metadata.
 
 Any future change to one of these choices requires a new specification version, explicit migration and compatibility rules, and corresponding updates to the conformance manifest. It is not an implementation detail.

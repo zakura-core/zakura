@@ -1,4 +1,4 @@
-spec_version = "1.3"
+spec_version = "1.4"
 
 # Phase 0 registers the complete rule catalog without inventing implementation
 # claims. Later checkpoints change each status only when its real owner and
@@ -43,6 +43,14 @@ status = "unimplemented"
 id = "LC-SCOPE-07"
 name = "Auxiliary-evidence boundary"
 status = "unimplemented"
+
+[[rule]]
+id = "LC-SCOPE-09"
+name = "Single protocol, no compatibility surface"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::header_sync_streams"
+tests = ["PW-08::declares_only_capability_bit_five_at_stream_version_eight", "PW-08::stale_accept_new_blocks_setting_is_rejected"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-DAG-01"
@@ -397,7 +405,7 @@ id = "LC-RETAIN-04"
 name = "Staged-target limits"
 status = "implemented"
 owner = "zakura_network::PeerTargetAdvertisement"
-tests = ["P8-05::registry_caps_targets_and_only_supersedes_unstarted_work"]
+tests = ["PW-05::registry_caps_targets_and_only_supersedes_unstarted_work"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -514,129 +522,109 @@ name = "Cryptographic metadata authentication"
 status = "unimplemented"
 
 [[rule]]
-id = "LC-V8-01"
-name = "Bounded v8 decoding"
+id = "LC-WIRE-01"
+name = "Bounded decoding"
 status = "implemented"
-owner = "zakura_network::zakura::header_sync::HeaderSyncV8Codec::decode"
-tests = ["P8-01::bounded_decode_rejects_discriminants_ids_bools_heights_and_trailing_bytes", "P8-01::decode_rejects_each_vector_hint_schema_and_byte_boundary"]
+owner = "zakura_network::zakura::header_sync::HeaderSyncCodec::decode"
+tests = ["PW-01::bounded_decode_rejects_discriminants_ids_bools_heights_and_trailing_bytes", "PW-01::decode_rejects_each_vector_hint_schema_and_byte_boundary"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
-id = "LC-V8-02"
+id = "LC-WIRE-02"
 name = "Atomic status snapshot"
 status = "implemented"
-owner = "zakura_network::zakura::header_sync::StatusV8::from_snapshot"
-tests = ["P8-01::v8_status_uses_committed_snapshots_and_bounded_cadence"]
+owner = "zakura_network::zakura::header_sync::Status::from_snapshot"
+tests = ["PW-01::status_uses_committed_snapshots_and_bounded_cadence"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
-id = "LC-V8-17"
+id = "LC-WIRE-17"
 name = "Status publication cadence"
 status = "implemented"
 owner = "zakura_network::zakura::header_sync::scheduler::status::StatusScheduler"
-tests = ["P8-07::v8_status_uses_committed_snapshots_and_bounded_cadence", "P8-07::initial_refresh_and_coalesced_change_deadlines_are_bounded"]
+tests = ["PW-07::status_uses_committed_snapshots_and_bounded_cadence", "PW-07::initial_refresh_and_coalesced_change_deadlines_are_bounded"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
-id = "LC-V8-03"
+id = "LC-WIRE-03"
 name = "Locator construction"
 status = "implemented"
 owner = "zakura_header_chain::HeaderLocator::for_selected_path"
-tests = ["P8-02::selected_path_locators_match_every_offset_and_cap_boundary", "P8-02::selected_path_locator_appends_a_non_genesis_finalized_frontier", "P8-02::selected_path_locator_fails_closed_on_a_projection_gap", "P8-02::coherent_reader_builds_locator_from_the_durable_selected_projection"]
+tests = ["PW-02::selected_path_locators_match_every_offset_and_cap_boundary", "PW-02::selected_path_locator_appends_a_non_genesis_finalized_frontier", "PW-02::selected_path_locator_fails_closed_on_a_projection_gap", "PW-02::coherent_reader_builds_locator_from_the_durable_selected_projection"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
-id = "LC-V8-04"
+id = "LC-WIRE-04"
 name = "Advertised-target scheduling"
 status = "implemented"
 owner = "zakura_network::TargetPursuit"
-tests = ["P8-05::unknown_status_targets_remain_eligible_regardless_of_advisory_shape", "P8-05::registry_caps_targets_and_only_supersedes_unstarted_work", "P8-05::v8_target_from_status_supersedes_only_before_exact_locator_publication"]
+tests = ["PW-05::unknown_status_targets_remain_eligible_regardless_of_advisory_shape", "PW-05::registry_caps_targets_and_only_supersedes_unstarted_work", "PW-05::target_from_status_supersedes_only_before_exact_locator_publication"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
-id = "LC-V8-13"
+id = "LC-WIRE-13"
 name = "Body-size hint safety"
 status = "unimplemented"
 
 [[rule]]
-id = "LC-V8-14"
+id = "LC-WIRE-14"
 name = "Auxiliary-schema validation"
 status = "unimplemented"
 
 [[rule]]
-id = "LC-V8-15"
+id = "LC-WIRE-15"
 name = "Immutable schema evolution"
 status = "implemented"
-owner = "zakura_network::zakura::header_sync::AuxSchemaV8"
-tests = ["P8-01::request_bounds_and_schema_advertisement_are_enforced", "P8-01::body_hints_completion_and_aux_defaults_are_enforced"]
+owner = "zakura_network::zakura::header_sync::AuxSchema"
+tests = ["PW-01::request_bounds_and_schema_advertisement_are_enforced", "PW-01::body_hints_completion_and_aux_defaults_are_enforced"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
-id = "LC-V8-16"
-name = "Version-scoped discriminants"
+id = "LC-WIRE-16"
+name = "Fixed discriminants and no block relay"
 status = "implemented"
-owner = "zakura_network::zakura::header_sync::run_v8_peer"
-tests = ["P8-01::discriminant_four_is_decoded_only_by_the_negotiated_codec", "P7-01::v7_new_block_golden_bytes_remain_frozen", "P8-01::negotiated_v8_pipe_dispatches_discriminant_four_as_outcome"]
+owner = "zakura_network::zakura::header_sync::run_peer"
+tests = ["PW-01::discriminant_four_is_decoded_only_as_headers_outcome", "PW-01::discriminator_four_never_guesses_block_relay_payload", "PW-01::discriminator_four_is_always_headers_outcome"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
-id = "LC-V8-05"
+id = "LC-WIRE-05"
 name = "Snapshot-bound path serving"
 status = "unimplemented"
 
 [[rule]]
-id = "LC-V8-06"
+id = "LC-WIRE-06"
 name = "No target substitution"
 status = "unimplemented"
 
 [[rule]]
-id = "LC-V8-07"
+id = "LC-WIRE-07"
 name = "Explicit response outcomes"
 status = "unimplemented"
 
 [[rule]]
-id = "LC-V8-08"
+id = "LC-WIRE-08"
 name = "Correlated response validation"
 status = "unimplemented"
 
 [[rule]]
-id = "LC-V8-09"
+id = "LC-WIRE-09"
 name = "Continuation target integrity"
 status = "unimplemented"
 
 [[rule]]
-id = "LC-V8-10"
+id = "LC-WIRE-10"
 name = "Non-punitive retry outcomes"
 status = "unimplemented"
 
 [[rule]]
-id = "LC-V8-11"
+id = "LC-WIRE-11"
 name = "Peer-attributable violations"
 status = "unimplemented"
 
 [[rule]]
-id = "LC-V8-12"
+id = "LC-WIRE-12"
 name = "Unknown-fork discovery"
-status = "unimplemented"
-
-[[rule]]
-id = "LC-V7-01"
-name = "Retained-ancestry compatibility"
-status = "unimplemented"
-
-[[rule]]
-id = "LC-V7-02"
-name = "Stale-anchor handling"
-status = "unimplemented"
-
-[[rule]]
-id = "LC-V7-03"
-name = "Disconnected-fork fallback"
-status = "unimplemented"
-
-[[rule]]
-id = "LC-V7-04"
-name = "ZIP 204 `getheaders` conformance"
 status = "unimplemented"
 
 [[rule]]

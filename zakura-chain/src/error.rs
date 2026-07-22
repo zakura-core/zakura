@@ -25,26 +25,6 @@ pub enum NoteError {
     InvalidRho,
 }
 
-/// An error type pertaining to note commitments.
-#[derive(Error, Copy, Clone, Debug, PartialEq, Eq)]
-pub enum NoteCommitmentError {
-    /// Errors of type `RandError`.
-    #[error("Randomness generation failure")]
-    InsufficientRandomness(#[from] RandError),
-    /// Error of `jubjub::AffinePoint::try_from`.
-    #[error("failed to generate a sapling::NoteCommitment from a diversifier")]
-    InvalidDiversifier,
-}
-
-/// An error type pertaining to key generation, parsing, modification,
-/// randomization.
-#[derive(Error, Copy, Clone, Debug, PartialEq, Eq)]
-pub enum KeyError {
-    /// Errors of type `RandError`.
-    #[error("Randomness generation failure")]
-    InsufficientRandomness(#[from] RandError),
-}
-
 /// An error type pertaining to payment address generation, parsing,
 /// modification, diversification.
 #[derive(Error, Copy, Clone, Debug, PartialEq, Eq)]

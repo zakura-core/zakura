@@ -1188,6 +1188,7 @@ async fn sync_checkpoints_local() -> Result<()> {
     let producer_network = Network::new_regtest(RegtestParameters::default());
     let producer_p2p_addr = format!("127.0.0.1:{}", random_known_port()).parse()?;
     let mut producer_config = os_assigned_rpc_port_config(false, &producer_network)?;
+    producer_config.mempool.debug_enable_at_height = Some(0);
     producer_config.network.listen_addr = producer_p2p_addr;
     producer_config.network.initial_testnet_peers = [].into();
     producer_config.network.cache_dir = false.into();
@@ -1197,7 +1198,7 @@ async fn sync_checkpoints_local() -> Result<()> {
         .spawn_child(args!["start"])?
         .with_timeout(LARGE_CHECKPOINT_TIMEOUT);
     let producer_rpc_addr = read_listen_addr_from_logs(&mut producer, OPENED_RPC_ENDPOINT_MSG)?;
-    tokio::time::sleep(LAUNCH_DELAY).await;
+    producer.expect_stdout_line_matches("activating mempool")?;
 
     let producer_rpc =
         RpcRequestClient::new_with_timeout(producer_rpc_addr, Duration::from_secs(15 * 60));
@@ -1478,11 +1479,10 @@ async fn metrics_endpoint() -> Result<()> {
     config.metrics.endpoint_addr = Some(endpoint.parse().unwrap());
 
     let dir = testdir()?.with_config(&mut config)?;
-    let child = dir.spawn_child(args!["start"])?;
-
-    // Run `zakurad` for a few seconds before testing the endpoint
-    // Since we're an async function, we have to use a sleep future, not thread sleep.
-    tokio::time::sleep(LAUNCH_DELAY).await;
+    let mut child = dir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
+    child.expect_stdout_line_matches(format!("Opened metrics endpoint at {endpoint}"))?;
 
     // Create an http client
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
@@ -1514,9 +1514,6 @@ async fn metrics_endpoint() -> Result<()> {
     )?;
     std::str::from_utf8(&body).expect("unexpected invalid UTF-8 in metrics exporter response");
 
-    // Make sure metrics was started
-    output.stdout_line_contains(format!("Opened metrics endpoint at {endpoint}").as_str())?;
-
     // [Note on port conflict](#Note on port conflict)
     output
         .assert_was_killed()
@@ -1547,11 +1544,10 @@ async fn tracing_endpoint() -> Result<()> {
     config.tracing.endpoint_addr = Some(endpoint.parse().unwrap());
 
     let dir = testdir()?.with_config(&mut config)?;
-    let child = dir.spawn_child(args!["start"])?;
-
-    // Run `zakurad` for a few seconds before testing the endpoint
-    // Since we're an async function, we have to use a sleep future, not thread sleep.
-    tokio::time::sleep(LAUNCH_DELAY).await;
+    let mut child = dir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
+    child.expect_stdout_line_matches(format!("Opened tracing endpoint at {endpoint}"))?;
 
     // Create an http client
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
@@ -1601,10 +1597,6 @@ async fn tracing_endpoint() -> Result<()> {
 
     let output = child.wait_with_output()?;
     let output = output.assert_failure()?;
-
-    // Make sure tracing endpoint was started
-    output.stdout_line_contains(format!("Opened tracing endpoint at {endpoint}").as_str())?;
-    // TODO: Match some trace level messages from output
 
     // Make sure the endpoint header is correct
     // The header is split over two lines. But we don't want to require line
@@ -3083,10 +3075,10 @@ async fn rejected_block_does_not_reject_same_hash_block_children() -> Result<()>
 
     let mut block_builder = testdir()?
         .with_config(&mut config)?
-        .spawn_child(args!["start"])?;
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut block_builder, OPENED_RPC_ENDPOINT_MSG)?;
-
-    tokio::time::sleep(LAUNCH_DELAY).await;
+    block_builder.expect_stdout_line_matches("activating mempool")?;
 
     let client = RpcRequestClient::new(rpc_address);
     let mut blocks = Vec::new();
@@ -3103,10 +3095,10 @@ async fn rejected_block_does_not_reject_same_hash_block_children() -> Result<()>
 
     let mut zakurad = testdir()?
         .with_config(&mut config)?
-        .spawn_child(args!["start"])?;
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
-
-    tokio::time::sleep(LAUNCH_DELAY).await;
+    zakurad.expect_stdout_line_matches("activating mempool")?;
 
     let client = RpcRequestClient::new(rpc_address);
     client.submit_block(blocks[0].clone()).await?;
@@ -3345,7 +3337,8 @@ async fn pruned_storage_mode_prunes_during_regtest_sync() -> Result<()> {
 
     let mut zakurad = testdir()?
         .with_config(&mut config)?
-        .spawn_child(args!["start"])?;
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
     // `with_config` set the state cache dir to the test directory; keep the
     // `TempDir` alive so we can reopen the database after shutdown.
@@ -3355,7 +3348,7 @@ async fn pruned_storage_mode_prunes_during_regtest_sync() -> Result<()> {
         .take()
         .expect("zakurad should have a test directory");
 
-    tokio::time::sleep(LAUNCH_DELAY).await;
+    zakurad.expect_stdout_line_matches("activating mempool")?;
 
     let client = RpcRequestClient::new(rpc_address);
 
@@ -3450,10 +3443,6 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
     let mut child = test_dir.spawn_child(args!["start"])?;
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
     let indexer_listen_addr = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
-
-    tracing::info!("waiting for Zakura state cache to be opened");
-
-    tokio::time::sleep(LAUNCH_DELAY).await;
 
     tracing::info!("starting read state with syncer");
     // Spawn a read state with the RPC syncer to check that it has the same best chain as Zebra
@@ -3673,10 +3662,6 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
     let mut child = test_dir.spawn_child(args!["start"])?;
     let _rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
     let indexer_listen_addr = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
-
-    tracing::info!("waiting for Zakura state cache to be opened");
-
-    tokio::time::sleep(LAUNCH_DELAY).await;
 
     tracing::info!("starting read state with syncer");
     // Spawn a read state with the RPC syncer to check that it has the same best chain as Zebra
@@ -4211,15 +4196,15 @@ async fn invalidate_and_reconsider_block() -> Result<()> {
     );
     let mut config = os_assigned_rpc_port_config(false, &net)?;
     config.state.ephemeral = false;
+    config.mempool.debug_enable_at_height = Some(0);
 
     let test_dir = testdir()?.with_config(&mut config)?;
 
-    let mut child = test_dir.spawn_child(args!["start"])?;
+    let mut child = test_dir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
-
-    tracing::info!("waiting for Zakura state cache to be opened");
-
-    tokio::time::sleep(LAUNCH_DELAY).await;
+    child.expect_stdout_line_matches("activating mempool")?;
 
     let rpc_client = RpcRequestClient::new(rpc_address);
     let mut blocks = Vec::new();
@@ -4615,18 +4600,22 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
 
     tracing::info!("waiting for zakurad nodes to connect");
 
-    // Wait a few seconds for Zebra to start up and make outbound peer connections
-    tokio::time::sleep(LAUNCH_DELAY).await;
+    let peer_info = tokio::time::timeout(EXTENDED_LAUNCH_DELAY, async {
+        loop {
+            if let Ok(peer_info) = rpc_client_2
+                .json_result_from_call::<Vec<PeerInfo>>("getpeerinfo", "[]")
+                .await
+            {
+                if !peer_info.is_empty() {
+                    break peer_info;
+                }
+            }
 
-    tracing::info!("checking for peers");
-
-    // Call `getpeerinfo` to check that the zakurad instances have connected
-    let peer_info: Vec<PeerInfo> = rpc_client_2
-        .json_result_from_call("getpeerinfo", "[]")
-        .await
-        .map_err(|err| eyre!(err))?;
-
-    assert!(!peer_info.is_empty(), "should have outbound peer");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| eyre!("zakurad nodes did not connect before the launch timeout"))?;
 
     tracing::info!(
         ?peer_info,

@@ -27,7 +27,7 @@ use zakurad::components::With;
 
 use super::{
     config::{os_assigned_rpc_port_config, read_listen_addr_from_logs, testdir},
-    launch::{ZakuradTestDirExt, LAUNCH_DELAY},
+    launch::{ZakuradTestDirExt, EXTENDED_LAUNCH_DELAY},
     regtest::MiningRpcMethods,
 };
 
@@ -63,14 +63,14 @@ pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
 
         let mut zakurad = testdir()?
             .with_config(&mut config)?
-            .spawn_child(args!["start"])?;
-
-        tokio::time::sleep(LAUNCH_DELAY).await;
+            .spawn_child(args!["start"])?
+            .with_timeout(EXTENDED_LAUNCH_DELAY);
 
         let client = RpcRequestClient::new(read_listen_addr_from_logs(
             &mut zakurad,
             OPENED_RPC_ENDPOINT_MSG,
         )?);
+        zakurad.expect_stdout_line_matches("activating mempool")?;
 
         for _ in 0..2 {
             let (mut block, height) = client.block_from_template(&net).await?;

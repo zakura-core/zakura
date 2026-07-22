@@ -1,22 +1,10 @@
 name: Coverage
 
 on:
-  # Coverage is a 120-minute instrumented full build. Keep it off the per-push
-  # critical path: run it only on landings to the long-lived branches, once a
-  # night, and on demand. Pushes to short-lived dev branches no longer trigger
-  # it (it is not a merge gate).
-  push:
-    branches: [main, "release/**"]
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - .config/nextest.toml
-      - codecov.yml
-      - .github/workflows/coverage.yml
-
+  # Coverage is an expensive instrumented full build and is not a merge gate.
+  # Run it once a week on Sunday and allow maintainers to trigger it on demand.
   schedule:
-    - cron: "0 8 * * *"
+    - cron: "0 8 * * 0"
 
   workflow_dispatch:
 
@@ -57,7 +45,8 @@ jobs:
         with:
           toolchain: stable
           components: llvm-tools-preview
-          cache-on-failure: true
+          # Avoid reserving about 1.2 GB for this infrequent workflow.
+          cache: false
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 #v2.83.2
         with:
           tool: cargo-llvm-cov,nextest

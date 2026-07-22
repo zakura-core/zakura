@@ -6,103 +6,104 @@ labels: "A-release, C-exclude-from-changelog, P-Critical :ambulance:"
 assignees: ""
 ---
 
-A hotfix release should only be created when a bug or critical issue is discovered in an existing release, and waiting for the next scheduled release is impractical or unacceptable.
+A hotfix release should only be created when a bug or critical issue is
+discovered in an existing release, and waiting for the next scheduled release
+is impractical or unacceptable. It ships the fix on top of the release
+operators are already running, instead of everything unreleased on `main`.
 
-## Create the Release PR
+For an **embargoed security fix**, follow
+[`docs/security-hotfix-release.md`](https://github.com/zakura-core/zakura/blob/main/docs/security-hotfix-release.md):
+all preparation below happens in the private staging repo, this PR is opened
+at forward-merge time, and the extra steps there (advisory, dress rehearsal,
+canary soak, announcement) apply on top of this checklist.
 
-- [ ] Create a branch to fix the issue based on the tag of the release being fixed (not the `main` branch).
-      for example: `hotfix-v2.3.1` - this needs to be different to the tag name
-- [ ] Make the required changes
-- [ ] Create a hotfix release PR by adding `&template=hotfix-release-checklist.md` to the comparing url ([Example](https://github.com/zakura-core/zakura/compare/bump-v1.0.0?expand=1&template=hotfix-release-checklist.md)).
-- [ ] Add one `changelog-unreleased/<PR-number>.md` fragment describing the
-      operator-visible hotfix.
-- [ ] Add the `C-exclude-from-changelog` label because the release PR consumes
-      its own fragment rather than carrying it into the next release.
-- [ ] Add the `A-release` tag to the release pull request in order for the `check_no_git_refs_in_cargo_lock` to run.
-- [ ] Add the `do-not-merge` tag to prevent Mergify from merging, since after PR approval the
-      release is done from the branch itself.
-- [ ] Ensure the `check_no_git_refs_in_cargo_lock` check passes.
+## Create the Hotfix Branch
 
-## Update Versions
+- [ ] Cut `hotfix/v<version>` from the tag of the release being fixed (not
+      from `main`). The branch **must** be named for the exact tag it will
+      release — the `Create release` workflow refuses to tag `v<version>`
+      from any other branch. The `hotfix/v*` ruleset blocks deletion and
+      force-pushes.
+- [ ] Make the required changes, minimal and with tests.
+- [ ] For a public (non-embargoed) hotfix: open this PR from the branch with
+      `&template=hotfix-release-checklist.md` in the compare URL, and add the
+      `do-not-merge` label — the release is dispatched from the branch itself,
+      and the PR is merged (as a merge commit) only after the release.
+- [ ] Add the `A-release` label so `check-no-git-dependencies` runs, and
+      ensure it passes.
 
-If it is a Zakura hotfix, the release level should always follow semantic
-versioning as a `patch` release. If it is a crate hotfix, it should simply
-follow semver, depending on the thing being fixed.
+## Update Versions and Prepare the Release
 
-- [ ] Follow the "Update Zakura Version" section in the regular checklist for
-  instructions.
-- [ ] After all package version bumps, run
-      `make prepare-release-changelog RELEASE_TAG=v<version>`.
-- [ ] Review and commit the generated root changelog and fragment deletion.
-- [ ] Run
-      `make pre-release RELEASE_TAG=v<version> BASE_TAG=v<previous-version>`.
+Hotfixes are `patch` releases of the `zakura` package, plus semver bumps for
+each changed crate — follow the "Update Versions" sections of the
+[regular checklist](https://github.com/zakura-core/zakura/blob/main/.github/PULL_REQUEST_TEMPLATE/release-checklist.md)
+for the commands, using the branch checkout (release.toml allows
+`hotfix/v*`).
 
-## Update the Release PR
+- [ ] Bump the `zakura` package version and changed-crate versions.
+- [ ] Generate and commit the stored config snapshot
+      (`zakurad/tests/common/configs/v<version>.toml`) — `last_config_is_stored`
+      fails without it.
+- [ ] Assemble the changelog section for `v<version>`:
+  - public hotfix with fragments on the branch: run
+    `make prepare-release-changelog RELEASE_TAG=v<version>` and commit the
+    result;
+  - embargoed hotfix (no public PR yet): write the release section by hand,
+    exactly as assembly would produce it — for a stable tag that includes
+    absorbing any `v<version>-rc*` sections — and verify with
+    `./scripts/changelog.py release v<version> --check`.
+- [ ] Do **not** bump `ESTIMATED_RELEASE_HEIGHT`: a hotfix inherits the base
+      release's end-of-support schedule (see the process doc for why). Check
+      the remaining runway and state it in the release notes if it is short.
+- [ ] Run `make pre-release RELEASE_TAG=v<version> BASE_TAG=v<base-version>`
+      and get it passing on the final commit.
+- [ ] Verify crate packaging: `./scripts/check-crate-packaging.sh --verify`.
 
-- [ ] Push the version increments and the release constants to the hotfix release branch.
+## Publish the Release
 
-# Publish the Release
-
-## Create the GitHub Pre-Release (if Zakura hotfix)
-
-- [ ] Wait for the hotfix release PR to be reviewed and approved.
-- [ ] Create a new release
-- [ ] Set the tag name to the version tag,
-      for example: `v2.3.1`
-- [ ] Set the release to target the hotfix release branch
-- [ ] Set the release title to `Zakura` followed by the version tag,
-      for example: `Zakura 2.3.1`
-- [ ] Populate the release description with the final changelog you created;
-      starting just _after_ the title `## [Zakura ...` of the current version being released,
-      and ending just _before_ the title of the previous release.
-- [ ] Mark the release as 'pre-release', until it has been built and tested
-- [ ] Publish the pre-release to GitHub using "Publish Release"
-
-## Test the Pre-Release (if Zakura hotfix)
-
-- [ ] Wait until the Docker binaries have been built on the hotfix release branch, and the quick tests have passed:
-  - [ ] [release-binaries.yml](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush)
-
-## Publish Release (if Zakura hotfix)
-
-- [ ] [Publish the release to GitHub](https://github.com/zakura-core/zakura/releases) by disabling 'pre-release', then clicking "Set as the latest release"
+- [ ] Push the final branch to `zakura-core/zakura`.
+- [ ] Dispatch the
+      [Create release workflow](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml)
+      **from the `hotfix/v<version>` branch** with the exact tag. The
+      workflow validates, builds and verifies the assets, then waits at the
+      `release` environment.
+- [ ] Approve the `release` environment deployment (right commit? right
+      tag?). The workflow publishes a complete pre-release and creates the
+      protected tag; the tag push starts Docker publishing.
+- [ ] Update the release description from the changelog section.
+- [ ] Sign the release: `make sign-release TAG=v<version>`.
+- [ ] Stable hotfix only: promote the release — disable 'pre-release' **and**
+      "Set as the latest release". Release candidates are never promoted.
 
 ## Publish Crates
 
-- [ ] Checkout the hotfix release branch
-- [ ] [Run `cargo login`](https://github.com/zakura-core/zakura/dev/crate-owners.html#logging-in-to-cratesio)
-- [ ] Run `cargo clean` in the zakura repo
-- [ ] Publish the changed crates to crates.io; edit the list to only include
-      the crates that have been changed (`git diff --stat <previous-tag>`),
-      but keep their overall order — unchanged crates are not bumped or
-      published:
+- [ ] From a fresh checkout of the new tag: `cargo login`, then publish the
+      changed crates in dependency order per the regular checklist
+      (`cargo release publish --verbose --execute -p <crate>`), editing the
+      list to only the crates that changed.
+- [ ] Check `cargo install --locked --force --version <version> zakura` works
+      and put the output in a comment on this PR.
 
-```
-for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakura-tower-batch-control zakura-node-services zakura-script zakura-state zakura-consensus zakura-network zakura-rpc zakura-utils zakura; do cargo release publish --verbose --execute --allow-branch {hotfix-release-branch} -p $c; done
-```
+## Publish Docker Images
 
-- [ ] Check that the published version of Zakura can be installed from `crates.io`:
-      `cargo install --locked --force --version 2.minor.patch zakura && ~/.cargo/bin/zakurad`
-      and put the output in a comment on the PR.
+- [ ] Wait for the tag-push
+      [release-binaries.yml run](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush)
+      to publish images, and confirm the new tags in the
+      [Docker Hub zakura space](https://hub.docker.com/r/zakuracore/zakura/tags).
+      Hyphenated tags (release candidates) never move `latest`.
 
-## Publish Docker Images (if Zakura hotfix)
+## Merge the Hotfix into Main
 
-- [ ] Wait for the [the Docker images to be published successfully](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush).
-- [ ] Wait for the new tag in the [Docker Hub zakura space](https://hub.docker.com/r/valaroman/zakura/tags)
-
-## Merge hotfix into main
-
-- [ ] Solve any conflicts between the hotfix branch and `main`. Do not force-push
-      into the branch! We need to include the commit that was released into `main`.
-- [ ] Get the PR reviewed again if changes were made
-- [ ] Admin-merge the PR with a merge commit (if by the time you are following
-      this we have switched to merge commits by default, then just remove
-      the `do-not-merge` label)
+- [ ] Forward-merge `hotfix/v<version>` into `main` **immediately** via this
+      PR. Solve conflicts in the branch without force-pushing — the released
+      commit must become an ancestor of `main`.
+- [ ] Merge with a **merge commit** (admin merge; do not squash), so the
+      tagged commit is preserved in `main`'s history.
+- [ ] Delete the hotfix branch after the merge; the tag is permanent.
 
 ## Release Failures
 
-If building or running fails after tagging:
-
-<details>
-1. Create a new hotfix release, starting from the top of this document.
-</details>
+If the pre-tag build or validation fails, no tag exists: fix the branch and
+re-dispatch `Create release` with the same version. If a failure is found
+after the tag exists, start a new `patch` hotfix from the top of this
+document — tags are immutable and are never reused.

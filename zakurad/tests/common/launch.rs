@@ -46,12 +46,6 @@ pub const EXTENDED_LAUNCH_DELAY: Duration = Duration::from_secs(45);
 /// it is using for its RPCs.
 pub const LIGHTWALLETD_DELAY: Duration = Duration::from_secs(60);
 
-/// The amount of time we wait between launching two conflicting nodes.
-///
-/// We use a longer time to make sure the first node has launched before the second starts,
-/// even if CI is under load.
-pub const BETWEEN_NODES_DELAY: Duration = Duration::from_secs(20);
-
 /// The amount of time we wait for lightwalletd to update to the tip.
 ///
 /// `lightwalletd` takes about 60-120 minutes to fully sync,

@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "session": 1,
-  "batch_runs_used": 2,
+  "batch_runs_used": 3,
   "next_exp_id": 2,
   "droplets": {
     "perf-lab-s1": {
@@ -10,12 +10,12 @@
     }
   },
   "in_flight": {
-    "exp001-p50": {
+    "exp001-p400": {
       "droplet": "perf-lab-s1",
       "build_ref": "847f6085-expected",
       "baseline_ref": "same",
-      "exp": "EXP-001 DL_LIMIT sweep p50",
-      "started_at": "2026-07-22T03:35:00Z"
+      "exp": "EXP-001 DL_LIMIT sweep p400",
+      "started_at": "2026-07-22T04:40:00Z"
     }
   },
   "noise_band_pct": 8.7

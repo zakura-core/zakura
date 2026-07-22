@@ -131,3 +131,11 @@ This file is the sole reporting channel (design D5). Entry template:
 - note: the prior-era baseline (94.90 on 4784aca6) is ~10% higher; the gap is
   confounded (≈15 commits of code drift × time-of-day network phase — seeder
   runs in this window also sat ~85-88). All sweep comparisons use base1 only.
+
+### exp001-p50 (DL_LIMIT=50, 2026-07-22)
+
+- legs 85.23 / 83.97 pc blk/s (within-run 1.48% — valid); run level ~84.6 vs
+  campaign baseline 85.37 = **-0.9%, flat**. 3× less download concurrency
+  changes nothing → concurrency is not the constraint at this window; the
+  floor-body HOL (banner: writer 23-24%, reorder ~430-460 MB) gates progress
+  regardless of parallelism.

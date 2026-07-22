@@ -101,6 +101,26 @@ keeps any PID it could not kill in `pids.json`, exiting non-zero. The blaster is
 signalled as a process group: signalling only the Python wrapper orphaned the
 `kresko` child, which then submitted into the next A/B leg.
 
+## Version coupling with Kresko
+
+Kresko renders the node config from `ZakuradConfig::default()` of **the zakura
+version Kresko itself links** (pinned in its `Cargo.toml`), and zakura's config
+is `#[serde(deny_unknown_fields)]`.
+
+So the ref under test must be new enough to understand that schema. A node
+older than Kresko's pin dies at startup with, for example:
+
+```
+Configuration error: unknown field `expose_peer_addresses`
+```
+
+This matters most for `baseline_ref`: an old baseline can fail here while the
+target ref is fine. `mempool-load-lab.py` recognises this failure and says so
+rather than leaving you with the raw field name.
+
+Fix by testing a newer ref, or by repinning Kresko's zakura dependency and
+updating `kresko_ref`.
+
 ## Artifact safety
 
 Premine spending keys never leave the box, even though they are worthless off

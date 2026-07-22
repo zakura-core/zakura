@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -522,8 +523,10 @@ def seed_node(lab: Path, args, index: int) -> None:
     proc = spawn_node(lab, args, index, bootstrap=True)
     try:
         if not wait_for_rpc(url, proc=proc):
+            log_path = lab / "nodes" / name / "bootstrap.log"
             raise RuntimeError(
-                f"{name}: bootstrap RPC never came up (see {lab / 'nodes' / name / 'bootstrap.log'})"
+                f"{name}: bootstrap RPC never came up (see {log_path})"
+                + explain_startup_failure(log_path)
             )
         # Idempotence: a node that already holds the seed chain must not be
         # re-seeded. Resubmitting genesis to a node whose tip has moved past it
@@ -542,6 +545,30 @@ def seed_node(lab: Path, args, index: int) -> None:
         print(f"{name}: seeded to height {height}", flush=True)
     finally:
         stop_proc(proc, name)
+
+
+def explain_startup_failure(log_path: Path) -> str:
+    """Turn known startup failures into an actionable hint.
+
+    The config Kresko renders comes from the zakura version *Kresko* links, and
+    zakura's config is #[serde(deny_unknown_fields)]. So a node older than
+    Kresko's pin rejects fields it has never heard of. The raw error names only
+    the field, which is a long way from the actual cause.
+    """
+    try:
+        body = log_path.read_text(errors="replace")
+    except OSError:
+        return ""
+    match = re.search(r"unknown field `([^`]+)`", body)
+    if match:
+        return (
+            f"\n  The node rejected config field `{match.group(1)}`. That field comes "
+            "from the zakura version Kresko was built against, so the node under "
+            "test is older than Kresko's pin. Test a newer ref, or repin Kresko."
+        )
+    if "panicked at" in body:
+        return "\n  The node panicked during startup; see the log."
+    return ""
 
 
 def submit_block(url: str, block_hex: str, label: str, retries: int = 10) -> None:

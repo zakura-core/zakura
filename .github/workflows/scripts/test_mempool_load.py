@@ -370,6 +370,45 @@ class PeeringCheck(unittest.TestCase):
         self.assertFalse(lab.wait_for_peers(2, timeout_secs=0.5, poll_secs=0.01))
 
 
+class StartupDiagnostics(unittest.TestCase):
+    """An opaque `unknown field` error must name its actual cause."""
+
+    def write_log(self, tmpdir, body):
+        path = Path(tmpdir) / "bootstrap.log"
+        path.write_text(body)
+        return path
+
+    def test_unknown_field_is_explained_as_version_skew(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log = self.write_log(
+                tmpdir,
+                "error: Configuration error: unknown field `expose_peer_addresses`, "
+                "expected one of `listen_addr`, `network`\n",
+            )
+            hint = lab.explain_startup_failure(log)
+        self.assertIn("expose_peer_addresses", hint)
+        self.assertIn("older than Kresko's pin", hint)
+
+    def test_panic_is_reported(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log = self.write_log(tmpdir, "thread 'main' panicked at src/foo.rs:1:1\n")
+            self.assertIn("panicked", lab.explain_startup_failure(log))
+
+    def test_unrecognised_failure_adds_nothing(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log = self.write_log(tmpdir, "starting up\nall good\n")
+            self.assertEqual(lab.explain_startup_failure(log), "")
+
+    def test_missing_log_is_not_an_error(self):
+        self.assertEqual(lab.explain_startup_failure(Path("/nonexistent/x.log")), "")
+
+
 class ConfigRewriting(unittest.TestCase):
     def section_of(self, text: str, name: str) -> str:
         """The body of [name], up to the next section header."""

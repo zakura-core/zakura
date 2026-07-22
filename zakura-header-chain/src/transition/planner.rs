@@ -174,6 +174,7 @@ pub fn apply_transition<S: StoreRead>(
     let mut verified = old_verified.clone();
     let mut aux_changes = Vec::new();
     let mut finality = None;
+    let operator_reason_changed = operator_reason_will_change(&graph, &request.event)?;
 
     apply_event(
         store,
@@ -184,6 +185,9 @@ pub fn apply_transition<S: StoreRead>(
         context,
     )?;
     graph.recompute_all_eligibility()?;
+    if operator_reason_changed {
+        verified = select_fully_verified_path(&graph)?;
+    }
     let (mut header_best, _) = graph.select_header_best()?;
 
     if let TransitionEvent::FullStateFinalized(event) = &request.event {
@@ -289,6 +293,64 @@ pub fn apply_transition<S: StoreRead>(
     }
     super::verify_plan(store, &plan)?;
     Ok(plan)
+}
+
+fn operator_reason_will_change(
+    graph: &MemHeaderStore,
+    event: &TransitionEvent,
+) -> Result<bool, GraphError> {
+    let (target, reason, inserting) = match event {
+        TransitionEvent::OperatorInvalidate(event) => (
+            event.target,
+            EligibilityReason::OperatorInvalid { id: event.id },
+            true,
+        ),
+        TransitionEvent::OperatorReconsider(event) => (
+            event.target,
+            EligibilityReason::OperatorInvalid { id: event.id },
+            false,
+        ),
+        _ => return Ok(false),
+    };
+    let present = graph
+        .node(target)
+        .ok_or(GraphError::UnknownNode(target))?
+        .eligibility
+        .direct_reasons
+        .contains(&reason);
+    Ok(if inserting { !present } else { present })
+}
+
+fn select_fully_verified_path(graph: &MemHeaderStore) -> Result<Vec<Frontier>, TransitionFailure> {
+    let finalized = graph.finalized();
+    let mut connected = HashSet::from([finalized.hash]);
+    let mut nodes: Vec<_> = graph.nodes().collect();
+    nodes.sort_unstable_by_key(|node| (node.height, node.hash.0));
+    for node in nodes {
+        if node.hash != finalized.hash
+            && node.is_eligible()
+            && matches!(node.body, BodyValidationState::Verified { .. })
+            && connected.contains(&node.parent_hash)
+        {
+            connected.insert(node.hash);
+        }
+    }
+    let tip = connected
+        .into_iter()
+        .map(|hash| {
+            let node = graph
+                .node(hash)
+                .expect("verified candidates are retained graph nodes");
+            graph
+                .score(hash)
+                .map(|score| (score, Frontier::new(node.height, hash)))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, frontier)| frontier)
+        .ok_or(GraphError::UnknownNode(finalized.hash))?;
+    path(graph, tip)
 }
 
 fn validate_snapshot(
@@ -1156,6 +1218,290 @@ mod tests {
                 aux: Vec::new(),
             }),
         }
+    }
+
+    fn insert_verified_branch(
+        graph: &mut MemHeaderStore,
+        parent: Frontier,
+        count: u32,
+        difficulty: zakura_chain::work::difficulty::CompactDifficulty,
+        nonce_seed: u8,
+    ) -> Frontier {
+        let mut parent = parent;
+        for offset in 0..count {
+            let mut header = *regtest_genesis_block().header;
+            header.previous_block_hash = parent.hash;
+            header.difficulty_threshold = difficulty;
+            header.nonce.0[0] = nonce_seed;
+            header.nonce.0[1..5].copy_from_slice(&offset.to_be_bytes());
+            let header = Arc::new(header);
+            let work = header
+                .difficulty_threshold
+                .to_work()
+                .expect("the fixture target has valid work");
+            parent = match graph
+                .insert(
+                    header,
+                    work,
+                    HeaderValidationState::Valid,
+                    [],
+                    BodyValidationState::Verified {
+                        evidence: EvidenceId::from_digest([nonce_seed; 32]),
+                    },
+                )
+                .expect("the verified fixture branch links to its parent")
+            {
+                crate::InsertResult::Inserted(frontier)
+                | crate::InsertResult::AlreadyPresent(frontier) => frontier,
+            };
+        }
+        parent
+    }
+
+    fn synchronize_fixture(store: &mut TestStore, verified_tip: Frontier) {
+        store
+            .graph
+            .recompute_all_eligibility()
+            .expect("the fixture eligibility cache recomputes");
+        let header_best = store
+            .graph
+            .select_header_best()
+            .expect("the fixture has an eligible tip")
+            .0;
+        store.selected = path(&store.graph, header_best).expect("the selected path is retained");
+        store.verified = path(&store.graph, verified_tip).expect("the verified path is retained");
+        store.metadata.frontiers.header_best = header_best;
+        store.metadata.frontiers.verified_best = verified_tip;
+        store.metadata.header_best_score = store
+            .graph
+            .score(header_best.hash)
+            .expect("the selected score is exact");
+    }
+
+    fn operator_invalidate(
+        store: &TestStore,
+        target: block::Hash,
+        id: crate::OperatorInvalidationId,
+        evidence: u8,
+    ) -> TransitionRequest {
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::OperatorInvalidate(crate::OperatorInvalidate {
+                target,
+                id,
+                operator_reason_digest: [evidence.wrapping_add(1); 32],
+                evidence: EvidenceId::from_digest([evidence; 32]),
+            }),
+        }
+    }
+
+    fn operator_reconsider(
+        store: &TestStore,
+        target: block::Hash,
+        id: crate::OperatorInvalidationId,
+        evidence: u8,
+    ) -> TransitionRequest {
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::OperatorReconsider(crate::OperatorReconsider {
+                target,
+                id,
+                evidence: EvidenceId::from_digest([evidence; 32]),
+            }),
+        }
+    }
+
+    #[test]
+    fn operator_actions_reselect_same_height_verified_forks_and_preserve_nested_reasons() {
+        let (mut store, config) = TestStore::new(EngineMode::Integrated);
+        let clock = ManualClock(Utc::now());
+        let anchor = store.graph.finalized();
+        let difficulty = store
+            .graph
+            .node(anchor.hash)
+            .expect("the anchor exists")
+            .header
+            .difficulty_threshold;
+        let left = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x11);
+        let right = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x22);
+        let (winner, loser) = if store.graph.score(left.hash).expect("left score exists")
+            > store.graph.score(right.hash).expect("right score exists")
+        {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        synchronize_fixture(&mut store, winner);
+        let first_id = crate::OperatorInvalidationId::new([1; 16]);
+        let second_id = crate::OperatorInvalidationId::new([2; 16]);
+
+        let first = apply_transition(
+            &store,
+            operator_invalidate(&store, winner.hash, first_id, 0x31),
+            &context(&config, &clock, None),
+        )
+        .expect("invalidating the winning verified fork reselects atomically");
+        assert_eq!(first.change_set.metadata.frontiers.header_best, loser);
+        assert_eq!(first.change_set.metadata.frontiers.verified_best, loser);
+        assert_eq!(
+            first.change_set.metadata.header_generation,
+            HeaderGeneration::new(1)
+        );
+        assert_eq!(
+            first.change_set.metadata.verified_generation,
+            VerifiedGeneration::new(1)
+        );
+        store.commit(&first);
+
+        let second = apply_transition(
+            &store,
+            operator_invalidate(&store, winner.hash, second_id, 0x32),
+            &context(&config, &clock, None),
+        )
+        .expect("a nested operator reason is independently durable");
+        store.commit(&second);
+        let reconsider_first = apply_transition(
+            &store,
+            operator_reconsider(&store, winner.hash, first_id, 0x33),
+            &context(&config, &clock, None),
+        )
+        .expect("reconsider removes only the named reason");
+        assert_eq!(
+            reconsider_first.change_set.metadata.frontiers.verified_best,
+            loser
+        );
+        let winner_node = reconsider_first
+            .projected()
+            .node(winner.hash)
+            .expect("the losing node remains retained");
+        assert!(!winner_node
+            .eligibility
+            .direct_reasons
+            .contains(&EligibilityReason::OperatorInvalid { id: first_id }));
+        assert!(winner_node
+            .eligibility
+            .direct_reasons
+            .contains(&EligibilityReason::OperatorInvalid { id: second_id }));
+        store.commit(&reconsider_first);
+
+        let reconsider_second = apply_transition(
+            &store,
+            operator_reconsider(&store, winner.hash, second_id, 0x34),
+            &context(&config, &clock, None),
+        )
+        .expect("removing the final operator reason restores both frontiers");
+        assert_eq!(
+            reconsider_second.change_set.metadata.frontiers.header_best,
+            winner
+        );
+        assert_eq!(
+            reconsider_second
+                .change_set
+                .metadata
+                .frontiers
+                .verified_best,
+            winner
+        );
+        store.commit(&reconsider_second);
+        let absent = apply_transition(
+            &store,
+            operator_reconsider(&store, winner.hash, second_id, 0x35),
+            &context(&config, &clock, None),
+        )
+        .expect("an absent operator ID is a valid no-change");
+        assert!(absent.is_no_change());
+    }
+
+    #[test]
+    fn reconsider_restores_a_shorter_higher_work_verified_branch() {
+        use zakura_chain::work::difficulty::{ExpandedDifficulty, U256};
+
+        let (mut store, config) = TestStore::new(EngineMode::Integrated);
+        let clock = ManualClock(Utc::now());
+        let anchor = store.graph.finalized();
+        let easy = store
+            .graph
+            .node(anchor.hash)
+            .expect("the anchor exists")
+            .header
+            .difficulty_threshold;
+        let easy_target: U256 = easy
+            .to_expanded()
+            .expect("the fixture target expands")
+            .into();
+        let hard = ExpandedDifficulty::from(easy_target >> 3).into();
+        let longer = insert_verified_branch(&mut store.graph, anchor, 2, easy, 0x41);
+        let shorter = insert_verified_branch(&mut store.graph, anchor, 1, hard, 0x42);
+        assert!(
+            store.graph.score(shorter.hash).expect("short score exists")
+                > store.graph.score(longer.hash).expect("long score exists")
+        );
+        synchronize_fixture(&mut store, shorter);
+        let id = crate::OperatorInvalidationId::new([3; 16]);
+
+        let invalidate = apply_transition(
+            &store,
+            operator_invalidate(&store, shorter.hash, id, 0x43),
+            &context(&config, &clock, None),
+        )
+        .expect("invalidating the shorter winner promotes the longer branch");
+        assert_eq!(invalidate.change_set.metadata.frontiers.header_best, longer);
+        assert_eq!(
+            invalidate.change_set.metadata.frontiers.verified_best,
+            longer
+        );
+        store.commit(&invalidate);
+
+        let reconsider = apply_transition(
+            &store,
+            operator_reconsider(&store, shorter.hash, id, 0x44),
+            &context(&config, &clock, None),
+        )
+        .expect("reconsider restores the shorter higher-work branch");
+        assert_eq!(
+            reconsider.change_set.metadata.frontiers.header_best,
+            shorter
+        );
+        assert_eq!(
+            reconsider.change_set.metadata.frontiers.verified_best,
+            shorter
+        );
+    }
+
+    #[test]
+    fn invalidating_the_only_non_finalized_verified_path_falls_back_to_finalized() {
+        let (mut store, config) = TestStore::new(EngineMode::Integrated);
+        let clock = ManualClock(Utc::now());
+        let anchor = store.graph.finalized();
+        let difficulty = store
+            .graph
+            .node(anchor.hash)
+            .expect("the anchor exists")
+            .header
+            .difficulty_threshold;
+        let tip = insert_verified_branch(&mut store.graph, anchor, 2, difficulty, 0x51);
+        synchronize_fixture(&mut store, tip);
+
+        let plan = apply_transition(
+            &store,
+            operator_invalidate(
+                &store,
+                store.verified[1].hash,
+                crate::OperatorInvalidationId::new([4; 16]),
+                0x52,
+            ),
+            &context(&config, &clock, None),
+        )
+        .expect("invalidating the only full-state branch falls back atomically");
+        assert_eq!(plan.change_set.metadata.frontiers.header_best, anchor);
+        assert_eq!(plan.change_set.metadata.frontiers.verified_best, anchor);
+        assert_eq!(
+            plan.change_set.verified_projection,
+            ProjectionDelta {
+                remove_from: Some(block::Height(1)),
+                put: Vec::new(),
+            }
+        );
     }
 
     #[test]

@@ -197,3 +197,12 @@ This file is the sole reporting channel (design D5). Entry template:
   newest-binary pick, serve-crash status, identity_dir wording. Both serve
   droplets re-patched via prepare_remote (self-healing checkout+repatch) and
   re-seeding with KEEP_CUR_FORK=1.
+
+## COHORT STANDING (2026-07-22, ~09:05Z)
+
+- perf-lab-serve-a (138.197.91.62) and perf-lab-serve-b (159.203.134.228)
+  frozen and SERVING cohort 'perf-lab-cohort-1' from seeded state (both
+  reached 1,836,000; keepfork patch preserved the forks; freeze height
+  assertion passed via log fallback — wrapper .exit death struck again,
+  fallback now built into freeze). COHORT_PEERS captured and committed.
+- reaper-exempt by code; ~$1/h combined while standing (Adam-approved).

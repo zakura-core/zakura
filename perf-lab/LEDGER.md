@@ -261,3 +261,21 @@ This file is the sole reporting channel (design D5). Entry template:
   63b8d4dc-era ~180-190 norm → suspicion shifts to the code: regcheck-1
   (30b0c63d vs 63b8d4dc, within-run on the cohort) separates code from
   environment. EXP-002 paused pending its verdict.
+
+## FINDING: no mainline regression — the cohort has a cache regime (2026-07-22)
+
+- regcheck-1 (within-run, same cohort): 63b8d4dc = 108.60 pc, 30b0c63d =
+  118.34 pc (+9%, inside single-run band). The new main is fine; exp002-base's
+  collapse was NOT code.
+- BUT both legs ran ~110 vs the ~185-190 both SHAs achieved hours earlier,
+  banners back to floor-body HOL with idle writer (20-22%). Health checks
+  clean. Hypothesis that fits every run today: SERVE-SIDE PAGE-CACHE REGIME —
+  freshly-seeded state serves RAM-warm (~190); idle gaps cool it toward
+  disk-read speed (~110); each bench's reads partially re-warm. aa-cohort1/3
+  (back-to-back-ish, warm, 0.0%), aa-cohort2 (transition, 7.6%), exp002-base
+  (after idle gap, cold/mixed, one leg collapsed), regcheck (cold-steady
+  ~110 both legs).
+- discriminator running: aa-cohort4 started immediately after regcheck —
+  warm-regime prediction ~150+; cold-steady prediction ~110. Either outcome
+  fixes the protocol (warmup pass before measuring, or re-baseline at the
+  cold-steady level).

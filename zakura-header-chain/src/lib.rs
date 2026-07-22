@@ -10,10 +10,13 @@ mod graph;
 mod ids;
 mod node;
 mod retention;
+mod transition;
 mod validation;
 
 pub use config::{
-    EngineLimits, MAX_CANDIDATE_TIPS_V1, MAX_NON_FINALIZED_NODES_V1, MAX_STAGED_TARGETS_V1,
+    CheckpointSet, EngineConfig, EngineConfigError, EngineLimits, EngineMode,
+    SettledUpgradeManifest, SettledUpgradePin, TrustedAnchor, MAX_CANDIDATE_TIPS_V1,
+    MAX_NON_FINALIZED_NODES_V1, MAX_STAGED_TARGETS_V1,
 };
 pub use error::{Attribution, ErrorCategory, ErrorSubject, HeaderChainError, RuleId};
 pub use frontier::{
@@ -29,6 +32,7 @@ pub use node::{
     HeaderNode, HeaderValidationState,
 };
 pub use retention::{enforce_retention, RetentionPlan};
+pub use transition::*;
 pub use validation::{
     infer_height, validate_commitment_structure, validate_compact_target,
     validate_contextual_difficulty_and_time, validate_encoding_version_hash, validate_future_time,

@@ -262,12 +262,18 @@ status = "unimplemented"
 [[rule]]
 id = "LC-ANCHOR-04"
 name = "Mode-independent release-authenticated settled pin"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::EngineConfig::new"
+tests = ["HV-09::release_manifest_pins_exact_v1_3_production_tuples", "HV-09::production_config_always_installs_the_release_manifest"]
+networks = ["mainnet", "testnet"]
 
 [[rule]]
 id = "LC-ANCHOR-05"
 name = "Atomic settled-pin updates"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::SettledUpgradeManifest::for_release"
+tests = ["HV-09::release_manifest_pins_exact_v1_3_production_tuples"]
+networks = ["mainnet", "testnet"]
 
 [[rule]]
 id = "LC-SELECT-01"

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "session": 1,
-  "batch_runs_used": 1,
-  "next_exp_id": 1,
+  "batch_runs_used": 2,
+  "next_exp_id": 2,
   "droplets": {
     "perf-lab-s1": {
       "ip": "104.131.188.233",
@@ -10,12 +10,12 @@
     }
   },
   "in_flight": {
-    "base1": {
+    "exp001-p50": {
       "droplet": "perf-lab-s1",
-      "build_ref": "main-pinned",
-      "baseline_ref": "main-pinned",
-      "exp": "campaign-baseline-repin",
-      "started_at": "2026-07-22T02:32:00Z"
+      "build_ref": "847f6085-expected",
+      "baseline_ref": "same",
+      "exp": "EXP-001 DL_LIMIT sweep p50",
+      "started_at": "2026-07-22T03:35:00Z"
     }
   },
   "noise_band_pct": 8.7

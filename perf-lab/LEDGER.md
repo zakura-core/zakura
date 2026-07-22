@@ -122,3 +122,12 @@ This file is the sole reporting channel (design D5). Entry template:
   first); (3) B-06 verifier batch sizes; (4) B-07 rayon pool sizing;
   (5) B-05 RocksDB read-side. B-01/B-03 knob-default work PROPOSAL-blocked
   on PRs 166/217. B-15-full awaits the droplet-cap decision above.
+
+### base1 re-pin (2026-07-22)
+
+- campaign baseline: **85.37 pc blk/s** = median of base1's legs (86.77 /
+  83.97) on SHA 847f6085, single-peer regime. Internal |delta| 3.23% — a
+  fourth single-peer noise sample, within band.
+- note: the prior-era baseline (94.90 on 4784aca6) is ~10% higher; the gap is
+  confounded (≈15 commits of code drift × time-of-day network phase — seeder
+  runs in this window also sat ~85-88). All sweep comparisons use base1 only.

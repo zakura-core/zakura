@@ -1071,13 +1071,8 @@ impl ZakuraDb {
             })?;
         let history_tree = (*self.try_history_tree()?).clone();
         validate_history_tree_height(self, confirmed_height, &history_tree)?;
-        let reconstructed =
+        let completed_checkpoint =
             self.completed_checkpoint_for_tip(confirmed_height, confirmed_hash, confirmed_header)?;
-        let completed_checkpoint = self
-            .try_header_root_auth_frontier_compat()?
-            .map(|frontier| frontier.completed_checkpoint)
-            .filter(|stored| stored.height > reconstructed.height)
-            .unwrap_or(reconstructed);
         let frontier = HeaderRootAuthFrontier {
             confirmed_height,
             confirmed_hash,
@@ -1975,6 +1970,61 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn startup_repair_reconstructs_checkpoint_after_deleting_covered_headers() {
+        let cache = tempfile::tempdir().expect("temporary cache directory is created");
+        let config = Config {
+            cache_dir: cache.path().to_owned(),
+            ephemeral: false,
+            repair_zakura_header_store_on_startup: true,
+            ..Config::default()
+        };
+        let (mut db, _block1, _block2, state) = two_block_checkpoint_fixture_with_config(&config);
+        assert_eq!(state.completed_checkpoint_height, Height(2));
+
+        let header_hash_by_height = db.db.cf_handle("zakura_header_hash_by_height").unwrap();
+        let header_by_height = db.db.cf_handle("zakura_header_by_height").unwrap();
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_delete(&header_hash_by_height, Height(1));
+        batch.zs_delete(&header_by_height, Height(1));
+        db.write_batch(batch)
+            .expect("interior checkpoint corruption writes");
+        db.update_format_version_on_disk(&state_database_format_version_in_code())
+            .expect("fixture format version writes");
+
+        let network = db.network();
+        db.shutdown(true);
+        drop(db);
+        let db = ZakuraDb::new(
+            &config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &network,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+        .expect("database reopens after repairing the checkpoint bracket");
+
+        let repaired = db
+            .validate_header_root_auth_state()
+            .expect("repaired authenticated state validates")
+            .expect("repaired frontier exists")
+            .state();
+        assert_eq!(repaired.authenticated_height, Height::MIN);
+        assert_eq!(
+            repaired.completed_checkpoint_height,
+            Height::MIN,
+            "repair must not preserve a checkpoint whose header bracket was deleted"
+        );
+        assert_eq!(
+            repaired.completed_checkpoint_hash,
+            db.network().genesis_hash()
+        );
     }
 
     #[test]

@@ -730,6 +730,32 @@ impl FinalizedState {
         next_vct_block: Option<NextVctBlock>,
         source: &str,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+        self.commit_finalized_direct_with(
+            finalizable_block,
+            prev_note_commitment_trees,
+            next_vct_block,
+            source,
+            |db, batch| {
+                db.header_chain_disk_db()
+                    .write(batch)
+                    .expect("unexpected rocksdb error while writing block");
+                Ok(())
+            },
+        )
+    }
+
+    /// Prepare a finalized block and delegate its single durable batch to `commit`.
+    pub(in crate::service) fn commit_finalized_direct_with<C>(
+        &mut self,
+        finalizable_block: FinalizableBlock,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        next_vct_block: Option<NextVctBlock>,
+        source: &str,
+        commit: C,
+    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError>
+    where
+        C: FnOnce(&mut ZakuraDb, DiskWriteBatch) -> Result<(), CommitCheckpointVerifiedError>,
+    {
         let (height, hash, finalized, prev_note_commitment_trees, retention, fast_write) =
             match finalizable_block {
                 FinalizableBlock::Checkpoint {
@@ -1198,13 +1224,14 @@ impl FinalizedState {
         // round-trip; its internal rayon uses the global pool instead. Measured net
         // win on the sandblast region (see PR).
         let network = self.network();
-        let result = self.db.write_block(
+        let result = self.db.write_block_with(
             finalized,
             prev_note_commitment_trees,
             &network,
             source,
             retention,
             fast_write,
+            commit,
         );
 
         if result.is_ok() {

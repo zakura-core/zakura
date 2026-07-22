@@ -139,6 +139,15 @@ impl HeaderChainRuntime {
         &self.publisher
     }
 
+    /// Read the exact durable verified projection used to prove full-state finality.
+    pub(in crate::service) fn verified_projection(
+        &self,
+    ) -> Result<Vec<Frontier>, HeaderChainStoreError> {
+        self.store
+            .verified_projection()
+            .map_err(HeaderChainStoreError::Store)
+    }
+
     /// Apply, commit, and publish one serialized transition.
     pub fn apply(
         &self,

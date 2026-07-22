@@ -22,14 +22,15 @@ use zakura_chain::{
 };
 use zakura_header_chain::{
     ApplyResult, BodyEvidence, EngineConfig, EvidenceId, Frontier, FullStateEvidenceAuthority,
-    OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, StateVersion, SystemClock,
-    TransitionContext, TransitionEvent, TransitionRequest, VerifiedBodyEvidence,
-    VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
+    FullStateFinalized, OperatorInvalidate, OperatorInvalidationId, OperatorReconsider,
+    StateVersion, SystemClock, TransitionContext, TransitionEvent, TransitionRequest,
+    VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
     constants::MAX_BLOCK_REORG_HEIGHT,
     error::CommitHeaderRangeError,
+    request::FinalizableBlock,
     service::{
         check,
         finalized_state::{
@@ -40,7 +41,8 @@ use crate::{
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
-    CheckpointVerifiedBlock, CommitBlockError, SemanticallyVerifiedBlock, ValidateContextError,
+    CheckpointVerifiedBlock, CommitBlockError, CommitCheckpointVerifiedError,
+    SemanticallyVerifiedBlock, ValidateContextError,
 };
 
 // These types are used in doc links
@@ -149,11 +151,18 @@ impl PreparedFullStateTransition {
         live_non_finalized: &mut NonFinalizedState,
         context: &TransitionContext<'_>,
     ) -> Result<ApplyResult, HeaderChainStoreError> {
+        let finalized_after = match &self.header_request.event {
+            TransitionEvent::FullStateFinalized(event) => Some(event.new_finalized),
+            _ => None,
+        };
         let expected_verified = self
             .non_finalized_after
             .best_tip()
             .map(|(height, hash)| Frontier::new(height, hash))
-            .unwrap_or_else(|| runtime.publisher().snapshot().frontiers.finalized);
+            .unwrap_or_else(|| {
+                finalized_after
+                    .unwrap_or_else(|| runtime.publisher().snapshot().frontiers.finalized)
+            });
         let Self {
             transition_id,
             non_finalized_after,
@@ -343,6 +352,96 @@ fn operator_identity(target: block::Hash) -> (OperatorInvalidationId, [u8; 32]) 
     let mut id = [0; 16];
     id.copy_from_slice(&digest[..16]);
     (OperatorInvalidationId::new(id), digest)
+}
+
+fn finalization_request(
+    writer: &HeaderChainWriter,
+    new_finalized: Frontier,
+) -> Result<(EvidenceId, TransitionRequest), HeaderChainStoreError> {
+    let snapshot = writer.runtime.publisher().snapshot();
+    let verified_path_proof = writer
+        .runtime
+        .verified_projection()?
+        .into_iter()
+        .take_while(|frontier| frontier.height <= new_finalized.height)
+        .map(|frontier| frontier.hash)
+        .collect::<Vec<_>>();
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-full-state-finalized-v1");
+    hasher.update(snapshot.state_version.get().to_be_bytes());
+    hasher.update(new_finalized.height.0.to_be_bytes());
+    hasher.update(new_finalized.hash.0);
+    for hash in &verified_path_proof {
+        hasher.update(hash.0);
+    }
+    let evidence = EvidenceId::from_digest(hasher.finalize().into());
+    Ok((
+        evidence,
+        TransitionRequest {
+            expected_version: snapshot.state_version,
+            event: TransitionEvent::FullStateFinalized(FullStateFinalized {
+                full_state_transition_id: evidence,
+                new_finalized,
+                verified_path_proof,
+            }),
+        },
+    ))
+}
+
+fn commit_contextual_finalization(
+    writer: &HeaderChainWriter,
+    finalized_state: &mut FinalizedState,
+    live: &mut NonFinalizedState,
+    prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+    let mut staged = live.clone();
+    let finalizable = staged.finalize();
+    let new_finalized = match &finalizable {
+        FinalizableBlock::Contextual {
+            contextually_verified,
+            ..
+        } => Frontier::new(contextually_verified.height, contextually_verified.hash),
+        FinalizableBlock::Checkpoint { .. } => {
+            unreachable!("non-finalized state only yields contextually verified blocks")
+        }
+    };
+    let (evidence, request) = finalization_request(writer, new_finalized).map_err(|error| {
+        CommitBlockError::HeaderChainError {
+            error: error.to_string(),
+        }
+    })?;
+    let old_frontier = writer
+        .runtime
+        .publisher()
+        .snapshot()
+        .frontiers
+        .verified_best;
+    let new_verified_path = verified_path(&staged);
+    finalized_state.commit_finalized_direct_with(
+        finalizable,
+        prev_note_commitment_trees,
+        None,
+        "commit contextually-verified request",
+        |_db, batch| {
+            PreparedFullStateTransition::new(
+                evidence,
+                old_frontier,
+                new_verified_path,
+                staged,
+                Some(batch),
+                request,
+            )
+            .map_err(|error| CommitBlockError::HeaderChainError {
+                error: error.to_string(),
+            })?
+            .commit(&writer.runtime, live, &writer.context())
+            .map(|_| ())
+            .map_err(|error| CommitBlockError::HeaderChainError {
+                error: error.to_string(),
+            })
+            .map_err(Into::into)
+        },
+    )
 }
 
 fn commit_operator_change(
@@ -1180,19 +1279,36 @@ impl WriteBlockWorkerTask {
                 > MAX_BLOCK_REORG_HEIGHT
             {
                 tracing::trace!("finalizing block past the reorg limit");
-                let contextually_verified_with_trees = non_finalized_state.finalize();
-                prev_finalized_note_commitment_trees = finalized_state
-                    .commit_finalized_direct(
-                        contextually_verified_with_trees,
+                let commit_result = if let Some(writer) = header_chain.as_ref() {
+                    commit_contextual_finalization(
+                        writer,
+                        finalized_state,
+                        non_finalized_state,
+                        prev_finalized_note_commitment_trees.take(),
+                    )
+                } else {
+                    let finalizable = non_finalized_state.finalize();
+                    finalized_state.commit_finalized_direct(
+                        finalizable,
                         prev_finalized_note_commitment_trees.take(),
                         None,
                         "commit contextually-verified request",
                     )
+                };
+                prev_finalized_note_commitment_trees = commit_result
                     .expect(
                         "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
                     )
                     .1
                     .into();
+                if header_chain.is_some() {
+                    update_latest_chain_channels(
+                        non_finalized_state,
+                        chain_tip_sender,
+                        non_finalized_state_sender,
+                        backup_dir_path.as_deref(),
+                    );
+                }
             }
 
             // Update the metrics if semantic and contextual validation passes
@@ -1253,7 +1369,10 @@ mod tests {
     use std::sync::Arc;
 
     use zakura_chain::{
-        block, parameters::Network, serialization::ZcashDeserializeInto,
+        block,
+        parameters::{Network, NetworkUpgrade},
+        serialization::ZcashDeserializeInto,
+        transaction::{arbitrary::transaction_to_fake_v5, Transaction},
         value_balance::ValueBalance,
     };
 
@@ -1265,13 +1384,14 @@ mod tests {
             },
             non_finalized_state::NonFinalizedState,
             write::{
-                commit_operator_change, seed_zakura_header_from_committed_block,
+                commit_contextual_finalization, commit_operator_change,
+                seed_zakura_header_from_committed_block,
                 should_seed_zakura_header_from_non_finalized_commit, verified_path,
                 verified_request, HeaderChainWriter, PreparedFullStateTransition,
             },
         },
         tests::FakeChainHelper,
-        Config,
+        CheckpointVerifiedBlock, Config,
     };
     use zakura_header_chain::{
         AlarmSet, BodyValidationState, ChainScore, CheckpointSet, EngineConfig, EngineMetadata,
@@ -1603,5 +1723,92 @@ mod tests {
             snapshot.frontiers.verified_best,
             snapshot.frontiers.finalized
         );
+    }
+
+    #[test]
+    fn contextual_finalization_commits_full_state_header_rows_and_memory_together() {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let mut finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        )
+        .expect("the fixture finalized state opens");
+        let genesis = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
+            .expect("genesis deserializes");
+        finalized_state
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(genesis.clone()).into(),
+                None,
+                None,
+                "shared finalization fixture genesis",
+            )
+            .expect("genesis commits");
+        let block1 = genesis.make_fake_child().set_work(10);
+        let block1_height = block1.coinbase_height().expect("block one has a height");
+        finalized_state
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(block1.clone()).into(),
+                None,
+                None,
+                "shared finalization fixture block one",
+            )
+            .expect("block one commits");
+        let writer = header_writer(&finalized_state, &network, block1_height, &block1);
+        let mut block2 = block1.make_fake_child().set_work(10);
+        let block2_height = block2.coinbase_height().expect("block two has a height");
+        let mut block2_tx =
+            transaction_to_fake_v5(&block2.transactions[0], &network, block2_height);
+        let Transaction::V5 {
+            network_upgrade, ..
+        } = &mut block2_tx
+        else {
+            unreachable!("the fake-v5 converter always returns v5 for genesis transactions")
+        };
+        *network_upgrade = NetworkUpgrade::Nu5;
+        Arc::make_mut(&mut block2).transactions[0] = Arc::new(block2_tx);
+        let frontier = Frontier::new(block2_height, block2.hash());
+        let mut live = NonFinalizedState::new(&network);
+        let mut staged = live.clone();
+        staged
+            .commit_new_chain(block2.prepare(), &finalized_state.db)
+            .expect("block two validates into staged full state");
+        let (evidence, event_path, request) = verified_request(&writer, &live, &staged, frontier)
+            .expect("block two produces exact verified growth");
+        PreparedFullStateTransition::new(
+            evidence,
+            writer
+                .runtime
+                .publisher()
+                .snapshot()
+                .frontiers
+                .verified_best,
+            event_path,
+            staged,
+            None,
+            request,
+        )
+        .expect("block two staging facts agree")
+        .commit(&writer.runtime, &mut live, &writer.context())
+        .expect("block two commits to both live views");
+
+        commit_contextual_finalization(&writer, &mut finalized_state, &mut live, None)
+            .expect("the finalized block and header transition commit together");
+
+        assert!(live.is_chain_set_empty());
+        assert_eq!(
+            finalized_state.db.tip(),
+            Some((frontier.height, frontier.hash))
+        );
+        let snapshot = writer.runtime.publisher().snapshot();
+        assert_eq!(snapshot.frontiers.finalized, frontier);
+        assert_eq!(snapshot.frontiers.verified_best, frontier);
+        let (reopened, _) = HeaderChainStore::new(finalized_state.db.db().clone())
+            .startup(&writer.config)
+            .expect("the combined finalized/header transaction reopens coherently");
+        assert_eq!(reopened.publisher().snapshot(), snapshot);
     }
 }

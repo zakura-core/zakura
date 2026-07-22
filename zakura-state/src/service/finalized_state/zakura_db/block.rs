@@ -1007,6 +1007,35 @@ impl ZakuraDb {
     // Write block methods
 
     /// Write `finalized` to the finalized state.
+    #[cfg(test)]
+    #[allow(clippy::unwrap_in_result)]
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn write_block(
+        &mut self,
+        finalized: FinalizedBlock,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        network: &Network,
+        source: &str,
+        retention: RetentionPlan,
+        vct_data: VctWriteData,
+    ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
+        self.write_block_with(
+            finalized,
+            prev_note_commitment_trees,
+            network,
+            source,
+            retention,
+            vct_data,
+            |db, batch| {
+                db.db
+                    .write(batch)
+                    .expect("unexpected rocksdb error while writing block");
+                Ok(())
+            },
+        )
+    }
+
+    /// Prepare `finalized`, then delegate its only durable batch to `commit`.
     ///
     /// Uses:
     /// - `history_tree`: the current tip's history tree
@@ -1020,7 +1049,7 @@ impl ZakuraDb {
     ///   from applying the change to the chain value balance
     #[allow(clippy::unwrap_in_result)]
     #[allow(clippy::too_many_arguments)]
-    pub(in super::super) fn write_block(
+    pub(in super::super) fn write_block_with<C>(
         &mut self,
         finalized: FinalizedBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
@@ -1028,7 +1057,11 @@ impl ZakuraDb {
         source: &str,
         retention: RetentionPlan,
         vct_data: VctWriteData,
-    ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
+        commit: C,
+    ) -> Result<block::Hash, CommitCheckpointVerifiedError>
+    where
+        C: FnOnce(&mut Self, DiskWriteBatch) -> Result<(), CommitCheckpointVerifiedError>,
+    {
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
             .iter()
@@ -1224,9 +1257,7 @@ impl ZakuraDb {
 
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
-        self.db
-            .write(batch)
-            .expect("unexpected rocksdb error while writing block");
+        commit(self, batch)?;
         metrics::histogram!("zakura.state.rocksdb.batch_commit.duration_seconds")
             .record(batch_start.elapsed().as_secs_f64());
 

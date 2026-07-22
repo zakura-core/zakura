@@ -60,6 +60,12 @@ pub struct MissingSproutTipTree {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StateInitError {
+    /// The canonical header store could not reconstruct completed checkpoint progress.
+    #[error("could not reconstruct the highest completed checkpoint: {0}")]
+    HighestCompletedCheckpoint(
+        #[from] crate::service::finalized_state::HighestCompletedCheckpointError,
+    ),
+
     /// A read-only state was requested, but the configured cache directory is
     /// missing or unreadable.
     ///
@@ -436,6 +442,12 @@ pub enum CommitHeaderRangeError {
         /// The conflicting height.
         height: block::Height,
     },
+
+    /// Local checkpoint-frontier reconstruction failed while preparing the range.
+    #[error("could not update the highest completed checkpoint: {0}")]
+    HighestCompletedCheckpoint(
+        #[from] crate::service::finalized_state::HighestCompletedCheckpointError,
+    ),
 
     /// A provisional reorg tried to overwrite too far behind the best header tip.
     #[error(

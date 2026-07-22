@@ -115,6 +115,7 @@ pub use vct::{
     GeneratorError, NextVctBlock,
 };
 pub use zakura_db::commitment_roots_db::COMMITMENT_ROOTS_BY_HEIGHT;
+pub use zakura_db::highest_completed_checkpoint::*;
 pub use zakura_db::ZakuraDb;
 
 #[cfg(any(test, feature = "proptest-impl"))]

@@ -671,12 +671,15 @@ impl ZakuraDb {
             .or_else(|| self.zakura_header_hash(height))
     }
 
-    fn header_height(&self, hash: block::Hash) -> Option<block::Height> {
+    pub(crate) fn header_height(&self, hash: block::Hash) -> Option<block::Height> {
         self.height(hash)
             .or_else(|| self.zakura_header_height(hash))
     }
 
-    fn header_by_height(&self, height: block::Height) -> Option<(block::Hash, Arc<block::Header>)> {
+    pub(crate) fn header_by_height(
+        &self,
+        height: block::Height,
+    ) -> Option<(block::Hash, Arc<block::Header>)> {
         if let Some(hash) = self.hash(height) {
             return self
                 .block_header(height.into())

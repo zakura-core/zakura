@@ -1,6 +1,6 @@
 [package]
 name = "zakura-tower-batch-control"
-version = "1.0.1-rc0"
+version = "1.0.1"
 authors.workspace = true
 description = "Tower middleware for batch request processing. Internal Zakura fork, published to support cargo install zakura"
 # # Legal
@@ -41,10 +41,10 @@ rand = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 tokio-test = { workspace = true }
-tower-fallback = { package = "zakura-tower-fallback", path = "../tower-fallback/", version = "1.0.1-rc0" }
+tower-fallback = { package = "zakura-tower-fallback", path = "../tower-fallback/", version = "1.0.1" }
 tower-test = { workspace = true }
 
-zakura-test = { path = "../zakura-test/", version = "1.0.1-rc0" }
+zakura-test = { path = "../zakura-test/", version = "2.0.0" }
 
 [lints]
 workspace = true

@@ -7,24 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-## [1.0.3-rc2] - 2026-07-22
-
-### Changed
-
-- Hardened the hotfix release checklist and process documentation from the
-  first hotfix-path release's findings
-  (see [docs/security-hotfix-release.md](docs/security-hotfix-release.md)).
-
-## [1.0.3-rc1] - 2026-07-21
-
-### Fixed
-
-- Fixed test log capture racing the process-wide tracing subscriber, which
-  could corrupt span bookkeeping in `zakurad` test binaries; `zakura-test` now
-  provides a `log_capture` module that captures messages from its shared
-  subscriber ([#332](https://github.com/zakura-core/zakura/pull/332)).
-
-## [1.0.3-rc0] - 2026-07-21
+## [1.0.3] - 2026-07-22
 
 ### Added
 
@@ -40,12 +23,23 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   committed checkpoint/frontier/provenance coupling (rejecting pre-pipeline
   bootstrap state unless explicitly overridden)
   ([#262](https://github.com/zakura-core/zakura/pull/262)).
+- Add `mempool::Request::TakePendingGossipTransactionIds` for bounded,
+  atomic draining of transaction IDs awaiting peer advertisement
+  ([#64](https://github.com/zakura-core/zakura/pull/64)).
 
 ### Changed
 
 - Update the embedded zcashd-compat binary and default split-container image to
   valargroup/zcashd v1.1.0
   ([#319](https://github.com/zakura-core/zakura/pull/319)).
+- Hardened the hotfix release checklist and process documentation from the
+  first hotfix-path release's findings
+  (see [docs/security-hotfix-release.md](docs/security-hotfix-release.md)).
+
+### Removed
+
+- Removed unused public `zakura-chain` errors, constants, and helper methods
+  ([#361](https://github.com/zakura-core/zakura/pull/361)).
 
 ### Fixed
 
@@ -74,6 +68,26 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Stop advertising dependent transactions after their expired parent is removed
   from the mempool
   ([#342](https://github.com/zakura-core/zakura/pull/342)).
+- Fixed test log capture racing the process-wide tracing subscriber, which
+  could corrupt span bookkeeping in `zakurad` test binaries; `zakura-test` now
+  provides a `log_capture` module that captures messages from its shared
+  subscriber ([#332](https://github.com/zakura-core/zakura/pull/332)).
+- Kept verbose block-header metadata bound to the resolved block across chain
+  reorganizations
+  ([#328](https://github.com/zakura-core/zakura/pull/328)).
+- Preserve transaction advertisements when the mempool gossip task lags its
+  notification channel
+  ([#64](https://github.com/zakura-core/zakura/pull/64)).
+
+### Security
+
+- Reject malformed legacy block-discovery responses instead of allowing them
+  to disrupt the active sync attempt
+  ([#355](https://github.com/zakura-core/zakura/pull/355)).
+- Allow chain synchronization to immediately retry an honest block body after
+  rejecting a body with the same header hash, without waiting for another state
+  request to trigger cleanup
+  ([#5](https://github.com/zakura-core/zakura-private/pull/5)).
 
 ## [1.0.2] - 2026-07-20
 

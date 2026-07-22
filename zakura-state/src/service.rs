@@ -1361,6 +1361,8 @@ impl Service<Request> for StateService {
             // Used by sync, inbound, and block verifier to check if a block is already in the state
             // before downloading or validating it.
             Request::KnownBlock(hash) => {
+                self.drain_non_finalized_rejected_hashes();
+
                 let timer = CodeTimer::start();
                 let sent_hash_response = self.known_sent_hash(&hash);
                 let read_service = self.read_service.clone();

@@ -8765,7 +8765,7 @@ checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 
 [[package]]
 name = "zakura"
-version = "1.0.3-rc2"
+version = "1.0.3"
 dependencies = [
  "abscissa_core",
  "anyhow",
@@ -8855,7 +8855,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "1.2.1-rc0"
+version = "2.0.0"
 dependencies = [
  "bech32",
  "bitflags 2.13.0",
@@ -8925,7 +8925,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "3.0.1-rc0"
+version = "4.0.0"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -8978,7 +8978,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-jsonl-trace"
-version = "1.0.1-rc0"
+version = "1.0.1"
 dependencies = [
  "tempfile",
  "tokio",
@@ -8988,7 +8988,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "4.0.0-rc0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -9036,7 +9036,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "2.0.0-rc0"
+version = "2.0.0"
 dependencies = [
  "color-eyre",
  "jsonrpsee-types",
@@ -9050,7 +9050,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "4.0.0-rc0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9120,7 +9120,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "1.0.2-rc0"
+version = "2.0.0"
 dependencies = [
  "hex",
  "lazy_static",
@@ -9138,7 +9138,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "4.0.0-rc0"
+version = "4.0.0"
 dependencies = [
  "bincode",
  "chrono",
@@ -9191,7 +9191,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-test"
-version = "1.0.1-rc1"
+version = "2.0.0"
 dependencies = [
  "color-eyre",
  "futures",
@@ -9218,7 +9218,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-tower-batch-control"
-version = "1.0.1-rc0"
+version = "1.0.1"
 dependencies = [
  "color-eyre",
  "ed25519-zebra",
@@ -9240,7 +9240,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-tower-fallback"
-version = "1.0.1-rc0"
+version = "1.0.1"
 dependencies = [
  "futures-core",
  "pin-project",
@@ -9252,7 +9252,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "1.1.0-rc0"
+version = "1.1.0"
 dependencies = [
  "color-eyre",
  "hex",

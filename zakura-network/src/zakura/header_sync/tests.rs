@@ -2101,6 +2101,89 @@ fn rooted_forward_overlap_advances_past_intermediate_checkpoint() {
     assert_eq!(first.anchor_hash, None);
 }
 
+#[test]
+fn refresh_forward_range_skips_one_height_retained_overlap_at_scheduled_tip() {
+    // Reproduce the panic: retain-roots overlap continues from scheduled_end when
+    // that end already equals the peer tip, so the next batch would be length 1
+    // and `next_height(batch_start)..=batch_end` is inverted.
+    let network = Parameters::build()
+        .with_network_name("HsOneHeightOverlapPanic")
+        .expect("custom network name is valid")
+        .with_genesis_hash(Network::Mainnet.genesis_hash())
+        .expect("mainnet genesis hash is valid")
+        .with_activation_heights(ConfiguredActivationHeights {
+            overwinter: Some(1),
+            sapling: Some(2),
+            blossom: Some(3),
+            heartwood: Some(4),
+            canopy: Some(4),
+            ..Default::default()
+        })
+        .expect("custom activation heights are in order")
+        .clear_funding_streams()
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (block::Height(0), Network::Mainnet.genesis_hash()),
+            (block::Height(400), block::Hash([4; 32])),
+            (block::Height(1_200), block::Hash([12; 32])),
+        ]))
+        .expect("custom checkpoints are valid")
+        .to_network()
+        .expect("custom testnet parameters are valid");
+    let anchor = (block::Height(0), network.genesis_hash());
+    let tip = (block::Height(400), block::Hash([4; 32]));
+    let peer_tip = block::Height(500);
+    let mut startup = startup_for(network, anchor, Some(tip));
+    startup.config.max_headers_per_response = 100;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: tip.0,
+        authenticated_hash: tip.1,
+        completed_checkpoint_height: tip.0,
+        completed_checkpoint_hash: tip.1,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    state.schedule.ensure_forward(RangeRequest {
+        range: CheckedHeaderRange::from_bounds(block::Height(401), peer_tip)
+            .expect("seeded forward range is bounded"),
+        anchor_hash: None,
+        finalized: false,
+        want_tree_aux_roots: true,
+        priority: RangePriority::Forward,
+    });
+    let peer_id = peer(237);
+    let (send, _recv) = crate::zakura::framed_channel(32);
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+    );
+    let mut peer_state = super::state::PeerHeaderState::new(
+        session,
+        tip,
+        100,
+        2,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+    );
+    peer_state.received_status = true;
+    peer_state.advertised_tip = peer_tip;
+    state.peers.insert(peer_id, peer_state);
+
+    state.refresh_forward_range(&startup);
+
+    assert_eq!(
+        state.schedule.highest_end(RangePriority::Forward),
+        Some(peer_tip),
+        "one-height retained overlap at the scheduled tip must stop without enqueueing"
+    );
+    assert_eq!(
+        state.schedule.range_count(RangePriority::Forward),
+        1,
+        "refresh must not add a degenerate one-height overlap batch"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn committed_forward_payload_authenticates_without_fallback_request() {
     let header_2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);

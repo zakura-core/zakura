@@ -186,19 +186,22 @@ impl HeaderSyncCore {
                 batch_end = handoff;
                 batch_len = count_between(batch_start, batch_end);
             }
+            // One-height retained-root overlap batches must not query checkpoints:
+            // `next_height(batch_start)..=batch_end` would be inverted and panic.
+            if repeats_boundary && batch_len < 2 {
+                break;
+            }
             let checkpoint_start = if repeats_boundary {
                 next_height(batch_start)
             } else {
                 Some(batch_start)
             };
             if let Some(checkpoint) = checkpoint_start
+                .filter(|start| *start <= batch_end)
                 .and_then(|start| checkpoints.min_height_in_range(start..=batch_end))
             {
                 batch_len = count_between(batch_start, checkpoint);
                 batch_end = checkpoint;
-            }
-            if repeats_boundary && batch_len < 2 {
-                break;
             }
             let range = CheckedHeaderRange::from_count(batch_start, batch_len)
                 .expect("bounded non-empty batch has checked geometry");

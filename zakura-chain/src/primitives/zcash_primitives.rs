@@ -280,21 +280,21 @@ impl PrecomputedTxData {
     }
 
     /// Returns the Orchard bundle in `tx_data`.
-    pub fn orchard_bundle(
+    pub(crate) fn orchard_bundle(
         &self,
     ) -> Option<orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>> {
         self.tx_data.orchard_bundle().cloned()
     }
 
     /// Returns the Ironwood bundle in `tx_data`.
-    pub fn ironwood_bundle(
+    pub(crate) fn ironwood_bundle(
         &self,
     ) -> Option<orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>> {
         self.tx_data.ironwood_bundle().cloned()
     }
 
     /// Returns the Sapling bundle in `tx_data`.
-    pub fn sapling_bundle(
+    pub(crate) fn sapling_bundle(
         &self,
     ) -> Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>> {
         self.tx_data.sapling_bundle().cloned()

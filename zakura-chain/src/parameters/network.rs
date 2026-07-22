@@ -12,7 +12,7 @@ use crate::{
 };
 
 mod error;
-pub mod magic;
+pub(super) mod magic;
 pub mod subsidy;
 pub mod testnet;
 

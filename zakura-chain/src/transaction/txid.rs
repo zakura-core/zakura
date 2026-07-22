@@ -16,7 +16,7 @@ pub(super) struct TxIdBuilder<'a> {
 
 impl<'a> TxIdBuilder<'a> {
     /// Return a new TxIdBuilder for the given transaction.
-    pub fn new(trans: &'a Transaction) -> Self {
+    pub(super) fn new(trans: &'a Transaction) -> Self {
         TxIdBuilder { trans }
     }
 

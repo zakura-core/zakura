@@ -27,7 +27,7 @@ use super::sinsemilla::*;
 /// Generates a random scalar from the scalar field 𝔽_{q_P}.
 ///
 /// <https://zips.z.cash/protocol/nu5.pdf#pallasandvesta>
-pub fn generate_trapdoor<T>(csprng: &mut T) -> Result<pallas::Scalar, RandError>
+pub(super) fn generate_trapdoor<T>(csprng: &mut T) -> Result<pallas::Scalar, RandError>
 where
     T: RngCore + CryptoRng,
 {

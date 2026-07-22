@@ -7,7 +7,7 @@ use zcash_protocol::consensus::BlockHeight;
 use crate::{serialization::SerializationError, BoxError};
 
 #[cfg(feature = "json-conversion")]
-pub mod json_conversion;
+pub(super) mod json_conversion;
 
 /// The length of the chain back to the genesis block.
 ///

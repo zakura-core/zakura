@@ -20,7 +20,7 @@ use sinsemilla::HashDomain;
 /// ExtractJ(𝑟) which returns a bit sequence.
 ///
 /// [concreteextractorpallas]: https://zips.z.cash/protocol/nu5.pdf#concreteextractorpallas
-pub fn extract_p(point: pallas::Point) -> pallas::Base {
+pub(super) fn extract_p(point: pallas::Point) -> pallas::Base {
     let option: Option<Coordinates<pallas::Affine>> =
         pallas::Affine::from(point).coordinates().into();
 
@@ -39,7 +39,7 @@ pub fn extract_p(point: pallas::Point) -> pallas::Base {
 ///
 /// <https://zips.z.cash/protocol/nu5.pdf#concretegrouphashpallasandvesta>
 #[allow(non_snake_case)]
-pub fn pallas_group_hash(D: &[u8], M: &[u8]) -> pallas::Point {
+pub(super) fn pallas_group_hash(D: &[u8], M: &[u8]) -> pallas::Point {
     let domain_separator = std::str::from_utf8(D).unwrap();
 
     pallas::Point::hash_to_curve(domain_separator)(M)

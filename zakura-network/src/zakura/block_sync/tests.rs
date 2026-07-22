@@ -11387,6 +11387,17 @@ async fn reactor_exchange_coalesced_reanchor_releases_stale_successor_body() {
             frontier: ChainFrontier {
                 finalized: test_frontier(0),
                 verified_body: Frontier::new(block::Height(1), blocks[0].hash()),
+                best_header: Frontier::new(block::Height(2), blocks[1].hash()),
+            },
+            change: FrontierChange::VerifiedGrow,
+        },
+        "test",
+    );
+    exchange.publish_frontier(
+        FrontierUpdate {
+            frontier: ChainFrontier {
+                finalized: test_frontier(0),
+                verified_body: Frontier::new(block::Height(1), blocks[0].hash()),
                 best_header: Frontier::new(block::Height(2), reanchored_successor.hash()),
             },
             change: FrontierChange::HeaderReanchored,

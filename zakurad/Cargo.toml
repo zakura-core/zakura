@@ -317,7 +317,7 @@ zakura-consensus = { path = "../zakura-consensus", version = "4.0.0", features =
 zakura-network = { path = "../zakura-network", version = "4.0.0", features = ["proptest-impl", "zakura-testkit"] }
 zakura-state = { path = "../zakura-state", version = "4.0.0", features = ["proptest-impl"] }
 
-zakura-test = { path = "../zakura-test", version = "1.0.1" }
+zakura-test = { path = "../zakura-test", version = "2.0.0" }
 
 # Used by the checkpoint generation tests via the zakura-checkpoints feature
 # (the binaries in this crate won't be built unless their features are enabled).

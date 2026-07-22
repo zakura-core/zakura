@@ -37,7 +37,7 @@ lazy_static = { workspace = true }
 ripemd = { workspace = true }
 secp256k1 = { workspace = true }
 sha2 = { workspace = true }
-zakura-test = { path = "../zakura-test", version = "1.0.1" }
+zakura-test = { path = "../zakura-test", version = "2.0.0" }
 
 [lints]
 workspace = true

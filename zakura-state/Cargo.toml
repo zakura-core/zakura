@@ -94,7 +94,7 @@ zakura-chain = { path = "../zakura-chain", version = "2.0.0", features = ["async
 howudoin = { workspace = true, optional = true }
 
 # test feature proptest-impl
-zakura-test = { path = "../zakura-test/", version = "1.0.1", optional = true }
+zakura-test = { path = "../zakura-test/", version = "2.0.0", optional = true }
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 derive-getters.workspace = true
@@ -121,7 +121,7 @@ jubjub = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
 zakura-chain = { path = "../zakura-chain", version = "2.0.0", features = ["proptest-impl"] }
-zakura-test = { path = "../zakura-test/", version = "1.0.1" }
+zakura-test = { path = "../zakura-test/", version = "2.0.0" }
 
 [lints]
 workspace = true

@@ -153,7 +153,7 @@ zakura-state = { path = "../zakura-state", version = "4.0.0", features = [
     "proptest-impl",
 ] }
 
-zakura-test = { path = "../zakura-test", version = "1.0.1" }
+zakura-test = { path = "../zakura-test", version = "2.0.0" }
 
 [lints]
 workspace = true

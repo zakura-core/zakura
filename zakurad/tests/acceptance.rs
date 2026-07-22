@@ -520,9 +520,11 @@ fn ephemeral(cache_dir_config: EphemeralConfig, cache_dir_check: EphemeralCheck)
     let mut child = run_dir
         .path()
         .with_config(&mut config)?
-        .spawn_child(args!["start"])?;
-    // Run the program and kill it after a few seconds
-    std::thread::sleep(EXTENDED_LAUNCH_DELAY);
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
+
+    // Wait until ephemeral state initialization has completed.
+    child.expect_stdout_line_matches("loaded Zakura state cache")?;
     child.kill(false)?;
     let output = child.wait_with_output()?;
 

@@ -4,8 +4,7 @@ use anyhow::anyhow;
 use std::iter;
 use zakura_chain::amount::Amount;
 
-use strum::IntoEnumIterator;
-use zcash_keys::address::{Address, UnifiedAddress};
+use zcash_keys::address::Address;
 
 use zakura_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 
@@ -27,13 +26,10 @@ use crate::config::mining::{default_miner_address, MinerAddressType};
 
 use super::MinerParams;
 
-/// Tests that coinbase transactions can be generated.
-///
-/// This test needs to be run with the `--release` flag so that it runs for ~ 30 seconds instead of
-/// ~ 90.
+/// Tests transparent coinbase generation at every configured Sapling-and-later
+/// network upgrade activation.
 #[test]
-#[ignore]
-fn coinbase() -> anyhow::Result<()> {
+fn transparent_coinbase() -> anyhow::Result<()> {
     let regtest = testnet::Parameters::build()
         .with_slow_start_interval(Height::MIN)
         .with_activation_heights(ConfiguredActivationHeights {
@@ -72,24 +68,20 @@ fn coinbase() -> anyhow::Result<()> {
         .to_network()?;
 
     for net in Network::iter().chain(iter::once(regtest)) {
+        let miner_params = MinerParams::from(
+            Address::decode(
+                &net,
+                default_miner_address(net.kind(), &MinerAddressType::Transparent),
+            )
+            .ok_or(anyhow!("hard-coded transparent address must be valid"))?,
+        );
+
         for nu in NetworkUpgrade::iter().filter(|nu| nu >= &NetworkUpgrade::Sapling) {
             if let Some(height) = nu.activation_height(&net) {
-                for addr_type in MinerAddressType::iter() {
-                    TransactionTemplate::new_coinbase(
-                        &net,
-                        height,
-                        &MinerParams::from(
-                            Address::decode(&net, default_miner_address(net.kind(), &addr_type))
-                                .ok_or(anyhow!("hard-coded addr must be valid"))?,
-                        ),
-                        Amount::zero(),
-                    )?
-                    .data()
-                    .as_ref()
-                    // Deserialization contains checks for elementary consensus rules, which must
-                    // pass.
-                    .zcash_deserialize_into::<Transaction>()?;
-                }
+                let transaction = coinbase_transaction(&net, height, &miner_params)?;
+                assert!(transaction.sapling_outputs().next().is_none());
+                assert!(transaction.orchard_shielded_data().is_none());
+                assert!(transaction.ironwood_shielded_data().is_none());
             }
         }
     }
@@ -219,98 +211,40 @@ fn coinbase_tag_and_limit() {
     );
 }
 
-/// Tests that a coinbase paying an Orchard-only unified address is routed to Orchard before
-/// NU6.3 and to Ironwood from NU6.3 onward.
+/// Tests each distinct shielded coinbase construction and routing path.
 ///
-/// Ironwood reuses the Orchard receiver, and net-new value into Orchard is forbidden after
-/// NU6.3, so the Orchard receiver is paid via Ironwood once NU6.3 is active.
+/// The exhaustive [`transparent_coinbase`] test does not need shielded proofs.
+/// This test limits real proof generation to the paths where the address type or
+/// network upgrade changes the selected shielded pool or circuit.
 ///
-/// Like [`coinbase`], this builds real shielded outputs, so it is ignored to keep normal
-/// debug test runs fast. Run it with `--release` when intentionally checking this path.
+/// Run this test with `--release` because it generates five real proofs.
 #[test]
 #[ignore]
-fn coinbase_routes_orchard_only_unified_address_by_network_upgrade() {
-    let net = nu6_3_testnet();
+fn shielded_coinbase_paths() -> anyhow::Result<()> {
+    let net = shielded_coinbase_testnet();
+    let sapling_height = NetworkUpgrade::Sapling
+        .activation_height(&net)
+        .expect("Sapling activation height is configured");
+    let canopy_height = NetworkUpgrade::Canopy
+        .activation_height(&net)
+        .expect("Canopy activation height is configured");
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&net)
+        .expect("NU5 activation height is configured");
+    let nu6_2_height = NetworkUpgrade::Nu6_2
+        .activation_height(&net)
+        .expect("NU6.2 activation height is configured");
     let nu6_3_height = NetworkUpgrade::Nu6_3
         .activation_height(&net)
         .expect("NU6.3 activation height is configured");
-    let nu7_height = NetworkUpgrade::Nu7
-        .activation_height(&net)
-        .expect("NU7 activation height is configured");
-    let pre_nu6_3_height = Height(nu6_3_height.0 - 1);
-    let miner_params = MinerParams::from(Address::Unified(orchard_only_unified_address()));
-
-    // Before NU6.3, the Orchard receiver is paid via Orchard.
-    let pre_tx =
-        TransactionTemplate::new_coinbase(&net, pre_nu6_3_height, &miner_params, Amount::zero())
-            .expect("Orchard-only unified address is paid via Orchard before NU6.3")
-            .data()
-            .as_ref()
-            .zcash_deserialize_into::<Transaction>()
-            .expect("coinbase transaction deserializes");
-
-    assert!(
-        pre_tx.orchard_shielded_data().is_some(),
-        "pre-NU6.3 coinbase to an Orchard-only address should have an Orchard output"
+    let sapling_params = MinerParams::from(
+        Address::decode(
+            &net,
+            default_miner_address(net.kind(), &MinerAddressType::Sapling),
+        )
+        .expect("hard-coded Sapling miner address is valid"),
     );
-    assert!(
-        pre_tx.ironwood_shielded_data().is_none(),
-        "pre-NU6.3 coinbase should not have an Ironwood output"
-    );
-
-    // After NU6.3, the Orchard receiver is paid via Ironwood instead.
-    let post_tx =
-        TransactionTemplate::new_coinbase(&net, nu6_3_height, &miner_params, Amount::zero())
-            .expect("Orchard-only unified address is paid via Ironwood after NU6.3")
-            .data()
-            .as_ref()
-            .zcash_deserialize_into::<Transaction>()
-            .expect("coinbase transaction deserializes");
-
-    assert!(
-        post_tx.ironwood_shielded_data().is_some(),
-        "post-NU6.3 coinbase to an Orchard-only address should have an Ironwood output"
-    );
-    assert!(
-        post_tx.orchard_shielded_data().is_none(),
-        "post-NU6.3 coinbase should not have an Orchard output"
-    );
-
-    let later_tx =
-        TransactionTemplate::new_coinbase(&net, nu7_height, &miner_params, Amount::zero())
-            .expect("Orchard-only unified address is still paid via Ironwood after NU6.3")
-            .data()
-            .as_ref()
-            .zcash_deserialize_into::<Transaction>()
-            .expect("coinbase transaction deserializes");
-
-    assert!(
-        later_tx.ironwood_shielded_data().is_some(),
-        "post-NU6.3 coinbase to an Orchard-only address should keep using Ironwood"
-    );
-    assert!(
-        later_tx.orchard_shielded_data().is_none(),
-        "post-NU6.3 coinbase should not have an Orchard output"
-    );
-}
-
-/// Tests that unified mining addresses with multiple shielded receivers still prefer the
-/// Orchard receiver before and from NU6.3 onward.
-///
-/// Like [`coinbase`], this builds real shielded outputs, so it is ignored to keep normal
-/// debug test runs fast. Run it with `--release` when intentionally checking this path.
-#[test]
-#[ignore]
-fn coinbase_preserves_orchard_priority_by_network_upgrade() {
-    let net = nu6_3_testnet();
-    let nu6_3_height = NetworkUpgrade::Nu6_3
-        .activation_height(&net)
-        .expect("NU6.3 activation height is configured");
-    let nu7_height = NetworkUpgrade::Nu7
-        .activation_height(&net)
-        .expect("NU7 activation height is configured");
-    let pre_nu6_3_height = Height(nu6_3_height.0 - 1);
-    let miner_params = MinerParams::from(
+    let unified_params = MinerParams::from(
         Address::decode(
             &net,
             default_miner_address(net.kind(), &MinerAddressType::Unified),
@@ -318,71 +252,80 @@ fn coinbase_preserves_orchard_priority_by_network_upgrade() {
         .expect("hard-coded unified miner address is valid"),
     );
 
-    let pre_tx =
-        TransactionTemplate::new_coinbase(&net, pre_nu6_3_height, &miner_params, Amount::zero())
-            .expect("unified address is paid via Orchard before NU6.3")
-            .data()
-            .as_ref()
-            .zcash_deserialize_into::<Transaction>()
-            .expect("coinbase transaction deserializes");
-
+    let sapling_tx = coinbase_transaction(&net, sapling_height, &sapling_params)?;
     assert!(
-        pre_tx.orchard_shielded_data().is_some(),
-        "pre-NU6.3 coinbase to a unified address should have an Orchard output"
+        sapling_tx.sapling_outputs().next().is_some(),
+        "a Sapling miner address should receive a Sapling output"
     );
     assert!(
-        pre_tx.sapling_outputs().next().is_none(),
-        "pre-NU6.3 coinbase should not prefer Sapling when Orchard is present"
+        sapling_tx.orchard_shielded_data().is_none(),
+        "a Sapling miner address should not receive an Orchard output"
     );
     assert!(
-        pre_tx.ironwood_shielded_data().is_none(),
-        "pre-NU6.3 coinbase should not have an Ironwood output"
+        sapling_tx.ironwood_shielded_data().is_none(),
+        "a Sapling miner address should not receive an Ironwood output"
     );
 
-    let post_tx =
-        TransactionTemplate::new_coinbase(&net, nu6_3_height, &miner_params, Amount::zero())
-            .expect("unified address is paid via Ironwood at NU6.3")
-            .data()
-            .as_ref()
-            .zcash_deserialize_into::<Transaction>()
-            .expect("coinbase transaction deserializes");
-
+    let pre_nu5_tx = coinbase_transaction(&net, canopy_height, &unified_params)?;
     assert!(
-        post_tx.ironwood_shielded_data().is_some(),
-        "NU6.3 coinbase to a unified address should have an Ironwood output"
+        pre_nu5_tx.sapling_outputs().next().is_some(),
+        "a pre-NU5 unified address should fall back to its Sapling receiver"
     );
     assert!(
-        post_tx.sapling_outputs().next().is_none(),
-        "NU6.3 coinbase should not prefer Sapling when Orchard is present"
+        pre_nu5_tx.orchard_shielded_data().is_none(),
+        "a pre-NU5 coinbase cannot contain an Orchard output"
     );
     assert!(
-        post_tx.orchard_shielded_data().is_none(),
-        "NU6.3 coinbase should not have an Orchard output"
+        pre_nu5_tx.ironwood_shielded_data().is_none(),
+        "a pre-NU5 coinbase cannot contain an Ironwood output"
     );
 
-    let later_tx =
-        TransactionTemplate::new_coinbase(&net, nu7_height, &miner_params, Amount::zero())
-            .expect("unified address is still paid via Ironwood after NU6.3")
-            .data()
-            .as_ref()
-            .zcash_deserialize_into::<Transaction>()
-            .expect("coinbase transaction deserializes");
+    let pre_nu6_2_tx = coinbase_transaction(&net, nu5_height, &unified_params)?;
+    assert!(
+        pre_nu6_2_tx.orchard_shielded_data().is_some(),
+        "an NU5 unified address should prefer its Orchard receiver"
+    );
+    assert!(
+        pre_nu6_2_tx.sapling_outputs().next().is_none(),
+        "an NU5 unified address should prefer Orchard over Sapling"
+    );
+    assert!(
+        pre_nu6_2_tx.ironwood_shielded_data().is_none(),
+        "an NU5 coinbase cannot contain an Ironwood output"
+    );
 
+    let nu6_2_tx = coinbase_transaction(&net, nu6_2_height, &unified_params)?;
     assert!(
-        later_tx.ironwood_shielded_data().is_some(),
-        "post-NU6.3 coinbase to a unified address should keep using Ironwood"
+        nu6_2_tx.orchard_shielded_data().is_some(),
+        "an NU6.2 unified address should receive an Orchard output"
     );
     assert!(
-        later_tx.sapling_outputs().next().is_none(),
-        "post-NU6.3 coinbase should not prefer Sapling when Orchard is present"
+        nu6_2_tx.sapling_outputs().next().is_none(),
+        "an NU6.2 unified address should prefer Orchard over Sapling"
     );
     assert!(
-        later_tx.orchard_shielded_data().is_none(),
-        "post-NU6.3 coinbase should not have an Orchard output"
+        nu6_2_tx.ironwood_shielded_data().is_none(),
+        "an NU6.2 coinbase cannot contain an Ironwood output"
     );
+
+    let nu6_3_tx = coinbase_transaction(&net, nu6_3_height, &unified_params)?;
+    assert!(
+        nu6_3_tx.ironwood_shielded_data().is_some(),
+        "an NU6.3 unified address should receive an Ironwood output"
+    );
+    assert!(
+        nu6_3_tx.sapling_outputs().next().is_none(),
+        "an NU6.3 unified address should prefer Ironwood over Sapling"
+    );
+    assert!(
+        nu6_3_tx.orchard_shielded_data().is_none(),
+        "an NU6.3 coinbase should not contain an Orchard output"
+    );
+
+    Ok(())
 }
 
-fn nu6_3_testnet() -> Network {
+fn shielded_coinbase_testnet() -> Network {
     testnet::Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
             overwinter: Some(1),
@@ -393,8 +336,8 @@ fn nu6_3_testnet() -> Network {
             nu5: Some(6),
             nu6: Some(7),
             nu6_1: Some(8),
-            nu6_3: Some(9),
-            nu7: Some(10),
+            nu6_2: Some(9),
+            nu6_3: Some(10),
             ..Default::default()
         })
         .expect("configured activation heights are valid")
@@ -403,17 +346,17 @@ fn nu6_3_testnet() -> Network {
         .expect("configured network is valid")
 }
 
-fn orchard_only_unified_address() -> UnifiedAddress {
-    let orchard_spending_key = Option::<orchard::keys::SpendingKey>::from(
-        orchard::keys::SpendingKey::from_bytes([0u8; 32]),
+fn coinbase_transaction(
+    net: &Network,
+    height: Height,
+    miner_params: &MinerParams,
+) -> anyhow::Result<Transaction> {
+    Ok(
+        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero())?
+            .data()
+            .as_ref()
+            // Deserialization contains checks for elementary consensus rules,
+            // which must pass.
+            .zcash_deserialize_into::<Transaction>()?,
     )
-    .expect("test Orchard spending key is valid");
-    let orchard_full_viewing_key = orchard::keys::FullViewingKey::from(&orchard_spending_key);
-    let orchard_address = orchard_full_viewing_key.address_at(
-        orchard::keys::DiversifierIndex::from([0u8; 11]),
-        orchard::keys::Scope::External,
-    );
-
-    UnifiedAddress::from_receivers(Some(orchard_address), None, None)
-        .expect("Orchard-only unified addresses are valid")
 }

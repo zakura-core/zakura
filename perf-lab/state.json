@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "session": 1,
-  "batch_runs_used": 7,
+  "batch_runs_used": 0,
   "next_exp_id": 2,
   "droplets": {
     "perf-lab-serve-a": {
@@ -23,10 +23,10 @@
     }
   },
   "in_flight": {
-    "aa-cohort2": {
+    "aa-cohort3": {
       "droplet": "perf-lab-s2",
-      "exp": "B-15 cohort determinism sample 2",
-      "started_at": "2026-07-22T18:22:00Z"
+      "exp": "B-15 cohort determinism sample 3",
+      "started_at": "2026-07-22T19:05:00Z"
     }
   },
   "noise_band_pct": 8.7

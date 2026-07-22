@@ -214,3 +214,25 @@ This file is the sole reporting channel (design D5). Entry template:
 - absolute throughput **~2× live-peer** (191 vs 85-100 pc blk/s): frozen
   uncontended servers on the private overlay feed flat-out — the bench now
   stresses the node itself much harder.
+
+### aa-cohort2 + diagnosis (2026-07-22)
+
+- within-run 7.60% (179.64 / 165.98 pc; legs 686/746s), SHA 63b8d4dc. Both
+  legs SUPPLY-BOUND with idle servers (loads ~0) and idle writer (33%/27%):
+  the slow leg's apply queue starved at 39 vs 401. Constraint = per-connection
+  overlay delivery, varying leg-to-leg. Cohort samples now {0.00, 7.60} —
+  bimodal; third sample running before the band is set.
+- run-to-run 191→~172 across SHAs 2d3d7e51→63b8d4dc: possible mainline
+  regression candidate — cross-SHA within-run A/B queued after band settles.
+- unlock: `max_blocks_per_response` is a config field — testable via a
+  harness write_config patch in our bench configs (no code-default change, no
+  PR-166/217 collision). Prime suspect for both the supply ceiling and the
+  leg variance (per-request RTT integrates into throughput at 1 blk/response).
+
+## BATCH 2 summary (2026-07-22)
+
+- collects (8): aa-seed2, base1, exp001-p50, exp001-p400, seed-a, seed-b,
+  aa-cohort1, aa-cohort2. Wins 0; products: B-15 cohort STANDING with 2×
+  throughput, EXP-001 DL_LIMIT-flat evidence, supply-bound attribution.
+- spend: ~US$5 (SESSION 1 tail + cohort build incl. one written-off seed
+  pair).

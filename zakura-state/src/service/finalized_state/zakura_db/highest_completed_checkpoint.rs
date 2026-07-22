@@ -63,6 +63,13 @@ struct TrackerState {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ProposedHighestCompletedCheckpoint(TrackerState);
 
+impl ProposedHighestCompletedCheckpoint {
+    /// Returns the checkpoint that would become current if this proposal commits.
+    pub fn current(&self) -> Option<HighestCompletedCheckpoint> {
+        self.0.current
+    }
+}
+
 /// The process-local highest completed checkpoint and its publication channel.
 ///
 /// Canonical headers are the durable source of truth. This cache is reconstructed on open
@@ -106,6 +113,9 @@ impl HighestCompletedCheckpointTracker {
     ///
     /// Passes the current tracker as `start_hint` so reconstruct resumes (path A) and
     /// only walks from the cursor through the new pending range (path D).
+    /// Empty batches and batches with an unknown anchor leave the proposed state unchanged.
+    /// A conflicting batch uses its final height as the proposed tip and re-walks from the
+    /// completed checkpoint when the conflict reaches the current cursor.
     /// This method does not mutate the tracker.
     pub fn propose_after_headers(
         &self,
@@ -117,10 +127,7 @@ impl HighestCompletedCheckpointTracker {
             return Ok(ProposedHighestCompletedCheckpoint(self.state));
         }
 
-        let Some(anchor_height) = db
-            .header_height(anchor)
-            .or_else(|| (anchor == db.network().genesis_hash()).then_some(Height::MIN))
-        else {
+        let Some(anchor_height) = Self::anchor_height(db, anchor) else {
             // Header-range validation reports the unknown anchor before this proposal is used.
             return Ok(ProposedHighestCompletedCheckpoint(self.state));
         };
@@ -174,6 +181,9 @@ impl HighestCompletedCheckpointTracker {
     }
 
     /// Rejects a reorg that would replace a completed checkpoint or any of its ancestors.
+    ///
+    /// Conflicts above the completed checkpoint are mutable and therefore allowed. An unknown
+    /// anchor is also allowed because header-range validation rejects it before commit.
     pub fn check_immutable_conflicts(
         &self,
         db: &ZakuraDb,
@@ -183,10 +193,7 @@ impl HighestCompletedCheckpointTracker {
         let Some(completed) = self.current() else {
             return Ok(());
         };
-        let Some(anchor_height) = db
-            .header_height(anchor)
-            .or_else(|| (anchor == db.network().genesis_hash()).then_some(Height::MIN))
-        else {
+        let Some(anchor_height) = Self::anchor_height(db, anchor) else {
             return Ok(());
         };
 
@@ -246,6 +253,11 @@ impl HighestCompletedCheckpointTracker {
         if changed {
             let _ = self.sender.send(state.current);
         }
+    }
+
+    fn anchor_height(db: &ZakuraDb, anchor: block::Hash) -> Option<Height> {
+        db.header_height(anchor)
+            .or_else(|| (anchor == db.network().genesis_hash()).then_some(Height::MIN))
     }
 }
 

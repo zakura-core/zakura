@@ -14,14 +14,14 @@ use zakura_chain::{
 
 use super::common::{
     mainnet_block, no_extra_checkpoint_test_network, persistent_config, persistent_state,
-    state_with_genesis_config,
+    state_with_genesis_config, write_full_block_header_and_transactions,
 };
 use crate::{
     service::{
         check::difficulty::{AdjustedDifficulty, POW_ADJUSTMENT_BLOCK_SPAN},
         finalized_state::{
-            DiskWriteBatch, HighestCompletedCheckpoint, HighestCompletedCheckpointTracker,
-            WriteDisk, ZakuraDb,
+            DiskWriteBatch, HighestCompletedCheckpoint, HighestCompletedCheckpointError,
+            HighestCompletedCheckpointTracker, WriteDisk, ZakuraDb,
         },
     },
     Config,
@@ -208,6 +208,197 @@ fn completed_checkpoint_rejects_conflicting_ancestor() {
         tracker.check_immutable_conflicts(&state, genesis.hash(), &[Arc::new(conflicting)]),
         Err(Height(1))
     );
+}
+
+#[test]
+fn empty_header_proposal_is_unchanged_and_does_not_notify() {
+    let _init_guard = zakura_test::init();
+    let (genesis, _headers, network) = checkpoint_chain(&[2]);
+    let state = state_with_genesis_config(&network, genesis.clone(), Config::ephemeral());
+    let (mut tracker, mut receiver) = HighestCompletedCheckpointTracker::open(&state);
+    let initial = checkpoint(Height::MIN, genesis.hash());
+
+    let proposal = tracker
+        .propose_after_headers(&state, genesis.hash(), &[])
+        .expect("an empty header proposal is valid");
+
+    assert_eq!(proposal.current(), Some(initial));
+    tracker.commit_success(proposal);
+    assert_eq!(tracker.current(), Some(initial));
+    assert!(!receiver.has_changed().expect("tracker sender remains open"));
+}
+
+#[test]
+fn unknown_anchor_is_unchanged_for_proposal_and_immutable_check() {
+    let _init_guard = zakura_test::init();
+    let (genesis, headers, network) = checkpoint_chain(&[2]);
+    let state = state_with_genesis_config(&network, genesis.clone(), Config::ephemeral());
+    let (tracker, _receiver) = HighestCompletedCheckpointTracker::open(&state);
+    let initial = tracker.current();
+    let mut unknown_anchor_header = *headers[0].as_ref();
+    unknown_anchor_header.nonce.0[0] = unknown_anchor_header.nonce.0[0].wrapping_add(1);
+    let unknown_anchor = block::Hash::from(&unknown_anchor_header);
+
+    let proposal = tracker
+        .propose_after_headers(&state, unknown_anchor, &headers[1..])
+        .expect("header-range validation owns unknown-anchor errors");
+
+    assert_eq!(proposal.current(), initial);
+    assert_eq!(
+        tracker.check_immutable_conflicts(&state, unknown_anchor, &headers[1..]),
+        Ok(())
+    );
+}
+
+#[test]
+fn reorg_above_completed_checkpoint_rewinds_the_cursor() {
+    let _init_guard = zakura_test::init();
+    let (genesis, headers, network) = checkpoint_chain(&[2, 6]);
+    let state = state_with_genesis_config(&network, genesis, Config::ephemeral());
+    for (index, header) in headers[..5].iter().enumerate() {
+        let height = Height(u32::try_from(index + 1).expect("small test height fits in u32"));
+        store_header(&state, height, header);
+    }
+    let (mut tracker, mut receiver) = HighestCompletedCheckpointTracker::open(&state);
+    let checkpoint_two = checkpoint(Height(2), block::Hash::from(headers[1].as_ref()));
+    assert_eq!(tracker.current(), Some(checkpoint_two));
+    assert_eq!(*receiver.borrow_and_update(), Some(checkpoint_two));
+
+    let mut conflicting_three = *headers[2].as_ref();
+    conflicting_three.nonce.0[0] = conflicting_three.nonce.0[0].wrapping_add(1);
+    let conflicting_three = Arc::new(conflicting_three);
+    let mut conflicting_four = *headers[3].as_ref();
+    conflicting_four.previous_block_hash = block::Hash::from(conflicting_three.as_ref());
+    let conflicting_four = Arc::new(conflicting_four);
+    let proposal = tracker
+        .propose_after_headers(
+            &state,
+            checkpoint_two.hash,
+            &[conflicting_three, conflicting_four],
+        )
+        .expect("a mutable shorter header reorg is valid");
+
+    assert_eq!(proposal.current(), Some(checkpoint_two));
+    tracker.commit_success(proposal);
+    assert_eq!(tracker.current(), Some(checkpoint_two));
+    assert!(!receiver.has_changed().expect("tracker sender remains open"));
+}
+
+#[test]
+fn immutable_check_allows_conflicts_above_completed_checkpoint() {
+    let _init_guard = zakura_test::init();
+    let (genesis, headers, network) = checkpoint_chain(&[2, 4]);
+    let state = state_with_genesis_config(&network, genesis, Config::ephemeral());
+    for (index, header) in headers[..3].iter().enumerate() {
+        let height = Height(u32::try_from(index + 1).expect("small test height fits in u32"));
+        store_header(&state, height, header);
+    }
+    let (tracker, _receiver) = HighestCompletedCheckpointTracker::open(&state);
+    let mut conflicting = *headers[2].as_ref();
+    conflicting.nonce.0[0] = conflicting.nonce.0[0].wrapping_add(1);
+
+    assert_eq!(
+        tracker.check_immutable_conflicts(
+            &state,
+            block::Hash::from(headers[1].as_ref()),
+            &[Arc::new(conflicting)],
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn immutable_check_is_disabled_without_a_completed_checkpoint() {
+    let _init_guard = zakura_test::init();
+    let (genesis, headers, network) = checkpoint_chain(&[2]);
+    let state = state_with_genesis_config(&network, genesis.clone(), Config::ephemeral());
+    store_header(&state, Height(1), &headers[0]);
+    let mut conflicting_checkpoint = *headers[1].as_ref();
+    conflicting_checkpoint.nonce.0[0] = conflicting_checkpoint.nonce.0[0].wrapping_add(1);
+    store_header(&state, Height(2), &Arc::new(conflicting_checkpoint));
+    let (tracker, _receiver) = HighestCompletedCheckpointTracker::open(&state);
+    assert_eq!(tracker.current(), None);
+
+    let mut conflicting_ancestor = *headers[0].as_ref();
+    conflicting_ancestor.nonce.0[0] = conflicting_ancestor.nonce.0[0].wrapping_add(1);
+    assert_eq!(
+        tracker.check_immutable_conflicts(
+            &state,
+            genesis.hash(),
+            &[Arc::new(conflicting_ancestor)],
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn proposal_reports_checkpoint_mismatch() {
+    let _init_guard = zakura_test::init();
+    let (genesis, headers, network) = checkpoint_chain(&[2]);
+    let state = state_with_genesis_config(&network, genesis.clone(), Config::ephemeral());
+    let (tracker, _receiver) = HighestCompletedCheckpointTracker::open(&state);
+    let mut conflicting_checkpoint = *headers[1].as_ref();
+    conflicting_checkpoint.nonce.0[0] = conflicting_checkpoint.nonce.0[0].wrapping_add(1);
+    let conflicting_checkpoint = Arc::new(conflicting_checkpoint);
+    let actual = block::Hash::from(conflicting_checkpoint.as_ref());
+
+    assert_eq!(
+        tracker.propose_after_headers(
+            &state,
+            genesis.hash(),
+            &[Arc::clone(&headers[0]), conflicting_checkpoint],
+        ),
+        Err(HighestCompletedCheckpointError::CheckpointMismatch {
+            height: Height(2),
+            expected: block::Hash::from(headers[1].as_ref()),
+            actual: Some(actual),
+        })
+    );
+}
+
+#[test]
+fn reconstruction_stops_at_broken_parent_link() {
+    let _init_guard = zakura_test::init();
+    let (genesis, headers, network) = checkpoint_chain(&[2]);
+    let state = state_with_genesis_config(&network, genesis.clone(), Config::ephemeral());
+    store_header(&state, Height(1), &headers[0]);
+    let mut broken = *headers[1].as_ref();
+    broken.previous_block_hash = genesis.hash();
+    store_header(&state, Height(2), &Arc::new(broken));
+
+    let (tracker, receiver) = HighestCompletedCheckpointTracker::open(&state);
+    let genesis_checkpoint = checkpoint(Height::MIN, genesis.hash());
+
+    assert_eq!(tracker.current(), Some(genesis_checkpoint));
+    assert_eq!(*receiver.borrow(), Some(genesis_checkpoint));
+}
+
+#[test]
+fn rebind_fast_forwards_to_checkpoint_covered_by_body_tip() {
+    let _init_guard = zakura_test::init();
+    let genesis = mainnet_block(0);
+    let blocks = [mainnet_block(1), mainnet_block(2)];
+    let headers = blocks
+        .iter()
+        .map(|block| Arc::clone(&block.header))
+        .collect::<Vec<_>>();
+    let network = checkpoint_network(&genesis, &headers, &[2]);
+    let state = state_with_genesis_config(&network, Arc::clone(&genesis), Config::ephemeral());
+    store_header(&state, Height(1), &headers[0]);
+    let (mut tracker, mut receiver) = HighestCompletedCheckpointTracker::open(&state);
+    let genesis_checkpoint = checkpoint(Height::MIN, genesis.hash());
+    assert_eq!(*receiver.borrow_and_update(), Some(genesis_checkpoint));
+
+    write_full_block_header_and_transactions(&state, Arc::clone(&blocks[0]));
+    write_full_block_header_and_transactions(&state, Arc::clone(&blocks[1]));
+    tracker
+        .rebind_from_db(&state)
+        .expect("body progress reconstructs checkpoint progress");
+
+    let checkpoint_two = checkpoint(Height(2), blocks[1].hash());
+    assert_eq!(tracker.current(), Some(checkpoint_two));
+    assert!(receiver.has_changed().expect("tracker sender remains open"));
+    assert_eq!(*receiver.borrow_and_update(), Some(checkpoint_two));
 }
 
 fn checkpoint(height: Height, hash: block::Hash) -> HighestCompletedCheckpoint {

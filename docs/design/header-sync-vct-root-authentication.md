@@ -879,6 +879,10 @@ Implemented in draft
 3. Simplify repair events that existed only because invalid roots were discovered
    late.
 4. Update the main VCT design document and changelog.
+5. Consider dropping the durable `HighestCompletedCheckpoint` column family and
+   deriving the value in memory from the coherent header tip (last configured
+   checkpoint at or below tip), once root authentication consumers no longer
+   need a separately persisted row.
 
 ## 21. Test plan
 

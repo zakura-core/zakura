@@ -28,7 +28,7 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 | `zakura-e2e.yml` | The heaviest PR-path job, isolated in its own workflow: regtest docker-compose end-to-end gate, multi-node testkit test, block-sync fuzz on every push to `main`, and long four-node modes nightly. PR runs are gated by a `changes` job or the `run-zakura-e2e` label. | PR/push (self-gated), merge queue, nightly, manual |
 | `status-checks.patch.yml` | Empty jobs with the same names as required checks, so branch protection passes when path filters skip `lint.yml` / `tests-unit.yml` / `test-crates.yml`. Its `paths-ignore` list **must stay the exact inverse** of those workflows' `paths`. | PR on non-Rust paths only |
 | `docs-check.yml` | markdownlint, codespell, and lychee link checking over all Markdown. | PR/push on Markdown paths |
-| `changelog.yml` | Validates the one-fragment-per-PR contract and tests release assembly. | Every PR/push/merge group |
+| `changelog.yml` | Requires one fragment for Rust/Cargo.toml PRs and tests release assembly. | Every PR/push/merge group |
 | `coverage.yml` | llvm-cov + nextest coverage uploaded to Codecov. A 120-minute instrumented build, kept off the PR path. | Push to `main`/`release/**`, nightly, manual |
 | `benchmarks.yml` | Criterion benchmarks. Runs on PRs carrying the `C-benchmark` label; results publish to the dashboard data on `gh-pages/dev/bench`. | Labeled PRs, manual |
 | `zcashd-compat-regtest.yml` | zcashd interoperability regtest suite (spawns fresh `zakurad` + `zcashd`, no external infrastructure). **Temporarily manual-only**: see the workflow header for the sidecar-zcashd re-enable condition. | Manual |

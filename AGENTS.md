@@ -50,9 +50,10 @@ cargo nextest run --profile sync-large-checkpoints-empty
 
 - PR titles must follow [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) (PRs are squash-merged — the PR title becomes the commit message)
 - Use `.github/pull_request_template.md`. For fixes, connect the root cause to both the solution and the test coverage.
-- Every ordinary PR adds one `changelog-unreleased/<PR-number>.md` fragment,
-  including an explicit no-changelog fragment for internal-only work. Do not
-  edit the shared changelog in ordinary PRs. See `CHANGELOG_GUIDELINES.md`.
+- Every PR that changes a Rust source file or any `Cargo.toml` adds one
+  `changelog-unreleased/<PR-number>.md` fragment, including an explicit
+  no-changelog fragment for internal-only work. Do not edit the shared
+  changelog in ordinary PRs. See `CHANGELOG_GUIDELINES.md`.
 
 ## Project Overview
 
@@ -175,8 +176,8 @@ cargo nextest run --profile sync-large-checkpoints-empty
 
 ## Changelog
 
-- After opening a draft PR, add exactly one
-  `changelog-unreleased/<PR-number>.md` file for that PR.
+- After opening a draft PR that changes a Rust source file or any `Cargo.toml`,
+  add exactly one `changelog-unreleased/<PR-number>.md` file for that PR.
 - Put user-visible `zakurad` entries under the appropriate Keep a Changelog
   category heading.
 - For internal-only work, use `<!-- changelog: none -->` and explain why.

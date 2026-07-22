@@ -368,11 +368,16 @@ def check_pull_request(
             )
         return
 
-    changed = run_git(
+    changed_paths = run_git(
         repo_root,
-        ["diff", "--name-only", base, head, "--", FRAGMENT_DIRECTORY],
+        ["diff", "--name-only", base, head],
     ).splitlines()
-    changed = [path for path in changed if path != f"{FRAGMENT_DIRECTORY}/README.md"]
+    changed = [
+        path
+        for path in changed_paths
+        if path.startswith(f"{FRAGMENT_DIRECTORY}/")
+        and path != f"{FRAGMENT_DIRECTORY}/README.md"
+    ]
     expected = f"{FRAGMENT_DIRECTORY}/{pull_request}.md"
     unexpected = [path for path in changed if path != expected]
     if unexpected:
@@ -380,7 +385,11 @@ def check_pull_request(
             "each PR owns one fragment; unexpected fragment changes: "
             + ", ".join(unexpected)
         )
-    if expected not in changed and not allow_missing:
+    changes_rust = any(
+        Path(path).suffix == ".rs" or Path(path).name == "Cargo.toml"
+        for path in changed_paths
+    )
+    if expected not in changed and not allow_missing and changes_rust:
         raise ChangelogError(
             f"add {expected}; use {NO_CHANGELOG_MARKER} for an internal-only PR"
         )

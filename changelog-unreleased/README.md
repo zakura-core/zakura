@@ -1,11 +1,13 @@
 # Changelog fragments
 
-Every ordinary pull request owns exactly one file in this directory. This
-keeps concurrent work out of the shared changelogs and makes the unreleased
-notes reviewable with the change that introduced them.
+Every pull request that changes a Rust source file or any `Cargo.toml` owns
+exactly one file in this directory. This keeps concurrent work out of the
+shared changelogs and makes the unreleased notes reviewable with the change
+that introduced them. Other pull requests do not need a fragment.
 
-After opening a draft PR, create `changelog-unreleased/<PR-number>.md`. Put
-each operator-visible change under its Keep a Changelog category:
+After opening a draft Rust or `Cargo.toml` PR, create
+`changelog-unreleased/<PR-number>.md`. Put each operator-visible change under
+its Keep a Changelog category:
 
 ```markdown
 ## Fixed
@@ -22,7 +24,8 @@ Write complete Keep a Changelog list items, including the PR link. Multiple
 changes and categories belong in the same fragment. Parameter changes still
 need a row in `CHANGELOG_PARAMS.md`.
 
-For an internal-only PR, use an explicit marker and explain the exclusion:
+For an internal-only Rust or `Cargo.toml` PR, use an explicit marker and
+explain the exclusion:
 
 ```markdown
 <!-- changelog: none -->

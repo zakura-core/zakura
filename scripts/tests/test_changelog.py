@@ -99,6 +99,38 @@ class ChangelogTests(unittest.TestCase):
                     self.root, "base", "head", "123", False, False
                 )
 
+    def test_rust_pull_request_requires_fragment(self):
+        with mock.patch.object(
+            changelog,
+            "run_git",
+            return_value="zakura-chain/src/lib.rs\n",
+        ):
+            with self.assertRaisesRegex(changelog.ChangelogError, "add .*123.md"):
+                changelog.check_pull_request(
+                    self.root, "base", "head", "123", False, False
+                )
+
+    def test_cargo_toml_pull_request_requires_fragment(self):
+        with mock.patch.object(
+            changelog,
+            "run_git",
+            return_value="zakura-chain/Cargo.toml\n",
+        ):
+            with self.assertRaisesRegex(changelog.ChangelogError, "add .*123.md"):
+                changelog.check_pull_request(
+                    self.root, "base", "head", "123", False, False
+                )
+
+    def test_non_rust_pull_request_does_not_require_fragment(self):
+        with mock.patch.object(
+            changelog,
+            "run_git",
+            return_value=".github/workflows/changelog.yml\nCargo.lock\n",
+        ):
+            changelog.check_pull_request(
+                self.root, "base", "head", "123", False, False
+            )
+
     def test_release_versions_root_changelog_and_consumes_fragments(self):
         path = self.root / "changelog-unreleased" / "123.md"
         path.write_text(

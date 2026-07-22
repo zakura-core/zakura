@@ -11316,6 +11316,101 @@ async fn reactor_exchange_reanchor_releases_stale_submitted_bodies() {
 }
 
 #[tokio::test]
+async fn reactor_exchange_coalesced_reanchor_releases_stale_successor_body() {
+    let blocks = mainnet_blocks_1_to_3();
+    let reanchored_successor = forked_block(&blocks[1], 101);
+    let mut config = immediate_body_download_config();
+    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 2;
+    config.request_timeout = Duration::from_secs(300);
+
+    let initial = FrontierUpdate {
+        frontier: ChainFrontier {
+            finalized: test_frontier(0),
+            verified_body: test_frontier(0),
+            best_header: Frontier::new(block::Height(2), blocks[1].hash()),
+        },
+        change: FrontierChange::Snapshot,
+    };
+    let (exchange, startup) = exchange_block_sync_startup(initial, config.clone());
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        69,
+        block::Height(2),
+        blocks[1].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![
+            block_meta(&blocks[0]),
+            block_meta(&blocks[1]),
+        ]))
+        .await
+        .expect("old-fork needed metadata queues");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 2)
+    );
+
+    for block in &blocks[..2] {
+        inbound_tx
+            .send(
+                BlockSyncMessage::Block(block.clone())
+                    .encode_frame()
+                    .expect("block frame encodes"),
+            )
+            .await
+            .expect("block frame queues");
+    }
+
+    let mut submitted = Vec::new();
+    while submitted.len() < 2 {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SubmitBlock { block, .. } => submitted.push(
+                block
+                    .coinbase_height()
+                    .expect("submitted test block has height"),
+            ),
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action before old-fork bodies submit: {action:?}"),
+        }
+    }
+    assert_eq!(submitted, vec![block::Height(1), block::Height(2)]);
+
+    exchange.publish_frontier(
+        FrontierUpdate {
+            frontier: ChainFrontier {
+                finalized: test_frontier(0),
+                verified_body: Frontier::new(block::Height(1), blocks[0].hash()),
+                best_header: Frontier::new(block::Height(2), reanchored_successor.hash()),
+            },
+            change: FrontierChange::HeaderReanchored,
+        },
+        "test",
+    );
+    wait_for_query_needed_blocks(&mut actions, block::Height(1), block::Height(2)).await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(
+            &reanchored_successor,
+        )]))
+        .await
+        .expect("reanchored needed metadata queues");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(2), 1),
+        "a reanchor carrying body growth must release the stale successor",
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
 async fn reactor_clamps_tiny_submitted_apply_config_above_checkpoint_range() {
     let blocks = fake_sequential_blocks(4);
     let mut config = immediate_body_download_config();

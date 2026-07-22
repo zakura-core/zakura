@@ -39,6 +39,17 @@ async fn rpc_server_spawn() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn block_and_hash_decode_rejects_mismatched_hash() -> Result<()> {
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let mut response = indexer::BlockAndHash::new(block.hash(), block);
+    response.hash[0] ^= 1;
+
+    assert!(response.decode().is_none());
+
+    Ok(())
+}
+
 /// Tests that `GetBlock` returns the requested block and rejects invalid
 /// requests.
 async fn test_get_block(

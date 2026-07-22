@@ -64,8 +64,11 @@ impl BlockAndHash {
     }
 
     /// Try to convert a [`BlockAndHash`] into a tuple of a decoded block and hash.
+    ///
+    /// Returns `None` if the advertised hash does not match the decoded block.
     pub fn decode(self) -> Option<(block::Block, block::Hash)> {
-        self.hash
+        let advertised_hash = self
+            .hash
             .try_into()
             .map(|bytes| block::Hash::from_bytes_in_display_order(&bytes))
             .map_err(|bytes: Vec<_>| {
@@ -74,13 +77,23 @@ impl BlockAndHash {
                     bytes.len()
                 )
             })
-            .ok()
-            .and_then(|hash| {
-                self.data
-                    .zcash_deserialize_into()
-                    .map_err(|err| tracing::warn!(?err, "failed to deserialize block",))
-                    .ok()
-                    .zip(Some(hash))
-            })
+            .ok()?;
+        let block: block::Block = self
+            .data
+            .zcash_deserialize_into()
+            .map_err(|err| tracing::warn!(?err, "failed to deserialize block"))
+            .ok()?;
+        let computed_hash = block.hash();
+
+        if advertised_hash != computed_hash {
+            tracing::warn!(
+                ?advertised_hash,
+                ?computed_hash,
+                "advertised hash does not match decoded block"
+            );
+            return None;
+        }
+
+        Some((block, advertised_hash))
     }
 }

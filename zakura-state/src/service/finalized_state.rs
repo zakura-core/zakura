@@ -114,13 +114,13 @@ pub use vct::{
     generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
     GeneratorError, NextVctBlock,
 };
-pub use zakura_db::highest_completed_checkpoint::*;
 #[allow(unused_imports)]
 pub use zakura_db::commitment_roots_db::{
     AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,
-    CompletedCheckpointFrontier, HeaderRootAuthFrontier, HeaderRootAuthFrontierError,
-    HeaderRootAuthState, COMMITMENT_ROOTS_BY_HEIGHT, HEADER_ROOT_AUTH_FRONTIER,
+    HeaderRootAuthFrontier, HeaderRootAuthFrontierError, HeaderRootAuthState,
+    COMMITMENT_ROOTS_BY_HEIGHT, HEADER_ROOT_AUTH_FRONTIER,
 };
+pub use zakura_db::highest_completed_checkpoint::*;
 pub use zakura_db::ZakuraDb;
 
 #[cfg(any(test, feature = "proptest-impl"))]

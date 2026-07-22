@@ -228,36 +228,36 @@ State may persist the frontier as a single history-tree snapshot. This avoids
 replaying a long header lead on every restart. The authenticated root rows remain a
 durable audit trail and can be used for defensive reconstruction.
 
-### 6.2 Completed checkpoint frontier
+### 6.2 Highest completed checkpoint
 
-State also owns the durable fact that a complete canonical checkpoint bracket is
-stored:
+State also tracks in memory the highest complete canonical checkpoint bracket:
 
 ```rust
-struct CompletedCheckpointFrontier {
+struct HighestCompletedCheckpoint {
     height: block::Height,
     hash: block::Hash,
 }
 ```
 
-This frontier is the highest configured checkpoint for which state has every
+This snapshot is the highest configured checkpoint for which state has every
 canonical header in the bracket, in order, from the previous completed boundary
 through `height`, and the terminal header hash equals the configured checkpoint
 hash. The previous boundary is the body-derived authentication base or the preceding
 completed checkpoint.
 
-State advances this frontier only after the header transaction that completes the
-bracket succeeds. It publishes the new value to header sync using a watch or the
-shared state-frontier event. On restart, state reconstructs or checks it from the
-durable canonical header store and configured checkpoint list before publishing it.
+Canonical headers are the durable source of truth; there is no separate completed-
+checkpoint database row. State advances the in-memory tracker only after the header
+transaction that completes the bracket succeeds, then publishes the new value to
+header sync. On restart, state reconstructs it from the durable canonical header
+store and configured checkpoint list before publishing it.
 
 `RangeRequest.finalized` is scheduling intent, not evidence that a bracket is
 complete. A short response retains no authority from that flag. Root authentication
-uses only `CompletedCheckpointFrontier` as its promotion limit.
+uses only `HighestCompletedCheckpoint` as its promotion limit.
 
 An authentication delivery may include one canonical successor header above the
-completed checkpoint frontier to witness the root at the frontier height. State may
-promote roots only through `CompletedCheckpointFrontier.height`; the successor's root
+completed checkpoint snapshot to witness the root at the frontier height. State may
+promote roots only through `HighestCompletedCheckpoint.height`; the successor's root
 remains unconfirmed until a later completed bracket authorizes further promotion.
 
 ## 7. State API
@@ -291,7 +291,7 @@ Header sync subscribes to both state-owned frontiers:
 ```rust
 struct HeaderRootAuthState {
     authenticated: HeaderRootAuthFrontier,
-    completed_checkpoint: CompletedCheckpointFrontier,
+    completed_checkpoint: HighestCompletedCheckpoint,
 }
 ```
 
@@ -418,8 +418,8 @@ The existing backward header-sync lane is removed before root authentication is
 implemented. Header discovery and root authentication schedule only ascending work
 from the durable verified body/history-tree authentication base.
 
-At startup, state publishes that base together with the canonical header and
-completed-checkpoint frontiers. Header sync resumes at the first missing height above
+At startup, state publishes that base together with the canonical header frontier and
+completed-checkpoint snapshot. Header sync resumes at the first missing height above
 the base. It may reuse a contiguous canonical header lead already present in state,
 but it does not schedule a range below the base or maintain a separate backfill
 frontier.
@@ -429,7 +429,7 @@ history-tree base is invalid. A header-only suffix separated from the base by a 
 is not adopted as forward progress; startup recovery truncates or ignores that suffix
 and resumes from the last coherent prefix.
 
-Once state publishes an advanced `CompletedCheckpointFrontier`, every ancestor in
+Once state publishes an advanced `HighestCompletedCheckpoint`, every ancestor in
 that forward bracket is pinned by the checkpoint hash and header linkage. The root
 lane walks the bracket upward using overlapping requests. Receiving or committing a
 range marked `finalized` does not by itself advance this frontier.
@@ -833,13 +833,13 @@ Implemented in draft
 Implemented in draft
 [PR #323](https://github.com/zakura-core/zakura/pull/323).
 
-1. Add `CompletedCheckpointFrontier`.
-2. Advance the completed-checkpoint frontier only after a durable bracket-closing
+1. Reuse the in-memory `HighestCompletedCheckpointTracker`.
+2. Advance the completed-checkpoint snapshot only after a durable bracket-closing
    header commit.
-3. Initialize or rebase the completed-checkpoint frontier from the canonical header
-   store.
-4. Add defensive reconstruction for both frontiers.
-5. Publish both frontiers to header sync using a watch or existing frontier event.
+3. Reconstruct the completed-checkpoint snapshot from the canonical header store.
+4. Add defensive reconstruction for the durable authentication frontier and the
+   in-memory checkpoint tracker.
+5. Publish both snapshots to header sync using a watch or existing frontier event.
 
 ### Phase 3: add root authentication requests
 
@@ -862,7 +862,7 @@ Implemented in draft
 3. Include one successor witness.
 4. Start the next request at the previous response's final header.
 5. Share responses with header discovery when their frontiers align.
-6. Gate promotion on the state-published `CompletedCheckpointFrontier`.
+6. Gate promotion on the state-published `HighestCompletedCheckpoint`.
 7. Require the successor witness itself to be covered by that frontier.
 
 ### Phase 5: integrate VCT consumption
@@ -907,7 +907,7 @@ Implemented in draft
   bracket and the configured terminal hash are durably stored.
 - Short or out-of-order header commits do not prematurely advance the completed
   checkpoint frontier.
-- Restart reconstructs the same completed checkpoint frontier from durable headers.
+- Restart reconstructs the same completed checkpoint snapshot from durable headers.
 - Defensive reconstruction stops at the first gap.
 - A body-tip advance safely rebases an older header-root frontier.
 - Promotion and body-derived replacement preserve a contiguous authoritative index
@@ -941,7 +941,7 @@ Implemented in draft
 - Root authentication waits for the contiguous canonical prefix.
 - A completed checkpoint bracket authenticates strictly upward.
 - `RangeRequest.finalized` never authorizes root promotion.
-- A successor witness above the completed checkpoint frontier confirms no root.
+- A successor witness above the completed checkpoint snapshot confirms no root.
 - Forward header progress does not move the root frontier past a gap.
 
 ### Restart and handoff

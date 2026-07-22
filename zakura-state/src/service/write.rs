@@ -25,8 +25,9 @@ use crate::{
     service::{
         check,
         finalized_state::{
-            FinalizedState, HighestCompletedCheckpoint, HighestCompletedCheckpointTracker, ZakuraDb,
-            AuthenticateHeaderRootsError, AuthenticatedHeaderRoots, HeaderRootAuthState,
+            AuthenticateHeaderRootsError, AuthenticatedHeaderRoots, FinalizedState,
+            HeaderRootAuthState, HighestCompletedCheckpoint, HighestCompletedCheckpointTracker,
+            ZakuraDb,
         },
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
@@ -213,6 +214,7 @@ fn commit_header_range(
 #[allow(clippy::too_many_arguments)]
 fn authenticate_header_roots(
     finalized_state: &FinalizedState,
+    completed_checkpoint: &HighestCompletedCheckpointTracker,
     header_root_auth_sender: &watch::Sender<Option<HeaderRootAuthState>>,
     expected_state: HeaderRootAuthState,
     anchor: block::Hash,
@@ -222,7 +224,11 @@ fn authenticate_header_roots(
     rsp_tx: oneshot::Sender<Result<AuthenticatedHeaderRoots, AuthenticateHeaderRootsError>>,
 ) {
     respond_if_requested(rsp_tx, || {
+        let completed_checkpoint = completed_checkpoint
+            .current()
+            .expect("a durable authentication frontier implies a completed genesis checkpoint");
         let result = finalized_state.db.authenticate_header_roots(
+            completed_checkpoint,
             expected_state,
             anchor,
             start,
@@ -249,11 +255,18 @@ fn respond_if_requested<T, E>(
 
 fn publish_header_root_auth_state(
     finalized_state: &FinalizedState,
+    completed_checkpoint: &HighestCompletedCheckpointTracker,
     sender: &watch::Sender<Option<HeaderRootAuthState>>,
 ) {
     match finalized_state.db.load_header_root_auth_frontier() {
-        Ok(frontier) => {
-            let _ = sender.send(frontier.map(|frontier| frontier.state()));
+        Ok(Some(frontier)) => {
+            let completed_checkpoint = completed_checkpoint
+                .current()
+                .expect("a durable authentication frontier implies a completed genesis checkpoint");
+            let _ = sender.send(Some(frontier.state(completed_checkpoint)));
+        }
+        Ok(None) => {
+            let _ = sender.send(None);
         }
         Err(error) => {
             tracing::error!(
@@ -394,7 +407,11 @@ impl BlockWriteSender {
             .db
             .validate_header_root_auth_state()
             .expect("authenticated header-root state was validated during database startup")
-            .map(|frontier| frontier.state());
+            .map(|frontier| {
+                frontier.state(highest_completed_checkpoint.current().expect(
+                    "a durable authentication frontier implies a completed genesis checkpoint",
+                ))
+            });
         let (header_root_auth_sender, header_root_auth_receiver) =
             watch::channel(initial_header_root_auth_state);
 
@@ -496,7 +513,11 @@ impl WriteBlockWorkerTask {
                         tree_aux_roots,
                     );
                     if result.is_ok() {
-                        publish_header_root_auth_state(finalized_state, header_root_auth_sender);
+                        publish_header_root_auth_state(
+                            finalized_state,
+                            highest_completed_checkpoint,
+                            header_root_auth_sender,
+                        );
                     }
                     let _ = rsp_tx.send(result);
                     continue;
@@ -511,6 +532,7 @@ impl WriteBlockWorkerTask {
                 }) => {
                     authenticate_header_roots(
                         finalized_state,
+                        highest_completed_checkpoint,
                         header_root_auth_sender,
                         expected_state,
                         anchor,
@@ -634,15 +656,25 @@ impl WriteBlockWorkerTask {
                     // path; rebind must not delay chain-tip notification.
                     let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
-                    publish_header_root_auth_state(finalized_state, header_root_auth_sender);
                     chain_tip_sender.set_finalized_tip(tip_block);
 
-                    if let Err(error) =
-                        highest_completed_checkpoint.rebind_from_db(&finalized_state.db)
+                    let checkpoint_rebound = match highest_completed_checkpoint
+                        .rebind_from_db(&finalized_state.db)
                     {
-                        tracing::warn!(
-                            ?error,
-                            "failed to refresh highest completed checkpoint after finalized block commit"
+                        Ok(()) => true,
+                        Err(error) => {
+                            tracing::warn!(
+                                ?error,
+                                "failed to refresh highest completed checkpoint after finalized block commit"
+                            );
+                            false
+                        }
+                    };
+                    if checkpoint_rebound {
+                        publish_header_root_auth_state(
+                            finalized_state,
+                            highest_completed_checkpoint,
+                            header_root_auth_sender,
                         );
                     }
                 }
@@ -729,7 +761,11 @@ impl WriteBlockWorkerTask {
                         tree_aux_roots,
                     );
                     if result.is_ok() {
-                        publish_header_root_auth_state(finalized_state, header_root_auth_sender);
+                        publish_header_root_auth_state(
+                            finalized_state,
+                            highest_completed_checkpoint,
+                            header_root_auth_sender,
+                        );
                     }
                     let _ = rsp_tx.send(result);
                     continue;
@@ -744,6 +780,7 @@ impl WriteBlockWorkerTask {
                 } => {
                     authenticate_header_roots(
                         finalized_state,
+                        highest_completed_checkpoint,
                         header_root_auth_sender,
                         expected_state,
                         anchor,
@@ -840,12 +877,16 @@ impl WriteBlockWorkerTask {
                 non_finalized_state,
                 child_height,
                 child_hash,
+            ) && seed_zakura_header_from_committed_block(
+                &finalized_state.db,
+                highest_completed_checkpoint,
+                child_height,
+                &child_block,
             ) {
-                seed_zakura_header_from_committed_block(
-                    &finalized_state.db,
+                publish_header_root_auth_state(
+                    finalized_state,
                     highest_completed_checkpoint,
-                    child_height,
-                    &child_block,
+                    header_root_auth_sender,
                 );
             }
 
@@ -884,12 +925,18 @@ impl WriteBlockWorkerTask {
                     )
                     .1
                     .into();
-                if let Err(error) = highest_completed_checkpoint.rebind_from_db(&finalized_state.db)
-                {
-                    tracing::warn!(
-                        ?error,
-                        "failed to refresh highest completed checkpoint after finalized block commit"
-                    );
+                match highest_completed_checkpoint.rebind_from_db(&finalized_state.db) {
+                    Ok(()) => publish_header_root_auth_state(
+                        finalized_state,
+                        highest_completed_checkpoint,
+                        header_root_auth_sender,
+                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            "failed to refresh highest completed checkpoint after finalized block commit"
+                        );
+                    }
                 }
             }
 
@@ -922,7 +969,7 @@ fn seed_zakura_header_from_committed_block(
     highest_completed_checkpoint: &mut HighestCompletedCheckpointTracker,
     height: block::Height,
     block: &Arc<block::Block>,
-) {
+) -> bool {
     match finalized_state.seed_zakura_header_from_committed_block(height, block) {
         Ok(()) => {
             if let Err(error) = highest_completed_checkpoint.rebind_from_db(finalized_state) {
@@ -930,8 +977,10 @@ fn seed_zakura_header_from_committed_block(
                     ?error,
                     "failed to refresh highest completed checkpoint after seeding a header"
                 );
+                return false;
             }
             tracing::trace!(?height, hash = ?block.hash(), "seeded Zakura header from committed block");
+            true
         }
         Err(error) => {
             tracing::warn!(
@@ -940,6 +989,7 @@ fn seed_zakura_header_from_committed_block(
                 ?error,
                 "failed to seed Zakura header from committed block"
             );
+            false
         }
     }
 }

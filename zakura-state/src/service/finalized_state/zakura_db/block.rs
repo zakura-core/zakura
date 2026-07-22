@@ -2074,12 +2074,6 @@ impl DiskWriteBatch {
         let finalized_height = zakura_db.finalized_tip_height();
         let best_header_tip = zakura_db.best_header_tip().map(|(height, _)| height);
         let checkpoints = zakura_db.network().checkpoint_list();
-        let completed_checkpoint_height = zakura_db
-            .try_header_root_auth_frontier()
-            .map_err(|error| CommitHeaderRangeError::HeaderRootAuthFrontier {
-                reason: error.to_string(),
-            })?
-            .map(|frontier| frontier.state().completed_checkpoint_height);
 
         let mut recent_headers = zakura_db.recent_header_context(anchor_height)?;
         if recent_headers.is_empty() {
@@ -2129,11 +2123,6 @@ impl DiskWriteBatch {
 
             if let Some((_existing_hash, existing_header)) = zakura_db.header_by_height(height) {
                 if existing_header != *header {
-                    if completed_checkpoint_height
-                        .is_some_and(|completed_checkpoint| height <= completed_checkpoint)
-                    {
-                        return Err(CommitHeaderRangeError::ImmutableConflict { height });
-                    }
                     if finalized_height.is_some_and(|finalized_height| height <= finalized_height) {
                         return Err(CommitHeaderRangeError::ImmutableConflict { height });
                     }
@@ -2242,11 +2231,6 @@ impl DiskWriteBatch {
             }
         }
 
-        let canonical_range = validated_headers
-            .iter()
-            .map(|(height, hash, header, _body_size)| (*height, *hash, (*header).clone()))
-            .collect::<Vec<_>>();
-
         for (height, hash, header, body_size) in validated_headers {
             // Finalized block heights already have authoritative block rows and
             // verified roots, even when pruning has removed their transactions.
@@ -2276,11 +2260,6 @@ impl DiskWriteBatch {
                 self.zs_delete(&body_size_by_height, height);
             }
         }
-        self.advance_completed_checkpoint_for_header_range(zakura_db, &canonical_range)
-            .map_err(|error| CommitHeaderRangeError::HeaderRootAuthFrontier {
-                reason: error.to_string(),
-            })?;
-
         Ok(block::Hash::from(
             &**headers.last().expect("headers is non-empty"),
         ))

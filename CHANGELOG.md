@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [1.0.3-rc1] - 2026-07-21
+
+### Fixed
+
+- Fixed test log capture racing the process-wide tracing subscriber, which
+  could corrupt span bookkeeping in `zakurad` test binaries; `zakura-test` now
+  provides a `log_capture` module that captures messages from its shared
+  subscriber ([#332](https://github.com/zakura-core/zakura/pull/332)).
+
 ## [1.0.3-rc0] - 2026-07-21
 
 ### Added

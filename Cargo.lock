@@ -8765,7 +8765,7 @@ checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 
 [[package]]
 name = "zakura"
-version = "1.0.3-rc0"
+version = "1.0.3-rc1"
 dependencies = [
  "abscissa_core",
  "anyhow",
@@ -9191,7 +9191,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-test"
-version = "1.0.1-rc0"
+version = "1.0.1-rc1"
 dependencies = [
  "color-eyre",
  "futures",

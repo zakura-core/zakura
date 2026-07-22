@@ -1429,3 +1429,71 @@ git push origin adam/zakura-agentic-perf-5667cc
 ```
 
 Phase 1 exit criterion (spec §8): the next overnight session — started by invoking the `perf-lab` skill — produces ≥3 completed verdicts in the morning REPORT.md.
+
+---
+
+### Task 11 (SESSION 2, approved 2026-07-22): B-15 frozen-cohort port
+
+Adam raised MAX_DROPLETS to 3 and approved ~$0.5/h per frozen server. Two
+serving droplets hold a frozen synced range and serve ONLY the bench over a
+private `dev_network` cohort tag; the bench's zakura bootstrap list points at
+them alone. Expected band ≤1% (the deploy/runner cohort's own rationale).
+
+**Files:**
+- Create: `perf-lab/cohort.sh`
+- Modify: `perf-lab/droplet.sh` (two more control-clone sed patches)
+- Modify: `perf-lab/bench.sh` (cohort env passthrough)
+- Modify: `perf-lab/config.env` (cohort vars)
+
+**Harness patches (prepare_remote, same idempotent-sed pattern as B-14):**
+
+1. Env-overridable cohort peers — insert after the `ZAKURA_BOOTSTRAP_PEERS=(...)`
+   array's closing `)` line:
+
+```
+# perf-lab cohort: PERF_COHORT_PEERS (space-separated id@ip:port) replaces the
+# public bootstrap list when set
+if [ -n "${PERF_COHORT_PEERS:-}" ]; then
+  read -r -a ZAKURA_BOOTSTRAP_PEERS <<< "$PERF_COHORT_PEERS"
+fi
+```
+
+2. Cohort tag — insert after the `trace_dir` echo inside write_config's
+   `[network.zakura]` section:
+
+```
+        [ -n "${PERF_DEV_NETWORK:-}" ] && echo "dev_network = \"${PERF_DEV_NETWORK}\""
+```
+
+**config.env additions:**
+
+```
+COHORT_TAG="${COHORT_TAG:-perf-lab-cohort-1}"
+COHORT_SEED_STOP="${COHORT_SEED_STOP:-1836000}"   # window end 1827210 + margin
+COHORT_PEERS=""                                    # captured by cohort.sh peers
+```
+
+**cohort.sh subcommands** (droplet-name convention `perf-lab-serve-a|b`):
+
+- `seed NAME` — provision the droplet (droplet.sh provision), then run the
+  harness once with `SKIP_BASELINE=1 STOP_HEIGHT=$COHORT_SEED_STOP` and KEEP
+  the fork: the fork becomes the serving state at
+  `/opt/zakura-bench/serve-state`.
+- `freeze NAME` — write `/root/serve.toml` (Mainnet, `p2p_stack="zakura"`,
+  `dev_network=$COHORT_TAG`, empty `bootstrap_peers`, `listen 0.0.0.0:8234`,
+  `cache_dir=/opt/zakura-bench/serve-state`, no debug_stop) and start the
+  seeded zakurad under nohup with a pid/log; the iroh identity persists in the
+  cache dir, so node_id survives restarts.
+- `peers` — grep each serve log for `node_id=`, emit `id@ip:8234` pairs, and
+  write them into config.env's COHORT_PEERS (space-separated).
+- `status|stop NAME` — pid/log inspection and shutdown.
+
+**bench.sh cohort mode:** when config's COHORT_PEERS is non-empty, cmd_start
+injects `PERF_COHORT_PEERS='$COHORT_PEERS' PERF_DEV_NETWORK='$COHORT_TAG'`
+into the remote env list (before extra-env so per-run args can still
+override), and FEED_PEER is forced empty (legacy side idle; bodies flow only
+from the cohort).
+
+**Sequence:** tooling → seed serve-a + serve-b in parallel (~50 min) → freeze
+both → peers → cohort A/A pair (aa-cohort1/2) → new NOISE_BAND_PCT from the
+cohort samples → campaign resumes with tight thresholds.

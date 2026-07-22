@@ -8,7 +8,6 @@
 #![doc(html_root_url = "https://docs.rs/zakura_chain")]
 // Required by bitvec! macro
 #![recursion_limit = "256"]
-#![cfg_attr(not(test), warn(unreachable_pub))]
 
 #[macro_use]
 extern crate bitflags;

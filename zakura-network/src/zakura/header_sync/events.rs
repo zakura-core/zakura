@@ -353,6 +353,17 @@ pub enum HeaderSyncEvent {
         /// Per-height commitment roots, parallel to `headers`.
         tree_aux_roots: Vec<BlockCommitmentRoots>,
     },
+    /// State returned the exact coherent locator for a fresh v8 target pursuit.
+    HeaderLocatorReady {
+        /// Peer whose advertised target requested the locator.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation that owns the target.
+        session_id: u64,
+        /// Exact target hash copied from the status snapshot.
+        target_tip_hash: block::Hash,
+        /// Exact selected-path locator, absent if state is not ready to serve it.
+        locator: Option<zakura_header_chain::HeaderLocator>,
+    },
 }
 
 impl HeaderSyncEvent {
@@ -383,6 +394,7 @@ impl HeaderSyncEvent {
             Self::HeaderRangeOperationFailed { .. } => "header_range_operation_failed",
             Self::HeaderRangeResponseFinished { .. } => "header_range_response_finished",
             Self::HeaderRangeResponseReady { .. } => "header_range_response_ready",
+            Self::HeaderLocatorReady { .. } => "header_locator_ready",
         }
     }
 }
@@ -427,6 +439,15 @@ pub enum HeaderSyncAction {
         count: u32,
         /// Whether the requester wants all-or-nothing tree-aux roots.
         want_tree_aux_roots: bool,
+    },
+    /// Ask state for one exact coherent selected-path locator.
+    QueryHeaderLocator {
+        /// Peer whose advertised target will consume the locator.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation that owns the target.
+        session_id: u64,
+        /// Exact target hash copied from the status snapshot.
+        target_tip_hash: block::Hash,
     },
     /// Ask state for missing block-body gaps.
     QueryMissingBlockBodies {

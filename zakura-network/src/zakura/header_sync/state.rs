@@ -46,6 +46,7 @@ pub(super) struct HeaderSyncCore {
     pub(super) repair: Option<VctRootRepair>,
     pub(super) advisory: HashMap<ZakuraPeerId, HeaderSyncAdvisoryPeerState>,
     pub(super) stale_anchor: StaleAnchorFailures,
+    pub(super) target_pursuits: super::scheduler::target::TargetPursuitRegistry,
 }
 
 impl HeaderSyncCore {
@@ -87,6 +88,7 @@ impl HeaderSyncCore {
             repair: None,
             advisory: HashMap::new(),
             stale_anchor: StaleAnchorFailures::default(),
+            target_pursuits: super::scheduler::target::TargetPursuitRegistry::default(),
         })
     }
 

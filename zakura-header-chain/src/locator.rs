@@ -69,6 +69,11 @@ impl HeaderLocator {
         Ok(Self(entries))
     }
 
+    /// Build the same-target continuation locator from the last returned suffix tip.
+    pub fn for_continuation(returned_suffix_tip: Frontier) -> Self {
+        Self(vec![returned_suffix_tip])
+    }
+
     /// Ordered height/hash entries used to authenticate a returned common ancestor.
     pub fn entries(&self) -> &[Frontier] {
         &self.0

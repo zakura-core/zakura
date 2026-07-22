@@ -1082,6 +1082,36 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     }
                 }
             }
+            HeaderSyncAction::QueryHeaderLocator {
+                peer,
+                session_id,
+                target_tip_hash,
+            } => {
+                let locator = match read_state
+                    .clone()
+                    .oneshot(zakura_state::ReadRequest::HeaderLocator)
+                    .await
+                {
+                    Ok(zakura_state::ReadResponse::HeaderLocator(locator)) => locator,
+                    Ok(response) => {
+                        warn!(?peer, ?response, "unexpected HeaderLocator response");
+                        None
+                    }
+                    Err(error) => {
+                        warn!(?peer, ?error, "failed to query exact header locator");
+                        None
+                    }
+                };
+                let _ = handles
+                    .header_sync
+                    .send(HeaderSyncEvent::HeaderLocatorReady {
+                        peer,
+                        session_id,
+                        target_tip_hash,
+                        locator,
+                    })
+                    .await;
+            }
             HeaderSyncAction::QueryBestHeaderTip => {
                 emit_commit_state(
                     &trace,
@@ -1831,6 +1861,15 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
                 insert_cs_peer(row, cs_trace::PEER, peer);
                 insert_cs_height(row, cs_trace::RANGE_START, *start);
                 insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(*count));
+            }
+            HeaderSyncAction::QueryHeaderLocator {
+                peer,
+                target_tip_hash,
+                ..
+            } => {
+                insert_cs_str(row, cs_trace::ACTION, "query_header_locator");
+                insert_cs_peer(row, cs_trace::PEER, peer);
+                insert_cs_hash(row, cs_trace::HASH, *target_tip_hash);
             }
             HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
                 insert_cs_str(row, cs_trace::ACTION, "query_missing_block_bodies");

@@ -395,7 +395,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-RETAIN-04"
 name = "Staged-target limits"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::PeerTargetAdvertisement"
+tests = ["P8-05::registry_caps_targets_and_only_supersedes_unstarted_work"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-INT-01"
@@ -545,7 +548,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-V8-04"
 name = "Advertised-target scheduling"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::TargetPursuit"
+tests = ["P8-05::unknown_status_targets_remain_eligible_regardless_of_advisory_shape", "P8-05::registry_caps_targets_and_only_supersedes_unstarted_work", "P8-05::v8_target_from_status_supersedes_only_before_exact_locator_publication"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-V8-13"

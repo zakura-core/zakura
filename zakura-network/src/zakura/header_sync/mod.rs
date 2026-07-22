@@ -58,6 +58,7 @@ pub use events::{
 };
 pub use range::{CheckedHeaderRange, HeaderRangeEntry, HeaderRangePayload};
 pub use reactor::spawn_header_sync_reactor;
+pub use scheduler::target::{PeerTargetAdvertisement, TargetPursuit};
 pub use service::HeaderSyncPeerSession;
 pub(crate) use service::{
     drive_header_sync_actions, HeaderSyncPassthroughService, HeaderSyncService,

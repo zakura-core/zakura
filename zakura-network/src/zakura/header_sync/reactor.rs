@@ -2,6 +2,9 @@ use super::super::trace::{
     header_sync_trace as hs_trace, ordered_send_error_label, queue_send_trace as qs_trace,
 };
 use super::scheduler::status::StatusScheduler;
+use super::scheduler::target::{
+    PeerTargetAdvertisement, StageTargetResult, TargetPriority, TargetPursuit,
+};
 use super::{config::*, error::*, events::*, requester::*, state::*, validation::*, wire::*, *};
 use crate::zakura::{
     FrontierChange, FrontierUpdate, HeaderSyncServiceSummary, OrderedSendError,
@@ -409,12 +412,13 @@ impl HeaderSyncReactor {
                 }
             }
             HeaderSyncEvent::SessionWireMessageV8 {
-                peer, session_id, ..
+                peer,
+                session_id,
+                msg,
             } => {
                 if self.is_current_session(&peer, session_id) {
-                    // PR-10a establishes strict negotiated decoding. PR-11
-                    // consumes peer target advertisements from this event.
                     metrics::counter!("sync.header.v8.message.decoded").increment(1);
+                    self.handle_wire_message_v8(peer, session_id, msg).await;
                 } else {
                     metrics::counter!("sync.header.session.stale_event").increment(1);
                 }
@@ -541,6 +545,18 @@ impl HeaderSyncReactor {
                         body_sizes,
                         tree_aux_roots,
                     );
+                } else {
+                    metrics::counter!("sync.header.session.stale_completion").increment(1);
+                }
+            }
+            HeaderSyncEvent::HeaderLocatorReady {
+                peer,
+                session_id,
+                target_tip_hash,
+                locator,
+            } => {
+                if self.is_current_session(&peer, session_id) {
+                    self.handle_header_locator_ready(peer, session_id, target_tip_hash, locator);
                 } else {
                     metrics::counter!("sync.header.session.stale_completion").increment(1);
                 }
@@ -765,6 +781,7 @@ impl HeaderSyncReactor {
 
         self.state.parked_peers.remove(&peer);
         self.state.schedule.forget_peer(&peer);
+        self.state.target_pursuits.remove(&peer);
         let status_refresh_interval = self.startup.status_refresh_interval;
         self.state
             .peers
@@ -863,6 +880,7 @@ impl HeaderSyncReactor {
         self.state.parked_peers.remove(&peer);
         self.state.advisory.remove(&peer);
         self.state.schedule.forget_peer(&peer);
+        self.state.target_pursuits.remove(&peer);
         self.finish_current_vct_repair_attempt(&peer);
         if was_connected {
             self.publish_connectivity_metrics();
@@ -1383,6 +1401,183 @@ impl HeaderSyncReactor {
             HeaderSyncMessage::GetHeaders { .. } | HeaderSyncMessage::Headers { .. } => {
                 self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage)
                     .await;
+            }
+        }
+    }
+
+    async fn handle_wire_message_v8(
+        &mut self,
+        peer: ZakuraPeerId,
+        session_id: u64,
+        msg: HeaderSyncMessageV8,
+    ) {
+        let HeaderSyncMessageV8::Status(status) = msg else {
+            // PR-11c/11d add request serving and correlated response admission.
+            return;
+        };
+        metrics::counter!("sync.header.peer.status_v8.received").increment(1);
+        if status.work_anchor_height > status.selected_tip_height {
+            self.report_misbehavior(peer, HeaderSyncMisbehavior::InvalidStatus)
+                .await;
+            return;
+        }
+
+        let now = Instant::now();
+        let advertisement = PeerTargetAdvertisement {
+            session_id,
+            observed_at: now,
+            status: status.clone(),
+        };
+        let Some(local) = self.committed_snapshot.as_ref() else {
+            return;
+        };
+        let comparable_order = advertisement.claimed_work_order(local);
+        let eligible = advertisement.is_discovery_eligible(local);
+        let Some(peer_state) = self.state.peers.get_mut(&peer) else {
+            return;
+        };
+        peer_state.advertised_tip = status.selected_tip_height;
+        peer_state.advertised_hash = status.selected_tip_hash;
+        peer_state.anchor = status.work_anchor_height;
+        peer_state.max_headers_per_response = status.max_headers_per_response.min(MAX_HS_RANGE);
+        peer_state.max_inflight_requests = status
+            .max_inflight_requests
+            .min(self.startup.config.advertised_max_inflight_requests());
+        peer_state.received_status = true;
+        peer_state.last_received_status_at = Some(now);
+
+        if !eligible {
+            self.state.target_pursuits.remove_unstarted(&peer);
+            return;
+        }
+        match self.state.target_pursuits.stage(
+            peer.clone(),
+            advertisement,
+            TargetPriority::from_work_order(comparable_order),
+        ) {
+            StageTargetResult::QueryLocator => {
+                let action = HeaderSyncAction::QueryHeaderLocator {
+                    peer: peer.clone(),
+                    session_id,
+                    target_tip_hash: status.selected_tip_hash,
+                };
+                if !self.dispatch_action(action) {
+                    self.state.target_pursuits.remove_unstarted(&peer);
+                }
+            }
+            StageTargetResult::Active => {
+                metrics::counter!("sync.header.v8.target.already_active").increment(1);
+            }
+            StageTargetResult::AtCapacity => {
+                metrics::counter!("sync.header.v8.target.capacity_refused").increment(1);
+            }
+        }
+        metrics::counter!(
+            "sync.header.v8.target.advertised",
+            "work" => match comparable_order {
+                Some(std::cmp::Ordering::Greater) => "greater",
+                Some(std::cmp::Ordering::Equal) => "equal",
+                Some(std::cmp::Ordering::Less) => "less",
+                None => "incomparable",
+            }
+        )
+        .increment(1);
+    }
+
+    fn handle_header_locator_ready(
+        &mut self,
+        peer: ZakuraPeerId,
+        session_id: u64,
+        target_tip_hash: block::Hash,
+        locator: Option<zakura_header_chain::HeaderLocator>,
+    ) {
+        let Some(advertisement) = self
+            .state
+            .target_pursuits
+            .awaiting(&peer, session_id, target_tip_hash)
+            .cloned()
+        else {
+            metrics::counter!("sync.header.v8.target.stale_locator").increment(1);
+            return;
+        };
+        let Some(locator) = locator else {
+            self.state.target_pursuits.remove_unstarted(&peer);
+            metrics::counter!("sync.header.v8.target.locator_unavailable").increment(1);
+            return;
+        };
+        let Some(session) = self
+            .state
+            .peers
+            .get(&peer)
+            .map(|peer_state| peer_state.session.clone())
+        else {
+            self.state.target_pursuits.remove_unstarted(&peer);
+            return;
+        };
+
+        let tree_aux_schema = if advertisement.status.tree_aux_schema_mask
+            & self.serve_capabilities.tree_aux_schema_mask()
+            & AuxSchemaV8::V1.mask_bit()
+            != 0
+        {
+            AuxSchemaV8::V1
+        } else {
+            AuxSchemaV8::None
+        };
+        let response_overhead = 1_u32 + 8 + 32 + 4 + 32 + 4 + 1 + 1;
+        let per_header = header_sync_header_bytes_for_network(&self.startup.network)
+            .saturating_add(4)
+            .saturating_add(if tree_aux_schema == AuxSchemaV8::V1 {
+                TREE_AUX_SCHEMA_V1_BYTES
+            } else {
+                0
+            });
+        let byte_limited_count = usize::try_from(
+            advertisement
+                .status
+                .max_message_bytes
+                .saturating_sub(response_overhead),
+        )
+        .unwrap_or(usize::MAX)
+        .checked_div(per_header)
+        .and_then(|count| u32::try_from(count).ok())
+        .unwrap_or(0);
+        let max_header_count = advertisement
+            .status
+            .max_headers_per_response
+            .min(self.serve_capabilities.max_headers_per_response())
+            .min(byte_limited_count)
+            .min(MAX_HS_RANGE);
+        if max_header_count == 0 {
+            self.state.target_pursuits.remove_unstarted(&peer);
+            metrics::counter!("sync.header.v8.target.capacity_refused").increment(1);
+            return;
+        }
+
+        match session.try_send_get_headers_v8(
+            &self.v8_codec,
+            target_tip_hash,
+            &locator,
+            max_header_count,
+            tree_aux_schema,
+        ) {
+            Ok(request_id) => {
+                let started = self.state.target_pursuits.start(TargetPursuit {
+                    peer,
+                    advertised: advertisement,
+                    sent_locator: locator,
+                    request_id,
+                });
+                debug_assert!(started, "the matching locator slot was checked above");
+                metrics::counter!("sync.header.v8.target.requested").increment(1);
+            }
+            Err(error) => {
+                self.state.target_pursuits.remove_unstarted(&peer);
+                metrics::counter!(
+                    "sync.header.v8.target.send_failed",
+                    "reason" => ordered_send_error_label(&error),
+                )
+                .increment(1);
             }
         }
     }

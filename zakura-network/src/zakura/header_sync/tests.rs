@@ -617,6 +617,137 @@ async fn v8_status_uses_committed_snapshots_and_bounded_cadence() {
     }
 }
 
+#[tokio::test]
+async fn v8_target_from_status_supersedes_only_before_exact_locator_publication() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let local = committed_snapshot(1);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(local.clone()));
+    let mut startup = startup_for(network.clone(), anchor, Some(anchor));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.range_state_actions_enabled = false;
+    let mut fixture = spawn_test_reactor(startup);
+    let (send, mut recv) = framed_channel(8);
+    let peer = peer(82);
+    let session = HeaderSyncPeerSession::from_parts_with_protocol(
+        peer.clone(),
+        ServicePeerDirection::Inbound,
+        HeaderSyncProtocolVersion::V8,
+        send,
+        CancellationToken::new(),
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(session))
+        .await
+        .expect("v8 peer connection reaches the reactor");
+    let codec = HeaderSyncV8Codec::new(network, LOCAL_MAX_MESSAGE_BYTES - 8, MAX_HS_RANGE, 1);
+    let initial = recv.recv().await.expect("the initial status is queued");
+    assert!(matches!(
+        codec.decode_frame(initial, None).expect("status decodes"),
+        HeaderSyncMessageV8::Status(_)
+    ));
+
+    let status = |marker: u8| StatusV8 {
+        work_anchor_height: local.frontiers.finalized.height,
+        work_anchor_hash: local.frontiers.finalized.hash,
+        selected_tip_height: local.frontiers.header_best.height,
+        selected_tip_hash: block::Hash([marker; 32]),
+        suffix_cumulative_work: local.header_best_score.suffix_work.as_u256(),
+        oldest_retained_height: local.oldest_retained_height,
+        max_headers_per_response: 1_000,
+        max_inflight_requests: 1,
+        max_message_bytes: 2_000_000,
+        tree_aux_schema_mask: 1,
+    };
+    fixture
+        .handle
+        .send(HeaderSyncEvent::SessionWireMessageV8 {
+            peer: peer.clone(),
+            session_id: 0,
+            msg: HeaderSyncMessageV8::Status(status(20)),
+        })
+        .await
+        .expect("first target status reaches the reactor");
+    match next_action(&mut fixture.actions).await {
+        HeaderSyncAction::QueryHeaderLocator {
+            target_tip_hash, ..
+        } => assert_eq!(target_tip_hash, block::Hash([20; 32])),
+        action => panic!("expected first locator query, got {action:?}"),
+    }
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::SessionWireMessageV8 {
+            peer: peer.clone(),
+            session_id: 0,
+            msg: HeaderSyncMessageV8::Status(status(21)),
+        })
+        .await
+        .expect("replacement target status reaches the reactor");
+    match next_action(&mut fixture.actions).await {
+        HeaderSyncAction::QueryHeaderLocator {
+            target_tip_hash, ..
+        } => assert_eq!(target_tip_hash, block::Hash([21; 32])),
+        action => panic!("expected replacement locator query, got {action:?}"),
+    }
+
+    let locator = zakura_header_chain::HeaderLocator::for_selected_path(&local, |height| {
+        Ok(Some(if height == local.frontiers.finalized.height {
+            local.frontiers.finalized.hash
+        } else {
+            local.frontiers.header_best.hash
+        }))
+    })
+    .expect("the two-frontier selected projection is coherent");
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderLocatorReady {
+            peer: peer.clone(),
+            session_id: 0,
+            target_tip_hash: block::Hash([20; 32]),
+            locator: Some(locator.clone()),
+        })
+        .await
+        .expect("stale locator completion reaches the reactor");
+    tokio::task::yield_now().await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), recv.recv())
+            .await
+            .is_err(),
+        "the superseded target stays unsent"
+    );
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderLocatorReady {
+            peer,
+            session_id: 0,
+            target_tip_hash: block::Hash([21; 32]),
+            locator: Some(locator.clone()),
+        })
+        .await
+        .expect("current locator completion reaches the reactor");
+    let request = codec
+        .decode_frame(
+            recv.recv()
+                .await
+                .expect("the exact-target request is queued"),
+            None,
+        )
+        .expect("the exact-target request decodes");
+    assert_eq!(
+        request,
+        HeaderSyncMessageV8::GetHeaders(GetHeadersV8 {
+            request_id: 1,
+            target_tip_hash: block::Hash([21; 32]),
+            locator_hashes: locator.hashes(),
+            max_header_count: 1_000,
+            tree_aux_schema: AuxSchemaV8::V1,
+        })
+    );
+}
+
 #[test]
 fn startup_new_is_passive_until_local_hooks_are_wired() {
     let network = Network::Mainnet;

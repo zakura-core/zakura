@@ -269,6 +269,60 @@ impl HeaderSyncPeerSession {
         }
     }
 
+    /// Publish one fresh exact-target request on a negotiated v8 session.
+    pub(super) fn try_send_get_headers_v8(
+        &self,
+        codec: &HeaderSyncV8Codec,
+        target_tip_hash: block::Hash,
+        locator: &zakura_header_chain::HeaderLocator,
+        max_header_count: u32,
+        tree_aux_schema: AuxSchemaV8,
+    ) -> Result<HeaderSyncRequestId, OrderedSendError> {
+        if self.protocol != HeaderSyncProtocolVersion::V8 {
+            return Err(OrderedSendError::Encode(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "attempted to encode a v8 request on a negotiated v7 header-sync stream",
+                )
+                .into(),
+            ));
+        }
+        let request_id = self.next_request_id()?;
+        let request = GetHeadersV8 {
+            request_id: request_id.get(),
+            target_tip_hash,
+            locator_hashes: locator.hashes(),
+            max_header_count,
+            tree_aux_schema,
+        };
+        let frame = codec
+            .encode_frame(&HeaderSyncMessageV8::GetHeaders(request))
+            .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
+        let expected = ExpectedHeadersV8Response {
+            request_id,
+            context: HeaderSyncV8DecodeContext {
+                max_header_count,
+                requested_tree_aux_schema: tree_aux_schema,
+            },
+        };
+        if let Some(commands) = &self.inner.commands {
+            commands
+                .send(HeaderSyncPeerCommand::ReserveV8(expected))
+                .map_err(|_| OrderedSendError::Closed)?;
+        }
+        let result = match self.inner.send.try_send(frame) {
+            Ok(()) => Ok(request_id),
+            Err(mpsc::error::TrySendError::Full(_frame)) => Err(OrderedSendError::Full),
+            Err(mpsc::error::TrySendError::Closed(_frame)) => Err(OrderedSendError::Closed),
+        };
+        if result.is_err() {
+            if let Some(commands) = &self.inner.commands {
+                let _ = commands.send(HeaderSyncPeerCommand::CancelV8(request_id));
+            }
+        }
+        result
+    }
+
     /// Prepare a correlated header request without making its frame visible to the peer.
     pub(super) fn prepare_get_headers(
         &self,
@@ -424,6 +478,16 @@ pub(super) enum HeaderSyncPeerCommand {
     Cancel(ExpectedHeadersResponse),
     /// Retire an expected `Headers` response after timeout or cancellation.
     Retire(HeaderSyncRequestId),
+    /// Reserve v8 response decode bounds before publishing its request.
+    ReserveV8(ExpectedHeadersV8Response),
+    /// Roll back a v8 response expectation after publication fails.
+    CancelV8(HeaderSyncRequestId),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct ExpectedHeadersV8Response {
+    pub(super) request_id: HeaderSyncRequestId,
+    pub(super) context: HeaderSyncV8DecodeContext,
 }
 
 /// Pump actor actions that can be satisfied at the transport/service seam.
@@ -476,6 +540,20 @@ pub(crate) async fn drive_header_sync_actions(
                         start_height: start,
                         requested_count: count,
                         returned_count: 0,
+                    })
+                    .await;
+            }
+            HeaderSyncAction::QueryHeaderLocator {
+                peer,
+                session_id,
+                target_tip_hash,
+            } => {
+                let _ = handle
+                    .send(HeaderSyncEvent::HeaderLocatorReady {
+                        peer,
+                        session_id,
+                        target_tip_hash,
+                        locator: None,
                     })
                     .await;
             }
@@ -663,6 +741,7 @@ impl Service for HeaderSyncService {
                             v8_codec,
                             pipe_peer,
                             session_id,
+                            commands_rx,
                             recv,
                             pipe_cancel_token,
                         )

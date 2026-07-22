@@ -1146,6 +1146,7 @@ mod tests {
                 HeaderSyncAction::Misbehavior { peer, reason } => {
                     local.misbehaviors.lock().await.push((peer, reason));
                 }
+                HeaderSyncAction::QueryHeaderLocator { .. } => {}
             }
         }
     }
@@ -1586,6 +1587,7 @@ mod tests {
                             .await;
                     }
                     HeaderSyncAction::QueryBestHeaderTip
+                    | HeaderSyncAction::QueryHeaderLocator { .. }
                     | HeaderSyncAction::QueryMissingBlockBodies { .. }
                     | HeaderSyncAction::BodyGaps { .. }
                     | HeaderSyncAction::HeaderAdvanced { .. }

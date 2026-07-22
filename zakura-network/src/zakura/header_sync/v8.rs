@@ -13,7 +13,10 @@ use zakura_chain::{
     work::difficulty::U256,
 };
 
-use super::{header_sync_header_bytes_for_network, Frame, MAX_HS_MESSAGE_BYTES, MAX_HS_RANGE};
+use super::{
+    header_sync_header_bytes_for_network, Frame, HeaderSyncRequestId, MAX_HS_MESSAGE_BYTES,
+    MAX_HS_RANGE,
+};
 
 /// Version-8 `Status` discriminator.
 pub const MSG_HS_V8_STATUS: u8 = 1;
@@ -168,7 +171,7 @@ impl AuxSchemaV8 {
         }
     }
 
-    fn mask_bit(self) -> u32 {
+    pub(crate) fn mask_bit(self) -> u32 {
         match self {
             Self::None => 0,
             Self::V1 => 1,
@@ -517,6 +520,26 @@ pub struct HeaderSyncV8Codec {
 }
 
 impl HeaderSyncV8Codec {
+    /// Read only the correlation ID needed to select bounded response decode context.
+    pub(crate) fn peek_headers_request_id(
+        frame: &Frame,
+    ) -> Result<HeaderSyncRequestId, HeaderSyncV8WireError> {
+        if u8::try_from(frame.message_type).ok() != Some(MSG_HS_V8_HEADERS) {
+            return Err(HeaderSyncV8WireError::UnknownFrameMessageType(
+                frame.message_type,
+            ));
+        }
+        let mut reader = io::Cursor::new(frame.payload.as_slice());
+        if reader.read_u8()? != MSG_HS_V8_HEADERS {
+            return Err(HeaderSyncV8WireError::MismatchedFrameMessageType {
+                frame: frame.message_type,
+                payload: frame.payload.first().copied().unwrap_or_default(),
+            });
+        }
+        let request_id = read_request_id(&mut reader, "Headers")?;
+        HeaderSyncRequestId::new(request_id).ok_or(HeaderSyncV8WireError::ZeroRequestId("Headers"))
+    }
+
     /// Construct a codec using negotiated caps, always narrowed by hard protocol limits.
     pub fn new(
         network: Network,

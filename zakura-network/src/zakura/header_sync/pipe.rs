@@ -25,7 +25,13 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{events::*, service::HeaderSyncPeerCommand, wire::*, work_queue::*, *};
+use super::{
+    events::*,
+    service::{ExpectedHeadersV8Response, HeaderSyncPeerCommand},
+    wire::*,
+    work_queue::*,
+    *,
+};
 use crate::zakura::{
     Edge, Flow, FramedRecv, Node, NodeKind, Pipe, PipeCx, PipeShape, SinkReject, ZakuraPeerId,
 };
@@ -161,6 +167,7 @@ impl HsLocal {
                 self.expected_headers_by_id.remove(&request_id);
                 self.remember_consumed_request_id(request_id);
             }
+            HeaderSyncPeerCommand::ReserveV8(_) | HeaderSyncPeerCommand::CancelV8(_) => {}
         }
     }
 
@@ -545,23 +552,85 @@ pub(super) async fn run_v8_peer(
     codec: HeaderSyncV8Codec,
     peer_id: ZakuraPeerId,
     session_id: u64,
+    mut commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
     mut recv: FramedRecv,
     cancel: CancellationToken,
 ) -> Result<(), SinkReject> {
+    let mut expected_headers = HashMap::<HeaderSyncRequestId, HeaderSyncV8DecodeContext>::new();
     loop {
-        let frame = tokio::select! {
-            () = cancel.cancelled() => return Ok(()),
-            frame = recv.recv() => frame,
+        enum Input {
+            Frame(Frame),
+            Command(HeaderSyncPeerCommand),
+            Done,
+        }
+        let input = tokio::select! {
+            biased;
+            () = cancel.cancelled() => Input::Done,
+            command = commands.recv() => match command {
+                Some(command) => Input::Command(command),
+                None => Input::Done,
+            },
+            frame = recv.recv() => match frame {
+                Some(frame) => Input::Frame(frame),
+                None => Input::Done,
+            },
         };
-        let Some(frame) = frame else {
-            return Ok(());
+        let frame = match input {
+            Input::Done => return Ok(()),
+            Input::Command(HeaderSyncPeerCommand::ReserveV8(ExpectedHeadersV8Response {
+                request_id,
+                context,
+            })) => {
+                expected_headers.insert(request_id, context);
+                continue;
+            }
+            Input::Command(HeaderSyncPeerCommand::CancelV8(request_id)) => {
+                expected_headers.remove(&request_id);
+                continue;
+            }
+            Input::Command(
+                HeaderSyncPeerCommand::Reserve(_)
+                | HeaderSyncPeerCommand::Cancel(_)
+                | HeaderSyncPeerCommand::Retire(_),
+            ) => continue,
+            Input::Frame(frame) => frame,
         };
-        let msg = codec.decode_frame(frame, None).map_err(|error| {
-            SinkReject::protocol(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                error.to_string(),
-            ))
-        })?;
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                HeaderSyncPeerCommand::ReserveV8(ExpectedHeadersV8Response {
+                    request_id,
+                    context,
+                }) => {
+                    expected_headers.insert(request_id, context);
+                }
+                HeaderSyncPeerCommand::CancelV8(request_id) => {
+                    expected_headers.remove(&request_id);
+                }
+                HeaderSyncPeerCommand::Reserve(_)
+                | HeaderSyncPeerCommand::Cancel(_)
+                | HeaderSyncPeerCommand::Retire(_) => {}
+            }
+        }
+        let response_context = if u8::try_from(frame.message_type).ok() == Some(MSG_HS_V8_HEADERS) {
+            let request_id =
+                HeaderSyncV8Codec::peek_headers_request_id(&frame).map_err(|error| {
+                    SinkReject::protocol(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        error.to_string(),
+                    ))
+                })?;
+            expected_headers.remove(&request_id)
+        } else {
+            None
+        };
+        let msg = codec
+            .decode_frame(frame, response_context)
+            .map_err(|error| {
+                SinkReject::protocol(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                ))
+            })?;
         if let Err(error) = handle.try_send(HeaderSyncEvent::SessionWireMessageV8 {
             peer: peer_id.clone(),
             session_id,
@@ -690,8 +759,17 @@ mod tests {
             .encode_frame(&outcome)
             .expect("test v8 outcome encodes");
         let (send, recv) = crate::zakura::framed_channel(1);
+        let (_commands, commands_rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(run_v8_peer(handle, codec, peer(), 7, recv, cancel.clone()));
+        let task = tokio::spawn(run_v8_peer(
+            handle,
+            codec,
+            peer(),
+            7,
+            commands_rx,
+            recv,
+            cancel.clone(),
+        ));
 
         send.send(frame).await.expect("test pipe remains open");
         assert!(matches!(
@@ -699,6 +777,63 @@ mod tests {
             Some(HeaderSyncEvent::SessionWireMessageV8 {
                 session_id: 7,
                 msg: HeaderSyncMessageV8::HeadersOutcome(_),
+                ..
+            })
+        ));
+
+        cancel.cancel();
+        task.await
+            .expect("test v8 pipe task does not panic")
+            .expect("test v8 pipe exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn negotiated_v8_pipe_decodes_headers_under_reserved_request_bounds() {
+        let (handle, mut events) = test_handle();
+        let codec = HeaderSyncV8Codec::new(Network::Mainnet, 1024, 1, 0);
+        let target = block::Hash([9; 32]);
+        let response = HeaderSyncMessageV8::Headers(HeadersV8 {
+            request_id: 1,
+            target_tip_hash: target,
+            common_ancestor_height: block::Height(0),
+            common_ancestor_hash: target,
+            complete: true,
+            tree_aux_schema: AuxSchemaV8::None,
+            entries: Vec::new(),
+        });
+        let frame = codec
+            .encode_frame(&response)
+            .expect("test v8 response encodes");
+        let (send, recv) = crate::zakura::framed_channel(1);
+        let (commands, commands_rx) = mpsc::unbounded_channel();
+        commands
+            .send(HeaderSyncPeerCommand::ReserveV8(
+                ExpectedHeadersV8Response {
+                    request_id: HeaderSyncRequestId::new(1).expect("one is a nonzero request ID"),
+                    context: HeaderSyncV8DecodeContext {
+                        max_header_count: 1,
+                        requested_tree_aux_schema: AuxSchemaV8::None,
+                    },
+                },
+            ))
+            .expect("the v8 pipe command channel is open");
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_v8_peer(
+            handle,
+            codec,
+            peer(),
+            7,
+            commands_rx,
+            recv,
+            cancel.clone(),
+        ));
+
+        send.send(frame).await.expect("test pipe remains open");
+        assert!(matches!(
+            events.recv().await,
+            Some(HeaderSyncEvent::SessionWireMessageV8 {
+                session_id: 7,
+                msg: HeaderSyncMessageV8::Headers(_),
                 ..
             })
         ));

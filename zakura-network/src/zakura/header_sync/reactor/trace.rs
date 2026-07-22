@@ -604,6 +604,23 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
             insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
             insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(*requested_count));
         }
+        HeaderSyncEvent::HeaderLocatorReady {
+            peer,
+            target_tip_hash,
+            locator,
+            ..
+        } => {
+            insert_optional_str(row, hs_trace::KIND, Some("header_locator_ready"));
+            insert_peer(row, hs_trace::PEER, peer);
+            insert_hash(row, hs_trace::HASH, *target_tip_hash);
+            insert_u64(
+                row,
+                hs_trace::RANGE_COUNT,
+                locator.as_ref().map_or(0, |locator| {
+                    u64::try_from(locator.entries().len()).unwrap_or(u64::MAX)
+                }),
+            );
+        }
     }
 }
 
@@ -656,6 +673,15 @@ fn trace_action_fields(row: &mut serde_json::Map<String, Value>, action: &Header
             insert_peer(row, hs_trace::PEER, peer);
             insert_height(row, hs_trace::RANGE_START, *start);
             insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*count));
+        }
+        HeaderSyncAction::QueryHeaderLocator {
+            peer,
+            target_tip_hash,
+            ..
+        } => {
+            insert_optional_str(row, hs_trace::KIND, Some("query_header_locator"));
+            insert_peer(row, hs_trace::PEER, peer);
+            insert_hash(row, hs_trace::HASH, *target_tip_hash);
         }
         HeaderSyncAction::CommitHeaderRange {
             operation, payload, ..

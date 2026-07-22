@@ -9047,6 +9047,7 @@ dependencies = [
  "tracing-error",
  "tracing-futures",
  "zakura-chain",
+ "zakura-header-chain",
  "zakura-jsonl-trace",
  "zakura-test",
 ]

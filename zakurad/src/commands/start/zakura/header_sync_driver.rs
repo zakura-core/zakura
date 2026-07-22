@@ -66,6 +66,7 @@ pub(crate) async fn zakura_header_sync_driver_startup(
     let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
     let verified_block_tip =
         verified_block_tip_from_state(finalized_tip, verified_block_tip, empty_state_tip);
+    let committed_snapshots = read_state.subscribe_header_chain_snapshots();
     let best_header_tip = root_covered_best_header_tip_or_verified(
         read_state,
         best_header_tip.unwrap_or(empty_state_tip),
@@ -81,6 +82,7 @@ pub(crate) async fn zakura_header_sync_driver_startup(
         },
         best_header_tip: Some(best_header_tip),
         verified_block_tip_hash: verified_block_tip.1,
+        committed_snapshots: Some(committed_snapshots),
     })
 }
 

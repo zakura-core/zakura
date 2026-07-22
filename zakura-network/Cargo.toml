@@ -94,6 +94,7 @@ proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
 zakura-chain = { path = "../zakura-chain", version = "1.2.1-rc0", features = ["async-error"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0-rc0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.0.1-rc0" }
 
 [dev-dependencies]

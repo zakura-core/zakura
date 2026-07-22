@@ -521,12 +521,18 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-V8-02"
 name = "Atomic status snapshot"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::StatusV8::from_snapshot"
+tests = ["P8-01::v8_status_uses_committed_snapshots_and_bounded_cadence"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-V8-17"
 name = "Status publication cadence"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::scheduler::status::StatusScheduler"
+tests = ["P8-07::v8_status_uses_committed_snapshots_and_bounded_cadence", "P8-07::initial_refresh_and_coalesced_change_deadlines_are_bounded"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-V8-03"

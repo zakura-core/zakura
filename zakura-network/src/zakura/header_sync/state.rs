@@ -379,6 +379,8 @@ pub(super) struct PeerHeaderState {
     /// any. Used to suppress re-sending an identical, non-tip-advancing status,
     /// which the peer's inbound rate limiter would otherwise treat as spam.
     pub(super) last_sent_status: Option<HeaderSyncStatus>,
+    /// Negotiated-v8 committed status publication state.
+    pub(super) status_v8: Option<super::scheduler::status::StatusScheduler>,
     pub(super) outstanding: Vec<OutstandingRange>,
     pub(super) requester_id: Option<HeaderRequesterId>,
     pub(super) requester: Option<HeaderRequesterHandle>,
@@ -409,6 +411,7 @@ impl PeerHeaderState {
             received_status: false,
             last_received_status_at: None,
             last_sent_status: None,
+            status_v8: None,
             outstanding: Vec::new(),
             requester_id: None,
             requester: None,

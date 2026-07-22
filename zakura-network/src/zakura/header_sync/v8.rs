@@ -208,6 +208,66 @@ pub struct StatusV8 {
     pub tree_aux_schema_mask: u32,
 }
 
+/// Effective nonzero local serving limits advertised in [`StatusV8`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ServeCapabilities {
+    /// Maximum headers returned in one response.
+    max_headers_per_response: u32,
+    /// Maximum concurrent requests served for one peer.
+    max_inflight_requests: u16,
+    /// Maximum encoded application-message bytes.
+    max_message_bytes: u32,
+    /// Supported auxiliary schema bits.
+    tree_aux_schema_mask: u32,
+}
+
+impl ServeCapabilities {
+    /// Construct effective local limits, rejecting unusable zero serving caps.
+    pub fn new(
+        max_headers_per_response: u32,
+        max_inflight_requests: u16,
+        max_message_bytes: u32,
+        tree_aux_schema_mask: u32,
+    ) -> Option<Self> {
+        (max_headers_per_response != 0 && max_inflight_requests != 0 && max_message_bytes != 0)
+            .then_some(Self {
+                max_headers_per_response,
+                max_inflight_requests,
+                max_message_bytes,
+                tree_aux_schema_mask,
+            })
+    }
+
+    pub(crate) fn max_headers_per_response(self) -> u32 {
+        self.max_headers_per_response
+    }
+
+    pub(crate) fn tree_aux_schema_mask(self) -> u32 {
+        self.tree_aux_schema_mask
+    }
+}
+
+impl StatusV8 {
+    /// Build one advertisement exclusively from an atomic committed snapshot and local limits.
+    pub fn from_snapshot(
+        snapshot: &zakura_header_chain::EngineSnapshot,
+        capabilities: &ServeCapabilities,
+    ) -> Self {
+        Self {
+            work_anchor_height: snapshot.frontiers.finalized.height,
+            work_anchor_hash: snapshot.frontiers.finalized.hash,
+            selected_tip_height: snapshot.frontiers.header_best.height,
+            selected_tip_hash: snapshot.frontiers.header_best.hash,
+            suffix_cumulative_work: snapshot.header_best_score.suffix_work.as_u256(),
+            oldest_retained_height: snapshot.oldest_retained_height,
+            max_headers_per_response: capabilities.max_headers_per_response,
+            max_inflight_requests: capabilities.max_inflight_requests,
+            max_message_bytes: capabilities.max_message_bytes,
+            tree_aux_schema_mask: capabilities.tree_aux_schema_mask,
+        }
+    }
+}
+
 /// Locator-based request for headers on one exact target branch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GetHeadersV8 {
@@ -1011,6 +1071,14 @@ mod tests {
 
     fn hash(byte: u8) -> block::Hash {
         block::Hash([byte; 32])
+    }
+
+    #[test]
+    fn local_serve_capabilities_reject_zero_resource_limits() {
+        assert!(ServeCapabilities::new(0, 1, 1, 1).is_none());
+        assert!(ServeCapabilities::new(1, 0, 1, 1).is_none());
+        assert!(ServeCapabilities::new(1, 1, 0, 1).is_none());
+        assert!(ServeCapabilities::new(1, 1, 1, 0).is_some());
     }
 
     fn request() -> GetHeadersV8 {

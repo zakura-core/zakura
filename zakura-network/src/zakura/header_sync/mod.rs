@@ -35,6 +35,7 @@ mod pipe;
 mod range;
 mod reactor;
 mod requester;
+mod scheduler;
 mod service;
 mod state;
 #[cfg(test)]
@@ -64,8 +65,8 @@ pub(crate) use service::{
 pub use v8::{
     AuxSchemaV8, GetHeadersV8, HeaderEntryV8, HeaderSyncMessageV8, HeaderSyncV8Codec,
     HeaderSyncV8DecodeContext, HeaderSyncV8WireError, HeadersOutcomeCodeV8, HeadersOutcomeV8,
-    HeadersV8, StatusV8, TreeAuxRecordV1, MSG_HS_V8_GET_HEADERS, MSG_HS_V8_HEADERS,
-    MSG_HS_V8_HEADERS_OUTCOME, MSG_HS_V8_STATUS, TREE_AUX_SCHEMA_V1_BYTES,
+    HeadersV8, ServeCapabilities, StatusV8, TreeAuxRecordV1, MSG_HS_V8_GET_HEADERS,
+    MSG_HS_V8_HEADERS, MSG_HS_V8_HEADERS_OUTCOME, MSG_HS_V8_STATUS, TREE_AUX_SCHEMA_V1_BYTES,
 };
 pub use validation::{
     validate_header_range_links, validate_headers_stateless, validate_new_block_stateless,

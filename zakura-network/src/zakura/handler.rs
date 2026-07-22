@@ -61,8 +61,8 @@ use crate::{
         ZakuraSyncExchange, ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC,
         CONTROL_VERSION, FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
         MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
-        TRANSCRIPT_HASH_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1,
-        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+        TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC_V8, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
 use crate::{BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
@@ -549,6 +549,8 @@ pub struct ZakuraHeaderSyncDriverStartup {
     pub best_header_tip: Option<(block::Height, block::Hash)>,
     /// Hash of `frontiers.verified_block_tip`.
     pub verified_block_tip_hash: block::Hash,
+    /// Durable header snapshots, absent until the semantic handoff audit succeeds.
+    pub committed_snapshots: Option<watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>>,
 }
 
 impl ZakuraEndpoint {
@@ -1591,6 +1593,7 @@ pub(crate) fn service_registry(
 pub struct ZakuraProtocolHandler {
     supervisor: ZakuraSupervisorHandle,
     handshake_config: ZakuraHandshakeConfig,
+    supported_capabilities: Arc<AtomicU64>,
     limits: ZakuraLocalLimits,
     registry: Arc<ServiceRegistry>,
     trace: ZakuraTrace,
@@ -1718,9 +1721,12 @@ impl ZakuraProtocolHandler {
     ) -> Self {
         let mut handshake_config = handshake_config;
         handshake_config.supported_capabilities = registry.supported_capabilities();
+        let supported_capabilities =
+            Arc::new(AtomicU64::new(handshake_config.supported_capabilities));
         Self {
             supervisor,
             handshake_config,
+            supported_capabilities,
             registry,
             trace,
             next_conn_id: Arc::new(AtomicU64::new(1)),
@@ -1743,7 +1749,27 @@ impl ZakuraProtocolHandler {
     #[cfg(any(test, feature = "zakura-testkit"))]
     pub(crate) fn with_supported_capabilities(mut self, supported_capabilities: u64) -> Self {
         self.handshake_config.supported_capabilities &= supported_capabilities;
+        self.supported_capabilities.store(
+            self.handshake_config.supported_capabilities,
+            Ordering::Relaxed,
+        );
         self
+    }
+
+    fn current_handshake_config(&self) -> ZakuraHandshakeConfig {
+        let mut config = self.handshake_config;
+        config.supported_capabilities = self.supported_capabilities.load(Ordering::Relaxed);
+        config
+    }
+
+    fn set_header_sync_v8_enabled(&self, enabled: bool) {
+        if enabled {
+            self.supported_capabilities
+                .fetch_or(ZAKURA_CAP_HEADER_SYNC_V8, Ordering::Relaxed);
+        } else {
+            self.supported_capabilities
+                .fetch_and(!ZAKURA_CAP_HEADER_SYNC_V8, Ordering::Relaxed);
+        }
     }
 
     /// Attach the bound iroh endpoint so inbound Router-accepted connections can
@@ -1858,12 +1884,13 @@ impl ZakuraProtocolHandler {
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
     ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
+        let handshake_config = self.current_handshake_config();
         self.trace.emit(
             HANDSHAKE_TABLE,
             conn.event("control.started")
                 .role("responder")
                 .phase("control")
-                .network(self.handshake_config.network_label()),
+                .network(handshake_config.network_label()),
         );
         let (mut send, mut recv) = timeout(self.limits.control_timeout, connection.accept_bi())
             .await
@@ -1871,13 +1898,13 @@ impl ZakuraProtocolHandler {
 
         let hello_bytes = read_control_payload(
             &mut recv,
-            self.handshake_config.max_control_frame_bytes,
+            handshake_config.max_control_frame_bytes,
             self.limits.control_timeout,
         )
         .await?;
         let hello = ZakuraControlHello::decode(&hello_bytes)?;
         let expected = ZakuraControlValidation {
-            local: &self.handshake_config,
+            local: &handshake_config,
             authenticated_remote_id: remote_peer_id.as_bytes(),
             selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_1,
             handshake_path: ZakuraHandshakePath::Native,
@@ -1898,9 +1925,8 @@ impl ZakuraProtocolHandler {
             selected_zakura_protocol: hello.selected_zakura_protocol,
             peer_nonce: local_nonce,
             remote_peer_nonce: hello.peer_nonce,
-            accepted_capabilities: hello.capabilities
-                & self.handshake_config.supported_capabilities,
-            accepted_channels: hello.required_channels & self.handshake_config.supported_channels,
+            accepted_capabilities: hello.capabilities & handshake_config.supported_capabilities,
+            accepted_channels: hello.required_channels & handshake_config.supported_channels,
             accepted_limits,
         };
         write_control_payload(&mut send, &ack.encode()?, self.limits.control_timeout).await?;
@@ -1910,7 +1936,7 @@ impl ZakuraProtocolHandler {
                 .role("responder")
                 .phase("control")
                 .selected_protocol(ack.selected_zakura_protocol)
-                .network(self.handshake_config.network_label()),
+                .network(handshake_config.network_label()),
         );
         Ok(NativeHandshakeNegotiated {
             limits: accepted_limits,
@@ -3036,6 +3062,9 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     startup.frontier_updates = sync_frontier
         .as_ref()
         .map(ZakuraSyncExchange::subscribe_frontier);
+    startup.committed_snapshots = header_sync_driver_startup
+        .as_ref()
+        .and_then(|driver| driver.committed_snapshots.clone());
     let header_sync_shutdown = CancellationToken::new();
     startup.shutdown = header_sync_shutdown.clone();
     if header_sync_driver_startup.is_some() {
@@ -3105,6 +3134,12 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         shutdown: header_sync_shutdown,
         tasks: Mutex::new(tasks),
     });
+    let committed_snapshots = header_sync_driver_startup
+        .as_ref()
+        .and_then(|startup| startup.committed_snapshots.clone());
+    let header_sync_v8_ready = committed_snapshots
+        .as_ref()
+        .is_some_and(|snapshots| snapshots.borrow().is_some());
     let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
         supervisor.clone(),
         config.network.clone(),
@@ -3116,6 +3151,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     // Give the handler the bound endpoint so inbound accepts can resolve the
     // peer's source IP and enforce the per-IP connection cap.
     .with_endpoint(endpoint.clone());
+    handler.set_header_sync_v8_enabled(header_sync_v8_ready);
     let router = Router::builder(endpoint)
         .accept(P2P_V2_ALPN, handler.clone())
         .spawn();
@@ -3131,6 +3167,29 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         block_sync_actions,
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
     };
+
+    if let Some(mut snapshots) = committed_snapshots {
+        let capability_handler = endpoint.handler.clone();
+        let shutdown = endpoint.background_shutdown_token();
+        let task = tokio::spawn(async move {
+            loop {
+                if snapshots.borrow().is_some() {
+                    capability_handler.set_header_sync_v8_enabled(true);
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    changed = snapshots.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        endpoint.push_header_sync_task(task).await;
+    }
 
     // Log our own dial address once iroh has resolved it, so operators can hand
     // out `<node_id>@<direct_addr>` for other nodes' `zakura.bootstrap_peers`.
@@ -3216,10 +3275,11 @@ pub(crate) async fn serve_native_dial_connection(
             .clone()
             .try_acquire_owned()
             .map_err(|_| ZakuraHandlerError::ResourceLimit("pending handshake"))?;
+        let handshake_config = endpoint.handler.current_handshake_config();
         run_native_initiator_handshake(
             &connection,
             limits,
-            &endpoint.handler.handshake_config,
+            &handshake_config,
             &local_peer_id,
             &endpoint.handler.trace,
             &conn,
@@ -4838,6 +4898,32 @@ mod tests {
         transaction::{self, UnminedTxId},
     };
     use zakura_test::vectors::BLOCK_TESTNET_141042_BYTES;
+
+    #[test]
+    fn header_v8_capability_tracks_committed_snapshot_readiness() {
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(1),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            ZakuraLocalLimits::from_config(&Config::default()),
+        );
+        handler.supported_capabilities.store(
+            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC_V8,
+            Ordering::Relaxed,
+        );
+
+        handler.set_header_sync_v8_enabled(false);
+        assert_eq!(
+            handler.current_handshake_config().supported_capabilities,
+            ZAKURA_CAP_HEADER_SYNC
+        );
+
+        handler.set_header_sync_v8_enabled(true);
+        assert_eq!(
+            handler.current_handshake_config().supported_capabilities,
+            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC_V8
+        );
+    }
 
     /// With no configured `zakura.listen_addr`, the native endpoint must bind
     /// loopback-only. Otherwise iroh's default bind (`0.0.0.0:0` / `[::]:0`)

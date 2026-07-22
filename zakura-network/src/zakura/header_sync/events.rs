@@ -28,6 +28,8 @@ pub struct HeaderSyncStartup {
     pub best_header_tip: Option<(block::Height, block::Hash)>,
     /// Shared sync exchange frontier stream.
     pub frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
+    /// Atomic snapshots from the durable header engine, absent before audited handoff.
+    pub committed_snapshots: Option<watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>>,
     /// Local header-sync advertisement.
     pub config: ZakuraHeaderSyncConfig,
     /// Negotiated or local application frame cap for header-sync responses.
@@ -63,6 +65,7 @@ impl HeaderSyncStartup {
             frontiers,
             best_header_tip,
             frontier_updates: None,
+            committed_snapshots: None,
             config,
             max_frame_bytes,
             request_timeout: DEFAULT_HS_REQUEST_TIMEOUT,

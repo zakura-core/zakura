@@ -128,6 +128,25 @@ impl HeaderSyncPeerSession {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_parts_with_protocol(
+        peer_id: ZakuraPeerId,
+        direction: ServicePeerDirection,
+        protocol: HeaderSyncProtocolVersion,
+        send: FramedSend,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        Self::from_parts_with_direction_and_commands(
+            peer_id,
+            0,
+            direction,
+            protocol,
+            send,
+            cancel_token,
+            None,
+        )
+    }
+
     fn from_parts_with_direction_and_commands(
         peer_id: ZakuraPeerId,
         session_id: u64,
@@ -223,6 +242,31 @@ impl HeaderSyncPeerSession {
     /// Send a typed status advertisement.
     pub fn try_send_status(&self, status: HeaderSyncStatus) -> Result<(), OrderedSendError> {
         self.try_send_message(HeaderSyncMessage::Status(status), None)
+    }
+
+    /// Send one status on a stream whose negotiation selected protocol v8.
+    pub(super) fn try_send_status_v8(
+        &self,
+        codec: &HeaderSyncV8Codec,
+        status: StatusV8,
+    ) -> Result<(), OrderedSendError> {
+        if self.protocol != HeaderSyncProtocolVersion::V8 {
+            return Err(OrderedSendError::Encode(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "attempted to encode a v8 status on a negotiated v7 header-sync stream",
+                )
+                .into(),
+            ));
+        }
+        let frame = codec
+            .encode_frame(&HeaderSyncMessageV8::Status(status))
+            .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
+        match self.inner.send.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_frame)) => Err(OrderedSendError::Full),
+            Err(mpsc::error::TrySendError::Closed(_frame)) => Err(OrderedSendError::Closed),
+        }
     }
 
     /// Prepare a correlated header request without making its frame visible to the peer.

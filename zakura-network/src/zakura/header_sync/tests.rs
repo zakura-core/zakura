@@ -42,6 +42,11 @@ use zakura_chain::{
     serialization::{ZcashDeserializeInto, ZcashSerialize},
     work::{difficulty::CompactDifficulty, equihash::Solution},
 };
+use zakura_header_chain::{
+    AlarmSet, ChainScore, EngineMode, EngineSnapshot, Frontier as EngineFrontier,
+    FrontierSet as EngineFrontierSet, HeaderGeneration, StateVersion, SuffixWork,
+    VerifiedGeneration,
+};
 use zakura_test::vectors::{
     BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES, BLOCK_MAINNET_4_BYTES,
     BLOCK_MAINNET_GENESIS_BYTES, BLOCK_TESTNET_GENESIS_BYTES,
@@ -500,6 +505,116 @@ fn startup_for(
     startup.range_state_actions_enabled = true;
     startup.inbound_new_block_acceptance_enabled = true;
     startup
+}
+
+fn committed_snapshot(marker: u8) -> EngineSnapshot {
+    let finalized = EngineFrontier::new(block::Height(10), block::Hash([10; 32]));
+    let selected = EngineFrontier::new(
+        block::Height(10 + u32::from(marker)),
+        block::Hash([marker; 32]),
+    );
+    EngineSnapshot {
+        mode: EngineMode::Integrated,
+        state_version: StateVersion::new(u64::from(marker)),
+        header_generation: HeaderGeneration::new(u64::from(marker)),
+        verified_generation: VerifiedGeneration::new(1),
+        frontiers: EngineFrontierSet {
+            finalized,
+            header_best: selected,
+            verified_best: finalized,
+        },
+        header_best_score: ChainScore::new(
+            SuffixWork::new(zakura_chain::work::difficulty::U256::from(u64::from(
+                marker,
+            ))),
+            selected.hash,
+        ),
+        oldest_retained_height: block::Height(7 + u32::from(marker)),
+        alarms: AlarmSet::default(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn v8_status_uses_committed_snapshots_and_bounded_cadence() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let first = committed_snapshot(1);
+    let (snapshots_tx, snapshots_rx) = watch::channel(Some(first.clone()));
+    let mut startup = startup_for(network.clone(), anchor, Some(anchor));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.status_refresh_interval = std::time::Duration::from_secs(30);
+    let mut fixture = spawn_test_reactor(startup);
+    let (send, mut recv) = framed_channel(8);
+    let session = HeaderSyncPeerSession::from_parts_with_protocol(
+        peer(81),
+        ServicePeerDirection::Inbound,
+        HeaderSyncProtocolVersion::V8,
+        send,
+        CancellationToken::new(),
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(session))
+        .await
+        .expect("v8 peer connection reaches the reactor");
+    let codec = HeaderSyncV8Codec::new(network, LOCAL_MAX_MESSAGE_BYTES - 8, MAX_HS_RANGE, 1);
+
+    let initial = codec
+        .decode_frame(
+            recv.recv().await.expect("initial status is immediate"),
+            None,
+        )
+        .expect("initial v8 status decodes");
+    let expected_caps = ServeCapabilities::new(
+        DEFAULT_HS_RANGE,
+        DEFAULT_HS_MAX_INFLIGHT,
+        u32::try_from(MAX_HS_MESSAGE_BYTES).expect("header-sync hard message cap fits u32"),
+        1,
+    )
+    .expect("test serving caps are nonzero");
+    assert_eq!(
+        initial,
+        HeaderSyncMessageV8::Status(StatusV8::from_snapshot(&first, &expected_caps))
+    );
+
+    snapshots_tx.send_replace(Some(committed_snapshot(2)));
+    let newest = committed_snapshot(3);
+    snapshots_tx.send_replace(Some(newest.clone()));
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_millis(999)).await;
+    tokio::select! {
+        biased;
+        frame = recv.recv() => panic!("status was published before the one-second floor: {frame:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    let changed = codec
+        .decode_frame(
+            recv.recv()
+                .await
+                .expect("coalesced status arrives at the floor"),
+            None,
+        )
+        .expect("changed v8 status decodes");
+    assert_eq!(
+        changed,
+        HeaderSyncMessageV8::Status(StatusV8::from_snapshot(&newest, &expected_caps))
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    let refresh = codec
+        .decode_frame(
+            recv.recv().await.expect("periodic status refresh arrives"),
+            None,
+        )
+        .expect("refreshed v8 status decodes");
+    assert_eq!(refresh, changed);
+    while let Ok(action) = fixture.actions.try_recv() {
+        assert!(
+            !matches!(action, HeaderSyncAction::Misbehavior { .. }),
+            "silent v8 status receipt must remain non-punitive"
+        );
+    }
 }
 
 #[test]

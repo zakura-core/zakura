@@ -1,6 +1,7 @@
 use super::super::trace::{
     header_sync_trace as hs_trace, ordered_send_error_label, queue_send_trace as qs_trace,
 };
+use super::scheduler::status::StatusScheduler;
 use super::{config::*, error::*, events::*, requester::*, state::*, validation::*, wire::*, *};
 use crate::zakura::{
     FrontierChange, FrontierUpdate, HeaderSyncServiceSummary, OrderedSendError,
@@ -43,18 +44,37 @@ pub fn spawn_header_sync_reactor(
         admitted_node_ids: Vec::new(),
         backed_off_node_ids: Vec::new(),
     });
+    // Safe because the protocol hard cap is the fixed 2 MiB constant.
+    let hard_message_cap = MAX_HS_MESSAGE_BYTES as u32;
+    let max_message_bytes = startup
+        .max_frame_bytes
+        .saturating_sub(8)
+        .min(hard_message_cap)
+        .max(1);
+    let serve_capabilities = ServeCapabilities::new(
+        startup.config.advertised_max_headers_per_response(),
+        startup.config.advertised_max_inflight_requests(),
+        max_message_bytes,
+        1,
+    )
+    .expect("clamped local v8 serving caps are nonzero");
+    let v8_codec = HeaderSyncV8Codec::new(
+        startup.network.clone(),
+        max_message_bytes,
+        serve_capabilities.max_headers_per_response(),
+        serve_capabilities.tree_aux_schema_mask(),
+    );
+    let committed_snapshot = startup
+        .committed_snapshots
+        .as_ref()
+        .and_then(|snapshots| snapshots.borrow().clone());
     let handle = HeaderSyncHandle {
         events: events_tx,
         lifecycle: lifecycle_tx,
         tip: tip_rx,
         peers: peers_rx,
         candidates: candidates_rx,
-        v8_codec: HeaderSyncV8Codec::new(
-            startup.network.clone(),
-            startup.max_frame_bytes.saturating_sub(8),
-            startup.config.advertised_max_headers_per_response(),
-            1,
-        ),
+        v8_codec: v8_codec.clone(),
     };
     let reactor = HeaderSyncReactor {
         startup,
@@ -71,6 +91,9 @@ pub fn spawn_header_sync_reactor(
         tip: tip_tx,
         peers: peers_tx,
         candidates: candidates_tx,
+        v8_codec,
+        serve_capabilities,
+        committed_snapshot,
     };
     let task = tokio::spawn(reactor.run());
 
@@ -93,6 +116,9 @@ pub(super) struct HeaderSyncReactor {
     tip: watch::Sender<(block::Height, block::Hash)>,
     peers: watch::Sender<ServicePeerSnapshot>,
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
+    v8_codec: HeaderSyncV8Codec,
+    serve_capabilities: ServeCapabilities,
+    committed_snapshot: Option<zakura_header_chain::EngineSnapshot>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -128,6 +154,8 @@ impl HeaderSyncReactor {
     async fn run(mut self) {
         let mut frontier_updates = self.startup.frontier_updates.clone();
         let mut frontier_updates_open = frontier_updates.is_some();
+        let mut committed_snapshots = self.startup.committed_snapshots.clone();
+        let mut committed_snapshots_open = committed_snapshots.is_some();
         self.publish_connectivity_metrics();
         if self.startup.range_state_actions_enabled {
             let _ = self.dispatch_action(HeaderSyncAction::QueryBestHeaderTip);
@@ -197,12 +225,32 @@ impl HeaderSyncReactor {
                         Err(_) => frontier_updates_open = false,
                     }
                 }
+                changed = async {
+                    match committed_snapshots.as_mut() {
+                        Some(committed_snapshots) => committed_snapshots.changed().await,
+                        None => std::future::pending().await,
+                    }
+                }, if committed_snapshots_open => {
+                    match changed {
+                        Ok(()) => {
+                            let committed_snapshots = committed_snapshots
+                                .as_mut()
+                                .expect("committed snapshot receiver exists while its branch is open");
+                            if let Some(snapshot) = committed_snapshots.borrow_and_update().clone() {
+                                self.observe_committed_snapshot(snapshot);
+                                self.refresh_v8_statuses();
+                            }
+                        }
+                        Err(_) => committed_snapshots_open = false,
+                    }
+                }
                 _ = time::sleep_until(maintenance_deadline) => {
                     metrics::counter!("sync.header.reactor.maintenance_wakeups").increment(1);
                     self.emit_trace(hs_trace::HEADER_MAINTENANCE_WAKEUP, |_| {});
                     metrics::counter!("sync.header.reactor.event_started", "kind" => "tick").increment(1);
                     self.handle_timeouts().await;
                     self.refresh_statuses();
+                    self.refresh_v8_statuses();
                     self.publish_connectivity_metrics();
                     metrics::counter!("sync.header.reactor.event_finished", "kind" => "tick").increment(1);
                 }
@@ -364,8 +412,8 @@ impl HeaderSyncReactor {
                 peer, session_id, ..
             } => {
                 if self.is_current_session(&peer, session_id) {
-                    // PR-10a establishes strict negotiated decoding. PR-10b
-                    // consumes status messages from this versioned event.
+                    // PR-10a establishes strict negotiated decoding. PR-11
+                    // consumes peer target advertisements from this event.
                     metrics::counter!("sync.header.v8.message.decoded").increment(1);
                 } else {
                     metrics::counter!("sync.header.session.stale_event").increment(1);
@@ -733,6 +781,7 @@ impl HeaderSyncReactor {
                 peer_state.received_status = false;
                 peer_state.last_received_status_at = None;
                 peer_state.reset_sent_status();
+                peer_state.status_v8 = None;
                 peer_state.outstanding.clear();
                 peer_state.requester_id = None;
                 peer_state.requester = None;
@@ -757,6 +806,27 @@ impl HeaderSyncReactor {
                 )
             });
         if requester_session.protocol() == HeaderSyncProtocolVersion::V8 {
+            if self.committed_snapshot.is_none() {
+                let snapshot = self
+                    .startup
+                    .committed_snapshots
+                    .as_ref()
+                    .and_then(|snapshots| snapshots.borrow().clone());
+                if let Some(snapshot) = snapshot {
+                    self.observe_committed_snapshot(snapshot);
+                }
+            }
+            if let Some(snapshot) = self.committed_snapshot.as_ref() {
+                let status = StatusV8::from_snapshot(snapshot, &self.serve_capabilities);
+                if let Some(peer_state) = self.state.peers.get_mut(&peer) {
+                    peer_state.status_v8 = Some(StatusScheduler::new(
+                        status,
+                        self.startup.status_refresh_interval,
+                        Instant::now(),
+                    ));
+                }
+                self.send_status_v8(&peer);
+            }
             self.publish_connectivity_metrics();
             self.trace_peer_connected(&peer, direction, self.state.peers.len());
             self.publish_peer_snapshot();
@@ -2184,6 +2254,10 @@ impl HeaderSyncReactor {
             {
                 deadline = deadline.min(request_deadline);
             }
+            if let Some(status_v8) = peer.status_v8.as_ref() {
+                deadline = deadline.min(status_v8.next_deadline());
+                continue;
+            }
             let status_deadline = if peer.status_differs_from_last_sent(self.local_status()) {
                 peer.meters.unsolicited.next_allowed
             } else {
@@ -2517,6 +2591,85 @@ impl HeaderSyncReactor {
             range,
             RangePurpose::VctRepair { height, generation },
         )
+    }
+
+    fn observe_committed_snapshot(&mut self, snapshot: zakura_header_chain::EngineSnapshot) {
+        let status = StatusV8::from_snapshot(&snapshot, &self.serve_capabilities);
+        let now = Instant::now();
+        self.committed_snapshot = Some(snapshot);
+        for peer in self.state.peers.values_mut() {
+            if peer.session.protocol() != HeaderSyncProtocolVersion::V8 {
+                continue;
+            }
+            match peer.status_v8.as_mut() {
+                Some(scheduler) => scheduler.observe(status.clone(), now),
+                None => {
+                    peer.status_v8 = Some(StatusScheduler::new(
+                        status.clone(),
+                        self.startup.status_refresh_interval,
+                        now,
+                    ));
+                }
+            }
+        }
+    }
+
+    fn send_status_v8(&mut self, peer: &ZakuraPeerId) -> bool {
+        let now = Instant::now();
+        let Some((session, status)) = self.state.peers.get(peer).and_then(|peer_state| {
+            let scheduler = peer_state.status_v8.as_ref()?;
+            scheduler
+                .due(now)
+                .then(|| (peer_state.session.clone(), scheduler.desired()))
+        }) else {
+            return false;
+        };
+
+        match session.try_send_status_v8(&self.v8_codec, status.clone()) {
+            Ok(()) => {
+                if let Some(scheduler) = self
+                    .state
+                    .peers
+                    .get_mut(peer)
+                    .and_then(|peer_state| peer_state.status_v8.as_mut())
+                {
+                    scheduler.record_sent(status, now);
+                }
+                metrics::counter!("sync.header.peer.status_v8.sent").increment(1);
+                true
+            }
+            Err(error) => {
+                if let Some(scheduler) = self
+                    .state
+                    .peers
+                    .get_mut(peer)
+                    .and_then(|peer_state| peer_state.status_v8.as_mut())
+                {
+                    scheduler.record_failed(now);
+                }
+                metrics::counter!("sync.header.peer.status_v8.send_failed").increment(1);
+                tracing::debug!(?peer, ?error, "failed to queue Zakura header-sync StatusV8");
+                false
+            }
+        }
+    }
+
+    fn refresh_v8_statuses(&mut self) {
+        let now = Instant::now();
+        let peers: Vec<_> = self
+            .state
+            .peers
+            .iter()
+            .filter(|(_, peer)| {
+                peer.status_v8
+                    .as_ref()
+                    .is_some_and(|status| status.due(now))
+            })
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        for peer in peers {
+            self.send_status_v8(&peer);
+        }
     }
 
     fn send_status(&mut self, peer: &ZakuraPeerId) -> bool {

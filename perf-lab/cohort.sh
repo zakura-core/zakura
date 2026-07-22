@@ -18,8 +18,14 @@ ip_of() { bash "$DIR/droplet.sh" ip "$1"; }
 
 cmd_seed() {
   local name="${1:?usage: cohort.sh seed NAME}"; check_serve_name "$name"
-  bash "$DIR/droplet.sh" provision "${name#perf-lab-}"
-  local ip; ip="$(ip_of "$name")"; [ -n "$ip" ] || die "no ip for $name"
+  # reuse an existing droplet (DO allows duplicate names — provisioning twice
+  # creates a doppelganger, seen live 2026-07-22)
+  local ip; ip="$(ip_of "$name")"
+  if [ -z "$ip" ]; then
+    bash "$DIR/droplet.sh" provision "${name#perf-lab-}"
+    ip="$(ip_of "$name")"
+  fi
+  [ -n "$ip" ] || die "no ip for $name"
   # Seed = one harness run whose fork we keep. SKIP_BASELINE=1 → single leg;
   # public peers; generous wall cap for the longer range.
   # shellcheck disable=SC2087  # client-side expansion intended

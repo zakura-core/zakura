@@ -202,7 +202,23 @@ sys.exit(0 if ok else 1)
 }
 
 cmd_destroy() {
-  local name="${1:?usage: droplet.sh destroy NAME}"
+  local name="${1:?usage: droplet.sh destroy NAME|ID}"
+  # numeric arg = droplet ID (needed when DO duplicate names make name-based
+  # deletion ambiguous); still guarded: the ID must belong to a tagged,
+  # prefix-named droplet
+  if [[ "$name" =~ ^[0-9]+$ ]]; then
+    local owner
+    owner="$(droplet_json | python3 -c '
+import json,sys
+did=int(sys.argv[1])
+for d in json.load(sys.stdin) or []:
+    if d["id"]==did and d["name"].startswith(sys.argv[2]): print(d["name"]); break
+' "$name" "$NAME_PREFIX")"
+    [ -n "$owner" ] || die "refusing: id $name is not a tagged ${NAME_PREFIX}-* droplet"
+    run $DOCTL compute droplet delete "$name" -f
+    echo "destroyed $owner (id $name)"
+    return
+  fi
   assert_ours "$name"
   run $DOCTL compute droplet delete "$name" -f
   echo "destroyed $name"

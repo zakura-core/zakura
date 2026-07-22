@@ -5,12 +5,12 @@
   "next_exp_id": 2,
   "droplets": {
     "perf-lab-serve-a": {
-      "ip": "pending",
-      "created_at": "2026-07-22T06:55:00Z",
+      "ip": "138.197.91.62",
+      "created_at": "2026-07-22T07:55:00Z",
       "role": "cohort-serve"
     },
     "perf-lab-serve-b": {
-      "ip": "pending",
+      "ip": "159.203.134.228",
       "created_at": "2026-07-22T06:56:00Z",
       "role": "cohort-serve"
     }
@@ -18,13 +18,13 @@
   "in_flight": {
     "seed-a": {
       "droplet": "perf-lab-serve-a",
-      "exp": "B-15 cohort seed",
-      "started_at": "2026-07-22T06:55:00Z"
+      "exp": "B-15 cohort re-seed",
+      "started_at": "2026-07-22T07:56:00Z"
     },
     "seed-b": {
       "droplet": "perf-lab-serve-b",
-      "exp": "B-15 cohort seed",
-      "started_at": "2026-07-22T06:56:00Z"
+      "exp": "B-15 cohort re-seed",
+      "started_at": "2026-07-22T08:02:00Z"
     }
   },
   "noise_band_pct": 8.7

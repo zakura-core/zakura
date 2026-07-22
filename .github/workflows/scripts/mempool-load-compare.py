@@ -28,10 +28,13 @@ COMPARISONS = (
      "Same figure per second. A real drop shows up here and above together."),
     ("Reject rate", ("throughput", "reject_rate"), True,
      "Node rejects only. 0 -> non-zero is the most actionable regression here."),
-    ("Confirm delay p50 (ms)", ("throughput", "confirm_delay_p50_ms"), True,
-     "Tracks block interval; moves with mining luck as well as code."),
-    ("Confirm delay p95 (ms)", ("throughput", "confirm_delay_p95_ms"), True,
-     "Tail latency. More sensitive to real stalls than p50."),
+    # Confirm delay is bounded by when the next block lands, so its percentiles
+    # swing hundreds of percent between identical runs. Reported for context,
+    # never graded -- otherwise it flags a regression on unchanged code.
+    ("Confirm delay p50 (ms)", ("throughput", "confirm_delay_p50_ms"), None,
+     "Bounded by block timing; informational, not graded (swings with mining luck)."),
+    ("Confirm delay p95 (ms)", ("throughput", "confirm_delay_p95_ms"), None,
+     "Bounded by block timing; informational, not graded."),
     ("Propagation p50 (s)", ("propagation", "spread_p50_secs"), True,
      "Typical gossip spread across nodes."),
     ("Propagation p95 (s)", ("propagation", "spread_p95_secs"), True,
@@ -74,6 +77,9 @@ def classify(delta_pct: float | None, lower_is_better: bool, baseline=None, targ
     failures). Treating their None delta as "=" would hide exactly the
     regression that matters most: 0 -> nonzero.
     """
+    # lower_is_better is None for metrics that are reported but never graded.
+    if lower_is_better is None:
+        return "info"
     if delta_pct is None:
         if not isinstance(baseline, (int, float)) or not isinstance(target, (int, float)):
             return "="

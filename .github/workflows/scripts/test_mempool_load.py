@@ -1299,7 +1299,12 @@ class Comparison(unittest.TestCase):
 
     def test_identical_runs_show_no_change(self):
         rows = compare.build_rows(self.leg(), self.leg())
-        self.assertTrue(all(r["verdict"] == "=" for r in rows))
+        # Graded metrics show no change; ungraded ones show 'info'.
+        self.assertTrue(all(r["verdict"] in ("=", "info") for r in rows))
+        # Confirm delay is intentionally not graded -- it swings with
+        # mining luck even on identical code.
+        cd = self.row_for(rows, "Confirm delay p95 (ms)")
+        self.assertEqual(cd["verdict"], "info")
 
     def test_throughput_drop_is_flagged_as_worse(self):
         target = self.leg(throughput={"submitted": 500})
@@ -1366,7 +1371,11 @@ class Comparison(unittest.TestCase):
         report = compare.render(self.leg(), target, rows)
         self.assertIn("regressed beyond the noise floor", report)
         self.assertIn("Transactions submitted", report)
-        self.assertNotIn("inf", report)
+        # Zero-baseline deltas must not render as a numeric infinity. Check the
+        # delta cells specifically -- "info"/"informational" appear elsewhere.
+        import re
+        delta_cells = re.findall(r"\| ([+-]?[\d.eE+]+%|n/a|inf%?) \|", report)
+        self.assertNotIn("inf", " ".join(delta_cells))
 
     def test_clean_report_says_so(self):
         rows = compare.build_rows(self.leg(), self.leg())

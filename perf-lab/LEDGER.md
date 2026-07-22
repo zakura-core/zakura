@@ -68,3 +68,16 @@ This file is the sole reporting channel (design D5). Entry template:
   scoped away from PR-active files) behind the L1 mock-blocksync pre-filter;
   (3) B-02 DL_LIMIT sweep once the band question settles. Batch note: 1
   collect remains in batch 1; the first seeder run closes it.
+
+### SESSION 1 scouting notes (pre-EXP-001)
+
+- `max_blocks_per_response` default 1 is DELIBERATE (doc comment: narrow
+  ranges keep a missing response from stalling multiple floor heights) — and
+  `block_sync/config.rs` is touched by open PRs 166/217, so code-default
+  experiments there are excluded for now. Filed as a PROPOSAL candidate
+  pending those PRs.
+- L1 mock-blocksync knob probe (base vs ZAKURA_MOCK_BS_MAX_BLOCKS_PER_RESPONSE=32,
+  medians of runs 2-4): 25196 vs 25455 blk/s = +1.0%, within warm noise.
+  Domain-validity lesson: loopback can't model the WAN per-request latency
+  this knob trades against — the mockbs pre-filter is valid for
+  codec/scheduling costs only; batching questions need L2.

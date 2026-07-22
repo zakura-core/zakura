@@ -206,3 +206,11 @@ This file is the sole reporting channel (design D5). Entry template:
   assertion passed via log fallback — wrapper .exit death struck again,
   fallback now built into freeze). COHORT_PEERS captured and committed.
 - reaper-exempt by code; ~$1/h combined while standing (Adam-approved).
+
+### aa-cohort1 (2026-07-22) — first cohort determinism sample
+
+- within-run |delta| **0.00%** on post-commit blk/s (191.39 / 191.39; legs
+  645s / 650s; whole-run 186.05 / 184.62 = 0.77%). SHA 2d3d7e51.
+- absolute throughput **~2× live-peer** (191 vs 85-100 pc blk/s): frozen
+  uncontended servers on the private overlay feed flat-out — the bench now
+  stresses the node itself much harder.

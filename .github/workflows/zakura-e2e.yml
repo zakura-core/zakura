@@ -18,7 +18,7 @@ on:
   #   the merged PR did not touch an obviously Zakura-specific path.
   pull_request:
     branches: [main, "feat/**", "release/**"]
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
   push:
     branches: [main, "feat/**", "release/**"]

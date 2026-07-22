@@ -81,3 +81,12 @@ This file is the sole reporting channel (design D5). Entry template:
   Domain-validity lesson: loopback can't model the WAN per-request latency
   this knob trades against — the mockbs pre-filter is valid for
   codec/scheduling costs only; batching questions need L2.
+
+## BATCH 1 summary (2026-07-22)
+
+- collects (8): aa1, aa2, aa3, aa4, aa5, aa6, exp000, aa-seed1 — all
+  calibration/validation; wins 0 by design.
+- key products: band 8.7% (single-peer), harness fixes (SHA pinning, fork
+  hygiene incl. B-14 auto-patch, coverage guard, honest exit codes),
+  EXP-000 pipeline validation, first seeder-mode sample 0.435%.
+- spend: ~US$5-6 total across two droplets.

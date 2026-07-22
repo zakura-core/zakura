@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "session": 1,
-  "batch_runs_used": 7,
+  "batch_runs_used": 0,
   "next_exp_id": 1,
   "droplets": {
     "perf-lab-s1": {
@@ -9,14 +9,6 @@
       "created_at": "2026-07-22T00:05:00Z"
     }
   },
-  "in_flight": {
-    "aa-seed1": {
-      "droplet": "perf-lab-s1",
-      "build_ref": "main-pinned-at-start",
-      "baseline_ref": "main-pinned-at-start",
-      "exp": "B-15-measurement",
-      "started_at": "2026-07-22T00:07:00Z"
-    }
-  },
+  "in_flight": {},
   "noise_band_pct": 8.7
 }

@@ -53,3 +53,18 @@ This file is the sole reporting channel (design D5). Entry template:
 - simplicity: 1
 - follow-ups: none — pipeline (worktree → branch → gates → push → pinned bench
   → verdict → ledger → cleanup) validated end to end
+
+## SESSION 1 (2026-07-21, started ~23:55Z)
+
+- origin/main: b3a2ad506 (moved from 4784aca68 since calibration — ~10 commits)
+- band on entry: 8.7% (measured today, golden image 20260720-2311); gate
+  re-checks if provision picks a newer image
+- exclusions refreshed: PRs 336/330/322/323/341 added (network/sync areas)
+- plan: (1) B-15 measurement first — two seeder-mode A/A runs (FEED_PEER
+  empty, PEERSET_SIZE=75) to test whether multi-peer delivery averaging
+  shrinks the ~9% single-peer variance; if yes, adopt seeder mode as the
+  standard window config and re-derive the band + campaign baseline from
+  those runs; (2) meanwhile implement EXP-001 (download-path code experiment
+  scoped away from PR-active files) behind the L1 mock-blocksync pre-filter;
+  (3) B-02 DL_LIMIT sweep once the band question settles. Batch note: 1
+  collect remains in batch 1; the first seeder run closes it.

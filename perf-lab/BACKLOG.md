@@ -74,4 +74,8 @@ sighash/ZIP-244 (merged caching + PR 288), block-template isolation (PR 292),
 VCT artifact generation (PR 249), retained-memory accounting (PR 217/225),
 lazy trace events (PR 228), block-sync peer accountability/reconnect
 (PR 209/166), header-sync alignment (PR 313 + active main-tip work),
-consensus/state-integrity fixes branch (PR 165).
+consensus/state-integrity fixes branch (PR 165). Refreshed 2026-07-21 SESSION
+1: also native peer discovery (PR 336), peer-ban on invalid blocks (PR 330),
+near-tip legacy-sync stall fallback (PR 322), VCT root authentication
+(PR 323), mempool advert retry (PR 341) — B-03-style reactor-knob work must
+avoid discovery/ban/legacy-sync files.

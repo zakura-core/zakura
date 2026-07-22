@@ -342,7 +342,7 @@ impl ZakuraCheckpointsTestDirExt for TempDir {
         };
 
         // Fall back to assuming zakura-checkpoints is in the same directory as zakurad.
-        let mut zakura_checkpoints_path: PathBuf = env!("CARGO_BIN_EXE_zakurad").into();
+        let mut zakura_checkpoints_path: PathBuf = super::zakurad_exe_path().into();
         assert!(
             zakura_checkpoints_path.pop(),
             "must have at least one path component",

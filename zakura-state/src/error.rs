@@ -12,7 +12,7 @@ use zakura_chain::{
     history_tree::HistoryTreeError,
     ironwood, orchard, sapling, sprout, transaction, transparent,
     value_balance::{ValueBalance, ValueBalanceError},
-    work::difficulty::CompactDifficulty,
+    work::difficulty::{CompactDifficulty, U256},
 };
 
 use crate::{
@@ -457,9 +457,9 @@ pub enum CommitHeaderRangeError {
         /// Height where the new range first conflicts with the stored chain.
         height: block::Height,
         /// Cumulative work of the existing conflicting suffix.
-        existing_work: u128,
+        existing_work: U256,
         /// Cumulative work of the new conflicting suffix.
-        new_work: u128,
+        new_work: U256,
     },
 
     /// A header conflicts with a trusted checkpoint hash.

@@ -57,18 +57,18 @@ fn debug_format() {
         "ExpandedDifficulty(\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\")"
     );
 
-    assert_eq!(format!("{:?}", Work(0)), "Work(0x0, 0, -inf)");
-    assert_eq!(format!("{:?}", Work(1)), "Work(0x1, 1, 0.00000)");
+    assert_eq!(format!("{:?}", Work(U256::zero())), "Work(0x0, 0, -inf)");
+    assert_eq!(format!("{:?}", Work(U256::one())), "Work(0x1, 1, 0.00000)");
     assert_eq!(
-        format!("{:?}", Work(u8::MAX as u128)),
+        format!("{:?}", Work(U256::from(u8::MAX))),
         "Work(0xff, 255, 7.99435)"
     );
     assert_eq!(
-        format!("{:?}", Work(u64::MAX as u128)),
+        format!("{:?}", Work(U256::from(u64::MAX))),
         "Work(0xffffffffffffffff, 18446744073709551615, 64.00000)"
     );
     assert_eq!(
-        format!("{:?}", Work(u128::MAX)),
+        format!("{:?}", Work(U256::from(u128::MAX))),
         "Work(0xffffffffffffffffffffffffffffffff, 340282366920938463463374607431768211455, 128.00000)"
     );
 }
@@ -112,7 +112,7 @@ fn compact_extremes() {
 
     // Values equal to one
     let expanded_one = Some(ExpandedDifficulty(U256::one()));
-    let work_one = None;
+    let work_one = Some(Work(U256::one() << 255));
 
     let canonical_one = CompactDifficulty((1 << PRECISION) + (1 << 16));
     assert_eq!(canonical_one.to_expanded(), expanded_one);
@@ -132,7 +132,8 @@ fn compact_extremes() {
 
     // Maximum mantissa
     let expanded_mant = Some(ExpandedDifficulty(UNSIGNED_MANTISSA_MASK.into()));
-    let work_mant = None;
+    let expanded_mant_value = U256::from(UNSIGNED_MANTISSA_MASK);
+    let work_mant = Some(Work((!expanded_mant_value / (expanded_mant_value + 1)) + 1));
 
     let mant = CompactDifficulty(OFFSET as u32 * (1 << PRECISION) + UNSIGNED_MANTISSA_MASK);
     assert_eq!(mant.to_expanded(), expanded_mant);
@@ -143,9 +144,7 @@ fn compact_extremes() {
     let exponent: U256 = (31 * 8).into();
     let u256_exp = U256::from(2).pow(exponent);
     let expanded_exp = Some(ExpandedDifficulty(u256_exp));
-    let work_exp = Some(Work(
-        ((U256::MAX - u256_exp) / (u256_exp + 1) + 1).as_u128(),
-    ));
+    let work_exp = Some(Work((!u256_exp / (u256_exp + 1)) + 1));
 
     let canonical_exp =
         CompactDifficulty(((31 + OFFSET - 2) as u32) * (1 << PRECISION) + (1 << 16));
@@ -167,7 +166,7 @@ fn compact_extremes() {
     let exponent: U256 = (29 * 8).into();
     let u256_me = U256::from(UNSIGNED_MANTISSA_MASK) * U256::from(2).pow(exponent);
     let expanded_me = Some(ExpandedDifficulty(u256_me));
-    let work_me = Some(Work((!u256_me / (u256_me + 1) + 1).as_u128()));
+    let work_me = Some(Work((!u256_me / (u256_me + 1)) + 1));
 
     let me = CompactDifficulty((31 + 1) * (1 << PRECISION) + UNSIGNED_MANTISSA_MASK);
     assert_eq!(me.to_expanded(), expanded_me);
@@ -193,7 +192,7 @@ fn compact_extremes() {
     let difficulty_btc_main = CompactDifficulty(0x1d00ffff);
     let u256_btc_main = U256::from(0xffff) << 208;
     let expanded_btc_main = Some(ExpandedDifficulty(u256_btc_main));
-    let work_btc_main = Some(Work(0x100010001));
+    let work_btc_main = Some(Work(U256::from(0x100010001_u64)));
     assert_eq!(difficulty_btc_main.to_expanded(), expanded_btc_main);
     assert_eq!(
         difficulty_btc_main.to_expanded().unwrap().to_compact(),
@@ -206,7 +205,7 @@ fn compact_extremes() {
     let difficulty_btc_reg = CompactDifficulty(0x207fffff);
     let u256_btc_reg = U256::from(0x7fffff) << 232;
     let expanded_btc_reg = Some(ExpandedDifficulty(u256_btc_reg));
-    let work_btc_reg = Some(Work(0x2));
+    let work_btc_reg = Some(Work(U256::from(0x2_u8)));
     assert_eq!(difficulty_btc_reg.to_expanded(), expanded_btc_reg);
     assert_eq!(
         difficulty_btc_reg.to_expanded().unwrap().to_compact(),
@@ -215,18 +214,63 @@ fn compact_extremes() {
     assert_eq!(difficulty_btc_reg.to_work(), work_btc_reg);
 }
 
+/// HV-07: exact per-block work remains representable above `u128::MAX`.
+#[test]
+fn hv_07_per_block_work_exceeds_u128() {
+    let target_one = CompactDifficulty((1 << PRECISION) + (1 << 16));
+    let work = target_one
+        .to_work()
+        .expect("a positive target has representable 256-bit work");
+
+    assert_eq!(work.as_u256(), U256::one() << 255);
+    assert!(work.as_u256() > U256::from(u128::MAX));
+    assert_eq!(
+        Work::try_from(ExpandedDifficulty(U256::MAX)),
+        Ok(Work(U256::one()))
+    );
+    assert_eq!(Work::try_from(ExpandedDifficulty(U256::zero())), Err(()));
+}
+
+/// HV-07: cumulative work reaches `U256::MAX` exactly and rejects overflow.
+#[test]
+fn hv_07_checked_cumulative_work_boundary() {
+    let one = Work(U256::one());
+    let below_max = PartialCumulativeWork(U256::MAX - 1);
+    let max = below_max
+        .checked_add(one)
+        .expect("adding one below the limit reaches the exact limit");
+
+    assert_eq!(max.as_u256(), U256::MAX);
+    assert_eq!(max.checked_add(one), None);
+    assert!(std::panic::catch_unwind(|| max + one).is_err());
+}
+
 /// Bitcoin test vectors for CompactDifficulty, and their corresponding
 /// ExpandedDifficulty and Work values.
 /// See <https://developer.bitcoin.org/reference/block_chain.html#target-nbits>
-static COMPACT_DIFFICULTY_CASES: &[(u32, Option<u128>, Option<u128>)] = &[
-    // These Work values will never happen in practice, because the corresponding
-    // difficulties are extremely high. So it is ok for us to reject them.
+static COMPACT_DIFFICULTY_CASES: &[(u32, Option<u128>, Option<&str>)] = &[
     (0x01003456, None /* 0x00 */, None),
-    (0x01123456, Some(0x12), None),
-    (0x02008000, Some(0x80), None),
-    (0x05009234, Some(0x92340000), None),
+    (
+        0x01123456,
+        Some(0x12),
+        Some("0d79435e50d79435e50d79435e50d79435e50d79435e50d79435e50d79435e50"),
+    ),
+    (
+        0x02008000,
+        Some(0x80),
+        Some("01fc07f01fc07f01fc07f01fc07f01fc07f01fc07f01fc07f01fc07f01fc07f0"),
+    ),
+    (
+        0x05009234,
+        Some(0x92340000),
+        Some("00000001c040c95a099201bcaf85db4e7f2e21e18707c8d55a887643b95afb2f"),
+    ),
     (0x04923456, None /* -0x12345600 */, None),
-    (0x04123456, Some(0x12345600), None),
+    (
+        0x04123456,
+        Some(0x12345600),
+        Some("0000000e10005c64415f04ef3e387b97db388404db9fdfaab2b1918f6783471d"),
+    ),
 ];
 
 /// Test Bitcoin test vectors for CompactDifficulty.
@@ -240,7 +284,9 @@ fn compact_bitcoin_test_vectors() {
         /// SPANDOC: Convert compact to expanded and work {?compact, ?expected_expanded, ?expected_work}
         {
             let expected_expanded = expected_expanded.map(U256::from).map(ExpandedDifficulty);
-            let expected_work = expected_work.map(Work);
+            let expected_work = expected_work.map(|work| {
+                Work(U256::from_str_radix(work, 16).expect("golden work value is valid hex"))
+            });
 
             let compact = CompactDifficulty(compact);
             let actual_expanded = compact.to_expanded();
@@ -280,8 +326,8 @@ fn block_difficulty_for_network(network: Network) -> Result<(), Report> {
     let diff_one = ExpandedDifficulty(U256::one());
     let diff_max = ExpandedDifficulty(U256::MAX);
 
-    let work_zero = PartialCumulativeWork(0);
-    let work_max = PartialCumulativeWork(u128::MAX);
+    let work_zero = PartialCumulativeWork(U256::zero());
+    let work_max = PartialCumulativeWork(U256::MAX);
 
     let mut cumulative_work = PartialCumulativeWork::default();
     let mut previous_cumulative_work = PartialCumulativeWork::default();

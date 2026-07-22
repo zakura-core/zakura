@@ -46,10 +46,11 @@ impl Arbitrary for Work {
     type Parameters = ();
 
     fn arbitrary_with(_args: ()) -> Self::Strategy {
-        // In the Zcash protocol, a Work is converted from an ExpandedDifficulty.
-        // But some randomised difficulties are impractically large, and will
-        // never appear in any real-world block. So we just use a random Work value.
-        (1..u128::MAX).prop_map(Work).boxed()
+        // Keep the established practical-work distribution used by state test
+        // generators. Full-width boundaries have deterministic vectors.
+        (1..u128::MAX)
+            .prop_map(|work| Work(U256::from(work)))
+            .boxed()
     }
 
     type Strategy = BoxedStrategy<Self>;

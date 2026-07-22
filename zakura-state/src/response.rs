@@ -19,7 +19,7 @@ use zakura_chain::{
     value_balance::ValueBalance,
 };
 
-use zakura_chain::work::difficulty::CompactDifficulty;
+use zakura_chain::work::difficulty::{CompactDifficulty, U256};
 
 // Allow *only* these unused imports, so that rustdoc link resolution
 // will work with inline links.
@@ -542,7 +542,7 @@ pub enum ReadResponse {
     ChainInfo(GetBlockTemplateChainInfo),
 
     /// Response to [`ReadRequest::SolutionRate`]
-    SolutionRate(Option<u128>),
+    SolutionRate(Option<U256>),
 
     /// Response to [`ReadRequest::CheckBlockProposalValidity`]
     ValidBlockProposal,

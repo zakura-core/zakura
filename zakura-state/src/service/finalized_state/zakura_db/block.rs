@@ -2196,8 +2196,8 @@ impl DiskWriteBatch {
             if new_work <= existing_work {
                 return Err(CommitHeaderRangeError::LowerWorkConflict {
                     height: first_conflicting_height,
-                    existing_work: existing_work.as_u128(),
-                    new_work: new_work.as_u128(),
+                    existing_work: existing_work.as_u256(),
+                    new_work: new_work.as_u256(),
                 });
             }
         }

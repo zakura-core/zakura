@@ -202,12 +202,18 @@ status = "unimplemented"
 [[rule]]
 id = "LC-VAL-10"
 name = "Per-block work calculation"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_chain::work::difficulty::Work::try_from"
+tests = ["HV-07::per_block_work_exceeds_u128"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-WORKCALC-01"
 name = "Checked cumulative work"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_chain::work::difficulty::PartialCumulativeWork::checked_add"
+tests = ["HV-07::checked_cumulative_work_boundary"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-VAL-11"

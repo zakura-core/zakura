@@ -103,7 +103,7 @@ pub const INVALID_COMPACT_DIFFICULTY: CompactDifficulty = CompactDifficulty(u32:
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ExpandedDifficulty(U256);
 
-/// A 128-bit unsigned "Work" value.
+/// A 256-bit unsigned "Work" value.
 ///
 /// Used to calculate the total work for each chain of blocks.
 ///
@@ -113,11 +113,8 @@ pub struct ExpandedDifficulty(U256);
 /// choose the best chain. But its precise value and bit pattern are not
 /// consensus-critical.
 ///
-/// We calculate work values according to the Zcash specification, but store
-/// them as u128, rather than the implied u256. We don't expect the total chain
-/// work to ever exceed 2^128. The current total chain work for Zcash is 2^58,
-/// and Bitcoin adds around 2^91 work per year. (Each extra bit represents twice
-/// as much work.)
+/// Work is kept at its exact 256-bit width so valid hard targets are not
+/// rejected or narrowed before cumulative-work comparisons.
 ///
 /// > a node chooses the “best” block chain visible to it by finding the chain of valid blocks
 /// > with the greatest total work. The work of a block with value nBits for the nBits field in
@@ -127,16 +124,16 @@ pub struct ExpandedDifficulty(U256);
 ///
 /// [section 7.7.5]: https://zips.z.cash/protocol/protocol.pdf#workdef
 #[derive(Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd)]
-pub struct Work(u128);
+pub struct Work(U256);
 
 impl Work {
     /// Returns a value representing no work.
     pub fn zero() -> Self {
-        Self(0)
+        Self(U256::zero())
     }
 
-    /// Return the inner `u128` value.
-    pub fn as_u128(self) -> u128 {
+    /// Returns the exact inner 256-bit value.
+    pub fn as_u256(self) -> U256 {
         self.0
     }
 }
@@ -151,7 +148,7 @@ impl fmt::Debug for Work {
             // Use decimal, to compare with zcashd
             .field(&format_args!("{}", self.0))
             // Use log2, to compare with zcashd
-            .field(&format_args!("{:.5}", (self.0 as f64).log2()))
+            .field(&format_args!("{:.5}", u256_to_f64(self.0).log2()))
             .finish()
     }
 }
@@ -254,8 +251,6 @@ impl CompactDifficulty {
     /// `GetBlockProof()` in zcashd.
     ///
     /// Returns None if the corresponding ExpandedDifficulty is None.
-    /// Also returns None on Work overflow, which should be impossible on a
-    /// valid chain.
     ///
     /// [Zcash Specification]: https://zips.z.cash/protocol/protocol.pdf#workdef
     pub fn to_work(self) -> Option<Work> {
@@ -398,12 +393,18 @@ impl TryFrom<ExpandedDifficulty> for Work {
         // 2^256, as it's too large for a u256. However, as 2^256 is at least as
         // large as `expanded + 1`, it is equal to
         // `((2^256 - expanded - 1) / (expanded + 1)) + 1`, or
-        let result = (!expanded.0 / (expanded.0 + 1)) + 1;
-        if result <= u128::MAX.into() {
-            Ok(Work(result.as_u128()))
-        } else {
-            Err(())
+        if expanded.0.is_zero() {
+            // A zero target has work 2^256, which is outside U256.
+            return Err(());
         }
+
+        if expanded.0 == U256::MAX {
+            // The mathematical denominator is 2^256, so the floor is one.
+            return Ok(Work(U256::one()));
+        }
+
+        let result = (!expanded.0 / (expanded.0 + 1)) + 1;
+        Ok(Work(result))
     }
 }
 
@@ -666,17 +667,27 @@ impl std::ops::Add for Work {
 ///
 /// See [`Work`] for details.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PartialCumulativeWork(u128);
+pub struct PartialCumulativeWork(U256);
 
 impl PartialCumulativeWork {
     /// Returns a value representing no work.
     pub fn zero() -> Self {
-        Self(0)
+        Self(U256::zero())
     }
 
-    /// Return the inner `u128` value.
-    pub fn as_u128(self) -> u128 {
+    /// Returns the exact inner 256-bit value.
+    pub fn as_u256(self) -> U256 {
         self.0
+    }
+
+    /// Adds exact per-block work, returning `None` at the 2^256 boundary.
+    pub fn checked_add(self, rhs: Work) -> Option<Self> {
+        self.0.checked_add(rhs.0).map(Self)
+    }
+
+    /// Subtracts exact per-block work, returning `None` on underflow.
+    pub fn checked_sub(self, rhs: Work) -> Option<Self> {
+        self.0.checked_sub(rhs.0).map(Self)
     }
 
     /// Returns a floating-point work multiplier that can be used for display.
@@ -690,9 +701,8 @@ impl PartialCumulativeWork {
             .to_work()
             .expect("target difficult limit is valid work");
 
-        // Convert to u128 then f64.
-        let pow_limit = pow_limit.as_u128() as f64;
-        let work = self.as_u128() as f64;
+        let pow_limit = u256_to_f64(pow_limit.as_u256());
+        let work = u256_to_f64(self.as_u256());
 
         work / pow_limit
     }
@@ -702,8 +712,7 @@ impl PartialCumulativeWork {
     pub fn difficulty_bits_for_display(&self) -> f64 {
         // This calculation is similar to `zcashd`'s bits display in its logs.
 
-        // Convert to u128 then f64.
-        let work = self.as_u128() as f64;
+        let work = u256_to_f64(self.as_u256());
 
         work.log2()
     }
@@ -751,16 +760,25 @@ impl From<Work> for PartialCumulativeWork {
     }
 }
 
+impl From<Work> for U256 {
+    fn from(work: Work) -> Self {
+        work.0
+    }
+}
+
+impl From<PartialCumulativeWork> for U256 {
+    fn from(work: PartialCumulativeWork) -> Self {
+        work.0
+    }
+}
+
 impl std::ops::Add<Work> for PartialCumulativeWork {
     type Output = PartialCumulativeWork;
 
     fn add(self, rhs: Work) -> Self::Output {
-        let result = self
-            .0
-            .checked_add(rhs.0)
-            .expect("Work values do not overflow");
-
-        PartialCumulativeWork(result)
+        self.checked_add(rhs).expect(
+            "cumulative work fits in 256 bits under the chain-work representation invariant",
+        )
     }
 }
 
@@ -774,11 +792,8 @@ impl std::ops::Sub<Work> for PartialCumulativeWork {
     type Output = PartialCumulativeWork;
 
     fn sub(self, rhs: Work) -> Self::Output {
-        let result = self.0
-            .checked_sub(rhs.0)
-            .expect("PartialCumulativeWork values do not underflow: all subtracted Work values must have been previously added to the PartialCumulativeWork");
-
-        PartialCumulativeWork(result)
+        self.checked_sub(rhs)
+            .expect("subtracted block work was previously included in cumulative work")
     }
 }
 
@@ -786,4 +801,19 @@ impl std::ops::SubAssign<Work> for PartialCumulativeWork {
     fn sub_assign(&mut self, rhs: Work) {
         *self = *self - rhs;
     }
+}
+
+fn u256_to_f64(value: U256) -> f64 {
+    let bits = value.bits();
+    let mantissa_bits = usize::try_from(f64::MANTISSA_DIGITS)
+        .expect("the f64 mantissa width fits in usize on every supported target");
+    if bits <= mantissa_bits {
+        // Values with at most 53 bits are represented exactly by f64.
+        return value.as_u64() as f64;
+    }
+
+    let shift = bits - mantissa_bits;
+    let significant = (value >> shift).as_u64();
+    // `significant` has exactly the 53 high bits, so this conversion is exact.
+    significant as f64 * 2.0_f64.powi(i32::try_from(shift).expect("a U256 shift fits in i32"))
 }

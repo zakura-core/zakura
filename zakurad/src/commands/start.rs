@@ -1827,8 +1827,8 @@ mod zakura_header_sync_driver_tests {
         };
         let lower_work = zakura_state::CommitHeaderRangeError::LowerWorkConflict {
             height: block::Height(1),
-            existing_work: 2,
-            new_work: 1,
+            existing_work: 2.into(),
+            new_work: 1.into(),
         };
 
         assert_eq!(

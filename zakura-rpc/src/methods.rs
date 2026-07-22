@@ -2804,14 +2804,17 @@ where
 
         let solution_rate = match response {
             // zcashd returns a 0 rate when the calculation is invalid
-            ReadResponse::SolutionRate(solution_rate) => solution_rate.unwrap_or(0),
+            ReadResponse::SolutionRate(solution_rate) => solution_rate.unwrap_or_default(),
 
             _ => unreachable!("unmatched response to a solution rate request"),
         };
 
-        Ok(solution_rate
-            .try_into()
-            .expect("per-second solution rate always fits in u64"))
+        assert!(
+            solution_rate <= U256::from(u64::MAX),
+            "per-second solution rate fits in the legacy u64 RPC response"
+        );
+
+        Ok(solution_rate.as_u64())
     }
 
     async fn get_network_info(&self) -> Result<GetNetworkInfoResponse> {

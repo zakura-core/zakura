@@ -403,8 +403,7 @@ impl Version for zcash_history::V1 {
             .difficulty_threshold
             .to_work()
             .expect("work must be valid during contextual verification");
-        // There is no direct `std::primitive::u128` to `bigint::U256` conversion
-        let work = primitive_types::U256::from_big_endian(&work.as_u128().to_be_bytes());
+        let work = primitive_types::U256::from_big_endian(&work.as_u256().to_big_endian());
 
         match network_upgrade {
             NetworkUpgrade::Genesis

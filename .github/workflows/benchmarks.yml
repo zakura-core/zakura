@@ -41,6 +41,7 @@ jobs:
         with:
           toolchain: stable
           cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-criterion
         run: cargo install cargo-criterion --locked
@@ -117,6 +118,7 @@ jobs:
         with:
           toolchain: stable
           cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install critcmp
         run: cargo install critcmp --locked

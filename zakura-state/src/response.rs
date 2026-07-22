@@ -456,6 +456,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::HeadersByHeightRange`].
     Headers(Vec<(block::Height, block::Hash, Arc<block::Header>)>),
 
+    /// Response to [`ReadRequest::HeaderLocator`], absent before semantic handoff.
+    HeaderLocator(Option<zakura_header_chain::HeaderLocator>),
+
     /// Response to [`ReadRequest::BestHeaderTip`].
     BestHeaderTip(Option<(block::Height, block::Hash)>),
 
@@ -657,6 +660,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::AddressUtxos(_)
             | ReadResponse::ChainInfo(_)
             | ReadResponse::Headers(_)
+            | ReadResponse::HeaderLocator(_)
             | ReadResponse::BestHeaderTip(_)
             | ReadResponse::MissingBlockBodies(_)
             | ReadResponse::MissingBlockBodyMetadata(_)

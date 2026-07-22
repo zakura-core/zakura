@@ -251,6 +251,10 @@ pub struct ReadStateService {
     /// Committed header-engine snapshots, absent until the semantic handoff audit succeeds.
     header_chain_snapshot_receiver:
         tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+
+    /// Coherent durable header-engine reader, absent until semantic handoff.
+    header_chain_reader_receiver:
+        tokio::sync::watch::Receiver<Option<finalized_state::header_chain::HeaderChainReader>>,
 }
 
 impl Drop for StateService {
@@ -408,6 +412,8 @@ impl StateService {
         let sync_backup_dir_path = backup_dir_path.filter(|_| skip_backup_task);
         let (header_chain_snapshot_sender, header_chain_snapshot_receiver) =
             tokio::sync::watch::channel(None);
+        let (header_chain_reader_sender, header_chain_reader_receiver) =
+            tokio::sync::watch::channel(None);
         let (
             block_write_sender,
             invalid_block_write_reset_receiver,
@@ -421,7 +427,10 @@ impl StateService {
             non_finalized_state_sender,
             should_use_finalized_block_write_sender,
             sync_backup_dir_path,
-            header_chain_snapshot_sender,
+            write::HeaderChainObservers::new(
+                header_chain_snapshot_sender,
+                header_chain_reader_sender,
+            ),
         );
 
         let read_service = ReadStateService::new(
@@ -430,6 +439,7 @@ impl StateService {
             non_finalized_state_receiver,
             vct_root_repair_receiver,
             header_chain_snapshot_receiver,
+            header_chain_reader_receiver,
         );
 
         let full_verifier_utxo_lookahead = max_checkpoint_height
@@ -1070,6 +1080,9 @@ impl ReadStateService {
         header_chain_snapshot_receiver: tokio::sync::watch::Receiver<
             Option<zakura_header_chain::EngineSnapshot>,
         >,
+        header_chain_reader_receiver: tokio::sync::watch::Receiver<
+            Option<finalized_state::header_chain::HeaderChainReader>,
+        >,
     ) -> Self {
         let read_service = Self {
             network: finalized_state.network(),
@@ -1078,6 +1091,7 @@ impl ReadStateService {
             block_write_task,
             vct_root_repair_receiver,
             header_chain_snapshot_receiver,
+            header_chain_reader_receiver,
         };
 
         tracing::debug!("created new read-only state service");
@@ -1893,6 +1907,12 @@ impl Service<ReadRequest> for ReadStateService {
                 headers_by_height_range(state.latest_best_chain(), &state.db, start, count),
             )),
 
+            ReadRequest::HeaderLocator => {
+                let reader = state.header_chain_reader_receiver.borrow().clone();
+                let locator = reader.map(|reader| reader.selected_locator()).transpose()?;
+                Ok(ReadResponse::HeaderLocator(locator))
+            }
+
             ReadRequest::BlockRoots {
                 start_height,
                 count,
@@ -2292,6 +2312,8 @@ pub fn init_read_only(
         tokio::sync::watch::channel(VctRootRepairStatus::default());
     let (_header_chain_snapshot_sender, header_chain_snapshot_receiver) =
         tokio::sync::watch::channel(None);
+    let (_header_chain_reader_sender, header_chain_reader_receiver) =
+        tokio::sync::watch::channel(None);
 
     Ok((
         ReadStateService::new(
@@ -2300,6 +2322,7 @@ pub fn init_read_only(
             WatchReceiver::new(non_finalized_state_receiver),
             vct_root_repair_receiver,
             header_chain_snapshot_receiver,
+            header_chain_reader_receiver,
         ),
         finalized_state.db.clone(),
         non_finalized_state_sender,

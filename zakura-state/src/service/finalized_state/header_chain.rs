@@ -16,11 +16,11 @@ use zakura_header_chain::{
     apply_transition, audit_store, ApplyResult, AuxDelivery, AuxDelta, ChainScore, ChangeSet,
     CommittedTransition, CounterExhausted, EligibilityReason, EngineConfig, EngineMetadata,
     EngineMode, EngineSnapshot, EvidenceId, FinalityRecord, FinalitySource, Frontier,
-    FullStateEvidenceAuthority, FullStateFinalized, HeaderNode, NoChangeReceipt, RecoveryFailure,
-    RecoveryPlan, RecoveryRepair, StaleReceipt, StoreAuditRead, StoreError, StoreRead, SystemClock,
-    TransitionContext, TransitionEvent, TransitionFailure, TransitionRequest,
-    ValidationContextRecord, ValidationLease, VerifiedChainChanged, VerifiedChangeCause,
-    VerifiedHeaderRef,
+    FullStateEvidenceAuthority, FullStateFinalized, HeaderLocator, HeaderNode, NoChangeReceipt,
+    RecoveryFailure, RecoveryPlan, RecoveryRepair, StaleReceipt, StoreAuditRead, StoreError,
+    StoreRead, SystemClock, TransitionContext, TransitionEvent, TransitionFailure,
+    TransitionRequest, ValidationContextRecord, ValidationLease, VerifiedChainChanged,
+    VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use super::{
@@ -170,10 +170,39 @@ pub struct HeaderChainRuntime {
     publisher: Publisher,
 }
 
+/// Read-only coherent queries serialized against durable header transitions.
+#[derive(Clone, Debug)]
+pub(crate) struct HeaderChainReader {
+    store: HeaderChainStore,
+}
+
+impl HeaderChainReader {
+    pub(crate) fn selected_locator(&self) -> Result<HeaderLocator, HeaderChainStoreError> {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let snapshot = self
+            .store
+            .snapshot()
+            .map_err(HeaderChainStoreError::Store)?;
+        HeaderLocator::for_selected_path(&snapshot, |height| self.store.selected_hash(height))
+            .map_err(HeaderChainStoreError::Store)
+    }
+}
+
 impl HeaderChainRuntime {
     /// Return the sole committed-snapshot publisher.
     pub fn publisher(&self) -> &Publisher {
         &self.publisher
+    }
+
+    /// Return a read-only handle whose compound reads share the transition lock.
+    pub(crate) fn reader(&self) -> HeaderChainReader {
+        HeaderChainReader {
+            store: self.store.clone(),
+        }
     }
 
     /// Read the exact durable verified projection used to prove full-state finality.
@@ -1764,6 +1793,28 @@ mod tests {
         committed.state_version = StateVersion::new(2);
         publisher.publish(committed.clone());
         assert_eq!(*mirror_receiver.borrow(), Some(committed));
+    }
+
+    #[test]
+    fn coherent_reader_builds_locator_from_the_durable_selected_projection() {
+        let db_config = Config::ephemeral();
+        let (engine_config, anchor, metadata) = fixture();
+        let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+        store
+            .initialize(metadata, anchor.clone())
+            .expect("the empty schema initializes");
+        let (runtime, _) = store
+            .startup(&engine_config)
+            .expect("the initialized store audits");
+
+        assert_eq!(
+            runtime
+                .reader()
+                .selected_locator()
+                .expect("the selected projection is coherent")
+                .entries(),
+            &[Frontier::new(anchor.height, anchor.hash)]
+        );
     }
 
     #[test]

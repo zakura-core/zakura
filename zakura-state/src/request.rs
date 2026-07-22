@@ -1433,6 +1433,9 @@ pub enum ReadRequest {
         count: u32,
     },
 
+    /// Returns the exact committed selected-header locator after semantic handoff.
+    HeaderLocator,
+
     /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)
     /// with the per-block commitment roots for the requested heights, in ascending height
     /// order. May return fewer than `count` roots if the node does not hold the whole range.
@@ -1680,6 +1683,7 @@ impl ReadRequest {
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
             ReadRequest::HeadersByHeightRange { .. } => "headers_by_height_range",
+            ReadRequest::HeaderLocator => "header_locator",
             ReadRequest::BlockRoots { .. } => "block_roots",
             ReadRequest::BestHeaderTip => "best_header_tip",
             ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",

@@ -8,6 +8,7 @@ mod error;
 mod frontier;
 mod graph;
 mod ids;
+mod locator;
 mod node;
 mod retention;
 mod transition;
@@ -27,6 +28,7 @@ pub use ids::{
     BranchId, CounterExhausted, EvidenceId, FinalityEpoch, HeaderGeneration, HeaderId,
     OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration, WorkOwner,
 };
+pub use locator::{HeaderLocator, MAX_HEADER_LOCATOR_HASHES};
 pub use node::{
     BodyRuleId, BodyUnavailableSummary, BodyValidationState, DurableNodeError, EligibilityReason,
     EligibilityState, HeaderNode, HeaderValidationState,

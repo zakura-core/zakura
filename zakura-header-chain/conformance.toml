@@ -537,7 +537,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-V8-03"
 name = "Locator construction"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::HeaderLocator::for_selected_path"
+tests = ["P8-02::selected_path_locators_match_every_offset_and_cap_boundary", "P8-02::selected_path_locator_appends_a_non_genesis_finalized_frontier", "P8-02::selected_path_locator_fails_closed_on_a_projection_gap", "P8-02::coherent_reader_builds_locator_from_the_durable_selected_projection"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-V8-04"

@@ -37,7 +37,7 @@ use crate::{
         finalized_state::{
             header_chain::{
                 migration::{migrate_v7_header_store_reconciled, HeaderChainMigrationError},
-                HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError,
+                HeaderChainReader, HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError,
             },
             DiskWriteBatch, FinalizedState, ZakuraDb,
         },
@@ -758,7 +758,25 @@ struct WriteBlockWorkerTask {
     backup_dir_path: Option<PathBuf>,
     header_chain: Option<HeaderChainWriter>,
     attach_header_chain_at_handoff: bool,
-    header_chain_snapshot_sender: watch::Sender<Option<EngineSnapshot>>,
+    header_chain_observers: HeaderChainObservers,
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::service) struct HeaderChainObservers {
+    snapshot_sender: watch::Sender<Option<EngineSnapshot>>,
+    reader_sender: watch::Sender<Option<HeaderChainReader>>,
+}
+
+impl HeaderChainObservers {
+    pub(in crate::service) fn new(
+        snapshot_sender: watch::Sender<Option<EngineSnapshot>>,
+        reader_sender: watch::Sender<Option<HeaderChainReader>>,
+    ) -> Self {
+        Self {
+            snapshot_sender,
+            reader_sender,
+        }
+    }
 }
 
 /// The message type for the non-finalized block write task channel.
@@ -828,7 +846,7 @@ impl BlockWriteSender {
         non_finalized_state_sender: watch::Sender<NonFinalizedState>,
         should_use_finalized_block_write_sender: bool,
         backup_dir_path: Option<PathBuf>,
-        header_chain_snapshot_sender: watch::Sender<Option<EngineSnapshot>>,
+        header_chain_observers: HeaderChainObservers,
     ) -> (
         Self,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
@@ -845,7 +863,7 @@ impl BlockWriteSender {
             backup_dir_path,
             None,
             true,
-            header_chain_snapshot_sender,
+            header_chain_observers,
         )
     }
 
@@ -859,7 +877,7 @@ impl BlockWriteSender {
         backup_dir_path: Option<PathBuf>,
         header_chain: Option<HeaderChainWriter>,
         attach_header_chain_at_handoff: bool,
-        header_chain_snapshot_sender: watch::Sender<Option<EngineSnapshot>>,
+        header_chain_observers: HeaderChainObservers,
     ) -> (
         Self,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
@@ -902,7 +920,7 @@ impl BlockWriteSender {
                     backup_dir_path,
                     header_chain,
                     attach_header_chain_at_handoff,
-                    header_chain_snapshot_sender,
+                    header_chain_observers,
                 }
                 .run()
             })
@@ -948,7 +966,7 @@ impl WriteBlockWorkerTask {
             backup_dir_path,
             header_chain,
             attach_header_chain_at_handoff,
-            header_chain_snapshot_sender,
+            header_chain_observers,
         } = &mut self;
 
         let mut prev_finalized_note_commitment_trees: Option<NoteCommitmentTrees> = None;
@@ -1158,10 +1176,15 @@ impl WriteBlockWorkerTask {
             );
         }
         if let Some(writer) = header_chain {
+            // Publish the coherent reader before the snapshot that enables v8 negotiation,
+            // so every negotiated requester can immediately obtain its exact locator.
+            header_chain_observers
+                .reader_sender
+                .send_replace(Some(writer.runtime.reader()));
             writer
                 .runtime
                 .publisher()
-                .mirror_to(header_chain_snapshot_sender.clone());
+                .mirror_to(header_chain_observers.snapshot_sender.clone());
         }
 
         // Save any errors to propagate down to queued child blocks

@@ -110,10 +110,6 @@ pub mod queue_send_trace {
     pub const MESSAGE: &str = "message";
     /// Peer field.
     pub const PEER: &str = "peer";
-    /// Source peer field for forwarded messages.
-    pub const SOURCE_PEER: &str = "source_peer";
-    /// Destination peer field for forwarded messages.
-    pub const DESTINATION_PEER: &str = "destination_peer";
     /// Bounded send error label (`full`, `closed`, or `encode`).
     pub const ERROR: &str = "error";
     /// Logical send reason field.
@@ -126,12 +122,6 @@ pub mod queue_send_trace {
     pub const RANGE_START: &str = "range_start";
     /// Range count field.
     pub const RANGE_COUNT: &str = "range_count";
-    /// Returned response count field.
-    pub const RETURNED: &str = "returned";
-    /// Height field.
-    pub const HEIGHT: &str = "height";
-    /// Hash field.
-    pub const HASH: &str = "hash";
 }
 
 /// Shared block-sync trace event names and field keys.
@@ -355,115 +345,6 @@ pub mod discovery_trace {
 
     /// A discovery dial worker completed and was classified for backoff.
     pub const DISCOVERY_DIAL_RESULT: &str = "discovery_dial_result";
-}
-
-/// Shared header-sync trace event names and field keys.
-pub mod header_sync_trace {
-    /// Trace row event field.
-    pub const EVENT: &str = "event";
-    /// Peer field.
-    pub const PEER: &str = "peer";
-    /// Action/event/message kind field.
-    pub const KIND: &str = "kind";
-    /// Source peer field for forwarded full-block floods.
-    pub const SOURCE_PEER: &str = "source_peer";
-    /// Height field.
-    pub const HEIGHT: &str = "height";
-    /// Hash field.
-    pub const HASH: &str = "hash";
-    /// Header anchor hash field.
-    pub const ANCHOR_HASH: &str = "anchor_hash";
-    /// Range start height field.
-    pub const RANGE_START: &str = "range_start";
-    /// Range count field.
-    pub const RANGE_COUNT: &str = "range_count";
-    /// Header validation stage field.
-    pub const VALIDATION_STAGE: &str = "validation_stage";
-    /// Concrete validation error kind field.
-    pub const ERROR_KIND: &str = "error_kind";
-    /// Advertised peer range cap field.
-    pub const ADVERTISED_CAP: &str = "advertised_cap";
-    /// Expected header count field.
-    pub const EXPECTED_COUNT: &str = "expected_count";
-    /// In-flight request count field.
-    pub const IN_FLIGHT_COUNT: &str = "in_flight_count";
-    /// Whether header-carried tree-aux roots were requested for this range.
-    pub const WANT_TREE_AUX_ROOTS: &str = "want_tree_aux_roots";
-    /// Whether the range is expected to terminate at a checkpoint.
-    pub const FINALIZED: &str = "finalized";
-    /// Header scheduler priority label (`forward` or `repair`).
-    pub const RANGE_PRIORITY: &str = "range_priority";
-    /// Highest verified full-block/body height observed by the header scheduler.
-    pub const VERIFIED_BLOCK_TIP: &str = "verified_block_tip";
-    /// Durable finalized height observed by the header scheduler.
-    pub const FINALIZED_HEIGHT: &str = "finalized_height";
-    /// Durable best header tip observed by the header scheduler.
-    pub const BEST_HEADER_TIP: &str = "best_header_tip";
-    /// Number of header-carried tree-aux roots present on this send/receive.
-    pub const TREE_AUX_ROOTS_LEN: &str = "tree_aux_roots_len";
-    /// First encoded tree-aux root height.
-    pub const FIRST_ROOT_HEIGHT: &str = "first_root_height";
-    /// Last encoded tree-aux root height.
-    pub const LAST_ROOT_HEIGHT: &str = "last_root_height";
-    /// Zero-based index of the first mismatching root.
-    pub const ROOT_MISMATCH_OFFSET: &str = "root_mismatch_offset";
-    /// Expected height of the first mismatching root.
-    pub const EXPECTED_ROOT_HEIGHT: &str = "expected_root_height";
-    /// Actual height of the first mismatching root.
-    pub const ACTUAL_ROOT_HEIGHT: &str = "actual_root_height";
-    /// Destination peer count field.
-    pub const DESTINATION_PEER_COUNT: &str = "destination_peer_count";
-    /// Active reactor service sessions after this event.
-    pub const ACTIVE_CONNECTIONS: &str = "active_connections";
-    /// Ordered-stream generation that owns this header-sync event.
-    pub const SESSION_ID: &str = "session_id";
-    /// Header-sync v7 request identifier, when present.
-    pub const REQUEST_ID: &str = "request_id";
-    /// Negotiated header-sync stream version for this peer session.
-    pub const STREAM_VERSION: &str = "stream_version";
-    /// Bounded reason field.
-    pub const REASON: &str = "reason";
-
-    /// Reactor accepted an inbound event.
-    pub const HEADER_EVENT_RECEIVED: &str = "header_event_received";
-    /// Reactor queued an outbound driver action.
-    pub const HEADER_ACTION_DISPATCHED: &str = "header_action_dispatched";
-    /// Local status sent to a peer.
-    pub const HEADER_STATUS_SENT: &str = "header_status_sent";
-    /// Peer status received.
-    pub const HEADER_STATUS_RECEIVED: &str = "header_status_received";
-    /// Header-sync peer connected to the reactor.
-    pub const HEADER_PEER_CONNECTED: &str = "header_peer_connected";
-    /// Header-sync peer disconnected from the reactor.
-    pub const HEADER_PEER_DISCONNECTED: &str = "header_peer_disconnected";
-    /// Header range request sent.
-    pub const HEADER_GET_HEADERS_SENT: &str = "header_get_headers_sent";
-    /// Header range response received.
-    pub const HEADER_HEADERS_RECEIVED: &str = "header_headers_received";
-    /// Header range response served from local state.
-    pub const HEADER_HEADERS_SERVED: &str = "header_headers_served";
-    /// Header range committed.
-    pub const HEADER_RANGE_COMMITTED: &str = "header_range_committed";
-    /// Header range rejected.
-    pub const HEADER_RANGE_REJECTED: &str = "header_range_rejected";
-    /// NewBlock tip flood received.
-    pub const HEADER_NEW_BLOCK_RECEIVED: &str = "header_new_block_received";
-    /// NewBlock tip flood forwarded.
-    pub const HEADER_NEW_BLOCK_FORWARDED: &str = "header_new_block_forwarded";
-    /// NewBlock tip flood deduped.
-    pub const HEADER_NEW_BLOCK_DEDUPED: &str = "header_new_block_deduped";
-    /// Peer violation observed.
-    pub const HEADER_PEER_VIOLATION: &str = "header_peer_violation";
-    /// Peer violation recorded without disconnecting the peer.
-    pub const HEADER_PEER_VIOLATION_RECORDED: &str = "header_peer_violation_recorded";
-    /// Header frontier advanced.
-    pub const HEADER_FRONTIER_ADVANCED: &str = "header_frontier_advanced";
-    /// Header frontier re-anchored down to the verified block frontier.
-    pub const HEADER_FRONTIER_REANCHORED: &str = "header_frontier_reanchored";
-    /// Missing block bodies reported.
-    pub const HEADER_MISSING_BODIES_REPORTED: &str = "header_missing_bodies_reported";
-    /// The reactor woke because a real retry, timeout, or status deadline expired.
-    pub const HEADER_MAINTENANCE_WAKEUP: &str = "header_maintenance_wakeup";
 }
 
 /// Shared commit/frontier adapter trace event names and field keys.

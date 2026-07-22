@@ -4,9 +4,9 @@ use tokio::time::Instant;
 
 use zakura_header_chain::{EngineSnapshot, HeaderLocator, MAX_STAGED_TARGETS_V1};
 
-use super::super::{HeaderSyncRequestId, StatusV8, ZakuraPeerId};
+use super::super::{HeaderSyncRequestId, Status, ZakuraPeerId};
 
-/// One peer's exact, session-bound v8 target claim.
+/// One peer's exact, session-bound target claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerTargetAdvertisement {
     /// Ordered-stream generation that supplied this status.
@@ -14,7 +14,7 @@ pub struct PeerTargetAdvertisement {
     /// Local receipt time, used only for freshness and scheduling.
     pub observed_at: Instant,
     /// Exact advisory snapshot supplied by the peer.
-    pub status: StatusV8,
+    pub status: Status,
 }
 
 impl PeerTargetAdvertisement {
@@ -39,7 +39,7 @@ impl PeerTargetAdvertisement {
     }
 }
 
-/// One published request for an exact advertised v8 target.
+/// One published request for an exact advertised target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetPursuit {
     /// Peer whose current session owns the request.
@@ -96,7 +96,7 @@ pub(in crate::zakura::header_sync) enum StageTargetResult {
     AtCapacity,
 }
 
-/// Bounded one-target-per-peer v8 pursuit ownership.
+/// Bounded one-target-per-peer pursuit ownership.
 #[derive(Clone, Debug, Default)]
 pub(in crate::zakura::header_sync) struct TargetPursuitRegistry {
     slots: HashMap<ZakuraPeerId, TargetSlot>,
@@ -245,7 +245,7 @@ mod tests {
         PeerTargetAdvertisement {
             session_id: 7,
             observed_at: Instant::now(),
-            status: StatusV8 {
+            status: Status {
                 work_anchor_height: block::Height(10),
                 work_anchor_hash: hash(10),
                 selected_tip_height: block::Height(u32::from(marker)),

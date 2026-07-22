@@ -61,7 +61,7 @@ use crate::{
         ZakuraSyncExchange, ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC,
         CONTROL_VERSION, FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
         MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
-        TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC_V8, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
         ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
@@ -213,7 +213,7 @@ const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
 const _: () = assert!(DISCOVERY_STREAM_KIND == super::discovery::ZAKURA_STREAM_DISCOVERY);
 const _: () = assert!(HEADER_SYNC_STREAM_KIND == super::header_sync::ZAKURA_STREAM_HEADER_SYNC);
-const _: () = assert!(ZAKURA_STREAM_VERSION_7 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
+const _: () = assert!(ZAKURA_HEADER_SYNC_STREAM_VERSION == 8);
 const _: () =
     assert!(LEGACY_REQUEST_BLOCKS_BY_HASH == super::legacy_gossip::MSG_REQUEST_BLOCKS_BY_HASH);
 const _: () = assert!(
@@ -1762,13 +1762,13 @@ impl ZakuraProtocolHandler {
         config
     }
 
-    fn set_header_sync_v8_enabled(&self, enabled: bool) {
+    fn set_header_sync_enabled(&self, enabled: bool) {
         if enabled {
             self.supported_capabilities
-                .fetch_or(ZAKURA_CAP_HEADER_SYNC_V8, Ordering::Relaxed);
+                .fetch_or(ZAKURA_CAP_HEADER_SYNC, Ordering::Relaxed);
         } else {
             self.supported_capabilities
-                .fetch_and(!ZAKURA_CAP_HEADER_SYNC_V8, Ordering::Relaxed);
+                .fetch_and(!ZAKURA_CAP_HEADER_SYNC, Ordering::Relaxed);
         }
     }
 
@@ -3067,10 +3067,6 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         .and_then(|driver| driver.committed_snapshots.clone());
     let header_sync_shutdown = CancellationToken::new();
     startup.shutdown = header_sync_shutdown.clone();
-    if header_sync_driver_startup.is_some() {
-        startup.range_state_actions_enabled = true;
-        startup.inbound_new_block_acceptance_enabled = config.zakura.header_sync.accept_new_blocks;
-    }
     let (header_sync, header_sync_actions, header_sync_task) = spawn_header_sync_reactor(startup)?;
     let block_sync_driver_enabled = header_sync_driver_startup.is_some();
     let (block_sync, block_sync_actions, block_sync_task) =
@@ -3137,7 +3133,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     let committed_snapshots = header_sync_driver_startup
         .as_ref()
         .and_then(|startup| startup.committed_snapshots.clone());
-    let header_sync_v8_ready = committed_snapshots
+    let header_sync_ready = committed_snapshots
         .as_ref()
         .is_some_and(|snapshots| snapshots.borrow().is_some());
     let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
@@ -3151,7 +3147,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     // Give the handler the bound endpoint so inbound accepts can resolve the
     // peer's source IP and enforce the per-IP connection cap.
     .with_endpoint(endpoint.clone());
-    handler.set_header_sync_v8_enabled(header_sync_v8_ready);
+    handler.set_header_sync_enabled(header_sync_ready);
     let router = Router::builder(endpoint)
         .accept(P2P_V2_ALPN, handler.clone())
         .spawn();
@@ -3174,7 +3170,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         let task = tokio::spawn(async move {
             loop {
                 if snapshots.borrow().is_some() {
-                    capability_handler.set_header_sync_v8_enabled(true);
+                    capability_handler.set_header_sync_enabled(true);
                     break;
                 }
                 tokio::select! {
@@ -4677,11 +4673,8 @@ fn should_run_freshness_reaper(
     ordered_stream_count > 0 || request_response_stream_count == 0
 }
 
-/// The stream-kind versions this handler serves. Most known kinds are at version 1;
-/// header sync is at version 7, which correlates each `Headers` response with the
-/// request that solicited it. Earlier header-sync versions are not served.
+/// The common stream version used by services whose declarations remain at version 1.
 const ZAKURA_STREAM_VERSION_1: u16 = 1;
-const ZAKURA_STREAM_VERSION_7: u16 = 7;
 
 /// Returns whether the handler can serve a stream with this kind and version.
 ///
@@ -4879,12 +4872,9 @@ mod tests {
         zakura::{
             legacy_gossip::{LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec},
             testkit::LocalEndpointFactory,
-            HeaderSyncEvent, HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession,
-            HeaderSyncRequestId, HeaderSyncStatus, ServicePeerLimits, ZakuraDiscoveryConfig,
-            ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, LOCAL_MAX_MESSAGE_BYTES,
-            MAX_HS_MESSAGE_BYTES, MSG_HS_STATUS, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-            ZAKURA_CAP_HEADER_SYNC_V8, ZAKURA_CAP_LEGACY_GOSSIP,
-            ZAKURA_HEADER_SYNC_STREAM_VERSION_V8,
+            HeaderSyncEvent, HeaderSyncMisbehavior, HeaderSyncPeerSession, ServicePeerLimits,
+            LOCAL_MAX_MESSAGE_BYTES, MAX_HS_MESSAGE_BYTES, ZAKURA_CAP_DISCOVERY,
+            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
         },
         P2pStack,
     };
@@ -4900,7 +4890,7 @@ mod tests {
     use zakura_test::vectors::BLOCK_TESTNET_141042_BYTES;
 
     #[test]
-    fn header_v8_capability_tracks_committed_snapshot_readiness() {
+    fn header_capability_tracks_committed_snapshot_readiness() {
         let handler = ZakuraProtocolHandler::new(
             ZakuraSupervisorHandle::new(1),
             Network::Mainnet,
@@ -4908,20 +4898,20 @@ mod tests {
             ZakuraLocalLimits::from_config(&Config::default()),
         );
         handler.supported_capabilities.store(
-            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC_V8,
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC,
             Ordering::Relaxed,
         );
 
-        handler.set_header_sync_v8_enabled(false);
+        handler.set_header_sync_enabled(false);
         assert_eq!(
             handler.current_handshake_config().supported_capabilities,
-            ZAKURA_CAP_HEADER_SYNC
+            ZAKURA_CAP_DISCOVERY
         );
 
-        handler.set_header_sync_v8_enabled(true);
+        handler.set_header_sync_enabled(true);
         assert_eq!(
             handler.current_handshake_config().supported_capabilities,
-            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC_V8
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC
         );
     }
 
@@ -4967,47 +4957,6 @@ mod tests {
                 };
                 let _ = self.stream_tx.send(streams).await;
             }
-            Ok(())
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct RecordingService {
-        deliveries: std::sync::Mutex<Vec<(ZakuraPeerId, u16, u16)>>,
-    }
-
-    impl RecordingService {
-        fn deliveries(&self) -> Vec<(ZakuraPeerId, u16, u16)> {
-            self.deliveries
-                .lock()
-                .expect("recording sink mutex is never poisoned")
-                .clone()
-        }
-    }
-
-    impl Service for RecordingService {
-        fn name(&self) -> &'static str {
-            "recording"
-        }
-
-        fn streams(&self) -> &[Stream] {
-            crate::zakura::legacy_gossip::legacy_gossip_streams()
-        }
-
-        fn add_peer(&self, _peer: Peer) {}
-
-        fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
-
-        fn deliver_frame(
-            &self,
-            peer_id: ZakuraPeerId,
-            stream_kind: u16,
-            frame: Frame,
-        ) -> Result<(), SinkReject> {
-            self.deliveries
-                .lock()
-                .map_err(|error| SinkReject::local(format!("recording sink poisoned: {error}")))?
-                .push((peer_id, stream_kind, frame.message_type));
             Ok(())
         }
     }
@@ -5685,40 +5634,6 @@ mod tests {
         )
     }
 
-    fn test_discovery_service(supervisor: &ZakuraSupervisorHandle) -> Arc<dyn Service> {
-        let (_handle, service) =
-            test_discovery_service_with_peer_limits(supervisor, ServicePeerLimits::default());
-        service
-    }
-
-    fn test_discovery_service_with_peer_limits(
-        supervisor: &ZakuraSupervisorHandle,
-        peer_limits: ServicePeerLimits,
-    ) -> (ZakuraDiscoveryHandle, Arc<dyn Service>) {
-        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
-        let handle = ZakuraDiscoveryHandle::new(
-            ZakuraDiscoveryLocalConfig {
-                secret_key: SecretKey::from_bytes(&[7u8; 32]),
-                direct_addrs: Vec::new(),
-                services: crate::zakura::discovery::default_advertised_services(),
-                zakura_protocol_min: handshake.zakura_protocol_min,
-                zakura_protocol_max: handshake.zakura_protocol_max,
-                network_id: handshake.network_id,
-                chain_id: handshake.chain_id,
-                last_authored_sequence: None,
-            },
-            ZakuraDiscoveryConfig {
-                peer_limits,
-                ..ZakuraDiscoveryConfig::default()
-            },
-            supervisor.subscribe(),
-        )
-        .expect("test discovery handle builds");
-        let service =
-            Arc::new(crate::zakura::DiscoveryService::new(handle.clone())) as Arc<dyn Service>;
-        (handle, service)
-    }
-
     fn header_sync_startup(shutdown: CancellationToken) -> HeaderSyncStartup {
         let network = Network::Mainnet;
         let anchor = (block::Height(0), network.genesis_hash());
@@ -5736,24 +5651,6 @@ mod tests {
         );
         startup.shutdown = shutdown;
         startup
-    }
-
-    async fn next_header_sync_action(
-        actions: &mut mpsc::Receiver<HeaderSyncAction>,
-    ) -> HeaderSyncAction {
-        tokio::time::timeout(Duration::from_secs(2), actions.recv())
-            .await
-            .expect("header-sync action arrives before timeout")
-            .expect("header-sync action channel stays open")
-    }
-
-    fn status_at_genesis(network: &Network) -> HeaderSyncStatus {
-        HeaderSyncStatus {
-            tip_height: block::Height(0),
-            tip_hash: network.genesis_hash(),
-            anchor_height: block::Height(0),
-            ..HeaderSyncStatus::default()
-        }
     }
 
     async fn register_test_peer(
@@ -6045,198 +5942,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_routes_legacy_and_header_sync_and_drops_unknown() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let shutdown = CancellationToken::new();
-        let startup = header_sync_startup(shutdown.clone());
-        let (header_sync, mut actions, task) = spawn_header_sync_reactor(startup)?;
-        let recorder = Arc::new(RecordingService::default());
-        let supervisor = ZakuraSupervisorHandle::new(1);
-        let registry = service_registry(
-            &supervisor,
-            Some(header_sync.clone()),
-            None,
-            ZakuraBlockSyncConfig::default(),
-            recorder.clone(),
-            test_discovery_service(&supervisor),
-        )?;
-        let peer = test_peer(6);
-
-        let (session, _recv) = header_sync_test_session(peer.clone());
-        header_sync
-            .send(HeaderSyncEvent::PeerConnected(session))
-            .await?;
-        assert!(matches!(
-            next_header_sync_action(&mut actions).await,
-            HeaderSyncAction::SendMessage {
-                msg: HeaderSyncMessage::Status(_),
-                ..
-            }
-        ));
-
-        let gossip_frame = Frame {
-            message_type: 11,
-            flags: 0,
-            payload: Vec::new(),
-        };
-        let request_frame = Frame {
-            message_type: 12,
-            flags: 0,
-            payload: Vec::new(),
-        };
-        let get_headers_frame = HeaderSyncMessage::GetHeaders {
-            start_height: block::Height(1),
-            count: 1,
-            want_tree_aux_roots: false,
-        }
-        .encode_frame(Some(
-            HeaderSyncRequestId::new(1).expect("non-zero request id"),
-        ))?;
-
-        let (gossip_result, request_result, header_sync_result) = tokio::join!(
-            async { registry.deliver(peer.clone(), LEGACY_GOSSIP_STREAM_KIND, gossip_frame) },
-            async { registry.deliver(peer.clone(), LEGACY_REQUEST_STREAM_KIND, request_frame) },
-            async { registry.deliver(peer.clone(), HEADER_SYNC_STREAM_KIND, get_headers_frame) },
-        );
-
-        gossip_result?;
-        request_result?;
-        header_sync_result?;
-        registry.deliver(
-            peer.clone(),
-            99,
-            Frame {
-                message_type: 13,
-                flags: 0,
-                payload: Vec::new(),
-            },
-        )?;
-
-        let action = next_header_sync_action(&mut actions).await;
-        assert!(
-            matches!(
-                action,
-                HeaderSyncAction::Misbehavior {
-                    reason: HeaderSyncMisbehavior::GetHeadersSpam,
-                    ..
-                }
-            ),
-            "kind-5 GetHeaders must reach the header-sync reactor, got {action:?}"
-        );
-
-        let deliveries = recorder.deliveries();
-        assert_eq!(deliveries.len(), 2);
-        assert!(deliveries.iter().any(|(_, kind, message_type)| *kind
-            == LEGACY_GOSSIP_STREAM_KIND
-            && *message_type == 11));
-        assert!(deliveries.iter().any(|(_, kind, message_type)| *kind
-            == LEGACY_REQUEST_STREAM_KIND
-            && *message_type == 12));
-        assert!(!deliveries
-            .iter()
-            .any(|(_, kind, _)| *kind == HEADER_SYNC_STREAM_KIND));
-
-        let rejected = registry
-            .request(
-                peer,
-                HEADER_SYNC_STREAM_KIND,
-                99,
-                LOCAL_MAX_CONTROL_FRAME_BYTES,
-                LOCAL_MAX_CONTROL_FRAME_BYTES,
-                Frame {
-                    message_type: 1,
-                    flags: 0,
-                    payload: Vec::new(),
-                },
-            )
-            .await;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
-
-        shutdown.cancel();
-        task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn malformed_header_sync_frame_is_protocol_reject_when_reactor_queue_closed(
-    ) -> Result<(), BoxError> {
-        let shutdown = CancellationToken::new();
-        let startup = header_sync_startup(shutdown.clone());
-        let (header_sync, _actions, task) = spawn_header_sync_reactor(startup)?;
-        let service = HeaderSyncService::new(header_sync);
-        let peer = test_peer(11);
-
-        shutdown.cancel();
-        task.await?;
-
-        let valid_status_frame =
-            HeaderSyncMessage::Status(status_at_genesis(&Network::Mainnet)).encode_frame(None)?;
-        let valid_result =
-            service.deliver_frame(peer.clone(), HEADER_SYNC_STREAM_KIND, valid_status_frame);
-        assert!(
-            matches!(valid_result, Err(SinkReject::Local(_))),
-            "valid header-sync frames depend on local reactor queue availability"
-        );
-
-        let malformed_frame = Frame {
-            message_type: u16::from(MSG_HS_STATUS),
-            flags: 0,
-            payload: Vec::new(),
-        };
-        let malformed_result =
-            service.deliver_frame(peer, HEADER_SYNC_STREAM_KIND, malformed_frame);
-        assert!(
-            matches!(malformed_result, Err(SinkReject::Protocol(_))),
-            "malformed header-sync frames must disconnect independently of reactor queue availability"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn header_sync_peer_connected_has_ready_outbound_source() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let shutdown = CancellationToken::new();
-        let startup = header_sync_startup(shutdown.clone());
-        let (header_sync, mut actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let service = HeaderSyncService::new(header_sync);
-        let peer = test_peer(12);
-        let cancel_token = CancellationToken::new();
-        let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
-        let (outbound_tx, mut outbound_rx) = crate::zakura::framed_channel(1);
-
-        let mut streams = HashMap::new();
-        streams.insert(HEADER_SYNC_STREAM_KIND, (inbound_rx, outbound_tx));
-        service.add_peer(Peer::new(
-            peer.clone(),
-            None,
-            ZAKURA_CAP_HEADER_SYNC,
-            streams,
-            cancel_token.clone(),
-        ));
-
-        let received = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .expect("header-sync outbound source is immediately ready")
-            .expect("header-sync outbound receiver stays open");
-        assert_eq!(received.message_type, u16::from(MSG_HS_STATUS));
-
-        assert!(matches!(
-            next_header_sync_action(&mut actions).await,
-            HeaderSyncAction::SendMessage {
-                msg: HeaderSyncMessage::Status(_),
-                ..
-            }
-        ));
-
-        cancel_token.cancel();
-        service.remove_peer(&peer, 0);
-        shutdown.cancel();
-        reactor_task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn lazy_escalation_service_demand_respects_directional_caps() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let shutdown = CancellationToken::new();
@@ -6262,251 +5967,6 @@ mod tests {
             ),
             "an outbound slot should still allow lazy header-sync escalation"
         );
-
-        shutdown.cancel();
-        reactor_task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn registry_add_remove_updates_header_sync_peers() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let shutdown = CancellationToken::new();
-        let startup = header_sync_startup(shutdown.clone());
-        let (header_sync, mut actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let peer = test_peer(7);
-        let supervisor = ZakuraSupervisorHandle::new(1);
-        let registry = service_registry(
-            &supervisor,
-            Some(header_sync.clone()),
-            None,
-            ZakuraBlockSyncConfig::default(),
-            Arc::new(RecordingService::default()),
-            test_discovery_service(&supervisor),
-        )?;
-        let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
-        let (outbound_tx, _outbound_rx) = crate::zakura::framed_channel(1);
-        let mut streams = HashMap::new();
-        streams.insert(HEADER_SYNC_STREAM_KIND, (inbound_rx, outbound_tx));
-        registry.add_peer(Peer::new(
-            peer.clone(),
-            None,
-            ZAKURA_CAP_HEADER_SYNC,
-            streams,
-            CancellationToken::new(),
-        ));
-        assert!(matches!(
-            next_header_sync_action(&mut actions).await,
-            HeaderSyncAction::SendMessage {
-                msg: HeaderSyncMessage::Status(_),
-                ..
-            }
-        ));
-
-        header_sync
-            .send(HeaderSyncEvent::WireMessage {
-                peer: peer.clone(),
-                msg: HeaderSyncMessage::Status(status_at_genesis(&Network::Mainnet)),
-            })
-            .await?;
-        assert_eq!(header_sync.peer_snapshot().inbound_peers, 1);
-
-        registry.remove_peer(&peer, 0, ZAKURA_CAP_HEADER_SYNC);
-
-        // Deregistering must drop the peer from header-sync state and release its
-        // slot. Its in-flight wire events are then dropped by the session guard
-        // rather than scored, so the freed slot is the observable.
-        timeout(Duration::from_secs(2), async {
-            while header_sync.peer_snapshot().inbound_peers != 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("deregistered peer must be removed from header-sync state");
-
-        shutdown.cancel();
-        reactor_task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn discovery_admission_is_independent_when_header_sync_is_full() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let shutdown = CancellationToken::new();
-        let mut startup = header_sync_startup(shutdown.clone());
-        startup.config.peer_limits = ServicePeerLimits {
-            max_inbound_peers: 0,
-            ..ServicePeerLimits::default()
-        };
-        let (header_sync, mut actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let supervisor = ZakuraSupervisorHandle::new(1);
-        let (discovery_handle, discovery_service) = test_discovery_service_with_peer_limits(
-            &supervisor,
-            ServicePeerLimits {
-                max_inbound_peers: 1,
-                ..ServicePeerLimits::default()
-            },
-        );
-        let registry = service_registry(
-            &supervisor,
-            Some(header_sync.clone()),
-            None,
-            ZakuraBlockSyncConfig::default(),
-            Arc::new(RecordingService::default()),
-            discovery_service,
-        )?;
-        let peer_node_id = SecretKey::from_bytes(&[13u8; 32]).public();
-        let peer = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
-        let (_hs_inbound_tx, hs_inbound_rx) = crate::zakura::framed_channel(1);
-        let (hs_outbound_tx, mut hs_outbound_rx) = crate::zakura::framed_channel(1);
-        let (_discovery_inbound_tx, discovery_inbound_rx) = crate::zakura::framed_channel(1);
-        let (discovery_outbound_tx, mut discovery_outbound_rx) = crate::zakura::framed_channel(4);
-        let streams = HashMap::from([
-            (HEADER_SYNC_STREAM_KIND, (hs_inbound_rx, hs_outbound_tx)),
-            (
-                DISCOVERY_STREAM_KIND,
-                (discovery_inbound_rx, discovery_outbound_tx),
-            ),
-        ]);
-
-        registry.add_peer(Peer::new(
-            peer.clone(),
-            None,
-            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY,
-            streams,
-            CancellationToken::new(),
-        ));
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            let mut snapshots = discovery_handle.subscribe_peer_snapshot();
-            while snapshots.borrow().inbound_peers != 1 {
-                snapshots
-                    .changed()
-                    .await
-                    .expect("discovery snapshot channel stays open");
-            }
-        })
-        .await
-        .expect("discovery admits while header-sync is full");
-
-        assert_eq!(header_sync.peer_snapshot().inbound_peers, 0);
-        assert_eq!(header_sync.peer_snapshot().inbound_slots_free, 0);
-        assert!(
-            !matches!(
-                tokio::time::timeout(Duration::from_millis(100), hs_outbound_rx.recv()).await,
-                Ok(Some(_))
-            ),
-            "header-sync rejected peer must not receive Status"
-        );
-        let discovery_frame =
-            tokio::time::timeout(Duration::from_secs(1), discovery_outbound_rx.recv())
-                .await
-                .expect("discovery source sends its normal hello")
-                .expect("discovery outbound stream stays open");
-        assert_eq!(discovery_frame.message_type, 1);
-
-        while let Ok(Some(action)) =
-            tokio::time::timeout(Duration::from_millis(50), actions.recv()).await
-        {
-            assert!(
-                !matches!(action, HeaderSyncAction::Misbehavior { peer: action_peer, .. } if action_peer == peer),
-                "header-sync cap rejection must not score peer misbehavior"
-            );
-        }
-
-        registry.remove_peer(&peer, 0, ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            let mut snapshots = discovery_handle.subscribe_peer_snapshot();
-            while snapshots.borrow().inbound_peers != 0 {
-                snapshots
-                    .changed()
-                    .await
-                    .expect("discovery snapshot channel stays open");
-            }
-        })
-        .await
-        .expect("discovery peer state is removed");
-
-        shutdown.cancel();
-        reactor_task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn header_sync_admission_is_independent_when_discovery_is_full() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let shutdown = CancellationToken::new();
-        let mut startup = header_sync_startup(shutdown.clone());
-        startup.config.peer_limits = ServicePeerLimits {
-            max_inbound_peers: 1,
-            ..ServicePeerLimits::default()
-        };
-        let (header_sync, mut actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let supervisor = ZakuraSupervisorHandle::new(1);
-        let (discovery_handle, discovery_service) = test_discovery_service_with_peer_limits(
-            &supervisor,
-            ServicePeerLimits {
-                max_inbound_peers: 0,
-                ..ServicePeerLimits::default()
-            },
-        );
-        let registry = service_registry(
-            &supervisor,
-            Some(header_sync.clone()),
-            None,
-            ZakuraBlockSyncConfig::default(),
-            Arc::new(RecordingService::default()),
-            discovery_service,
-        )?;
-        let peer_node_id = SecretKey::from_bytes(&[14u8; 32]).public();
-        let peer = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
-        let (_hs_inbound_tx, hs_inbound_rx) = crate::zakura::framed_channel(1);
-        let (hs_outbound_tx, mut hs_outbound_rx) = crate::zakura::framed_channel(1);
-        let (_discovery_inbound_tx, discovery_inbound_rx) = crate::zakura::framed_channel(1);
-        let (discovery_outbound_tx, mut discovery_outbound_rx) = crate::zakura::framed_channel(1);
-        let streams = HashMap::from([
-            (HEADER_SYNC_STREAM_KIND, (hs_inbound_rx, hs_outbound_tx)),
-            (
-                DISCOVERY_STREAM_KIND,
-                (discovery_inbound_rx, discovery_outbound_tx),
-            ),
-        ]);
-
-        registry.add_peer(Peer::new(
-            peer.clone(),
-            None,
-            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY,
-            streams,
-            CancellationToken::new(),
-        ));
-
-        let header_frame = tokio::time::timeout(Duration::from_secs(1), hs_outbound_rx.recv())
-            .await
-            .expect("header-sync sends immediate Status")
-            .expect("header-sync outbound stream stays open");
-        assert_eq!(header_frame.message_type, u16::from(MSG_HS_STATUS));
-        assert!(matches!(
-            next_header_sync_action(&mut actions).await,
-            HeaderSyncAction::SendMessage {
-                peer: action_peer,
-                msg: HeaderSyncMessage::Status(_),
-                ..
-            } if action_peer == peer
-        ));
-        assert_eq!(header_sync.peer_snapshot().inbound_peers, 1);
-        assert_eq!(discovery_handle.peer_snapshot().inbound_peers, 0);
-        assert!(
-            !matches!(
-                tokio::time::timeout(Duration::from_millis(100), discovery_outbound_rx.recv())
-                    .await,
-                Ok(Some(_))
-            ),
-            "discovery rejected peer must not receive discovery source messages"
-        );
-
-        registry.remove_peer(&peer, 0, ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(header_sync.peer_snapshot().inbound_peers, 0);
 
         shutdown.cancel();
         reactor_task.await?;
@@ -7821,16 +7281,9 @@ mod tests {
                 },
                 Stream {
                     kind: HEADER_SYNC_STREAM_KIND,
-                    version: ZAKURA_STREAM_VERSION_7,
+                    version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
                     frame_cap: 1024,
                     capability: ZAKURA_CAP_HEADER_SYNC,
-                    mode: StreamMode::Ordered,
-                },
-                Stream {
-                    kind: HEADER_SYNC_STREAM_KIND,
-                    version: ZAKURA_HEADER_SYNC_STREAM_VERSION_V8,
-                    frame_cap: 1024,
-                    capability: ZAKURA_CAP_HEADER_SYNC_V8,
                     mode: StreamMode::Ordered,
                 },
                 Stream {
@@ -7848,11 +7301,7 @@ mod tests {
             (LEGACY_GOSSIP_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (LEGACY_REQUEST_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (DISCOVERY_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
-            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_7),
-            (
-                HEADER_SYNC_STREAM_KIND,
-                ZAKURA_HEADER_SYNC_STREAM_VERSION_V8,
-            ),
+            (HEADER_SYNC_STREAM_KIND, ZAKURA_HEADER_SYNC_STREAM_VERSION),
             (ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_VERSION_1),
         ] {
             assert!(
@@ -7876,6 +7325,14 @@ mod tests {
         assert!(
             !is_supported_stream(&registry, HEADER_SYNC_STREAM_KIND, 5),
             "header-sync v5 is rejected after the expanded Ironwood root-record wire break"
+        );
+        assert!(
+            !is_supported_stream(&registry, HEADER_SYNC_STREAM_KIND, 7),
+            "the predecessor header-sync stream version is rejected"
+        );
+        assert!(
+            registry.ordered_streams_for_negotiated(1 << 4).is_empty(),
+            "the retired predecessor capability opens no header-sync stream"
         );
 
         assert_eq!(stream_kind_label(2), "gossip");

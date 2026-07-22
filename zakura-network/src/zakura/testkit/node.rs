@@ -442,8 +442,6 @@ impl ZakuraTestNodeBuilder {
             if let Some(request_timeout) = self.header_sync_request_timeout {
                 startup.request_timeout = request_timeout;
             }
-            startup.range_state_actions_enabled = true;
-            startup.inbound_new_block_acceptance_enabled = true;
             startup.status_refresh_interval = Duration::from_millis(200);
             let shutdown = CancellationToken::new();
             startup.shutdown = shutdown.clone();

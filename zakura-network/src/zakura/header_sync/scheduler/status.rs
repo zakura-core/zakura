@@ -2,17 +2,17 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::super::StatusV8;
+use super::super::Status;
 
 const MIN_PUBLICATION_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_CHANGE_DELAY: Duration = Duration::from_secs(2);
 const PUBLICATION_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-/// Per-session v8 status timing state.
+/// Per-session status timing state.
 #[derive(Clone, Debug)]
 pub(in crate::zakura::header_sync) struct StatusScheduler {
-    desired: StatusV8,
-    last_sent: Option<StatusV8>,
+    desired: Status,
+    last_sent: Option<Status>,
     last_sent_at: Option<Instant>,
     pending_at: Option<Instant>,
     refresh_interval: Duration,
@@ -21,7 +21,7 @@ pub(in crate::zakura::header_sync) struct StatusScheduler {
 impl StatusScheduler {
     /// Start with an immediate publication for a newly negotiated session.
     pub(in crate::zakura::header_sync) fn new(
-        desired: StatusV8,
+        desired: Status,
         refresh_interval: Duration,
         now: Instant,
     ) -> Self {
@@ -37,7 +37,7 @@ impl StatusScheduler {
     /// Coalesce a newly committed advertisement behind the one-per-second floor.
     pub(in crate::zakura::header_sync) fn observe(
         &mut self,
-        desired: StatusV8,
+        desired: Status,
         committed_at: Instant,
     ) {
         if self.desired == desired && self.last_sent.as_ref() == Some(&desired) {
@@ -64,11 +64,11 @@ impl StatusScheduler {
         now >= self.next_deadline()
     }
 
-    pub(in crate::zakura::header_sync) fn desired(&self) -> StatusV8 {
+    pub(in crate::zakura::header_sync) fn desired(&self) -> Status {
         self.desired.clone()
     }
 
-    pub(in crate::zakura::header_sync) fn record_sent(&mut self, sent: StatusV8, now: Instant) {
+    pub(in crate::zakura::header_sync) fn record_sent(&mut self, sent: Status, now: Instant) {
         self.last_sent = Some(sent);
         self.last_sent_at = Some(now);
         self.pending_at = None;
@@ -88,8 +88,8 @@ mod tests {
 
     use super::*;
 
-    fn status(marker: u8) -> StatusV8 {
-        StatusV8 {
+    fn status(marker: u8) -> Status {
+        Status {
             work_anchor_height: block::Height(1),
             work_anchor_hash: block::Hash([1; 32]),
             selected_tip_height: block::Height(u32::from(marker)),

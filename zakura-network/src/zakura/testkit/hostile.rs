@@ -12,9 +12,8 @@ use crate::{
         legacy_gossip::ZAKURA_STREAM_GOSSIP, run_native_initiator_handshake, Frame, StreamPrelude,
         ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES,
         LEGACY_GOSSIP_VERSION, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC, ZAKURA_BLOCK_SYNC_STREAM_VERSION,
-        ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_HEADER_SYNC_V8, ZAKURA_CAP_LEGACY_GOSSIP,
-        ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-        ZAKURA_HEADER_SYNC_STREAM_VERSION_V8, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY,
+        ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_DISCOVERY_STREAM_VERSION,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY,
         ZAKURA_STREAM_HEADER_SYNC,
     },
     BoxError, Config,
@@ -438,8 +437,8 @@ impl HostilePeer {
 
     /// Selected header-sync stream version for an explicit capability mask.
     pub fn selected_header_sync_version(capabilities: u64) -> Option<u16> {
-        if capabilities & ZAKURA_CAP_HEADER_SYNC_V8 != 0 {
-            Some(ZAKURA_HEADER_SYNC_STREAM_VERSION_V8)
+        if capabilities & ZAKURA_CAP_HEADER_SYNC != 0 {
+            Some(ZAKURA_HEADER_SYNC_STREAM_VERSION)
         } else {
             (capabilities & ZAKURA_CAP_HEADER_SYNC != 0)
                 .then_some(ZAKURA_HEADER_SYNC_STREAM_VERSION)

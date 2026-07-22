@@ -12,7 +12,7 @@ use zakura_chain::block;
 
 use super::{
     commit_state_trace as cs_trace, BlockApplyResult, BlockApplyToken, BlockSyncBlockMeta,
-    HeaderSyncCommitFailureKind, ZakuraPeerId, ZakuraTrace, COMMIT_STATE_TABLE,
+    ZakuraTrace, COMMIT_STATE_TABLE,
 };
 
 /// A height/hash pair at one chain frontier.
@@ -172,15 +172,6 @@ impl ZakuraSyncExchange {
     }
 }
 
-/// Result of a header range commit through the sync exchange.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct HeaderRangeCommit {
-    /// First committed header height.
-    pub start_height: block::Height,
-    /// New durable best header frontier.
-    pub tip: Frontier,
-}
-
 /// Result of a submitted block body through the sync exchange.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BlockBodySubmit {
@@ -194,32 +185,6 @@ pub struct BlockBodySubmit {
     pub result: BlockApplyResult,
     /// Locally observed shared frontier after the apply attempt.
     pub local_frontier: Option<ChainFrontier>,
-}
-
-/// Header-sync view of shared Zakura state.
-pub trait HeaderSyncStatePortImpl: Send + Sync + 'static {
-    /// Return the currently cached shared frontier.
-    fn current_frontier(&self) -> ChainFrontier;
-
-    /// Subscribe to latest-value shared frontier updates.
-    fn subscribe_frontier(&self) -> watch::Receiver<FrontierUpdate>;
-
-    /// Commit a contiguous header range.
-    fn commit_header_range(
-        &self,
-        peer: ZakuraPeerId,
-        anchor: block::Hash,
-        start_height: block::Height,
-        headers: Vec<Arc<block::Header>>,
-        body_sizes: Vec<u32>,
-        finalized: bool,
-    ) -> BoxFuture<'static, Result<HeaderRangeCommit, HeaderSyncCommitFailureKind>>;
-
-    /// Publish a locally accepted best-header advance.
-    fn publish_best_header(&self, tip: Frontier) -> BoxFuture<'static, ()>;
-
-    /// Publish a best-header reanchor.
-    fn publish_header_reanchor(&self, old: Frontier, new: Frontier) -> BoxFuture<'static, ()>;
 }
 
 /// Block-sync view of shared Zakura state.
@@ -256,59 +221,6 @@ pub trait BlockSyncStatePortImpl: Send + Sync + 'static {
 
     /// Publish body-sync progress that did not come from a direct submit path.
     fn publish_body_progress(&self, update: FrontierUpdate) -> BoxFuture<'static, ()>;
-}
-
-/// Cloneable header-sync state port.
-#[derive(Clone)]
-pub struct HeaderSyncStatePort {
-    inner: Arc<dyn HeaderSyncStatePortImpl>,
-}
-
-impl HeaderSyncStatePort {
-    /// Wrap an implementation in a cloneable port.
-    pub fn new(inner: Arc<dyn HeaderSyncStatePortImpl>) -> Self {
-        Self { inner }
-    }
-
-    /// Return the currently cached shared frontier.
-    pub fn current_frontier(&self) -> ChainFrontier {
-        self.inner.current_frontier()
-    }
-
-    /// Subscribe to latest-value shared frontier updates.
-    pub fn subscribe_frontier(&self) -> watch::Receiver<FrontierUpdate> {
-        self.inner.subscribe_frontier()
-    }
-
-    /// Commit a contiguous header range.
-    pub fn commit_header_range(
-        &self,
-        peer: ZakuraPeerId,
-        anchor: block::Hash,
-        start_height: block::Height,
-        headers: Vec<Arc<block::Header>>,
-        body_sizes: Vec<u32>,
-        finalized: bool,
-    ) -> BoxFuture<'static, Result<HeaderRangeCommit, HeaderSyncCommitFailureKind>> {
-        self.inner
-            .commit_header_range(peer, anchor, start_height, headers, body_sizes, finalized)
-    }
-
-    /// Publish a locally accepted best-header advance.
-    pub fn publish_best_header(&self, tip: Frontier) -> BoxFuture<'static, ()> {
-        self.inner.publish_best_header(tip)
-    }
-
-    /// Publish a best-header reanchor.
-    pub fn publish_header_reanchor(&self, old: Frontier, new: Frontier) -> BoxFuture<'static, ()> {
-        self.inner.publish_header_reanchor(old, new)
-    }
-}
-
-impl std::fmt::Debug for HeaderSyncStatePort {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("HeaderSyncStatePort")
-    }
 }
 
 /// Cloneable block-sync state port.

@@ -3,12 +3,13 @@
 
 # If you want to include a file in the Docker image, add it to .dockerignore.
 #
-# We use 5 (TODO: 6) stages:
+# We use 6 (TODO: 7) stages:
 # - deps: installs build dependencies and sets default values
 # - tests: prepares a test image
 # - release-zakurad: builds the standalone release binary
 # - release: adds the maintenance binaries used by the runtime image
 # - runtime: prepares the release image
+# - runtime-zcashd-compat: adds zcashd compatibility to the release image
 # - TODO: Add a `monitoring` stage
 #
 # We first set default values for build arguments used across the stages.
@@ -134,7 +135,7 @@ CMD [ "cargo", "test" ]
 # This stage builds the standalone zakurad release binary.
 #
 # It also adds `cache mounts` as this stage is completely independent from the
-# `test` stage. The resulting binaries are used in the `runtime` stage.
+# `test` stage. The resulting binary is used by the `release` stage.
 FROM deps AS release-zakurad
 
 ARG SHORT_SHA

@@ -29,8 +29,12 @@ canary soak, announcement) apply on top of this checklist.
       `&template=hotfix-release-checklist.md` in the compare URL, and add the
       `do-not-merge` label — the release is dispatched from the branch itself,
       and the PR is merged (as a merge commit) only after the release.
-- [ ] Add the `A-release` label so `check-no-git-dependencies` runs, and
-      ensure it passes.
+- [ ] Add the `A-release` and `C-exclude-from-changelog` labels **when
+      opening the PR**: the changelog fragment check only accepts a
+      fragment-consuming release branch in release-PR mode, and relabeling
+      after the fact leaves a confusing trail of cancelled check runs.
+      `A-release` also makes `check-no-git-dependencies` run; ensure it
+      passes.
 
 ## Update Versions and Prepare the Release
 
@@ -98,7 +102,10 @@ for the commands, using the branch checkout (release.toml allows
       PR. Solve conflicts in the branch without force-pushing — the released
       commit must become an ancestor of `main`.
 - [ ] Merge with a **merge commit** (admin merge; do not squash), so the
-      tagged commit is preserved in `main`'s history.
+      tagged commit is preserved in `main`'s history. **The merge button
+      defaults to squash — change the dropdown before clicking.** (A squash
+      copies the content but orphans the tagged commit from `main`'s
+      history, breaking later base-tag ancestry checks from `main`.)
 - [ ] Delete the hotfix branch after the merge; the tag is permanent.
 
 ## Release Failures

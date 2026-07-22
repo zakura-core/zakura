@@ -69,6 +69,48 @@ fn checkpoint_list_multiple() -> Result<(), BoxError> {
     Ok(())
 }
 
+#[test]
+fn checkpoint_list_neighbor_lookups() -> Result<(), BoxError> {
+    let checkpoints = [
+        (block::Height(0), block::Hash([1; 32])),
+        (block::Height(10), block::Hash([2; 32])),
+        (block::Height(20), block::Hash([3; 32])),
+    ];
+    let list = CheckpointList::from_list(checkpoints)?;
+
+    assert_eq!(
+        list.checkpoint_at_or_before(block::Height(15)),
+        Some(checkpoints[1])
+    );
+    assert_eq!(
+        list.checkpoint_at_or_before(block::Height(10)),
+        Some(checkpoints[1])
+    );
+    assert_eq!(
+        list.checkpoint_at_or_before(block::Height(0)),
+        Some(checkpoints[0])
+    );
+    assert_eq!(
+        list.checkpoint_at_or_before(block::Height(25)),
+        Some(checkpoints[2])
+    );
+    assert_eq!(
+        list.checkpoint_after(block::Height(0)),
+        Some(checkpoints[1])
+    );
+    assert_eq!(
+        list.checkpoint_after(block::Height(10)),
+        Some(checkpoints[2])
+    );
+    assert_eq!(
+        list.checkpoint_after(block::Height(15)),
+        Some(checkpoints[2])
+    );
+    assert_eq!(list.checkpoint_after(block::Height(20)), None);
+
+    Ok(())
+}
+
 /// Make sure that an empty checkpoint list fails
 #[test]
 fn checkpoint_list_empty_fail() -> Result<(), BoxError> {

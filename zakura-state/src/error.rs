@@ -437,6 +437,12 @@ pub enum CommitHeaderRangeError {
         height: block::Height,
     },
 
+    /// Local checkpoint-frontier reconstruction failed while preparing the range.
+    #[error("could not update the highest completed checkpoint: {0}")]
+    HighestCompletedCheckpoint(
+        #[from] crate::service::finalized_state::HighestCompletedCheckpointError,
+    ),
+
     /// A provisional reorg tried to overwrite too far behind the best header tip.
     #[error(
         "header reorg at {height:?} is deeper than the maximum reorg window from best header tip {best_header_tip:?}"

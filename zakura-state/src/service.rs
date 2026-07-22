@@ -245,6 +245,14 @@ pub struct ReadStateService {
     /// Used to check for panics when writing blocks.
     block_write_task: Option<Arc<std::thread::JoinHandle<()>>>,
 
+    /// Watch channel publishing durable completed-checkpoint advances.
+    highest_completed_checkpoint_receiver:
+        tokio::sync::watch::Receiver<Option<finalized_state::HighestCompletedCheckpoint>>,
+
+    /// Keeps the completed-checkpoint watch open in read-only services.
+    _highest_completed_checkpoint_sender:
+        Option<tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>>,
+
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
     vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
 }
@@ -406,6 +414,7 @@ impl StateService {
             block_write_sender,
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
+            highest_completed_checkpoint_receiver,
             vct_root_repair_receiver,
             block_write_task,
         ) = write::BlockWriteSender::spawn(
@@ -421,6 +430,8 @@ impl StateService {
             &finalized_state,
             block_write_task,
             non_finalized_state_receiver,
+            highest_completed_checkpoint_receiver,
+            None,
             vct_root_repair_receiver,
         );
 
@@ -1058,6 +1069,12 @@ impl ReadStateService {
         finalized_state: &FinalizedState,
         block_write_task: Option<Arc<std::thread::JoinHandle<()>>>,
         non_finalized_state_receiver: WatchReceiver<NonFinalizedState>,
+        highest_completed_checkpoint_receiver: tokio::sync::watch::Receiver<
+            Option<finalized_state::HighestCompletedCheckpoint>,
+        >,
+        highest_completed_checkpoint_sender: Option<
+            tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>,
+        >,
         vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
     ) -> Self {
         let read_service = Self {
@@ -1065,6 +1082,8 @@ impl ReadStateService {
             db: finalized_state.db.clone(),
             non_finalized_state_receiver,
             block_write_task,
+            highest_completed_checkpoint_receiver,
+            _highest_completed_checkpoint_sender: highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
         };
 
@@ -1081,6 +1100,13 @@ impl ReadStateService {
     /// Subscribe to VCT supplied-root repair needs discovered by the finalized writer.
     pub fn subscribe_vct_root_repairs(&self) -> tokio::sync::watch::Receiver<VctRootRepairStatus> {
         self.vct_root_repair_receiver.clone()
+    }
+
+    /// Subscribe to durable completed-checkpoint advances.
+    pub fn subscribe_highest_completed_checkpoint(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<finalized_state::HighestCompletedCheckpoint>> {
+        self.highest_completed_checkpoint_receiver.clone()
     }
 
     /// Gets a clone of the latest non-finalized state from the `non_finalized_state_receiver`
@@ -2273,12 +2299,17 @@ pub fn init_read_only(
         tokio::sync::watch::channel(NonFinalizedState::new(network));
     let (_vct_root_repair_sender, vct_root_repair_receiver) =
         tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let (highest_completed_checkpoint, highest_completed_checkpoint_receiver) =
+        finalized_state::HighestCompletedCheckpointTracker::open(&finalized_state.db);
+    let highest_completed_checkpoint_sender = Some(highest_completed_checkpoint.keepalive_sender());
 
     Ok((
         ReadStateService::new(
             &finalized_state,
             None,
             WatchReceiver::new(non_finalized_state_receiver),
+            highest_completed_checkpoint_receiver,
+            highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
         ),
         finalized_state.db.clone(),

@@ -90,7 +90,10 @@ pub use service::finalized_state::{
     VctSproutHistoryValidationError, VctSproutHistoryValidationSummary,
 };
 pub use service::{
-    finalized_state::{DiskWriteBatch, FromDisk, IntoDisk, WriteDisk, ZakuraDb},
+    finalized_state::{
+        DiskWriteBatch, FromDisk, HighestCompletedCheckpoint, HighestCompletedCheckpointError,
+        IntoDisk, WriteDisk, ZakuraDb,
+    },
     ReadStateService, VctRootRepairState, VctRootRepairStatus,
 };
 

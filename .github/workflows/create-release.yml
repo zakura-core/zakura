@@ -1,6 +1,10 @@
 # This workflow is the only supported path for creating v* release tags.
 # It builds and verifies every release asset before a protected environment
 # allows the release GitHub App to publish a draft and create the immutable tag.
+#
+# It dispatches from main, or from a hotfix/vX.Y.Z branch named for the exact
+# tag it releases (see docs/security-hotfix-release.md). The
+# source_first_release input is the emergency "Mode B" path described there.
 name: Create release
 
 on:
@@ -12,6 +16,11 @@ on:
         type: string
       allow_bootstrap_release_state:
         description: "Emergency override: accept legacy-bootstrap Mainnet release state (note it in the release PR)"
+        required: false
+        default: false
+        type: boolean
+      source_first_release:
+        description: "Emergency mode: skip the staged asset build and publish a source-only release immediately; the tag-push run of release-binaries.yml builds and attaches binaries afterwards (see docs/security-hotfix-release.md, Mode B)"
         required: false
         default: false
         type: boolean
@@ -51,10 +60,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ "$SOURCE_REF" != "refs/heads/main" ]; then
-            echo "Create release must be dispatched from the main branch, not ${SOURCE_REF}." >&2
-            exit 1
-          fi
+          case "$SOURCE_REF" in
+            refs/heads/main) ;;
+            refs/heads/hotfix/v*)
+              # Hotfix branches are named for the exact tag they release, so a
+              # tag can never be dispatched from another release's branch.
+              if [ "$SOURCE_REF" != "refs/heads/hotfix/${RELEASE_TAG}" ]; then
+                echo "Tag ${RELEASE_TAG} must be dispatched from hotfix/${RELEASE_TAG}, not ${SOURCE_REF}." >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "Create release must be dispatched from main or a hotfix/v* branch, not ${SOURCE_REF}." >&2
+              exit 1
+              ;;
+          esac
 
           # This validates only release state committed to the source ref.
           # Resolving the moving R2 pointer belongs to update-release-state.yml.
@@ -68,6 +88,10 @@ jobs:
   build-assets:
     name: Build and verify release assets
     needs: [validate]
+    # Mode B (source_first_release) trades the pre-tag asset build for speed:
+    # the tag-push run of release-binaries.yml rebuilds and attaches assets to
+    # the published release instead.
+    if: ${{ !inputs.source_first_release }}
     uses: ./.github/workflows/release-binaries.yml
     # The nested publish-zakurad-assets job declares contents: write, and a
     # called workflow may not request more than the caller grants. The staging
@@ -86,15 +110,27 @@ jobs:
     name: Publish release and create tag
     runs-on: ubuntu-latest
     needs: [validate, build-assets]
+    # Tolerate build-assets being skipped, but only when Mode B asked for it.
+    if: >-
+      ${{
+        !cancelled()
+        && needs.validate.result == 'success'
+        && (
+          needs.build-assets.result == 'success'
+          || (inputs.source_first_release && needs.build-assets.result == 'skipped')
+        )
+      }}
     environment: release
     steps:
       - name: Download staged release assets
+        if: ${{ !inputs.source_first_release }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
         with:
           name: staged-release-assets
           path: ./assets
 
       - name: Verify staged release assets
+        if: ${{ !inputs.source_first_release }}
         env:
           RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
           REPOSITORY: ${{ github.repository }}
@@ -199,8 +235,14 @@ jobs:
           RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
           REPOSITORY: ${{ github.repository }}
           TARGET_SHA: ${{ needs.validate.outputs.target_sha }}
+          SOURCE_FIRST: ${{ inputs.source_first_release && 'true' || 'false' }}
         run: |
           set -euo pipefail
+
+          release_body="Release created by the protected Create release workflow."
+          if [ "$SOURCE_FIRST" = "true" ]; then
+            release_body="Source-first release: binaries are being built and attached by the tag-push release-binaries run."
+          fi
 
           # On HTTP errors `gh api` prints the JSON error body to stdout, so
           # branch on the exit status instead of the captured output, and only
@@ -258,13 +300,14 @@ jobs:
               jq -n \
                 --arg tag "$RELEASE_TAG" \
                 --arg sha "$TARGET_SHA" \
+                --arg body "$release_body" \
                 '{
                   tag_name: $tag,
                   target_commitish: $sha,
                   name: $tag,
                   draft: true,
                   prerelease: true,
-                  body: "Release created by the protected Create release workflow."
+                  body: $body
                 }' \
               | gh api --method POST \
                   "repos/${REPOSITORY}/releases" \
@@ -273,22 +316,26 @@ jobs:
             )"
           fi
 
-          mapfile -t asset_files < <(
-            find ./assets -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' | sort
-          )
-          asset_files+=("./assets/SHA256SUMS.txt")
-          for asset in "${asset_files[@]}"; do
-            name="$(basename "$asset")"
-            encoded_name="$(jq -rn --arg name "$name" '$name | @uri')"
-            echo "Uploading ${name}."
-            curl --fail --silent --show-error \
-              --request POST \
-              --header "Authorization: Bearer ${GH_TOKEN}" \
-              --header "Content-Type: application/octet-stream" \
-              --data-binary "@${asset}" \
-              --output /dev/null \
-              "https://uploads.github.com/repos/${REPOSITORY}/releases/${draft_id}/assets?name=${encoded_name}"
-          done
+          if [ "$SOURCE_FIRST" = "true" ]; then
+            echo "Source-first release: publishing without assets; the tag-push run attaches them."
+          else
+            mapfile -t asset_files < <(
+              find ./assets -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' | sort
+            )
+            asset_files+=("./assets/SHA256SUMS.txt")
+            for asset in "${asset_files[@]}"; do
+              name="$(basename "$asset")"
+              encoded_name="$(jq -rn --arg name "$name" '$name | @uri')"
+              echo "Uploading ${name}."
+              curl --fail --silent --show-error \
+                --request POST \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "Content-Type: application/octet-stream" \
+                --data-binary "@${asset}" \
+                --output /dev/null \
+                "https://uploads.github.com/repos/${REPOSITORY}/releases/${draft_id}/assets?name=${encoded_name}"
+            done
+          fi
 
           html_url="$(
             gh api --method PATCH "repos/${REPOSITORY}/releases/${draft_id}" \

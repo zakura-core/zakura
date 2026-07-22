@@ -1,5 +1,6 @@
-# Only allow releases from the main branch
-allow-branch = [ 'main' ]
+# Only allow releases from the main branch or a hotfix release branch
+# (see docs/security-hotfix-release.md)
+allow-branch = [ 'main', 'hotfix/v*' ]
 
 # Workspace crate versions are deliberately independent: a crate is bumped and
 # published only when it has changes to publish. Do not configure

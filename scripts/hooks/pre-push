@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Reject pushes of embargoed security branches from an everyday clone.
+#
+# Embargoed fixes are developed on security/<codename> branches in a dedicated
+# clone whose only remote is the private staging repo
+# (docs/security-hotfix-release.md). Pushing such a branch to the public
+# remote by muscle memory is the most likely catastrophic mistake in that
+# process; this hook is the cheap insurance. Install it in your everyday
+# public clone with:
+#
+#   cp scripts/hooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+#
+# git calls pre-push with lines "<local ref> <local sha> <remote ref> <remote sha>".
+set -euo pipefail
+
+while read -r local_ref _local_sha remote_ref _remote_sha; do
+  for ref in "$local_ref" "$remote_ref"; do
+    case "$ref" in
+      refs/heads/security/*)
+        echo "pre-push: refusing to push embargoed branch ${ref}." >&2
+        echo "pre-push: embargoed work belongs in the dedicated private clone only" >&2
+        echo "pre-push: (see docs/security-hotfix-release.md)." >&2
+        exit 1
+        ;;
+    esac
+  done
+done
+
+exit 0

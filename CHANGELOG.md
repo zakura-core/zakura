@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [1.0.3-rc2] - 2026-07-22
+
+### Changed
+
+- Hardened the hotfix release checklist and process documentation from the
+  first hotfix-path release's findings
+  (see [docs/security-hotfix-release.md](docs/security-hotfix-release.md)).
+
 ## [1.0.3-rc1] - 2026-07-21
 
 ### Fixed

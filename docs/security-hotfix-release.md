@@ -311,7 +311,9 @@ warrants a pre-announcement.
 - [ ] Main base: un-freeze Mergify.
 - [ ] Confirm installer-metadata/post-release automation completed as usual.
 - [ ] Delete embargoed branches, rehearsal tags, and the private rehearsal
-      release from the staging repo.
+      release from the staging repo **before the next release preparation
+      begins**: a leftover rehearsal tag shadows the real tag of the same
+      name and breaks the `make pre-release` base-tag ancestry check.
 - [ ] Update the advisory with fuller detail when appropriate; credit the
       reporter.
 - [ ] Retro: what leaked, what was slow, what the rehearsal missed; update

@@ -52,12 +52,27 @@ export CARGO_TARGET_DIR=/root/cargo-target
 # commit is under test. That pin is Kresko's, not this ref's: it only has to
 # generate a chain the zakurad under test accepts.
 
-if [ ! -x /root/kresko/target/release/kresko ]; then
+# The baked image ships a prebuilt kresko (see pr-node-bake.sh). Reuse it only
+# when it is the ref this run asked for -- otherwise a stale binary would
+# silently generate the chain, which is exactly the kind of thing that makes an
+# A/B result untrustworthy.
+WANT_SHA=""
+if [ -d /root/kresko ]; then
+  git -C /root/kresko fetch --no-tags origin "${KRESKO_REF}" 2>/dev/null || true
+  WANT_SHA=$(git -C /root/kresko rev-parse FETCH_HEAD 2>/dev/null || true)
+fi
+BAKED_SHA=$(cat /root/kresko/.baked-ref 2>/dev/null || true)
+
+if [ -x /root/kresko/target/release/kresko ] && [ -n "$WANT_SHA" ] && [ "$BAKED_SHA" = "$WANT_SHA" ]; then
+  echo "reusing baked kresko at ${BAKED_SHA}"
+else
+  echo "building kresko at ${KRESKO_REF} (baked: ${BAKED_SHA:-none}, want: ${WANT_SHA:-unknown})"
   git clone "${KRESKO_REPO}" /root/kresko 2>/dev/null || true
   git -C /root/kresko fetch --no-tags origin "${KRESKO_REF}"
   git -C /root/kresko checkout --detach FETCH_HEAD
   # No patch step: Kresko builds against the zakura crates upstream.
   ( cd /root/kresko && cargo build --release )
+  git -C /root/kresko rev-parse HEAD > /root/kresko/.baked-ref
 fi
 KRESKO_BIN=/root/kresko/target/release/kresko
 KRESKO_SHA=$(git -C /root/kresko rev-parse HEAD)

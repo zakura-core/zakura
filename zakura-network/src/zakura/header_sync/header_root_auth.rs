@@ -1,7 +1,37 @@
 //! Helpers for durable header-root authentication frontiers.
 
 use super::events::HeaderRootAuthState;
+use super::state::{RangePriority, RangeRequest};
+use super::HeaderRangePayload;
 use zakura_chain::block;
+
+/// Build an authentication request from an exact next-frontier retained payload.
+///
+/// The complete single-peer payload is kept intact so its terminal header remains
+/// the successor witness for the confirmed prefix.
+pub(super) fn retained_root_auth_range(
+    auth: HeaderRootAuthState,
+    payload: &HeaderRangePayload,
+    handoff: block::Height,
+) -> Option<RangeRequest> {
+    let expected_start = auth
+        .authenticated_height
+        .0
+        .checked_add(1)
+        .map(block::Height)?;
+    (payload.range().start() == expected_start
+        && payload.range().count() >= 2
+        && payload.has_tree_aux_roots()
+        && payload.range().end() <= auth.completed_checkpoint_height
+        && payload.range().end() <= handoff)
+        .then_some(RangeRequest {
+            range: payload.range(),
+            anchor_hash: Some(auth.authenticated_hash),
+            finalized: true,
+            want_tree_aux_roots: true,
+            priority: RangePriority::AuthenticateRoots,
+        })
+}
 
 /// True when both frontiers exist and neither was rebased onto a different hash
 /// at the same height.

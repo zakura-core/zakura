@@ -606,6 +606,9 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
                 hs_trace::REASON,
                 Some(match kind {
                     HeaderRootAuthenticationFailureKind::Stale => "stale",
+                    HeaderRootAuthenticationFailureKind::CanonicalMismatch { .. } => {
+                        "canonical_mismatch"
+                    }
                     HeaderRootAuthenticationFailureKind::InvalidPeerRange => "invalid_peer_range",
                     HeaderRootAuthenticationFailureKind::Local => "local",
                 }),

@@ -560,6 +560,12 @@ pub enum HeaderSyncCommitFailureKind {
 pub enum HeaderRootAuthenticationFailureKind {
     /// The compact state snapshot raced newer durable progress; retry without blame.
     Stale,
+    /// A supplied header no longer matches canonical storage; invalidate retained
+    /// coverage at and above this height without blaming its peer.
+    CanonicalMismatch {
+        /// First height that differed from canonical storage.
+        height: block::Height,
+    },
     /// The supplying peer's roots or aligned records were invalid.
     InvalidPeerRange,
     /// Local storage/channel/frontier failure; do not score the peer.

@@ -3,11 +3,12 @@ use super::{
     config::*,
     error::*,
     events::*,
+    header_root_auth::*,
     reactor::*,
     state::{
         BufferedHeaderRange, HeaderSyncCore, OutstandingPhase, OutstandingRange, PendingOperation,
-        RangePriority, RangePurpose, RangeRequest, VctRootRepair, ROOT_AUTH_PREFETCH_BATCHES,
-        VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME,
+        RangePriority, RangePurpose, RangeRequest, RootAuthSource, VctRootRepair,
+        RETAINED_ROOT_LOCAL_MAX_ATTEMPTS, VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME,
     },
     validation::*,
     wire::*,
@@ -595,7 +596,7 @@ fn root_auth_ranges_overlap_once_and_stay_checkpoint_covered() {
 }
 
 #[test]
-fn root_auth_prefetch_fills_a_bounded_overlapping_window() {
+fn root_auth_fallback_schedules_exactly_one_range() {
     let network = Network::Mainnet;
     let anchor = (block::Height(0), network.genesis_hash());
     let mut startup = startup_for(
@@ -622,16 +623,11 @@ fn root_auth_prefetch_fills_a_bounded_overlapping_window() {
         .collect();
     assert_eq!(
         ranges,
-        vec![
-            (block::Height(1), block::Height(3), Some(anchor.1)),
-            (block::Height(3), block::Height(5), None),
-            (block::Height(5), block::Height(7), None),
-            (block::Height(7), block::Height(9), None),
-        ]
+        vec![(block::Height(1), block::Height(3), Some(anchor.1))]
     );
     assert_eq!(
         state.schedule.range_count(RangePriority::AuthenticateRoots),
-        ROOT_AUTH_PREFETCH_BATCHES
+        1
     );
 }
 
@@ -666,19 +662,20 @@ fn clamped_root_auth_request_never_enqueues_non_overlapping_suffix() {
         want_tree_aux_roots: true,
         priority: RangePriority::AuthenticateRoots,
     };
-    assert_eq!(clamped_request_suffix(auth, 2), None);
+    assert_eq!(clamped_request_suffix(auth, 2, block::Height(10)), None);
 
     let forward = RangeRequest {
         priority: RangePriority::Forward,
         ..auth
     };
-    let suffix = clamped_request_suffix(forward, 2).expect("forward work keeps its suffix");
-    assert_eq!(suffix.start_height(), block::Height(3));
-    assert_eq!(suffix.count(), 3);
+    let suffix = clamped_request_suffix(forward, 2, block::Height(10))
+        .expect("rooted forward work keeps its overlapping suffix");
+    assert_eq!(suffix.start_height(), block::Height(2));
+    assert_eq!(suffix.count(), 4);
 }
 
 #[test]
-fn forward_response_reuse_requires_exact_current_frontier_and_covered_witness() {
+fn retained_response_requires_exact_current_frontier_and_covered_witness() {
     let headers = vec![
         mainnet_header(&BLOCK_MAINNET_1_BYTES),
         mainnet_header(&BLOCK_MAINNET_2_BYTES),
@@ -700,30 +697,271 @@ fn forward_response_reuse_requires_exact_current_frontier_and_covered_witness() 
         completed_checkpoint_hash: block::Hash([2; 32]),
     };
 
-    let reusable =
-        reusable_root_auth_range(auth, &payload).expect("exact covered response is reusable");
-    assert_eq!(reusable.start_height(), block::Height(1));
-    assert_eq!(reusable.end_height(), block::Height(2));
+    let retained = retained_root_auth_range(auth, &payload, block::Height(2))
+        .expect("exact covered response is retained-auth eligible");
+    assert_eq!(retained.start_height(), block::Height(1));
+    assert_eq!(retained.end_height(), block::Height(2));
 
-    assert!(reusable_root_auth_range(
+    assert!(retained_root_auth_range(
         HeaderRootAuthState {
             authenticated_height: block::Height(1),
             ..auth
         },
-        &payload
+        &payload,
+        block::Height(2),
     )
     .is_none());
-    assert!(reusable_root_auth_range(
+    assert!(retained_root_auth_range(
         HeaderRootAuthState {
             completed_checkpoint_height: block::Height(1),
             ..auth
         },
-        &payload
+        &payload,
+        block::Height(2),
     )
     .is_none());
     let one_entry = HeaderRangePayload::new(vec![payload.entries()[0].clone()])
         .expect("single entry is structurally valid");
-    assert!(reusable_root_auth_range(auth, &one_entry).is_none());
+    assert!(retained_root_auth_range(auth, &one_entry, block::Height(2)).is_none());
+}
+
+#[test]
+fn retained_payload_waits_for_checkpoint_and_suppresses_fallback() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(
+        network,
+        anchor,
+        Some((block::Height(4), block::Hash([4; 32]))),
+    );
+    let mut auth = HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(1),
+        completed_checkpoint_hash: block::Hash([1; 32]),
+    };
+    startup.header_root_auth = Some(auth);
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(1),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+            vec![0, 0],
+            roots_from_height(block::Height(1), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    let wire_request = HeaderSyncWireRequestIdentity {
+        peer: peer(230),
+        session_id: 1,
+        request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+    };
+
+    assert!(state.admit_retained_root_payload(wire_request, payload));
+    assert!(state.retained_ready(auth, Instant::now()).is_none());
+    state.refresh_root_auth_range(&startup);
+    assert!(
+        state.schedule.authenticate_roots.is_empty(),
+        "retained open-bracket coverage prevents a duplicate fallback"
+    );
+
+    auth.completed_checkpoint_height = block::Height(2);
+    auth.completed_checkpoint_hash = block::Hash([2; 32]);
+    assert!(state.retained_ready(auth, Instant::now()).is_some());
+    assert_eq!(state.retained_heights(), 2);
+}
+
+#[test]
+fn retained_admission_keeps_farthest_same_start_payload() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let startup = startup_for(network, anchor, None);
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let wire_request = |request_id| HeaderSyncWireRequestIdentity {
+        peer: peer(231),
+        session_id: 1,
+        request_id: HeaderSyncRequestId::new(request_id).expect("request ID is non-zero"),
+    };
+    let payload = |count| {
+        HeaderRangePayload::new(
+            HeaderRangeEntry::from_parallel(
+                block::Height(1),
+                vec![mainnet_header(&BLOCK_MAINNET_1_BYTES); count],
+                vec![0; count],
+                roots_from_height(block::Height(1), count),
+            )
+            .expect("test response vectors align"),
+        )
+        .expect("test payload is contiguous")
+    };
+
+    let original_wire_request = wire_request(1);
+    assert!(state.admit_retained_root_payload(original_wire_request.clone(), payload(3)));
+    state
+        .retained_roots
+        .get_mut(&block::Height(1))
+        .expect("original retained entry exists")
+        .authenticating = true;
+    assert!(!state.admit_retained_root_payload(wire_request(2), payload(2)));
+    let replacement_wire_request = wire_request(3);
+    assert!(state.admit_retained_root_payload(replacement_wire_request.clone(), payload(4)));
+    assert!(
+        state
+            .remove_retained_root_if_owned(
+                block::Height(1),
+                &original_wire_request,
+                "invalid_roots",
+            )
+            .is_none(),
+        "an older authentication failure must not remove its replacement"
+    );
+    assert_eq!(
+        state
+            .retained_roots
+            .get(&block::Height(1))
+            .expect("same-start entry remains")
+            .wire_request,
+        replacement_wire_request
+    );
+}
+
+#[test]
+fn retained_admission_supersedes_queued_fallback() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(
+        network,
+        anchor,
+        Some((block::Height(4), block::Hash([4; 32]))),
+    );
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(2),
+        completed_checkpoint_hash: block::Hash([2; 32]),
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    state.refresh_root_auth_range(&startup);
+    assert_eq!(state.schedule.authenticate_roots.len(), 1);
+
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(1),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+            vec![0, 0],
+            roots_from_height(block::Height(1), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    assert!(state.admit_retained_root_payload(
+        HeaderSyncWireRequestIdentity {
+            peer: peer(232),
+            session_id: 1,
+            request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+        },
+        payload,
+    ));
+
+    assert!(state.schedule.authenticate_roots.is_empty());
+}
+
+#[test]
+fn retained_store_does_not_pressure_evict_long_lead() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let startup = startup_for(network, anchor, None);
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+
+    for index in 0..16u32 {
+        let start = block::Height(index.saturating_mul(2).saturating_add(1));
+        let payload = HeaderRangePayload::new(
+            HeaderRangeEntry::from_parallel(
+                start,
+                vec![
+                    mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                    mainnet_header(&BLOCK_MAINNET_2_BYTES),
+                ],
+                vec![0, 0],
+                roots_from_height(start, 2),
+            )
+            .expect("test response vectors align"),
+        )
+        .expect("test payload is contiguous");
+        assert!(state.admit_retained_root_payload(
+            HeaderSyncWireRequestIdentity {
+                peer: peer(233),
+                session_id: 1,
+                request_id: HeaderSyncRequestId::new(u64::from(index) + 1)
+                    .expect("request ID is non-zero"),
+            },
+            payload,
+        ));
+    }
+
+    assert_eq!(state.retained_roots.len(), 16);
+    assert_eq!(state.retained_heights(), 32);
+}
+
+#[test]
+fn retained_local_retry_window_starts_on_failure_and_can_fallback_after_exhaustion() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(
+        network,
+        anchor,
+        Some((block::Height(4), block::Hash([4; 32]))),
+    );
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(2),
+        completed_checkpoint_hash: block::Hash([2; 32]),
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let wire_request = HeaderSyncWireRequestIdentity {
+        peer: peer(237),
+        session_id: 1,
+        request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+    };
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(1),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+            vec![0, 0],
+            roots_from_height(block::Height(1), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    assert!(state.admit_retained_root_payload(wire_request.clone(), payload));
+    let now = Instant::now();
+    let retained = state
+        .retained_roots
+        .get_mut(&block::Height(1))
+        .expect("retained entry exists");
+    assert!(retained.local_retry_started_at.is_none());
+    assert!(retained.retry_local(now));
+    assert_eq!(retained.local_retry_started_at, Some(now));
+    retained.local_attempts = RETAINED_ROOT_LOCAL_MAX_ATTEMPTS.saturating_sub(1);
+    assert!(!retained.retry_local(now + std::time::Duration::from_secs(1)));
+    assert!(retained.local_retry_exhausted);
+
+    assert!(state
+        .remove_retained_root_if_owned(block::Height(1), &wire_request, "local_retry_exhausted",)
+        .is_some());
+    state.refresh_root_auth_range(&startup);
+    assert_eq!(state.schedule.authenticate_roots.len(), 1);
 }
 
 fn startup_with_timeout(
@@ -810,7 +1048,8 @@ fn commit_and_authentication_operations_from_one_request_are_distinct() {
     let pending = PendingOperation {
         range,
         purpose: RangePurpose::Sync,
-        reusable_payload: None,
+        retention_candidate: None,
+        root_auth_source: None,
         completion_observed: false,
     };
     state
@@ -851,7 +1090,7 @@ fn stale_root_auth_waits_for_watch_before_rescheduling() {
 }
 
 #[test]
-fn session_retirement_cleans_auth_and_disables_obsolete_reuse() {
+fn session_retirement_cleans_auth_and_retained_payloads() {
     let network = Network::Mainnet;
     let startup = startup_for(
         network.clone(),
@@ -901,7 +1140,8 @@ fn session_retirement_cleans_auth_and_disables_obsolete_reuse() {
         PendingOperation {
             range: auth_range,
             purpose: RangePurpose::AuthenticateRoots,
-            reusable_payload: None,
+            retention_candidate: None,
+            root_auth_source: Some(RootAuthSource::Fallback),
             completion_observed: false,
         },
     );
@@ -913,10 +1153,12 @@ fn session_retirement_cleans_auth_and_disables_obsolete_reuse() {
                 ..auth_range
             },
             purpose: RangePurpose::Sync,
-            reusable_payload: Some(payload),
+            retention_candidate: Some(payload.clone()),
+            root_auth_source: None,
             completion_observed: false,
         },
     );
+    assert!(state.admit_retained_root_payload(auth_operation.wire_request.clone(), payload,));
     let buffered_range = RangeRequest {
         range: CheckedHeaderRange::from_count(block::Height(2), 2).expect("test range is bounded"),
         anchor_hash: None,
@@ -966,8 +1208,9 @@ fn session_retirement_cleans_auth_and_disables_obsolete_reuse() {
         .pending_operations
         .get(&commit_operation)
         .expect("canonical commit remains pending")
-        .reusable_payload
+        .retention_candidate
         .is_none());
+    assert!(state.retained_roots.is_empty());
 }
 
 #[test]
@@ -1011,7 +1254,8 @@ fn clear_inflight_root_auth_completes_on_advancement() {
         PendingOperation {
             range: auth_range,
             purpose: RangePurpose::AuthenticateRoots,
-            reusable_payload: None,
+            retention_candidate: None,
+            root_auth_source: Some(RootAuthSource::Fallback),
             completion_observed: false,
         },
     );
@@ -1023,7 +1267,8 @@ fn clear_inflight_root_auth_completes_on_advancement() {
                 ..auth_range
             },
             purpose: RangePurpose::Sync,
-            reusable_payload: None,
+            retention_candidate: None,
+            root_auth_source: None,
             completion_observed: false,
         },
     );
@@ -1068,7 +1313,8 @@ fn clear_inflight_root_auth_retires_without_requeue_on_rebase() {
         PendingOperation {
             range: auth_range,
             purpose: RangePurpose::AuthenticateRoots,
-            reusable_payload: None,
+            retention_candidate: None,
+            root_auth_source: Some(RootAuthSource::Fallback),
             completion_observed: false,
         },
     );
@@ -1665,26 +1911,6 @@ async fn next_outbound_get_headers(
     }
 }
 
-async fn next_root_authentication_action(
-    actions: &mut mpsc::Receiver<HeaderSyncAction>,
-) -> (
-    HeaderSyncOperationIdentity,
-    HeaderRootAuthState,
-    HeaderRangePayload,
-) {
-    loop {
-        if let HeaderSyncAction::AuthenticateHeaderRoots {
-            operation,
-            expected_state,
-            payload,
-            ..
-        } = next_non_query_action(actions).await
-        {
-            return (operation, expected_state, payload);
-        }
-    }
-}
-
 /// Await the next outbound `GetHeaders` and return the request ID the session
 /// allocated for it, so a test can echo that exact ID back in its response.
 async fn next_get_headers_request_id(
@@ -1751,23 +1977,22 @@ async fn send_headers(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn prefetched_root_auth_responses_are_dispatched_in_frontier_order() {
+async fn rooted_forward_requests_overlap_once_through_handoff() {
     let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_4_BYTES).as_ref());
     let (network, _) = checkpoint_testnet_with_hash(block::Height(4), checkpoint_hash);
     let anchor = (block::Height(0), network.genesis_hash());
-    let mut startup = startup_for(network, anchor, Some((block::Height(4), checkpoint_hash)));
+    let mut startup = startup_for(network, anchor, Some(anchor));
     startup.config.max_headers_per_response = 2;
     startup.header_root_auth = Some(HeaderRootAuthState {
         authenticated_height: anchor.0,
         authenticated_hash: anchor.1,
-        completed_checkpoint_height: block::Height(4),
-        completed_checkpoint_hash: checkpoint_hash,
+        completed_checkpoint_height: anchor.0,
+        completed_checkpoint_hash: anchor.1,
     });
     let mut fixture = spawn_test_reactor(startup);
     let peer_id = peer(214);
 
     connect_peer(&fixture, peer_id.clone()).await;
-    // Forward work is also available, but root-auth prefetch reserves the first slots.
     advertise_tip(&fixture, peer_id.clone(), anchor.0, block::Height(8), 2, 4).await;
 
     let mut requests = BTreeMap::new();
@@ -1783,109 +2008,162 @@ async fn prefetched_root_auth_responses_are_dispatched_in_frontier_order() {
         vec![block::Height(1), block::Height(2), block::Height(3)]
     );
 
-    let advanced_checkpoint_hash = block::Hash([5; 32]);
-    fixture
-        .handle
-        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(
-            HeaderRootAuthState {
-                authenticated_height: anchor.0,
-                authenticated_hash: anchor.1,
-                completed_checkpoint_height: block::Height(5),
-                completed_checkpoint_hash: advanced_checkpoint_hash,
-            },
-        )))
-        .await
-        .unwrap();
+    fixture.task.abort();
+}
 
-    for (start, headers) in [
-        (
-            block::Height(3),
-            vec![
-                mainnet_header(&BLOCK_MAINNET_3_BYTES),
-                mainnet_header(&BLOCK_MAINNET_4_BYTES),
-            ],
-        ),
-        (
-            block::Height(2),
-            vec![
-                mainnet_header(&BLOCK_MAINNET_2_BYTES),
-                mainnet_header(&BLOCK_MAINNET_3_BYTES),
-            ],
-        ),
-        (
-            block::Height(1),
+#[test]
+fn rooted_forward_overlap_advances_past_intermediate_checkpoint() {
+    let network = Parameters::build()
+        .with_network_name("HsIntermediateOverlapTest")
+        .expect("custom network name is valid")
+        .with_genesis_hash(Network::Mainnet.genesis_hash())
+        .expect("mainnet genesis hash is valid")
+        .with_activation_heights(ConfiguredActivationHeights {
+            overwinter: Some(1),
+            sapling: Some(2),
+            blossom: Some(3),
+            heartwood: Some(4),
+            canopy: Some(4),
+            ..Default::default()
+        })
+        .expect("custom activation heights are in order")
+        .clear_funding_streams()
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (block::Height(0), Network::Mainnet.genesis_hash()),
+            (block::Height(400), block::Hash([4; 32])),
+            (block::Height(1_200), block::Hash([12; 32])),
+        ]))
+        .expect("custom checkpoints are valid")
+        .to_network()
+        .expect("custom testnet parameters are valid");
+    let anchor = (block::Height(0), network.genesis_hash());
+    let checkpoint = (block::Height(400), block::Hash([4; 32]));
+    let mut startup = startup_for(network, anchor, Some(checkpoint));
+    startup.config.max_headers_per_response = 600;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: checkpoint.0,
+        completed_checkpoint_hash: checkpoint.1,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let peer_id = peer(236);
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(399),
             vec![
                 mainnet_header(&BLOCK_MAINNET_1_BYTES),
                 mainnet_header(&BLOCK_MAINNET_2_BYTES),
             ],
-        ),
-    ] {
-        send_headers(
-            &fixture,
-            &peer_id,
-            requests[&start],
-            headers_message_from(start, headers),
+            vec![0, 0],
+            roots_from_height(block::Height(399), 2),
         )
-        .await;
-    }
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    assert!(state.admit_retained_root_payload(
+        HeaderSyncWireRequestIdentity {
+            peer: peer_id.clone(),
+            session_id: 1,
+            request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+        },
+        payload,
+    ));
+    let (send, _recv) = crate::zakura::framed_channel(32);
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+    );
+    let mut peer_state = super::state::PeerHeaderState::new(
+        session,
+        anchor,
+        600,
+        2,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+    );
+    peer_state.received_status = true;
+    peer_state.advertised_tip = block::Height(1_000);
+    state.peers.insert(peer_id, peer_state);
 
-    let (first_operation, first_expected, first_payload) =
-        next_root_authentication_action(&mut fixture.actions).await;
-    assert_eq!(first_expected.authenticated_height, block::Height(0));
-    assert_eq!(first_expected.completed_checkpoint_height, block::Height(5));
-    assert_eq!(first_payload.range().start(), block::Height(1));
+    state.refresh_forward_range(&startup);
 
-    let first_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_1_BYTES).as_ref());
+    let first = state
+        .schedule
+        .forward
+        .front()
+        .expect("forward scheduling continues from retained checkpoint overlap");
+    assert_eq!(first.start_height(), checkpoint.0);
+    assert_eq!(first.count(), 600);
+    assert_eq!(first.anchor_hash, None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn committed_forward_payload_authenticates_without_fallback_request() {
+    let header_2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    let header_2_hash = block::Hash::from(header_2.as_ref());
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(3),
+        completed_checkpoint_hash: checkpoint_hash,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(234);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id.clone(), anchor.0, block::Height(3), 2, 1).await;
+    let (requested_peer, request_id, start, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, peer_id);
+    assert_eq!((start, count), (block::Height(1), 2));
+
+    send_headers(
+        &fixture,
+        &peer_id,
+        request_id,
+        headers_message_from(
+            block::Height(1),
+            vec![mainnet_header(&BLOCK_MAINNET_1_BYTES), header_2],
+        ),
+    )
+    .await;
+
+    let commit_operation = loop {
+        if let HeaderSyncAction::CommitHeaderRange { operation, .. } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            break operation;
+        }
+    };
     fixture
         .handle
-        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(
-            HeaderRootAuthState {
-                authenticated_height: block::Height(1),
-                authenticated_hash: first_hash,
-                completed_checkpoint_height: block::Height(5),
-                completed_checkpoint_hash: advanced_checkpoint_hash,
-            },
-        )))
-        .await
-        .unwrap();
-    fixture
-        .handle
-        .send(HeaderSyncEvent::HeaderRootAuthenticationCompleted {
-            operation: first_operation,
+        .send(HeaderSyncEvent::HeaderRangeOperationCompleted {
+            operation: commit_operation.clone(),
+            tip_hash: header_2_hash,
         })
         .await
         .unwrap();
 
-    let (second_operation, second_expected, second_payload) =
-        next_root_authentication_action(&mut fixture.actions).await;
-    assert_eq!(second_expected.authenticated_height, block::Height(1));
-    assert_eq!(second_payload.range().start(), block::Height(2));
-
-    fixture
-        .handle
-        .send(HeaderSyncEvent::HeaderRootAuthenticationCompleted {
-            operation: second_operation,
-        })
-        .await
-        .unwrap();
-    let second_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_2_BYTES).as_ref());
-    fixture
-        .handle
-        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(
-            HeaderRootAuthState {
-                authenticated_height: block::Height(2),
-                authenticated_hash: second_hash,
-                completed_checkpoint_height: block::Height(5),
-                completed_checkpoint_hash: advanced_checkpoint_hash,
-            },
-        )))
-        .await
-        .unwrap();
-
-    let (_third_operation, third_expected, third_payload) =
-        next_root_authentication_action(&mut fixture.actions).await;
-    assert_eq!(third_expected.authenticated_height, block::Height(2));
-    assert_eq!(third_payload.range().start(), block::Height(3));
+    let (auth_operation, payload) = loop {
+        if let HeaderSyncAction::AuthenticateHeaderRoots {
+            operation, payload, ..
+        } = next_non_query_action(&mut fixture.actions).await
+        {
+            break (operation, payload);
+        }
+    };
+    assert_eq!(auth_operation.wire_request, commit_operation.wire_request);
+    assert_eq!(payload.range().start(), block::Height(1));
+    assert_eq!(payload.range().end(), block::Height(2));
 
     fixture.task.abort();
 }
@@ -3702,6 +3980,12 @@ async fn forward_ranges_below_checkpoint_handoff_request_tree_aux_roots() {
         (block::Height(0), Network::Mainnet.genesis_hash()),
         Some((first_checkpoint, first_checkpoint_hash)),
     );
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: first_checkpoint,
+        authenticated_hash: first_checkpoint_hash,
+        completed_checkpoint_height: first_checkpoint,
+        completed_checkpoint_hash: first_checkpoint_hash,
+    });
     startup.trace = ZakuraTrace::new(capture.tracer(), "01");
     let mut fixture = spawn_test_reactor(startup);
     let peer_id = peer(77);
@@ -3755,6 +4039,48 @@ async fn forward_ranges_below_checkpoint_handoff_request_tree_aux_roots() {
     );
 
     let _ = capture.finish().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn forward_ranges_above_handoff_do_not_request_tree_aux_roots() {
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let checkpoint = (block::Height(3), checkpoint_hash);
+    let mut startup = startup_for(
+        network,
+        (block::Height(0), Network::Mainnet.genesis_hash()),
+        Some(checkpoint),
+    );
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: checkpoint.0,
+        authenticated_hash: checkpoint.1,
+        completed_checkpoint_height: checkpoint.0,
+        completed_checkpoint_hash: checkpoint.1,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(235);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id, block::Height(0), block::Height(4), 1, 1).await;
+
+    loop {
+        if let HeaderSyncAction::SendMessage {
+            msg:
+                HeaderSyncMessage::GetHeaders {
+                    start_height,
+                    want_tree_aux_roots,
+                    ..
+                },
+            ..
+        } = next_non_query_action(&mut fixture.actions).await
+        {
+            assert_eq!(start_height, block::Height(4));
+            assert!(!want_tree_aux_roots);
+            break;
+        }
+    }
+
+    fixture.task.abort();
 }
 
 #[tokio::test(flavor = "current_thread")]

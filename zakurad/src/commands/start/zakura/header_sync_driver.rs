@@ -31,7 +31,7 @@ use super::{
 };
 
 const ROOT_AUTH_STATE_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_ROOT_AUTH_STATE_TASKS: usize = 4;
+const MAX_ROOT_AUTH_STATE_TASKS: usize = 1;
 
 pub(crate) async fn zakura_header_sync_driver_startup(
     read_state: zakura_state::ReadStateService,
@@ -288,14 +288,24 @@ fn header_root_authentication_failure_kind(
         .downcast_ref::<zakura_state::AuthenticateHeaderRootsError>()
         .map_or(
             HeaderRootAuthenticationFailureKind::Local,
-            |error| match error.outcome() {
-                zakura_state::AuthenticateHeaderRootsOutcome::Stale => {
-                    HeaderRootAuthenticationFailureKind::Stale
+            |error| match error {
+                zakura_state::AuthenticateHeaderRootsError::NonCanonicalHeader { height } => {
+                    HeaderRootAuthenticationFailureKind::CanonicalMismatch { height: *height }
                 }
-                zakura_state::AuthenticateHeaderRootsOutcome::Invalid => {
+                zakura_state::AuthenticateHeaderRootsError::Verification { .. } => {
                     HeaderRootAuthenticationFailureKind::InvalidPeerRange
                 }
-                zakura_state::AuthenticateHeaderRootsOutcome::Local => {
+                zakura_state::AuthenticateHeaderRootsError::StaleState { .. }
+                | zakura_state::AuthenticateHeaderRootsError::AnchorMismatch { .. }
+                | zakura_state::AuthenticateHeaderRootsError::StartMismatch { .. }
+                | zakura_state::AuthenticateHeaderRootsError::WitnessAboveCompletedCheckpoint {
+                    ..
+                } => HeaderRootAuthenticationFailureKind::Stale,
+                zakura_state::AuthenticateHeaderRootsError::CountMismatch { .. }
+                | zakura_state::AuthenticateHeaderRootsError::MissingSuccessorWitness { .. }
+                | zakura_state::AuthenticateHeaderRootsError::NonContiguous { .. }
+                | zakura_state::AuthenticateHeaderRootsError::HeightOverflow
+                | zakura_state::AuthenticateHeaderRootsError::Frontier(_) => {
                     HeaderRootAuthenticationFailureKind::Local
                 }
             },
@@ -387,6 +397,9 @@ mod operation_identity_tests {
             headers: 2,
             roots: 1,
         };
+        let canonical_mismatch = zakura_state::AuthenticateHeaderRootsError::NonCanonicalHeader {
+            height: block::Height(2),
+        };
         let local = std::io::Error::other("local state service failure");
 
         assert_eq!(
@@ -395,7 +408,13 @@ mod operation_identity_tests {
         );
         assert_eq!(
             header_root_authentication_failure_kind(&invalid),
-            HeaderRootAuthenticationFailureKind::InvalidPeerRange
+            HeaderRootAuthenticationFailureKind::Local
+        );
+        assert_eq!(
+            header_root_authentication_failure_kind(&canonical_mismatch),
+            HeaderRootAuthenticationFailureKind::CanonicalMismatch {
+                height: block::Height(2)
+            }
         );
         assert_eq!(
             header_root_authentication_failure_kind(&local),

@@ -412,6 +412,24 @@ impl HeaderWorkQueue {
         self.rebuild_start_indexes();
     }
 
+    /// Drop queued or active fallback work whose range starts at `start`.
+    ///
+    /// A newly retained committed-forward payload for the same frontier is the
+    /// preferred source. Any late fallback response becomes stale rather than
+    /// starting duplicate authentication.
+    pub(super) fn discard_root_auth_at(&mut self, start: block::Height) {
+        self.authenticate_roots
+            .retain(|range| range.start_height() != start);
+        self.active.retain(|range, state| {
+            range.priority != RangePriority::AuthenticateRoots
+                || range.start_height() != start
+                || matches!(state, HeaderWorkState::Committing { .. })
+        });
+        self.delayed_retries
+            .remove(&(start, RangePriority::AuthenticateRoots));
+        self.rebuild_start_indexes();
+    }
+
     /// True when `range` is actively owned by `peer` in the `InFlight` state.
     pub(super) fn is_in_flight_for(&self, range: RangeRequest, peer: &ZakuraPeerId) -> bool {
         matches!(

@@ -127,6 +127,20 @@ impl CheckedHeaderRange {
         let start = covered_through.0.checked_add(1).map(block::Height)?;
         Self::from_bounds(start, self.end)
     }
+
+    /// Return the next range start, repeating this range's terminal header while
+    /// it remains below `overlap_through`.
+    ///
+    /// Root-carrying forward deliveries overlap so each later delivery contains
+    /// both its first root and that root's successor witness. The terminal
+    /// handoff header is not repeated because roots are not requested above it.
+    pub fn continuation_start(self, overlap_through: block::Height) -> Option<block::Height> {
+        if self.end < overlap_through {
+            Some(self.end)
+        } else {
+            self.end.0.checked_add(1).map(block::Height)
+        }
+    }
 }
 
 /// A non-empty delivered header range with structurally aligned per-height data.
@@ -370,6 +384,21 @@ mod tests {
         assert_eq!(suffix.end(), block::Height(u32::MAX));
         assert_eq!(suffix.count(), 1);
         assert_eq!(suffix.suffix_after(block::Height(u32::MAX)), None);
+    }
+
+    #[test]
+    fn checked_range_continuation_overlaps_only_before_handoff() {
+        let range = CheckedHeaderRange::from_bounds(block::Height(7), block::Height(9))
+            .expect("bounds are ascending");
+
+        assert_eq!(
+            range.continuation_start(block::Height(10)),
+            Some(block::Height(9))
+        );
+        assert_eq!(
+            range.continuation_start(block::Height(9)),
+            Some(block::Height(10))
+        );
     }
 
     #[test]

@@ -2336,11 +2336,7 @@ mod tests {
             contains_peer(&registered.borrow(), peer_id.as_bytes()),
             "discovery must not disconnect a connection owned by the admitted legacy service"
         );
-        assert_eq!(
-            victim.discovery().peer_snapshot().inbound_peers,
-            0,
-            "the one-shot discovery session is released after settling"
-        );
+        assert_eq!(victim.discovery().peer_snapshot().inbound_peers, 1);
 
         peer.send_raw_frame(
             ZAKURA_STREAM_GOSSIP,

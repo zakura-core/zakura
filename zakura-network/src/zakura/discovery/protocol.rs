@@ -1524,6 +1524,42 @@ impl ZakuraDiscoveryHandle {
         self.self_record.borrow().clone()
     }
 
+    /// Returns a locally authored record that remains valid through the next refresh interval.
+    ///
+    /// A node can keep its native connections longer than the record TTL. Refreshing lazily before
+    /// a discovery exchange prevents a long-running node from sending an expired `Hello` to a new
+    /// peer after its startup record has aged out.
+    pub(crate) async fn current_self_record_for_gossip(
+        &self,
+    ) -> Result<Arc<ZakuraNodeRecord>, DiscoveryWireError> {
+        self.current_self_record_for_gossip_at(current_unix_secs(), current_sequence_tick())
+            .await
+    }
+
+    async fn current_self_record_for_gossip_at(
+        &self,
+        now_unix_secs: u64,
+        wall_clock_sequence: u64,
+    ) -> Result<Arc<ZakuraNodeRecord>, DiscoveryWireError> {
+        let mut inner = self.inner.lock().await;
+        let current = self.current_self_record();
+        if current.body.expires_at_unix_secs
+            > now_unix_secs.saturating_add(inner.config.refresh_interval.as_secs())
+        {
+            return Ok(current);
+        }
+        let record_ttl = inner.config.record_ttl;
+        let record = Arc::new(inner.local.build_self_record(
+            now_unix_secs,
+            wall_clock_sequence,
+            record_ttl,
+        )?);
+        // Publish before releasing the state lock so concurrent refreshers cannot publish a lower
+        // sequence after a newer record.
+        self.self_record_tx.send_replace(record.clone());
+        Ok(record)
+    }
+
     /// Returns the local node id used in authored self-records.
     pub fn local_node_id(&self) -> NodeId {
         self.self_record.borrow().body.node_id
@@ -6628,6 +6664,38 @@ mod tests {
                 ..context()
             })
             .expect("updated record verifies");
+    }
+
+    #[tokio::test]
+    async fn self_record_for_gossip_refreshes_before_expiry() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let config = ZakuraDiscoveryConfig {
+            record_ttl: Duration::from_secs(60),
+            refresh_interval: Duration::from_secs(10),
+            ..ZakuraDiscoveryConfig::default()
+        };
+        let handle = discovery_handle_at_with_sequence(
+            local_config_with(secret_key(), vec![test_addr(43)], vec![service(1)]),
+            config,
+            connected_rx,
+            NOW,
+            100,
+        );
+        let initial = handle.current_self_record();
+
+        let still_current = handle
+            .current_self_record_for_gossip_at(NOW + 49, 101)
+            .await
+            .expect("current self-record remains valid past the refresh window");
+        assert_eq!(still_current, initial);
+
+        let refreshed = handle
+            .current_self_record_for_gossip_at(NOW + 50, 102)
+            .await
+            .expect("self-record refresh signs");
+        assert!(refreshed.body.sequence > initial.body.sequence);
+        assert_eq!(refreshed.body.expires_at_unix_secs, NOW + 110);
+        assert_eq!(handle.current_self_record(), refreshed);
     }
 
     #[test]

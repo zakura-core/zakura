@@ -7,7 +7,7 @@ use zakura_chain::block;
 
 use crate::{
     BodyEvidence, BodyUnavailableSummary, BodyValidationState, ChangeSet, CounterExhausted,
-    EligibilityDelta, EligibilityReason, EngineMetadata, EngineMode, EngineSnapshot,
+    EligibilityDelta, EligibilityReason, EngineLimits, EngineMetadata, EngineMode, EngineSnapshot,
     EventAdmission, EvidenceId, FinalityRecord, FinalitySource, Frontier, FrontierSet, GraphError,
     HeaderNode, HeaderValidationState, IndexChanges, MemHeaderStore, ProjectionDelta,
     RetentionPlan, StateVersion, StoreError, StoreRead, TransitionCause, TransitionContext,
@@ -17,11 +17,12 @@ use crate::{
 /// A complete write set plus the private projected graph it was verified against.
 #[derive(Clone, Debug)]
 pub struct TransitionPlan {
-    before: EngineSnapshot,
-    change_set: ChangeSet,
-    #[allow(dead_code)] // Read by the commit invariant checker introduced in PR-6c.
-    projected: MemHeaderStore,
-    cause: TransitionCause,
+    pub(super) before: EngineSnapshot,
+    pub(super) change_set: ChangeSet,
+    pub(super) projected: MemHeaderStore,
+    pub(super) cause: TransitionCause,
+    pub(super) trust_pins: Vec<Frontier>,
+    pub(super) limits: EngineLimits,
 }
 
 impl TransitionPlan {
@@ -45,7 +46,6 @@ impl TransitionPlan {
         self.before.state_version == self.change_set.metadata.state_version
     }
 
-    #[allow(dead_code)] // Read by the commit invariant checker introduced in PR-6c.
     pub(crate) const fn projected(&self) -> &MemHeaderStore {
         &self.projected
     }
@@ -87,6 +87,9 @@ pub enum TransitionFailure {
     /// Retention could not admit this event without evicting protected state.
     #[error("header admission refused because protected paths fill the resource bound")]
     ResourceStalled,
+    /// The projected write set violated a commit invariant.
+    #[error(transparent)]
+    Invariant(#[from] super::InvariantViolation),
 }
 
 /// Derive one atomic transition without mutating `store`.
@@ -98,11 +101,6 @@ pub fn apply_transition<S: StoreRead>(
     let before = store.snapshot()?;
     let metadata = store.metadata()?;
     validate_snapshot(&before, &metadata, context)?;
-    if request.expected_version != before.state_version {
-        return Err(TransitionFailure::Stale {
-            current: before.state_version,
-        });
-    }
     if metadata.last_transition_id
         == request
             .event
@@ -110,7 +108,14 @@ pub fn apply_transition<S: StoreRead>(
             .unwrap_or(metadata.last_transition_id)
         && request.event.idempotency_key().is_some()
     {
-        return no_change(store, before, metadata, request.event, context);
+        let plan = no_change(store, before, metadata, request.event, context)?;
+        super::verify_plan(store, &plan)?;
+        return Ok(plan);
+    }
+    if request.expected_version != before.state_version {
+        return Err(TransitionFailure::Stale {
+            current: before.state_version,
+        });
     }
     if let Some(owner) = request.event.work_owner() {
         validate_owner(owner, &before)?;
@@ -223,7 +228,7 @@ pub fn apply_transition<S: StoreRead>(
     header_best = graph.select_header_best()?.0;
     let selected = path(&graph, header_best)?;
     let verified = trim_projection(&graph, verified)?;
-    let plan = derive_plan(
+    let mut plan = derive_plan(
         before,
         metadata,
         graph,
@@ -237,7 +242,17 @@ pub fn apply_transition<S: StoreRead>(
         retention,
         request.event.idempotency_key(),
         cause,
+        invariant_pins(context),
+        context.config.limits,
     )?;
+    for hash in &plan.change_set.delete_nodes {
+        for delivery in store.aux_deliveries(*hash)? {
+            plan.change_set
+                .aux_changes
+                .push(crate::AuxDelta::Delete(delivery.delivery_id));
+        }
+    }
+    super::verify_plan(store, &plan)?;
     Ok(plan)
 }
 
@@ -508,6 +523,10 @@ fn apply_event<S: StoreRead>(
             }
             let mut delivery = event.delivery;
             delivery.authentication = event.authentication;
+            let node = graph.node_mut(delivery.header_hash)?;
+            if !node.aux_delivery_ids.contains(&delivery.delivery_id) {
+                node.aux_delivery_ids.push(delivery.delivery_id);
+            }
             aux_changes.push(crate::AuxDelta::Put(Box::new(delivery)));
         }
         TransitionEvent::ReevaluateDeferred => {
@@ -570,6 +589,8 @@ fn derive_plan(
     retention: RetentionPlan,
     event_id: Option<EvidenceId>,
     cause: TransitionCause,
+    trust_pins: Vec<Frontier>,
+    limits: EngineLimits,
 ) -> Result<TransitionPlan, TransitionFailure> {
     let new_nodes = node_map(&graph);
     let mut put_nodes: Vec<_> = new_nodes
@@ -661,6 +682,8 @@ fn derive_plan(
         change_set,
         projected: graph,
         cause,
+        trust_pins,
+        limits,
     })
 }
 
@@ -688,7 +711,22 @@ fn no_change<S: StoreRead>(
         },
         projected: graph,
         cause: TransitionCause::Event,
+        trust_pins: invariant_pins(context),
+        limits: context.config.limits,
     })
+}
+
+fn invariant_pins(context: &TransitionContext<'_>) -> Vec<Frontier> {
+    let mut pins: Vec<_> = context.config.local_checkpoints.iter().collect();
+    if let Some(pin) = context
+        .config
+        .settled_manifest
+        .pin_for_network(&context.config.network)
+    {
+        pins.push(pin.activation);
+    }
+    pins.sort_unstable_by_key(|pin| (pin.height, pin.hash.0));
+    pins
 }
 
 fn load_graph<S: StoreRead>(
@@ -817,9 +855,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        AlarmSet, BranchId, CheckpointSet, EngineConfig, FinalityEpoch, HeaderChainDiskVersion,
-        HeaderContextFact, HeaderGeneration, PreparedHeader, PreparedHeaderBatch, SourceId,
-        TargetCompletion, TrustedAnchor, ValidationLease, VerifiedGeneration,
+        verify_plan, AlarmSet, BranchId, CheckpointSet, EngineConfig, FinalityEpoch,
+        HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, PreparedHeader,
+        PreparedHeaderBatch, SourceId, TargetCompletion, TrustedAnchor, ValidationLease,
+        VerifiedGeneration,
     };
 
     #[derive(Clone)]
@@ -1208,6 +1247,228 @@ mod tests {
             );
         }
         assert!(!include_str!("../../src/lib.rs").contains("pub use retention::enforce_retention"));
+    }
+
+    #[test]
+    fn every_named_invariant_category_rejects_its_projected_corruption() {
+        use std::num::NonZeroUsize;
+
+        use crate::{
+            AuxAuthentication, AuxDelivery, BodySizeHint, ChainScore, InvariantViolation,
+            SuffixWork, WorkCoordinate,
+        };
+        use zakura_chain::work::difficulty::U256;
+
+        let (store, config) = TestStore::new(EngineMode::HeadersOnly);
+        let clock = ManualClock(Utc::now());
+        let request = insertion(&store, 2, EvidenceId::from_digest([8; 32]));
+        let owner = request
+            .event
+            .work_owner()
+            .expect("insertion carries an owner");
+        let plan = apply_transition(&store, request, &context(&config, &clock, None))
+            .expect("the baseline plan satisfies every invariant");
+        let tip = plan.change_set.metadata.frontiers.header_best;
+        let first = plan
+            .projected
+            .ancestor(tip.hash, block::Height(1))
+            .expect("the baseline ancestry is coherent")
+            .expect("height one is retained");
+
+        let mut corrupt = plan.clone();
+        corrupt
+            .projected
+            .node_mut(tip.hash)
+            .expect("tip exists")
+            .hash = block::Hash([0; 32]);
+        assert!(matches!(
+            verify_plan(&store, &corrupt),
+            Err(InvariantViolation::NodeHash(_))
+        ));
+
+        let mut corrupt = plan.clone();
+        corrupt
+            .projected
+            .node_mut(tip.hash)
+            .expect("tip exists")
+            .parent_hash = block::Hash([0; 32]);
+        assert!(matches!(
+            verify_plan(&store, &corrupt),
+            Err(InvariantViolation::Parent(_))
+        ));
+
+        let mut corrupt = plan.clone();
+        corrupt.change_set.index_changes.inserted.clear();
+        assert!(matches!(
+            verify_plan(&store, &corrupt),
+            Err(InvariantViolation::Index(_))
+        ));
+
+        let mut corrupt = plan.clone();
+        corrupt
+            .projected
+            .node_mut(tip.hash)
+            .expect("tip exists")
+            .work_coordinate = WorkCoordinate::new(block::Hash([0; 32]), U256::zero());
+        assert!(matches!(
+            verify_plan(&store, &corrupt),
+            Err(InvariantViolation::Work(_))
+        ));
+
+        let mut corrupt = plan.clone();
+        corrupt
+            .projected
+            .node_mut(tip.hash)
+            .expect("tip exists")
+            .eligibility
+            .inherited_from = Some(block::Hash([0; 32]));
+        assert!(matches!(
+            verify_plan(&store, &corrupt),
+            Err(InvariantViolation::Eligibility(_))
+        ));
+
+        let mut corrupt = plan.clone();
+        corrupt.change_set.selected_projection.put.clear();
+        assert!(matches!(
+            verify_plan(&store, &corrupt),
+            Err(InvariantViolation::SelectedProjection(_))
+        ));
+
+        let mut corrupt = plan.clone();
+        corrupt.change_set.metadata.header_best_score =
+            ChainScore::new(SuffixWork::zero(), tip.hash);
+        assert_eq!(
+            verify_plan(&store, &corrupt),
+            Err(InvariantViolation::Selection)
+        );
+
+        let mut corrupt = plan.clone();
+        corrupt.change_set.verified_projection.put = vec![first, tip];
+        corrupt.change_set.metadata.frontiers.verified_best = tip;
+        assert!(matches!(
+            verify_plan(&store, &corrupt),
+            Err(InvariantViolation::VerifiedProjection(_))
+        ));
+
+        let mut corrupt = plan.clone();
+        corrupt
+            .trust_pins
+            .push(Frontier::new(first.height, block::Hash([9; 32])));
+        assert_eq!(
+            verify_plan(&store, &corrupt),
+            Err(InvariantViolation::TrustPin(first.height))
+        );
+
+        let mut corrupt = plan.clone();
+        corrupt.change_set.delete_nodes.push(tip.hash);
+        corrupt.change_set.index_changes.deleted.push(tip.hash);
+        assert_eq!(
+            verify_plan(&store, &corrupt),
+            Err(InvariantViolation::Protected(tip.hash))
+        );
+
+        let mut corrupt = plan.clone();
+        corrupt.limits.max_non_finalized_nodes = NonZeroUsize::new(1).expect("one is nonzero");
+        assert_eq!(
+            verify_plan(&store, &corrupt),
+            Err(InvariantViolation::Limits)
+        );
+
+        let mut corrupt = plan.clone();
+        corrupt.change_set.metadata.header_generation = plan.before.header_generation;
+        assert_eq!(
+            verify_plan(&store, &corrupt),
+            Err(InvariantViolation::Generation)
+        );
+
+        let mut corrupt = plan;
+        let missing = block::Hash([0xab; 32]);
+        corrupt
+            .change_set
+            .aux_changes
+            .push(crate::AuxDelta::Put(Box::new(AuxDelivery {
+                delivery_id: EvidenceId::from_digest([0xac; 32]),
+                header_hash: missing,
+                source: SourceId::from_digest([0xad; 32]),
+                owner,
+                body_size: BodySizeHint::Unknown,
+                payload_digest: None,
+                authentication: AuxAuthentication::Unauthenticated,
+            })));
+        assert_eq!(
+            verify_plan(&store, &corrupt),
+            Err(InvariantViolation::Auxiliary(missing))
+        );
+    }
+
+    #[test]
+    fn checked_in_transition_seed_corpus_replays_green() {
+        let seeds = include_str!("transition-seeds-v1.txt");
+        for seed in seeds
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            let (store, config) = TestStore::new(EngineMode::HeadersOnly);
+            let clock = ManualClock(Utc::now());
+            match seed {
+                "headers_only_insert_1" => {
+                    apply_transition(
+                        &store,
+                        insertion(&store, 1, EvidenceId::from_digest([0x11; 32])),
+                        &context(&config, &clock, None),
+                    )
+                    .expect("the one-header seed replays");
+                }
+                "headers_only_insert_1000" => {
+                    let plan = apply_transition(
+                        &store,
+                        insertion(&store, 1_000, EvidenceId::from_digest([0x12; 32])),
+                        &context(&config, &clock, None),
+                    )
+                    .expect("the exact-depth seed replays");
+                    assert_eq!(
+                        plan.change_set.metadata.frontiers.finalized.height,
+                        block::Height(0)
+                    );
+                }
+                "headers_only_insert_1001" => {
+                    let plan = apply_transition(
+                        &store,
+                        insertion(&store, 1_001, EvidenceId::from_digest([0x13; 32])),
+                        &context(&config, &clock, None),
+                    )
+                    .expect("the depth-plus-one seed replays");
+                    assert_eq!(
+                        plan.change_set.metadata.frontiers.finalized.height,
+                        block::Height(1)
+                    );
+                }
+                "stale_expected_version" => {
+                    let mut request = insertion(&store, 1, EvidenceId::from_digest([0x14; 32]));
+                    request.expected_version = StateVersion::new(1);
+                    assert!(matches!(
+                        apply_transition(&store, request, &context(&config, &clock, None)),
+                        Err(TransitionFailure::Stale { .. })
+                    ));
+                }
+                "idempotent_replay" => {
+                    let mut store = store;
+                    let request = insertion(&store, 1, EvidenceId::from_digest([0x15; 32]));
+                    let plan =
+                        apply_transition(&store, request.clone(), &context(&config, &clock, None))
+                            .expect("the initial idempotency seed commits");
+                    store.commit(&plan);
+                    let replay = apply_transition(&store, request, &context(&config, &clock, None))
+                        .expect("the committed evidence replay is a valid no-change");
+                    assert!(replay.is_no_change());
+                    assert_eq!(
+                        replay.change_set.metadata.state_version,
+                        store.metadata.state_version
+                    );
+                }
+                unknown => panic!("unknown checked-in transition seed {unknown}"),
+            }
+        }
     }
 
     fn apply_projection(projection: &mut Vec<Frontier>, delta: &ProjectionDelta) {

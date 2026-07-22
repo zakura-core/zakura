@@ -1,0 +1,6 @@
+# Deterministic PR-6c transition regression seeds.
+headers_only_insert_1
+headers_only_insert_1000
+headers_only_insert_1001
+stale_expected_version
+idempotent_replay

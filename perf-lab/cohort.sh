@@ -56,8 +56,14 @@ cmd_freeze() {
   # shellcheck disable=SC2087
   $SSH "${SSH_OPTS[@]}" "root@$ip" bash -s <<REMOTE
 set -euo pipefail
-[ -f ${BENCH_OUT_REMOTE}/seed.exit ] || { echo "seed not finished (no seed.exit)"; exit 1; }
-[ "\$(cat ${BENCH_OUT_REMOTE}/seed.exit)" = "0" ] || { echo "seed failed: exit \$(cat ${BENCH_OUT_REMOTE}/seed.exit) — see seed.log"; exit 1; }
+# completion: the .exit sentinel, or the harness's own final log line (the
+# wrapper subshell can die at ssh teardown without writing .exit — the same
+# fallback bench.sh status uses)
+if [ -f ${BENCH_OUT_REMOTE}/seed.exit ]; then
+  [ "\$(cat ${BENCH_OUT_REMOTE}/seed.exit)" = "0" ] || { echo "seed failed: exit \$(cat ${BENCH_OUT_REMOTE}/seed.exit) — see seed.log"; exit 1; }
+elif ! grep -q "reached stop:   yes" ${BENCH_OUT_REMOTE}/seed.log 2>/dev/null; then
+  echo "seed not finished (no seed.exit and no reached-stop in seed.log)"; exit 1
+fi
 fork=\$(ls -d ${BENCH_HOME_REMOTE}/forks/primary-* 2>/dev/null | head -1)
 [ -n "\$fork" ] || { echo "no primary fork found to serve from"; exit 1; }
 # a wall-capped seed exits 0 but stops short; the served state must cover the

@@ -421,10 +421,6 @@ fn configured_activation_heights(
         return Err("latest_network_upgrade must be BeforeOverwinter or later".into());
     }
 
-    if latest_network_upgrade >= Overwinter && latest_network_upgrade.branch_id().is_none() {
-        return Err("latest_network_upgrade must have a consensus branch ID".into());
-    }
-
     Ok(ConfiguredActivationHeights {
         before_overwinter: Some(1),
         overwinter: (latest_network_upgrade >= Overwinter).then_some(activation_height),

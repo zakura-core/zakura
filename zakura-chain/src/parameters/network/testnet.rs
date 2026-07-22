@@ -654,6 +654,12 @@ impl ParametersBuilder {
                 .collect::<Result<BTreeMap<_, _>, _>>()?
         };
 
+        if let Some(&network_upgrade) = activation_heights.values().find(|network_upgrade| {
+            **network_upgrade >= Overwinter && network_upgrade.branch_id().is_none()
+        }) {
+            return Err(ParametersBuilderError::MissingConsensusBranchId { network_upgrade });
+        }
+
         let network_upgrades: Vec<_> = activation_heights.iter().map(|(_h, &nu)| nu).collect();
 
         // Check that the provided network upgrade activation heights are in the same order by height as the default testnet activation heights

@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::parameters::NetworkUpgrade;
+
 /// An error that can occur when building `Parameters` using `ParametersBuilder`.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ParametersBuilderError {
@@ -50,6 +52,10 @@ pub enum ParametersBuilderError {
     #[error("network upgrades must be activated in order specified by the protocol")]
     #[non_exhaustive]
     OutOfOrderUpgrades,
+
+    #[error("configured network upgrade {network_upgrade} must have a consensus branch ID")]
+    #[non_exhaustive]
+    MissingConsensusBranchId { network_upgrade: NetworkUpgrade },
 
     #[error("difficulty limits are valid expanded values")]
     #[non_exhaustive]

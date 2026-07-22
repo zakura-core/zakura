@@ -15,7 +15,7 @@ use zakura_header_chain::{
     Clock, EligibilityReason, EngineConfig, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch,
     FinalityRecord, FinalitySource, Frontier, FrontierSet, HeaderChainDiskVersion,
     HeaderGeneration, HeaderNode, HeaderValidationState, IndexChanges, PowPolicy, ProjectionDelta,
-    StateVersion, SystemClock, VerifiedGeneration, WorkCoordinate,
+    StateVersion, SystemClock, VerifiedGeneration, VerifiedHeaderRef, WorkCoordinate,
 };
 
 use super::{HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError, StartupReport};
@@ -75,6 +75,15 @@ pub enum HeaderChainMigrationError {
 pub fn migrate_v7_header_store(
     source: &ZakuraDb,
     config: &EngineConfig,
+) -> Result<(HeaderChainRuntime, HeaderChainMigrationReport), HeaderChainMigrationError> {
+    migrate_v7_header_store_reconciled(source, config, Vec::new())
+}
+
+/// Import the legacy overlay and reconcile restored full state before publication.
+pub(in crate::service) fn migrate_v7_header_store_reconciled(
+    source: &ZakuraDb,
+    config: &EngineConfig,
+    restored_path: Vec<VerifiedHeaderRef>,
 ) -> Result<(HeaderChainRuntime, HeaderChainMigrationReport), HeaderChainMigrationError> {
     let store = HeaderChainStore::new(source.header_chain_disk_db());
     if store.metadata_row()?.is_some() {
@@ -263,7 +272,7 @@ pub fn migrate_v7_header_store(
     store.db.write(batch)?;
     let imported_headers = legacy.len();
     let validation_context_rows = contexts.len();
-    let (runtime, startup) = store.startup(config)?;
+    let (runtime, startup) = store.startup_reconciled(config, anchor, Vec::new(), restored_path)?;
     Ok((
         runtime,
         HeaderChainMigrationReport {

@@ -125,7 +125,7 @@ impl DbOpenMode {
 
 impl ZakuraDb {
     /// Clone the shared low-level database for the atomic header-chain migration.
-    pub(in crate::service::finalized_state) fn header_chain_disk_db(&self) -> DiskDb {
+    pub(in crate::service) fn header_chain_disk_db(&self) -> DiskDb {
         self.db.clone()
     }
 

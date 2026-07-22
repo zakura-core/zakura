@@ -679,7 +679,7 @@ impl ZakuraDb {
             .or_else(|| self.zakura_header_height(hash))
     }
 
-    pub(in crate::service::finalized_state) fn header_by_height(
+    pub(in crate::service) fn header_by_height(
         &self,
         height: block::Height,
     ) -> Option<(block::Hash, Arc<block::Header>)> {

@@ -15,10 +15,11 @@ use zakura_chain::block;
 use zakura_header_chain::{
     apply_transition, audit_store, ApplyResult, AuxDelivery, AuxDelta, ChainScore, ChangeSet,
     CommittedTransition, EligibilityReason, EngineConfig, EngineMetadata, EngineSnapshot,
-    EvidenceId, FinalityRecord, Frontier, HeaderNode, NoChangeReceipt, RecoveryFailure,
-    RecoveryPlan, RecoveryRepair, StaleReceipt, StoreAuditRead, StoreError, StoreRead,
-    TransitionContext, TransitionFailure, TransitionRequest, ValidationContextRecord,
-    ValidationLease,
+    EvidenceId, FinalityRecord, Frontier, FullStateEvidenceAuthority, FullStateFinalized,
+    HeaderNode, NoChangeReceipt, RecoveryFailure, RecoveryPlan, RecoveryRepair, StaleReceipt,
+    StoreAuditRead, StoreError, StoreRead, SystemClock, TransitionContext, TransitionEvent,
+    TransitionFailure, TransitionRequest, ValidationContextRecord, ValidationLease,
+    VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use super::{
@@ -336,6 +337,10 @@ impl HeaderChainStore {
         }
     }
 
+    pub(in crate::service) fn is_initialized(&self) -> Result<bool, HeaderChainStoreError> {
+        Ok(self.metadata_row()?.is_some())
+    }
+
     /// Exhaustively audit, atomically repair reconstructible caches, then enable publication.
     pub fn startup(
         self,
@@ -352,6 +357,141 @@ impl HeaderChainStore {
             self.db.write(self.recovery_batch(&plan)?)?;
         }
         let current = plan.metadata.snapshot();
+        let report = StartupReport {
+            previous,
+            current: current.clone(),
+            repairs,
+            publication_allowed: true,
+        };
+        let publisher = Publisher::new(current);
+        drop(writer);
+        Ok((
+            HeaderChainRuntime {
+                store: self,
+                publisher,
+            },
+            report,
+        ))
+    }
+
+    /// Audit and reconcile the exact restored full-state path before enabling publication.
+    pub(in crate::service) fn startup_reconciled(
+        self,
+        config: &EngineConfig,
+        full_state_finalized: Frontier,
+        finalized_path: Vec<VerifiedHeaderRef>,
+        restored_path: Vec<VerifiedHeaderRef>,
+    ) -> Result<(HeaderChainRuntime, StartupReport), HeaderChainStoreError> {
+        struct Authority(EvidenceId);
+
+        impl FullStateEvidenceAuthority for Authority {
+            fn authorizes(&self, evidence: EvidenceId) -> bool {
+                evidence == self.0
+            }
+        }
+
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let initial = audit_store(&self, config)?;
+        let previous = initial.before.clone();
+        let mut repairs = initial.repairs.clone();
+        if !initial.is_clean() {
+            self.db.write(self.recovery_batch(&initial)?)?;
+        }
+
+        let snapshot = self.snapshot()?;
+        let mut authoritative_path = finalized_path;
+        authoritative_path.extend(restored_path);
+        let mut expected_projection = vec![snapshot.frontiers.finalized];
+        expected_projection.extend(
+            authoritative_path
+                .iter()
+                .map(|header| Frontier::new(header.height, header.hash)),
+        );
+        if self.verified_projection()? != expected_projection {
+            let mut hasher = Sha256::new();
+            hasher.update(b"zakura-header-chain-startup-reconciliation-v1");
+            hasher.update(snapshot.state_version.get().to_be_bytes());
+            hasher.update(snapshot.frontiers.verified_best.hash.0);
+            for header in &authoritative_path {
+                hasher.update(header.height.0.to_be_bytes());
+                hasher.update(header.hash.0);
+            }
+            let evidence = EvidenceId::from_digest(hasher.finalize().into());
+            let authority = Authority(evidence);
+            let context = TransitionContext {
+                config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                startup_capability: None,
+            };
+            let plan = apply_transition(
+                &self,
+                TransitionRequest {
+                    expected_version: snapshot.state_version,
+                    event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+                        full_state_transition_id: evidence,
+                        old_tip: snapshot.frontiers.verified_best,
+                        new_path: authoritative_path,
+                        cause: VerifiedChangeCause::Reset,
+                    }),
+                },
+                &context,
+            )?;
+            if !plan.is_no_change() {
+                self.db.write(self.batch_for(plan.change_set())?)?;
+            }
+        }
+
+        let snapshot = self.snapshot()?;
+        if snapshot.frontiers.finalized != full_state_finalized {
+            let proof = self
+                .verified_projection()?
+                .into_iter()
+                .take_while(|frontier| frontier.height <= full_state_finalized.height)
+                .map(|frontier| frontier.hash)
+                .collect::<Vec<_>>();
+            let mut hasher = Sha256::new();
+            hasher.update(b"zakura-header-chain-startup-finalization-v1");
+            hasher.update(snapshot.state_version.get().to_be_bytes());
+            hasher.update(full_state_finalized.height.0.to_be_bytes());
+            hasher.update(full_state_finalized.hash.0);
+            for hash in &proof {
+                hasher.update(hash.0);
+            }
+            let evidence = EvidenceId::from_digest(hasher.finalize().into());
+            let authority = Authority(evidence);
+            let context = TransitionContext {
+                config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                startup_capability: None,
+            };
+            let plan = apply_transition(
+                &self,
+                TransitionRequest {
+                    expected_version: snapshot.state_version,
+                    event: TransitionEvent::FullStateFinalized(FullStateFinalized {
+                        full_state_transition_id: evidence,
+                        new_finalized: full_state_finalized,
+                        verified_path_proof: proof,
+                    }),
+                },
+                &context,
+            )?;
+            if !plan.is_no_change() {
+                self.db.write(self.batch_for(plan.change_set())?)?;
+            }
+        }
+
+        let final_audit = audit_store(&self, config)?;
+        repairs.extend(final_audit.repairs.iter().copied());
+        if !final_audit.is_clean() {
+            self.db.write(self.recovery_batch(&final_audit)?)?;
+        }
+        let current = final_audit.metadata.snapshot();
         let report = StartupReport {
             previous,
             current: current.clone(),
@@ -1465,6 +1605,95 @@ mod tests {
             last_transition_id: EvidenceId::from_digest([0; 32]),
         };
         (config, node, metadata)
+    }
+
+    #[test]
+    fn startup_reconciles_restored_full_state_before_first_publication() {
+        let cache = tempfile::tempdir().expect("the test cache directory is created");
+        let db_config = Config {
+            cache_dir: cache.path().to_owned(),
+            ephemeral: false,
+            debug_skip_non_finalized_state_backup_task: true,
+            ..Config::default()
+        };
+        let (engine_config, anchor, metadata) = fixture();
+        let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+        let db = open(&db_config, &engine_config.network);
+        let store = HeaderChainStore::new(db.clone());
+        store
+            .initialize(metadata, anchor.clone())
+            .expect("the header schema initializes");
+
+        let mut child_header = *anchor.header;
+        child_header.previous_block_hash = anchor.hash;
+        let child_header = Arc::new(child_header);
+        let child = VerifiedHeaderRef {
+            height: anchor
+                .height
+                .next()
+                .expect("genesis has a successor height"),
+            hash: child_header.hash(),
+            header: child_header,
+        };
+        let (runtime, report) = store
+            .startup_reconciled(
+                &engine_config,
+                anchor_frontier,
+                Vec::new(),
+                vec![child.clone()],
+            )
+            .expect("restored full state reconciles before publication");
+
+        assert!(report.publication_allowed);
+        assert_eq!(
+            runtime.publisher().snapshot().frontiers.verified_best,
+            Frontier::new(child.height, child.hash)
+        );
+        assert_eq!(
+            runtime
+                .verified_projection()
+                .expect("projection is readable"),
+            vec![anchor_frontier, Frontier::new(child.height, child.hash)]
+        );
+        assert!(matches!(
+            runtime.store.node(child.hash),
+            Ok(Some(HeaderNode {
+                body: BodyValidationState::Verified { .. },
+                ..
+            }))
+        ));
+
+        drop(runtime);
+        let reopened = HeaderChainStore::new(db.clone())
+            .startup_reconciled(&engine_config, anchor_frontier, Vec::new(), Vec::new())
+            .expect("a restart resets a committed-but-unrestored verified suffix")
+            .0;
+        assert_eq!(
+            reopened.publisher().snapshot().frontiers.verified_best,
+            anchor_frontier
+        );
+        assert_eq!(
+            reopened
+                .verified_projection()
+                .expect("reset projection is readable"),
+            vec![anchor_frontier]
+        );
+
+        drop(reopened);
+        let finalized_child = Frontier::new(child.height, child.hash);
+        let advanced = HeaderChainStore::new(db)
+            .startup_reconciled(&engine_config, finalized_child, vec![child], Vec::new())
+            .expect("a dark checkpoint gap is reconciled and finalized before publication")
+            .0;
+        let snapshot = advanced.publisher().snapshot();
+        assert_eq!(snapshot.frontiers.finalized, finalized_child);
+        assert_eq!(snapshot.frontiers.verified_best, finalized_child);
+        assert_eq!(
+            advanced
+                .verified_projection()
+                .expect("advanced projection is readable"),
+            vec![finalized_child]
+        );
     }
 
     #[test]

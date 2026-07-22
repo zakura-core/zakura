@@ -374,6 +374,23 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
         "poll_ready should have handed off to non-finalized writes at the max checkpoint height",
     );
 
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let store = crate::service::finalized_state::header_chain::HeaderChainStore::new(
+                state_service.read_service.db.header_chain_disk_db(),
+            );
+            if store
+                .is_initialized()
+                .expect("the header-chain format marker is readable")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the production writer attaches the header runtime at handoff");
+
     Ok(())
 }
 

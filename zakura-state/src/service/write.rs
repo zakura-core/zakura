@@ -21,10 +21,11 @@ use zakura_chain::{
     parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
 };
 use zakura_header_chain::{
-    ApplyResult, BodyEvidence, EngineConfig, EvidenceId, Frontier, FullStateEvidenceAuthority,
-    FullStateFinalized, OperatorInvalidate, OperatorInvalidationId, OperatorReconsider,
-    StateVersion, SystemClock, TransitionContext, TransitionEvent, TransitionRequest,
-    VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
+    ApplyResult, BodyEvidence, CheckpointSet, EngineConfig, EngineConfigError, EngineMode,
+    EvidenceId, Frontier, FullStateEvidenceAuthority, FullStateFinalized, OperatorInvalidate,
+    OperatorInvalidationId, OperatorReconsider, StateVersion, StoreError, StoreRead, SystemClock,
+    TransitionContext, TransitionEvent, TransitionRequest, TrustedAnchor, VerifiedBodyEvidence,
+    VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -34,7 +35,10 @@ use crate::{
     service::{
         check,
         finalized_state::{
-            header_chain::{HeaderChainRuntime, HeaderChainStoreError},
+            header_chain::{
+                migration::{migrate_v7_header_store_reconciled, HeaderChainMigrationError},
+                HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError,
+            },
             DiskWriteBatch, FinalizedState, ZakuraDb,
         },
         non_finalized_state::NonFinalizedState,
@@ -207,14 +211,102 @@ pub(in crate::service) struct HeaderChainWriter {
     clock: SystemClock,
 }
 
+#[derive(Debug, Error)]
+enum HeaderChainAttachmentError {
+    #[error("finalized state has no authenticated genesis header at semantic handoff")]
+    MissingGenesis,
+    #[error("finalized genesis hash does not match the configured network")]
+    GenesisMismatch,
+    #[error("persisted header finality is not an ancestor of finalized full state")]
+    FinalizedDivergence,
+    #[error("finalized state is missing a header required to reconcile height {0:?}")]
+    MissingFinalizedHeader(Height),
+    #[error(transparent)]
+    Config(#[from] EngineConfigError),
+    #[error(transparent)]
+    Store(#[from] HeaderChainStoreError),
+    #[error(transparent)]
+    Read(#[from] StoreError),
+    #[error(transparent)]
+    Migration(#[from] HeaderChainMigrationError),
+}
+
 impl HeaderChainWriter {
-    #[allow(dead_code)] // Production construction lands with restart reconciliation in PR-9e.
     pub(in crate::service) fn new(runtime: HeaderChainRuntime, config: EngineConfig) -> Self {
         Self {
             runtime,
             config,
             clock: SystemClock,
         }
+    }
+
+    fn attach_at_semantic_handoff(
+        finalized_state: &FinalizedState,
+        non_finalized_state: &NonFinalizedState,
+    ) -> Result<Self, HeaderChainAttachmentError> {
+        let network = finalized_state.db.network();
+        let (genesis_hash, genesis_header) = finalized_state
+            .db
+            .header_by_height(Height(0))
+            .ok_or(HeaderChainAttachmentError::MissingGenesis)?;
+        if genesis_hash != network.genesis_hash() {
+            return Err(HeaderChainAttachmentError::GenesisMismatch);
+        }
+        let config = EngineConfig::new(
+            EngineMode::Integrated,
+            network.clone(),
+            TrustedAnchor {
+                frontier: Frontier::new(Height(0), genesis_hash),
+                header: genesis_header,
+            },
+            CheckpointSet::new(
+                network
+                    .checkpoint_list()
+                    .iter_cloned()
+                    .map(|(height, hash)| Frontier::new(height, hash)),
+            )?,
+        )?;
+        let restored_path = verified_path(non_finalized_state);
+        let store = HeaderChainStore::new(finalized_state.db.header_chain_disk_db());
+        let runtime = if store.is_initialized()? {
+            let persisted_finalized = store.snapshot()?.frontiers.finalized;
+            let (full_state_height, full_state_hash) = finalized_state
+                .db
+                .tip()
+                .ok_or(HeaderChainAttachmentError::MissingGenesis)?;
+            let full_state_finalized = Frontier::new(full_state_height, full_state_hash);
+            let persisted_hash = finalized_state
+                .db
+                .header_by_height(persisted_finalized.height)
+                .map(|(hash, _)| hash);
+            if persisted_finalized.height > full_state_height
+                || persisted_hash != Some(persisted_finalized.hash)
+            {
+                return Err(HeaderChainAttachmentError::FinalizedDivergence);
+            }
+            let mut finalized_path = Vec::new();
+            let mut height = persisted_finalized.height;
+            while height < full_state_height {
+                height = height
+                    .next()
+                    .map_err(|_| HeaderChainAttachmentError::FinalizedDivergence)?;
+                let (hash, header) = finalized_state
+                    .db
+                    .header_by_height(height)
+                    .ok_or(HeaderChainAttachmentError::MissingFinalizedHeader(height))?;
+                finalized_path.push(VerifiedHeaderRef {
+                    height,
+                    hash,
+                    header,
+                });
+            }
+            store
+                .startup_reconciled(&config, full_state_finalized, finalized_path, restored_path)?
+                .0
+        } else {
+            migrate_v7_header_store_reconciled(&finalized_state.db, &config, restored_path)?.0
+        };
+        Ok(Self::new(runtime, config))
     }
 
     fn context(&self) -> TransitionContext<'_> {
@@ -665,6 +757,7 @@ struct WriteBlockWorkerTask {
     /// synchronously before each channel update, instead of via the async backup task.
     backup_dir_path: Option<PathBuf>,
     header_chain: Option<HeaderChainWriter>,
+    attach_header_chain_at_handoff: bool,
 }
 
 /// The message type for the non-finalized block write task channel.
@@ -749,6 +842,7 @@ impl BlockWriteSender {
             should_use_finalized_block_write_sender,
             backup_dir_path,
             None,
+            true,
         )
     }
 
@@ -761,6 +855,7 @@ impl BlockWriteSender {
         should_use_finalized_block_write_sender: bool,
         backup_dir_path: Option<PathBuf>,
         header_chain: Option<HeaderChainWriter>,
+        attach_header_chain_at_handoff: bool,
     ) -> (
         Self,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
@@ -802,6 +897,7 @@ impl BlockWriteSender {
                     vct_root_repair_sender,
                     backup_dir_path,
                     header_chain,
+                    attach_header_chain_at_handoff,
                 }
                 .run()
             })
@@ -846,6 +942,7 @@ impl WriteBlockWorkerTask {
             seed_zakura_header_from_best_chain_commits,
             backup_dir_path,
             header_chain,
+            attach_header_chain_at_handoff,
         } = &mut self;
 
         let mut prev_finalized_note_commitment_trees: Option<NoteCommitmentTrees> = None;
@@ -1044,6 +1141,15 @@ impl WriteBlockWorkerTask {
         if invalid_block_reset_sender.is_closed() {
             info!("StateService closed the block reset channel. Is Zakura shutting down?");
             return;
+        }
+
+        if *attach_header_chain_at_handoff && header_chain.is_none() {
+            *header_chain = Some(
+                HeaderChainWriter::attach_at_semantic_handoff(finalized_state, non_finalized_state)
+                    .expect(
+                        "header-chain startup reconciliation must succeed before semantic writes",
+                    ),
+            );
         }
 
         // Save any errors to propagate down to queued child blocks

@@ -368,9 +368,11 @@ def check_pull_request(
             )
         return
 
+    # Compare from the merge base so fragments added to a moving base branch do
+    # not look like deletions made by a stale pull request branch.
     changed_paths = run_git(
         repo_root,
-        ["diff", "--name-only", base, head],
+        ["diff", "--name-only", f"{base}...{head}"],
     ).splitlines()
     changed = [
         path

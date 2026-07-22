@@ -27,10 +27,6 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
-- Let native Zakura peer sets converge beyond bootstrap nodes by dialing valid
-  gossiped records, advertising configured external addresses, refreshing
-  long-lived discovery sessions, and tracking actual service ownership
-  ([#336](https://github.com/zakura-core/zakura/pull/336)).
 - Treat IPv4 and IPv4-mapped IPv6 peer addresses as the same address when
   enforcing bans, preventing banned peers from reconnecting through the
   alternate representation

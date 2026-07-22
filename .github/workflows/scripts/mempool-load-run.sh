@@ -71,10 +71,22 @@ else
   git -C /root/kresko fetch --no-tags origin "${KRESKO_REF}"
   git -C /root/kresko checkout --detach FETCH_HEAD
   # No patch step: Kresko builds against the zakura crates upstream.
-  ( cd /root/kresko && cargo build --release )
+  # Own target dir: CARGO_TARGET_DIR is exported for the zakura build, and
+  # inheriting it puts the binary somewhere KRESKO_BIN does not point --
+  # and makes kresko and zakurad thrash one cache built from different
+  # versions of the same crates.
+  ( cd /root/kresko && CARGO_TARGET_DIR=/root/kresko/target cargo build --release )
   git -C /root/kresko rev-parse HEAD > /root/kresko/.baked-ref
 fi
+
 KRESKO_BIN=/root/kresko/target/release/kresko
+# Fail here rather than at first use: a build that lands the binary somewhere
+# else still "succeeds", and the next error is an opaque FileNotFoundError from
+# inside the Python driver several steps later.
+if [ ! -x "$KRESKO_BIN" ]; then
+  echo "kresko build produced no binary at ${KRESKO_BIN}" >&2
+  exit 1
+fi
 KRESKO_SHA=$(git -C /root/kresko rev-parse HEAD)
 echo "kresko: ${KRESKO_SHA}"
 

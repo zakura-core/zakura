@@ -70,7 +70,11 @@ if [ ! -d /root/kresko ]; then
 fi
 git -C /root/kresko fetch --no-tags origin "${KRESKO_BAKE_REF}"
 git -C /root/kresko checkout --detach FETCH_HEAD
-( cd /root/kresko && cargo build --release )
+# Own target dir, for the same reasons as mempool-load-run.sh: the binary
+# must land where that script looks for it, and kresko must not share a
+# cargo cache with zakurad.
+( cd /root/kresko && CARGO_TARGET_DIR=/root/kresko/target cargo build --release )
+test -x /root/kresko/target/release/kresko
 git -C /root/kresko rev-parse HEAD > /root/kresko/.baked-ref
 echo "baked kresko at $(cat /root/kresko/.baked-ref)"
 

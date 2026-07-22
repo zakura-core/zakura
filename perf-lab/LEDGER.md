@@ -186,3 +186,14 @@ This file is the sole reporting channel (design D5). Entry template:
   zakura node ids, freeze onto a private dev_network tag); (3) bench cohort
   mode; (4) cohort A/A pair → new band (target ≤1%) → resume campaign with
   tight thresholds.
+
+### cohort gate + re-seed (2026-07-22)
+
+- freeze-gate review caught two criticals before any state was served: the
+  harness EXIT trap deletes the seed's fork on completion (first seed pair
+  written off, ~$1; KEEP_CUR_FORK guard patch added, chain-validated), and
+  the 24h reaper would have destroyed the frozen servers at the next session
+  start (perf-lab-serve-* now code-exempt). Also: freeze height assertion,
+  newest-binary pick, serve-crash status, identity_dir wording. Both serve
+  droplets re-patched via prepare_remote (self-healing checkout+repatch) and
+  re-seeding with KEEP_CUR_FORK=1.

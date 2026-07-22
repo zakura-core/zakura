@@ -16,6 +16,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 #[allow(missing_docs)]
 pub mod command;
 
+pub mod log_capture;
 pub mod mock_service;
 pub mod net;
 pub mod network_addr;
@@ -107,6 +108,7 @@ pub fn init() -> impl Drop {
         tracing_subscriber::registry()
             .with(filter_layer)
             .with(fmt_layer)
+            .with(log_capture::LogCaptureLayer)
             .with(ErrorLayer::default())
             .try_init()
             .ok();

@@ -194,7 +194,9 @@ pub use crate::{
     peer_set::{init, init_with_zakura_header_sync},
     policies::RetryLimit,
     protocol::{
-        external::{Version, VersionMessage, MAX_TX_INV_IN_SENT_MESSAGE},
+        external::{
+            Version, VersionMessage, MAX_FIND_BLOCKS_RESPONSE_HASHES, MAX_TX_INV_IN_SENT_MESSAGE,
+        },
         internal::{InventoryResponse, PeerSource, Request, Response},
     },
 };

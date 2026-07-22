@@ -1745,6 +1745,7 @@ where
                 server_rx,
                 error_slot.clone(),
                 peer_tx,
+                address_book_updater.clone(),
                 connection_tracker,
                 connection_info.clone(),
                 addr_label,

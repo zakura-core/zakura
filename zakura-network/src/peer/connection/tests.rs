@@ -117,6 +117,7 @@ fn new_test_connection_with_protection<A>(
     let mock_inbound_service = MockService::build().finish();
     let (client_tx, client_rx) = mpsc::channel(0);
     let shared_error_slot = ErrorSlot::default();
+    let (address_book_updater, _address_book_updates) = tokio::sync::mpsc::channel(1);
 
     // Normally the network has more capacity than the sender's single implicit slot,
     // but the smaller capacity makes some tests easier.
@@ -166,6 +167,7 @@ fn new_test_connection_with_protection<A>(
         client_rx,
         shared_error_slot.clone(),
         peer_tx,
+        address_book_updater,
         ActiveConnectionCounter::new_counter().track_connection(),
         Arc::new(connection_info),
         addr_label,
@@ -192,6 +194,7 @@ fn new_never_closing_test_connection<A>(
     let mock_inbound_service = MockService::build().finish();
     let (client_tx, client_rx) = mpsc::channel(0);
     let shared_error_slot = ErrorSlot::default();
+    let (address_book_updater, _address_book_updates) = tokio::sync::mpsc::channel(1);
 
     let fake_addr: SocketAddr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4).into();
     let fake_version = CURRENT_NETWORK_PROTOCOL_VERSION;
@@ -221,6 +224,7 @@ fn new_never_closing_test_connection<A>(
         client_rx,
         shared_error_slot.clone(),
         NeverClosingSink,
+        address_book_updater,
         connection_tracker,
         Arc::new(connection_info),
         addr_label,

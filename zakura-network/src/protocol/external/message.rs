@@ -19,6 +19,9 @@ use proptest_derive::Arbitrary;
 #[cfg(any(test, feature = "proptest-impl"))]
 use zakura_chain::serialization::arbitrary::datetime_full;
 
+/// The maximum number of block hashes in an `inv` response to `getblocks`.
+pub const MAX_FIND_BLOCKS_RESPONSE_HASHES: usize = 500;
+
 /// A Bitcoin-like network message for the Zcash protocol.
 ///
 /// The Zcash network protocol is mostly inherited from Bitcoin, and a list of
@@ -128,7 +131,8 @@ pub enum Message {
     ///
     /// The peer responds with an `inv` packet with the hashes of subsequent blocks.
     /// If supplied, the `stop` parameter specifies the last header to request.
-    /// Otherwise, an inv packet with the maximum number (500) are sent.
+    /// Otherwise, an `inv` packet with up to
+    /// [`MAX_FIND_BLOCKS_RESPONSE_HASHES`] hashes is sent.
     ///
     /// The known blocks list contains zero or more block hashes.
     ///

@@ -23,10 +23,10 @@ use zakura_chain::{
 
 use crate::{
     constants::{
-        self, MAX_ADDRS_IN_MESSAGE, MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY,
-        OVERLOAD_PROTECTION_INTERVAL, PEER_ADDR_RESPONSE_LIMIT,
+        self, MAX_ADDRS_IN_MESSAGE, MAX_OVERLOAD_DROP_PROBABILITY, MAX_PEER_MISBEHAVIOR_SCORE,
+        MIN_OVERLOAD_DROP_PROBABILITY, OVERLOAD_PROTECTION_INTERVAL, PEER_ADDR_RESPONSE_LIMIT,
     },
-    meta_addr::MetaAddr,
+    meta_addr::{MetaAddr, MetaAddrChange},
     peer::{
         connection::peer_tx::PeerTx, error::AlreadyErrored, ClientRequest, ClientRequestReceiver,
         ConnectionInfo, ErrorSlot, InProgressClientRequest, MustUseClientResponseSender, PeerError,
@@ -34,7 +34,7 @@ use crate::{
     },
     peer_set::ConnectionTracker,
     protocol::{
-        external::{types::Nonce, InventoryHash, Message},
+        external::{types::Nonce, InventoryHash, Message, MAX_FIND_BLOCKS_RESPONSE_HASHES},
         internal::{InventoryResponse, Request, Response},
     },
     BoxError, PeerSocketAddr, MAX_TX_INV_IN_SENT_MESSAGE,
@@ -57,7 +57,9 @@ pub(super) enum Handler {
         ping_sent_at: Instant,
     },
     Peers,
-    FindBlocks,
+    FindBlocks {
+        requested_locators: HashSet<block::Hash>,
+    },
     FindHeaders,
     BlocksByHash {
         pending_hashes: HashSet<block::Hash>,
@@ -79,7 +81,7 @@ impl fmt::Display for Handler {
             Handler::Ping { .. } => "Ping".to_string(),
             Handler::Peers => "Peers".to_string(),
 
-            Handler::FindBlocks => "FindBlocks".to_string(),
+            Handler::FindBlocks { .. } => "FindBlocks".to_string(),
             Handler::FindHeaders => "FindHeaders".to_string(),
             Handler::BlocksByHash {
                 pending_hashes,
@@ -113,7 +115,7 @@ impl Handler {
             Handler::Ping { .. } => "Ping".into(),
             Handler::Peers => "Peers".into(),
 
-            Handler::FindBlocks => "FindBlocks".into(),
+            Handler::FindBlocks { .. } => "FindBlocks".into(),
             Handler::FindHeaders => "FindHeaders".into(),
 
             Handler::BlocksByHash { .. } => "BlocksByHash".into(),
@@ -399,14 +401,33 @@ impl Handler {
 
             // TODO:
             // - use `any(inv)` rather than `all(inv)`?
-            (Handler::FindBlocks, Message::Inv(items))
+            (Handler::FindBlocks { requested_locators }, Message::Inv(items))
                 if items
                     .iter()
                     .all(|item| matches!(item, InventoryHash::Block(_))) =>
             {
-                Handler::Finished(Ok(Response::BlockHashes(
-                    block_hashes(&items[..]).collect(),
-                )))
+                if items.len() > MAX_FIND_BLOCKS_RESPONSE_HASHES {
+                    Handler::Finished(Err(PeerError::InvalidFindBlocksResponse(
+                        "response contains too many block hashes",
+                    )))
+                } else {
+                    let hashes: Vec<_> = block_hashes(&items).collect();
+                    let unique_hashes: HashSet<_> = hashes.iter().copied().collect();
+
+                    let violation = if unique_hashes.len() != hashes.len() {
+                        Some("response contains duplicate block hashes")
+                    } else if !requested_locators.is_disjoint(&unique_hashes) {
+                        Some("response echoes a requested locator hash")
+                    } else {
+                        None
+                    };
+
+                    if let Some(violation) = violation {
+                        Handler::Finished(Err(PeerError::InvalidFindBlocksResponse(violation)))
+                    } else {
+                        Handler::Finished(Ok(Response::BlockHashes(hashes)))
+                    }
+                }
             }
             (Handler::FindHeaders, Message::Headers(headers)) => {
                 Handler::Finished(Ok(Response::BlockHeaders(headers)))
@@ -591,6 +612,9 @@ where
     /// The corresponding peer message receiver is passed to [`Connection::run`].
     pub(super) peer_tx: PeerTx<Tx>,
 
+    /// A channel for reporting peer address changes to the address book.
+    pub(super) address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+
     /// A connection tracker that reduces the open connection count when dropped.
     /// Used to limit the number of open connections in Zebra.
     ///
@@ -646,6 +670,7 @@ where
         client_rx: futures::channel::mpsc::Receiver<ClientRequest>,
         error_slot: ErrorSlot,
         peer_tx: Tx,
+        address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
         connection_tracker: ConnectionTracker,
         connection_info: Arc<ConnectionInfo>,
         addr_label: String,
@@ -660,6 +685,7 @@ where
             client_rx: client_rx.into(),
             error_slot,
             peer_tx: peer_tx.into(),
+            address_book_updater,
             connection_tracker,
             addr_label,
             last_metrics_state: None,
@@ -781,6 +807,38 @@ where
 
                 // Check whether the handler is finished before waiting for a response message,
                 // because the response might be `Nil` or synthetic.
+                State::AwaitingResponse {
+                    handler: Handler::Finished(Err(PeerError::InvalidFindBlocksResponse(_))),
+                    ref span,
+                    ..
+                } => {
+                    let span = span.clone();
+                    debug!(parent: &span, "banning peer for invalid getblocks response");
+
+                    let tmp_state = std::mem::replace(&mut self.state, State::Failed);
+                    let State::AwaitingResponse {
+                        handler: Handler::Finished(Err(error)),
+                        tx,
+                        ..
+                    } = tmp_state
+                    else {
+                        unreachable!("already checked for an invalid getblocks response");
+                    };
+
+                    let error = SharedPeerError::from(error);
+                    let _ = tx.send(Err(error.clone()));
+
+                    if let Some(addr) = self.connection_info.connected_addr.get_address_book_addr()
+                    {
+                        let _ = self
+                            .address_book_updater
+                            .send(MetaAddr::new_misbehavior(addr, MAX_PEER_MISBEHAVIOR_SCORE))
+                            .await;
+                    }
+
+                    self.fail_with(error).await;
+                }
+
                 State::AwaitingResponse {
                     handler: Handler::Finished(_),
                     ref span,
@@ -1086,13 +1144,12 @@ where
             }
 
             (AwaitingRequest, FindBlocks { known_blocks, stop }) => {
+                let requested_locators = known_blocks.iter().copied().collect();
                 self
                     .peer_tx
                     .send(Message::GetBlocks { known_blocks, stop })
                     .await
-                    .map(|()|
-                         Handler::FindBlocks
-                    )
+                    .map(|()| Handler::FindBlocks { requested_locators })
             }
             (AwaitingRequest, FindHeaders { known_blocks, stop }) => {
                 self

@@ -22,16 +22,183 @@ use zakura_chain::{block, serialization::SerializationError};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
-    constants::{MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY, REQUEST_TIMEOUT},
+    constants::{
+        MAX_OVERLOAD_DROP_PROBABILITY, MAX_PEER_MISBEHAVIOR_SCORE, MIN_OVERLOAD_DROP_PROBABILITY,
+        REQUEST_TIMEOUT,
+    },
+    meta_addr::MetaAddr,
     peer::{
-        connection::{overload_drop_connection_probability, Connection, State},
+        connection::{overload_drop_connection_probability, Connection, Handler, State},
         ClientRequest, ErrorSlot,
     },
     peer_set::ActiveConnectionCounter,
     protocol::external::Message,
     types::Nonce,
-    PeerError, PeerSource, Request, Response,
+    PeerError, PeerSource, Request, Response, MAX_FIND_BLOCKS_RESPONSE_HASHES,
 };
+
+#[test]
+fn maximum_find_blocks_response_is_accepted() {
+    let locator = block_hash(0);
+    let hashes: Vec<_> = (1..=MAX_FIND_BLOCKS_RESPONSE_HASHES)
+        .map(block_hash)
+        .collect();
+    let mut handler = Handler::FindBlocks {
+        requested_locators: HashSet::from([locator]),
+    };
+
+    let ignored = handler.process_message(
+        Message::Inv(hashes.iter().copied().map(Into::into).collect()),
+        &mut Vec::new(),
+        None,
+    );
+
+    assert!(ignored.is_none());
+    assert!(matches!(
+        handler,
+        Handler::Finished(Ok(Response::BlockHashes(response))) if response == hashes
+    ));
+}
+
+#[tokio::test]
+async fn oversized_find_blocks_response_bans_peer() {
+    let locator = block_hash(0);
+    let response = (1..=MAX_FIND_BLOCKS_RESPONSE_HASHES + 1)
+        .map(block_hash)
+        .collect();
+
+    assert_invalid_find_blocks_response_bans_peer(
+        locator,
+        response,
+        "response contains too many block hashes",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn duplicate_find_blocks_response_bans_peer() {
+    let locator = block_hash(0);
+    let duplicate = block_hash(1);
+
+    assert_invalid_find_blocks_response_bans_peer(
+        locator,
+        vec![duplicate, duplicate],
+        "response contains duplicate block hashes",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn locator_echo_find_blocks_response_bans_peer() {
+    let locator = block_hash(0);
+
+    assert_invalid_find_blocks_response_bans_peer(
+        locator,
+        vec![block_hash(1), locator],
+        "response echoes a requested locator hash",
+    )
+    .await;
+}
+
+async fn assert_invalid_find_blocks_response_bans_peer(
+    locator: block::Hash,
+    response: Vec<block::Hash>,
+    expected_error: &str,
+) {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (
+        mut connection,
+        mut client_tx,
+        mut inbound_service,
+        mut peer_outbound_messages,
+        shared_error_slot,
+    ) = new_protected_test_connection();
+    let (address_book_updater, mut address_book_updates) = tokio::sync::mpsc::channel(1);
+    connection.address_book_updater = address_book_updater;
+    let peer_addr = connection
+        .connection_info
+        .connected_addr
+        .get_address_book_addr()
+        .expect("protected test connections have direct peer addresses");
+
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let (request_tx, request_rx) = oneshot::channel();
+    client_tx
+        .send(ClientRequest {
+            request: Request::FindBlocks {
+                known_blocks: vec![locator],
+                stop: None,
+            },
+            tx: request_tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::current(),
+        })
+        .await
+        .expect("connection accepts the FindBlocks request");
+
+    assert_eq!(
+        peer_outbound_messages.next().await,
+        Some(Message::GetBlocks {
+            known_blocks: vec![locator],
+            stop: None,
+        })
+    );
+
+    peer_tx
+        .send(Ok(Message::Inv(
+            response.into_iter().map(Into::into).collect(),
+        )))
+        .await
+        .expect("peer response channel is open");
+
+    assert_eq!(
+        address_book_updates.recv().await,
+        Some(MetaAddr::new_misbehavior(
+            peer_addr,
+            MAX_PEER_MISBEHAVIOR_SCORE,
+        )),
+        "invalid responses must immediately receive a banning score"
+    );
+
+    let response_error = request_rx
+        .await
+        .expect("connection returns a response")
+        .expect_err("invalid FindBlocks responses fail the request");
+    assert!(
+        response_error.inner_debug().contains(expected_error),
+        "unexpected response error: {response_error:?}"
+    );
+
+    connection_task
+        .await
+        .expect("invalid response shuts down the connection cleanly");
+    assert!(
+        client_tx.is_closed(),
+        "the banned peer must be disconnected"
+    );
+    assert!(
+        shared_error_slot
+            .try_get_error()
+            .expect("invalid response fails the connection")
+            .inner_debug()
+            .contains(expected_error),
+        "connection failure must identify the protocol violation"
+    );
+    inbound_service.expect_no_requests().await;
+}
+
+fn block_hash(index: usize) -> block::Hash {
+    let mut bytes = [0; 32];
+    bytes[..8].copy_from_slice(
+        &u64::try_from(index)
+            .expect("test hash index fits in u64")
+            .to_le_bytes(),
+    );
+    block::Hash(bytes)
+}
 
 /// Test that the connection run loop works as a future
 #[tokio::test]

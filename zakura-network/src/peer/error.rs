@@ -123,6 +123,10 @@ pub enum PeerError {
     #[error("Remote peer sent handshake messages after handshake")]
     DuplicateHandshake,
 
+    /// A remote peer sent a structurally invalid response to `getblocks`.
+    #[error("Remote peer sent an invalid getblocks response: {0}")]
+    InvalidFindBlocksResponse(&'static str),
+
     /// This node's internal services were overloaded, so the connection was dropped
     /// to shed load.
     #[error("Internal services over capacity")]
@@ -196,6 +200,7 @@ impl PeerError {
             // TODO: add error kinds or summaries to `SerializationError`
             PeerError::Serialization(inner) => format!("Serialization({inner})").into(),
             PeerError::DuplicateHandshake => "DuplicateHandshake".into(),
+            PeerError::InvalidFindBlocksResponse(_) => "InvalidFindBlocksResponse".into(),
             PeerError::Overloaded => "Overloaded".into(),
             PeerError::NoReadyPeers => "NoReadyPeers".into(),
             PeerError::InboundTimeout => "InboundTimeout".into(),

@@ -24,8 +24,8 @@ pub enum HighestCompletedCheckpointError {
     #[error("the configured checkpoint list does not contain genesis")]
     MissingGenesisCheckpoint,
 
-    /// A canonical header required to establish the trusted body base is missing.
-    #[error("missing canonical header at trusted body height {height:?}")]
+    /// A canonical header required by `from_finalized_body` is missing.
+    #[error("missing canonical header at finalized body height {height:?}")]
     MissingCanonicalHeader {
         /// Missing header height.
         height: Height,
@@ -76,7 +76,7 @@ pub struct HighestCompletedCheckpointTracker {
 impl HighestCompletedCheckpointTracker {
     /// Reconstructs checkpoint progress from durable canonical headers.
     ///
-    /// Cold open: no `start_hint`, so reconstruct uses the trusted body base (path B)
+    /// Cold open: no `start_hint`, so reconstruct uses `from_finalized_body` (path B)
     /// then walks any headers above the body tip (path D).
     ///
     /// If durable headers are inconsistent, logs the error and clears progress so startup
@@ -125,13 +125,13 @@ impl HighestCompletedCheckpointTracker {
             return Ok(ProposedHighestCompletedCheckpoint(self.state));
         };
 
-        let mut pending = Vec::with_capacity(headers.len());
+        let mut pending_headers = Vec::with_capacity(headers.len());
         for (index, header) in headers.iter().enumerate() {
             let offset = u32::try_from(index + 1)
                 .map_err(|_| HighestCompletedCheckpointError::HeightOverflow)?;
             let height = (anchor_height + i64::from(offset))
                 .ok_or(HighestCompletedCheckpointError::HeightOverflow)?;
-            pending.push((
+            pending_headers.push((
                 height,
                 block::Hash::from(header.as_ref()),
                 Arc::clone(header),
@@ -139,19 +139,19 @@ impl HighestCompletedCheckpointTracker {
         }
 
         // First height where pending disagrees with durable headers (reorg into the range).
-        let first_conflict = pending.iter().find_map(|(height, hash, _)| {
+        let first_conflict = pending_headers.iter().find_map(|(height, hash, _)| {
             db.header_hash(*height)
                 .is_some_and(|stored| stored != *hash)
                 .then_some(*height)
         });
         // After a conflict, tip is the end of the pending batch; otherwise max(disk, pending).
         let post_tip = if first_conflict.is_some() {
-            pending.last().map(|(height, _, _)| *height)
+            pending_headers.last().map(|(height, _, _)| *height)
         } else {
             db.best_header_tip()
                 .map(|(height, _)| height)
                 .into_iter()
-                .chain(pending.last().map(|(height, _, _)| *height))
+                .chain(pending_headers.last().map(|(height, _, _)| *height))
                 .max()
         };
 
@@ -169,7 +169,7 @@ impl HighestCompletedCheckpointTracker {
         }
 
         Ok(ProposedHighestCompletedCheckpoint(
-            TrackerState::reconstruct(db, &pending, Some((start_hint, post_tip)))?,
+            TrackerState::reconstruct(db, &pending_headers, Some((start_hint, post_tip)))?,
         ))
     }
 
@@ -253,7 +253,7 @@ impl TrackerState {
     /// Rebuilds tracker state for `[genesis, canonical_tip]`.
     ///
     /// Call paths:
-    /// - startup / cold open: `start_hint = None` → trusted body base, then walk headers
+    /// - startup / cold open: `start_hint = None` → `from_finalized_body`, then walk headers
     /// - post-commit proposal / rebind: `start_hint = Some(prior state)` → resume from
     ///   `current` / `next_checkpoint` / `cursor` instead of rescanning all checkpoints
     fn reconstruct(
@@ -262,8 +262,8 @@ impl TrackerState {
         start_hint: Option<(TrackerState, Option<Height>)>,
     ) -> Result<Self, HighestCompletedCheckpointError> {
         // Tip is either the proposed post-commit height or the durable header tip.
-        let disk_tip = db.best_header_tip().map(|(height, _)| height);
-        let canonical_tip = start_hint.and_then(|(_, tip)| tip).or(disk_tip);
+        let disk_best_header_tip = db.best_header_tip().map(|(height, _)| height);
+        let canonical_tip = start_hint.and_then(|(_, tip)| tip).or(disk_best_header_tip);
         let Some(canonical_tip) = canonical_tip else {
             // Empty header store: nothing completed yet.
             return Ok(Self {
@@ -295,7 +295,7 @@ impl TrackerState {
             {
                 state
             }
-            _ => Self::trusted_body_base(db, canonical_tip, genesis_hash)?,
+            _ => Self::from_finalized_body(db, canonical_tip, genesis_hash)?,
         };
 
         // Drop a stale cursor (past tip, or hash no longer canonical / pending) back to
@@ -392,9 +392,18 @@ impl TrackerState {
         Ok(state)
     }
 
-    /// Cold-start base for reconstruct path B: one `checkpoint_at_or_before(body_tip)`
-    /// (or genesis if there is no body), not a walk over the full checkpoint list.
-    fn trusted_body_base(
+    /// Builds the cold-start tracker base when no valid in-memory hint is available (path B in reconstruct()).
+    ///
+    /// `current` is the highest configured checkpoint covered by the durable finalized
+    /// body tip at or below `canonical_tip`, or genesis when no such body exists.
+    /// `cursor` is that body tip (or genesis) so a later header walk only covers
+    /// body→tip. Does not scan the full checkpoint list or walk headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns if the body-tip header is missing, the checkpoint list lacks genesis,
+    /// or the completed checkpoint does not match the canonical header store.
+    fn from_finalized_body(
         db: &ZakuraDb,
         canonical_tip: Height,
         genesis_hash: block::Hash,

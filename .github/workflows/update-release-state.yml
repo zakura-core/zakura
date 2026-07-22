@@ -145,6 +145,7 @@ jobs:
         if: steps.import.outputs.has_changes == 'true'
         with:
           toolchain: stable
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Re-prove the checkpoint/frontier pairing in cargo
         if: steps.import.outputs.has_changes == 'true'

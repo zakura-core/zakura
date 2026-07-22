@@ -130,6 +130,8 @@ jobs:
           # above), so they share a cache with each other but not with that group.
           cache-shared-key: zakura-e2e-debug
           cache-on-failure: true
+          # This is the only writer for the shared e2e debug cache.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/setup-zakura-build
       # Compile the e2e once. `cargo test --no-run` builds both the integration
       # test binary and the `zakurad` bin (cargo always builds a package's
@@ -199,6 +201,7 @@ jobs:
           # acceptance jobs, so it shares their consolidated build cache.
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
+          cache-save-if: false
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 #v2.83.2
         with:
           tool: cargo-nextest
@@ -240,6 +243,7 @@ jobs:
           toolchain: stable
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
+          cache-save-if: false
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 #v2.83.2
         with:
           tool: cargo-nextest
@@ -284,6 +288,7 @@ jobs:
           toolchain: stable
           cache-shared-key: zakura-e2e-debug
           cache-on-failure: true
+          cache-save-if: false
       - uses: ./.github/actions/setup-zakura-build
       # Build once (see the pr-gate job for the ROCKSDB_LIB_DIR / static-link
       # rationale); the run step reuses the compiled artifacts.

@@ -215,7 +215,7 @@ fn empty_header_proposal_is_unchanged_and_does_not_notify() {
     let _init_guard = zakura_test::init();
     let (genesis, _headers, network) = checkpoint_chain(&[2]);
     let state = state_with_genesis_config(&network, genesis.clone(), Config::ephemeral());
-    let (mut tracker, mut receiver) = HighestCompletedCheckpointTracker::open(&state);
+    let (mut tracker, receiver) = HighestCompletedCheckpointTracker::open(&state);
     let initial = checkpoint(Height::MIN, genesis.hash());
 
     let proposal = tracker

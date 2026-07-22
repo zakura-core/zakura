@@ -63,6 +63,7 @@ struct TrackerState {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ProposedHighestCompletedCheckpoint(TrackerState);
 
+#[cfg(test)]
 impl ProposedHighestCompletedCheckpoint {
     /// Returns the checkpoint that would become current if this proposal commits.
     pub fn current(&self) -> Option<HighestCompletedCheckpoint> {

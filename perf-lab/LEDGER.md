@@ -302,3 +302,35 @@ This file is the sole reporting channel (design D5). Entry template:
   two-leg WIN test passes. k8's own leg spread (4.1%) is wider than the
   steady 0.1% — batching may chunk delivery; noted, does not overturn the
   worst-leg margin.
+
+## EXP-002 — WIN (pending one confirmation) : block-request batching (2026-07-22)
+
+- dose-response on SHA 41368ad4, frozen cohort, steady regime, back-to-back:
+  | k (max_blocks_per_response) | legs (pc blk/s) | mean | spread |
+  | 1 (default)                 | 105.26 / 105.17 | 105.2 | 0.1% |
+  | 8                           | 114.83 / 110.09 | 112.5 | 4.1% |
+  | 32                          |  99.59 / 104.71 | 102.2 | 5.0% |
+- k=8 passes the two-leg test against BOTH neighbors (its worst leg beats
+  k=1's best by +4.7% and k=32's best by +5.1%). Inverted-U shape matches the
+  HOL trade documented at zakura-network/src/zakura/block_sync/config.rs:3-7
+  — the caution is right, the calibration is not: the optimum is near 8, not 1.
+- verdict: WIN pending one confirmation run (exp002-k8-c, queued as the next
+  session's first work per the two-run protocol).
+- PROPOSAL (for Adam): raise DEFAULT_BS_BLOCKS_PER_RESPONSE 1→8 once PRs
+  166/217 release block_sync/config.rs. Caveats to weigh: evidence is
+  cohort-mode/steady-regime (clean links, 2 peers); public-network loss/HOL
+  behavior at k=8 deserves a live-peer comparison run and/or e2e long-mode
+  before the default changes. perf-lab adopts k=8 as a standing comparison
+  point in its own bench configs meanwhile.
+- also settled: EXP-002's earlier anomaly was the cache transition, not code;
+  B-03's request-shape question is now answered with data (backlog updated).
+
+## SESSION 2 close (2026-07-22, ~23:50Z)
+
+- collects: 14 across the session (cohort build 2 seeds + 1 written-off pair,
+  4 cohort A/As, exp002-base + regcheck + k8 + k32, plus batch-2 carryover).
+- findings: B-15 cohort delivered; cache regime decoded into protocol; no
+  mainline regression; EXP-002 batching WIN pending confirmation.
+- spend ~US$9 today. perf-lab-s2 destroyed; frozen serve pair standing.
+- next session queue: exp002-k8-c confirmation → formal WIN; then B-04 (state
+  collision check first) / B-06 / B-07 under the steady protocol.

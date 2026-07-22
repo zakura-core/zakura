@@ -16,7 +16,7 @@ READY | BLOCKED(<why>) | DONE(EXP-NNN) | DROPPED(<why>).
   confirmations, 3 points (500/1000/3000).
 - B-02 READY — Sweep `DL_LIMIT` (download_concurrency_limit) 50/150/400.
   Same shape as B-01.
-- B-03 READY — Block-sync knob sweep: `max_blocks_per_response`, request
+- B-03 DONE(EXP-002: k=8 wins +5-9%, curve in ledger) — Block-sync knob sweep: `max_blocks_per_response`, request
   timeout, in-flight cap. Hypothesis: one manual pass tuned these; a
   mock-blocksync-pre-filtered sweep finds a better operating point.
   Lane: code-default change per point; mock-blocksync L1 pre-filter.

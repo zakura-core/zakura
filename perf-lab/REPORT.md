@@ -1,24 +1,21 @@
 # perf-lab report
 
-Last regenerated: 2026-07-22, SESSION 1 close (halted per rule).
+Last regenerated: 2026-07-22, SESSION 2 close.
 
-- Regime: single-peer feed, 120k window, band 8.7%, single-run threshold
-  17.4%, sweep bar 26.1%. Campaign baseline 85.37 pc blk/s (SHA 847f6085;
-  re-pin on drift).
-- Confirmed wins: none. Promising: none.
-- Evidence produced: DL_LIMIT flat across 50/150/400 (concurrency is not the
-  lever; floor-body HOL gates the window); seeder mode narrows worst-case
-  noise to 5.8% but fails the ≤3% adoption bar; absolute throughput swings
-  ~10% with network phase and ~15 commits of main drift — within-run
-  A/B is the only trustworthy comparison, which the tooling enforces.
-- DECISION WAITING (Adam): B-15 frozen-cohort port — needs MAX_DROPLETS 2→3
-  (2 seeded-then-frozen serving droplets + 1 bench) and ~$0.5/h per frozen
-  server while active. This is the unlock for tight thresholds (expected
-  ≤1% band per the cohort design's own rationale).
-- PROPOSAL queue: blocks-per-response / request-shape experiments (blocked on
-  PRs 166/217); B-13 per-side knobs; B-14 upstream PR (local patch active).
-- Incidents this session: provision heredoc escape bug (fixed, orphan
-  self-clean validated live); none after.
-- Spend: SESSION 0+1 total ≈ US$8.
-- Resume: say "run the perf lab" after any unlock (B-15 approval, PRs 166/217
-  landing, or choosing a heavier-blocks window campaign).
+1. **WIN (pending confirmation): block-request batching.** Raising
+   `max_blocks_per_response` from 1 to 8 gains +5-9% sync throughput; 32
+   overshoots into head-of-line losses (inverted-U curve, ledger EXP-002).
+   Proposal: default 1→8 once PRs 166/217 release the file, after a
+   live-peer sanity run. Config-level evidence, no code changed.
+2. **No mainline regression.** 63b8d4dc vs 30b0c63d raced head-to-head:
+   +9% for the newer main. The scare was the rig, not the code.
+3. **Cohort cache regime decoded.** Fresh-seeded servers serve RAM-warm
+   (~190 pc blk/s, unreproducible); steady disk regime is ~105 and
+   deterministic to ~0.1% when measured back-to-back. Protocol: measure in
+   cadence; settling run after >30 min idle; two-run confirmation for wins.
+4. **Standing infrastructure**: frozen serve pair (reaper-exempt, ~$1/h,
+   Adam-approved) + all tooling. Next session: exp002-k8-c confirmation,
+   then B-04/B-06/B-07 under the steady protocol.
+
+Spend: ~$9 today; ~$22 program-to-date. Batches: 3 participated (6 of 8 in
+batch 3 at close).

@@ -2997,21 +2997,18 @@ async fn validate_regtest_genesis_block() {
 fn external_address() -> Result<()> {
     let _init_guard = zakura_test::init();
     let testdir = testdir()?.with_config(&mut external_address_test_config(&Mainnet)?)?;
-    let mut child = testdir.spawn_child(args!["start"])?;
+    let mut child = testdir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
 
-    // Give enough time to start connecting to some peers.
-    std::thread::sleep(Duration::from_secs(10));
+    child.expect_stdout_line_matches("Starting zakurad")?;
+    // Wait for an actual outbound handshake to use the configured address.
+    child.expect_stdout_line_matches("using external address for Version messages")?;
 
     child.kill(false)?;
 
     let output = child.wait_with_output()?;
     let output = output.assert_failure()?;
-
-    // Zebra started
-    output.stdout_line_contains("Starting zakurad")?;
-
-    // Make sure we are using external address for Version messages.
-    output.stdout_line_contains("using external address for Version messages")?;
 
     // Make sure the command was killed.
     output.assert_was_killed()?;
@@ -4374,18 +4371,22 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     let mut config = os_assigned_rpc_port_config(false, &network)?;
     config.state.ephemeral = false;
     config.state.debug_skip_non_finalized_state_backup_task = true;
+    config.mempool.debug_enable_at_height = Some(0);
     let test_dir = testdir()?.with_config(&mut config)?;
 
     // Start Zebra and generate some blocks.
 
     tracing::info!("starting Zakura and generating some blocks");
-    let mut child = test_dir.spawn_child(args!["start"])?;
+    let mut child = test_dir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
     // Avoid dropping the test directory and cleanup of the state cache needed by the next zakurad instance.
     let test_dir = child.dir.take().expect("should have test directory");
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
-    // Wait for Zebra to load its state cache
-    tokio::time::sleep(Duration::from_secs(5)).await;
     let rpc_client = RpcRequestClient::new(rpc_address);
+    child.expect_stdout_line_matches("verified final checkpoint")?;
+    wake_debug_mempool(&rpc_client).await?;
+    child.expect_stdout_line_matches("activating mempool")?;
     let generated_block_hashes = rpc_client.generate(INITIAL_NON_FINALIZED_BLOCKS).await?;
 
     child.kill(true)?;
@@ -4406,13 +4407,13 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     // max checkpoint height and that it can still commit more blocks to its state.
 
     tracing::info!("restarting Zakura to check that non-finalized state is restored");
-    let mut child = test_dir.spawn_child(args!["start"])?;
+    let mut child = test_dir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
     let test_dir = child.dir.take().expect("should have test directory");
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
     let rpc_client = RpcRequestClient::new(rpc_address);
 
-    // Wait for Zebra to load its state cache
-    tokio::time::sleep(Duration::from_secs(5)).await;
     let blockchain_info = rpc_client.blockchain_info().await?;
     tracing::info!(
         ?blockchain_info,
@@ -4426,6 +4427,8 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     );
 
     tracing::info!("checking that Zakura can commit blocks after restoring non-finalized state");
+    wake_debug_mempool(&rpc_client).await?;
+    child.expect_stdout_line_matches("activating mempool")?;
     rpc_client
         .generate(1)
         .await
@@ -4466,13 +4469,13 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     });
     let mut config = os_assigned_rpc_port_config(false, &network)?;
     config.state.ephemeral = false;
+    config.mempool.debug_enable_at_height = Some(0);
     let mut child = test_dir
         .with_config(&mut config)?
-        .spawn_child(args!["start"])?;
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
     let test_dir = child.dir.take().expect("should have test directory");
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
-    // Wait for Zebra to load its state cache
-    tokio::time::sleep(Duration::from_secs(5)).await;
     let rpc_client = RpcRequestClient::new(rpc_address);
 
     assert_eq!(
@@ -4495,6 +4498,8 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     // Commit a block to check that Zebra's state will still commit blocks
     // after checkpoint verification.
 
+    wake_debug_mempool(&rpc_client).await?;
+    child.expect_stdout_line_matches("activating mempool")?;
     rpc_client
         .generate(1)
         .await
@@ -4516,20 +4521,30 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     config.state.should_backup_non_finalized_state = false;
     let mut child = test_dir
         .with_config(&mut config)?
-        .spawn_child(args!["start"])?;
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
     let rpc_client = RpcRequestClient::new(rpc_address);
 
-    // Wait for Zebra to load its state cache
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
     tracing::info!("checking that Zakura commits blocks with empty non-finalized state");
+    wake_debug_mempool(&rpc_client).await?;
+    child.expect_stdout_line_matches("activating mempool")?;
     rpc_client
         .generate(1)
         .await
         .expect("should successfully commit more blocks to the state");
 
     child.kill(true)
+}
+
+/// Prompt the mempool service to apply its debug activation setting.
+async fn wake_debug_mempool(rpc_client: &RpcRequestClient) -> Result<()> {
+    let _: Value = rpc_client
+        .json_result_from_call("getmempoolinfo", "[]")
+        .await
+        .map_err(|error| eyre!(error))?;
+
+    Ok(())
 }
 
 /// Check that Zebra will disconnect from misbehaving peers.

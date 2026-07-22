@@ -2646,20 +2646,20 @@ impl ZakuraDiscoveryBook {
         // — was attacker-paced, allocation-heavy work performed while holding the global discovery
         // mutex. Per-call clone work is now bounded by `limit`, not the book size. See finding
         // `claude-discovery-expensive-work-under-global-mutex` (SR-2/SR-4).
-        self.entries
-            .iter()
-            .filter(|(node_id, entry)| {
-                !exclude_node_ids.contains(*node_id)
-                    && self.local_node_id != Some(**node_id)
-                    && !entry_is_expired(entry, now)
-                    && has_wanted_services(&entry.record, wanted_services)
-                    && has_discovery_dialable_direct_addrs(&entry.record)
-            })
-            .map(|(_, entry)| &entry.record)
-            .choose_multiple(rng, limit)
-            .into_iter()
-            .cloned()
-            .collect()
+        choose_multiple_cloned(
+            self.entries
+                .iter()
+                .filter(|(node_id, entry)| {
+                    !exclude_node_ids.contains(*node_id)
+                        && self.local_node_id != Some(**node_id)
+                        && !entry_is_expired(entry, now)
+                        && has_wanted_services(&entry.record, wanted_services)
+                        && has_discovery_dialable_direct_addrs(&entry.record)
+                })
+                .map(|(_, entry)| &entry.record),
+            limit,
+            rng,
+        )
     }
 
     /// Returns bounded dial candidates for later dial-loop code.
@@ -3019,6 +3019,23 @@ impl ZakuraDiscoveryBook {
                     .map(|(node_id, _)| *node_id)
             })
     }
+}
+
+/// Chooses at most `limit` references, then clones only the chosen values.
+fn choose_multiple_cloned<'a, T, R>(
+    values: impl Iterator<Item = &'a T>,
+    limit: usize,
+    rng: &mut R,
+) -> Vec<T>
+where
+    T: Clone + 'a,
+    R: rand::Rng + ?Sized,
+{
+    values
+        .choose_multiple(rng, limit)
+        .into_iter()
+        .cloned()
+        .collect()
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -4394,7 +4411,14 @@ fn u16_from_usize(value: usize, field: &'static str) -> Result<u16, DiscoveryWir
 
 #[cfg(test)]
 mod tests {
-    use std::{net::IpAddr, time::Duration};
+    use std::{
+        net::IpAddr,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use iroh::SecretKey;
     use rand::{rngs::OsRng, rngs::StdRng, SeedableRng};
@@ -7655,94 +7679,38 @@ mod tests {
     /// (`max_records`, default 10_000) — even though at most `max_imported_records_per_response`
     /// records are ever returned. The clone is now bounded to the chosen sample.
     ///
-    /// The bound is proven machine-independently by comparing the production `sample_peers` against
-    /// an in-test reference that reproduces the pre-fix clone-the-whole-filtered-set behavior, over
-    /// the same large book in the same run. With the fix, production clones only the returned sample
-    /// and is markedly cheaper than the clone-everything reference; before the fix the two are the
-    /// same computation, so the production-is-cheaper bound fails.
+    /// The bound is proven machine-independently by counting clones in the same
+    /// helper used by `sample_peers`.
     #[test]
     fn sample_peers_clone_cost_is_bounded_by_returned_sample() {
-        const BOOK: usize = 1024;
-        const ITERS: usize = 400;
+        const BOOK_SIZE: usize = 1024;
+        const SAMPLE_LIMIT: usize = MAX_DISCOVERY_RECORDS_PER_RESPONSE;
 
-        let wanted = service(1);
-        // Heavy records (maximum direct-address fan-out plus many services, with the wanted service
-        // first so the filter match itself stays cheap) make each *record clone* far more expensive
-        // than the allocation-free per-entry filter scan, so the clone count is the dominant cost
-        // and the bounded-vs-unbounded clone gap is large.
-        let addrs: Vec<SocketAddr> = (1u8..=MAX_DIRECT_ADDRS_PER_RECORD as u8)
-            .map(test_addr)
-            .collect();
-        let mut services = vec![wanted.clone()];
-        services.extend((100..100 + (MAX_SERVICES_PER_RECORD - 1)).map(service));
-
-        let mut book = ZakuraDiscoveryBook::new(ZakuraDiscoveryBookLimits {
-            max_records: BOOK,
-            ..ZakuraDiscoveryBookLimits::default()
-        });
-        for seq in 0..BOOK {
-            let secret = secret_key();
-            let mut record_body = body(&secret);
-            record_body.sequence = seq as u64 + 1;
-            record_body.direct_addrs = addrs.clone();
-            record_body.services = services.clone();
-            let record = ZakuraNodeRecord::sign(record_body, &secret).expect("test record signs");
-            book.import_record(record, None, NOW, &context())
-                .expect("test record imports");
+        struct CloneCounter {
+            clone_count: Arc<AtomicUsize>,
         }
 
-        let cap = book.limits.max_imported_records_per_response;
+        impl Clone for CloneCounter {
+            fn clone(&self) -> Self {
+                self.clone_count.fetch_add(1, Ordering::Relaxed);
+                Self {
+                    clone_count: Arc::clone(&self.clone_count),
+                }
+            }
+        }
 
-        // Reference implementation: the pre-fix behavior of cloning every record that passes the
-        // filter, then reservoir-sampling the clones. Mirrors `sample_peers`'s filter exactly.
-        let naive_sample =
-            |book: &ZakuraDiscoveryBook, rng: &mut StdRng| -> Vec<ZakuraNodeRecord> {
-                book.entries
-                    .iter()
-                    .filter(|(node_id, entry)| {
-                        book.local_node_id != Some(**node_id)
-                            && !entry_is_expired(entry, NOW)
-                            && has_wanted_services(&entry.record, std::slice::from_ref(&wanted))
-                            && has_discovery_dialable_direct_addrs(&entry.record)
-                    })
-                    .map(|(_, entry)| entry.record.clone())
-                    .choose_multiple(rng, cap)
-            };
-
+        let clone_count = Arc::new(AtomicUsize::new(0));
+        let records: Vec<_> = (0..BOOK_SIZE)
+            .map(|_| CloneCounter {
+                clone_count: Arc::clone(&clone_count),
+            })
+            .collect();
         let mut rng = StdRng::seed_from_u64(5);
 
-        // Warm up the allocator and instruction caches before timing.
-        let _ = naive_sample(&book, &mut rng);
-        let _ = book.sample_peers(cap, std::slice::from_ref(&wanted), &[], NOW, &mut rng);
+        let sample = choose_multiple_cloned(records.iter(), SAMPLE_LIMIT, &mut rng);
 
-        let naive_start = std::time::Instant::now();
-        for _ in 0..ITERS {
-            assert_eq!(naive_sample(&book, &mut rng).len(), cap);
-        }
-        let naive_time = naive_start.elapsed();
-
-        let production_start = std::time::Instant::now();
-        for _ in 0..ITERS {
-            assert_eq!(
-                book.sample_peers(cap, std::slice::from_ref(&wanted), &[], NOW, &mut rng)
-                    .len(),
-                cap
-            );
-        }
-        let production_time = production_start.elapsed();
-
-        // Both run the same O(book) filter scan and reservoir sampling; the only difference is how
-        // many records are cloned (production: the returned `cap`; reference: every match in the
-        // book). With the bound in place production must be clearly cheaper than cloning the whole
-        // filtered set. Before the fix they are the identical computation, so production is not
-        // meaningfully cheaper and this fails. The 0.8 factor is a ratio on the same machine, so it
-        // is machine-independent.
-        assert!(
-            production_time.as_nanos() * 5 < naive_time.as_nanos() * 4,
-            "sample_peers did not bound its clone work: production={production_time:?} \
-             clone-everything reference={naive_time:?}; production should be clearly cheaper than \
-             cloning every filtered record"
-        );
+        assert_eq!(sample.len(), SAMPLE_LIMIT);
+        assert_eq!(clone_count.load(Ordering::Relaxed), SAMPLE_LIMIT);
     }
 
     /// Guards the bounded top-k dial-candidate selection added for

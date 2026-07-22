@@ -1144,11 +1144,17 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
         .extend_funding_streams()
         .to_network()
         .expect("failed to build configured network");
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("NU5 activation height is configured");
+    // The poisoned target is NU5 + 1, and its successor is also required.
+    let tested_block_count =
+        usize::try_from(nu5_height.0 + 3).expect("test activation height fits in usize");
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
     proptest!(ProptestConfig::with_cases(1),
-        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+        |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
 
             let blocks: Vec<_> = chain.iter().collect();
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
@@ -1460,6 +1466,12 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
         .extend_funding_streams()
         .to_network()
         .expect("failed to build configured network");
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("NU5 activation height is configured");
+    // The handoff is NU5 + 3, so generate exactly through that height.
+    let tested_block_count =
+        usize::try_from(nu5_height.0 + 4).expect("test activation height fits in usize");
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -1467,7 +1479,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES)),
-        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+        |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
 
             let blocks: Vec<_> = chain.iter().collect();
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
@@ -1805,11 +1817,17 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
         .extend_funding_streams()
         .to_network()
         .expect("failed to build configured network");
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("NU5 activation height is configured");
+    // The test consumes two blocks after its NU5 + 3 handoff.
+    let tested_block_count =
+        usize::try_from(nu5_height.0 + 6).expect("test activation height fits in usize");
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
     proptest!(ProptestConfig::with_cases(1),
-        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+        |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
             let blocks: Vec<_> = chain.iter().collect();
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
             let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;

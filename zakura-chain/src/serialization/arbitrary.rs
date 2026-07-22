@@ -85,7 +85,7 @@ impl Arbitrary for CompactSizeMessage {
     type Strategy = BoxedStrategy<Self>;
 }
 
-/// Allocate a maximum-sized vector of cloned `item`s, and serialize that array.
+/// Calculate the serialized sizes immediately around `item`'s allocation limit.
 ///
 /// Returns the following calculations on `item`:
 ///   smallest_disallowed_vec_len
@@ -100,24 +100,31 @@ where
     T: TrustedPreallocate + ZcashSerialize + Clone,
 {
     let max_allocation: usize = T::max_allocation().try_into().unwrap();
-    let mut smallest_disallowed_vec = vec![item; max_allocation + 1];
+    let smallest_disallowed_vec_len = max_allocation + 1;
+    let largest_allowed_vec_len = max_allocation;
+    let item_len = item.zcash_serialized_size();
 
-    let smallest_disallowed_serialized = smallest_disallowed_vec
-        .zcash_serialize_to_vec()
-        .expect("Serialization to vec must succeed");
-    let smallest_disallowed_vec_len = smallest_disallowed_vec.len();
-
-    // Create largest_allowed_vec by removing one element from smallest_disallowed_vec without copying (for efficiency)
-    smallest_disallowed_vec.pop();
-    let largest_allowed_vec = smallest_disallowed_vec;
-    let largest_allowed_serialized = largest_allowed_vec
-        .zcash_serialize_to_vec()
-        .expect("Serialization to vec must succeed");
+    // A vector of identical clones is a CompactSize count followed by the
+    // identical serialization of each item. Calculate that exact size without
+    // allocating and serializing multi-megabyte test vectors.
+    let serialized_vec_len = |len: usize| {
+        let count: CompactSizeMessage = len
+            .try_into()
+            .expect("trusted allocation limits fit in a protocol message");
+        count
+            .zcash_serialized_size()
+            .checked_add(
+                item_len
+                    .checked_mul(len)
+                    .expect("test vector serialized size fits in usize"),
+            )
+            .expect("test vector serialized size fits in usize")
+    };
 
     (
         smallest_disallowed_vec_len,
-        smallest_disallowed_serialized.len(),
-        largest_allowed_vec.len(),
-        largest_allowed_serialized.len(),
+        serialized_vec_len(smallest_disallowed_vec_len),
+        largest_allowed_vec_len,
+        serialized_vec_len(largest_allowed_vec_len),
     )
 }

@@ -24,7 +24,9 @@ use crate::{
     error::CommitHeaderRangeError,
     service::{
         check,
-        finalized_state::{FinalizedState, ZakuraDb},
+        finalized_state::{
+            FinalizedState, HighestCompletedCheckpoint, HighestCompletedCheckpointTracker, ZakuraDb,
+        },
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
@@ -164,12 +166,20 @@ fn update_latest_chain_channels(
 
 fn commit_header_range(
     finalized_state: &FinalizedState,
+    completed_checkpoint: &mut HighestCompletedCheckpointTracker,
     anchor: block::Hash,
     headers: Vec<Arc<block::Header>>,
     body_sizes: Vec<u32>,
     tree_aux_roots: Vec<BlockCommitmentRoots>,
     rsp_tx: oneshot::Sender<Result<block::Hash, CommitHeaderRangeError>>,
 ) {
+    if let Err(height) =
+        completed_checkpoint.check_immutable_conflicts(&finalized_state.db, anchor, &headers)
+    {
+        let _ = rsp_tx.send(Err(CommitHeaderRangeError::ImmutableConflict { height }));
+        return;
+    }
+
     let mut batch = crate::service::finalized_state::DiskWriteBatch::new();
     let result = batch
         .prepare_header_range_batch_with_roots(
@@ -180,10 +190,18 @@ fn commit_header_range(
             &tree_aux_roots,
         )
         .and_then(|hash| {
+            let proposed = completed_checkpoint.propose_after_headers(
+                &finalized_state.db,
+                anchor,
+                &headers,
+            )?;
             finalized_state
                 .db
                 .write_batch(batch)
-                .map(|()| hash)
+                .map(|()| {
+                    completed_checkpoint.commit_success(proposed);
+                    hash
+                })
                 .map_err(|error| {
                     tracing::error!(?error, "failed to write validated header range");
 
@@ -215,6 +233,7 @@ struct WriteBlockWorkerTask {
     non_finalized_rejected_sender: UnboundedSender<block::Hash>,
     chain_tip_sender: ChainTipSender,
     non_finalized_state_sender: watch::Sender<NonFinalizedState>,
+    highest_completed_checkpoint: HighestCompletedCheckpointTracker,
     vct_root_repair_sender: watch::Sender<VctRootRepairStatus>,
     /// If `Some`, the non-finalized state is written to this backup directory
     /// synchronously before each channel update, instead of via the async backup task.
@@ -292,6 +311,7 @@ impl BlockWriteSender {
         Self,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
+        watch::Receiver<Option<HighestCompletedCheckpoint>>,
         watch::Receiver<VctRootRepairStatus>,
         Option<Arc<std::thread::JoinHandle<()>>>,
     ) {
@@ -307,6 +327,10 @@ impl BlockWriteSender {
             tokio::sync::mpsc::unbounded_channel();
         let (vct_root_repair_sender, vct_root_repair_receiver) =
             watch::channel(VctRootRepairStatus::default());
+        let (highest_completed_checkpoint, highest_completed_checkpoint_receiver) =
+            HighestCompletedCheckpointTracker::open(&finalized_state.db).expect(
+                "highest completed checkpoint reconstructs after startup header-store audit",
+            );
 
         let seed_zakura_header_from_best_chain_commits = finalized_state
             .db
@@ -326,6 +350,7 @@ impl BlockWriteSender {
                     non_finalized_rejected_sender,
                     chain_tip_sender,
                     non_finalized_state_sender,
+                    highest_completed_checkpoint,
                     vct_root_repair_sender,
                     backup_dir_path,
                 }
@@ -341,6 +366,7 @@ impl BlockWriteSender {
             },
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
+            highest_completed_checkpoint_receiver,
             vct_root_repair_receiver,
             Some(Arc::new(task)),
         )
@@ -368,6 +394,7 @@ impl WriteBlockWorkerTask {
             non_finalized_rejected_sender,
             chain_tip_sender,
             non_finalized_state_sender,
+            highest_completed_checkpoint,
             vct_root_repair_sender,
             seed_zakura_header_from_best_chain_commits,
             backup_dir_path,
@@ -393,6 +420,7 @@ impl WriteBlockWorkerTask {
                 }) => {
                     commit_header_range(
                         finalized_state,
+                        highest_completed_checkpoint,
                         anchor,
                         headers,
                         body_sizes,
@@ -497,6 +525,14 @@ impl WriteBlockWorkerTask {
                 next_vct_block,
             ) {
                 Ok((finalized, note_commitment_trees)) => {
+                    if let Err(error) =
+                        highest_completed_checkpoint.rebind_from_db(&finalized_state.db)
+                    {
+                        tracing::warn!(
+                            ?error,
+                            "failed to refresh highest completed checkpoint after finalized block commit"
+                        );
+                    }
                     // Whether this successful commit consumed header-carried
                     // tree-aux roots to skip the note-commitment frontier rebuild.
                     if next_block_took_vct_path {
@@ -589,6 +625,7 @@ impl WriteBlockWorkerTask {
                 } => {
                     commit_header_range(
                         finalized_state,
+                        highest_completed_checkpoint,
                         anchor,
                         headers,
                         body_sizes,
@@ -686,6 +723,7 @@ impl WriteBlockWorkerTask {
             ) {
                 seed_zakura_header_from_committed_block(
                     &finalized_state.db,
+                    highest_completed_checkpoint,
                     child_height,
                     &child_block,
                 );
@@ -726,6 +764,13 @@ impl WriteBlockWorkerTask {
                     )
                     .1
                     .into();
+                if let Err(error) = highest_completed_checkpoint.rebind_from_db(&finalized_state.db)
+                {
+                    tracing::warn!(
+                        ?error,
+                        "failed to refresh highest completed checkpoint after finalized block commit"
+                    );
+                }
             }
 
             // Update the metrics if semantic and contextual validation passes
@@ -754,11 +799,18 @@ impl WriteBlockWorkerTask {
 
 fn seed_zakura_header_from_committed_block(
     finalized_state: &ZakuraDb,
+    highest_completed_checkpoint: &mut HighestCompletedCheckpointTracker,
     height: block::Height,
     block: &Arc<block::Block>,
 ) {
     match finalized_state.seed_zakura_header_from_committed_block(height, block) {
         Ok(()) => {
+            if let Err(error) = highest_completed_checkpoint.rebind_from_db(finalized_state) {
+                tracing::warn!(
+                    ?error,
+                    "failed to refresh highest completed checkpoint after seeding a header"
+                );
+            }
             tracing::trace!(?height, hash = ?block.hash(), "seeded Zakura header from committed block");
         }
         Err(error) => {
@@ -792,7 +844,9 @@ mod tests {
     use crate::{
         arbitrary::Prepare,
         service::{
-            finalized_state::{DiskWriteBatch, FinalizedState, WriteDisk},
+            finalized_state::{
+                DiskWriteBatch, FinalizedState, HighestCompletedCheckpointTracker, WriteDisk,
+            },
             non_finalized_state::NonFinalizedState,
             write::{
                 seed_zakura_header_from_committed_block,
@@ -860,7 +914,15 @@ mod tests {
             best_height,
             best_block.hash(),
         ));
-        seed_zakura_header_from_committed_block(&finalized_state.db, best_height, &best_block);
+        let (mut completed_checkpoint, _receiver) =
+            HighestCompletedCheckpointTracker::open(&finalized_state.db)
+                .expect("checkpoint tracker opens");
+        seed_zakura_header_from_committed_block(
+            &finalized_state.db,
+            &mut completed_checkpoint,
+            best_height,
+            &best_block,
+        );
 
         non_finalized_state
             .commit_new_chain(side_block.clone().prepare(), &finalized_state)

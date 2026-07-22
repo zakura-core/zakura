@@ -33,12 +33,13 @@ no earlier Zakura releases to describe deltas against:
 
 After v1.0.0, normal changelog maintenance (everything below) resumes.
 
-## One fragment per pull request
+## One fragment per Rust pull request
 
-Ordinary PRs do not edit the shared root changelog. After opening a draft PR,
-add exactly one `changelog-unreleased/<PR-number>.md` file. Keeping each PR in
-its own file avoids merge conflicts while preserving the link between the
-change, its review, and its release note.
+PRs that change a Rust source file or any `Cargo.toml` do not edit the shared
+root changelog. After opening a draft PR, add exactly one
+`changelog-unreleased/<PR-number>.md` file. Keeping each PR in its own file
+avoids merge conflicts while preserving the link between the change, its
+review, and its release note. Other PRs do not need a fragment.
 
 A user-visible fragment contains one or more Keep a Changelog categories:
 
@@ -49,8 +50,8 @@ A user-visible fragment contains one or more Keep a Changelog categories:
   ([#123](https://github.com/zakura-core/zakura/pull/123)).
 ```
 
-Internal-only PRs still own a fragment, but use an explicit exclusion with a
-reason:
+Internal-only Rust or `Cargo.toml` PRs still own a fragment, but use an explicit
+exclusion with a reason:
 
 ```markdown
 <!-- changelog: none -->
@@ -58,9 +59,9 @@ reason:
 This PR only changes tests and has no operator-visible effect.
 ```
 
-Dependabot and release PRs are the only automated exceptions to the one-file
-check. The `C-exclude-from-changelog` label remains useful release metadata,
-but does not replace the explicit fragment for ordinary PRs.
+Dependabot and release PRs are automated exceptions to the one-file check. The
+`C-exclude-from-changelog` label remains useful release metadata, but does not
+replace the explicit fragment for Rust or `Cargo.toml` PRs.
 
 Run `./scripts/changelog.py check` locally. CI validates the syntax and checks
 that the fragment filename matches the PR number. The concise format reference
@@ -73,8 +74,8 @@ is in
   follow [Semantic Versioning](https://semver.org).
 - Add a fragment entry in the same PR as any **user-visible** change: behavior,
   RPCs, command-line, configuration, performance, or supported platforms.
-- Use the explicit no-changelog fragment for internal-only changes such as
-  refactors, CI, tests, and docs.
+- Use the explicit no-changelog fragment for internal-only Rust or
+  `Cargo.toml` changes such as refactors and tests.
 - Categories: `### Added`, `### Changed`, `### Deprecated`, `### Removed`,
   `### Fixed`, `### Security`. Prefer `Fixed` if you're not sure.
 - Write for node operators: describe the observable effect, not the

@@ -337,20 +337,17 @@ fn start_no_args() -> Result<()> {
     // start caches state, so run one of the start tests with persistent state
     let testdir = testdir()?.with_config(&mut persistent_test_config(&Mainnet)?)?;
 
-    let mut child = testdir.spawn_child(args!["-v", "start"])?;
+    let mut child = testdir
+        .spawn_child(args!["-v", "start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
 
-    // Run the program and kill it after a few seconds
-    std::thread::sleep(LAUNCH_DELAY);
+    child.expect_stdout_line_matches("Starting zakurad")?;
+    child.expect_stdout_line_matches("starting legacy chain check")?;
+    child.expect_stdout_line_matches("no legacy chain found")?;
     child.kill(false)?;
 
     let output = child.wait_with_output()?;
     let output = output.assert_failure()?;
-
-    output.stdout_line_contains("Starting zakurad")?;
-
-    // Make sure the command passed the legacy chain check
-    output.stdout_line_contains("starting legacy chain check")?;
-    output.stdout_line_contains("no legacy chain found")?;
 
     // Make sure the command was killed
     output.assert_was_killed()?;
@@ -365,9 +362,10 @@ fn start_args() -> Result<()> {
     let testdir = testdir()?.with_config(&mut default_test_config(&Mainnet))?;
     let testdir = &testdir;
 
-    let mut child = testdir.spawn_child(args!["start"])?;
-    // Run the program and kill it after a few seconds
-    std::thread::sleep(LAUNCH_DELAY);
+    let mut child = testdir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
+    child.expect_stdout_line_matches("Starting zakurad")?;
     child.kill(false)?;
     let output = child.wait_with_output()?;
 

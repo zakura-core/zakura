@@ -272,12 +272,18 @@ status = "unimplemented"
 [[rule]]
 id = "LC-SELECT-01"
 name = "Eligible-path filtering"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::MemHeaderStore::eligible_tips"
+tests = ["DG-01::fork_indexes_selection_and_inherited_reason_sets_are_exact", "DG-01::arbitrary_graph_operations_match_an_independent_uncached_model"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-SELECT-02"
 name = "Greatest-work selection"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::MemHeaderStore::select_header_best"
+tests = ["DG-01::insertion_permutations_match_an_independent_greatest_work_model", "DG-01::arbitrary_graph_operations_match_an_independent_uncached_model"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-SELECT-03"
@@ -290,12 +296,18 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-SELECT-04"
 name = "Deterministic selection"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::MemHeaderStore::select_header_best"
+tests = ["DG-01::insertion_permutations_match_an_independent_greatest_work_model", "DG-01::arbitrary_graph_operations_match_an_independent_uncached_model"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-REORG-01"
 name = "Finalized-anchor reorganization"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::MemHeaderStore::select_header_best"
+tests = ["DG-05::fixed_anchor_selection_has_no_incumbent_relative_rollback_horizon"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-FINAL-01"
@@ -320,17 +332,26 @@ status = "unimplemented"
 [[rule]]
 id = "LC-RETAIN-01"
 name = "Fork and node limits"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::enforce_retention"
+tests = ["DG-06::candidate_tip_eviction_is_lowest_work_then_smallest_raw_hash", "DG-06::exact_v1_node_boundary_refuses_to_evict_the_selected_path", "DG-06::protected_paths_and_context_references_fail_closed_under_node_pressure"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-RETAIN-02"
 name = "Deterministic eviction order"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::enforce_retention"
+tests = ["DG-06::permanent_subtrees_are_evicted_first_only_under_pressure", "DG-06::candidate_tip_eviction_is_lowest_work_then_smallest_raw_hash"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-RETAIN-03"
 name = "Eviction is not invalidity"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::RetentionPlan"
+tests = ["DG-06::candidate_tip_eviction_is_lowest_work_then_smallest_raw_hash"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-RETAIN-04"
@@ -400,7 +421,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-AVAIL-03"
 name = "Availability-neutral fork choice"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::MemHeaderStore::select_header_best"
+tests = ["DG-02::body_availability_does_not_override_header_work_or_mark_other_bodies"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-WORK-01"

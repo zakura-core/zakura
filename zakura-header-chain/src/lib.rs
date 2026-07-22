@@ -6,7 +6,10 @@
 mod config;
 mod error;
 mod frontier;
+mod graph;
 mod ids;
+mod node;
+mod retention;
 mod validation;
 
 pub use config::{
@@ -16,10 +19,16 @@ pub use error::{Attribution, ErrorCategory, ErrorSubject, HeaderChainError, Rule
 pub use frontier::{
     ChainScore, Frontier, FrontierSet, SuffixWork, WorkCoordinate, WorkCoordinateError,
 };
+pub use graph::{GraphError, InsertResult, MemHeaderStore};
 pub use ids::{
     BranchId, CounterExhausted, EvidenceId, FinalityEpoch, HeaderGeneration, HeaderId,
     OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration, WorkOwner,
 };
+pub use node::{
+    BodyRuleId, BodyUnavailableSummary, BodyValidationState, EligibilityReason, EligibilityState,
+    HeaderNode, HeaderValidationState,
+};
+pub use retention::{enforce_retention, RetentionPlan};
 pub use validation::{
     infer_height, validate_commitment_structure, validate_compact_target,
     validate_contextual_difficulty_and_time, validate_encoding_version_hash, validate_future_time,

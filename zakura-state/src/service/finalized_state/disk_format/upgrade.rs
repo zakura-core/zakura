@@ -127,8 +127,10 @@ fn format_upgrades(
         )),
         Box::new(add_ironwood_tree::Upgrade),
         Box::new(repair_vct_sprout_history::Upgrade::new(prepared_vct_repair)),
-        Box::new(header_root_auth_frontier::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 11])
+        // `header_root_auth_frontier::Upgrade` stays unregistered until the
+        // authenticated-root cutover lands. The module and CF scaffolding ship
+        // first; enabling this upgrade truncates provisional header-ahead roots.
+    ] as [Box<dyn DiskFormatUpgrade>; 10])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -1085,10 +1087,9 @@ fn vct_format_changes_include_ironwood_then_sprout_repair() {
 
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0)), None).collect();
 
-    assert_eq!(upgrades.len(), 3);
+    assert_eq!(upgrades.len(), 2);
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
     assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
-    assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
     assert_eq!(
         upgrades.last().expect("repair is registered").version(),
         state_database_format_version_in_code()

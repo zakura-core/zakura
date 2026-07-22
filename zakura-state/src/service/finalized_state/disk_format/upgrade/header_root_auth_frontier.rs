@@ -1,4 +1,11 @@
 //! Removes legacy unauthenticated root rows and initializes their durable frontier.
+//!
+//! This upgrade is intentionally not registered in `format_upgrades` yet. The
+//! frontier CF, encode/decode helpers, and promotion primitive ship first while
+//! header sync continues writing provisional `tree_aux_roots`. Enable the
+//! cutover together with authenticated-root persistence.
+
+#![allow(dead_code)] // Registered when the authenticated-root cutover is enabled.
 
 use crossbeam_channel::{Receiver, TryRecvError};
 use semver::Version;

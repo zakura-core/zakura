@@ -234,13 +234,6 @@ pub enum RollbackFinalizedStateError {
     #[error("failed to rebuild history tree")]
     HistoryTree(#[from] HistoryTreeError),
 
-    /// Rebuilding the authenticated header-root frontier failed.
-    #[error("failed to rebuild header-root authentication frontier: {reason}")]
-    HeaderRootAuthFrontier {
-        /// The local frontier coherence failure.
-        reason: String,
-    },
-
     /// Computing a block subsidy failed.
     #[error("failed to compute block subsidy")]
     Subsidy(#[from] SubsidyError),
@@ -508,18 +501,6 @@ fn prepare_rollback(
 
     write_address_balances(db, &mut batch, address_balances);
     reset_tip_trees(db, &mut batch, &target_treestate);
-    batch
-        .rebase_header_root_auth_frontier(
-            db,
-            bounds.new_tip.0,
-            bounds.new_tip.1,
-            &target_treestate.history_tree,
-        )
-        .map_err(
-            |error| RollbackFinalizedStateError::HeaderRootAuthFrontier {
-                reason: error.to_string(),
-            },
-        )?;
     reset_value_pool(db, &mut batch, &target_value_pool);
     prune_tree_indexes(
         db,

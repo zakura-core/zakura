@@ -487,6 +487,7 @@ impl ZakuraDb {
         Ok(())
     }
 
+    #[allow(dead_code)] // Used by the unregistered header-root auth frontier cutover.
     pub(crate) fn prepare_header_root_auth_frontier_from_body_tip(
         &self,
         batch: &mut DiskWriteBatch,
@@ -546,10 +547,11 @@ impl ZakuraDb {
         roots
     }
 
-    /// Persists raw roots for test fixtures outside a larger transaction.
+    /// Persists raw header roots outside a larger header transaction.
     ///
-    /// Production callers must use [`Self::write_verified_header_commitment_roots`].
-    #[cfg(any(test, feature = "proptest-impl"))]
+    /// This remains the provisional header-sync write path until the
+    /// authenticated-root cutover is enabled. Prefer
+    /// [`Self::write_verified_header_commitment_roots`] once that lane is live.
     pub fn insert_zakura_header_commitment_roots(
         &self,
         roots: impl IntoIterator<Item = BlockCommitmentRoots>,
@@ -557,6 +559,18 @@ impl ZakuraDb {
         let mut batch = DiskWriteBatch::new();
         for roots in roots {
             batch.insert_legacy_header_commitment_roots(self, &roots);
+        }
+        self.write_batch(batch)
+    }
+
+    /// Deletes provisional header roots outside a larger header transaction.
+    pub fn delete_zakura_header_commitment_roots(
+        &self,
+        heights: impl IntoIterator<Item = Height>,
+    ) -> Result<(), rocksdb::Error> {
+        let mut batch = DiskWriteBatch::new();
+        for height in heights {
+            batch.delete_legacy_header_commitment_root(self, height);
         }
         self.write_batch(batch)
     }
@@ -629,6 +643,7 @@ impl DiskWriteBatch {
             );
     }
 
+    #[allow(dead_code)] // Wired when body tip owns the authenticated frontier.
     pub(crate) fn advance_header_root_auth_frontier_from_body(
         &mut self,
         db: &ZakuraDb,
@@ -648,6 +663,7 @@ impl DiskWriteBatch {
         self.rebase_header_root_auth_frontier(db, confirmed_height, confirmed_hash, history_tree)
     }
 
+    #[allow(dead_code)] // Wired when body tip owns the authenticated frontier.
     pub(crate) fn rebase_header_root_auth_frontier(
         &mut self,
         db: &ZakuraDb,
@@ -667,6 +683,7 @@ impl DiskWriteBatch {
         Ok(())
     }
 
+    #[allow(dead_code)] // Wired when the authenticated-root cutover is enabled.
     pub(crate) fn delete_header_root_auth_frontier(&mut self, db: &ZakuraDb) {
         let _ = db
             .header_root_auth_frontier_cf()
@@ -674,6 +691,7 @@ impl DiskWriteBatch {
             .zs_delete(&RawBytes::new_raw_bytes(Vec::new()));
     }
 
+    #[allow(dead_code)] // Wired when the authenticated-root cutover is enabled.
     pub(crate) fn truncate_all_commitment_roots(&mut self, db: &ZakuraDb) {
         let writer = db
             .commitment_roots_cf()
@@ -687,7 +705,6 @@ impl DiskWriteBatch {
     ///
     /// "Legacy" identifies the temporary pre-authentication behavior where header sync persists
     /// peer-supplied roots directly. The verified-root persistence boundary will replace this path.
-    #[cfg(any(test, feature = "proptest-impl"))]
     pub(super) fn insert_legacy_header_commitment_roots(
         &mut self,
         db: &ZakuraDb,

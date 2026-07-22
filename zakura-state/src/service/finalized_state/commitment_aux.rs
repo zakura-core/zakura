@@ -384,10 +384,10 @@ pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// Discard the supplied root for `height` so a later [`vct_root`](Self::vct_root)
     /// returns `None` for it.
     ///
-    /// Called by the committer when a supplied root fails body verification.
-    ///
-    /// Authenticated rows are durable state and must not be deleted individually,
-    /// because that would create a gap below the persisted frontier.
+    /// Called by the committer when a supplied root fails verification: dropping the bad
+    /// root un-poisons the store so a re-fetch from a different peer can replace it, rather
+    /// than the committer re-reading the same rejected root forever. The default is a no-op
+    /// for test-only local sources; the peer source overrides it.
     fn invalidate(&self, _height: block::Height) {}
 }
 
@@ -440,11 +440,12 @@ impl CommitmentRootSource for FixtureSource {
     }
 }
 
-/// A [`CommitmentRootSource`] backed by authenticated header-ahead roots in `db`.
+/// A [`CommitmentRootSource`] backed by provisional header-ahead roots in `db`.
 ///
-/// State persists only roots sealed by header-root verification ahead of body commit;
-/// the committer reads them per height through the [`CommitmentRootSource`] seam.
-/// Tests can still fill fixture roots directly. The handoff frontier is embedded in the binary, held
+/// Header sync persists peer-supplied roots into `db` ahead of body commit
+/// ([`ZakuraDb::insert_zakura_header_commitment_roots`]); the committer reads them per
+/// height through the [`CommitmentRootSource`] seam, and tests fill roots through the
+/// same database write path. The handoff frontier is embedded in the binary, held
 /// immutably here and never fetched over the network — a peer source always has one,
 /// because peer mode is only selected on networks with an embedded frontier. Committed
 /// rows are cleaned up by the database's own retention, not through this seam.
@@ -455,7 +456,7 @@ pub(super) struct PeerSource {
 }
 
 impl PeerSource {
-    /// Create a source backed by authenticated header-ahead roots in `db`. `frontiers`
+    /// Create a source backed by provisional header-ahead roots in `db`. `frontiers`
     /// is the embedded handoff frontier for the network.
     pub(super) fn new(db: ZakuraDb, frontiers: FinalFrontiers) -> Self {
         PeerSource { db, frontiers }
@@ -479,6 +480,13 @@ impl CommitmentRootSource for PeerSource {
     }
     fn final_frontiers(&self) -> &FinalFrontiers {
         &self.frontiers
+    }
+    fn invalidate(&self, height: block::Height) {
+        // Drop the rejected root so the next read misses; header sync can then deliver a
+        // verifiable replacement for this height from another peer.
+        if let Err(error) = self.db.delete_zakura_header_commitment_roots([height]) {
+            tracing::debug!(?error, ?height, "failed to delete rejected VCT root");
+        }
     }
 }
 
@@ -1447,9 +1455,13 @@ mod tests {
         );
     }
 
-    /// Body mismatch invalidation must not create a gap below the durable frontier.
+    /// The peer source reads roots persisted by the header-sync write path, and
+    /// `invalidate` deletes a root so a later read misses it, letting the driver re-fetch
+    /// a verifiable replacement from another peer. This un-poisons the store after a bad
+    /// root is rejected by the committer, so one malicious peer cannot wedge the same
+    /// rejected root in place forever. Exercises the same database rows production uses.
     #[test]
-    fn peer_source_keeps_authenticated_roots_on_body_mismatch() {
+    fn peer_source_reads_and_invalidates_header_sync_roots() {
         let db = ephemeral_mainnet_db();
         db.insert_zakura_header_commitment_roots([BlockCommitmentRoots {
             height: block::Height(42),
@@ -1485,14 +1497,9 @@ mod tests {
 
         source.invalidate(block::Height(42));
 
-        assert_eq!(
-            source.vct_root(block::Height(42)),
-            Some((
-                sapling::tree::NoteCommitmentTree::default().root(),
-                orchard::tree::NoteCommitmentTree::default().root(),
-                ironwood::tree::NoteCommitmentTree::default().root(),
-            )),
-            "body mismatch must not delete one authenticated row below the frontier"
+        assert!(
+            source.vct_root(block::Height(42)).is_none(),
+            "an invalidated root is gone, so the next read misses and a re-fetch can replace it"
         );
     }
 }

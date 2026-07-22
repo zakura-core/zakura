@@ -1866,9 +1866,11 @@ impl ZakuraDiscoveryHandle {
             return Ok(());
         }
 
-        let Some(expires_at_unix_secs) =
-            effective_live_summary_expiry(services.expires_at_unix_secs, now)
-        else {
+        let Some(expires_at_unix_secs) = effective_live_summary_expiry(
+            services.expires_at_unix_secs,
+            now,
+            inner.config.clock_skew_tolerance,
+        ) else {
             if let Some(entry) = inner.active_services.get_mut(&peer_node_id) {
                 entry.live_summaries.clear();
                 if entry.record.is_none() {
@@ -3365,14 +3367,22 @@ fn push_unique_service(services: &mut Vec<ZakuraServiceId>, service: ZakuraServi
     }
 }
 
-fn effective_live_summary_expiry(declared_expires_at: u64, now_unix_secs: u64) -> Option<u64> {
-    if declared_expires_at <= now_unix_secs {
+fn effective_live_summary_expiry(
+    declared_expires_at: u64,
+    now_unix_secs: u64,
+    clock_skew_tolerance: Duration,
+) -> Option<u64> {
+    let local_expiry = now_unix_secs.saturating_add(DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs());
+    if declared_expires_at > now_unix_secs {
+        return Some(declared_expires_at.min(local_expiry));
+    }
+    if declared_expires_at.saturating_add(clock_skew_tolerance.as_secs()) <= now_unix_secs {
         return None;
     }
-    Some(
-        declared_expires_at
-            .min(now_unix_secs.saturating_add(DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs())),
-    )
+    // This response arrived on the authenticated live stream but is already expired locally. Use
+    // a bounded receipt TTL only inside the accepted skew window; future expiries still honor a
+    // peer's intentionally shorter lifetime.
+    Some(local_expiry)
 }
 
 fn header_sync_candidate_preference(
@@ -6916,6 +6926,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connected_services_tolerate_clock_skew_with_a_local_receipt_ttl() {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let node_id = secret_key().public();
+        connected_tx.send_replace(vec![peer_id_for(node_id)]);
+
+        handle
+            .import_connected_peer_services_at(
+                first_party_services(
+                    node_id,
+                    NOW - 1,
+                    vec![ServiceSummaryEnvelope::discovery(&discovery_summary())
+                        .expect("test discovery summary encodes")],
+                ),
+                node_id,
+                NOW,
+            )
+            .await
+            .expect("a live first-party summary inside the clock-skew window imports");
+        let cached = handle
+            .live_service_summaries_at(node_id, NOW)
+            .await
+            .expect("clock-skew-tolerant summary remains live");
+        assert_eq!(
+            cached[0].expires_at_unix_secs,
+            NOW + DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs()
+        );
+
+        handle
+            .import_connected_peer_services_at(
+                first_party_services(
+                    node_id,
+                    NOW - DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs() - 1,
+                    vec![ServiceSummaryEnvelope::discovery(&discovery_summary())
+                        .expect("test discovery summary encodes")],
+                ),
+                node_id,
+                NOW,
+            )
+            .await
+            .expect("a stale live summary is ignored without rejecting the connection");
+        assert!(handle
+            .live_service_summaries_at(node_id, NOW)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn connected_services_mismatched_node_id_rejected_without_live_summary() {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handle = discovery_handle_with_connected(connected_rx);
@@ -7249,7 +7307,7 @@ mod tests {
             .import_connected_peer_services_at(
                 first_party_services(
                     preferred_id,
-                    now,
+                    now.saturating_sub(DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs()),
                     vec![ServiceSummaryEnvelope::header_sync(&preferred_summary)
                         .expect("test header summary encodes")],
                 ),
@@ -7257,7 +7315,7 @@ mod tests {
                 now,
             )
             .await
-            .expect("expired first-party header summary is dropped");
+            .expect("stale first-party header summary is dropped");
 
         assert_eq!(
             handle
@@ -7814,7 +7872,7 @@ mod tests {
                 .import_connected_peer_services_at(
                     first_party_services(
                         node_id,
-                        now,
+                        now.saturating_sub(DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs()),
                         vec![ServiceSummaryEnvelope {
                             service_id: service.clone(),
                             summary_tag: 999,
@@ -7825,7 +7883,7 @@ mod tests {
                     now,
                 )
                 .await
-                .expect("expired first-party live summary is dropped");
+                .expect("stale first-party live summary is dropped");
         }
 
         assert_eq!(handle.active_services(live_only_node_id).await, None);

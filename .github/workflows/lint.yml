@@ -143,7 +143,7 @@ jobs:
         env:
           # The -A and -W settings must be the same as the `rustdocflags` in:
           # https://github.com/ZcashFoundation/zebra/blob/main/.cargo/config.toml#L87
-          RUSTDOCFLAGS: --html-in-header katex-header.html -A rustdoc::private_intra_doc_links -D warnings
+          RUSTDOCFLAGS: -A rustdoc::private_intra_doc_links -D warnings
 
   fmt:
     name: fmt

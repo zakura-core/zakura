@@ -20,7 +20,6 @@ funds, and no public peers. No Mainnet state and no real value are involved.
 | `mempool-load-compare.py` | Renders a baseline-vs-target regression table |
 | `mempool-load-run.sh` | Droplet entrypoint used by `zakura-mempool-load.yml` |
 | `test_mempool_load.py` | Unit tests (`python3 test_mempool_load.py`) |
-| `kresko/` | The Kresko compat patch and why it exists |
 
 All Python is stdlib-only, matching `deploy/deployer/deploy.py`.
 
@@ -36,11 +35,9 @@ backpressure counters, which exist nowhere else.
 ```bash
 cargo build --release --features internal-miner,prometheus --package zakura --bin zakurad
 
+# Kresko builds against the zakura crates directly; no patch needed.
 git clone https://github.com/valargroup/kresko /tmp/kresko
 cd /tmp/kresko
-sed 's|ZAKURA_CHECKOUT|/path/to/zakura|g' \
-  /path/to/zakura/.github/workflows/scripts/kresko/zakura-compat.patch > /tmp/compat.patch
-git apply /tmp/compat.patch
 cargo build --release
 ```
 

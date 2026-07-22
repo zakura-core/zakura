@@ -47,20 +47,16 @@ export CARGO_TARGET_DIR=/root/cargo-target
 # ---------------------------------------------------------------------------- #
 # Load generator: Kresko, built against this repo's crates
 # ---------------------------------------------------------------------------- #
-# Kresko upstream pins the zebra-* crates; the zakura-compat dep set renames
-# them to this checkout. Built once and reused across both A/B legs, since it
-# is independent of which zakura commit is under test.
+# Kresko depends on the zakura crates at its own pinned tag, so it is built
+# once and reused across both A/B legs -- it is independent of which zakura
+# commit is under test. That pin is Kresko's, not this ref's: it only has to
+# generate a chain the zakurad under test accepts.
 
 if [ ! -x /root/kresko/target/release/kresko ]; then
   git clone "${KRESKO_REPO}" /root/kresko 2>/dev/null || true
   git -C /root/kresko fetch --no-tags origin "${KRESKO_REF}"
   git -C /root/kresko checkout --detach FETCH_HEAD
-  # Repoint Kresko's zebra-* deps at this checkout's zakura-* crates and drop
-  # its hardcoded NU7 activation. Remove once the upstream PR lands; until
-  # then `git apply` failing is a real signal that Kresko moved under us.
-  sed 's|ZAKURA_CHECKOUT|/root/zakura|g' \
-    /root/kresko-zakura-compat.patch > /root/kresko/zakura-compat.patch
-  git -C /root/kresko apply --verbose zakura-compat.patch
+  # No patch step: Kresko builds against the zakura crates upstream.
   ( cd /root/kresko && cargo build --release )
 fi
 KRESKO_BIN=/root/kresko/target/release/kresko

@@ -48,12 +48,11 @@ on:
         options: [c-4, c-8, c-16, c-32]
         default: c-16
       kresko_ref:
-        description: "Kresko ref for the load generator (pinned; see scripts/kresko/)"
+        description: "Kresko ref for the load generator"
         required: false
-        # Pinned, not `main`: the zakura-compat patch is generated against this
-        # tree. A moving ref makes `git apply` fail, or worse, apply to a
-        # changed file. Bump deliberately after re-running the local rehearsal.
-        default: 72fec25d71ba260159826ea54ef88c795f070d35
+        # Tracks valargroup/kresko#5, which makes Kresko build against the
+        # zakura crates directly. Repoint at main once that merges.
+        default: fix/local-genesis-upgrade-consistency
       teardown_after_run:
         description: "Delete the droplet immediately after the run"
         type: boolean
@@ -243,9 +242,6 @@ jobs:
             .github/workflows/scripts/mempool-load-monitor.py \
             .github/workflows/scripts/mempool-load-compare.py \
             "root@${IP}:/root/"
-          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
-            .github/workflows/scripts/kresko/zakura-compat.patch \
-            "root@${IP}:/root/kresko-zakura-compat.patch"
           rm -f /tmp/run.env
           # Keepalives: the measured window is long and low-output.
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \

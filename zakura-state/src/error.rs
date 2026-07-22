@@ -150,6 +150,13 @@ pub enum CommitBlockError {
     #[error("could not commit header range")]
     HeaderCommitError(#[from] Box<CommitHeaderRangeError>),
 
+    /// The body mutation could not commit its matching fork-aware header transition.
+    #[error("could not commit matching header-chain transition: {error}")]
+    HeaderChainError {
+        /// Stable local error diagnostic; never peer-attributed.
+        error: String,
+    },
+
     /// The write task exited (likely during shutdown).
     #[error("block commit task exited. Is Zakura shutting down?")]
     #[non_exhaustive]
@@ -536,6 +543,13 @@ pub enum InvalidateError {
     /// The block hash was not found in any non-finalized chain.
     #[error("block hash {0} not found in any non-finalized chain")]
     BlockNotFound(block::Hash),
+
+    /// The staged state mutation disagreed with or could not commit its header transition.
+    #[error("could not commit matching header-chain invalidation: {error}")]
+    HeaderChain {
+        /// Stable local error diagnostic; never peer-attributed.
+        error: String,
+    },
 }
 
 /// An error describing why a `ReconsiderBlock` request failed.
@@ -574,6 +588,13 @@ pub enum ReconsiderError {
     /// The finalized parent chain is missing its Sprout tip frontier.
     #[error(transparent)]
     MissingSproutTipTree(#[from] MissingSproutTipTree),
+
+    /// The staged state mutation disagreed with or could not commit its header transition.
+    #[error("could not commit matching header-chain reconsideration: {error}")]
+    HeaderChain {
+        /// Stable local error diagnostic; never peer-attributed.
+        error: String,
+    },
 }
 
 /// An error describing why a block failed contextual validation.

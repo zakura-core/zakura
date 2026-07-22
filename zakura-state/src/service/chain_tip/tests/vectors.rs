@@ -1,13 +1,26 @@
-use std::iter;
+use std::{iter, sync::Arc};
 
+use chrono::Utc;
 use futures::FutureExt;
 
 use zakura_chain::{
+    block,
     chain_tip::{ChainTip, NoChainTip},
     parameters::Network::*,
 };
 
-use super::super::ChainTipSender;
+use super::super::{ChainTipBlock, ChainTipSender};
+
+fn tip(height: u32, hash_byte: u8, parent_byte: u8) -> ChainTipBlock {
+    ChainTipBlock {
+        hash: block::Hash([hash_byte; 32]),
+        height: block::Height(height),
+        time: Utc::now(),
+        transactions: Vec::new(),
+        transaction_hashes: Arc::from([]),
+        previous_block_hash: block::Hash([parent_byte; 32]),
+    }
+}
 
 #[test]
 fn current_best_tip_is_initially_empty() {
@@ -79,4 +92,20 @@ fn chain_tip_change_is_initially_not_ready() {
     assert_eq!(first_clone, None);
 
     assert_eq!(chain_tip_change.last_tip_change(), None);
+}
+
+#[test]
+fn empty_non_finalized_state_returns_tip_publication_to_finalized() {
+    let initial = tip(10, 10, 9);
+    let non_finalized = tip(12, 12, 11);
+    let finalized = tip(11, 11, 10);
+    let (mut sender, latest, _) = ChainTipSender::new(initial, &Mainnet);
+
+    sender.set_best_non_finalized_tip(non_finalized.clone());
+    sender.set_finalized_tip(finalized.clone());
+    assert_eq!(latest.best_tip_hash(), Some(non_finalized.hash));
+
+    sender.clear_best_non_finalized_tip(finalized.clone());
+    assert_eq!(latest.best_tip_height(), Some(finalized.height));
+    assert_eq!(latest.best_tip_hash(), Some(finalized.hash));
 }

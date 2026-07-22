@@ -69,6 +69,14 @@ pub enum HeaderChainStoreError {
     /// The serialized writer lock was poisoned by a prior panic.
     #[error("header-chain serialized writer lock is poisoned")]
     WriterPoisoned,
+    /// A staged full-state value disagreed with the header plan derived from the same evidence.
+    #[error("staged full-state verified frontier {expected:?} differs from projected header frontier {actual:?}")]
+    VerifiedFrontierMismatch {
+        /// Exact staged full-state winner.
+        expected: Frontier,
+        /// Header transition result derived before any write.
+        actual: Frontier,
+    },
     /// Exhaustive startup audit or deterministic reconstruction failed.
     #[error(transparent)]
     Recovery(#[from] RecoveryFailure),
@@ -165,12 +173,56 @@ impl HeaderChainRuntime {
         self.apply_combined_with_fault(request, context, full_state_batch, memory_swap, |_| Ok(()))
     }
 
+    pub(in crate::service) fn apply_combined_expected<M>(
+        &self,
+        request: TransitionRequest,
+        context: &TransitionContext<'_>,
+        full_state_batch: DiskWriteBatch,
+        expected_verified: Frontier,
+        memory_swap: M,
+    ) -> Result<ApplyResult, HeaderChainStoreError>
+    where
+        M: FnOnce(),
+    {
+        self.apply_combined_with_fault_and_expected(
+            request,
+            context,
+            full_state_batch,
+            memory_swap,
+            Some(expected_verified),
+            |_| Ok(()),
+        )
+    }
+
     fn apply_combined_with_fault<M, F>(
         &self,
         request: TransitionRequest,
         context: &TransitionContext<'_>,
         full_state_batch: DiskWriteBatch,
         memory_swap: M,
+        fault: F,
+    ) -> Result<ApplyResult, HeaderChainStoreError>
+    where
+        M: FnOnce(),
+        F: FnMut(FaultPoint) -> Result<(), HeaderChainStoreError>,
+    {
+        self.apply_combined_with_fault_and_expected(
+            request,
+            context,
+            full_state_batch,
+            memory_swap,
+            None,
+            fault,
+        )
+    }
+
+    fn apply_combined_with_fault_and_expected<M, F>(
+        &self,
+        request: TransitionRequest,
+        context: &TransitionContext<'_>,
+        full_state_batch: DiskWriteBatch,
+        memory_swap: M,
+        expected_verified: Option<Frontier>,
         mut fault: F,
     ) -> Result<ApplyResult, HeaderChainStoreError>
     where
@@ -205,7 +257,19 @@ impl HeaderChainRuntime {
             }
             Err(error) => return Err(error.into()),
         };
+        if let Some(expected) = expected_verified {
+            let actual = plan.change_set().metadata.frontiers.verified_best;
+            if expected != actual {
+                return Err(HeaderChainStoreError::VerifiedFrontierMismatch { expected, actual });
+            }
+        }
         if plan.is_no_change() {
+            fault(FaultPoint::BeforeDbCommit)?;
+            self.store.db.write(full_state_batch)?;
+            fault(FaultPoint::AfterDbCommit)?;
+            fault(FaultPoint::BeforeMemorySwap)?;
+            memory_swap();
+            fault(FaultPoint::BeforeReactorObserve)?;
             return Ok(ApplyResult::NoChange(NoChangeReceipt {
                 state_version: plan.before().state_version,
                 event,
@@ -1638,6 +1702,148 @@ mod tests {
                 .snapshot()
                 .expect("the combined commit is durable"),
             receipt.current
+        );
+    }
+
+    #[test]
+    fn no_change_header_plan_still_commits_full_state_then_swaps_without_publication() {
+        let db_config = Config::ephemeral();
+        let (engine_config, anchor, metadata) = fixture();
+        let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+        store
+            .initialize(metadata.clone(), anchor.clone())
+            .expect("the empty schema initializes");
+        let (runtime, _) = store
+            .startup(&engine_config)
+            .expect("the initial store audits");
+        let evidence = EvidenceId::from_digest([0x61; 32]);
+        let request = TransitionRequest {
+            expected_version: metadata.state_version,
+            event: TransitionEvent::OperatorReconsider(zakura_header_chain::OperatorReconsider {
+                target: anchor.hash,
+                id: zakura_header_chain::OperatorInvalidationId::new([0x62; 16]),
+                evidence,
+            }),
+        };
+        let marker_key = [0x63; 4];
+        let mut full_state_batch = DiskWriteBatch::new();
+        runtime
+            .store
+            .put_raw(
+                &mut full_state_batch,
+                ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+                marker_key,
+                [0x64],
+            )
+            .expect("the full-state marker stages");
+        let mut live = NonFinalizedState::new(&Network::Mainnet);
+        let prepared = PreparedFullStateTransition::new(
+            evidence,
+            metadata.frontiers.verified_best,
+            Vec::new(),
+            NonFinalizedState::new(&engine_config.network),
+            Some(full_state_batch),
+            request,
+        )
+        .expect("the no-change header evidence is coherent");
+        let result = prepared
+            .commit(
+                &runtime,
+                &mut live,
+                &TransitionContext {
+                    config: &engine_config,
+                    clock: &SystemClock,
+                    full_state_authority: None,
+                    startup_capability: None,
+                },
+            )
+            .expect("the full-state-only mutation commits");
+
+        assert!(matches!(result, ApplyResult::NoChange(_)));
+        assert_eq!(live.network, engine_config.network);
+        assert_eq!(runtime.publisher().snapshot(), metadata.snapshot());
+        let marker_cf = runtime
+            .store
+            .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+            .expect("the marker column is open");
+        assert_eq!(
+            runtime
+                .store
+                .db
+                .raw_get_cf(&marker_cf, &marker_key)
+                .expect("the committed marker reads"),
+            Some(vec![0x64])
+        );
+    }
+
+    #[test]
+    fn mismatched_staged_frontier_writes_and_swaps_nothing() {
+        let db_config = Config::ephemeral();
+        let (engine_config, anchor, metadata) = fixture();
+        let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+        store
+            .initialize(metadata.clone(), anchor.clone())
+            .expect("the empty schema initializes");
+        let (runtime, _) = store
+            .startup(&engine_config)
+            .expect("the initial store audits");
+        let marker_key = [0x71; 4];
+        let mut full_state_batch = DiskWriteBatch::new();
+        runtime
+            .store
+            .put_raw(
+                &mut full_state_batch,
+                ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+                marker_key,
+                [0x72],
+            )
+            .expect("the full-state marker stages");
+        let swapped = AtomicBool::new(false);
+        let expected = Frontier::new(block::Height(1), anchor.hash);
+        let error = runtime
+            .apply_combined_expected(
+                TransitionRequest {
+                    expected_version: metadata.state_version,
+                    event: TransitionEvent::OperatorReconsider(
+                        zakura_header_chain::OperatorReconsider {
+                            target: anchor.hash,
+                            id: zakura_header_chain::OperatorInvalidationId::new([0x73; 16]),
+                            evidence: EvidenceId::from_digest([0x74; 32]),
+                        },
+                    ),
+                },
+                &TransitionContext {
+                    config: &engine_config,
+                    clock: &SystemClock,
+                    full_state_authority: None,
+                    startup_capability: None,
+                },
+                full_state_batch,
+                expected,
+                || swapped.store(true, Ordering::SeqCst),
+            )
+            .expect_err("a mismatched full-state frontier fails before mutation");
+
+        assert!(matches!(
+            error,
+            HeaderChainStoreError::VerifiedFrontierMismatch {
+                expected: error_expected,
+                actual,
+            } if error_expected == expected && actual == metadata.frontiers.verified_best
+        ));
+        assert!(!swapped.load(Ordering::SeqCst));
+        assert_eq!(runtime.publisher().snapshot(), metadata.snapshot());
+        let marker_cf = runtime
+            .store
+            .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+            .expect("the marker column is open");
+        assert_eq!(
+            runtime
+                .store
+                .db
+                .raw_get_cf(&marker_cf, &marker_key)
+                .expect("the absent marker reads"),
+            None
         );
     }
 

@@ -8,6 +8,7 @@ use std::{
 };
 
 use indexmap::IndexMap;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{
     mpsc::{error::TryRecvError, UnboundedReceiver, UnboundedSender},
@@ -20,8 +21,10 @@ use zakura_chain::{
     parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
 };
 use zakura_header_chain::{
-    ApplyResult, EvidenceId, Frontier, FullStateEvidenceAuthority, TransitionContext,
-    TransitionEvent, TransitionRequest, VerifiedHeaderRef,
+    ApplyResult, BodyEvidence, EngineConfig, EvidenceId, Frontier, FullStateEvidenceAuthority,
+    OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, StateVersion, SystemClock,
+    TransitionContext, TransitionEvent, TransitionRequest, VerifiedBodyEvidence,
+    VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -37,7 +40,7 @@ use crate::{
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
-    SemanticallyVerifiedBlock, ValidateContextError,
+    CheckpointVerifiedBlock, CommitBlockError, SemanticallyVerifiedBlock, ValidateContextError,
 };
 
 // These types are used in doc links
@@ -146,6 +149,11 @@ impl PreparedFullStateTransition {
         live_non_finalized: &mut NonFinalizedState,
         context: &TransitionContext<'_>,
     ) -> Result<ApplyResult, HeaderChainStoreError> {
+        let expected_verified = self
+            .non_finalized_after
+            .best_tip()
+            .map(|(height, hash)| Frontier::new(height, hash))
+            .unwrap_or_else(|| runtime.publisher().snapshot().frontiers.finalized);
         let Self {
             transition_id,
             non_finalized_after,
@@ -160,10 +168,11 @@ impl PreparedFullStateTransition {
             full_state_authority: Some(&authority),
             startup_capability: context.startup_capability,
         };
-        runtime.apply_combined(
+        runtime.apply_combined_expected(
             header_request,
             &guarded_context,
             finalized_batch.unwrap_or_else(DiskWriteBatch::new),
+            expected_verified,
             || *live_non_finalized = non_finalized_after,
         )
     }
@@ -179,6 +188,210 @@ pub enum PreparedFullStateTransitionError {
     /// A verified-chain event did not repeat the exact old frontier and new suffix.
     #[error("prepared full-state/header verified paths differ")]
     VerifiedPathMismatch,
+}
+
+/// Audited header runtime and immutable configuration injected into the state writer.
+#[derive(Clone, Debug)]
+pub(in crate::service) struct HeaderChainWriter {
+    runtime: HeaderChainRuntime,
+    config: EngineConfig,
+    clock: SystemClock,
+}
+
+impl HeaderChainWriter {
+    #[allow(dead_code)] // Production construction lands with restart reconciliation in PR-9e.
+    pub(in crate::service) fn new(runtime: HeaderChainRuntime, config: EngineConfig) -> Self {
+        Self {
+            runtime,
+            config,
+            clock: SystemClock,
+        }
+    }
+
+    fn context(&self) -> TransitionContext<'_> {
+        TransitionContext {
+            config: &self.config,
+            clock: &self.clock,
+            full_state_authority: None,
+            startup_capability: None,
+        }
+    }
+}
+
+fn verified_path(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
+    state
+        .best_chain()
+        .into_iter()
+        .flat_map(|chain| chain.blocks.values())
+        .map(|block| VerifiedHeaderRef {
+            height: block.height,
+            hash: block.hash,
+            header: block.block.header.clone(),
+        })
+        .collect()
+}
+
+fn verified_frontier(state: &NonFinalizedState, finalized: Frontier) -> Frontier {
+    state
+        .best_tip()
+        .map(|(height, hash)| Frontier::new(height, hash))
+        .unwrap_or(finalized)
+}
+
+fn full_state_evidence(
+    tag: &[u8],
+    version: StateVersion,
+    target: block::Hash,
+    path: &[VerifiedHeaderRef],
+) -> EvidenceId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-full-state-header-transition-v1");
+    hasher.update(tag);
+    hasher.update(version.get().to_be_bytes());
+    hasher.update(target.0);
+    for header in path {
+        hasher.update(header.height.0.to_be_bytes());
+        hasher.update(header.hash.0);
+    }
+    EvidenceId::from_digest(hasher.finalize().into())
+}
+
+fn verified_request(
+    writer: &HeaderChainWriter,
+    before: &NonFinalizedState,
+    after: &NonFinalizedState,
+    accepted: Frontier,
+) -> Result<(EvidenceId, Vec<VerifiedHeaderRef>, TransitionRequest), HeaderChainStoreError> {
+    let snapshot = writer.runtime.publisher().snapshot();
+    let old_path = verified_path(before);
+    let new_path = verified_path(after);
+    let old_frontier = verified_frontier(before, snapshot.frontiers.finalized);
+    if old_frontier != snapshot.frontiers.verified_best {
+        return Err(HeaderChainStoreError::VerifiedFrontierMismatch {
+            expected: old_frontier,
+            actual: snapshot.frontiers.verified_best,
+        });
+    }
+    let best_changed =
+        old_path.last().map(|header| header.hash) != new_path.last().map(|header| header.hash);
+    let event_path;
+    let event = if best_changed {
+        let grows = new_path.len() > old_path.len()
+            && new_path
+                .iter()
+                .zip(&old_path)
+                .all(|(new, old)| new.hash == old.hash);
+        event_path = if grows {
+            new_path[old_path.len()..].to_vec()
+        } else {
+            new_path.clone()
+        };
+        let evidence = full_state_evidence(
+            if grows { b"grow" } else { b"reset" },
+            snapshot.state_version,
+            accepted.hash,
+            &event_path,
+        );
+        return Ok((
+            evidence,
+            event_path.clone(),
+            TransitionRequest {
+                expected_version: snapshot.state_version,
+                event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+                    full_state_transition_id: evidence,
+                    old_tip: old_frontier,
+                    new_path: event_path,
+                    cause: if grows {
+                        VerifiedChangeCause::Grow
+                    } else {
+                        VerifiedChangeCause::Reset
+                    },
+                }),
+            },
+        ));
+    } else {
+        event_path = Vec::new();
+        let evidence = full_state_evidence(
+            b"verified-body",
+            snapshot.state_version,
+            accepted.hash,
+            &event_path,
+        );
+        TransitionEvent::BodyEvidence(BodyEvidence::Verified(VerifiedBodyEvidence {
+            hash: accepted.hash,
+            evidence,
+        }))
+    };
+    let evidence = event
+        .idempotency_key()
+        .expect("full-state evidence events always have an identity");
+    Ok((
+        evidence,
+        event_path,
+        TransitionRequest {
+            expected_version: snapshot.state_version,
+            event,
+        },
+    ))
+}
+
+fn operator_identity(target: block::Hash) -> (OperatorInvalidationId, [u8; 32]) {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-operator-invalidation-v1");
+    hasher.update(target.0);
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest[..16]);
+    (OperatorInvalidationId::new(id), digest)
+}
+
+fn commit_operator_change(
+    writer: &HeaderChainWriter,
+    live: &mut NonFinalizedState,
+    staged: NonFinalizedState,
+    target: block::Hash,
+    invalidate: bool,
+) -> Result<ApplyResult, HeaderChainStoreError> {
+    let snapshot = writer.runtime.publisher().snapshot();
+    let path = verified_path(&staged);
+    let evidence = full_state_evidence(
+        if invalidate {
+            b"operator-invalidate"
+        } else {
+            b"operator-reconsider"
+        },
+        snapshot.state_version,
+        target,
+        &path,
+    );
+    let (id, operator_reason_digest) = operator_identity(target);
+    let event = if invalidate {
+        TransitionEvent::OperatorInvalidate(OperatorInvalidate {
+            target,
+            id,
+            operator_reason_digest,
+            evidence,
+        })
+    } else {
+        TransitionEvent::OperatorReconsider(OperatorReconsider {
+            target,
+            id,
+            evidence,
+        })
+    };
+    PreparedFullStateTransition::new(
+        evidence,
+        snapshot.frontiers.verified_best,
+        path,
+        staged,
+        None,
+        TransitionRequest {
+            expected_version: snapshot.state_version,
+            event,
+        },
+    )
+    .map_err(|_| HeaderChainStoreError::Incoherent("staged operator transition disagrees"))?
+    .commit(&writer.runtime, live, &writer.context())
 }
 
 /// The maximum size of the parent error map.
@@ -266,6 +479,35 @@ fn update_latest_chain_channels(
     tip_block_height
 }
 
+fn update_channels_after_operator_change(
+    non_finalized_state: &NonFinalizedState,
+    finalized_state: &FinalizedState,
+    chain_tip_sender: &mut ChainTipSender,
+    non_finalized_state_sender: &watch::Sender<NonFinalizedState>,
+    backup_dir_path: Option<&Path>,
+) {
+    if non_finalized_state.is_chain_set_empty() {
+        if let Some(backup_dir_path) = backup_dir_path {
+            non_finalized_state.write_to_backup(backup_dir_path);
+        }
+        let _ = non_finalized_state_sender.send(non_finalized_state.clone());
+        chain_tip_sender.clear_best_non_finalized_tip(
+            finalized_state
+                .db
+                .tip_block()
+                .map(CheckpointVerifiedBlock::from)
+                .map(ChainTipBlock::from),
+        );
+    } else {
+        update_latest_chain_channels(
+            non_finalized_state,
+            chain_tip_sender,
+            non_finalized_state_sender,
+            backup_dir_path,
+        );
+    }
+}
+
 fn commit_header_range(
     finalized_state: &FinalizedState,
     anchor: block::Hash,
@@ -323,6 +565,7 @@ struct WriteBlockWorkerTask {
     /// If `Some`, the non-finalized state is written to this backup directory
     /// synchronously before each channel update, instead of via the async backup task.
     backup_dir_path: Option<PathBuf>,
+    header_chain: Option<HeaderChainWriter>,
 }
 
 /// The message type for the non-finalized block write task channel.
@@ -399,6 +642,33 @@ impl BlockWriteSender {
         watch::Receiver<VctRootRepairStatus>,
         Option<Arc<std::thread::JoinHandle<()>>>,
     ) {
+        Self::spawn_with_header_chain(
+            finalized_state,
+            non_finalized_state,
+            chain_tip_sender,
+            non_finalized_state_sender,
+            should_use_finalized_block_write_sender,
+            backup_dir_path,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::service) fn spawn_with_header_chain(
+        finalized_state: FinalizedState,
+        non_finalized_state: NonFinalizedState,
+        chain_tip_sender: ChainTipSender,
+        non_finalized_state_sender: watch::Sender<NonFinalizedState>,
+        should_use_finalized_block_write_sender: bool,
+        backup_dir_path: Option<PathBuf>,
+        header_chain: Option<HeaderChainWriter>,
+    ) -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
+        tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
+        watch::Receiver<VctRootRepairStatus>,
+        Option<Arc<std::thread::JoinHandle<()>>>,
+    ) {
         // Security: The number of blocks in these channels is limited by
         //           the syncer and inbound lookahead limits.
         let (non_finalized_block_write_sender, non_finalized_block_write_receiver) =
@@ -432,6 +702,7 @@ impl BlockWriteSender {
                     non_finalized_state_sender,
                     vct_root_repair_sender,
                     backup_dir_path,
+                    header_chain,
                 }
                 .run()
             })
@@ -475,6 +746,7 @@ impl WriteBlockWorkerTask {
             vct_root_repair_sender,
             seed_zakura_header_from_best_chain_commits,
             backup_dir_path,
+            header_chain,
         } = &mut self;
 
         let mut prev_finalized_note_commitment_trees: Option<NoteCommitmentTrees> = None;
@@ -703,24 +975,69 @@ impl WriteBlockWorkerTask {
                 }
                 NonFinalizedWriteMessage::Invalidate { hash, rsp_tx } => {
                     tracing::info!(?hash, "invalidating a block in the non-finalized state");
-                    let _ = rsp_tx.send(non_finalized_state.invalidate_block(hash));
+                    let result = if let Some(writer) = header_chain.as_ref() {
+                        let mut staged = non_finalized_state.clone();
+                        staged.invalidate_block(hash).and_then(|result| {
+                            commit_operator_change(writer, non_finalized_state, staged, hash, true)
+                                .map(|_| result)
+                                .map_err(|error| InvalidateError::HeaderChain {
+                                    error: error.to_string(),
+                                })
+                        })
+                    } else {
+                        non_finalized_state.invalidate_block(hash)
+                    };
+                    if result.is_ok() {
+                        update_channels_after_operator_change(
+                            non_finalized_state,
+                            finalized_state,
+                            chain_tip_sender,
+                            non_finalized_state_sender,
+                            backup_dir_path.as_deref(),
+                        );
+                    }
+                    let _ = rsp_tx.send(result);
                     None
                 }
                 NonFinalizedWriteMessage::Reconsider { hash, rsp_tx } => {
                     tracing::info!(?hash, "reconsidering a block in the non-finalized state");
-                    let _ = rsp_tx
-                        .send(non_finalized_state.reconsider_block(hash, &finalized_state.db));
+                    let result = if let Some(writer) = header_chain.as_ref() {
+                        let mut staged = non_finalized_state.clone();
+                        staged
+                            .reconsider_block(hash, &finalized_state.db)
+                            .and_then(|result| {
+                                commit_operator_change(
+                                    writer,
+                                    non_finalized_state,
+                                    staged,
+                                    hash,
+                                    false,
+                                )
+                                .map(|_| result)
+                                .map_err(|error| {
+                                    ReconsiderError::HeaderChain {
+                                        error: error.to_string(),
+                                    }
+                                })
+                            })
+                    } else {
+                        non_finalized_state.reconsider_block(hash, &finalized_state.db)
+                    };
+                    if result.is_ok() {
+                        update_channels_after_operator_change(
+                            non_finalized_state,
+                            finalized_state,
+                            chain_tip_sender,
+                            non_finalized_state_sender,
+                            backup_dir_path.as_deref(),
+                        );
+                    }
+                    let _ = rsp_tx.send(result);
                     None
                 }
             };
 
             let Some((queued_child, rsp_tx)) = queued_child_and_rsp_tx else {
-                update_latest_chain_channels(
-                    non_finalized_state,
-                    chain_tip_sender,
-                    non_finalized_state_sender,
-                    backup_dir_path.as_deref(),
-                );
                 continue;
             };
 
@@ -735,15 +1052,57 @@ impl WriteBlockWorkerTask {
             // At this point, we know that all the block's descendants
             // are invalid, because we checked all the consensus rules before
             // committing the failing ancestor block to the non-finalized state.
-            let result = if let Some(parent_error) = parent_error {
-                Err(parent_error.clone())
+            let result: Result<(), CommitBlockError> = if let Some(parent_error) = parent_error {
+                Err(Box::new(parent_error.clone()).into())
             } else {
                 tracing::trace!(?child_hash, "validating queued child");
-                validate_and_commit_non_finalized(
-                    &finalized_state.db,
-                    non_finalized_state,
-                    queued_child,
-                )
+                if let Some(writer) = header_chain.as_ref() {
+                    let mut staged = non_finalized_state.clone();
+                    validate_and_commit_non_finalized(
+                        &finalized_state.db,
+                        &mut staged,
+                        queued_child,
+                    )
+                    .map_err(|error| CommitBlockError::from(Box::new(error)))
+                    .and_then(|()| {
+                        let accepted = Frontier::new(child_height, child_hash);
+                        let (evidence, event_path, request) =
+                            verified_request(writer, non_finalized_state, &staged, accepted)
+                                .map_err(|error| CommitBlockError::HeaderChainError {
+                                    error: error.to_string(),
+                                })?;
+                        PreparedFullStateTransition::new(
+                            evidence,
+                            writer
+                                .runtime
+                                .publisher()
+                                .snapshot()
+                                .frontiers
+                                .verified_best,
+                            event_path,
+                            staged,
+                            None,
+                            request,
+                        )
+                        .map_err(|error| CommitBlockError::HeaderChainError {
+                            error: error.to_string(),
+                        })?
+                        .commit(&writer.runtime, non_finalized_state, &writer.context())
+                        .map(|_| ())
+                        .map_err(|error| {
+                            CommitBlockError::HeaderChainError {
+                                error: error.to_string(),
+                            }
+                        })
+                    })
+                } else {
+                    validate_and_commit_non_finalized(
+                        &finalized_state.db,
+                        non_finalized_state,
+                        queued_child,
+                    )
+                    .map_err(|error| CommitBlockError::from(Box::new(error)))
+                }
             };
 
             // TODO: fix the test timing bugs that require the result to be sent
@@ -752,7 +1111,9 @@ impl WriteBlockWorkerTask {
 
             if let Err(ref error) = result {
                 // If the block is invalid, mark any descendant blocks as rejected.
-                parent_error_map.insert(child_hash, error.clone());
+                if let CommitBlockError::ValidateContextError(error) = error {
+                    parent_error_map.insert(child_hash, (**error).clone());
+                }
 
                 // Make sure the error map doesn't get too big.
                 if parent_error_map.len() > PARENT_ERROR_MAP_LIMIT {
@@ -782,12 +1143,14 @@ impl WriteBlockWorkerTask {
             // recorded for a different block body with the same header hash.
             parent_error_map.shift_remove(&child_hash);
 
-            if should_seed_zakura_header_from_non_finalized_commit(
-                *seed_zakura_header_from_best_chain_commits,
-                non_finalized_state,
-                child_height,
-                child_hash,
-            ) {
+            if header_chain.is_none()
+                && should_seed_zakura_header_from_non_finalized_commit(
+                    *seed_zakura_header_from_best_chain_commits,
+                    non_finalized_state,
+                    child_height,
+                    child_hash,
+                )
+            {
                 seed_zakura_header_from_committed_block(
                     &finalized_state.db,
                     child_height,
@@ -890,22 +1253,99 @@ mod tests {
     use std::sync::Arc;
 
     use zakura_chain::{
-        parameters::Network, serialization::ZcashDeserializeInto, value_balance::ValueBalance,
+        block, parameters::Network, serialization::ZcashDeserializeInto,
+        value_balance::ValueBalance,
     };
 
     use crate::{
         arbitrary::Prepare,
         service::{
-            finalized_state::{DiskWriteBatch, FinalizedState, WriteDisk},
+            finalized_state::{
+                header_chain::HeaderChainStore, DiskWriteBatch, FinalizedState, WriteDisk,
+            },
             non_finalized_state::NonFinalizedState,
             write::{
-                seed_zakura_header_from_committed_block,
-                should_seed_zakura_header_from_non_finalized_commit,
+                commit_operator_change, seed_zakura_header_from_committed_block,
+                should_seed_zakura_header_from_non_finalized_commit, verified_path,
+                verified_request, HeaderChainWriter, PreparedFullStateTransition,
             },
         },
         tests::FakeChainHelper,
         Config,
     };
+    use zakura_header_chain::{
+        AlarmSet, BodyValidationState, ChainScore, CheckpointSet, EngineConfig, EngineMetadata,
+        EngineMode, EvidenceId, FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion,
+        HeaderGeneration, HeaderNode, HeaderValidationState, StateVersion, SuffixWork,
+        TrustedAnchor, VerifiedGeneration, WorkCoordinate,
+    };
+
+    fn header_writer(
+        finalized_state: &FinalizedState,
+        network: &Network,
+        anchor_height: block::Height,
+        anchor_block: &Arc<zakura_chain::block::Block>,
+    ) -> HeaderChainWriter {
+        let frontier = Frontier::new(anchor_height, anchor_block.hash());
+        let config = EngineConfig::new(
+            EngineMode::Integrated,
+            network.clone(),
+            TrustedAnchor {
+                frontier,
+                header: anchor_block.header.clone(),
+            },
+            CheckpointSet::default(),
+        )
+        .expect("the full-state fixture anchor is coherent");
+        let work = anchor_block
+            .header
+            .difficulty_threshold
+            .to_work()
+            .expect("the fixture target has exact work");
+        let anchor = HeaderNode::from_durable_parts(
+            anchor_block.header.clone(),
+            frontier.hash,
+            anchor_block.header.previous_block_hash,
+            frontier.height,
+            work,
+            WorkCoordinate::new(frontier.hash, work.as_u256()),
+            HeaderValidationState::Valid,
+            Default::default(),
+            BodyValidationState::Verified {
+                evidence: EvidenceId::from_digest([0x70; 32]),
+            },
+            Vec::new(),
+        )
+        .expect("the anchor node fields agree");
+        let metadata = EngineMetadata {
+            disk_format: HeaderChainDiskVersion(1),
+            mode: EngineMode::Integrated,
+            network_id: config.network.kind(),
+            anchor_manifest_digest: config.trust_anchor_digest(),
+            work_origin: frontier,
+            state_version: StateVersion::new(1),
+            header_generation: HeaderGeneration::new(1),
+            verified_generation: VerifiedGeneration::new(1),
+            finality_epoch: FinalityEpoch::new(0),
+            frontiers: FrontierSet {
+                finalized: frontier,
+                header_best: frontier,
+                verified_best: frontier,
+            },
+            header_best_score: ChainScore::new(SuffixWork::zero(), frontier.hash),
+            oldest_retained_height: frontier.height,
+            alarms: AlarmSet::default(),
+            last_transition_id: EvidenceId::from_digest([0x71; 32]),
+        };
+        let store = HeaderChainStore::new(finalized_state.db.db().clone());
+        store
+            .initialize(metadata, anchor)
+            .expect("the fixture header store initializes");
+        let (runtime, _) = store
+            .startup(&config)
+            .expect("the fixture header store audits");
+        HeaderChainWriter::new(runtime, config)
+    }
 
     #[test]
     fn side_chain_commit_does_not_seed_zakura_headers() {
@@ -983,6 +1423,185 @@ mod tests {
         assert_eq!(
             finalized_state.db.headers_by_height_range(best_height, 1),
             vec![(best_height, best_block.hash(), best_block.header.clone())],
+        );
+    }
+
+    #[test]
+    fn staged_grow_reset_invalidate_and_reconsider_keep_both_frontiers_atomic() {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        )
+        .expect("the fixture finalized state opens");
+        finalized_state.set_finalized_value_pool(ValueBalance::fake_populated_pool());
+        let parent = zakura_test::vectors::BLOCK_MAINNET_434873_BYTES
+            .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
+            .expect("the parent block deserializes");
+        let parent_height = parent
+            .coinbase_height()
+            .expect("the parent has a coinbase height");
+        let parent_hash_cf = finalized_state
+            .db
+            .db()
+            .cf_handle("zakura_header_hash_by_height")
+            .expect("the legacy hash column is open");
+        let mut parent_batch = DiskWriteBatch::new();
+        parent_batch.zs_insert(&parent_hash_cf, parent_height, parent.hash());
+        finalized_state
+            .db
+            .db()
+            .write(parent_batch)
+            .expect("the parent anchor row writes");
+        let writer = header_writer(&finalized_state, &network, parent_height, &parent);
+        let mut live = NonFinalizedState::new(&network);
+
+        let common = parent.make_fake_child().set_work(1);
+        let first = common.make_fake_child().set_work(10);
+        let first_frontier = Frontier::new(
+            first.coinbase_height().expect("the child has a height"),
+            first.hash(),
+        );
+        let mut staged = live.clone();
+        staged
+            .commit_new_chain(common.clone().prepare(), &finalized_state.db)
+            .expect("the common full-state block validates");
+        staged
+            .commit_block(first.clone().prepare(), &finalized_state.db)
+            .expect("the first full-state branch validates");
+        let (evidence, event_path, request) =
+            verified_request(&writer, &live, &staged, first_frontier)
+                .expect("the grow evidence matches full state");
+        PreparedFullStateTransition::new(
+            evidence,
+            writer
+                .runtime
+                .publisher()
+                .snapshot()
+                .frontiers
+                .verified_best,
+            event_path,
+            staged,
+            None,
+            request,
+        )
+        .expect("the grow staging facts agree")
+        .commit(&writer.runtime, &mut live, &writer.context())
+        .expect("grow commits before swapping full state");
+        assert_eq!(
+            live.best_tip(),
+            Some((first_frontier.height, first_frontier.hash))
+        );
+        assert_eq!(
+            writer
+                .runtime
+                .publisher()
+                .snapshot()
+                .frontiers
+                .verified_best,
+            first_frontier
+        );
+
+        let replacement = common.make_fake_child().set_work(20);
+        let replacement_frontier = Frontier::new(
+            replacement
+                .coinbase_height()
+                .expect("the replacement has a height"),
+            replacement.hash(),
+        );
+        let mut staged = live.clone();
+        staged
+            .commit_block(replacement.clone().prepare(), &finalized_state.db)
+            .expect("the higher-work replacement validates");
+        let (evidence, event_path, request) =
+            verified_request(&writer, &live, &staged, replacement_frontier)
+                .expect("the reset evidence matches full state");
+        PreparedFullStateTransition::new(
+            evidence,
+            writer
+                .runtime
+                .publisher()
+                .snapshot()
+                .frontiers
+                .verified_best,
+            event_path,
+            staged,
+            None,
+            request,
+        )
+        .expect("the reset staging facts agree")
+        .commit(&writer.runtime, &mut live, &writer.context())
+        .expect("reset commits before swapping full state");
+        assert_eq!(
+            writer
+                .runtime
+                .publisher()
+                .snapshot()
+                .frontiers
+                .verified_best,
+            replacement_frontier
+        );
+
+        let mut staged = live.clone();
+        staged
+            .invalidate_block(replacement_frontier.hash)
+            .expect("the winning replacement invalidates in staged state");
+        commit_operator_change(&writer, &mut live, staged, replacement_frontier.hash, true)
+            .expect("invalidation commits both frontiers before swapping state");
+        assert_eq!(
+            live.best_tip(),
+            Some((first_frontier.height, first_frontier.hash))
+        );
+        assert_eq!(
+            writer
+                .runtime
+                .publisher()
+                .snapshot()
+                .frontiers
+                .verified_best,
+            first_frontier
+        );
+
+        let mut staged = live.clone();
+        staged
+            .reconsider_block(replacement_frontier.hash, &finalized_state.db)
+            .expect("the replacement replays into staged state");
+        commit_operator_change(&writer, &mut live, staged, replacement_frontier.hash, false)
+            .expect("reconsider commits both frontiers before swapping state");
+        assert_eq!(
+            live.best_tip(),
+            Some((replacement_frontier.height, replacement_frontier.hash))
+        );
+        assert_eq!(
+            writer
+                .runtime
+                .publisher()
+                .snapshot()
+                .frontiers
+                .verified_best,
+            replacement_frontier
+        );
+        assert_eq!(
+            verified_path(&live)
+                .last()
+                .map(|header| Frontier::new(header.height, header.hash)),
+            Some(replacement_frontier)
+        );
+
+        let mut staged = live.clone();
+        staged
+            .invalidate_block(common.hash())
+            .expect("invalidating the common root empties every full-state branch");
+        commit_operator_change(&writer, &mut live, staged, common.hash(), true)
+            .expect("empty full state commits its exact finalized fallback");
+        assert!(live.is_chain_set_empty());
+        let snapshot = writer.runtime.publisher().snapshot();
+        assert_eq!(
+            snapshot.frontiers.verified_best,
+            snapshot.frontiers.finalized
         );
     }
 }

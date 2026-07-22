@@ -90,3 +90,35 @@ This file is the sole reporting channel (design D5). Entry template:
   hygiene incl. B-14 auto-patch, coverage guard, honest exit codes),
   EXP-000 pipeline validation, first seeder-mode sample 0.435%.
 - spend: ~US$5-6 total across two droplets.
+
+## B-15 MEASUREMENT — seeder mode NOT adopted (2026-07-22)
+
+- seeder-mode A/A samples: 0.435% (aa-seed1, SHA b3a2ad506), 5.828%
+  (aa-seed2, SHA 847f6085) vs single-peer history 0.401/8.383/8.653%.
+- read: multi-peer averaging lowers the observed worst case (5.8 vs 8.7) but
+  both live-peer modes drift ≥5% on hour timescales; adoption bar (both ≤3%)
+  not met. Seeder absolute throughput also runs ~8% below single-peer
+  (~85-88 vs ~93-100 pc blk/s) — numbers across modes are not comparable.
+- conclusion: the real B-15 is the frozen-cohort port (two seeded-then-frozen
+  serving droplets; byte-identical range every run — the deploy/runner
+  design's own rationale). **DECISION NEEDED (Adam):** that needs 3
+  concurrent droplets (2 serving + 1 bench), above the MAX_DROPLETS=2 hard
+  rule, and frozen servers cost ~$0.5/h each while kept. Until approved, the
+  band stays 8.7% (single-peer) and the effective single-run threshold 17.4%.
+
+## CAMPAIGN (2026-07-22, SESSION 1)
+
+- regime: single-peer (167.99.162.47), 120k window, band 8.7%, single-run
+  threshold 17.4%, sweep PROMISING bar max(5%, 3×band) = 26.1%.
+- attribution: download head-of-line dominant; commit writer 22-26% busy.
+  Download-path experiments only; state/commit invisible at this window.
+- campaign baseline: STALE — prior single-peer legs are on SHA 4784aca6
+  (median 94.90 pc blk/s) but main has drifted twice since. Drift rule: when
+  a run's pinned SHA differs from the baseline's, re-pin with one fresh
+  default-knob single-peer run before comparing. base1 (next bench) re-pins.
+- top-5: (1) B-02 DL_LIMIT sweep 50/400 vs re-pinned baseline (env-only, no
+  collisions; even sub-bar deltas are recorded as evidence for when the band
+  tightens); (2) B-04 body-commit batch knee (state-file collision check
+  first); (3) B-06 verifier batch sizes; (4) B-07 rayon pool sizing;
+  (5) B-05 RocksDB read-side. B-01/B-03 knob-default work PROPOSAL-blocked
+  on PRs 166/217. B-15-full awaits the droplet-cap decision above.

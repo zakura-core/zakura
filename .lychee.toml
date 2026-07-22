@@ -21,6 +21,9 @@ exclude = [
     # Template placeholder URLs (0000)
     "^https://github.com/.*/issues/0000",
     "^https://github.com/.*/pull/0000",
+    # Merged PR references are permanent, but GitHub intermittently returns 502
+    # responses for them, causing link-check flakes with no broken-link signal.
+    "^https://github.com/zakura-core/zakura/pull/[0-9]+",
     # Mergify dashboard (requires auth)
     "^https://dashboard.mergify.com/",
     # IACR eprint server returns 403 to automated link checkers

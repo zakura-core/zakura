@@ -1588,6 +1588,23 @@ where
             [rest @ .., _last] => rest,
         };
 
+        let unknown_hashes = match matched_hashes {
+            [expected_hash, rest @ ..] if *expected_hash == expected_next => rest,
+            [] => return Ok(Some(&[])),
+            _ => unreachable!("matched FindBlocks response starts with the expected hash"),
+        };
+
+        // Apply the count guard before scanning peer-controlled hashes or
+        // querying state, so oversized responses cannot amplify state work.
+        if !has_valid_tips_response_hash_count(unknown_hashes) {
+            debug!(
+                hashes.len = unknown_hashes.len(),
+                max_hashes = MAX_TIPS_RESPONSE_HASH_COUNT,
+                "discarding oversized FindBlocks response"
+            );
+            return Ok(None);
+        }
+
         let mut seen = HashSet::new();
         if matched_hashes.iter().any(|hash| !seen.insert(*hash)) {
             debug!(
@@ -1596,12 +1613,6 @@ where
             );
             return Ok(None);
         }
-
-        let unknown_hashes = match matched_hashes {
-            [expected_hash, rest @ ..] if *expected_hash == expected_next => rest,
-            [] => return Ok(Some(&[])),
-            _ => unreachable!("matched FindBlocks response starts with the expected hash"),
-        };
 
         for &hash in unknown_hashes {
             if Self::state_contains_service(state, hash).await? {
@@ -1863,18 +1874,6 @@ where
                         else {
                             continue;
                         };
-
-                        // Apply the count guard after stripping the trailing
-                        // hash so a full 500-hash chain plus one appended hash
-                        // is still usable.
-                        if !has_valid_tips_response_hash_count(unknown_hashes) {
-                            debug!(
-                                hashes.len = unknown_hashes.len(),
-                                max_hashes = MAX_TIPS_RESPONSE_HASH_COUNT,
-                                "discarding oversized FindBlocks response"
-                            );
-                            continue;
-                        }
 
                         let new_tip = if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
                             CheckedTip {

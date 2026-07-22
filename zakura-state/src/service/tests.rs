@@ -6,7 +6,7 @@
 
 use std::{env, sync::Arc, time::Duration};
 
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, time::timeout};
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
 
 use zakura_chain::{
@@ -36,7 +36,7 @@ use crate::{
         FakeChainHelper,
     },
     BoxError, CheckpointVerifiedBlock, Config, ReadRequest, ReadResponse, Request, Response,
-    SemanticallyVerifiedBlock,
+    SemanticallyVerifiedBlock, CHAIN_TIP_UPDATE_WAIT_LIMIT,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
@@ -1094,7 +1094,8 @@ proptest! {
     ) {
         let _init_guard = zakura_test::init();
 
-        let (mut state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change) = Runtime::new().unwrap().block_on(async {
+        let runtime = Runtime::new().unwrap();
+        let (mut state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change) = runtime.block_on(async {
             // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
             StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await
         });
@@ -1121,12 +1122,16 @@ proptest! {
 
             prop_assert!(result.is_ok(), "unexpected failed finalized block commit: {:?}", result);
 
-            // Wait for the channels to be updated by the block commit task.
-            // TODO: add a blocking method on ChainTipChange
-            std::thread::sleep(Duration::from_secs(1));
+            let actual_action = runtime
+                .block_on(timeout(
+                    CHAIN_TIP_UPDATE_WAIT_LIMIT,
+                    chain_tip_change.wait_for_tip_change(),
+                ))
+                .expect("tip change arrives because the committed block updates the channel")
+                .expect("tip sender remains open while the state service is alive");
 
             prop_assert_eq!(latest_chain_tip.best_tip_height(), Some(expected_block.height));
-            prop_assert_eq!(chain_tip_change.last_tip_change(), Some(expected_action));
+            prop_assert_eq!(actual_action, expected_action);
         }
 
         for block in non_finalized_blocks {
@@ -1142,12 +1147,16 @@ proptest! {
 
             prop_assert!(result.is_ok(), "unexpected failed non-finalized block commit: {:?}", result);
 
-            // Wait for the channels to be updated by the block commit task.
-            // TODO: add a blocking method on ChainTipChange
-            std::thread::sleep(Duration::from_secs(1));
+            let actual_action = runtime
+                .block_on(timeout(
+                    CHAIN_TIP_UPDATE_WAIT_LIMIT,
+                    chain_tip_change.wait_for_tip_change(),
+                ))
+                .expect("tip change arrives because the committed block updates the channel")
+                .expect("tip sender remains open while the state service is alive");
 
             prop_assert_eq!(latest_chain_tip.best_tip_height(), Some(expected_block.height));
-            prop_assert_eq!(chain_tip_change.last_tip_change(), Some(expected_action));
+            prop_assert_eq!(actual_action, expected_action);
         }
     }
 }

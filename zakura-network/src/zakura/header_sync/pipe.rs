@@ -535,6 +535,47 @@ pub(super) async fn run_peer(
     }
 }
 
+/// Run a peer whose stream prelude selected protocol version 8.
+///
+/// The selected codec is fixed before this loop sees a frame. In particular,
+/// discriminator 4 is decoded only as `HeadersOutcomeV8`; payload shape is never
+/// consulted to fall back to v7 `NewBlock`.
+pub(super) async fn run_v8_peer(
+    handle: HeaderSyncHandle,
+    codec: HeaderSyncV8Codec,
+    peer_id: ZakuraPeerId,
+    session_id: u64,
+    mut recv: FramedRecv,
+    cancel: CancellationToken,
+) -> Result<(), SinkReject> {
+    loop {
+        let frame = tokio::select! {
+            () = cancel.cancelled() => return Ok(()),
+            frame = recv.recv() => frame,
+        };
+        let Some(frame) = frame else {
+            return Ok(());
+        };
+        let msg = codec.decode_frame(frame, None).map_err(|error| {
+            SinkReject::protocol(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            ))
+        })?;
+        if let Err(error) = handle.try_send(HeaderSyncEvent::SessionWireMessageV8 {
+            peer: peer_id.clone(),
+            session_id,
+            msg,
+        }) {
+            tracing::debug!(
+                ?error,
+                ?peer_id,
+                "header-sync v8 stream could not deliver frame locally"
+            );
+        }
+    }
+}
+
 /// Forward a successfully decoded inbound event to the reactor.
 ///
 /// A closed reactor queue is a local, non-fatal condition for the peer: the old
@@ -596,6 +637,7 @@ mod tests {
                 tip,
                 peers,
                 candidates,
+                v8_codec: HeaderSyncV8Codec::new(Network::Mainnet, 1024, 1, 0),
             },
             events_rx,
         )
@@ -621,6 +663,7 @@ mod tests {
                 tip,
                 peers,
                 candidates,
+                v8_codec: HeaderSyncV8Codec::new(Network::Mainnet, 1024, 1, 0),
             },
             events_rx,
         )
@@ -632,6 +675,38 @@ mod tests {
             flags: 0,
             payload,
         }
+    }
+
+    #[tokio::test]
+    async fn negotiated_v8_pipe_dispatches_discriminant_four_as_outcome() {
+        let (handle, mut events) = test_handle();
+        let codec = HeaderSyncV8Codec::new(Network::Mainnet, 1024, 1, 0);
+        let outcome = HeaderSyncMessageV8::HeadersOutcome(HeadersOutcomeV8 {
+            request_id: 1,
+            target_tip_hash: block::Hash([9; 32]),
+            outcome: HeadersOutcomeCodeV8::Busy,
+        });
+        let frame = codec
+            .encode_frame(&outcome)
+            .expect("test v8 outcome encodes");
+        let (send, recv) = crate::zakura::framed_channel(1);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_v8_peer(handle, codec, peer(), 7, recv, cancel.clone()));
+
+        send.send(frame).await.expect("test pipe remains open");
+        assert!(matches!(
+            events.recv().await,
+            Some(HeaderSyncEvent::SessionWireMessageV8 {
+                session_id: 7,
+                msg: HeaderSyncMessageV8::HeadersOutcome(_),
+                ..
+            })
+        ));
+
+        cancel.cancel();
+        task.await
+            .expect("test v8 pipe task does not panic")
+            .expect("test v8 pipe exits cleanly");
     }
 
     /// A `Headers` frame with no recorded expectation is unsolicited: it reports

@@ -1455,6 +1455,7 @@ impl StreamWorkerContext {
 
 struct AdmittedOrderedStream {
     kind: u16,
+    version: u16,
     session_id: u64,
     recv: FramedRecv,
     send: FramedSend,
@@ -2082,6 +2083,7 @@ impl ZakuraProtocolHandler {
                     admitted.kind,
                     ServiceStream::new(
                         admitted.session_id,
+                        admitted.version,
                         admitted.recv,
                         admitted.send,
                         admitted.cancel_token,
@@ -2190,6 +2192,7 @@ impl ZakuraProtocolHandler {
                                 admitted.kind,
                                 ServiceStream::new(
                                     admitted.session_id,
+                                    admitted.version,
                                     admitted.recv,
                                     admitted.send,
                                     admitted.cancel_token,
@@ -2355,6 +2358,7 @@ impl ZakuraProtocolHandler {
                                     kind,
                                     ServiceStream::new(
                                         admitted.session_id,
+                                        admitted.version,
                                         admitted.recv,
                                         admitted.send,
                                         admitted.cancel_token.clone(),
@@ -2646,6 +2650,34 @@ impl ZakuraProtocolHandler {
                 STREAM_TABLE,
                 admission
                     .event("rejected.unnegotiated_capability", stream_id)
+                    .stream_kind(stream_kind),
+            );
+            return None;
+        }
+
+        if stream.mode == StreamMode::Ordered
+            && self
+                .registry
+                .ordered_streams_for_negotiated(admission.accepted_capabilities)
+                .into_iter()
+                .find(|selected| selected.kind == stream.kind)
+                .is_some_and(|selected| selected.version != stream.version)
+        {
+            debug!(
+                stream_kind = prelude.stream_kind,
+                stream_version = prelude.stream_version,
+                "rejecting a lower ordered-stream version than the mutually selected version"
+            );
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_UNKNOWN_STREAM));
+            metrics::counter!(
+                "zakura.p2p.stream.rejected.unselected_version",
+                "stream_kind" => stream_kind,
+            )
+            .increment(1);
+            admission.trace.emit(
+                STREAM_TABLE,
+                admission
+                    .event("rejected.unselected_version", stream_id)
                     .stream_kind(stream_kind),
             );
             return None;
@@ -3321,6 +3353,7 @@ fn spawn_persistent_stream_worker(
     let (from_service_tx, from_service_rx) = mpsc::channel(queue_depth);
     let admitted = AdmittedOrderedStream {
         kind: prelude.stream_kind,
+        version: prelude.stream_version,
         session_id: context.stream_id,
         recv: FramedRecv::new(to_service_rx),
         send: FramedSend::new(from_service_tx),
@@ -4790,7 +4823,8 @@ mod tests {
             HeaderSyncRequestId, HeaderSyncStatus, ServicePeerLimits, ZakuraDiscoveryConfig,
             ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, LOCAL_MAX_MESSAGE_BYTES,
             MAX_HS_MESSAGE_BYTES, MSG_HS_STATUS, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-            ZAKURA_CAP_LEGACY_GOSSIP,
+            ZAKURA_CAP_HEADER_SYNC_V8, ZAKURA_CAP_LEGACY_GOSSIP,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V8,
         },
         P2pStack,
     };
@@ -7707,6 +7741,13 @@ mod tests {
                     mode: StreamMode::Ordered,
                 },
                 Stream {
+                    kind: HEADER_SYNC_STREAM_KIND,
+                    version: ZAKURA_HEADER_SYNC_STREAM_VERSION_V8,
+                    frame_cap: 1024,
+                    capability: ZAKURA_CAP_HEADER_SYNC_V8,
+                    mode: StreamMode::Ordered,
+                },
+                Stream {
                     kind: ZAKURA_STREAM_BLOCK_SYNC,
                     version: ZAKURA_STREAM_VERSION_1,
                     frame_cap: MAX_BS_FRAME_BYTES,
@@ -7722,6 +7763,10 @@ mod tests {
             (LEGACY_REQUEST_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (DISCOVERY_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_7),
+            (
+                HEADER_SYNC_STREAM_KIND,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION_V8,
+            ),
             (ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_VERSION_1),
         ] {
             assert!(
@@ -7733,7 +7778,7 @@ mod tests {
                 "registered kind {kind} at version 0 must be rejected"
             );
             assert!(
-                !is_supported_stream(&registry, kind, version.saturating_add(1)),
+                !is_supported_stream(&registry, kind, u16::MAX),
                 "registered kind {kind} at an unsupported version must be rejected"
             );
         }

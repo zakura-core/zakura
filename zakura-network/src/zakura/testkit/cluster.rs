@@ -1332,6 +1332,14 @@ mod tests {
         let anchor = (block::Height(0), mainnet_genesis_hash());
         ZakuraTestNode::builder(seed)
             .tracer(trace.tracer_for_node(seed))
+            // These established end-to-end cases freeze the v7 reactor. V8
+            // negotiation/dispatch and status cadence have dedicated P8 tests.
+            .supported_capabilities(
+                ZAKURA_CAP_LEGACY_GOSSIP
+                    | ZAKURA_CAP_DISCOVERY
+                    | ZAKURA_CAP_HEADER_SYNC
+                    | ZAKURA_CAP_BLOCK_SYNC,
+            )
             .header_sync_driver(
                 network,
                 anchor,

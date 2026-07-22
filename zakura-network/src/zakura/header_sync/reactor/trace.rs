@@ -11,6 +11,7 @@ use super::super::{
     state::RangeRequest,
     validation::count_between,
     wire::HeaderSyncMessage,
+    HeaderSyncMessageV8,
 };
 use super::HeaderSyncReactor;
 use crate::zakura::{
@@ -443,6 +444,20 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
             insert_optional_str(row, hs_trace::REASON, Some(header_sync_message_label(msg)));
             insert_peer(row, hs_trace::PEER, peer);
             trace_header_sync_message_fields(row, msg);
+        }
+        HeaderSyncEvent::SessionWireMessageV8 { peer, msg, .. } => {
+            insert_optional_str(row, hs_trace::KIND, Some("session_wire_message_v8"));
+            insert_optional_str(
+                row,
+                hs_trace::REASON,
+                Some(match msg {
+                    HeaderSyncMessageV8::Status(_) => "status",
+                    HeaderSyncMessageV8::GetHeaders(_) => "get_headers",
+                    HeaderSyncMessageV8::Headers(_) => "headers",
+                    HeaderSyncMessageV8::HeadersOutcome(_) => "headers_outcome",
+                }),
+            );
+            insert_peer(row, hs_trace::PEER, peer);
         }
         HeaderSyncEvent::WireHeaders {
             wire_request,

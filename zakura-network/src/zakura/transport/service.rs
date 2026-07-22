@@ -44,6 +44,7 @@ pub struct Stream {
 #[derive(Debug)]
 pub(crate) struct ServiceStream {
     pub(crate) session_id: u64,
+    pub(crate) version: u16,
     pub(crate) recv: FramedRecv,
     pub(crate) send: FramedSend,
     pub(crate) cancel_token: CancellationToken,
@@ -52,12 +53,14 @@ pub(crate) struct ServiceStream {
 impl ServiceStream {
     pub(crate) fn new(
         session_id: u64,
+        version: u16,
         recv: FramedRecv,
         send: FramedSend,
         cancel_token: CancellationToken,
     ) -> Self {
         Self {
             session_id,
+            version,
             recv,
             send,
             cancel_token,
@@ -162,7 +165,7 @@ impl Peer {
             .map(|(kind, (recv, send))| {
                 (
                     kind,
-                    ServiceStream::new(0, recv, send, cancel_token.child_token()),
+                    ServiceStream::new(0, 0, recv, send, cancel_token.child_token()),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -247,6 +250,16 @@ impl Peer {
         self.streams
             .remove(&kind)
             .map(|stream| (stream.session_id, stream.recv, stream.send))
+    }
+
+    /// Take ownership of a stream pair, its version, and ordered-stream generation.
+    pub fn take_versioned_stream_with_session_id(
+        &mut self,
+        kind: u16,
+    ) -> Option<(u64, u16, FramedRecv, FramedSend)> {
+        self.streams
+            .remove(&kind)
+            .map(|stream| (stream.session_id, stream.version, stream.recv, stream.send))
     }
 
     /// Return the cancellation token for this peer's service tasks.

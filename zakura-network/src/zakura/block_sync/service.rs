@@ -410,6 +410,7 @@ impl Service for BlockSyncService {
         let session = PeerStreamSession::new(
             peer_id.clone(),
             ZAKURA_STREAM_BLOCK_SYNC,
+            ZAKURA_BLOCK_SYNC_STREAM_VERSION,
             recv,
             send,
             peer.service_cancel_token(),
@@ -419,7 +420,8 @@ impl Service for BlockSyncService {
         let close_cause = peer.close_cause();
         let block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
         let session_id = self.inner.next_session_id.fetch_add(1, Ordering::Relaxed);
-        let (_session_peer, _stream_kind, recv, send, _session_cancel) = session.into_parts();
+        let (_session_peer, _stream_kind, _stream_version, recv, send, _session_cancel) =
+            session.into_parts();
 
         // Production outbound block-sync frames go directly through
         // `BlockSyncPeerSession` (the per-peer routine's `try_send_get_blocks` /

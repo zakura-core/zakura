@@ -1153,6 +1153,7 @@ fn test_header_sync_handle() -> (HeaderSyncHandle, mpsc::UnboundedReceiver<Heade
             tip,
             peers,
             candidates,
+            v8_codec: HeaderSyncV8Codec::new(Network::Mainnet, 1024, 1, 0),
         },
         lifecycle_rx,
     )
@@ -1467,6 +1468,17 @@ fn codec_round_trips_new_block() {
 
     assert_eq!(decoded, message);
     assert_eq!(request_id, None);
+}
+
+#[test]
+fn v7_new_block_golden_bytes_remain_frozen() {
+    let message = HeaderSyncMessage::NewBlock(mainnet_block(&BLOCK_MAINNET_1_BYTES));
+    let encoded = message.encode(None).expect("the v7 fixture encodes");
+    let mut golden = Vec::with_capacity(1 + BLOCK_MAINNET_1_BYTES.len());
+    golden.push(MSG_HS_NEW_BLOCK);
+    golden.extend_from_slice(&BLOCK_MAINNET_1_BYTES);
+
+    assert_eq!(encoded, golden);
 }
 
 #[test]

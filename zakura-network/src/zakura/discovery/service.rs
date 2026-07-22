@@ -26,6 +26,7 @@ use crate::zakura::{
     OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServiceAdmissionDecision,
     ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+    ZAKURA_CAP_HEADER_SYNC_V8,
 };
 
 #[cfg(test)]
@@ -222,6 +223,7 @@ impl Service for DiscoveryService {
         let session = PeerStreamSession::new(
             peer.id.clone(),
             ZAKURA_STREAM_DISCOVERY,
+            ZAKURA_DISCOVERY_STREAM_VERSION,
             recv,
             send,
             peer.service_cancel_token(),
@@ -232,7 +234,8 @@ impl Service for DiscoveryService {
         let connection_cancel = peer.cancel_token();
         let close_cause = peer.close_cause();
         let other_service_negotiated = has_other_negotiated_service(peer.negotiated);
-        let (_peer_id, _stream_kind, recv, _send, _session_cancel) = session.into_parts();
+        let (_peer_id, _stream_kind, _stream_version, recv, _send, _session_cancel) =
+            session.into_parts();
 
         let handle = self.handle.clone();
         let header_sync = self.header_sync.clone();
@@ -730,7 +733,7 @@ fn peer_has_other_service_owner(
 }
 
 fn has_other_negotiated_service(negotiated: u64) -> bool {
-    negotiated & !(ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC) != 0
+    negotiated & !(ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC_V8) != 0
 }
 
 /// Returns the iroh node id encoded by a discovery peer id, if it is a 32-byte
@@ -777,7 +780,7 @@ mod tests {
         ServicePeerLimits, ZakuraBlockSyncConfig, ZakuraDiscoveryConfig,
         ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig,
         LOCAL_MAX_MESSAGE_BYTES, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_BLOCK_SYNC,
-        ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+        ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_HEADER_SYNC_V8,
     };
     use zakura_chain::{block, parameters::Network};
 
@@ -786,6 +789,9 @@ mod tests {
         assert!(!has_other_negotiated_service(ZAKURA_CAP_DISCOVERY));
         assert!(!has_other_negotiated_service(
             ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC
+        ));
+        assert!(!has_other_negotiated_service(
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC_V8
         ));
         assert!(has_other_negotiated_service(
             ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_BLOCK_SYNC

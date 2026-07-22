@@ -1,8 +1,4 @@
-//! Inert version-8 header-sync wire types and bounded codec.
-//!
-//! Version 8 is intentionally not connected to stream negotiation or dispatch in
-//! this checkpoint. Keeping its codec separate freezes the v7 discriminator-4
-//! `NewBlock` meaning while v8 assigns discriminator 4 to `HeadersOutcomeV8`.
+//! Version-8 header-sync wire types and bounded codec.
 
 use std::{io, sync::Arc};
 
@@ -17,7 +13,7 @@ use zakura_chain::{
     work::difficulty::U256,
 };
 
-use super::{header_sync_header_bytes_for_network, MAX_HS_MESSAGE_BYTES, MAX_HS_RANGE};
+use super::{header_sync_header_bytes_for_network, Frame, MAX_HS_MESSAGE_BYTES, MAX_HS_RANGE};
 
 /// Version-8 `Status` discriminator.
 pub const MSG_HS_V8_STATUS: u8 = 1;
@@ -48,6 +44,20 @@ pub enum HeaderSyncV8WireError {
     /// An unknown message discriminator was received.
     #[error("unknown Zakura header-sync v8 message type {0}")]
     UnknownMessageType(u8),
+    /// A frame message type did not fit the one-byte application discriminator.
+    #[error("unknown Zakura header-sync v8 frame message type {0}")]
+    UnknownFrameMessageType(u16),
+    /// A frame and its duplicated payload discriminator disagreed.
+    #[error("Zakura header-sync v8 frame type {frame} does not match payload type {payload}")]
+    MismatchedFrameMessageType {
+        /// Outer frame discriminator.
+        frame: u16,
+        /// Inner payload discriminator.
+        payload: u8,
+    },
+    /// Version 8 defines no frame flags.
+    #[error("unsupported Zakura header-sync v8 frame flags {0:#06x}")]
+    UnsupportedFlags(u16),
     /// A request ID was zero.
     #[error("Zakura header-sync v8 {0} request ID must be non-zero")]
     ZeroRequestId(&'static str),
@@ -437,7 +447,7 @@ pub struct HeaderSyncV8DecodeContext {
     pub requested_tree_aux_schema: AuxSchemaV8,
 }
 
-/// Standalone bounded codec for the not-yet-negotiated v8 protocol.
+/// Standalone bounded codec for the negotiated v8 protocol.
 #[derive(Clone, Debug)]
 pub struct HeaderSyncV8Codec {
     network: Network,
@@ -495,6 +505,18 @@ impl HeaderSyncV8Codec {
         Ok(bytes)
     }
 
+    /// Convert a message into a bounded Zakura frame.
+    pub fn encode_frame(
+        &self,
+        message: &HeaderSyncMessageV8,
+    ) -> Result<Frame, HeaderSyncV8WireError> {
+        Ok(Frame {
+            message_type: u16::from(message.message_type()),
+            flags: 0,
+            payload: self.encode(message)?,
+        })
+    }
+
     /// Decode a message, requiring request bounds for `Headers` and no other message.
     pub fn decode(
         &self,
@@ -548,6 +570,27 @@ impl HeaderSyncV8Codec {
             value => return Err(HeaderSyncV8WireError::UnknownMessageType(value)),
         };
         reject_trailing(bytes.len(), &reader)?;
+        Ok(message)
+    }
+
+    /// Decode a v8 message from a Zakura frame after checking type agreement.
+    pub fn decode_frame(
+        &self,
+        frame: Frame,
+        response_context: Option<HeaderSyncV8DecodeContext>,
+    ) -> Result<HeaderSyncMessageV8, HeaderSyncV8WireError> {
+        if frame.flags != 0 {
+            return Err(HeaderSyncV8WireError::UnsupportedFlags(frame.flags));
+        }
+        let message = self.decode(&frame.payload, response_context)?;
+        let frame_message_type = u8::try_from(frame.message_type)
+            .map_err(|_| HeaderSyncV8WireError::UnknownFrameMessageType(frame.message_type))?;
+        if frame_message_type != message.message_type() {
+            return Err(HeaderSyncV8WireError::MismatchedFrameMessageType {
+                frame: frame.message_type,
+                payload: message.message_type(),
+            });
+        }
         Ok(message)
     }
 
@@ -954,6 +997,7 @@ const _: () = assert!(KNOWN_TREE_AUX_SCHEMA_MASK == 1);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zakura::{HeaderSyncDecodeContext, HeaderSyncMessage};
     use zakura_chain::block::genesis::regtest_genesis_block;
 
     fn codec() -> HeaderSyncV8Codec {
@@ -1165,6 +1209,38 @@ mod tests {
                 .decode(&golden, None)
                 .expect("golden outcome decodes"),
             message
+        );
+    }
+
+    #[test]
+    fn discriminant_four_is_decoded_only_by_the_negotiated_codec() {
+        let outcome = HeaderSyncMessageV8::HeadersOutcome(HeadersOutcomeV8 {
+            request_id: 7,
+            target_tip_hash: hash(0xaa),
+            outcome: HeadersOutcomeCodeV8::HistoryPruned,
+        });
+        let outcome_frame = codec()
+            .encode_frame(&outcome)
+            .expect("valid v8 outcome encodes as a frame");
+        assert_eq!(
+            codec()
+                .decode_frame(outcome_frame.clone(), None)
+                .expect("a negotiated v8 codec decodes outcome discriminator 4"),
+            outcome
+        );
+        assert!(
+            HeaderSyncMessage::decode_frame(outcome_frame, HeaderSyncDecodeContext::control())
+                .is_err(),
+            "a negotiated v7 codec must not reinterpret a v8 outcome as NewBlock"
+        );
+
+        let new_block = HeaderSyncMessage::NewBlock(regtest_genesis_block());
+        let new_block_frame = new_block
+            .encode_frame(None)
+            .expect("valid v7 NewBlock encodes as a frame");
+        assert!(
+            codec().decode_frame(new_block_frame, None).is_err(),
+            "a negotiated v8 codec must not reinterpret a v7 NewBlock as an outcome"
         );
     }
 

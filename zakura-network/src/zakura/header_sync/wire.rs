@@ -15,6 +15,39 @@ pub const ZAKURA_STREAM_HEADER_SYNC: u16 = 5;
 /// Each of these is a breaking wire change: a peer that speaks an earlier version cannot
 /// exchange header-sync ranges with version 7 and does not negotiate header sync at all.
 pub const ZAKURA_HEADER_SYNC_STREAM_VERSION: u16 = 7;
+/// Version of the fork-aware native header-sync stream.
+pub const ZAKURA_HEADER_SYNC_STREAM_VERSION_V8: u16 = 8;
+
+/// Codec selected by the negotiated header-sync stream prelude.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HeaderSyncProtocolVersion {
+    /// Height-range protocol with full-block discriminator 4.
+    V7,
+    /// Fork-aware locator protocol with outcome discriminator 4.
+    V8,
+}
+
+impl HeaderSyncProtocolVersion {
+    /// Return the exact stream-prelude version.
+    pub const fn wire_version(self) -> u16 {
+        match self {
+            Self::V7 => ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            Self::V8 => ZAKURA_HEADER_SYNC_STREAM_VERSION_V8,
+        }
+    }
+}
+
+impl TryFrom<u16> for HeaderSyncProtocolVersion {
+    type Error = u16;
+
+    fn try_from(version: u16) -> Result<Self, Self::Error> {
+        match version {
+            ZAKURA_HEADER_SYNC_STREAM_VERSION => Ok(Self::V7),
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V8 => Ok(Self::V8),
+            version => Err(version),
+        }
+    }
+}
 
 /// Peer status advertisement.
 pub const MSG_HS_STATUS: u8 = 1;

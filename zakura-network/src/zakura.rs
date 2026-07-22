@@ -60,8 +60,11 @@ pub const ZAKURA_CAP_LEGACY_GOSSIP: u64 = 1 << 0;
 /// Capability bit for the native discovery service.
 pub const ZAKURA_CAP_DISCOVERY: u64 = 1 << 2;
 
-/// Capability bit for the native header-sync service.
+/// Capability bit for the version-7 native header-sync service.
 pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 4;
+
+/// Capability bit for the version-8 fork-aware native header-sync service.
+pub const ZAKURA_CAP_HEADER_SYNC_V8: u64 = 1 << 5;
 
 // Bit `1 << 1` is retired: it advertised the pre-request-id header-sync stream, which
 // correlated responses by arrival order and is no longer spoken. Do not lease it to a new

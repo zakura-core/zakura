@@ -83,6 +83,7 @@ pub struct HeaderSyncHandle {
     pub(super) tip: watch::Receiver<(block::Height, block::Hash)>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) candidates: watch::Receiver<ZakuraHeaderSyncCandidateState>,
+    pub(super) v8_codec: HeaderSyncV8Codec,
 }
 
 impl HeaderSyncHandle {
@@ -140,6 +141,11 @@ impl HeaderSyncHandle {
     /// Return the currently cached header-sync candidate hints.
     pub fn candidate_state(&self) -> ZakuraHeaderSyncCandidateState {
         self.candidates.borrow().clone()
+    }
+
+    /// Return the bounded codec fixed for negotiated v8 sessions.
+    pub(crate) fn v8_codec(&self) -> HeaderSyncV8Codec {
+        self.v8_codec.clone()
     }
 }
 
@@ -221,6 +227,15 @@ pub enum HeaderSyncEvent {
         session_id: u64,
         /// Decoded header-sync message.
         msg: HeaderSyncMessage,
+    },
+    /// Inbound message decoded only after a version-8 stream was negotiated.
+    SessionWireMessageV8 {
+        /// Serving peer.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation that delivered the message.
+        session_id: u64,
+        /// Decoded version-8 message.
+        msg: HeaderSyncMessageV8,
     },
     /// Inbound `Headers` response with its mandatory request ID.
     WireHeaders {
@@ -352,6 +367,7 @@ impl HeaderSyncEvent {
             #[cfg(test)]
             Self::WireMessage { .. } => "wire_message",
             Self::SessionWireMessage { .. } => "session_wire_message",
+            Self::SessionWireMessageV8 { .. } => "session_wire_message_v8",
             Self::WireHeaders { .. } => "wire_headers",
             Self::WireGetHeaders { .. } => "wire_get_headers",
             Self::WireDecodeFailed { .. } => "wire_decode_failed",

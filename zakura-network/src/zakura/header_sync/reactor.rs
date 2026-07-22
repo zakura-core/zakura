@@ -49,6 +49,12 @@ pub fn spawn_header_sync_reactor(
         tip: tip_rx,
         peers: peers_rx,
         candidates: candidates_rx,
+        v8_codec: HeaderSyncV8Codec::new(
+            startup.network.clone(),
+            startup.max_frame_bytes.saturating_sub(8),
+            startup.config.advertised_max_headers_per_response(),
+            1,
+        ),
     };
     let reactor = HeaderSyncReactor {
         startup,
@@ -350,6 +356,17 @@ impl HeaderSyncReactor {
             } => {
                 if self.is_current_session(&peer, session_id) {
                     self.handle_wire_message(peer, msg).await;
+                } else {
+                    metrics::counter!("sync.header.session.stale_event").increment(1);
+                }
+            }
+            HeaderSyncEvent::SessionWireMessageV8 {
+                peer, session_id, ..
+            } => {
+                if self.is_current_session(&peer, session_id) {
+                    // PR-10a establishes strict negotiated decoding. PR-10b
+                    // consumes status messages from this versioned event.
+                    metrics::counter!("sync.header.v8.message.decoded").increment(1);
                 } else {
                     metrics::counter!("sync.header.session.stale_event").increment(1);
                 }
@@ -739,6 +756,13 @@ impl HeaderSyncReactor {
                     DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
                 )
             });
+        if requester_session.protocol() == HeaderSyncProtocolVersion::V8 {
+            self.publish_connectivity_metrics();
+            self.trace_peer_connected(&peer, direction, self.state.peers.len());
+            self.publish_peer_snapshot();
+            self.publish_candidate_state();
+            return;
+        }
         let requester_generation = self.next_requester_generation;
         self.next_requester_generation = self.next_requester_generation.wrapping_add(1).max(1);
         let requester_id = HeaderRequesterId {
@@ -2519,6 +2543,9 @@ impl HeaderSyncReactor {
         // rate limiter would treat the redundant message as spam. Keepalive
         // sends are exempt: their meter keeps them above that limit.
         let session = match self.state.peers.get(peer) {
+            Some(peer_state) if peer_state.session.protocol() == HeaderSyncProtocolVersion::V8 => {
+                return false;
+            }
             Some(peer_state) if force || peer_state.status_differs_from_last_sent(status) => {
                 peer_state.session.clone()
             }

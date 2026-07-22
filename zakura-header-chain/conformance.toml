@@ -559,7 +559,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-V8-16"
 name = "Version-scoped discriminants"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::run_v8_peer"
+tests = ["P8-01::discriminant_four_is_decoded_only_by_the_negotiated_codec", "P7-01::v7_new_block_golden_bytes_remain_frozen", "P8-01::negotiated_v8_pipe_dispatches_discriminant_four_as_outcome"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-V8-05"

@@ -26,6 +26,17 @@ pub enum RegistryError {
         second_service: &'static str,
     },
 
+    /// One service declared the same stream kind and version twice.
+    #[error("service {service} declared duplicate Zakura stream kind {kind} version {version}")]
+    DuplicateStream {
+        /// Service containing the duplicate declaration.
+        service: &'static str,
+        /// Duplicated stream kind.
+        kind: u16,
+        /// Duplicated stream version.
+        version: u16,
+    },
+
     /// A service declared a stream whose capability is not exactly one bit.
     ///
     /// Each [`Stream`] maps to a single capability bit so
@@ -59,12 +70,13 @@ pub struct ServiceRegistry {
 impl ServiceRegistry {
     /// Build a registry from protocol services.
     pub fn new(services: Vec<Arc<dyn Service>>) -> Result<Self, RegistryError> {
-        let mut by_kind = HashMap::new();
+        let mut by_kind: HashMap<u16, usize> = HashMap::new();
         let mut by_capability: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut supported_capabilities = 0;
 
         for (index, service) in services.iter().enumerate() {
             let mut service_capabilities = HashSet::new();
+            let mut service_streams = HashSet::new();
 
             for stream in service.streams() {
                 // Each stream must map to exactly one capability bit, otherwise
@@ -78,12 +90,24 @@ impl ServiceRegistry {
                     });
                 }
 
-                if let Some(first_index) = by_kind.insert(stream.kind, index) {
-                    return Err(RegistryError::DuplicateKind {
+                if !service_streams.insert((stream.kind, stream.version)) {
+                    return Err(RegistryError::DuplicateStream {
+                        service: service.name(),
                         kind: stream.kind,
-                        first_service: services[first_index].name(),
-                        second_service: service.name(),
+                        version: stream.version,
                     });
+                }
+
+                if let Some(first_index) = by_kind.get(&stream.kind).copied() {
+                    if first_index != index {
+                        return Err(RegistryError::DuplicateKind {
+                            kind: stream.kind,
+                            first_service: services[first_index].name(),
+                            second_service: service.name(),
+                        });
+                    }
+                } else {
+                    by_kind.insert(stream.kind, index);
                 }
 
                 supported_capabilities |= stream.capability;
@@ -180,9 +204,11 @@ impl ServiceRegistry {
         let mut streams = Vec::new();
 
         for service in self.services_for_negotiated(negotiated) {
-            streams.extend(service.streams().iter().copied().filter(|stream| {
-                stream.mode == StreamMode::Ordered && negotiated & stream.capability != 0
-            }));
+            streams.extend(selected_streams(
+                service.streams(),
+                negotiated,
+                StreamMode::Ordered,
+            ));
         }
 
         streams
@@ -207,9 +233,11 @@ impl ServiceRegistry {
                 continue;
             }
 
-            streams.extend(service.streams().iter().copied().filter(|stream| {
-                stream.mode == StreamMode::Ordered && negotiated & stream.capability != 0
-            }));
+            streams.extend(selected_streams(
+                service.streams(),
+                negotiated,
+                StreamMode::Ordered,
+            ));
         }
 
         streams
@@ -235,9 +263,11 @@ impl ServiceRegistry {
         let mut streams = Vec::new();
 
         for service in self.services_for_negotiated(negotiated) {
-            streams.extend(service.streams().iter().copied().filter(|stream| {
-                stream.mode == StreamMode::RequestResponse && negotiated & stream.capability != 0
-            }));
+            streams.extend(selected_streams(
+                service.streams(),
+                negotiated,
+                StreamMode::RequestResponse,
+            ));
         }
 
         streams
@@ -396,6 +426,32 @@ impl ServiceRegistry {
     }
 }
 
+/// Select exactly one mutually negotiated version of each stream kind.
+///
+/// Version alternatives are declared as distinct capability bits. Selecting the
+/// highest matching version before opening the prelude makes decoding
+/// version-scoped and keeps older peers on their existing stream.
+fn selected_streams(streams: &[Stream], negotiated: u64, mode: StreamMode) -> Vec<Stream> {
+    let mut selected = Vec::<Stream>::new();
+    for stream in streams
+        .iter()
+        .copied()
+        .filter(|stream| stream.mode == mode && negotiated & stream.capability != 0)
+    {
+        if let Some(existing) = selected
+            .iter_mut()
+            .find(|existing| existing.kind == stream.kind)
+        {
+            if stream.version > existing.version {
+                *existing = stream;
+            }
+        } else {
+            selected.push(stream);
+        }
+    }
+    selected
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -508,6 +564,57 @@ mod tests {
             capability,
             mode: StreamMode::Ordered,
         }
+    }
+
+    fn versioned_stream(kind: u16, version: u16, capability: u64) -> Stream {
+        Stream {
+            version,
+            ..stream(kind, capability)
+        }
+    }
+
+    #[test]
+    fn one_service_can_declare_version_alternatives_for_one_kind() {
+        let header = TestService::new(
+            "header",
+            vec![
+                versioned_stream(5, 8, 0b0010),
+                versioned_stream(5, 7, 0b0001),
+            ],
+        );
+        let registry =
+            ServiceRegistry::new(vec![header]).expect("one service owns both negotiated versions");
+
+        assert!(registry.is_supported_stream(5, 7));
+        assert!(registry.is_supported_stream(5, 8));
+        assert_eq!(
+            registry.ordered_streams_for_negotiated(0b0001),
+            vec![versioned_stream(5, 7, 0b0001)]
+        );
+        assert_eq!(
+            registry.ordered_streams_for_negotiated(0b0011),
+            vec![versioned_stream(5, 8, 0b0010)]
+        );
+    }
+
+    #[test]
+    fn duplicate_kind_and_version_in_one_service_is_rejected() {
+        let header = TestService::new(
+            "header",
+            vec![
+                versioned_stream(5, 8, 0b0010),
+                versioned_stream(5, 8, 0b0010),
+            ],
+        );
+
+        assert!(matches!(
+            ServiceRegistry::new(vec![header]),
+            Err(RegistryError::DuplicateStream {
+                service: "header",
+                kind: 5,
+                version: 8,
+            })
+        ));
     }
 
     #[test]

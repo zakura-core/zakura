@@ -14,20 +14,31 @@ use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, Flow, Frame, FramedRecv, FramedSend,
     OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServicePeerDirection, SessionGuard,
     Sink, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId, ZakuraSupervisorHandle,
-    ZAKURA_CAP_HEADER_SYNC,
+    ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_HEADER_SYNC_V8,
 };
 
-const HEADER_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
-    kind: ZAKURA_STREAM_HEADER_SYNC,
-    version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
-    // Advisory until the transport wires Stream::frame_cap end-to-end; the
-    // authoritative inbound cap is app_frame_cap_for_stream_kind. The cast is
-    // safe because both terms are small protocol constants checked against the
+const HEADER_SYNC_FRAME_CAP: u32 = {
+    // Safe because both terms are small protocol constants checked against the
     // local message cap in header_sync::wire.
-    frame_cap: (MAX_HS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32,
-    capability: ZAKURA_CAP_HEADER_SYNC,
-    mode: StreamMode::Ordered,
-}];
+    (MAX_HS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32
+};
+
+const HEADER_SYNC_SERVICE_STREAMS: [Stream; 2] = [
+    Stream {
+        kind: ZAKURA_STREAM_HEADER_SYNC,
+        version: ZAKURA_HEADER_SYNC_STREAM_VERSION_V8,
+        frame_cap: HEADER_SYNC_FRAME_CAP,
+        capability: ZAKURA_CAP_HEADER_SYNC_V8,
+        mode: StreamMode::Ordered,
+    },
+    Stream {
+        kind: ZAKURA_STREAM_HEADER_SYNC,
+        version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        frame_cap: HEADER_SYNC_FRAME_CAP,
+        capability: ZAKURA_CAP_HEADER_SYNC,
+        mode: StreamMode::Ordered,
+    },
+];
 
 /// Service-declared streams for native header sync.
 pub(crate) fn header_sync_streams() -> &'static [Stream] {
@@ -40,6 +51,7 @@ pub struct HeaderSyncPeerSession {
     peer_id: ZakuraPeerId,
     session_id: u64,
     direction: ServicePeerDirection,
+    protocol: HeaderSyncProtocolVersion,
     inner: Arc<HeaderSyncPeerSessionInner>,
 }
 
@@ -62,6 +74,8 @@ impl HeaderSyncPeerSession {
             session.peer_id().clone(),
             session_id,
             direction,
+            HeaderSyncProtocolVersion::try_from(session.stream_version())
+                .expect("transport admits only declared header-sync stream versions"),
             session.sender(),
             session.cancel_token(),
             Some(commands),
@@ -88,6 +102,7 @@ impl HeaderSyncPeerSession {
             peer_id,
             0,
             direction,
+            HeaderSyncProtocolVersion::V7,
             send,
             cancel_token,
             None,
@@ -106,6 +121,7 @@ impl HeaderSyncPeerSession {
             peer_id,
             session_id,
             direction,
+            HeaderSyncProtocolVersion::V7,
             send,
             cancel_token,
             None,
@@ -116,6 +132,7 @@ impl HeaderSyncPeerSession {
         peer_id: ZakuraPeerId,
         session_id: u64,
         direction: ServicePeerDirection,
+        protocol: HeaderSyncProtocolVersion,
         send: FramedSend,
         cancel_token: CancellationToken,
         commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
@@ -124,6 +141,7 @@ impl HeaderSyncPeerSession {
             peer_id,
             session_id,
             direction,
+            protocol,
             inner: Arc::new(HeaderSyncPeerSessionInner {
                 send,
                 cancel_token,
@@ -146,6 +164,11 @@ impl HeaderSyncPeerSession {
     /// Direction of the underlying Zakura connection.
     pub fn direction(&self) -> ServicePeerDirection {
         self.direction
+    }
+
+    /// Codec selected before any header-sync message is decoded.
+    pub fn protocol(&self) -> HeaderSyncProtocolVersion {
+        self.protocol
     }
 
     /// Peer disconnect/local shutdown cancellation token.
@@ -259,6 +282,15 @@ impl HeaderSyncPeerSession {
         msg: HeaderSyncMessage,
         request_id: Option<HeaderSyncRequestId>,
     ) -> Result<(), OrderedSendError> {
+        if self.protocol != HeaderSyncProtocolVersion::V7 {
+            return Err(OrderedSendError::Encode(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "attempted to encode a v7 message on a negotiated v8 header-sync stream",
+                )
+                .into(),
+            ));
+        }
         let frame = msg
             .encode_frame(request_id)
             .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
@@ -471,16 +503,24 @@ impl Service for HeaderSyncService {
     }
 
     fn add_peer(&self, mut peer: Peer) {
-        let Some((session_id, recv, send)) =
-            peer.take_stream_with_session_id(ZAKURA_STREAM_HEADER_SYNC)
+        let Some((session_id, stream_version, recv, send)) =
+            peer.take_versioned_stream_with_session_id(ZAKURA_STREAM_HEADER_SYNC)
         else {
             return;
+        };
+        // `Peer`'s public in-memory constructor predates version propagation and
+        // uses zero for test-only streams; preserve its established v7 behavior.
+        let stream_version = if stream_version == 0 {
+            ZAKURA_HEADER_SYNC_STREAM_VERSION
+        } else {
+            stream_version
         };
 
         let peer_id = peer.id.clone();
         let session = PeerStreamSession::new(
             peer_id.clone(),
             ZAKURA_STREAM_HEADER_SYNC,
+            stream_version,
             recv,
             send,
             peer.service_cancel_token(),
@@ -530,19 +570,14 @@ impl Service for HeaderSyncService {
             .header_sync
             .send_lifecycle(HeaderSyncEvent::PeerConnected(header_sync_session.clone()));
 
-        let (_session_peer, _stream_kind, recv, _send, _session_cancel) = session.into_parts();
+        let protocol = header_sync_session.protocol();
+        let (_session_peer, _stream_kind, _stream_version, recv, _send, _session_cancel) =
+            session.into_parts();
 
         // Phase 2 keeps request/response correlation in `HsLocal`: after the
         // session queues an outbound `GetHeaders`, the peer-owned pipe records
         // the expected `Headers` response in plain local state.
-        let pipe = Pipe::new(
-            peer_id.clone(),
-            HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
-            HsEnv::new_with_session_id(self.header_sync.clone(), session_id),
-            SessionGuard::oversize_only(header_sync_guard_max_bytes()),
-            run_inbound,
-            &PIPE_SHAPE,
-        );
+        let v8_codec = self.header_sync.v8_codec();
         // The pipe future reproduces the old sink's connection handling: a
         // protocol reject (the only way `run_peer` returns `Err`, since
         // `run_inbound` maps a closed-queue `Local` to a benign continue)
@@ -552,13 +587,45 @@ impl Service for HeaderSyncService {
         let pipe_cancel_token = service_cancel_token.clone();
         let protocol_connection_cancel_token = connection_cancel_token.clone();
         let protocol_close_cause = close_cause.clone();
-        let pipe = async move {
-            handle_pipe_exit(
-                "header-sync",
-                &protocol_connection_cancel_token,
-                &protocol_close_cause,
-                run_peer(pipe, recv, pipe_cancel_token).await,
-            );
+        let pipe: BoxRunFuture<'static, ()> = match protocol {
+            HeaderSyncProtocolVersion::V7 => {
+                let pipe = Pipe::new(
+                    peer_id.clone(),
+                    HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
+                    HsEnv::new_with_session_id(self.header_sync.clone(), session_id),
+                    SessionGuard::oversize_only(header_sync_guard_max_bytes()),
+                    run_inbound,
+                    &PIPE_SHAPE,
+                );
+                Box::pin(async move {
+                    handle_pipe_exit(
+                        "header-sync",
+                        &protocol_connection_cancel_token,
+                        &protocol_close_cause,
+                        run_peer(pipe, recv, pipe_cancel_token).await,
+                    );
+                })
+            }
+            HeaderSyncProtocolVersion::V8 => {
+                let handle = self.header_sync.clone();
+                let pipe_peer = peer_id.clone();
+                Box::pin(async move {
+                    handle_pipe_exit(
+                        "header-sync-v8",
+                        &protocol_connection_cancel_token,
+                        &protocol_close_cause,
+                        run_v8_peer(
+                            handle,
+                            v8_codec,
+                            pipe_peer,
+                            session_id,
+                            recv,
+                            pipe_cancel_token,
+                        )
+                        .await,
+                    );
+                })
+            }
         };
 
         // The supervised teardown runs on every exit path — normal return,
@@ -814,6 +881,7 @@ mod request_id_tests {
             peer_id.clone(),
             1,
             ServicePeerDirection::Outbound,
+            HeaderSyncProtocolVersion::V7,
             send,
             CancellationToken::new(),
             Some(commands_tx),

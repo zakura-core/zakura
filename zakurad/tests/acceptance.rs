@@ -4617,7 +4617,10 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
     .await
     .map_err(|_| eyre!("zakurad nodes did not connect before the launch timeout"))?;
 
-    tracing::info!(?peer_info, "found peer connection, committing genesis block");
+    tracing::info!(
+        ?peer_info,
+        "found peer connection, committing genesis block"
+    );
 
     let genesis_block = network1.block_parsed_iter().next().unwrap();
     rpc_client_1.submit_block(genesis_block.clone()).await?;

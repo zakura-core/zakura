@@ -1075,6 +1075,40 @@ class Reporting(unittest.TestCase):
             "reasons": [] if verdict == "ok" else ["something went wrong"],
         }
 
+    def test_every_metric_row_carries_an_interpretation_hint(self):
+        # The hints exist because these numbers are genuinely easy to misread:
+        # "Confirmed 10 / Submitted 27" looked like a 63% failure rate when
+        # acceptance was actually 100%.
+        out = monitor.render_markdown(self.full_result())
+        header = "| Metric | Value | How to read it |"
+        self.assertIn(header, out)
+        body = [
+            line for line in out.splitlines()
+            if line.startswith("| ") and line != header and not line.startswith("| ---")
+            and not line.startswith("| Counter")
+        ]
+        self.assertTrue(body)
+        for line in body:
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            self.assertEqual(len(cells), 3, f"row is not 3 columns: {line}")
+            self.assertTrue(cells[2], f"row has no hint: {line}")
+
+    def test_confirmed_is_not_presented_as_a_success_rate(self):
+        out = monitor.render_markdown(self.full_result())
+        confirmed = next(l for l in out.splitlines() if l.startswith("| Confirmed"))
+        self.assertIn("not** a success rate", confirmed)
+        self.assertIn("lags", confirmed)
+
+    def test_backpressure_counters_are_explained(self):
+        out = monitor.render_markdown(self.full_result())
+        row = next(l for l in out.splitlines() if "mempool_full_queue_per_peer_total" in l)
+        self.assertIn("backpressure", row.lower())
+        # The rejected-ID cache is routinely misread as a reject count.
+        self.assertIn(
+            "NOT a count",
+            monitor.BACKPRESSURE_HINTS["mempool_rejected_transaction_ids"],
+        )
+
     def test_markdown_reports_the_headline_numbers(self):
         out = monitor.render_markdown(self.full_result())
         self.assertIn("PASS", out)

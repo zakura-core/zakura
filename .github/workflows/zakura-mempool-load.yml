@@ -58,9 +58,7 @@ on:
       kresko_ref:
         description: "Kresko ref for the load generator"
         required: false
-        # Tracks valargroup/kresko#5, which makes Kresko build against the
-        # zakura crates directly. Repoint at main once that merges.
-        default: fix/local-genesis-upgrade-consistency
+        default: main
       teardown_after_run:
         description: "Delete the droplet immediately after the run"
         type: boolean
@@ -98,7 +96,10 @@ jobs:
           # dispatch default. The ref defaults to the pushed branch by name
           # (not SHA) so the PR lookup below can still match on head branch.
           REF: ${{ inputs.ref || (github.event_name == 'push' && github.ref_name || '') }}
-          BASELINE_REF: ${{ inputs.baseline_ref }}
+          # TEMPORARY, with the push trigger: gives the smoke run a real
+          # baseline so the two-leg A/B path is actually exercised. main and
+          # this branch have identical Rust, so the second build is cached.
+          BASELINE_REF: ${{ inputs.baseline_ref || (github.event_name == 'push' && 'main' || '') }}
           NODE_COUNT: ${{ inputs.node_count || '2' }}
           TX_RATE: ${{ inputs.tx_rate || '2' }}
           DURATION_MINUTES: ${{ inputs.duration_minutes || '2' }}
@@ -230,7 +231,7 @@ jobs:
           NODE_COUNT: ${{ inputs.node_count || '2' }}
           TX_RATE: ${{ inputs.tx_rate || '2' }}
           DURATION_MINUTES: ${{ inputs.duration_minutes || '2' }}
-          KRESKO_REF: ${{ inputs.kresko_ref || 'fix/local-genesis-upgrade-consistency' }}
+          KRESKO_REF: ${{ inputs.kresko_ref || 'main' }}
         run: |
           set -euo pipefail
           umask 077

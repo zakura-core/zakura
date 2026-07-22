@@ -367,6 +367,21 @@ def grade_run(result: dict, args) -> tuple[str, list[str]]:
 # ---------------------------------------------------------------------------- #
 
 
+# What each backpressure counter means, so the table is readable without
+# going and grepping the mempool source.
+BACKPRESSURE_HINTS = {
+    "zcash_mempool_size_transactions": "Transactions resident in the mempool at the end.",
+    "zcash_mempool_size_bytes": "Serialized size of the mempool.",
+    "zcash_mempool_cost_bytes": "Weighted cost used for eviction; compare against tx_cost_limit.",
+    "mempool_currently_queued_transactions": "Awaiting verification right now. Sustained growth means verification is the bottleneck.",
+    "mempool_queued_transactions_total": "Cumulative queued. Compare with submitted to see re-queues.",
+    "mempool_gossiped_transactions_total": "Cumulative gossiped to peers. Should scale with submissions x peers.",
+    "mempool_rejected_transaction_ids": "Size of the rejected-ID cache, NOT a count of rejected workload transactions.",
+    "mempool_failed_verify_tasks_total": "Verification tasks that failed. Non-zero deserves a look.",
+    "mempool_full_queue_per_peer_total": "Times a peer's queue was full. The clearest backpressure signal.",
+}
+
+
 def render_markdown(result: dict) -> str:
     throughput = result["throughput"]
     propagation = result["propagation"]
@@ -384,36 +399,116 @@ def render_markdown(result: dict) -> str:
         for reason in result["reasons"]:
             lines.append(f"- {reason}")
         lines.append("")
+
+    # (label, rendered value, how to read it). The hints exist because several
+    # of these numbers are easy to misread: `Confirmed` looks like a success
+    # rate but is bounded by block production, and effective throughput looks
+    # like a shortfall against the target rate but is bounded by proving.
+    rows = [
+        (
+            "Transactions submitted",
+            str(throughput["submitted"]),
+            "Offered by the load generator during the measured window.",
+        ),
+        (
+            "Accepted into mempool",
+            str(throughput["mempool_seen"]),
+            "Should equal submitted. A shortfall is the node refusing work.",
+        ),
+        (
+            "Confirmed so far",
+            str(throughput["confirmed"]),
+            "Block inclusions seen so far. Bounded by block production and "
+            "sampled mid-flight, so it lags -- **not** a success rate.",
+        ),
+        (
+            "Node rejects",
+            str(throughput["node_rejects"]),
+            "Rejections attributable to the node. Non-zero is the thing to investigate.",
+        ),
+        (
+            "Workload-side failures",
+            str(throughput["workload_failures"]),
+            "Blaster racing a new block (anchor races). Retried, and not graded.",
+        ),
+        (
+            "Reject rate",
+            fmt_pct(throughput["reject_rate"]),
+            "Node rejects over graded attempts. Only graded above the "
+            "minimum-sample floor, since one reject in a short run is several percent.",
+        ),
+        (
+            "Effective throughput",
+            f"{fmt_num(result['effective_tx_per_sec'])} tx/s",
+            "Bounded by Orchard proving, not the mempool. Compare legs against "
+            "each other, never against the requested rate.",
+        ),
+        (
+            "Confirm delay p50 / p95",
+            f"{fmt_num(throughput['confirm_delay_p50_ms'])} / "
+            f"{fmt_num(throughput['confirm_delay_p95_ms'])} ms",
+            "Submit to block inclusion. Tracks the block interval, so read it "
+            "against how fast blocks were produced.",
+        ),
+        (
+            "Distinct txids observed",
+            str(propagation["txids_observed"]),
+            "Unique txids seen in any mempool sample. Slightly under submitted "
+            "is normal -- the last ones arrive after the final sample.",
+        ),
+        (
+            "Reached all nodes",
+            str(propagation["txids_on_all_nodes"]),
+            "Propagated to every node. Should be close to observed; a large gap "
+            "means transactions are not reaching the whole network.",
+        ),
+        (
+            "Propagation spread p50 / p95",
+            f"{fmt_num(propagation['spread_p50_secs'])} / "
+            f"{fmt_num(propagation['spread_p95_secs'])} s",
+            "First to last node seeing a txid. **The headline number for gossip "
+            "changes.** Varies run to run, so trust it only in an A/B.",
+        ),
+        (
+            "Propagation resolution",
+            f"{fmt_num(propagation.get('resolution_secs'))} s",
+            "Median sampling gap. Spreads below this are unresolvable, so a p50 "
+            "near this value means propagation was faster than we can measure.",
+        ),
+        (
+            "Peak mempool depth",
+            str(result["peak_mempool_txs"]),
+            "Most transactions held at once. Near zero with non-zero submissions "
+            "means they confirmed as fast as they arrived.",
+        ),
+        (
+            "Tip spread at end",
+            fmt_num(convergence["spread"]),
+            "Height difference across nodes. 0 or 1 is converged; higher means a "
+            "node fell behind.",
+        ),
+    ]
+
     lines += [
         f"`{meta.get('sha', 'unknown')}` | {meta.get('node_count')} nodes | "
         f"{meta.get('duration_secs')}s | target {meta.get('tx_rate')} tx/s",
         "",
-        "| Metric | Value |",
-        "| --- | --- |",
-        f"| Transactions submitted | {throughput['submitted']} |",
-        f"| Confirmed | {throughput['confirmed']} |",
-        f"| Seen in mempool | {throughput['mempool_seen']} |",
-        f"| Node rejects | {throughput['node_rejects']} |",
-        f"| Workload-side failures | {throughput['workload_failures']} "
-        f"(anchor races, not graded) |",
-        f"| Reject rate | {fmt_pct(throughput['reject_rate'])} |",
-        f"| Effective throughput | {fmt_num(result['effective_tx_per_sec'])} tx/s |",
-        f"| Confirm delay p50 / p95 | {fmt_num(throughput['confirm_delay_p50_ms'])} / "
-        f"{fmt_num(throughput['confirm_delay_p95_ms'])} ms |",
-        f"| Distinct txids observed | {propagation['txids_observed']} |",
-        f"| Reached all nodes | {propagation['txids_on_all_nodes']} |",
-        f"| Propagation spread p50 / p95 | {fmt_num(propagation['spread_p50_secs'])} / "
-        f"{fmt_num(propagation['spread_p95_secs'])} s |",
-        f"| Propagation resolution | {fmt_num(propagation.get('resolution_secs'))} s "
-        f"(sampling floor) |",
-        f"| Peak mempool depth | {result['peak_mempool_txs']} |",
-        f"| Tip spread at end | {fmt_num(convergence['spread'])} |",
-        "",
+        "| Metric | Value | How to read it |",
+        "| --- | --- | --- |",
     ]
+    lines += [f"| {label} | {value} | {hint} |" for label, value, hint in rows]
+    lines.append("")
+
     if result["backpressure"]:
-        lines += ["### Backpressure counters (final)", "", "| Counter | Value |", "| --- | --- |"]
+        lines += [
+            "### Backpressure counters (final)",
+            "",
+            "| Counter | Value | How to read it |",
+            "| --- | --- | --- |",
+        ]
         for key, value in sorted(result["backpressure"].items()):
-            lines.append(f"| `{key}` | {fmt_num(value)} |")
+            hint = BACKPRESSURE_HINTS.get(key, "")
+            lines.append(f"| `{key}` | {fmt_num(value)} | {hint} |")
         lines.append("")
     return "\n".join(lines)
 

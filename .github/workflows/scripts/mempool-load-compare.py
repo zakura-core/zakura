@@ -20,16 +20,26 @@ from pathlib import Path
 
 # (label, json path, lower_is_better). Percent deltas are only meaningful for
 # ratio-scale quantities, which is every metric here.
+# (label, json path, lower_is_better, how to read it)
 COMPARISONS = (
-    ("Transactions submitted", ("throughput", "submitted"), False),
-    ("Effective throughput (tx/s)", ("effective_tx_per_sec",), False),
-    ("Reject rate", ("throughput", "reject_rate"), True),
-    ("Confirm delay p50 (ms)", ("throughput", "confirm_delay_p50_ms"), True),
-    ("Confirm delay p95 (ms)", ("throughput", "confirm_delay_p95_ms"), True),
-    ("Propagation p50 (s)", ("propagation", "spread_p50_secs"), True),
-    ("Propagation p95 (s)", ("propagation", "spread_p95_secs"), True),
-    ("Txids reaching all nodes", ("propagation", "txids_on_all_nodes"), False),
-    ("Peak mempool depth", ("peak_mempool_txs",), False),
+    ("Transactions submitted", ("throughput", "submitted"), False,
+     "Proving-bound, so treat small moves as noise."),
+    ("Effective throughput (tx/s)", ("effective_tx_per_sec",), False,
+     "Same figure per second. A real drop shows up here and above together."),
+    ("Reject rate", ("throughput", "reject_rate"), True,
+     "Node rejects only. 0 -> non-zero is the most actionable regression here."),
+    ("Confirm delay p50 (ms)", ("throughput", "confirm_delay_p50_ms"), True,
+     "Tracks block interval; moves with mining luck as well as code."),
+    ("Confirm delay p95 (ms)", ("throughput", "confirm_delay_p95_ms"), True,
+     "Tail latency. More sensitive to real stalls than p50."),
+    ("Propagation p50 (s)", ("propagation", "spread_p50_secs"), True,
+     "Typical gossip spread across nodes."),
+    ("Propagation p95 (s)", ("propagation", "spread_p95_secs"), True,
+     "Tail gossip spread. **The number to watch for advertisement/retry changes.**"),
+    ("Txids reaching all nodes", ("propagation", "txids_on_all_nodes"), False,
+     "Full-network reach. A drop means transactions are not getting everywhere."),
+    ("Peak mempool depth", ("peak_mempool_txs",), False,
+     "Higher can mean slower draining, or simply more submitted; read with the rows above."),
 )
 
 # Below this, run-to-run noise dominates and a delta is not worth flagging.
@@ -91,7 +101,7 @@ def fmt_delta(delta_pct: float | None) -> str:
 
 def build_rows(baseline: dict, target: dict) -> list[dict]:
     rows = []
-    for label, path, lower_is_better in COMPARISONS:
+    for label, path, lower_is_better, hint in COMPARISONS:
         base_value = dig(baseline, path)
         target_value = dig(target, path)
         delta = pct_delta(base_value, target_value)
@@ -102,6 +112,7 @@ def build_rows(baseline: dict, target: dict) -> list[dict]:
                 "target": target_value,
                 "delta_pct": delta,
                 "verdict": classify(delta, lower_is_better, base_value, target_value),
+                "hint": hint,
             }
         )
     return rows
@@ -125,13 +136,13 @@ def render(baseline: dict, target: dict, rows: list[dict]) -> str:
         f"target {target_meta.get('tx_rate', '?')} tx/s | "
         f"deltas under {NOISE_FLOOR_PCT:.0f}% treated as noise",
         "",
-        "| Metric | Baseline | Target | Delta | |",
-        "| --- | --- | --- | --- | --- |",
+        "| Metric | Baseline | Target | Delta | | How to read it |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
         lines.append(
             f"| {row['metric']} | {fmt(row['baseline'])} | {fmt(row['target'])} | "
-            f"{fmt_delta(row['delta_pct'])} | {row['verdict']} |"
+            f"{fmt_delta(row['delta_pct'])} | {row['verdict']} | {row.get('hint', '')} |"
         )
     lines.append("")
     if regressions:

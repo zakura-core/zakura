@@ -31,7 +31,7 @@ use zakura_chain::{
     },
     transparent,
     value_balance::ValueBalance,
-    work::difficulty::PartialCumulativeWork,
+    work::difficulty::{PartialCumulativeWork, U256},
 };
 
 use crate::{
@@ -2649,29 +2649,43 @@ impl Ord for Chain {
     /// [1]: super::NonFinalizedState
     /// [2]: super::NonFinalizedState::chain_set
     fn cmp(&self, other: &Self) -> Ordering {
-        if self.partial_cumulative_work != other.partial_cumulative_work {
-            self.partial_cumulative_work
-                .cmp(&other.partial_cumulative_work)
-        } else {
-            let self_hash = self
-                .blocks
-                .values()
-                .last()
-                .expect("always at least 1 element")
-                .hash;
-
-            let other_hash = other
-                .blocks
-                .values()
-                .last()
-                .expect("always at least 1 element")
-                .hash;
-
-            // This comparison is a tie-breaker within the local node, so it does not need to
-            // be consistent with the ordering on `ExpandedDifficulty` and `block::Hash`.
-            self_hash.0.cmp(&other_hash.0)
-        }
+        compare_chain_score_parts(
+            self.partial_cumulative_work.as_u256(),
+            || {
+                self.blocks
+                    .values()
+                    .last()
+                    .expect("a non-finalized chain with tied work always contains a block")
+                    .hash
+            },
+            other.partial_cumulative_work.as_u256(),
+            || {
+                other
+                    .blocks
+                    .values()
+                    .last()
+                    .expect("a non-finalized chain with tied work always contains a block")
+                    .hash
+            },
+        )
     }
+}
+
+/// Exact comparison used by [`Chain::cmp`], exposed to its differential test.
+pub(super) fn compare_chain_score_parts<LeftTip, RightTip>(
+    left_work: U256,
+    left_tip: LeftTip,
+    right_work: U256,
+    right_tip: RightTip,
+) -> Ordering
+where
+    LeftTip: FnOnce() -> block::Hash,
+    RightTip: FnOnce() -> block::Hash,
+{
+    left_work
+        .cmp(&right_work)
+        // This is the existing Zebra tie-breaker: raw internal bytes, never display order.
+        .then_with(|| left_tip().0.cmp(&right_tip().0))
 }
 
 impl PartialOrd for Chain {

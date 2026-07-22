@@ -1,0 +1,23 @@
+[package]
+name = "zakura-header-chain"
+version = "1.0.0-rc0"
+authors.workspace = true
+description = "Fork-aware header-chain domain types and transition engine for Zakura"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["cryptography::cryptocurrencies"]
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+zakura-chain = { path = "../zakura-chain", version = "1.2.1-rc0" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+toml = { workspace = true }
+
+[lints]
+workspace = true

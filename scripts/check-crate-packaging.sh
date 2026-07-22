@@ -47,6 +47,7 @@ PUBLISH_ORDER=(
   zakura-tower-fallback
   zakura-jsonl-trace
   zakura-chain
+  zakura-header-chain
   zakura-tower-batch-control
   zakura-node-services
   zakura-script

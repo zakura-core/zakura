@@ -257,7 +257,7 @@ from publication until deletion.
       have been changed, but keep their overall order:
 
 ```
-for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakura-tower-batch-control zakura-node-services zakura-script zakura-state zakura-consensus zakura-network zakura-rpc zakura-utils zakura; do cargo release publish --verbose --execute -p $c; done
+for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakura-header-chain zakura-tower-batch-control zakura-node-services zakura-script zakura-state zakura-consensus zakura-network zakura-rpc zakura-utils zakura; do cargo release publish --verbose --execute -p $c; done
 ```
 
 - [ ] Check that Zakura can be installed from `crates.io`:

@@ -258,7 +258,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-SELECT-03"
 name = "Raw-hash tie-breaker"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::ChainScore::cmp"
+tests = ["DF-01::header_chain_score_matches_legacy_chain_comparator"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-SELECT-04"

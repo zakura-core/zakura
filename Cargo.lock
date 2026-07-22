@@ -8981,6 +8981,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakura-header-chain"
+version = "1.0.0-rc0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.18",
+ "toml 1.1.2+spec-1.1.0",
+ "zakura-chain",
+]
+
+[[package]]
 name = "zakura-jsonl-trace"
 version = "1.0.1-rc0"
 dependencies = [
@@ -9188,6 +9198,7 @@ dependencies = [
  "tower 0.4.13",
  "tracing",
  "zakura-chain",
+ "zakura-header-chain",
  "zakura-node-services",
  "zakura-test",
  "zakura-vct-sprout-history",

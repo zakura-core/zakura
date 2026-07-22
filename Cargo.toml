@@ -2,6 +2,7 @@
 members = [
         "zakurad",
         "zakura-chain",
+        "zakura-header-chain",
         "zakura-network",
         "zakura-state",
         "zakura-script",

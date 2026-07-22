@@ -13,6 +13,7 @@ use zakura_chain::{
     value_balance::ValueBalance,
     LedgerState,
 };
+use zakura_header_chain::{ChainScore, SuffixWork};
 
 use crate::{
     arbitrary::Prepare,
@@ -25,6 +26,33 @@ const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
 
 /// The default number of proptest cases for short partial chain tests.
 const DEFAULT_SHORT_CHAIN_PROPTEST_CASES: u32 = 16;
+
+proptest! {
+    /// Differentially locks the new engine comparator to the exact parts comparator used by
+    /// `Chain::cmp`, including raw internal hash-byte tie-breaking.
+    #[test]
+    fn header_chain_score_matches_legacy_chain_comparator(
+        left_work in any::<[u8; 32]>(),
+        left_tip in any::<[u8; 32]>(),
+        right_work in any::<[u8; 32]>(),
+        right_tip in any::<[u8; 32]>(),
+    ) {
+        let left_work = zakura_chain::work::difficulty::U256::from_little_endian(&left_work);
+        let right_work = zakura_chain::work::difficulty::U256::from_little_endian(&right_work);
+        let left_tip = block::Hash(left_tip);
+        let right_tip = block::Hash(right_tip);
+        let legacy = super::super::chain::compare_chain_score_parts(
+            left_work,
+            || left_tip,
+            right_work,
+            || right_tip,
+        );
+        let engine = ChainScore::new(SuffixWork::new(left_work), left_tip).cmp(
+            &ChainScore::new(SuffixWork::new(right_work), right_tip),
+        );
+        prop_assert_eq!(engine, legacy);
+    }
+}
 
 /// Check that chain block pushes work with blocks from genesis
 ///

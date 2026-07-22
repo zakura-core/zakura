@@ -8722,6 +8722,10 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "toml 1.1.2+spec-1.1.0",
+]
 
 [[package]]
 name = "yaml-rust2"

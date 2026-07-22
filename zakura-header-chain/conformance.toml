@@ -1,0 +1,570 @@
+spec_version = "1.3"
+
+# Phase 0 registers the complete rule catalog without inventing implementation
+# claims. Later checkpoints change each status only when its real owner and
+# deterministic tests can be recorded here.
+
+[[rule]]
+id = "LC-SCOPE-01"
+name = "Best-header semantics"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-SCOPE-02"
+name = "Correctness assumptions"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-SCOPE-03"
+name = "Header-validity boundary"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-SCOPE-08"
+name = "Headers-only finality disclosure"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-SCOPE-04"
+name = "Wallet features excluded"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-SCOPE-05"
+name = "FlyClient proofs excluded"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-SCOPE-06"
+name = "Block-sync concerns excluded"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-SCOPE-07"
+name = "Auxiliary-evidence boundary"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-DAG-01"
+name = "Durable node record"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-DAG-02"
+name = "Fork-aware indexes"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-DAG-03"
+name = "Bounded orphan staging"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-FRONTIER-01"
+name = "Shared finalized ancestry"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-FRONTIER-02"
+name = "Independent frontier selection"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-FRONTIER-03"
+name = "Selection is not verification"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-FRONTIER-04"
+name = "Durable frontier publication"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-GEN-01"
+name = "State-version advancement"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-GEN-02"
+name = "Frontier-generation advancement"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-GEN-03"
+name = "Branch-scoped work identity"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-GEN-04"
+name = "Stale-result rejection"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-GEN-05"
+name = "Single frontier publisher"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-TXN-01"
+name = "Atomic frontier mutation"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-TXN-02"
+name = "Uniform transition path"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-RECOVER-01"
+name = "Startup integrity audit"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-RECOVER-02"
+name = "Deterministic startup reconstruction"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-RECOVER-03"
+name = "Projection repair or fail-close"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-VAL-01"
+name = "Bounded response decoding"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-VAL-02"
+name = "Canonical header and version"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-VAL-03"
+name = "Parent-link continuity"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-HEIGHT-01"
+name = "Authenticated height inference"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-COMMIT-01"
+name = "Production commitment parsing"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-COMMIT-02"
+name = "Custom-schedule commitment parsing"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-VAL-05"
+name = "Target and hash validation"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-VAL-04"
+name = "Equihash verification"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-VAL-06"
+name = "Contextual difficulty validation"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-POW-01"
+name = "Configured proof-of-work waiver"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-VAL-07"
+name = "Median and maximum time"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-TIME-01"
+name = "Custom-network time rules"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-VAL-08"
+name = "Future-header deferral"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-VAL-09"
+name = "Checkpoint ancestry"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-VAL-10"
+name = "Per-block work calculation"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-WORKCALC-01"
+name = "Checked cumulative work"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-VAL-11"
+name = "Validation before admission"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-ANCHOR-01"
+name = "Absolute trust anchors"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-ANCHOR-02"
+name = "Trusted-anchor validation"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-ANCHOR-03"
+name = "Post-anchor validation context"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-ANCHOR-04"
+name = "Mode-independent release-authenticated settled pin"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-ANCHOR-05"
+name = "Atomic settled-pin updates"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-SELECT-01"
+name = "Eligible-path filtering"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-SELECT-02"
+name = "Greatest-work selection"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-SELECT-03"
+name = "Raw-hash tie-breaker"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-SELECT-04"
+name = "Deterministic selection"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-REORG-01"
+name = "Finalized-anchor reorganization"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-FINAL-01"
+name = "Atomic finalization transition"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-FINAL-02"
+name = "Full-state finality"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-FINAL-03"
+name = "Headers-only depth finality"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-FINAL-04"
+name = "Mode and finality provenance"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-RETAIN-01"
+name = "Fork and node limits"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-RETAIN-02"
+name = "Deterministic eviction order"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-RETAIN-03"
+name = "Eviction is not invalidity"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-RETAIN-04"
+name = "Staged-target limits"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-INT-01"
+name = "Unified transition events"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-INT-02"
+name = "Branch-aware resets"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-INT-03"
+name = "Full-block integration"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-INT-04"
+name = "Atomic invalidate and reconsider"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-BODY-01"
+name = "Body-payload mismatch"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-BODY-02"
+name = "Consensus-invalid body feedback"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-BODY-03"
+name = "Transient body failures"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-BODY-04"
+name = "Evidence-bound peer scoring"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-OP-01"
+name = "Durable operator invalidation"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-OP-02"
+name = "Reason-scoped reconsideration"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-AVAIL-01"
+name = "Body acquisition retries"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-AVAIL-02"
+name = "Persistent body-unavailable alarm"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-AVAIL-03"
+name = "Availability-neutral fork choice"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-WORK-01"
+name = "Generation-scoped forward work"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-WORK-02"
+name = "Safe finalized-coverage reuse"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-WORK-03"
+name = "Stale-anchor recovery"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-ERR-01"
+name = "Error-category preservation"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-ERR-02"
+name = "Peer-fault boundary"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-AUX-01"
+name = "Hash-scoped metadata provenance"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-AUX-02"
+name = "Unauthenticated metadata isolation"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-AUX-03"
+name = "Branch-scoped VCT repair"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-AUX-04"
+name = "Cryptographic metadata authentication"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-01"
+name = "Bounded v8 decoding"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-02"
+name = "Atomic status snapshot"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-17"
+name = "Status publication cadence"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-03"
+name = "Locator construction"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-04"
+name = "Advertised-target scheduling"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-13"
+name = "Body-size hint safety"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-14"
+name = "Auxiliary-schema validation"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-15"
+name = "Immutable schema evolution"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-16"
+name = "Version-scoped discriminants"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-05"
+name = "Snapshot-bound path serving"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-06"
+name = "No target substitution"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-07"
+name = "Explicit response outcomes"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-08"
+name = "Correlated response validation"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-09"
+name = "Continuation target integrity"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-10"
+name = "Non-punitive retry outcomes"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-11"
+name = "Peer-attributable violations"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V8-12"
+name = "Unknown-fork discovery"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V7-01"
+name = "Retained-ancestry compatibility"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V7-02"
+name = "Stale-anchor handling"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V7-03"
+name = "Disconnected-fork fallback"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-V7-04"
+name = "ZIP 204 `getheaders` conformance"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-PARITY-01"
+name = "Observable-header consensus parity"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-PARITY-02"
+name = "Typed intentional differences"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-PARITY-03"
+name = "Tie-break policy isolation"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-TEST-01"
+name = "Cross-network conformance coverage"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-TEST-02"
+name = "Rule-to-test completeness"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-ACCEPT-01"
+name = "Complete regression coverage"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-ACCEPT-02"
+name = "Durable deterministic frontiers"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-ACCEPT-03"
+name = "Zero stale-generation effects"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-ACCEPT-04"
+name = "Terminating body-failure handling"
+status = "unimplemented"
+
+[[rule]]
+id = "LC-ACCEPT-05"
+name = "Explained parity differences"
+status = "unimplemented"

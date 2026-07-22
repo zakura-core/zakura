@@ -7,6 +7,8 @@ use std::{
     process::{Command, ExitStatus},
 };
 
+mod header_conformance;
+
 const DEFAULT_FEATURES: &str = "default-release-binaries";
 const DEFAULT_UBUNTU_IMAGE: &str = "ubuntu:22.04";
 const DEFAULT_RUST_VERSION: &str = "1.91";
@@ -25,8 +27,8 @@ fn main() {
 fn try_main() -> Result<(), BoxError> {
     let mut args = env::args().skip(1);
 
-    match (args.next().as_deref(), args.next().as_deref()) {
-        (Some("package"), Some("ubuntu")) => {
+    match args.next().as_deref() {
+        Some("package") if args.next().as_deref() == Some("ubuntu") => {
             if args.next().is_some() {
                 return Err(Box::new(UsageError(
                     "unexpected extra arguments for `cargo xtask package ubuntu`",
@@ -35,13 +37,28 @@ fn try_main() -> Result<(), BoxError> {
 
             package_ubuntu()
         }
-        (Some("-h" | "--help"), None) | (None, None) => {
+        Some("header-conformance") => {
+            let rule_id = args.next();
+
+            if args.next().is_some() {
+                return Err(Box::new(UsageError(
+                    "expected at most one rule ID after `cargo xtask header-conformance`",
+                )));
+            }
+
+            header_conformance::run(&repo_root()?, rule_id.as_deref())
+        }
+        Some("-h" | "--help") | None => {
+            if args.next().is_some() {
+                return Err(Box::new(UsageError(
+                    "help does not accept additional arguments",
+                )));
+            }
+
             print_help();
             Ok(())
         }
-        _ => Err(Box::new(UsageError(
-            "expected `cargo xtask package ubuntu`",
-        ))),
+        _ => Err(Box::new(UsageError("unknown xtask command"))),
     }
 }
 
@@ -227,7 +244,9 @@ fn print_help() {
 }
 
 fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
-    writeln!(output, "Usage: cargo xtask package ubuntu")?;
+    writeln!(output, "Usage:")?;
+    writeln!(output, "  cargo xtask package ubuntu")?;
+    writeln!(output, "  cargo xtask header-conformance [LC-…]")?;
     writeln!(output)?;
     writeln!(
         output,
@@ -237,5 +256,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "enables features `{DEFAULT_FEATURES}`, and writes the binary to"
     )?;
-    writeln!(output, "target/ubuntu/{OUTPUT_BINARY_NAME}.")
+    writeln!(output, "target/ubuntu/{OUTPUT_BINARY_NAME}.")?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Validates the fork-aware header-chain specification and conformance manifest."
+    )
 }

@@ -206,6 +206,13 @@ impl EngineConfig {
         bootstrap_anchor: TrustedAnchor,
         local_checkpoints: CheckpointSet,
     ) -> Result<Self, EngineConfigError> {
+        let actual_anchor = bootstrap_anchor.header.hash();
+        if actual_anchor != bootstrap_anchor.frontier.hash {
+            return Err(EngineConfigError::AnchorHashMismatch {
+                expected: bootstrap_anchor.frontier.hash,
+                actual: actual_anchor,
+            });
+        }
         let settled_manifest = SettledUpgradeManifest::for_release()?;
         if matches!(network, Network::Mainnet) || network.is_default_testnet() {
             settled_manifest
@@ -221,11 +228,33 @@ impl EngineConfig {
             limits: EngineLimits::v1(),
         })
     }
+
+    /// Digest binding every absolute trust anchor used by validation and startup.
+    pub fn trust_anchor_digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-header-chain-trust-anchors-v1");
+        hasher.update(self.settled_manifest.digest());
+        hasher.update(self.bootstrap_anchor.frontier.height.0.to_le_bytes());
+        hasher.update(self.bootstrap_anchor.frontier.hash.0);
+        for checkpoint in self.local_checkpoints.iter() {
+            hasher.update(checkpoint.height.0.to_le_bytes());
+            hasher.update(checkpoint.hash.0);
+        }
+        hasher.finalize().into()
+    }
 }
 
 /// Invalid immutable engine or trust-anchor configuration.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum EngineConfigError {
+    /// The canonical trusted header did not match its configured hash.
+    #[error("trusted anchor header hashes to {actual:?}, expected {expected:?}")]
+    AnchorHashMismatch {
+        /// Configured hash.
+        expected: block::Hash,
+        /// Locally computed hash.
+        actual: block::Hash,
+    },
     /// Two local checkpoints name different hashes at one height.
     #[error("conflicting local checkpoint at {0:?}")]
     ConflictingCheckpoint(block::Height),
@@ -358,5 +387,48 @@ mod tests {
                 .pin_for_network(&Network::Mainnet)
                 .is_some());
         }
+    }
+
+    #[test]
+    fn engine_config_binds_and_validates_every_trust_anchor() {
+        let block = regtest_genesis_block();
+        let network = Network::new_regtest(RegtestParameters::default());
+        let anchor = TrustedAnchor {
+            frontier: Frontier::new(block::Height(0), block.hash()),
+            header: block.header.clone(),
+        };
+        let plain = EngineConfig::new(
+            EngineMode::HeadersOnly,
+            network.clone(),
+            anchor.clone(),
+            CheckpointSet::default(),
+        )
+        .expect("the fixture anchor is canonical");
+        let checkpointed = EngineConfig::new(
+            EngineMode::HeadersOnly,
+            network.clone(),
+            anchor.clone(),
+            CheckpointSet::new([Frontier::new(block::Height(10), block::Hash([9; 32]))])
+                .expect("the fixture checkpoint set has unique heights"),
+        )
+        .expect("the fixture checkpoint is hash-qualified");
+        assert_ne!(
+            plain.trust_anchor_digest(),
+            checkpointed.trust_anchor_digest()
+        );
+
+        let mismatched = TrustedAnchor {
+            frontier: Frontier::new(block::Height(0), block::Hash([1; 32])),
+            ..anchor
+        };
+        assert!(matches!(
+            EngineConfig::new(
+                EngineMode::HeadersOnly,
+                network,
+                mismatched,
+                CheckpointSet::default()
+            ),
+            Err(EngineConfigError::AnchorHashMismatch { .. })
+        ));
     }
 }

@@ -171,7 +171,7 @@ impl MemHeaderStore {
     }
 
     /// Insert one admitted header after its exact parent is retained.
-    pub fn insert(
+    pub(crate) fn insert(
         &mut self,
         header: Arc<block::Header>,
         block_work: Work,
@@ -243,7 +243,7 @@ impl MemHeaderStore {
     }
 
     /// Add one independent direct reason, then recompute the affected subtree cache.
-    pub fn add_reason(
+    pub(crate) fn add_reason(
         &mut self,
         hash: block::Hash,
         reason: EligibilityReason,
@@ -265,7 +265,7 @@ impl MemHeaderStore {
     }
 
     /// Remove exactly one operator invalidation, preserving every unrelated reason.
-    pub fn remove_operator_invalidation(
+    pub(crate) fn remove_operator_invalidation(
         &mut self,
         hash: block::Hash,
         id: OperatorInvalidationId,
@@ -285,7 +285,7 @@ impl MemHeaderStore {
     }
 
     /// Atomically record one commitment-matching deterministic body failure.
-    pub fn set_consensus_body_invalid(
+    pub(crate) fn set_consensus_body_invalid(
         &mut self,
         hash: block::Hash,
         evidence: EvidenceId,
@@ -315,7 +315,7 @@ impl MemHeaderStore {
     }
 
     /// Update body availability or verification without changing fork choice eligibility.
-    pub fn set_body_state(
+    pub(crate) fn set_body_state(
         &mut self,
         hash: block::Hash,
         body: BodyValidationState,
@@ -341,7 +341,7 @@ impl MemHeaderStore {
     }
 
     /// Update local-time validation state and recompute descendant eligibility.
-    pub fn set_validation(
+    pub(crate) fn set_validation(
         &mut self,
         hash: block::Hash,
         validation: HeaderValidationState,
@@ -438,6 +438,113 @@ impl MemHeaderStore {
                 .suffix_after(anchor.work_coordinate())?,
             hash,
         ))
+    }
+
+    pub(crate) fn from_nodes(
+        finalized: Frontier,
+        nodes: impl IntoIterator<Item = HeaderNode>,
+    ) -> Result<Self, GraphError> {
+        let mut node_map = HashMap::new();
+        let mut children: HashMap<_, HashSet<_>> = HashMap::new();
+        let mut heights: HashMap<_, HashSet<_>> = HashMap::new();
+        for node in nodes {
+            heights.entry(node.height).or_default().insert(node.hash);
+            children
+                .entry(node.parent_hash)
+                .or_default()
+                .insert(node.hash);
+            node_map.insert(node.hash, node);
+        }
+        if !node_map.contains_key(&finalized.hash) {
+            return Err(GraphError::UnknownNode(finalized.hash));
+        }
+        children.remove(
+            &node_map
+                .get(&finalized.hash)
+                .expect("the finalized node was checked above")
+                .parent_hash,
+        );
+        Ok(Self {
+            finalized,
+            nodes: node_map,
+            children,
+            heights,
+        })
+    }
+
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = &HeaderNode> {
+        self.nodes.values()
+    }
+
+    pub(crate) fn node_mut(&mut self, hash: block::Hash) -> Result<&mut HeaderNode, GraphError> {
+        self.nodes
+            .get_mut(&hash)
+            .ok_or(GraphError::UnknownNode(hash))
+    }
+
+    pub(crate) fn recompute_all_eligibility(&mut self) -> Result<(), GraphError> {
+        let mut frontiers: Vec<_> = self
+            .nodes
+            .values()
+            .map(|node| Frontier::new(node.height, node.hash))
+            .collect();
+        frontiers.sort_unstable_by_key(|frontier| (frontier.height, frontier.hash.0));
+        for frontier in frontiers {
+            if frontier == self.finalized {
+                self.node_mut(frontier.hash)?.eligibility.inherited_from = None;
+                continue;
+            }
+            let parent_hash = self
+                .node(frontier.hash)
+                .expect("frontier came from nodes")
+                .parent_hash;
+            let parent = self.node(parent_hash).ok_or(GraphError::UnknownParent {
+                header: frontier.hash,
+                parent: parent_hash,
+            })?;
+            let inherited_from = (!parent.is_eligible()).then_some(parent_hash);
+            self.node_mut(frontier.hash)?.eligibility.inherited_from = inherited_from;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn advance_finalized(
+        &mut self,
+        finalized: Frontier,
+    ) -> Result<Vec<block::Hash>, GraphError> {
+        let node = self
+            .node(finalized.hash)
+            .ok_or(GraphError::UnknownNode(finalized.hash))?;
+        if node.height != finalized.height {
+            return Err(GraphError::UnknownNode(finalized.hash));
+        }
+        let retained: HashSet<_> = self
+            .nodes
+            .keys()
+            .copied()
+            .filter(|hash| {
+                self.ancestor(*hash, finalized.height)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|ancestor| ancestor == finalized)
+            })
+            .collect();
+        let mut deleted: Vec<_> = self
+            .nodes
+            .keys()
+            .copied()
+            .filter(|hash| !retained.contains(hash))
+            .collect();
+        deleted.sort_unstable_by_key(|hash| hash.0);
+        let nodes: Vec<_> = self
+            .nodes
+            .values()
+            .filter(|node| retained.contains(&node.hash))
+            .cloned()
+            .collect();
+        *self = Self::from_nodes(finalized, nodes)?;
+        self.recompute_all_eligibility()?;
+        Ok(deleted)
     }
 
     pub(crate) fn retained_hashes(&self) -> impl Iterator<Item = block::Hash> + '_ {

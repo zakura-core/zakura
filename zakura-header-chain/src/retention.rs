@@ -18,7 +18,7 @@ pub struct RetentionPlan {
 }
 
 /// Enforce deterministic retention while protecting selected, verified, and context paths.
-pub fn enforce_retention(
+pub(crate) fn enforce_retention(
     store: &mut MemHeaderStore,
     header_best: Frontier,
     verified_best: Frontier,

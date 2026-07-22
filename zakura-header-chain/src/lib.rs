@@ -31,7 +31,7 @@ pub use node::{
     BodyRuleId, BodyUnavailableSummary, BodyValidationState, EligibilityReason, EligibilityState,
     HeaderNode, HeaderValidationState,
 };
-pub use retention::{enforce_retention, RetentionPlan};
+pub use retention::RetentionPlan;
 pub use transition::*;
 pub use validation::{
     infer_height, validate_commitment_structure, validate_compact_target,

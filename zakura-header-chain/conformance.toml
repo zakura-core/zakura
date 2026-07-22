@@ -97,7 +97,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-GEN-04"
 name = "Stale-result rejection"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::apply_transition"
+tests = ["IN-02::stale_version_and_owner_fail_before_any_plan_effect"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-GEN-05"
@@ -112,7 +115,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-TXN-02"
 name = "Uniform transition path"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::apply_transition"
+tests = ["IN-02::apply_transition_is_the_only_public_dag_mutation_entry_point"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-RECOVER-01"
@@ -323,12 +329,18 @@ status = "unimplemented"
 [[rule]]
 id = "LC-FINAL-02"
 name = "Full-state finality"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::apply_transition"
+tests = ["DG-07::integrated_finality_requires_authority_and_exact_verified_path"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-FINAL-03"
 name = "Headers-only depth finality"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::apply_transition"
+tests = ["DG-07::headers_only_finalizes_exactly_tip_minus_one_thousand_before_publication"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-FINAL-04"

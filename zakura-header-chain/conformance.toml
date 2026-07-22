@@ -80,7 +80,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-FRONTIER-04"
 name = "Durable frontier publication"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::HeaderChainRuntime"
+tests = ["DG-03::every_named_crash_point_reopens_to_complete_before_or_after"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-GEN-01"
@@ -113,7 +116,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-TXN-01"
 name = "Atomic frontier mutation"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::HeaderChainRuntime::apply"
+tests = ["DG-03::every_named_crash_point_reopens_to_complete_before_or_after"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-TXN-02"
@@ -126,17 +132,26 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-RECOVER-01"
 name = "Startup integrity audit"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::audit_store"
+tests = ["DG-04::audits_each_normative_invariant"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-RECOVER-02"
 name = "Deterministic startup reconstruction"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::audit_store"
+tests = ["DG-04::recompute_not_cached_projection"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-RECOVER-03"
 name = "Projection repair or fail-close"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::HeaderChainStore::startup"
+tests = ["DG-04::startup_repairs_every_reconstructible_index_atomically_before_publication"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-VAL-01"

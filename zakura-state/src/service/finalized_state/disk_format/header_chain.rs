@@ -312,6 +312,19 @@ impl HeaderDeferredKey {
             hash,
         })
     }
+
+    /// Decode a durable deferred key while rejecting malformed timestamps.
+    pub fn try_from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self, HeaderChainKeyError> {
+        let bytes = fixed::<44>(bytes)?;
+        let ordered = u64::from_be_bytes(fixed::<8>(&bytes[..8])?);
+        let seconds = i64::from_be_bytes((ordered ^ (1_u64 << 63)).to_be_bytes());
+        let nanoseconds = u32::from_be_bytes(fixed::<4>(&bytes[8..12])?);
+        Self::new(
+            seconds,
+            nanoseconds,
+            block::Hash(fixed::<32>(&bytes[12..])?),
+        )
+    }
 }
 
 impl IntoDisk for HeaderDeferredKey {
@@ -329,21 +342,7 @@ impl IntoDisk for HeaderDeferredKey {
 
 impl FromDisk for HeaderDeferredKey {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        let bytes = fixed::<44>(bytes).expect("deferred keys have a fixed v1 width");
-        let ordered = u64::from_be_bytes(bytes[..8].try_into().expect("the slice is 8 bytes"));
-        let seconds = i64::from_be_bytes((ordered ^ (1_u64 << 63)).to_be_bytes());
-        let nanoseconds =
-            u32::from_be_bytes(bytes[8..12].try_into().expect("the slice is 4 bytes"));
-        Self::new(
-            seconds,
-            nanoseconds,
-            block::Hash(
-                bytes[12..]
-                    .try_into()
-                    .expect("the slice is exactly 32 bytes"),
-            ),
-        )
-        .expect("deferred keys contain valid v1 nanoseconds")
+        Self::try_from_bytes(bytes).expect("deferred keys contain a valid v1 timestamp")
     }
 }
 
@@ -480,6 +479,12 @@ mod tests {
         ));
         assert_eq!(
             HeaderDeferredKey::new(0, 1_000_000_000, block::Hash([0; 32])),
+            Err(HeaderChainKeyError::InvalidNanoseconds(1_000_000_000))
+        );
+        let mut invalid_deferred = [0; 44];
+        invalid_deferred[8..12].copy_from_slice(&1_000_000_000_u32.to_be_bytes());
+        assert_eq!(
+            HeaderDeferredKey::try_from_bytes(invalid_deferred),
             Err(HeaderChainKeyError::InvalidNanoseconds(1_000_000_000))
         );
 

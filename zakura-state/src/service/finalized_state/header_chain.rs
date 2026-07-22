@@ -2,16 +2,23 @@
 
 #![allow(dead_code)] // Constructed by the full-state migration and service wiring in PR-9.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::{Arc, Mutex},
+};
 
+use chrono::{TimeZone, Utc};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::sync::watch;
 use zakura_chain::block;
 use zakura_header_chain::{
-    apply_transition, ApplyResult, AuxDelta, ChainScore, ChangeSet, CommittedTransition,
-    EligibilityReason, EngineMetadata, EngineSnapshot, EvidenceId, FinalityRecord, Frontier,
-    HeaderNode, NoChangeReceipt, StaleReceipt, StoreError, StoreRead, TransitionContext,
-    TransitionFailure, TransitionRequest, ValidationLease,
+    apply_transition, audit_store, ApplyResult, AuxDelivery, AuxDelta, ChainScore, ChangeSet,
+    CommittedTransition, EligibilityReason, EngineConfig, EngineMetadata, EngineSnapshot,
+    EvidenceId, FinalityRecord, Frontier, HeaderNode, NoChangeReceipt, RecoveryFailure,
+    RecoveryPlan, RecoveryRepair, StaleReceipt, StoreAuditRead, StoreError, StoreRead,
+    TransitionContext, TransitionFailure, TransitionRequest, ValidationContextRecord,
+    ValidationLease,
 };
 
 use super::{
@@ -51,12 +58,162 @@ pub enum HeaderChainStoreError {
     /// Pure transition planning rejected the request before commit.
     #[error(transparent)]
     Transition(#[from] TransitionFailure),
+    /// A runtime durable read failed before transition planning.
+    #[error(transparent)]
+    Store(#[from] StoreError),
     /// RocksDB rejected the one atomic write batch.
     #[error("header-chain atomic write failed: {0}")]
     RocksDb(#[from] rocksdb::Error),
     /// The serialized writer lock was poisoned by a prior panic.
     #[error("header-chain serialized writer lock is poisoned")]
     WriterPoisoned,
+    /// Exhaustive startup audit or deterministic reconstruction failed.
+    #[error(transparent)]
+    Recovery(#[from] RecoveryFailure),
+    /// A test crash was injected at a named durable/publication boundary.
+    #[cfg(test)]
+    #[error("injected header-chain crash at {0:?}")]
+    InjectedCrash(FaultPoint),
+}
+
+/// One successful startup audit and optional atomic repair.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartupReport {
+    /// Snapshot read before any reconstructible repair.
+    pub previous: EngineSnapshot,
+    /// Audited snapshot that is safe to publish.
+    pub current: EngineSnapshot,
+    /// Exact reconstructible categories repaired in one batch.
+    pub repairs: BTreeSet<RecoveryRepair>,
+    /// Publication is true only for a successful, fully audited startup.
+    pub publication_allowed: bool,
+}
+
+/// The sole latest-value publisher for durable header-chain snapshots.
+#[derive(Clone, Debug)]
+pub struct Publisher {
+    sender: watch::Sender<EngineSnapshot>,
+}
+
+impl Publisher {
+    fn new(snapshot: EngineSnapshot) -> Self {
+        let (sender, _) = watch::channel(snapshot);
+        Self { sender }
+    }
+
+    /// Return the latest durable snapshot.
+    pub fn snapshot(&self) -> EngineSnapshot {
+        self.sender.borrow().clone()
+    }
+
+    /// Subscribe to the latest durable snapshot without replay dependence.
+    pub fn subscribe(&self) -> watch::Receiver<EngineSnapshot> {
+        self.sender.subscribe()
+    }
+
+    fn publish(&self, snapshot: EngineSnapshot) {
+        self.sender.send_replace(snapshot);
+    }
+}
+
+/// An audited durable store paired with its only production publisher.
+#[derive(Clone, Debug)]
+pub struct HeaderChainRuntime {
+    store: HeaderChainStore,
+    publisher: Publisher,
+}
+
+impl HeaderChainRuntime {
+    /// Return the sole committed-snapshot publisher.
+    pub fn publisher(&self) -> &Publisher {
+        &self.publisher
+    }
+
+    /// Apply, commit, and publish one serialized transition.
+    pub fn apply(
+        &self,
+        request: TransitionRequest,
+        context: &TransitionContext<'_>,
+    ) -> Result<ApplyResult, HeaderChainStoreError> {
+        self.apply_with_fault(request, context, |_| Ok(()))
+    }
+
+    fn apply_with_fault<F>(
+        &self,
+        request: TransitionRequest,
+        context: &TransitionContext<'_>,
+        mut fault: F,
+    ) -> Result<ApplyResult, HeaderChainStoreError>
+    where
+        F: FnMut(FaultPoint) -> Result<(), HeaderChainStoreError>,
+    {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let before = self.store.snapshot()?;
+        fault(FaultPoint::AfterSnapshot)?;
+        let event = request.event.idempotency_key();
+        let branch = request.event.work_owner().map(|owner| owner.branch);
+        let metadata = self.store.metadata()?;
+        let is_idempotent_replay = event.is_some_and(|event| metadata.last_transition_id == event);
+        if !is_idempotent_replay && request.expected_version != before.state_version {
+            return Ok(ApplyResult::Stale(StaleReceipt {
+                current_version: before.state_version,
+                branch,
+            }));
+        }
+        fault(FaultPoint::AfterVersionCheck)?;
+        let plan = match apply_transition(&self.store, request, context) {
+            Ok(plan) => plan,
+            Err(TransitionFailure::Stale { current }) => {
+                return Ok(ApplyResult::Stale(StaleReceipt {
+                    current_version: current,
+                    branch,
+                }));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if plan.is_no_change() {
+            return Ok(ApplyResult::NoChange(NoChangeReceipt {
+                state_version: plan.before().state_version,
+                event,
+            }));
+        }
+
+        let durable_tx_id = plan.change_set().metadata.state_version.get();
+        let batch = self
+            .store
+            .batch_for_with_fault(plan.change_set(), &mut fault)?;
+        fault(FaultPoint::BeforeDbCommit)?;
+        self.store.db.write(batch)?;
+        fault(FaultPoint::AfterDbCommit)?;
+        fault(FaultPoint::BeforeMemorySwap)?;
+        let receipt = plan.into_committed_receipt(durable_tx_id);
+        fault(FaultPoint::BeforePublish)?;
+        self.publisher.publish(receipt.current.clone());
+        fault(FaultPoint::AfterPublish)?;
+        fault(FaultPoint::BeforeReactorObserve)?;
+        Ok(ApplyResult::Committed(Box::new(receipt)))
+    }
+}
+
+/// Deterministic state-writer and observer boundaries used by the crash harness.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum FaultPoint {
+    AfterSnapshot,
+    AfterVersionCheck,
+    AfterEachNodeWrite,
+    AfterEachIndexWrite,
+    AfterProjectionWrite,
+    AfterMetadataWrite,
+    BeforeDbCommit,
+    AfterDbCommit,
+    BeforeMemorySwap,
+    BeforePublish,
+    AfterPublish,
+    BeforeReactorObserve,
 }
 
 /// One RocksDB-backed header DAG with a process-local serialized writer.
@@ -75,41 +232,37 @@ impl HeaderChainStore {
         }
     }
 
-    /// Apply the sole pure planner under the serialized CAS and commit its complete write set.
-    pub fn apply(
-        &self,
-        request: TransitionRequest,
-        context: &TransitionContext<'_>,
-    ) -> Result<ApplyResult, HeaderChainStoreError> {
-        let _writer = self
+    /// Exhaustively audit, atomically repair reconstructible caches, then enable publication.
+    pub fn startup(
+        self,
+        config: &EngineConfig,
+    ) -> Result<(HeaderChainRuntime, StartupReport), HeaderChainStoreError> {
+        let writer = self
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let event = request.event.idempotency_key();
-        let branch = request.event.work_owner().map(|owner| owner.branch);
-        let plan = match apply_transition(self, request, context) {
-            Ok(plan) => plan,
-            Err(TransitionFailure::Stale { current }) => {
-                return Ok(ApplyResult::Stale(StaleReceipt {
-                    current_version: current,
-                    branch,
-                }));
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if plan.is_no_change() {
-            return Ok(ApplyResult::NoChange(NoChangeReceipt {
-                state_version: plan.before().state_version,
-                event,
-            }));
+        let plan = audit_store(&self, config)?;
+        let previous = plan.before.clone();
+        let repairs = plan.repairs.clone();
+        if !plan.is_clean() {
+            self.db.write(self.recovery_batch(&plan)?)?;
         }
-
-        let durable_tx_id = plan.change_set().metadata.state_version.get();
-        let batch = self.batch_for(plan.change_set())?;
-        self.db.write(batch)?;
-        Ok(ApplyResult::Committed(Box::new(
-            plan.into_committed_receipt(durable_tx_id),
-        )))
+        let current = plan.metadata.snapshot();
+        let report = StartupReport {
+            previous,
+            current: current.clone(),
+            repairs,
+            publication_allowed: true,
+        };
+        let publisher = Publisher::new(current);
+        drop(writer);
+        Ok((
+            HeaderChainRuntime {
+                store: self,
+                publisher,
+            },
+            report,
+        ))
     }
 
     /// Bootstrap an empty header schema with one already-authenticated anchor.
@@ -174,6 +327,17 @@ impl HeaderChainStore {
     }
 
     fn batch_for(&self, changes: &ChangeSet) -> Result<DiskWriteBatch, HeaderChainStoreError> {
+        self.batch_for_with_fault(changes, &mut |_| Ok(()))
+    }
+
+    fn batch_for_with_fault<F>(
+        &self,
+        changes: &ChangeSet,
+        fault: &mut F,
+    ) -> Result<DiskWriteBatch, HeaderChainStoreError>
+    where
+        F: FnMut(FaultPoint) -> Result<(), HeaderChainStoreError>,
+    {
         let mut batch = DiskWriteBatch::new();
 
         for hash in &changes.delete_nodes {
@@ -205,6 +369,7 @@ impl HeaderChainStore {
             for (key, _) in self.scan_prefix(HEADER_CHILD, &hash.0)? {
                 self.delete_raw(&mut batch, HEADER_CHILD, key)?;
             }
+            fault(FaultPoint::AfterEachNodeWrite)?;
         }
 
         for node in &changes.put_nodes {
@@ -254,11 +419,15 @@ impl HeaderChainStore {
             for reason in &node.eligibility.direct_reasons {
                 self.put_reason(&mut batch, node.hash, reason)?;
             }
+            fault(FaultPoint::AfterEachNodeWrite)?;
         }
 
         self.replace_candidates(&mut batch, &changes.candidate_tips)?;
+        fault(FaultPoint::AfterEachIndexWrite)?;
         self.apply_projection(&mut batch, HEADER_SELECTED, &changes.selected_projection)?;
+        fault(FaultPoint::AfterProjectionWrite)?;
         self.apply_projection(&mut batch, HEADER_VERIFIED, &changes.verified_projection)?;
+        fault(FaultPoint::AfterProjectionWrite)?;
 
         for delta in &changes.aux_changes {
             match delta {
@@ -280,6 +449,7 @@ impl HeaderChainStore {
                     }
                 }
             }
+            fault(FaultPoint::AfterEachIndexWrite)?;
         }
 
         if let Some(record) = changes.finality_append {
@@ -289,6 +459,7 @@ impl HeaderChainStore {
                 HeaderFinalityKey(record.epoch).as_bytes(),
                 &HeaderFinalityRecordDisk(record),
             )?;
+            fault(FaultPoint::AfterEachIndexWrite)?;
         }
 
         // The singleton logical root is deliberately enqueued last in the same atomic batch.
@@ -298,7 +469,119 @@ impl HeaderChainStore {
             METADATA_KEY,
             &HeaderEngineMetadataDisk(changes.metadata.clone()),
         )?;
+        fault(FaultPoint::AfterMetadataWrite)?;
         Ok(batch)
+    }
+
+    fn recovery_batch(&self, plan: &RecoveryPlan) -> Result<DiskWriteBatch, HeaderChainStoreError> {
+        let mut batch = DiskWriteBatch::new();
+        if plan.repairs.contains(&RecoveryRepair::InheritedEligibility) {
+            for node in &plan.nodes {
+                self.put_value(
+                    &mut batch,
+                    HEADER_NODE_BY_HASH,
+                    node.hash.0,
+                    &HeaderNodeDisk::from_domain(node),
+                )?;
+            }
+        }
+        if plan.repairs.contains(&RecoveryRepair::ChildIndex) {
+            self.clear_family(&mut batch, HEADER_CHILD)?;
+            for (parent, child) in &plan.child_edges {
+                self.put_empty(
+                    &mut batch,
+                    HEADER_CHILD,
+                    HeaderChildKey {
+                        parent: *parent,
+                        child: *child,
+                    }
+                    .as_bytes(),
+                )?;
+            }
+        }
+        if plan.repairs.contains(&RecoveryRepair::HeightIndex) {
+            self.clear_family(&mut batch, HEADER_HEIGHT_HASH)?;
+            for frontier in &plan.height_entries {
+                self.put_empty(
+                    &mut batch,
+                    HEADER_HEIGHT_HASH,
+                    HeaderHeightHashKey {
+                        height: frontier.height,
+                        hash: frontier.hash,
+                    }
+                    .as_bytes(),
+                )?;
+            }
+        }
+        if plan.repairs.contains(&RecoveryRepair::DeferredIndex) {
+            self.clear_family(&mut batch, HEADER_DEFERRED)?;
+            for (until, hash) in &plan.deferred_entries {
+                let key = HeaderDeferredKey::new(
+                    until.timestamp(),
+                    until.timestamp_subsec_nanos(),
+                    *hash,
+                )
+                .map_err(|_| HeaderChainStoreError::Incoherent("invalid recovery timestamp"))?;
+                self.put_empty(&mut batch, HEADER_DEFERRED, key.as_bytes())?;
+            }
+        }
+        if plan.repairs.contains(&RecoveryRepair::CandidateIndex) {
+            self.clear_family(&mut batch, HEADER_CANDIDATE)?;
+            for (score, hash) in &plan.candidate_entries {
+                if score.tip_hash != *hash {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "recovery candidate score/hash mismatch",
+                    ));
+                }
+                self.put_empty(
+                    &mut batch,
+                    HEADER_CANDIDATE,
+                    HeaderCandidateKey(*score).as_bytes(),
+                )?;
+            }
+        }
+        if plan.repairs.contains(&RecoveryRepair::SelectedProjection) {
+            self.replace_projection(&mut batch, HEADER_SELECTED, &plan.selected_projection)?;
+        }
+        if plan.repairs.contains(&RecoveryRepair::VerifiedProjection) {
+            self.replace_projection(&mut batch, HEADER_VERIFIED, &plan.verified_projection)?;
+        }
+        self.put_value(
+            &mut batch,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            &HeaderEngineMetadataDisk(plan.metadata.clone()),
+        )?;
+        Ok(batch)
+    }
+
+    fn clear_family(
+        &self,
+        batch: &mut DiskWriteBatch,
+        family: &'static str,
+    ) -> Result<(), HeaderChainStoreError> {
+        for (key, _) in self.scan_raw(family)? {
+            self.delete_raw(batch, family, key)?;
+        }
+        Ok(())
+    }
+
+    fn replace_projection(
+        &self,
+        batch: &mut DiskWriteBatch,
+        family: &'static str,
+        projection: &[Frontier],
+    ) -> Result<(), HeaderChainStoreError> {
+        self.clear_family(batch, family)?;
+        for frontier in projection {
+            self.put_raw(
+                batch,
+                family,
+                HeaderHeightKey(frontier.height).as_bytes(),
+                frontier.hash.0,
+            )?;
+        }
+        Ok(())
     }
 
     fn metadata_row(&self) -> Result<Option<EngineMetadata>, HeaderChainStoreError> {
@@ -711,7 +994,186 @@ impl StoreRead for HeaderChainStore {
     }
 }
 
+impl StoreAuditRead for HeaderChainStore {
+    fn all_nodes(&self) -> Result<Vec<HeaderNode>, StoreError> {
+        let mut reasons_by_hash: HashMap<block::Hash, Vec<EligibilityReason>> = HashMap::new();
+        for (hash, reason) in self.all_reason_rows()? {
+            reasons_by_hash.entry(hash).or_default().push(reason);
+        }
+        let mut nodes = Vec::new();
+        for (key, value) in self.scan_raw(HEADER_NODE_BY_HASH).map_err(store_error)? {
+            if key.len() != 32 {
+                return Err(StoreError::Incoherent("invalid node key width"));
+            }
+            let hash = block::Hash(
+                key.as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Incoherent("invalid node hash key"))?,
+            );
+            let disk = HeaderNodeDisk::decode(&value)
+                .map_err(|_| StoreError::Incoherent("invalid durable node value"))?;
+            if disk.hash != hash {
+                return Err(StoreError::Incoherent("node key/hash mismatch"));
+            }
+            let node = disk
+                .into_domain(reasons_by_hash.remove(&hash).unwrap_or_default())
+                .map_err(|_| StoreError::Incoherent("invalid durable node"))?;
+            nodes.push(node);
+        }
+        if !reasons_by_hash.is_empty() {
+            return Err(StoreError::Incoherent("eligibility root has no node"));
+        }
+        Ok(nodes)
+    }
+
+    fn child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError> {
+        let mut edges = Vec::new();
+        for (key, value) in self.scan_raw(HEADER_CHILD).map_err(store_error)? {
+            if key.len() != 64 || !value.is_empty() {
+                return Err(StoreError::Incoherent("invalid child-index row"));
+            }
+            let key = HeaderChildKey::from_bytes(&key);
+            edges.push((key.parent, key.child));
+        }
+        Ok(edges)
+    }
+
+    fn height_entries(&self) -> Result<Vec<Frontier>, StoreError> {
+        let mut entries = Vec::new();
+        for (key, value) in self.scan_raw(HEADER_HEIGHT_HASH).map_err(store_error)? {
+            if key.len() != 36 || !value.is_empty() {
+                return Err(StoreError::Incoherent("invalid height-index row"));
+            }
+            let key = HeaderHeightHashKey::from_bytes(&key);
+            entries.push(Frontier::new(key.height, key.hash));
+        }
+        Ok(entries)
+    }
+
+    fn selected_projection(&self) -> Result<Vec<Frontier>, StoreError> {
+        self.projection_entries(HEADER_SELECTED)
+    }
+
+    fn verified_projection(&self) -> Result<Vec<Frontier>, StoreError> {
+        self.projection_entries(HEADER_VERIFIED)
+    }
+
+    fn candidate_entries(&self) -> Result<Vec<(ChainScore, block::Hash)>, StoreError> {
+        self.candidate_tips()
+    }
+
+    fn deferred_entries(&self) -> Result<Vec<(chrono::DateTime<Utc>, block::Hash)>, StoreError> {
+        let mut entries = Vec::new();
+        for (key, value) in self.scan_raw(HEADER_DEFERRED).map_err(store_error)? {
+            if key.len() != 44 || !value.is_empty() {
+                return Err(StoreError::Incoherent("invalid deferred-index row"));
+            }
+            let key = HeaderDeferredKey::try_from_bytes(&key)
+                .map_err(|_| StoreError::Incoherent("invalid deferred-index key"))?;
+            let until = Utc
+                .timestamp_opt(key.seconds, key.nanoseconds)
+                .single()
+                .ok_or(StoreError::Incoherent("invalid deferred-index timestamp"))?;
+            entries.push((until, key.hash));
+        }
+        Ok(entries)
+    }
+
+    fn eligibility_roots(&self) -> Result<Vec<(block::Hash, EligibilityReason)>, StoreError> {
+        self.all_reason_rows()
+    }
+
+    fn all_aux_deliveries(&self) -> Result<Vec<AuxDelivery>, StoreError> {
+        let mut deliveries = Vec::new();
+        for (key, value) in self.scan_raw(HEADER_AUX_DELIVERY).map_err(store_error)? {
+            if key.len() != 64 {
+                return Err(StoreError::Incoherent("invalid auxiliary key width"));
+            }
+            let key = HeaderAuxDeliveryKey::from_bytes(&key);
+            let delivery = HeaderAuxDeliveryDisk::decode(&value)
+                .map_err(|_| StoreError::Incoherent("invalid auxiliary value"))?
+                .0;
+            if delivery.header_hash != key.header || delivery.delivery_id != key.delivery {
+                return Err(StoreError::Incoherent("auxiliary key/value mismatch"));
+            }
+            deliveries.push(delivery);
+        }
+        Ok(deliveries)
+    }
+
+    fn validation_context_records(&self) -> Result<Vec<ValidationContextRecord>, StoreError> {
+        let mut records = Vec::new();
+        for (key, value) in self
+            .scan_raw(HEADER_VALIDATION_CONTEXT)
+            .map_err(store_error)?
+        {
+            if key.len() != 32 {
+                return Err(StoreError::Incoherent(
+                    "invalid validation-context key width",
+                ));
+            }
+            let hash = block::Hash(
+                key.as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Incoherent("invalid validation-context key"))?,
+            );
+            let record = HeaderValidationContextDisk::decode(&value)
+                .map_err(|_| StoreError::Incoherent("invalid validation-context value"))?;
+            if record.header.hash() != hash {
+                return Err(StoreError::Incoherent(
+                    "validation-context key/hash mismatch",
+                ));
+            }
+            records.push(ValidationContextRecord {
+                header: record.header,
+                height: record.height,
+            });
+        }
+        Ok(records)
+    }
+}
+
 impl HeaderChainStore {
+    fn all_reason_rows(&self) -> Result<Vec<(block::Hash, EligibilityReason)>, StoreError> {
+        let mut reasons = Vec::new();
+        for (key, value) in self
+            .scan_raw(HEADER_ELIGIBILITY_ROOT)
+            .map_err(store_error)?
+        {
+            let key = HeaderEligibilityRootKey::try_from_bytes(&key)
+                .map_err(|_| StoreError::Incoherent("invalid eligibility-root key"))?;
+            let reason = HeaderEligibilityReasonDisk::decode(&value)
+                .map_err(|_| StoreError::Incoherent("invalid eligibility-root value"))?
+                .into_domain();
+            if reason_kind(&reason) != key.kind || reason_evidence(&reason) != key.evidence {
+                return Err(StoreError::Incoherent(
+                    "eligibility-root key/value mismatch",
+                ));
+            }
+            reasons.push((key.root, reason));
+        }
+        Ok(reasons)
+    }
+
+    fn projection_entries(&self, family: &'static str) -> Result<Vec<Frontier>, StoreError> {
+        let mut projection = Vec::new();
+        for (key, value) in self.scan_raw(family).map_err(store_error)? {
+            if key.len() != 4 || value.len() != 32 {
+                return Err(StoreError::Incoherent("invalid projection row width"));
+            }
+            let height = HeaderHeightKey::from_bytes(&key).0;
+            let hash = block::Hash(
+                value
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Incoherent("invalid projection hash"))?,
+            );
+            projection.push(Frontier::new(height, hash));
+        }
+        projection.sort_unstable_by_key(|frontier| (frontier.height, frontier.hash.0));
+        Ok(projection)
+    }
+
     fn projection_hash(
         &self,
         family: &'static str,
@@ -917,6 +1379,12 @@ mod tests {
             store.candidate_tips(),
             Ok(vec![(metadata.header_best_score, anchor.hash)])
         );
+        let (runtime, startup) = store
+            .startup(&engine_config)
+            .expect("the coherent store audits before publication");
+        assert!(startup.repairs.is_empty());
+        assert_eq!(runtime.publisher().snapshot(), metadata.snapshot());
+        let mut subscriber = runtime.publisher().subscribe();
 
         let evidence = EvidenceId::from_digest([7; 32]);
         let authority = Authority(evidence);
@@ -934,7 +1402,7 @@ mod tests {
                 kind: TransientBodyFailureKind::Storage,
             })),
         };
-        let receipt = store
+        let receipt = runtime
             .apply(request.clone(), &context)
             .expect("the transition commits");
         let ApplyResult::Committed(receipt) = receipt else {
@@ -943,16 +1411,20 @@ mod tests {
         assert_eq!(receipt.previous.state_version, StateVersion::new(1));
         assert_eq!(receipt.current.state_version, StateVersion::new(2));
         assert_eq!(receipt.durable_tx_id, 2);
+        assert!(subscriber
+            .has_changed()
+            .expect("the publisher remains open"));
+        assert_eq!(*subscriber.borrow_and_update(), receipt.current);
         assert!(matches!(
-            store.node(anchor.hash).expect("the node row decodes").expect("the anchor remains").body,
+            runtime.store.node(anchor.hash).expect("the node row decodes").expect("the anchor remains").body,
             BodyValidationState::Unavailable(summary) if summary.attempts == 1
         ));
         assert!(matches!(
-            store.apply(request, &context).expect("idempotent replay succeeds"),
+            runtime.apply(request, &context).expect("idempotent replay succeeds"),
             ApplyResult::NoChange(receipt) if receipt.state_version == StateVersion::new(2)
         ));
         assert!(matches!(
-            store
+            runtime
                 .apply(
                     TransitionRequest {
                         expected_version: StateVersion::new(1),
@@ -964,15 +1436,17 @@ mod tests {
             ApplyResult::Stale(receipt) if receipt.current_version == StateVersion::new(2)
         ));
 
-        drop(store);
+        drop(runtime);
         drop(db);
         let reopened = HeaderChainStore::new(open(&db_config, &network));
-        assert_eq!(
-            reopened.snapshot().expect("committed metadata reopens"),
-            receipt.current
-        );
+        let (reopened, report) = reopened
+            .startup(&engine_config)
+            .expect("the committed store reopens through exhaustive audit");
+        assert_eq!(report.current, receipt.current);
+        assert_eq!(reopened.publisher().snapshot(), receipt.current);
         assert!(matches!(
             reopened
+                .store
                 .node(anchor.hash)
                 .expect("the reopened node row decodes")
                 .expect("the reopened anchor exists")
@@ -1040,5 +1514,340 @@ mod tests {
                 .state_version,
             StateVersion::new(1)
         );
+    }
+
+    #[test]
+    fn startup_repairs_every_reconstructible_index_atomically_before_publication() {
+        let cache = tempfile::tempdir().expect("the test cache directory is created");
+        let db_config = Config {
+            cache_dir: cache.path().to_owned(),
+            ephemeral: false,
+            debug_skip_non_finalized_state_backup_task: true,
+            ..Config::default()
+        };
+        let (engine_config, anchor, metadata) = fixture();
+        let network = engine_config.network.clone();
+        let db = open(&db_config, &network);
+        let store = HeaderChainStore::new(db.clone());
+        store
+            .initialize(metadata.clone(), anchor.clone())
+            .expect("the empty schema initializes");
+        let mut corrupt = DiskWriteBatch::new();
+        let bogus_parent = block::Hash([0x11; 32]);
+        let bogus_child = block::Hash([0x22; 32]);
+        let mut child_header = *anchor.header;
+        child_header.previous_block_hash = anchor.hash;
+        let child_hash = child_header.hash();
+        let child_eligibility = zakura_header_chain::EligibilityState {
+            inherited_from: Some(bogus_parent),
+            ..Default::default()
+        };
+        let child = HeaderNode::from_durable_parts(
+            Arc::new(child_header),
+            child_hash,
+            anchor.hash,
+            block::Height(1),
+            anchor.block_work,
+            anchor
+                .work_coordinate()
+                .checked_add(anchor.block_work)
+                .expect("the fixture work coordinate does not overflow"),
+            HeaderValidationState::Valid,
+            child_eligibility,
+            BodyValidationState::Unknown,
+            Vec::new(),
+        )
+        .expect("the child fixture is internally coherent");
+        store
+            .put_value(
+                &mut corrupt,
+                HEADER_NODE_BY_HASH,
+                child.hash.0,
+                &HeaderNodeDisk::from_domain(&child),
+            )
+            .expect("the child source row encodes");
+        store
+            .put_empty(
+                &mut corrupt,
+                HEADER_CHILD,
+                HeaderChildKey {
+                    parent: bogus_parent,
+                    child: bogus_child,
+                }
+                .as_bytes(),
+            )
+            .expect("the child cache accepts the fixture row");
+        store
+            .delete_raw(
+                &mut corrupt,
+                HEADER_HEIGHT_HASH,
+                HeaderHeightHashKey {
+                    height: anchor.height,
+                    hash: anchor.hash,
+                }
+                .as_bytes(),
+            )
+            .expect("the height cache row is addressable");
+        store
+            .delete_raw(
+                &mut corrupt,
+                HEADER_SELECTED,
+                HeaderHeightKey(anchor.height).as_bytes(),
+            )
+            .expect("the selected cache row is addressable");
+        store
+            .delete_raw(
+                &mut corrupt,
+                HEADER_VERIFIED,
+                HeaderHeightKey(anchor.height).as_bytes(),
+            )
+            .expect("the verified cache row is addressable");
+        store
+            .delete_raw(
+                &mut corrupt,
+                HEADER_CANDIDATE,
+                HeaderCandidateKey(metadata.header_best_score).as_bytes(),
+            )
+            .expect("the candidate cache row is addressable");
+        store
+            .put_empty(
+                &mut corrupt,
+                HEADER_DEFERRED,
+                HeaderDeferredKey::new(1, 0, bogus_child)
+                    .expect("the fixture timestamp is valid")
+                    .as_bytes(),
+            )
+            .expect("the deferred cache accepts the fixture row");
+        let mut corrupt_metadata = metadata.clone();
+        corrupt_metadata.oldest_retained_height = block::Height(1);
+        store
+            .put_value(
+                &mut corrupt,
+                HEADER_ENGINE_META,
+                METADATA_KEY,
+                &HeaderEngineMetadataDisk(corrupt_metadata),
+            )
+            .expect("the fixture metadata encodes");
+        db.write(corrupt)
+            .expect("the fixture cache corruption is durable");
+
+        let (runtime, report) = store
+            .startup(&engine_config)
+            .expect("a reconstructible cache is repaired");
+        assert_eq!(
+            report.repairs,
+            BTreeSet::from([
+                RecoveryRepair::ChildIndex,
+                RecoveryRepair::HeightIndex,
+                RecoveryRepair::DeferredIndex,
+                RecoveryRepair::CandidateIndex,
+                RecoveryRepair::SelectedProjection,
+                RecoveryRepair::VerifiedProjection,
+                RecoveryRepair::InheritedEligibility,
+                RecoveryRepair::RetentionMetadata,
+            ])
+        );
+        assert_eq!(report.previous.state_version, StateVersion::new(1));
+        assert_eq!(report.current.state_version, StateVersion::new(2));
+        assert_eq!(report.current.header_generation, HeaderGeneration::new(2));
+        assert_eq!(
+            report.current.verified_generation,
+            VerifiedGeneration::new(2)
+        );
+        assert_eq!(report.current.oldest_retained_height, anchor.height);
+        assert!(report.publication_allowed);
+        assert_eq!(runtime.publisher().snapshot(), report.current);
+        assert_eq!(
+            runtime.store.selected_hash(anchor.height),
+            Ok(Some(anchor.hash))
+        );
+        assert_eq!(
+            runtime.store.selected_hash(child.height),
+            Ok(Some(child.hash))
+        );
+        assert_eq!(
+            runtime.store.verified_hash(anchor.height),
+            Ok(Some(anchor.hash))
+        );
+        assert_eq!(
+            runtime.store.child_edges(),
+            Ok(vec![(anchor.hash, child.hash)])
+        );
+        assert_eq!(
+            runtime.store.height_entries(),
+            Ok(vec![
+                Frontier::new(anchor.height, anchor.hash),
+                Frontier::new(child.height, child.hash),
+            ])
+        );
+        assert_eq!(runtime.store.deferred_entries(), Ok(Vec::new()));
+        assert_eq!(
+            runtime.store.candidate_tips(),
+            Ok(vec![(report.current.header_best_score, child.hash)])
+        );
+        assert_eq!(
+            runtime
+                .store
+                .node(child.hash)
+                .expect("the repaired child decodes")
+                .expect("the repaired child remains")
+                .eligibility
+                .inherited_from,
+            None
+        );
+
+        drop(runtime);
+        drop(db);
+        let (reopened, reopened_report) = HeaderChainStore::new(open(&db_config, &network))
+            .startup(&engine_config)
+            .expect("the atomic repair reopens coherently");
+        assert!(reopened_report.repairs.is_empty());
+        assert_eq!(reopened.publisher().snapshot(), report.current);
+    }
+
+    #[test]
+    fn authoritative_corruption_fails_before_publisher_construction() {
+        let db_config = Config::ephemeral();
+        let (engine_config, anchor, metadata) = fixture();
+        let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+        store
+            .initialize(metadata, anchor.clone())
+            .expect("the empty schema initializes");
+        let mut corrupt = DiskWriteBatch::new();
+        store
+            .delete_raw(&mut corrupt, HEADER_NODE_BY_HASH, anchor.hash.0)
+            .expect("the anchor row is addressable");
+        store
+            .db
+            .write(corrupt)
+            .expect("the fixture source corruption is durable");
+
+        assert!(matches!(
+            store.startup(&engine_config),
+            Err(HeaderChainStoreError::Recovery(
+                RecoveryFailure::Source { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn every_named_crash_point_reopens_to_complete_before_or_after() {
+        let fault_points = [
+            FaultPoint::AfterSnapshot,
+            FaultPoint::AfterVersionCheck,
+            FaultPoint::AfterEachNodeWrite,
+            FaultPoint::AfterEachIndexWrite,
+            FaultPoint::AfterProjectionWrite,
+            FaultPoint::AfterMetadataWrite,
+            FaultPoint::BeforeDbCommit,
+            FaultPoint::AfterDbCommit,
+            FaultPoint::BeforeMemorySwap,
+            FaultPoint::BeforePublish,
+            FaultPoint::AfterPublish,
+            FaultPoint::BeforeReactorObserve,
+        ];
+        for (index, target) in fault_points.into_iter().enumerate() {
+            let cache = tempfile::tempdir().expect("the test cache directory is created");
+            let db_config = Config {
+                cache_dir: cache.path().to_owned(),
+                ephemeral: false,
+                debug_skip_non_finalized_state_backup_task: true,
+                ..Config::default()
+            };
+            let (engine_config, anchor, metadata) = fixture();
+            let network = engine_config.network.clone();
+            let db = open(&db_config, &network);
+            let store = HeaderChainStore::new(db.clone());
+            store
+                .initialize(metadata.clone(), anchor.clone())
+                .expect("the empty schema initializes");
+            let (runtime, _) = store
+                .startup(&engine_config)
+                .expect("the initial store audits");
+            let marker = u8::try_from(index + 1).expect("the fault-point list fits in u8");
+            let evidence = EvidenceId::from_digest([marker; 32]);
+            let authority = Authority(evidence);
+            let context = TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                startup_capability: None,
+            };
+            let request = TransitionRequest {
+                expected_version: StateVersion::new(1),
+                event: TransitionEvent::BodyEvidence(BodyEvidence::Transient(
+                    TransientBodyFailure {
+                        hash: anchor.hash,
+                        evidence,
+                        kind: TransientBodyFailureKind::Storage,
+                    },
+                )),
+            };
+            let result = runtime.apply_with_fault(request, &context, |point| {
+                if point == target {
+                    Err(HeaderChainStoreError::InjectedCrash(point))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(
+                result,
+                Err(HeaderChainStoreError::InjectedCrash(point)) if point == target
+            ));
+            let published = runtime.publisher().snapshot().state_version;
+            let publish_completed = matches!(
+                target,
+                FaultPoint::AfterPublish | FaultPoint::BeforeReactorObserve
+            );
+            assert_eq!(
+                published,
+                if publish_completed {
+                    StateVersion::new(2)
+                } else {
+                    StateVersion::new(1)
+                },
+                "{target:?}"
+            );
+            if publish_completed {
+                assert_eq!(
+                    runtime
+                        .store
+                        .snapshot()
+                        .expect("published state is durable"),
+                    runtime.publisher().snapshot(),
+                    "{target:?}"
+                );
+            }
+            drop(runtime);
+            drop(db);
+
+            let (reopened, report) = HeaderChainStore::new(open(&db_config, &network))
+                .startup(&engine_config)
+                .expect("the crash boundary reopens to a coherent transaction");
+            let committed = matches!(
+                target,
+                FaultPoint::AfterDbCommit
+                    | FaultPoint::BeforeMemorySwap
+                    | FaultPoint::BeforePublish
+                    | FaultPoint::AfterPublish
+                    | FaultPoint::BeforeReactorObserve
+            );
+            let expected = if committed {
+                StateVersion::new(2)
+            } else {
+                StateVersion::new(1)
+            };
+            assert_eq!(report.current.state_version, expected, "{target:?}");
+            assert_eq!(
+                reopened.publisher().snapshot(),
+                report.current,
+                "{target:?}"
+            );
+            assert_eq!(
+                reopened.store.snapshot().expect("the snapshot reopens"),
+                report.current,
+                "{target:?}"
+            );
+        }
     }
 }

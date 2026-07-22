@@ -135,16 +135,44 @@ impl HeaderChainRuntime {
         request: TransitionRequest,
         context: &TransitionContext<'_>,
     ) -> Result<ApplyResult, HeaderChainStoreError> {
-        self.apply_with_fault(request, context, |_| Ok(()))
+        self.apply_combined(request, context, DiskWriteBatch::new(), || {})
     }
 
     fn apply_with_fault<F>(
         &self,
         request: TransitionRequest,
         context: &TransitionContext<'_>,
+        fault: F,
+    ) -> Result<ApplyResult, HeaderChainStoreError>
+    where
+        F: FnMut(FaultPoint) -> Result<(), HeaderChainStoreError>,
+    {
+        self.apply_combined_with_fault(request, context, DiskWriteBatch::new(), || {}, fault)
+    }
+
+    pub(in crate::service) fn apply_combined<M>(
+        &self,
+        request: TransitionRequest,
+        context: &TransitionContext<'_>,
+        full_state_batch: DiskWriteBatch,
+        memory_swap: M,
+    ) -> Result<ApplyResult, HeaderChainStoreError>
+    where
+        M: FnOnce(),
+    {
+        self.apply_combined_with_fault(request, context, full_state_batch, memory_swap, |_| Ok(()))
+    }
+
+    fn apply_combined_with_fault<M, F>(
+        &self,
+        request: TransitionRequest,
+        context: &TransitionContext<'_>,
+        full_state_batch: DiskWriteBatch,
+        memory_swap: M,
         mut fault: F,
     ) -> Result<ApplyResult, HeaderChainStoreError>
     where
+        M: FnOnce(),
         F: FnMut(FaultPoint) -> Result<(), HeaderChainStoreError>,
     {
         let _writer = self
@@ -183,13 +211,14 @@ impl HeaderChainRuntime {
         }
 
         let durable_tx_id = plan.change_set().metadata.state_version.get();
-        let batch = self
-            .store
-            .batch_for_with_fault(plan.change_set(), &mut fault)?;
+        let batch =
+            self.store
+                .batch_for_with_fault(plan.change_set(), full_state_batch, &mut fault)?;
         fault(FaultPoint::BeforeDbCommit)?;
         self.store.db.write(batch)?;
         fault(FaultPoint::AfterDbCommit)?;
         fault(FaultPoint::BeforeMemorySwap)?;
+        memory_swap();
         let receipt = plan.into_committed_receipt(durable_tx_id);
         fault(FaultPoint::BeforePublish)?;
         self.publisher.publish(receipt.current.clone());
@@ -327,19 +356,18 @@ impl HeaderChainStore {
     }
 
     fn batch_for(&self, changes: &ChangeSet) -> Result<DiskWriteBatch, HeaderChainStoreError> {
-        self.batch_for_with_fault(changes, &mut |_| Ok(()))
+        self.batch_for_with_fault(changes, DiskWriteBatch::new(), &mut |_| Ok(()))
     }
 
     fn batch_for_with_fault<F>(
         &self,
         changes: &ChangeSet,
+        mut batch: DiskWriteBatch,
         fault: &mut F,
     ) -> Result<DiskWriteBatch, HeaderChainStoreError>
     where
         F: FnMut(FaultPoint) -> Result<(), HeaderChainStoreError>,
     {
-        let mut batch = DiskWriteBatch::new();
-
         for hash in &changes.delete_nodes {
             if let Some(node) = self.node(*hash).map_err(|_| {
                 HeaderChainStoreError::Incoherent("deleted node could not be decoded")
@@ -1260,10 +1288,18 @@ fn store_error(error: HeaderChainStoreError) -> StoreError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
     use crate::{
         constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
-        service::finalized_state::STATE_COLUMN_FAMILIES_IN_CODE,
+        service::finalized_state::{
+            zakura_db::block::ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT, STATE_COLUMN_FAMILIES_IN_CODE,
+        },
+        service::{
+            non_finalized_state::NonFinalizedState,
+            write::{PreparedFullStateTransition, PreparedFullStateTransitionError},
+        },
         Config,
     };
     use zakura_chain::{
@@ -1275,7 +1311,8 @@ mod tests {
         EngineConfig, EngineMode, FinalityEpoch, FrontierSet, FullStateEvidenceAuthority,
         HeaderChainDiskVersion, HeaderGeneration, HeaderValidationState, StateVersion, SuffixWork,
         SystemClock, TransientBodyFailure, TransientBodyFailureKind, TransitionEvent,
-        TrustedAnchor, VerifiedGeneration, WorkCoordinate,
+        TrustedAnchor, VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration,
+        WorkCoordinate,
     };
 
     struct Authority(EvidenceId);
@@ -1513,6 +1550,92 @@ mod tests {
                 .expect("the original metadata remains readable")
                 .state_version,
             StateVersion::new(1)
+        );
+    }
+
+    #[test]
+    fn prepared_full_state_swaps_only_after_combined_commit() {
+        let db_config = Config::ephemeral();
+        let (engine_config, anchor, metadata) = fixture();
+        let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+        store
+            .initialize(metadata.clone(), anchor.clone())
+            .expect("the empty schema initializes");
+        let (runtime, _) = store
+            .startup(&engine_config)
+            .expect("the initial store audits");
+        let evidence = EvidenceId::from_digest([0x44; 32]);
+        let request = TransitionRequest {
+            expected_version: metadata.state_version,
+            event: TransitionEvent::BodyEvidence(BodyEvidence::Transient(TransientBodyFailure {
+                hash: anchor.hash,
+                evidence,
+                kind: TransientBodyFailureKind::Storage,
+            })),
+        };
+        assert!(matches!(
+            PreparedFullStateTransition::new(
+                EvidenceId::from_digest([0x45; 32]),
+                metadata.frontiers.verified_best,
+                Vec::new(),
+                NonFinalizedState::new(&engine_config.network),
+                None,
+                request.clone(),
+            ),
+            Err(PreparedFullStateTransitionError::IdentityMismatch)
+        ));
+        let verified_request = TransitionRequest {
+            expected_version: metadata.state_version,
+            event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+                full_state_transition_id: evidence,
+                old_tip: metadata.frontiers.verified_best,
+                new_path: Vec::new(),
+                cause: VerifiedChangeCause::Reset,
+            }),
+        };
+        assert!(matches!(
+            PreparedFullStateTransition::new(
+                evidence,
+                Frontier::new(block::Height(1), block::Hash([0x55; 32])),
+                Vec::new(),
+                NonFinalizedState::new(&engine_config.network),
+                None,
+                verified_request,
+            ),
+            Err(PreparedFullStateTransitionError::VerifiedPathMismatch)
+        ));
+
+        let staged = NonFinalizedState::new(&engine_config.network);
+        let mut live = NonFinalizedState::new(&Network::Mainnet);
+        let prepared = PreparedFullStateTransition::new(
+            evidence,
+            metadata.frontiers.verified_best,
+            Vec::new(),
+            staged,
+            None,
+            request,
+        )
+        .expect("the duplicated staged facts agree");
+        let context = TransitionContext {
+            config: &engine_config,
+            clock: &SystemClock,
+            full_state_authority: None,
+            startup_capability: None,
+        };
+        let result = prepared
+            .commit(&runtime, &mut live, &context)
+            .expect("the staged mutation commits");
+        let ApplyResult::Committed(receipt) = result else {
+            panic!("new staged evidence must commit");
+        };
+        assert_eq!(live.network, engine_config.network);
+        assert_eq!(runtime.publisher().snapshot(), receipt.current);
+        assert_eq!(
+            runtime
+                .store
+                .snapshot()
+                .expect("the combined commit is durable"),
+            receipt.current
         );
     }
 
@@ -1783,17 +1906,69 @@ mod tests {
                     },
                 )),
             };
-            let result = runtime.apply_with_fault(request, &context, |point| {
-                if point == target {
-                    Err(HeaderChainStoreError::InjectedCrash(point))
-                } else {
-                    Ok(())
-                }
-            });
+            let marker_key = [marker; 4];
+            let mut full_state_batch = DiskWriteBatch::new();
+            runtime
+                .store
+                .put_raw(
+                    &mut full_state_batch,
+                    ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+                    marker_key,
+                    [marker],
+                )
+                .expect("the combined full-state marker can be staged");
+            let memory_swapped = Arc::new(AtomicBool::new(false));
+            let swap_probe = memory_swapped.clone();
+            let result = runtime.apply_combined_with_fault(
+                request,
+                &context,
+                full_state_batch,
+                move || swap_probe.store(true, Ordering::SeqCst),
+                |point| {
+                    if point == target {
+                        Err(HeaderChainStoreError::InjectedCrash(point))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
             assert!(matches!(
                 result,
                 Err(HeaderChainStoreError::InjectedCrash(point)) if point == target
             ));
+            let committed = matches!(
+                target,
+                FaultPoint::AfterDbCommit
+                    | FaultPoint::BeforeMemorySwap
+                    | FaultPoint::BeforePublish
+                    | FaultPoint::AfterPublish
+                    | FaultPoint::BeforeReactorObserve
+            );
+            let marker_cf = runtime
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the marker column family is open");
+            assert_eq!(
+                runtime
+                    .store
+                    .db
+                    .raw_get_cf(&marker_cf, &marker_key)
+                    .expect("the combined marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+            let swap_completed = matches!(
+                target,
+                FaultPoint::BeforePublish
+                    | FaultPoint::AfterPublish
+                    | FaultPoint::BeforeReactorObserve
+            );
+            assert_eq!(
+                memory_swapped.load(Ordering::SeqCst),
+                swap_completed,
+                "{target:?}"
+            );
             let published = runtime.publisher().snapshot().state_version;
             let publish_completed = matches!(
                 target,
@@ -1824,14 +1999,6 @@ mod tests {
             let (reopened, report) = HeaderChainStore::new(open(&db_config, &network))
                 .startup(&engine_config)
                 .expect("the crash boundary reopens to a coherent transaction");
-            let committed = matches!(
-                target,
-                FaultPoint::AfterDbCommit
-                    | FaultPoint::BeforeMemorySwap
-                    | FaultPoint::BeforePublish
-                    | FaultPoint::AfterPublish
-                    | FaultPoint::BeforeReactorObserve
-            );
             let expected = if committed {
                 StateVersion::new(2)
             } else {

@@ -416,6 +416,30 @@ pub struct VerifiedBodyEvidence {
 
 /// Exhaustive body-result categories with intentionally distinct effects.
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BodyVerificationOutcome {
+    /// Full-state accepted the exact body/header pair.
+    Verified(VerifiedBodyEvidence),
+    /// The supplier delivered a payload that did not match the requested header.
+    PayloadMismatch(BodyPayloadMismatch),
+    /// Commitment-matching body data deterministically failed consensus.
+    ConsensusInvalid(ConsensusBodyInvalid),
+    /// Verification could not reach a durable consensus conclusion.
+    Retryable(TransientBodyFailure),
+}
+
+impl From<BodyVerificationOutcome> for BodyEvidence {
+    fn from(outcome: BodyVerificationOutcome) -> Self {
+        match outcome {
+            BodyVerificationOutcome::Verified(evidence) => Self::Verified(evidence),
+            BodyVerificationOutcome::PayloadMismatch(evidence) => Self::PayloadMismatch(evidence),
+            BodyVerificationOutcome::ConsensusInvalid(evidence) => Self::ConsensusInvalid(evidence),
+            BodyVerificationOutcome::Retryable(evidence) => Self::Transient(evidence),
+        }
+    }
+}
+
+/// Durable transition evidence derived from one body-verification outcome.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BodyEvidence {
     /// Bad delivery only.
     PayloadMismatch(BodyPayloadMismatch),
@@ -809,6 +833,50 @@ mod tests {
             EventAdmission::AnyMode
         );
         assert_eq!(TransitionEvent::ReevaluateDeferred.idempotency_key(), None);
+    }
+
+    #[test]
+    fn body_verification_outcomes_preserve_distinct_transition_effects() {
+        let evidence = EvidenceId::from_digest([9; 32]);
+        let hash = block::Hash([8; 32]);
+        assert!(matches!(
+            BodyEvidence::from(BodyVerificationOutcome::Verified(VerifiedBodyEvidence {
+                hash,
+                evidence,
+            })),
+            BodyEvidence::Verified(VerifiedBodyEvidence { hash: actual, .. }) if actual == hash
+        ));
+        assert!(matches!(
+            BodyEvidence::from(BodyVerificationOutcome::PayloadMismatch(
+                BodyPayloadMismatch {
+                    evidence,
+                    requested: hash,
+                    delivered: block::Hash([7; 32]),
+                    kind: BodyCommitmentKind::HeaderHash,
+                    source: SourceId::from_digest([6; 32]),
+                }
+            )),
+            BodyEvidence::PayloadMismatch(BodyPayloadMismatch { requested, .. }) if requested == hash
+        ));
+        assert!(matches!(
+            BodyEvidence::from(BodyVerificationOutcome::ConsensusInvalid(
+                ConsensusBodyInvalid {
+                    hash,
+                    evidence,
+                    rule: BodyRuleId::new("body.rule"),
+                    source: SourceId::from_digest([5; 32]),
+                }
+            )),
+            BodyEvidence::ConsensusInvalid(ConsensusBodyInvalid { hash: actual, .. }) if actual == hash
+        ));
+        assert!(matches!(
+            BodyEvidence::from(BodyVerificationOutcome::Retryable(TransientBodyFailure {
+                hash,
+                evidence,
+                kind: TransientBodyFailureKind::MissingContext,
+            })),
+            BodyEvidence::Transient(TransientBodyFailure { hash: actual, .. }) if actual == hash
+        ));
     }
 
     #[test]

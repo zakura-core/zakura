@@ -8,6 +8,7 @@ use std::{
 };
 
 use indexmap::IndexMap;
+use thiserror::Error;
 use tokio::sync::{
     mpsc::{error::TryRecvError, UnboundedReceiver, UnboundedSender},
     oneshot, watch,
@@ -18,13 +19,20 @@ use zakura_chain::{
     block::{self, Height},
     parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
 };
+use zakura_header_chain::{
+    ApplyResult, EvidenceId, Frontier, FullStateEvidenceAuthority, TransitionContext,
+    TransitionEvent, TransitionRequest, VerifiedHeaderRef,
+};
 
 use crate::{
     constants::MAX_BLOCK_REORG_HEIGHT,
     error::CommitHeaderRangeError,
     service::{
         check,
-        finalized_state::{FinalizedState, ZakuraDb},
+        finalized_state::{
+            header_chain::{HeaderChainRuntime, HeaderChainStoreError},
+            DiskWriteBatch, FinalizedState, ZakuraDb,
+        },
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
@@ -75,6 +83,102 @@ pub enum VctRootRepairState {
         /// Height whose supplied roots are missing from the VCT source.
         height: block::Height,
     },
+}
+
+/// A full-state mutation staged until its matching header transition commits durably.
+#[allow(dead_code)] // Constructed when the dark header engine is attached to the writer task.
+pub struct PreparedFullStateTransition {
+    /// Stable identity authenticated by the state writer.
+    transition_id: EvidenceId,
+    /// Verified frontier against which the mutation was prepared.
+    old_frontier: Frontier,
+    /// Exact new verified suffix, empty for a finality-only mutation.
+    new_verified_path: Vec<VerifiedHeaderRef>,
+    /// Complete in-memory state installed only after the durable commit.
+    non_finalized_after: NonFinalizedState,
+    /// Optional finalized-state writes combined with the header write batch.
+    finalized_batch: Option<DiskWriteBatch>,
+    /// Matching version-qualified header-engine evidence.
+    header_request: TransitionRequest,
+}
+
+struct PreparedAuthority(EvidenceId);
+
+impl FullStateEvidenceAuthority for PreparedAuthority {
+    fn authorizes(&self, evidence: EvidenceId) -> bool {
+        evidence == self.0
+    }
+}
+
+#[allow(dead_code)] // Called when the dark header engine is attached to the writer task.
+impl PreparedFullStateTransition {
+    /// Construct a staged mutation only when its duplicated identity and verified path agree.
+    pub fn new(
+        transition_id: EvidenceId,
+        old_frontier: Frontier,
+        new_verified_path: Vec<VerifiedHeaderRef>,
+        non_finalized_after: NonFinalizedState,
+        finalized_batch: Option<DiskWriteBatch>,
+        header_request: TransitionRequest,
+    ) -> Result<Self, PreparedFullStateTransitionError> {
+        if header_request.event.idempotency_key() != Some(transition_id) {
+            return Err(PreparedFullStateTransitionError::IdentityMismatch);
+        }
+        if let TransitionEvent::VerifiedChainChanged(change) = &header_request.event {
+            if change.old_tip != old_frontier || change.new_path != new_verified_path {
+                return Err(PreparedFullStateTransitionError::VerifiedPathMismatch);
+            }
+        }
+        Ok(Self {
+            transition_id,
+            old_frontier,
+            new_verified_path,
+            non_finalized_after,
+            finalized_batch,
+            header_request,
+        })
+    }
+
+    /// Commit the combined batch, then swap memory, then publish the committed receipt.
+    pub(super) fn commit(
+        self,
+        runtime: &HeaderChainRuntime,
+        live_non_finalized: &mut NonFinalizedState,
+        context: &TransitionContext<'_>,
+    ) -> Result<ApplyResult, HeaderChainStoreError> {
+        let Self {
+            transition_id,
+            non_finalized_after,
+            finalized_batch,
+            header_request,
+            ..
+        } = self;
+        let authority = PreparedAuthority(transition_id);
+        let guarded_context = TransitionContext {
+            config: context.config,
+            clock: context.clock,
+            full_state_authority: Some(&authority),
+            startup_capability: context.startup_capability,
+        };
+        runtime.apply_combined(
+            header_request,
+            &guarded_context,
+            finalized_batch.unwrap_or_else(DiskWriteBatch::new),
+            || *live_non_finalized = non_finalized_after,
+        )
+    }
+}
+
+/// Incoherent duplicated facts at the staging boundary.
+#[allow(dead_code)] // Returned when the dark header engine stages writer mutations.
+#[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
+pub enum PreparedFullStateTransitionError {
+    /// The header request did not carry the exact state-writer transition identity.
+    #[error("prepared full-state/header transition identities differ")]
+    IdentityMismatch,
+    /// A verified-chain event did not repeat the exact old frontier and new suffix.
+    #[error("prepared full-state/header verified paths differ")]
+    VerifiedPathMismatch,
 }
 
 /// The maximum size of the parent error map.

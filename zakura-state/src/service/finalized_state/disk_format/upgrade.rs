@@ -126,7 +126,11 @@ fn format_upgrades(
         )),
         Box::new(add_ironwood_tree::Upgrade),
         Box::new(repair_vct_sprout_history::Upgrade::new(prepared_vct_repair)),
-    ] as [Box<dyn DiskFormatUpgrade>; 10])
+        Box::new(no_migration::NoMigration::new(
+            "add fork-aware header-chain column families and codecs",
+            Version::new(28, 1, 1),
+        )),
+    ] as [Box<dyn DiskFormatUpgrade>; 11])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -1083,11 +1087,15 @@ fn vct_format_changes_include_ironwood_then_sprout_repair() {
 
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0)), None).collect();
 
-    assert_eq!(upgrades.len(), 2);
+    assert_eq!(upgrades.len(), 3);
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
     assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
+    assert_eq!(upgrades[2].version(), Version::new(28, 1, 1));
     assert_eq!(
-        upgrades.last().expect("repair is registered").version(),
+        upgrades
+            .last()
+            .expect("latest format upgrade is registered")
+            .version(),
         state_database_format_version_in_code()
     );
 }

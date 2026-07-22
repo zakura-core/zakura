@@ -154,6 +154,16 @@ impl fmt::Debug for Work {
 }
 
 impl CompactDifficulty {
+    /// Return the exact four-byte little-endian consensus representation.
+    pub const fn to_le_bytes(self) -> [u8; 4] {
+        self.0.to_le_bytes()
+    }
+
+    /// Construct from the exact four-byte little-endian consensus representation.
+    pub const fn from_le_bytes(bytes: [u8; 4]) -> Self {
+        Self(u32::from_le_bytes(bytes))
+    }
+
     /// CompactDifficulty exponent base.
     const BASE: u32 = 256;
 

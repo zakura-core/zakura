@@ -55,6 +55,10 @@ pub enum SuppliedRootsError {
     #[error("invalid header commitment: {0}")]
     InvalidHeaderCommitment(#[from] CommitmentError),
 
+    /// A header commitment requires a parent history tree, but the supplied tree is empty.
+    #[error("missing parent history tree root required by the header commitment")]
+    MissingHistoryTreeRoot,
+
     /// The supplied auxiliary roots could not extend the history tree.
     #[error("invalid history tree update: {0}")]
     HistoryTree(#[from] Arc<HistoryTreeError>),
@@ -168,7 +172,7 @@ pub fn header_commitment_is_valid_for_chain_history(
             // folded into `history_tree` before this block.
             let history_tree_root = history_tree
                 .hash()
-                .expect("the previous block history tree exists because current header has a ChainHistoryRoot");
+                .ok_or(SuppliedRootsError::MissingHistoryTreeRoot)?;
             if actual_history_tree_root == history_tree_root {
                 Ok(())
             } else {
@@ -191,9 +195,7 @@ pub fn header_commitment_is_valid_for_chain_history(
                     (NetworkUpgrade::Heartwood.activation_height(network) == Some(height))
                         .then_some(block::CHAIN_HISTORY_ACTIVATION_RESERVED.into())
                 })
-                .expect(
-                    "the previous block history tree exists because current header has a ChainHistoryBlockTxAuthCommitment",
-                );
+                .ok_or(SuppliedRootsError::MissingHistoryTreeRoot)?;
             let hash_block_commitments = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
                 &history_tree_root,
                 &auth_data_root,
@@ -603,5 +605,45 @@ mod tests {
             Height(activation + 1),
             "a wrong root at H is detected at H+1"
         );
+    }
+
+    #[test]
+    fn rejects_empty_history_tree_when_header_requires_parent_root() {
+        let heartwood_successor = NetworkUpgrade::Heartwood
+            .activation_height(&Mainnet)
+            .expect("mainnet has Heartwood")
+            .0
+            + 1;
+        let nu5_activation = NetworkUpgrade::Nu5
+            .activation_height(&Mainnet)
+            .expect("mainnet has NU5")
+            .0;
+        let block = mainnet_block_at(heartwood_successor);
+        let roots = roots_from_block(
+            &block,
+            mainnet_sapling_root_at(heartwood_successor),
+            orchard::tree::NoteCommitmentTree::default().root(),
+        );
+
+        for height in [heartwood_successor, nu5_activation] {
+            let roots = BlockCommitmentRoots {
+                height: Height(height),
+                ..roots.clone()
+            };
+
+            let error = verify_supplied_roots_from_parts(
+                &Mainnet,
+                empty_history_tree(),
+                [(block.header.as_ref(), &roots)],
+            )
+            .expect_err("an empty parent history tree must be rejected");
+
+            assert_eq!(error.0, Height(height));
+            assert!(
+                matches!(error.1, SuppliedRootsError::MissingHistoryTreeRoot),
+                "rejection uses the missing history tree error, got: {:?}",
+                error.1
+            );
+        }
     }
 }

@@ -176,3 +176,13 @@ This file is the sole reporting channel (design D5). Entry template:
   heavier-window campaign.
 - spend: ~US$2.75 this session (perf-lab-s1, ~5.5 h); droplet destroyed at
   close.
+
+## SESSION 2 (2026-07-22) — B-15 cohort port APPROVED by Adam
+
+- decision: MAX_DROPLETS 2→3; frozen-cohort port green-lit (~$0.5/h per
+  frozen server accepted). Design doc hard rule amended.
+- plan: (1) investigate harness bootstrap-peer/dev_network overridability;
+  (2) cohort tooling (seed two serving droplets past 1,835,000, capture
+  zakura node ids, freeze onto a private dev_network tag); (3) bench cohort
+  mode; (4) cohort A/A pair → new band (target ≤1%) → resume campaign with
+  tight thresholds.

@@ -192,7 +192,9 @@ Hard rules regardless of class:
   resources, or any DO resource not tagged `zakura-perf-lab`.
 - DO actions are restricted to: create/destroy/list droplets and volumes
   named `perf-lab-*` + tagged `zakura-perf-lab`, and the one-time
-  `perf-lab-claude` key creation. Concurrent perf-lab droplets ≤ 2.
+  `perf-lab-claude` key creation. Concurrent perf-lab droplets ≤ 3 (raised
+  from 2 by Adam, 2026-07-22, to admit the B-15 frozen-cohort port: two
+  seeded-then-frozen serving droplets plus one bench).
 - Never modify `deploy/`, `.github/workflows/`, checkpoint files, or bump
   dependencies in `Cargo.lock` as part of an experiment.
 - Bench budget runs in batches of 8 L2 runs (D6): at each batch boundary the

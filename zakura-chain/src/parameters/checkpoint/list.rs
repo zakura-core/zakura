@@ -7,7 +7,7 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    ops::RangeBounds,
+    ops::{Bound, RangeBounds},
     str::FromStr,
     sync::Arc,
 };
@@ -203,6 +203,25 @@ impl CheckpointList {
         R: RangeBounds<block::Height>,
     {
         self.0.range(range).map(|(height, _)| *height).next_back()
+    }
+
+    /// Returns the checkpoint at or immediately below `height`.
+    pub fn checkpoint_at_or_before(
+        &self,
+        height: block::Height,
+    ) -> Option<(block::Height, block::Hash)> {
+        self.0
+            .range(..=height)
+            .next_back()
+            .map(|(&height, &hash)| (height, hash))
+    }
+
+    /// Returns the first checkpoint strictly above `height`.
+    pub fn checkpoint_after(&self, height: block::Height) -> Option<(block::Height, block::Hash)> {
+        self.0
+            .range((Bound::Excluded(height), Bound::Unbounded))
+            .next()
+            .map(|(&height, &hash)| (height, hash))
     }
 
     /// Returns an iterator over all the checkpoints, in increasing height order.

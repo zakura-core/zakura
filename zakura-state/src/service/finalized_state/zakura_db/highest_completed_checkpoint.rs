@@ -52,6 +52,8 @@ pub enum HighestCompletedCheckpointError {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct TrackerState {
     current: Option<HighestCompletedCheckpoint>,
+    /// The first configured checkpoint strictly above `current`.
+    next_checkpoint: Option<(Height, block::Hash)>,
     cursor: Option<(Height, block::Hash)>,
 }
 
@@ -222,6 +224,7 @@ impl TrackerState {
         let Some(canonical_tip) = canonical_tip else {
             return Ok(Self {
                 current: None,
+                next_checkpoint: None,
                 cursor: None,
             });
         };
@@ -234,50 +237,18 @@ impl TrackerState {
         let body_tip = db
             .finalized_tip_height()
             .filter(|height| *height <= canonical_tip);
-        let (base_current, base_cursor) = if let Some(body_height) = body_tip {
-            let body_hash = db.header_hash(body_height).ok_or(
-                HighestCompletedCheckpointError::MissingCanonicalHeader {
-                    height: body_height,
-                },
-            )?;
-            let completed = checkpoints
-                .iter_cloned()
-                .take_while(|(height, _)| *height <= body_height)
-                .last()
-                .map(|(height, hash)| HighestCompletedCheckpoint { height, hash })
-                .ok_or(HighestCompletedCheckpointError::MissingGenesisCheckpoint)?;
-            Self::validate_checkpoint(db, completed)?;
-            (Some(completed), Some((body_height, body_hash)))
-        } else {
-            let genesis = HighestCompletedCheckpoint {
-                height: Height::MIN,
-                hash: genesis_hash,
-            };
-            Self::validate_checkpoint(db, genesis)?;
-            (Some(genesis), Some((Height::MIN, genesis_hash)))
-        };
-
-        let mut state = start_hint.map(|(state, _)| state).unwrap_or(Self {
-            current: base_current,
-            cursor: base_cursor,
-        });
-
-        if state
-            .current
-            .is_none_or(|current| base_current.is_some_and(|base| base.height > current.height))
-        {
-            state.current = base_current;
-            state.cursor = base_cursor;
-        } else if let Some(current) = state.current {
-            if Self::validate_checkpoint(db, current).is_err() {
-                state.current = base_current;
-                state.cursor = base_cursor;
+        let hinted_state = start_hint.map(|(state, _)| state);
+        let mut state = match hinted_state {
+            Some(state)
+                if state.current.is_some_and(|current| {
+                    current.height <= canonical_tip
+                        && Self::validate_checkpoint(db, current).is_ok()
+                }) =>
+            {
+                state
             }
-        }
-
-        if base_cursor.is_some_and(|base| state.cursor.is_none_or(|cursor| base.0 > cursor.0)) {
-            state.cursor = base_cursor;
-        }
+            _ => Self::trusted_body_base(db, canonical_tip, genesis_hash)?,
+        };
 
         if let Some((cursor_height, cursor_hash)) = state.cursor {
             if cursor_height > canonical_tip
@@ -285,8 +256,34 @@ impl TrackerState {
             {
                 state.cursor = state
                     .current
-                    .map(|checkpoint| (checkpoint.height, checkpoint.hash))
-                    .or(base_cursor);
+                    .map(|checkpoint| (checkpoint.height, checkpoint.hash));
+            }
+        }
+
+        if let Some(body_height) = body_tip {
+            if state
+                .next_checkpoint
+                .is_some_and(|(height, _)| height <= body_height)
+            {
+                let (height, hash) = checkpoints
+                    .checkpoint_at_or_before(body_height)
+                    .ok_or(HighestCompletedCheckpointError::MissingGenesisCheckpoint)?;
+                let completed = HighestCompletedCheckpoint { height, hash };
+                Self::validate_checkpoint(db, completed)?;
+                state.current = Some(completed);
+                state.next_checkpoint = checkpoints.checkpoint_after(height);
+            }
+
+            if state
+                .cursor
+                .is_none_or(|(cursor_height, _)| cursor_height < body_height)
+            {
+                let body_hash = db.header_hash(body_height).ok_or(
+                    HighestCompletedCheckpointError::MissingCanonicalHeader {
+                        height: body_height,
+                    },
+                )?;
+                state.cursor = Some((body_height, body_hash));
             }
         }
 
@@ -313,7 +310,10 @@ impl TrackerState {
             {
                 break;
             }
-            if let Some(expected) = checkpoints.hash(next_height) {
+            if let Some((_, expected)) = state
+                .next_checkpoint
+                .filter(|(height, _)| *height == next_height)
+            {
                 if hash != expected {
                     return Err(HighestCompletedCheckpointError::CheckpointMismatch {
                         height: next_height,
@@ -325,6 +325,7 @@ impl TrackerState {
                     height: next_height,
                     hash,
                 });
+                state.next_checkpoint = checkpoints.checkpoint_after(next_height);
             }
             cursor_height = next_height;
             cursor_hash = hash;
@@ -332,6 +333,46 @@ impl TrackerState {
         state.cursor = Some((cursor_height, cursor_hash));
 
         Ok(state)
+    }
+
+    fn trusted_body_base(
+        db: &ZakuraDb,
+        canonical_tip: Height,
+        genesis_hash: block::Hash,
+    ) -> Result<Self, HighestCompletedCheckpointError> {
+        let checkpoints = db.network().checkpoint_list();
+        let (completed, cursor) = if let Some(body_height) = db
+            .finalized_tip_height()
+            .filter(|height| *height <= canonical_tip)
+        {
+            let body_hash = db.header_hash(body_height).ok_or(
+                HighestCompletedCheckpointError::MissingCanonicalHeader {
+                    height: body_height,
+                },
+            )?;
+            let (height, hash) = checkpoints
+                .checkpoint_at_or_before(body_height)
+                .ok_or(HighestCompletedCheckpointError::MissingGenesisCheckpoint)?;
+            (
+                HighestCompletedCheckpoint { height, hash },
+                (body_height, body_hash),
+            )
+        } else {
+            (
+                HighestCompletedCheckpoint {
+                    height: Height::MIN,
+                    hash: genesis_hash,
+                },
+                (Height::MIN, genesis_hash),
+            )
+        };
+        Self::validate_checkpoint(db, completed)?;
+
+        Ok(Self {
+            current: Some(completed),
+            next_checkpoint: checkpoints.checkpoint_after(completed.height),
+            cursor: Some(cursor),
+        })
     }
 
     fn validate_checkpoint(

@@ -91,6 +91,26 @@ fn advances_after_disk_commit_and_reconstructs_after_restart() {
 }
 
 #[test]
+fn reconstructs_header_completed_frontier_above_body_tip() {
+    let _init_guard = zakura_test::init();
+    let (genesis, headers, network) = checkpoint_chain(&[2, 5]);
+    let state = state_with_genesis_config(&network, genesis, Config::ephemeral());
+
+    for (index, header) in headers.iter().enumerate() {
+        let height = Height(u32::try_from(index + 1).expect("small test height fits in u32"));
+        store_header(&state, height, header);
+    }
+
+    let (tracker, receiver) =
+        HighestCompletedCheckpointTracker::open(&state).expect("tracker reconstructs");
+    let checkpoint_five = checkpoint(Height(5), block::Hash::from(headers[4].as_ref()));
+
+    assert_eq!(state.finalized_tip_height(), Some(Height::MIN));
+    assert_eq!(tracker.current(), Some(checkpoint_five));
+    assert_eq!(*receiver.borrow(), Some(checkpoint_five));
+}
+
+#[test]
 fn failed_write_proposal_has_no_side_effects() {
     let _init_guard = zakura_test::init();
     let (genesis, headers, network) = checkpoint_chain(&[2]);

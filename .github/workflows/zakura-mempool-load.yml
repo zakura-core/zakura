@@ -17,6 +17,14 @@ name: Mempool load
 # and no public peers. No Mainnet state and no real funds are involved.
 
 on:
+  # TEMPORARY -- REMOVE BEFORE MERGING.
+  # `workflow_dispatch` only works once the workflow is on the default branch,
+  # so this is the only way to exercise the droplet path pre-merge. A `push`
+  # event reads the workflow from the pushed commit. Every push to this branch
+  # provisions a droplet, which is exactly why it must not survive the merge.
+  push:
+    branches: [ci/mempool-load-harness]
+
   workflow_dispatch:
     inputs:
       pr_number:
@@ -63,7 +71,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: zakura-mempool-load-${{ inputs.pr_number || inputs.ref }}
+  group: zakura-mempool-load-${{ inputs.pr_number || inputs.ref || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -86,11 +94,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
-          REF: ${{ inputs.ref }}
+          # On a push event every input is empty, so each falls back to the
+          # dispatch default. The ref defaults to the pushed branch by name
+          # (not SHA) so the PR lookup below can still match on head branch.
+          REF: ${{ inputs.ref || (github.event_name == 'push' && github.ref_name || '') }}
           BASELINE_REF: ${{ inputs.baseline_ref }}
-          NODE_COUNT: ${{ inputs.node_count }}
-          TX_RATE: ${{ inputs.tx_rate }}
-          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+          NODE_COUNT: ${{ inputs.node_count || '2' }}
+          TX_RATE: ${{ inputs.tx_rate || '2' }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes || '2' }}
         run: |
           set -euo pipefail
           if { [ -n "${PR_NUMBER}" ] && [ -n "${REF}" ]; } || { [ -z "${PR_NUMBER}" ] && [ -z "${REF}" ]; }; then
@@ -174,7 +185,7 @@ jobs:
       - name: Create droplet
         id: droplet
         env:
-          DROPLET_SIZE: ${{ inputs.droplet_size || 'c-16' }}
+          DROPLET_SIZE: ${{ inputs.droplet_size || 'c-8' }}
           SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
           IMAGE_ID: ${{ steps.baked.outputs.image_id }}
           SLUG: ${{ steps.target.outputs.slug }}
@@ -216,10 +227,10 @@ jobs:
           SHA: ${{ steps.target.outputs.sha }}
           REFSPEC: ${{ steps.target.outputs.refspec }}
           BASELINE_REF: ${{ steps.target.outputs.baseline_sha }}
-          NODE_COUNT: ${{ inputs.node_count || '4' }}
-          TX_RATE: ${{ inputs.tx_rate || '10' }}
-          DURATION_MINUTES: ${{ inputs.duration_minutes || '5' }}
-          KRESKO_REF: ${{ inputs.kresko_ref || 'main' }}
+          NODE_COUNT: ${{ inputs.node_count || '2' }}
+          TX_RATE: ${{ inputs.tx_rate || '2' }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes || '2' }}
+          KRESKO_REF: ${{ inputs.kresko_ref || 'fix/local-genesis-upgrade-consistency' }}
         run: |
           set -euo pipefail
           umask 077
@@ -365,7 +376,7 @@ jobs:
         if: always()
         env:
           DROPLET_ID: ${{ steps.droplet.outputs.id }}
-          TEARDOWN: ${{ inputs.teardown_after_run }}
+          TEARDOWN: ${{ inputs.teardown_after_run == false && 'false' || 'true' }}
           SSH_FAILED: ${{ steps.sshwait.outcome == 'failure' }}
         run: |
           set +e

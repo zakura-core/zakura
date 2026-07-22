@@ -370,6 +370,53 @@ class PeeringCheck(unittest.TestCase):
         self.assertFalse(lab.wait_for_peers(2, timeout_secs=0.5, poll_secs=0.01))
 
 
+class StartupConvergence(unittest.TestCase):
+    """Peer counts are too weak a gate; a mined block must actually arrive."""
+
+    def with_heights(self, rounds):
+        """Stub rpc_call to walk through successive per-round height maps."""
+        state = {"round": 0, "i": 0}
+
+        def fake(url, method, params=None, timeout=15):
+            r = rounds[min(state["round"], len(rounds) - 1)]
+            value = r[state["i"] % len(r)]
+            state["i"] += 1
+            if state["i"] % len(r) == 0:
+                state["round"] += 1
+            return {"blocks": value}
+
+        original = lab.rpc_call
+        lab.rpc_call = fake
+        self.addCleanup(lambda: setattr(lab, "rpc_call", original))
+
+    def test_agreement_without_progress_is_not_convergence(self):
+        # All nodes parked at the seed height agree trivially. That says
+        # nothing about whether blocks propagate.
+        self.with_heights([[128, 128, 128]])
+        self.assertFalse(
+            lab.wait_for_chain_convergence(3, timeout_secs=0.5, poll_secs=0.01)
+        )
+
+    def test_a_block_reaching_every_node_converges(self):
+        self.with_heights([[128, 128, 128], [130, 130, 130]])
+        self.assertTrue(
+            lab.wait_for_chain_convergence(3, timeout_secs=5, poll_secs=0.01)
+        )
+
+    def test_a_node_left_behind_is_rejected(self):
+        # The observed failure: miner-1 stuck while the others advanced.
+        self.with_heights([[128, 128, 128], [140, 135, 140]])
+        self.assertFalse(
+            lab.wait_for_chain_convergence(3, timeout_secs=0.5, poll_secs=0.01)
+        )
+
+    def test_one_block_of_spread_is_tolerated(self):
+        self.with_heights([[128, 128, 128], [131, 130, 131]])
+        self.assertTrue(
+            lab.wait_for_chain_convergence(3, timeout_secs=5, poll_secs=0.01)
+        )
+
+
 class StartupDiagnostics(unittest.TestCase):
     """An opaque `unknown field` error must name its actual cause."""
 

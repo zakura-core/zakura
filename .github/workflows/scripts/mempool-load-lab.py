@@ -616,8 +616,53 @@ def cmd_up(args) -> int:
         print("nodes did not peer with each other", file=sys.stderr)
         return 1
 
-    print(f"{args.node_count} nodes up and peered", flush=True)
+    # Peer counts alone are too weak a signal. A run that came up with only
+    # n-1 connections satisfied the peer gate but left one node unable to
+    # follow the chain -- it sat 8 blocks behind for the whole run and the
+    # verdict failed on tip divergence at the very end. Waiting for a mined
+    # block to reach every node proves the topology actually carries data,
+    # and turns that late, confusing failure into an immediate one.
+    if args.node_count > 1 and not wait_for_chain_convergence(args.node_count):
+        print("nodes did not converge on a common tip at startup", file=sys.stderr)
+        return 1
+
+    print(f"{args.node_count} nodes up, peered, and following one chain", flush=True)
     return 0
+
+
+def wait_for_chain_convergence(
+    node_count: int, timeout_secs: int = 180, poll_secs: float = 5.0
+) -> bool:
+    """Wait until every node reports the same tip, above the seeded height.
+
+    Requires progress as well as agreement: nodes all sitting at the seed
+    height agree trivially, which proves nothing about propagation.
+    """
+    deadline = time.monotonic() + timeout_secs
+    heights: dict[str, int] = {}
+    baseline: int | None = None
+    while True:
+        heights = {}
+        for i in range(node_count):
+            url = f"http://{node_ip(i)}:{RPC_PORT}"
+            try:
+                heights[node_name(i)] = rpc_call(url, "getblockchaininfo", timeout=5)["blocks"]
+            except (urllib.error.URLError, OSError, RuntimeError, json.JSONDecodeError, KeyError):
+                heights[node_name(i)] = -1
+        if baseline is None:
+            baseline = min(heights.values())
+        values = list(heights.values())
+        if min(values) > baseline and max(values) - min(values) <= 1:
+            print(f"all nodes following one chain: {heights}", flush=True)
+            return True
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(poll_secs)
+    print(
+        f"nodes still diverged after {timeout_secs}s (baseline {baseline}): {heights}",
+        file=sys.stderr,
+    )
+    return False
 
 
 def wait_for_peers(node_count: int, timeout_secs: int = 120, poll_secs: float = 5.0) -> bool:

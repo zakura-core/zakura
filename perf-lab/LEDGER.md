@@ -236,3 +236,19 @@ This file is the sole reporting channel (design D5). Entry template:
   throughput, EXP-001 DL_LIMIT-flat evidence, supply-bound attribution.
 - spend: ~US$5 (SESSION 1 tail + cohort build incl. one written-off seed
   pair).
+
+## B-15 DELIVERED (partial) — 2026-07-22
+
+- cohort determinism samples: {0.00, 7.60, 0.00} — a bimodal picture: the
+  normal mode is PERFECT (two samples with byte-identical leg numbers), with
+  occasional per-connection delivery excursions (cohort2's starved-queue leg).
+- throughput 2× live peers (~165-191 pc blk/s); attribution now SUPPLY-BOUND
+  (writer 27-34%) — per-connection overlay delivery is both ceiling and
+  excursion source; request shape (1 blk/response) is the prime suspect and
+  EXP-002 tests it via the bsknob config patch.
+- thresholds: NOISE_BAND_PCT 8.7→7.6 (max rule); single-run effective
+  threshold 15.2%; NEW two-run protocol: confirmed same-direction results
+  ≥3% on the cohort qualify as WINs (excursions do not repeat consistently;
+  2 of 3 samples show exact-zero noise).
+- standing cost: ~$1/h serve pair (reaper-exempt) + bench droplet while
+  active.

@@ -103,10 +103,10 @@ COHORT_PEERS="${COHORT_PEERS:-}"                   # id@ip:8234 pairs, set by co
 
 BATCH_SIZE=8                                   # D3/D6: bench runs per batch
 WIN_THRESHOLD_PCT="3.0"                        # floor; effective = max(this, 2*NOISE_BAND_PCT)
-# max of the clean pinned long-window A/A samples (0.401 / 8.383 / 8.653,
-# 2026-07-21, single pinned feed peer). Dominated by peer delivery variance —
-# see B-15. Effective single-run threshold = max(3%, 2x band).
-NOISE_BAND_PCT="${NOISE_BAND_PCT:-8.7}"
+# COHORT regime (2026-07-22): samples {0.00, 7.60, 0.00} — deterministic mode
+# with occasional delivery excursions. Max rule keeps 7.6 for single runs;
+# CONFIRMED two-run same-direction results >=3% qualify as wins (SKILL).
+NOISE_BAND_PCT="${NOISE_BAND_PCT:-7.6}"
 ```
 
 - [ ] **Step 4: Write `perf-lab/BACKLOG.md`** (seeded from spec §6; EV/cost are the orchestrator's running estimates)

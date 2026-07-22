@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "session": 1,
-  "batch_runs_used": 0,
-  "next_exp_id": 2,
+  "batch_runs_used": 1,
+  "next_exp_id": 3,
   "droplets": {
     "perf-lab-serve-a": {
       "ip": "138.197.91.62",
@@ -22,12 +22,6 @@
       "role": "bench"
     }
   },
-  "in_flight": {
-    "aa-cohort3": {
-      "droplet": "perf-lab-s2",
-      "exp": "B-15 cohort determinism sample 3",
-      "started_at": "2026-07-22T19:05:00Z"
-    }
-  },
-  "noise_band_pct": 8.7
+  "in_flight": {},
+  "noise_band_pct": 7.6
 }

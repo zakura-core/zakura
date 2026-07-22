@@ -278,6 +278,14 @@ where
                     SuppliedRootsError::InvalidHeaderCommitment(error) => {
                         ValidateContextError::InvalidBlockCommitment(error)
                     }
+                    SuppliedRootsError::MissingHistoryTreeRoot => {
+                        ValidateContextError::HistoryTreeError(Arc::new(
+                            zakura_chain::history_tree::HistoryTreeError::InvalidCachedTree {
+                                reason:
+                                    "a header commitment requires a non-empty parent history tree",
+                            },
+                        ))
+                    }
                     SuppliedRootsError::HistoryTree(error) => {
                         ValidateContextError::HistoryTreeError(error)
                     }

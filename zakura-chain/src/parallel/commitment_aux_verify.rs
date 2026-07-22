@@ -16,13 +16,36 @@ use crate::{
     sapling,
 };
 
-/// Result of verifying supplied header-sync commitment roots from header parts.
+/// Commitment roots authenticated by their successor headers.
+///
+/// The private fields make successful verification the only construction path.
 #[derive(Clone, Debug)]
-pub struct SuppliedRootsVerification {
-    /// The history tree after folding only roots confirmed by this delivery.
-    pub tree: HistoryTree,
-    /// Last height whose supplied roots were confirmed and folded.
-    pub confirmed_tip: Option<Height>,
+pub struct VerifiedHeaderCommitmentRoots {
+    confirmed_roots: Vec<BlockCommitmentRoots>,
+    confirmed_hashes: Vec<block::Hash>,
+    history_tree: HistoryTree,
+}
+
+impl VerifiedHeaderCommitmentRoots {
+    /// Returns the roots confirmed by this delivery, in ascending height order.
+    pub fn confirmed_roots(&self) -> &[BlockCommitmentRoots] {
+        &self.confirmed_roots
+    }
+
+    /// Returns the header hashes corresponding to the confirmed roots.
+    pub fn confirmed_hashes(&self) -> &[block::Hash] {
+        &self.confirmed_hashes
+    }
+
+    /// Returns the header hash at the confirmed tip, if any roots were confirmed.
+    pub fn confirmed_hash(&self) -> Option<block::Hash> {
+        self.confirmed_hashes.last().copied()
+    }
+
+    /// Returns the history tree after folding the confirmed roots.
+    pub fn history_tree(&self) -> &HistoryTree {
+        &self.history_tree
+    }
 }
 
 /// A supplied-root verification failure.
@@ -31,6 +54,10 @@ pub enum SuppliedRootsError {
     /// A header commitment did not match its supplied auxiliary data.
     #[error("invalid header commitment: {0}")]
     InvalidHeaderCommitment(#[from] CommitmentError),
+
+    /// A header commitment requires a parent history tree, but the supplied tree is empty.
+    #[error("missing parent history tree root required by the header commitment")]
+    MissingHistoryTreeRoot,
 
     /// The supplied auxiliary roots could not extend the history tree.
     #[error("invalid history tree update: {0}")]
@@ -54,12 +81,13 @@ pub fn verify_supplied_roots_from_parts<'a, I>(
     network: &Network,
     mut tree: HistoryTree,
     items: I,
-) -> Result<SuppliedRootsVerification, (Height, SuppliedRootsError)>
+) -> Result<VerifiedHeaderCommitmentRoots, (Height, SuppliedRootsError)>
 where
     I: IntoIterator<Item = (&'a Header, &'a BlockCommitmentRoots)>,
 {
     let items = items.into_iter().collect::<Vec<_>>();
-    let mut confirmed_tip = None;
+    let mut confirmed_roots = Vec::with_capacity(items.len().saturating_sub(1));
+    let mut confirmed_hashes = Vec::with_capacity(items.len().saturating_sub(1));
 
     for (index, (header, roots)) in items.iter().enumerate() {
         let height = roots.height;
@@ -106,12 +134,14 @@ where
         .map_err(Arc::new)
         .map_err(SuppliedRootsError::from)
         .map_err(|error| (height, error))?;
-        confirmed_tip = Some(height);
+        confirmed_roots.push((*roots).clone());
+        confirmed_hashes.push(block::Hash::from(*header));
     }
 
-    Ok(SuppliedRootsVerification {
-        tree,
-        confirmed_tip,
+    Ok(VerifiedHeaderCommitmentRoots {
+        confirmed_roots,
+        confirmed_hashes,
+        history_tree: tree,
     })
 }
 
@@ -142,7 +172,7 @@ pub fn header_commitment_is_valid_for_chain_history(
             // folded into `history_tree` before this block.
             let history_tree_root = history_tree
                 .hash()
-                .expect("the previous block history tree exists because current header has a ChainHistoryRoot");
+                .ok_or(SuppliedRootsError::MissingHistoryTreeRoot)?;
             if actual_history_tree_root == history_tree_root {
                 Ok(())
             } else {
@@ -165,9 +195,7 @@ pub fn header_commitment_is_valid_for_chain_history(
                     (NetworkUpgrade::Heartwood.activation_height(network) == Some(height))
                         .then_some(block::CHAIN_HISTORY_ACTIVATION_RESERVED.into())
                 })
-                .expect(
-                    "the previous block history tree exists because current header has a ChainHistoryBlockTxAuthCommitment",
-                );
+                .ok_or(SuppliedRootsError::MissingHistoryTreeRoot)?;
             let hash_block_commitments = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
                 &history_tree_root,
                 &auth_data_root,
@@ -525,12 +553,16 @@ mod tests {
             .expect("real roots verify against the headers");
 
         assert_eq!(
-            verified.confirmed_tip,
-            Some(Height(activation)),
+            verified.confirmed_roots(),
+            std::slice::from_ref(&act_roots),
             "a two-header range only confirms the first header's roots"
         );
         assert_eq!(
-            verified.tree.hash(),
+            verified.confirmed_hash(),
+            Some(block::Hash::from(act_block.header.as_ref())),
+        );
+        assert_eq!(
+            verified.history_tree().hash(),
             HistoryTree::from_block(
                 &Mainnet,
                 act_block,
@@ -573,5 +605,45 @@ mod tests {
             Height(activation + 1),
             "a wrong root at H is detected at H+1"
         );
+    }
+
+    #[test]
+    fn rejects_empty_history_tree_when_header_requires_parent_root() {
+        let heartwood_successor = NetworkUpgrade::Heartwood
+            .activation_height(&Mainnet)
+            .expect("mainnet has Heartwood")
+            .0
+            + 1;
+        let nu5_activation = NetworkUpgrade::Nu5
+            .activation_height(&Mainnet)
+            .expect("mainnet has NU5")
+            .0;
+        let block = mainnet_block_at(heartwood_successor);
+        let roots = roots_from_block(
+            &block,
+            mainnet_sapling_root_at(heartwood_successor),
+            orchard::tree::NoteCommitmentTree::default().root(),
+        );
+
+        for height in [heartwood_successor, nu5_activation] {
+            let roots = BlockCommitmentRoots {
+                height: Height(height),
+                ..roots.clone()
+            };
+
+            let error = verify_supplied_roots_from_parts(
+                &Mainnet,
+                empty_history_tree(),
+                [(block.header.as_ref(), &roots)],
+            )
+            .expect_err("an empty parent history tree must be rejected");
+
+            assert_eq!(error.0, Height(height));
+            assert!(
+                matches!(error.1, SuppliedRootsError::MissingHistoryTreeRoot),
+                "rejection uses the missing history tree error, got: {:?}",
+                error.1
+            );
+        }
     }
 }

@@ -523,14 +523,6 @@ impl WriteBlockWorkerTask {
                 next_vct_block,
             ) {
                 Ok((finalized, note_commitment_trees)) => {
-                    if let Err(error) =
-                        highest_completed_checkpoint.rebind_from_db(&finalized_state.db)
-                    {
-                        tracing::warn!(
-                            ?error,
-                            "failed to refresh highest completed checkpoint after finalized block commit"
-                        );
-                    }
                     // Whether this successful commit consumed header-carried
                     // tree-aux roots to skip the note-commitment frontier rebuild.
                     if next_block_took_vct_path {
@@ -543,9 +535,21 @@ impl WriteBlockWorkerTask {
                     // the stalled-height gauge if it had been raised.
                     vct_write_manager.on_commit_success();
 
+                    // Publish the tip before checkpoint rebind. `commit_finalized`
+                    // already answered the oneshot, so tip waiters can race this
+                    // path; rebind must not delay chain-tip notification.
                     let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
                     chain_tip_sender.set_finalized_tip(tip_block);
+
+                    if let Err(error) =
+                        highest_completed_checkpoint.rebind_from_db(&finalized_state.db)
+                    {
+                        tracing::warn!(
+                            ?error,
+                            "failed to refresh highest completed checkpoint after finalized block commit"
+                        );
+                    }
                 }
                 Err((ordered_block, error)) => {
                     // Retryable VCT root stalls (an absent/evicted root, or one not yet

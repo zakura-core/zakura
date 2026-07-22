@@ -18,6 +18,11 @@ pub(super) const HEADER_SYNC_STALE_ANCHOR_LINK_FAILURES: u32 = 3;
 pub(super) const HEADER_SYNC_STALE_ANCHOR_DISTINCT_PEERS: usize = 2;
 pub(super) const VCT_ROOT_REPAIR_MAX_ATTEMPTS: usize = 6;
 pub(super) const VCT_ROOT_REPAIR_MAX_WALL_TIME: Duration = Duration::from_secs(240);
+/// Number of overlapping root ranges fetched ahead of the durable authentication frontier.
+///
+/// Verification remains strictly serial, but this bounded window keeps network latency for the
+/// next range off the authentication critical path.
+pub(super) const ROOT_AUTH_PREFETCH_BATCHES: usize = 4;
 pub(super) const VCT_ROOT_REPAIR_BACKOFFS: [Duration; VCT_ROOT_REPAIR_MAX_ATTEMPTS] = [
     Duration::from_secs(0),
     Duration::from_secs(1),
@@ -192,24 +197,122 @@ impl HeaderSyncCore {
         if range.count() < 2 {
             return;
         }
-        let count = range
+        let batch_count = range
             .count()
             .min(startup.config.advertised_max_headers_per_response());
-        if count < 2 {
+        if batch_count < 2 {
             return;
         }
-        let range = CheckedHeaderRange::from_count(start, count)
-            .expect("root authentication request count is checked and non-zero");
-        self.schedule.ensure(
-            RangeRequest {
-                range,
-                anchor_hash: Some(auth.authenticated_hash),
-                finalized: true,
-                want_tree_aux_roots: true,
-                priority: RangePriority::AuthenticateRoots,
-            },
-            RangePriority::AuthenticateRoots,
+
+        let resident_height_cap = u64::from(
+            startup
+                .config
+                .advertised_max_headers_per_response()
+                .saturating_mul(HEADER_SYNC_MAX_RESIDENT_BATCHES),
         );
+        let mut available = resident_height_cap.saturating_sub(self.schedule.resident_heights());
+        let mut resident_batches = self.schedule.range_count(RangePriority::AuthenticateRoots);
+        let mut batch_start = self
+            .schedule
+            .highest_end(RangePriority::AuthenticateRoots)
+            .unwrap_or(start);
+
+        while resident_batches < ROOT_AUTH_PREFETCH_BATCHES && batch_start <= end && available >= 2
+        {
+            let available_count = u32::try_from(available).unwrap_or(u32::MAX);
+            let count = count_between(batch_start, end)
+                .min(batch_count)
+                .min(available_count);
+            if count < 2 {
+                break;
+            }
+            let range = CheckedHeaderRange::from_count(batch_start, count)
+                .expect("bounded root-authentication batch has checked geometry");
+            self.schedule.ensure(
+                RangeRequest {
+                    range,
+                    anchor_hash: (batch_start == start).then_some(auth.authenticated_hash),
+                    finalized: true,
+                    want_tree_aux_roots: true,
+                    priority: RangePriority::AuthenticateRoots,
+                },
+                RangePriority::AuthenticateRoots,
+            );
+            resident_batches = resident_batches.saturating_add(1);
+            available = available.saturating_sub(u64::from(count));
+
+            // The final entry is the successor witness, so it is also the first entry of the
+            // next speculative batch.
+            batch_start = range.end();
+        }
+    }
+
+    /// Drop in-flight `AuthenticateRoots` ops after durable frontier movement.
+    ///
+    /// On real auth-tip advancement, mark ranges complete. Otherwise retire them
+    /// so the schedule slot is freed without claiming success (e.g. rebase).
+    pub(super) fn clear_inflight_root_auth(&mut self, auth_advanced: bool) {
+        let auth_operations: Vec<_> = self
+            .pending_operations
+            .iter()
+            .filter_map(|(operation, pending)| {
+                (operation.op_kind == HeaderSyncOperationKind::AuthenticateRoots)
+                    .then_some((operation.clone(), pending.range))
+            })
+            .collect();
+        for (operation, range) in auth_operations {
+            self.pending_operations.remove(&operation);
+            if auth_advanced {
+                self.schedule.complete(range);
+            } else {
+                self.schedule.retire_operation(&operation, range);
+            }
+        }
+    }
+
+    /// Keep scheduled/buffered root-auth work that still sits after the
+    /// authenticated tip and within the completed checkpoint bracket.
+    pub(super) fn prune_root_auth_pipeline(
+        &mut self,
+        auth: HeaderRootAuthState,
+        auth_advanced: bool,
+    ) {
+        let next_start =
+            next_height(auth.authenticated_height).unwrap_or(auth.authenticated_height);
+        if auth_advanced {
+            self.schedule.prune_root_auth_before(next_start);
+        }
+        let before = self.buffered.len();
+        self.buffered.retain(|(priority, start), buffered| {
+            *priority != RangePriority::AuthenticateRoots
+                || (*start >= next_start
+                    && buffered.range.end_height() <= auth.completed_checkpoint_height)
+        });
+        let dropped = before.saturating_sub(self.buffered.len());
+        if dropped > 0 {
+            metrics::counter!(
+                "sync.header.root_auth.prefetch.dropped",
+                "reason" => "frontier_advanced"
+            )
+            .increment(dropped as u64);
+        }
+    }
+
+    /// Discard the whole root-auth schedule lane and buffered prefetch after a
+    /// rebase or cleared authentication state.
+    pub(super) fn discard_root_auth_pipeline(&mut self) {
+        self.schedule.clear_root_auth();
+        let before = self.buffered.len();
+        self.buffered
+            .retain(|(priority, _), _| *priority != RangePriority::AuthenticateRoots);
+        let dropped = before.saturating_sub(self.buffered.len());
+        if dropped > 0 {
+            metrics::counter!(
+                "sync.header.root_auth.prefetch.dropped",
+                "reason" => "frontier_rebased"
+            )
+            .increment(dropped as u64);
+        }
     }
 
     pub(super) fn retire_peer_session_auth(
@@ -234,6 +337,27 @@ impl HeaderSyncCore {
             self.pending_operations.remove(&operation);
             self.schedule.retire_operation(&operation, range);
             self.schedule.retry(range);
+        }
+
+        let buffered_keys: Vec<_> = self
+            .buffered
+            .iter()
+            .filter_map(|(key, buffered)| {
+                (key.0 == RangePriority::AuthenticateRoots
+                    && &buffered.wire_request.peer == peer
+                    && session_id.is_none_or(|session| buffered.wire_request.session_id == session))
+                .then_some(*key)
+            })
+            .collect();
+        for key in buffered_keys {
+            if let Some(buffered) = self.buffered.remove(&key) {
+                self.schedule.retry(buffered.range);
+                metrics::counter!(
+                    "sync.header.root_auth.prefetch.dropped",
+                    "reason" => "session_retired"
+                )
+                .increment(1);
+            }
         }
     }
 

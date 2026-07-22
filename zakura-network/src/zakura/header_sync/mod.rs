@@ -31,6 +31,7 @@ use super::{Frame, ZakuraPeerId, ZakuraTrace, FRAME_HEADER_BYTES, LOCAL_MAX_MESS
 mod config;
 mod error;
 mod events;
+mod header_root_auth;
 mod pipe;
 mod range;
 mod reactor;

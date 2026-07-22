@@ -1,7 +1,10 @@
 use super::super::trace::{
     header_sync_trace as hs_trace, ordered_send_error_label, queue_send_trace as qs_trace,
 };
-use super::{config::*, error::*, events::*, requester::*, state::*, validation::*, wire::*, *};
+use super::{
+    config::*, error::*, events::*, header_root_auth::*, requester::*, state::*, validation::*,
+    wire::*, work_queue::HeaderWorkState, *,
+};
 use crate::zakura::{
     FrontierChange, FrontierUpdate, HeaderSyncServiceSummary, OrderedSendError,
     ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
@@ -1213,6 +1216,7 @@ impl HeaderSyncReactor {
     }
 
     async fn handle_header_root_auth_state_changed(&mut self, state: Option<HeaderRootAuthState>) {
+        // If the state is the same, no-op.
         if self.state.header_root_auth == state {
             if self.state.root_auth_waiting_for_watch {
                 self.state.root_auth_waiting_for_watch = false;
@@ -1220,12 +1224,34 @@ impl HeaderSyncReactor {
             }
             return;
         }
+
+        let transition = self.state.header_root_auth.zip(state);
+
+        // Pipeline compatible means neither frontier rebased onto a different hash at the
+        // same height.
+        let pipeline_compatible = root_auth_pipeline_compatible(self.state.header_root_auth, state);
+
+        // If the authenticated height has advanced, complete the in-flight operations.
+        let auth_advanced = transition
+            .is_some_and(|(old, new)| new.authenticated_height > old.authenticated_height);
         self.state.header_root_auth = state;
         self.state.root_auth_waiting_for_watch = false;
-        self.state.schedule.clear_root_auth();
-        self.state
-            .pending_operations
-            .retain(|operation, _| operation.op_kind != HeaderSyncOperationKind::AuthenticateRoots);
+
+        // Clear in-flight auth when the tip advanced or the pipeline was invalidated.
+        // Checkpoint-only advances leave pending ops alone (same auth target).
+        let should_clear_inflight_root_auth = auth_advanced || !pipeline_compatible;
+        if should_clear_inflight_root_auth {
+            self.state.clear_inflight_root_auth(auth_advanced);
+        }
+
+        if pipeline_compatible {
+            let auth = state.expect("a compatible authentication update has a state");
+            self.state.prune_root_auth_pipeline(auth, auth_advanced);
+            self.drain_buffered_with_permit(None).await;
+        } else {
+            self.state.discard_root_auth_pipeline();
+        }
+        metrics::gauge!("sync.header.work.buffered.count").set(self.state.buffered.len() as f64);
         self.schedule().await;
     }
 
@@ -1914,6 +1940,19 @@ impl HeaderSyncReactor {
         }
 
         if outstanding.range_request.priority == RangePriority::AuthenticateRoots {
+            if !self
+                .state
+                .schedule
+                .is_in_flight_for(outstanding.range_request, &peer)
+            {
+                metrics::counter!(
+                    "sync.header.root_auth.prefetch.dropped",
+                    "reason" => "stale_pipeline"
+                )
+                .increment(1);
+                self.schedule().await;
+                return;
+            }
             if payload.range().count() < 2 {
                 self.state
                     .schedule
@@ -1925,10 +1964,45 @@ impl HeaderSyncReactor {
                 range: payload.range(),
                 ..outstanding.range_request
             };
+            let short_response = actual_range.end_height() < outstanding.range_request.end_height();
             self.state
                 .schedule
                 .narrow_queued_range(outstanding.range_request, actual_range);
-            self.start_root_authentication(outstanding.wire_request, actual_range, payload);
+            if short_response {
+                self.state
+                    .schedule
+                    .discard_root_auth_after(actual_range.start_height());
+                let before = self.state.buffered.len();
+                self.state.buffered.retain(|(priority, start), _| {
+                    *priority != RangePriority::AuthenticateRoots
+                        || *start <= actual_range.start_height()
+                });
+                let dropped = before.saturating_sub(self.state.buffered.len());
+                metrics::counter!(
+                    "sync.header.root_auth.prefetch.dropped",
+                    "reason" => "short_response"
+                )
+                .increment(dropped as u64);
+            }
+            self.state
+                .schedule
+                .mark_buffered(peer.clone(), actual_range);
+            self.state.buffered.insert(
+                (
+                    RangePriority::AuthenticateRoots,
+                    actual_range.start_height(),
+                ),
+                BufferedHeaderRange {
+                    wire_request: outstanding.wire_request,
+                    range: actual_range,
+                    purpose: RangePurpose::AuthenticateRoots,
+                    payload,
+                },
+            );
+            metrics::counter!("sync.header.root_auth.prefetched").increment(1);
+            metrics::gauge!("sync.header.work.buffered.count")
+                .set(self.state.buffered.len() as f64);
+            self.drain_buffered_with_permit(None).await;
             self.schedule().await;
             return;
         }
@@ -1986,6 +2060,84 @@ impl HeaderSyncReactor {
         mut reserved: Option<mpsc::OwnedPermit<HeaderSyncAction>>,
     ) {
         loop {
+            if let Some((key, expected_state)) = self.next_buffered_root_auth() {
+                let invalid = self.state.buffered.get(&key).and_then(|buffered| {
+                    validate_header_range_links(
+                        expected_state.authenticated_hash,
+                        buffered.payload.headers(),
+                    )
+                    .err()
+                });
+                if let Some(error) = invalid {
+                    let buffered = self
+                        .state
+                        .buffered
+                        .remove(&key)
+                        .expect("root-auth candidate exists until the reactor removes it");
+                    self.state
+                        .schedule
+                        .retry_avoiding(buffered.wire_request.peer.clone(), buffered.range);
+                    self.trace_range_validation_rejected(
+                        &buffered.wire_request.peer,
+                        buffered.range,
+                        buffered.payload.range().count(),
+                        "authenticated_predecessor",
+                        header_sync_wire_error_kind(&error),
+                    );
+                    self.report_misbehavior(
+                        buffered.wire_request.peer,
+                        HeaderSyncMisbehavior::InvalidRange,
+                    )
+                    .await;
+                    metrics::counter!(
+                        "sync.header.root_auth.prefetch.dropped",
+                        "reason" => "wrong_predecessor"
+                    )
+                    .increment(1);
+                    continue;
+                }
+
+                let Some(permit) = self.take_buffered_action_permit(&mut reserved) else {
+                    return;
+                };
+                let mut buffered = self
+                    .state
+                    .buffered
+                    .remove(&key)
+                    .expect("root-auth candidate exists until action admission");
+                let original = buffered.range;
+                buffered.range.anchor_hash = Some(expected_state.authenticated_hash);
+                self.state
+                    .schedule
+                    .narrow_queued_range(original, buffered.range);
+                let operation = HeaderSyncOperationIdentity {
+                    wire_request: buffered.wire_request,
+                    op_kind: HeaderSyncOperationKind::AuthenticateRoots,
+                };
+                self.state
+                    .schedule
+                    .mark_authenticating(operation.clone(), buffered.range);
+                self.state.pending_operations.insert(
+                    operation.clone(),
+                    PendingOperation {
+                        range: buffered.range,
+                        purpose: RangePurpose::AuthenticateRoots,
+                        reusable_payload: None,
+                        completion_observed: false,
+                    },
+                );
+                permit.send(HeaderSyncAction::AuthenticateHeaderRoots {
+                    operation,
+                    expected_state,
+                    anchor: expected_state.authenticated_hash,
+                    payload: buffered.payload,
+                });
+                metrics::counter!("sync.header.root_auth.prefetch.consumed").increment(1);
+                metrics::gauge!("sync.header.work.buffered.count")
+                    .set(self.state.buffered.len() as f64);
+                continue;
+            }
+
             let candidate = self.next_buffered_commit();
             let Some((key, anchor)) = candidate else {
                 return;
@@ -2032,30 +2184,8 @@ impl HeaderSyncReactor {
                 continue;
             }
 
-            let permit = if let Some(permit) = reserved.take() {
-                permit
-            } else {
-                match self.actions.clone().try_reserve_owned() {
-                    Ok(permit) => permit,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        metrics::counter!("sync.header.commit.action_queue_full").increment(1);
-                        metrics::counter!(
-                            "sync.header.fill.stop",
-                            "reason" => "action_queue_full"
-                        )
-                        .increment(1);
-                        self.arm_commit_capacity_waiter();
-                        return;
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        metrics::counter!(
-                            "sync.header.fill.stop",
-                            "reason" => "action_queue_closed"
-                        )
-                        .increment(1);
-                        return;
-                    }
-                }
+            let Some(permit) = self.take_buffered_action_permit(&mut reserved) else {
+                return;
             };
 
             let mut buffered = self
@@ -2101,6 +2231,26 @@ impl HeaderSyncReactor {
         }
     }
 
+    fn next_buffered_root_auth(
+        &self,
+    ) -> Option<((RangePriority, block::Height), HeaderRootAuthState)> {
+        if self
+            .state
+            .pending_operations
+            .keys()
+            .any(|operation| operation.op_kind == HeaderSyncOperationKind::AuthenticateRoots)
+        {
+            return None;
+        }
+        let auth = self.state.header_root_auth?;
+        let start = next_height(auth.authenticated_height)?;
+        let key = (RangePriority::AuthenticateRoots, start);
+        self.state
+            .buffered
+            .contains_key(&key)
+            .then_some((key, auth))
+    }
+
     fn next_buffered_commit(&self) -> Option<((RangePriority, block::Height), block::Hash)> {
         if let Some((&key, buffered)) = self
             .state
@@ -2140,13 +2290,17 @@ impl HeaderSyncReactor {
             .pending_operations
             .keys()
             .any(|operation| operation.op_kind == HeaderSyncOperationKind::AuthenticateRoots)
+            || self
+                .state
+                .schedule
+                .range_count(RangePriority::AuthenticateRoots)
+                > 0
         {
             return;
         }
         let Some(range) = reusable_root_auth_range(auth, &payload) else {
             return;
         };
-        self.state.schedule.clear_root_auth();
         self.start_root_authentication(wire_request, range, payload);
     }
 
@@ -2200,6 +2354,31 @@ impl HeaderSyncReactor {
                 let _ = permits.send(permit);
             }
         });
+    }
+
+    fn take_buffered_action_permit(
+        &mut self,
+        reserved: &mut Option<mpsc::OwnedPermit<HeaderSyncAction>>,
+    ) -> Option<mpsc::OwnedPermit<HeaderSyncAction>> {
+        if let Some(permit) = reserved.take() {
+            return Some(permit);
+        }
+
+        match self.actions.clone().try_reserve_owned() {
+            Ok(permit) => Some(permit),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                metrics::counter!("sync.header.commit.action_queue_full").increment(1);
+                metrics::counter!("sync.header.fill.stop", "reason" => "action_queue_full")
+                    .increment(1);
+                self.arm_commit_capacity_waiter();
+                None
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                metrics::counter!("sync.header.fill.stop", "reason" => "action_queue_closed")
+                    .increment(1);
+                None
+            }
+        }
     }
 
     fn validate_vct_repair_response(
@@ -2443,8 +2622,8 @@ impl HeaderSyncReactor {
             return;
         }
 
-        self.state.refresh_forward_range(&self.startup);
         self.state.refresh_root_auth_range(&self.startup);
+        self.state.refresh_forward_range(&self.startup);
 
         if self.schedule_vct_repair() {
             return;
@@ -2694,6 +2873,40 @@ impl HeaderSyncReactor {
         );
         metrics::gauge!("sync.header.work.last_progress_age_seconds")
             .set(self.state.last_header_progress_at.elapsed().as_secs_f64());
+
+        let auth_priority = RangePriority::AuthenticateRoots;
+        let auth_in_flight = self
+            .state
+            .schedule
+            .active_count_for(auth_priority, |state| {
+                matches!(state, HeaderWorkState::InFlight { .. })
+            });
+        let auth_buffered = self
+            .state
+            .schedule
+            .active_count_for(auth_priority, |state| {
+                matches!(state, HeaderWorkState::Buffered { .. })
+            });
+        let auth_committing = self
+            .state
+            .schedule
+            .active_count_for(auth_priority, |state| {
+                matches!(state, HeaderWorkState::Committing { .. })
+            });
+        metrics::gauge!("sync.header.root_auth.work.pending_batches")
+            .set(self.state.schedule.authenticate_roots.len() as f64);
+        metrics::gauge!("sync.header.root_auth.work.in_flight_batches").set(auth_in_flight as f64);
+        metrics::gauge!("sync.header.root_auth.work.buffered_batches").set(auth_buffered as f64);
+        metrics::gauge!("sync.header.root_auth.work.authenticating_batches")
+            .set(auth_committing as f64);
+        metrics::gauge!("sync.header.root_auth.work.resident_heights")
+            .set(self.state.schedule.resident_heights_for(auth_priority) as f64);
+        let auth_lead = self.state.header_root_auth.map_or(0, |auth| {
+            auth.authenticated_height
+                .0
+                .saturating_sub(self.state.verified_block_tip.0)
+        });
+        metrics::gauge!("sync.header.root_auth.lead_blocks").set(f64::from(auth_lead));
     }
 
     fn schedule_vct_repair(&mut self) -> bool {

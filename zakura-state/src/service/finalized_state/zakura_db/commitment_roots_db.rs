@@ -677,7 +677,12 @@ impl ZakuraDb {
             .load_header_root_auth_frontier()?
             .ok_or(HeaderRootAuthFrontierError::MissingFrontier)?;
         let current = frontier.state(completed_checkpoint);
-        if expected_state != current {
+        // Checkpoint coverage can advance independently while this request is in flight. That
+        // does not stale the authentication base: the current checkpoint is still used below
+        // to bound the witness, while only the durable root frontier is compare-and-swapped.
+        if expected_state.authenticated_height != current.authenticated_height
+            || expected_state.authenticated_hash != current.authenticated_hash
+        {
             return Err(AuthenticateHeaderRootsError::StaleState {
                 expected: expected_state,
                 current,
@@ -1671,28 +1676,6 @@ mod tests {
         ));
         assert_eq!(stale_error.outcome(), AuthenticateHeaderRootsOutcome::Stale);
 
-        let mut stale_checkpoint = current;
-        stale_checkpoint.completed_checkpoint_height = Height::MIN;
-        stale_checkpoint.completed_checkpoint_hash = db.network().genesis_hash();
-        let stale_checkpoint_error = db
-            .authenticate_header_roots(
-                completed,
-                stale_checkpoint,
-                current.authenticated_hash,
-                start,
-                &headers,
-                &supplied,
-            )
-            .expect_err("stale completed-checkpoint snapshot is rejected");
-        assert!(matches!(
-            &stale_checkpoint_error,
-            AuthenticateHeaderRootsError::StaleState { .. }
-        ));
-        assert_eq!(
-            stale_checkpoint_error.outcome(),
-            AuthenticateHeaderRootsOutcome::Stale
-        );
-
         let successor_height = Height(2);
         let mut wrong_successor = *successor.header;
         *wrong_successor.nonce = [0x77; 32];
@@ -1731,6 +1714,74 @@ mod tests {
         assert_eq!(result.authenticated, start..=start);
         assert_eq!(result.state.authenticated_height, start);
         assert_eq!(db.commitment_roots(start), Some(roots));
+    }
+
+    #[test]
+    fn checkpoint_progress_does_not_stale_an_unchanged_authentication_frontier() {
+        let (db, block, successor, current) = two_block_checkpoint_fixture();
+        let completed = HighestCompletedCheckpoint {
+            height: current.completed_checkpoint_height,
+            hash: current.completed_checkpoint_hash,
+        };
+        let mut expected = current;
+        expected.completed_checkpoint_height = Height::MIN;
+        expected.completed_checkpoint_hash = db.network().genesis_hash();
+        let roots = roots_from_block(&block);
+        let result = db
+            .authenticate_header_roots(
+                completed,
+                expected,
+                current.authenticated_hash,
+                Height(1),
+                &[block.header.clone(), successor.header.clone()],
+                &[roots.clone(), roots_from_block(&successor)],
+            )
+            .expect("new checkpoint coverage preserves the same authentication base");
+
+        assert_eq!(result.authenticated, Height(1)..=Height(1));
+        assert_eq!(result.state.authenticated_height, Height(1));
+        assert_eq!(db.commitment_roots(Height(1)), Some(roots));
+    }
+
+    #[test]
+    fn out_of_order_prefetched_range_changes_no_durable_state() {
+        let (db, block, successor, current) = two_block_checkpoint_fixture();
+        let completed = HighestCompletedCheckpoint {
+            height: current.completed_checkpoint_height,
+            hash: current.completed_checkpoint_hash,
+        };
+        let mut first = roots_from_block(&block);
+        first.height = Height(2);
+        let mut second = roots_from_block(&successor);
+        second.height = Height(3);
+
+        let error = db
+            .authenticate_header_roots(
+                completed,
+                current,
+                current.authenticated_hash,
+                Height(2),
+                &[block.header.clone(), successor.header.clone()],
+                &[first, second],
+            )
+            .expect_err("a prefetched range cannot leapfrog the durable frontier");
+
+        assert!(matches!(
+            error,
+            AuthenticateHeaderRootsError::StartMismatch {
+                expected: Height(1),
+                actual: Height(2),
+            }
+        ));
+        assert_eq!(db.commitment_roots(Height(1)), None);
+        assert_eq!(db.commitment_roots(Height(2)), None);
+        assert_eq!(
+            db.validate_header_root_auth_state()
+                .expect("rejected prefetch leaves coherent state")
+                .expect("frontier exists")
+                .state(completed),
+            current
+        );
     }
 
     #[test]

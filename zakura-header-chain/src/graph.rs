@@ -205,9 +205,12 @@ impl MemHeaderStore {
             })?;
         let inherited_from = (!parent.is_eligible()).then_some(parent_hash);
         let direct_reasons: BTreeSet<EligibilityReason> = direct_reasons.into_iter().collect();
-        let body_reason = match body {
+        let body_reason = match &body {
             BodyValidationState::ConsensusInvalid { evidence, rule } => {
-                Some(EligibilityReason::ConsensusBodyInvalid { evidence, rule })
+                Some(EligibilityReason::ConsensusBodyInvalid {
+                    evidence: *evidence,
+                    rule: rule.clone(),
+                })
             }
             _ => None,
         };
@@ -215,7 +218,9 @@ impl MemHeaderStore {
             .iter()
             .filter(|reason| matches!(reason, EligibilityReason::ConsensusBodyInvalid { .. }))
             .count();
-        if body_reason.is_some_and(|reason| !direct_reasons.contains(&reason))
+        if body_reason
+            .as_ref()
+            .is_some_and(|reason| !direct_reasons.contains(reason))
             || (body_reason.is_none() && recorded_body_reasons != 0)
             || recorded_body_reasons > 1
         {
@@ -295,7 +300,10 @@ impl MemHeaderStore {
             .nodes
             .get_mut(&hash)
             .ok_or(GraphError::UnknownNode(hash))?;
-        let body = BodyValidationState::ConsensusInvalid { evidence, rule };
+        let body = BodyValidationState::ConsensusInvalid {
+            evidence,
+            rule: rule.clone(),
+        };
         let reason = EligibilityReason::ConsensusBodyInvalid { evidence, rule };
         if node.eligibility.direct_reasons.iter().any(|existing| {
             matches!(existing, EligibilityReason::ConsensusBodyInvalid { .. })
@@ -975,7 +983,9 @@ mod tests {
                     }
                     1 => {
                         if target_hash != model.anchor {
-                            store.add_reason(target_hash, reason).expect("target is retained");
+                            store
+                                .add_reason(target_hash, reason.clone())
+                                .expect("target is retained");
                             model.nodes.get_mut(&target_hash).expect("target exists").direct_reasons.insert(reason);
                         }
                     }

@@ -47,7 +47,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-DAG-01"
 name = "Durable node record"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::service::finalized_state::disk_format::header_chain_values::HeaderNodeDisk"
+tests = ["DG-01::node_round_trip_contains_all_normative_fields"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-DAG-02"

@@ -10,13 +10,15 @@ use zakura_chain::{
     block,
     parameters::NetworkKind,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
-    work::difficulty::{CompactDifficulty, U256},
+    work::difficulty::U256,
 };
 use zakura_header_chain::{
-    AlarmSet, AuxAuthentication, AuxDelivery, BodySizeHint, BodyUnavailableSummary, BranchId,
-    ChainScore, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch, FinalityRecord,
-    FinalitySource, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderContextFact,
-    HeaderGeneration, SourceId, StateVersion, SuffixWork, VerifiedGeneration, WorkOwner,
+    AlarmSet, AuxAuthentication, AuxDelivery, BodyRuleId, BodySizeHint, BodyUnavailableSummary,
+    BodyValidationState, BranchId, ChainScore, EligibilityReason, EligibilityState, EngineMetadata,
+    EngineMode, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
+    HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode, HeaderValidationState,
+    OperatorInvalidationId, SourceId, StateVersion, SuffixWork, VerifiedGeneration, WorkCoordinate,
+    WorkOwner,
 };
 
 const MAX_HEADER_BYTES: usize = 2 * 1024;
@@ -239,6 +241,50 @@ pub enum HeaderEligibilityReasonDisk {
     Operator([u8; 16]),
 }
 
+impl HeaderEligibilityReasonDisk {
+    /// Convert one direct domain reason into its stable disk value.
+    pub fn from_domain(reason: &EligibilityReason) -> Self {
+        match reason {
+            EligibilityReason::SettledUpgradeConflict { height, expected } => {
+                Self::SettledUpgrade {
+                    height: *height,
+                    expected: *expected,
+                }
+            }
+            EligibilityReason::CheckpointConflict { height, expected } => Self::LocalCheckpoint {
+                height: *height,
+                expected: *expected,
+            },
+            EligibilityReason::FinalityConflict { finalized } => Self::Finality(*finalized),
+            EligibilityReason::ConsensusBodyInvalid { evidence, rule } => Self::ConsensusBody {
+                evidence: *evidence,
+                rule: rule.as_str().to_owned(),
+            },
+            EligibilityReason::OperatorInvalid { id } => Self::Operator(id.bytes()),
+        }
+    }
+
+    /// Convert one decoded disk reason into its domain representation.
+    pub fn into_domain(self) -> EligibilityReason {
+        match self {
+            Self::SettledUpgrade { height, expected } => {
+                EligibilityReason::SettledUpgradeConflict { height, expected }
+            }
+            Self::LocalCheckpoint { height, expected } => {
+                EligibilityReason::CheckpointConflict { height, expected }
+            }
+            Self::Finality(finalized) => EligibilityReason::FinalityConflict { finalized },
+            Self::ConsensusBody { evidence, rule } => EligibilityReason::ConsensusBodyInvalid {
+                evidence,
+                rule: BodyRuleId::new(rule),
+            },
+            Self::Operator(bytes) => EligibilityReason::OperatorInvalid {
+                id: OperatorInvalidationId::new(bytes),
+            },
+        }
+    }
+}
+
 impl HeaderChainValue for HeaderEligibilityReasonDisk {
     fn encode(&self) -> Result<Vec<u8>, HeaderChainValueError> {
         let mut encoder = Encoder::default();
@@ -342,6 +388,84 @@ pub struct HeaderNodeDisk {
     pub body: HeaderBodyStateDisk,
     /// Bounded hash-keyed auxiliary delivery IDs.
     pub aux_delivery_ids: Vec<EvidenceId>,
+}
+
+impl HeaderNodeDisk {
+    /// Convert one domain node into its version-one durable representation.
+    pub fn from_domain(node: &HeaderNode) -> Self {
+        let body = match &node.body {
+            BodyValidationState::Unknown => HeaderBodyStateDisk::Unknown,
+            BodyValidationState::CommitmentMatched => HeaderBodyStateDisk::CommitmentMatched,
+            BodyValidationState::Verified { evidence } => HeaderBodyStateDisk::Verified(*evidence),
+            BodyValidationState::ConsensusInvalid { evidence, rule } => {
+                HeaderBodyStateDisk::ConsensusInvalid {
+                    evidence: *evidence,
+                    rule: rule.as_str().to_owned(),
+                }
+            }
+            BodyValidationState::Unavailable(summary) => HeaderBodyStateDisk::Unavailable(*summary),
+        };
+        Self {
+            header: node.header.clone(),
+            hash: node.hash,
+            parent_hash: node.parent_hash,
+            height: node.height,
+            block_work: node.block_work.as_u256(),
+            work_origin: node.work_coordinate().origin_hash(),
+            cumulative_work: node.work_coordinate().cumulative_work(),
+            deferred_until: match node.validation {
+                HeaderValidationState::Valid => None,
+                HeaderValidationState::DeferredUntil(until) => Some(until),
+            },
+            inherited_from: node.eligibility.inherited_from,
+            body,
+            aux_delivery_ids: node.aux_delivery_ids.clone(),
+        }
+    }
+
+    /// Reconstruct one domain node after its direct-reason rows were decoded.
+    pub fn into_domain(
+        self,
+        direct_reasons: impl IntoIterator<Item = EligibilityReason>,
+    ) -> Result<HeaderNode, HeaderChainValueError> {
+        let block_work = self
+            .header
+            .difficulty_threshold
+            .to_work()
+            .filter(|work| work.as_u256() == self.block_work)
+            .ok_or(HeaderChainValueError::Header)?;
+        let body = match self.body {
+            HeaderBodyStateDisk::Unknown => BodyValidationState::Unknown,
+            HeaderBodyStateDisk::CommitmentMatched => BodyValidationState::CommitmentMatched,
+            HeaderBodyStateDisk::Verified(evidence) => BodyValidationState::Verified { evidence },
+            HeaderBodyStateDisk::ConsensusInvalid { evidence, rule } => {
+                BodyValidationState::ConsensusInvalid {
+                    evidence,
+                    rule: BodyRuleId::new(rule),
+                }
+            }
+            HeaderBodyStateDisk::Unavailable(summary) => BodyValidationState::Unavailable(summary),
+        };
+        HeaderNode::from_durable_parts(
+            self.header,
+            self.hash,
+            self.parent_hash,
+            self.height,
+            block_work,
+            WorkCoordinate::new(self.work_origin, self.cumulative_work),
+            self.deferred_until.map_or(
+                HeaderValidationState::Valid,
+                HeaderValidationState::DeferredUntil,
+            ),
+            EligibilityState {
+                direct_reasons: direct_reasons.into_iter().collect(),
+                inherited_from: self.inherited_from,
+            },
+            body,
+            self.aux_delivery_ids,
+        )
+        .map_err(|_| HeaderChainValueError::Header)
+    }
 }
 
 impl HeaderChainValue for HeaderNodeDisk {
@@ -666,30 +790,50 @@ impl HeaderChainValue for HeaderFinalityRecordDisk {
     }
 }
 
-/// Immutable validation-context fact value.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct HeaderValidationContextDisk(pub HeaderContextFact);
+/// Immutable canonical predecessor below the selectable finalized anchor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderValidationContextDisk {
+    /// Canonical context header, including its backward link.
+    pub header: Arc<block::Header>,
+    /// Locally authenticated height of this context header.
+    pub height: block::Height,
+}
+
+impl HeaderValidationContextDisk {
+    /// Return the contextual validation fact authenticated by this row.
+    pub fn fact(&self) -> HeaderContextFact {
+        HeaderContextFact {
+            frontier: Frontier::new(self.height, self.header.hash()),
+            difficulty_threshold: self.header.difficulty_threshold,
+            time: self.header.time,
+        }
+    }
+}
 
 impl HeaderChainValue for HeaderValidationContextDisk {
     fn encode(&self) -> Result<Vec<u8>, HeaderChainValueError> {
         let mut encoder = Encoder::default();
-        put_frontier(&mut encoder, self.0.frontier);
-        encoder.fixed(&self.0.difficulty_threshold.to_le_bytes());
-        put_time(&mut encoder, self.0.time);
+        let header = self
+            .header
+            .zcash_serialize_to_vec()
+            .map_err(|_| HeaderChainValueError::Header)?;
+        encoder.bounded("context_header", &header, MAX_HEADER_BYTES)?;
+        encoder.u32(self.height.0);
         Ok(encoder.0)
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, HeaderChainValueError> {
         let mut decoder = Decoder::new(bytes);
-        let frontier = get_frontier(&mut decoder)?;
-        let difficulty_threshold = CompactDifficulty::from_le_bytes(decoder.array()?);
-        let time = get_time(&mut decoder)?;
+        let header: block::Header = decoder
+            .bounded("context_header", MAX_HEADER_BYTES)?
+            .zcash_deserialize_into()
+            .map_err(|_| HeaderChainValueError::Header)?;
+        let height = block::Height(decoder.u32()?);
         decoder.finish()?;
-        Ok(Self(HeaderContextFact {
-            frontier,
-            difficulty_threshold,
-            time,
-        }))
+        Ok(Self {
+            header: Arc::new(header),
+            height,
+        })
     }
 }
 
@@ -836,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn node_reason_and_context_values_have_stable_golden_prefixes_and_round_trip() {
+    fn node_round_trip_contains_all_normative_fields() {
         let block = regtest_genesis_block();
         let node = HeaderNodeDisk {
             header: block.header.clone(),
@@ -890,14 +1034,13 @@ mod tests {
             Ok(reason)
         );
 
-        let context = HeaderValidationContextDisk(HeaderContextFact {
-            frontier: frontier(7, 7),
-            difficulty_threshold: block.header.difficulty_threshold,
-            time: block.header.time,
-        });
+        let context = HeaderValidationContextDisk {
+            header: block.header.clone(),
+            height: block::Height(7),
+        };
         assert_eq!(
             HeaderValidationContextDisk::decode(&context.encode().expect("context encodes")),
-            Ok(context)
+            Ok(context.clone())
         );
         assert_eq!(
             [
@@ -908,7 +1051,7 @@ mod tests {
             [
                 "c7e3448aa1cabc72e6ed1bff3de3a65183f4906f8fab9b052c12b0805710a266",
                 "095c753ad1f2a99c1a29f14db8f4e36c528c159c7e436957ac0f18a46dde7049",
-                "607ca73c15bc28edc414783bd87e2debd745650a942849c5665d3faab91323b1",
+                "dcb21b5799e73e2ca54fd1448f50dd56d5d7994cb173e5279d28942350534863",
             ]
         );
     }

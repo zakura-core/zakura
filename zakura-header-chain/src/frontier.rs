@@ -121,6 +121,11 @@ impl WorkCoordinate {
         self.origin_hash
     }
 
+    /// Return the exact cumulative work from the immutable origin.
+    pub const fn cumulative_work(self) -> U256 {
+        self.cumulative
+    }
+
     /// Add one block's exact work, failing closed on overflow.
     pub fn checked_add(self, work: Work) -> Result<Self, WorkCoordinateError> {
         let cumulative = self

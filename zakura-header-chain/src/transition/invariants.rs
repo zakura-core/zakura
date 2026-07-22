@@ -122,6 +122,7 @@ pub fn verify_plan<S: StoreRead>(
         verify_node(graph, node, metadata.work_origin.hash)?;
     }
     verify_indexes(before, plan)?;
+    verify_candidates(plan)?;
     let selected = projected_path(before, &source, &plan.change_set.selected_projection, true)?;
     let verified = projected_path(before, &source, &plan.change_set.verified_projection, false)?;
     verify_projection(
@@ -151,6 +152,25 @@ pub fn verify_plan<S: StoreRead>(
     }
     verify_generations(plan, &selected, &verified)?;
     verify_aux(before, plan)?;
+    Ok(())
+}
+
+fn verify_candidates(plan: &TransitionPlan) -> Result<(), InvariantViolation> {
+    let mut expected: Vec<_> = plan
+        .projected()
+        .eligible_tips()
+        .into_iter()
+        .map(|tip| {
+            plan.projected()
+                .score(tip.hash)
+                .map(|score| (score, tip.hash))
+                .map_err(|_| InvariantViolation::Selection)
+        })
+        .collect::<Result<_, _>>()?;
+    expected.sort_unstable_by_key(|(score, hash)| (*score, hash.0));
+    if plan.change_set.candidate_tips != expected {
+        return Err(InvariantViolation::Selection);
+    }
     Ok(())
 }
 
@@ -311,7 +331,7 @@ fn verify_verified(
     if mode == EngineMode::Integrated {
         for frontier in projection.iter().skip(1) {
             if !matches!(
-                graph.node(frontier.hash).map(|node| node.body),
+                graph.node(frontier.hash).map(|node| node.body.clone()),
                 Some(BodyValidationState::Verified { .. })
             ) {
                 return Err(InvariantViolation::VerifiedProjection(frontier.hash));

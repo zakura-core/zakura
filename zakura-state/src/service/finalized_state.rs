@@ -81,6 +81,7 @@ pub(crate) mod commitment_aux;
 pub(crate) mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
+mod header_chain;
 mod vct;
 mod zakura_db;
 

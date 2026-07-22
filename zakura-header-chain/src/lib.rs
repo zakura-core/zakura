@@ -28,8 +28,8 @@ pub use ids::{
     OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration, WorkOwner,
 };
 pub use node::{
-    BodyRuleId, BodyUnavailableSummary, BodyValidationState, EligibilityReason, EligibilityState,
-    HeaderNode, HeaderValidationState,
+    BodyRuleId, BodyUnavailableSummary, BodyValidationState, DurableNodeError, EligibilityReason,
+    EligibilityState, HeaderNode, HeaderValidationState,
 };
 pub use retention::RetentionPlan;
 pub use transition::*;

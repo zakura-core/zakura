@@ -3,6 +3,7 @@
 use std::{num::NonZeroU32, sync::Arc};
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zakura_chain::{block, parameters::NetworkKind, work::difficulty::Work};
 
@@ -80,6 +81,22 @@ pub struct EngineMetadata {
     pub last_transition_id: EvidenceId,
 }
 
+impl EngineMetadata {
+    /// Project the authoritative metadata row into its externally visible snapshot.
+    pub fn snapshot(&self) -> EngineSnapshot {
+        EngineSnapshot {
+            mode: self.mode,
+            state_version: self.state_version,
+            header_generation: self.header_generation,
+            verified_generation: self.verified_generation,
+            frontiers: self.frontiers,
+            header_best_score: self.header_best_score,
+            oldest_retained_height: self.oldest_retained_height,
+            alarms: self.alarms.clone(),
+        }
+    }
+}
+
 /// One immutable predecessor fact sealed into a validation lease.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct HeaderContextFact {
@@ -102,6 +119,34 @@ pub struct ValidationLease {
     pub trust_anchor_digest: [u8; 32],
     /// Digest binding the complete lease contents.
     pub context_digest: [u8; 32],
+}
+
+impl ValidationLease {
+    /// Construct a lease digest bound to its exact ordered durable context.
+    pub fn new(
+        parent: Frontier,
+        predecessors: Vec<HeaderContextFact>,
+        trust_anchor_digest: [u8; 32],
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-header-chain-validation-lease-v1");
+        hasher.update(parent.height.0.to_le_bytes());
+        hasher.update(parent.hash.0);
+        hasher.update(trust_anchor_digest);
+        for fact in &predecessors {
+            hasher.update(fact.frontier.height.0.to_le_bytes());
+            hasher.update(fact.frontier.hash.0);
+            hasher.update(fact.difficulty_threshold.to_le_bytes());
+            hasher.update(fact.time.timestamp().to_le_bytes());
+            hasher.update(fact.time.timestamp_subsec_nanos().to_le_bytes());
+        }
+        Self {
+            parent,
+            predecessors,
+            trust_anchor_digest,
+            context_digest: hasher.finalize().into(),
+        }
+    }
 }
 
 /// One fully prepared observable-header result.
@@ -320,7 +365,7 @@ pub struct BodyPayloadMismatch {
 }
 
 /// Commitment-matching deterministic body consensus failure.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConsensusBodyInvalid {
     /// Exact affected header.
     pub hash: block::Hash,
@@ -370,7 +415,7 @@ pub struct VerifiedBodyEvidence {
 }
 
 /// Exhaustive body-result categories with intentionally distinct effects.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BodyEvidence {
     /// Bad delivery only.
     PayloadMismatch(BodyPayloadMismatch),
@@ -620,6 +665,8 @@ pub struct ChangeSet {
     pub delete_nodes: Vec<block::Hash>,
     /// Reconstructible indexes changed with the nodes.
     pub index_changes: IndexChanges,
+    /// Complete deterministic candidate-tip index after this transition.
+    pub candidate_tips: Vec<(ChainScore, block::Hash)>,
     /// Selected-header height projection change.
     pub selected_projection: ProjectionDelta,
     /// Full-state verified height projection change.

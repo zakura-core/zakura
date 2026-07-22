@@ -1166,6 +1166,43 @@ impl DiskDb {
         self.db.cf_handle(cf_name)
     }
 
+    /// Read raw bytes from one column family without panicking on RocksDB failure.
+    pub(crate) fn raw_get_cf<C>(
+        &self,
+        cf: &C,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        self.db.get_cf(cf, key)
+    }
+
+    /// Collect a raw half-open key range without panicking on iterator failure.
+    pub(crate) fn raw_range_cf<C>(
+        &self,
+        cf: &C,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        let mut options = ReadOptions::default();
+        options.set_iterate_lower_bound(lower.to_vec());
+        if let Some(upper) = upper {
+            options.set_iterate_upper_bound(upper.to_vec());
+        }
+        self.db
+            .iterator_cf_opt(
+                cf,
+                options,
+                rocksdb::IteratorMode::From(lower, rocksdb::Direction::Forward),
+            )
+            .map(|result| result.map(|(key, value)| (key.to_vec(), value.to_vec())))
+            .collect()
+    }
+
     // Read methods are located in the ReadDisk trait
 
     // Write methods

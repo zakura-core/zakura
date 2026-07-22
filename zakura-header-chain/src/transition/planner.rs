@@ -46,6 +46,41 @@ impl TransitionPlan {
         self.before.state_version == self.change_set.metadata.state_version
     }
 
+    /// Consume a successfully committed plan and create its ordered receipt.
+    pub fn into_committed_receipt(self, durable_tx_id: u64) -> crate::CommittedTransition {
+        let current = self.change_set.metadata.snapshot();
+        let inserted = self
+            .change_set
+            .index_changes
+            .inserted
+            .iter()
+            .map(|frontier| frontier.hash)
+            .collect();
+        let eligibility_changed = self
+            .change_set
+            .eligibility_changes
+            .iter()
+            .map(|delta| delta.hash)
+            .collect();
+        let evicted = self.change_set.delete_nodes.clone();
+        crate::CommittedTransition {
+            previous: self.before.clone(),
+            current,
+            cause: self.cause,
+            inserted,
+            eligibility_changed,
+            evicted,
+            retired_work: crate::RetiredWork {
+                header_generation_changed: self.before.header_generation
+                    != self.change_set.metadata.header_generation,
+                verified_generation_changed: self.before.verified_generation
+                    != self.change_set.metadata.verified_generation,
+                owners: Vec::new(),
+            },
+            durable_tx_id,
+        }
+    }
+
     pub(crate) const fn projected(&self) -> &MemHeaderStore {
         &self.projected
     }
@@ -446,7 +481,8 @@ fn apply_event<S: StoreRead>(
             let previous = graph
                 .node(event.hash)
                 .ok_or(GraphError::UnknownNode(event.hash))?
-                .body;
+                .body
+                .clone();
             let summary = match previous {
                 BodyValidationState::Unavailable(summary) => BodyUnavailableSummary {
                     attempts: summary.attempts.saturating_add(1),
@@ -460,7 +496,7 @@ fn apply_event<S: StoreRead>(
             graph.set_body_state(event.hash, BodyValidationState::Unavailable(summary))?;
         }
         TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(event)) => {
-            graph.set_consensus_body_invalid(event.hash, event.evidence, event.rule)?;
+            graph.set_consensus_body_invalid(event.hash, event.evidence, event.rule.clone())?;
         }
         TransitionEvent::BodyEvidence(BodyEvidence::Verified(event)) => {
             graph.set_body_state(
@@ -663,6 +699,12 @@ fn derive_plan(
         .filter(|node| !old_nodes.contains_key(&node.hash))
         .map(|node| Frontier::new(node.height, node.hash))
         .collect();
+    let mut candidate_tips: Vec<_> = graph
+        .eligible_tips()
+        .into_iter()
+        .map(|tip| graph.score(tip.hash).map(|score| (score, tip.hash)))
+        .collect::<Result<_, _>>()?;
+    candidate_tips.sort_unstable_by_key(|(score, hash)| (*score, hash.0));
     let change_set = ChangeSet {
         put_nodes,
         delete_nodes: delete_nodes.clone(),
@@ -670,6 +712,7 @@ fn derive_plan(
             inserted,
             deleted: delete_nodes,
         },
+        candidate_tips,
         selected_projection: projection_delta(&old_selected, &selected),
         verified_projection: projection_delta(&old_verified, &verified),
         eligibility_changes,
@@ -702,6 +745,7 @@ fn no_change<S: StoreRead>(
             put_nodes: Vec::new(),
             delete_nodes: Vec::new(),
             index_changes: IndexChanges::default(),
+            candidate_tips: store.candidate_tips()?,
             selected_projection: ProjectionDelta::default(),
             verified_projection: ProjectionDelta::default(),
             eligibility_changes: Vec::new(),

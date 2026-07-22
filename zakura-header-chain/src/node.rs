@@ -3,23 +3,24 @@
 use std::{cmp::Ordering, collections::BTreeSet, sync::Arc};
 
 use chrono::{DateTime, Utc};
+use thiserror::Error;
 use zakura_chain::{block, work::difficulty::Work};
 
 use crate::{EvidenceId, Frontier, OperatorInvalidationId, WorkCoordinate};
 
 /// Stable full-state consensus rule identity attached to body evidence.
-#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct BodyRuleId(&'static str);
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BodyRuleId(Arc<str>);
 
 impl BodyRuleId {
     /// Construct a stable body-rule identity.
-    pub const fn new(id: &'static str) -> Self {
-        Self(id)
+    pub fn new(id: impl Into<Arc<str>>) -> Self {
+        Self(id.into())
     }
 
     /// Return the stable identifier.
-    pub const fn as_str(self) -> &'static str {
-        self.0
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -33,7 +34,7 @@ pub enum HeaderValidationState {
 }
 
 /// One durable reason that a header cannot participate in selection.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EligibilityReason {
     /// Header conflicts with a compiled settled-upgrade pin.
     SettledUpgradeConflict {
@@ -135,7 +136,7 @@ impl PartialOrd for EligibilityReason {
 
 impl EligibilityReason {
     /// Return true when resource retention may discard this permanently invalid subtree first.
-    pub fn is_permanent(self) -> bool {
+    pub fn is_permanent(&self) -> bool {
         !matches!(self, Self::OperatorInvalid { .. })
     }
 }
@@ -166,7 +167,7 @@ impl EligibilityState {
 }
 
 /// Full-state knowledge about a header's corresponding block body.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum BodyValidationState {
     /// No body conclusion is known.
     #[default]
@@ -231,7 +232,58 @@ impl HeaderNode {
     }
 
     /// Return this node's checked cumulative work coordinate.
-    pub(crate) const fn work_coordinate(&self) -> WorkCoordinate {
+    pub const fn work_coordinate(&self) -> WorkCoordinate {
         self.work_coordinate
     }
+
+    /// Reconstruct one node from audited durable fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_durable_parts(
+        header: Arc<block::Header>,
+        hash: block::Hash,
+        parent_hash: block::Hash,
+        height: block::Height,
+        block_work: Work,
+        work_coordinate: WorkCoordinate,
+        validation: HeaderValidationState,
+        eligibility: EligibilityState,
+        body: BodyValidationState,
+        aux_delivery_ids: Vec<EvidenceId>,
+    ) -> Result<Self, DurableNodeError> {
+        if header.hash() != hash {
+            return Err(DurableNodeError::Hash);
+        }
+        if header.previous_block_hash != parent_hash {
+            return Err(DurableNodeError::Parent);
+        }
+        if header.difficulty_threshold.to_work() != Some(block_work) {
+            return Err(DurableNodeError::Work);
+        }
+        Ok(Self {
+            header,
+            hash,
+            parent_hash,
+            height,
+            block_work,
+            work_coordinate,
+            validation,
+            eligibility,
+            body,
+            aux_delivery_ids,
+        })
+    }
+}
+
+/// A durable node row contradicted its canonical header fields.
+#[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
+pub enum DurableNodeError {
+    /// The stored hash did not match the canonical header.
+    #[error("durable header hash mismatch")]
+    Hash,
+    /// The stored parent did not match the canonical header link.
+    #[error("durable header parent mismatch")]
+    Parent,
+    /// The stored per-block work did not match the compact target.
+    #[error("durable header work mismatch")]
+    Work,
 }

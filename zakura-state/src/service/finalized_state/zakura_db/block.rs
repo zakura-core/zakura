@@ -60,9 +60,12 @@ mod startup_audit;
 #[cfg(test)]
 mod tests;
 
-const ZAKURA_HEADER_HASH_BY_HEIGHT: &str = "zakura_header_hash_by_height";
-const ZAKURA_HEADER_HEIGHT_BY_HASH: &str = "zakura_header_height_by_hash";
-const ZAKURA_HEADER_BY_HEIGHT: &str = "zakura_header_by_height";
+pub(in crate::service::finalized_state) const ZAKURA_HEADER_HASH_BY_HEIGHT: &str =
+    "zakura_header_hash_by_height";
+pub(in crate::service::finalized_state) const ZAKURA_HEADER_HEIGHT_BY_HASH: &str =
+    "zakura_header_height_by_hash";
+pub(in crate::service::finalized_state) const ZAKURA_HEADER_BY_HEIGHT: &str =
+    "zakura_header_by_height";
 pub const ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT: &str = "zakura_header_body_size_by_height";
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -676,7 +679,10 @@ impl ZakuraDb {
             .or_else(|| self.zakura_header_height(hash))
     }
 
-    fn header_by_height(&self, height: block::Height) -> Option<(block::Hash, Arc<block::Header>)> {
+    pub(in crate::service::finalized_state) fn header_by_height(
+        &self,
+        height: block::Height,
+    ) -> Option<(block::Hash, Arc<block::Header>)> {
         if let Some(hash) = self.hash(height) {
             return self
                 .block_header(height.into())

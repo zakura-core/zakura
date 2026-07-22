@@ -43,6 +43,8 @@ use super::{
 
 const METADATA_KEY: &[u8] = b"";
 
+pub(in crate::service) mod migration;
+
 /// Failure at the durable header-chain boundary.
 #[derive(Debug, Error)]
 pub enum HeaderChainStoreError {

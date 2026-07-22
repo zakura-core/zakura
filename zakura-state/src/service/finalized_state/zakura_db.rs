@@ -124,6 +124,11 @@ impl DbOpenMode {
 }
 
 impl ZakuraDb {
+    /// Clone the shared low-level database for the atomic header-chain migration.
+    pub(in crate::service::finalized_state) fn header_chain_disk_db(&self) -> DiskDb {
+        self.db.clone()
+    }
+
     /// Opens or creates the database at a path based on the kind, major version and network,
     /// with the supplied column families, preserving any existing column families,
     /// and returns a shared high-level typed database wrapper.

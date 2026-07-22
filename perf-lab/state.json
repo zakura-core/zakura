@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "session": 1,
-  "batch_runs_used": 1,
+  "batch_runs_used": 2,
   "next_exp_id": 3,
   "droplets": {
     "perf-lab-serve-a": {
@@ -23,10 +23,10 @@
     }
   },
   "in_flight": {
-    "exp002-base": {
+    "regcheck-1": {
       "droplet": "perf-lab-s2",
-      "exp": "EXP-002 request-shape baseline (knob=1 default)",
-      "started_at": "2026-07-22T20:05:00Z"
+      "exp": "mainline regression check 63b8d4dc->30b0c63d",
+      "started_at": "2026-07-22T20:38:00Z"
     }
   },
   "noise_band_pct": 7.6

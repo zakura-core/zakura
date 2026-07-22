@@ -252,3 +252,12 @@ This file is the sole reporting channel (design D5). Entry template:
   2 of 3 samples show exact-zero noise).
 - standing cost: ~$1/h serve pair (reaper-exempt) + bench droplet while
   active.
+
+### exp002-base anomaly (2026-07-22)
+
+- legs 105.26 pc (full window, 1163s) / 18.70 pc (wall-capped at 37k of
+  120k) on SHA 30b0c63d — coverage guard refused the comparison. All droplet
+  health checks clean (disk/mem/serve nodes). Both legs sit far below the
+  63b8d4dc-era ~180-190 norm → suspicion shifts to the code: regcheck-1
+  (30b0c63d vs 63b8d4dc, within-run on the cohort) separates code from
+  environment. EXP-002 paused pending its verdict.

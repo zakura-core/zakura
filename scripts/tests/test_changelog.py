@@ -82,8 +82,13 @@ class ChangelogTests(unittest.TestCase):
             changelog,
             "run_git",
             return_value="changelog-unreleased/123.md\n",
-        ):
+        ) as run_git:
             changelog.check_pull_request(self.root, "base", "head", "123", False, False)
+
+        run_git.assert_called_once_with(
+            self.root,
+            ["diff", "--name-only", "base...head"],
+        )
 
     def test_pull_request_cannot_delete_another_fragment(self):
         path = self.root / "changelog-unreleased" / "123.md"

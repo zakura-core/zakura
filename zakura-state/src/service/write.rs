@@ -77,10 +77,10 @@ pub enum VctRootRepairState {
     },
 }
 
-/// The maximum size of the parent error map.
+/// The maximum size of the rejected ancestor map.
 ///
 /// We allow enough space for multiple concurrent chain forks with errors.
-const PARENT_ERROR_MAP_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
+const REJECTED_ANCESTOR_MAP_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
 
 /// Run contextual validation on the prepared block and add it to the
 /// non-finalized state if it is contextually valid.
@@ -571,8 +571,9 @@ impl WriteBlockWorkerTask {
             return;
         }
 
-        // Save any errors to propagate down to queued child blocks
-        let mut parent_error_map: IndexMap<block::Hash, ValidateContextError> = IndexMap::new();
+        // Track rejected ancestors so queued descendants can be rejected without
+        // attributing the ancestor's validation failure to the descendant's peer.
+        let mut rejected_ancestor_map: IndexMap<block::Hash, block::Hash> = IndexMap::new();
 
         while let Some(msg) = deferred_non_finalized_messages
             .pop_front()
@@ -624,15 +625,15 @@ impl WriteBlockWorkerTask {
             let parent_hash = queued_child.block.header.previous_block_hash;
             let child_height = queued_child.height;
             let child_block = queued_child.block.clone();
-            let parent_error = parent_error_map.get(&parent_hash);
+            let rejected_ancestor_hash = rejected_ancestor_map.get(&parent_hash).copied();
 
             // If the parent block was marked as rejected, also reject all its children.
             //
             // At this point, we know that all the block's descendants
             // are invalid, because we checked all the consensus rules before
             // committing the failing ancestor block to the non-finalized state.
-            let result = if let Some(parent_error) = parent_error {
-                Err(parent_error.clone())
+            let result = if let Some(ancestor_hash) = rejected_ancestor_hash {
+                Err(ValidateContextError::InvalidAncestorBlock(ancestor_hash))
             } else {
                 tracing::trace!(?child_hash, "validating queued child");
                 validate_and_commit_non_finalized(
@@ -646,14 +647,15 @@ impl WriteBlockWorkerTask {
             //       after `update_latest_chain_channels()`,
             //       and send the result on rsp_tx here
 
-            if let Err(ref error) = result {
+            if result.is_err() {
                 // If the block is invalid, mark any descendant blocks as rejected.
-                parent_error_map.insert(child_hash, error.clone());
+                rejected_ancestor_map
+                    .insert(child_hash, rejected_ancestor_hash.unwrap_or(child_hash));
 
-                // Make sure the error map doesn't get too big.
-                if parent_error_map.len() > PARENT_ERROR_MAP_LIMIT {
+                // Make sure the rejected ancestor map doesn't get too big.
+                if rejected_ancestor_map.len() > REJECTED_ANCESTOR_MAP_LIMIT {
                     // We only add one hash at a time, so we only need to remove one extra here.
-                    parent_error_map.shift_remove_index(0);
+                    rejected_ancestor_map.shift_remove_index(0);
                 }
 
                 // Signal the StateService to drop this hash from
@@ -676,7 +678,7 @@ impl WriteBlockWorkerTask {
 
             // A successfully committed block supersedes any contextual error
             // recorded for a different block body with the same header hash.
-            parent_error_map.shift_remove(&child_hash);
+            rejected_ancestor_map.shift_remove(&child_hash);
 
             if should_seed_zakura_header_from_non_finalized_commit(
                 *seed_zakura_header_from_best_chain_commits,

@@ -1323,6 +1323,77 @@ async fn should_restart_sync_returns_false() {
     );
 }
 
+/// A queued descendant inherits only an unscored invalid-ancestor failure, so
+/// its advertiser is not blamed for the invalid block served by another peer.
+#[test]
+fn invalid_ancestor_does_not_score_descendant_advertiser() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        _peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(2);
+    chain_sync.misbehavior_sender = misbehavior_tx;
+
+    let parent_advertiser: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let child_advertiser: PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
+    let parent_hash = block::Hash([0xA1; 32]);
+    let child_hash = block::Hash([0xB2; 32]);
+
+    let parent_error = zs::CommitBlockError::ValidateContextError(Box::new(
+        zs::ValidateContextError::InvalidBlockCommitment(
+            zakura_chain::block::CommitmentError::InvalidChainHistoryActivationReserved {
+                actual: [1; 32],
+            },
+        ),
+    ));
+    let parent_error = RouterError::Block {
+        source: Box::new(VerifyBlockError::Commit(parent_error)),
+    };
+    let parent_response = BlockDownloadVerifyError::Invalid {
+        error: parent_error,
+        height: Height(42),
+        hash: parent_hash,
+        advertiser_addr: Some(parent_advertiser),
+    };
+
+    assert!(chain_sync
+        .handle_block_response(Err(parent_response))
+        .is_err());
+    assert_eq!(
+        misbehavior_rx.try_recv(),
+        Ok((parent_advertiser, 100)),
+        "the peer that served the invalid block must be scored"
+    );
+
+    let child_error = zs::CommitBlockError::ValidateContextError(Box::new(
+        zs::ValidateContextError::InvalidAncestorBlock(parent_hash),
+    ));
+    let child_error = RouterError::Block {
+        source: Box::new(VerifyBlockError::Commit(child_error)),
+    };
+    let child_response = BlockDownloadVerifyError::Invalid {
+        error: child_error,
+        height: Height(43),
+        hash: child_hash,
+        advertiser_addr: Some(child_advertiser),
+    };
+
+    assert!(chain_sync
+        .handle_block_response(Err(child_response))
+        .is_err());
+    assert!(
+        matches!(
+            misbehavior_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "the different peer that served the descendant must not be scored"
+    );
+}
+
 /// A scratch state can have finalized genesis tip metadata before
 /// `KnownBlock(genesis)` can find a block body. In that state, committing the
 /// downloaded genesis block returns duplicate/finalized; the genesis bootstrap

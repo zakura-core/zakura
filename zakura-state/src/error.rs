@@ -610,6 +610,9 @@ pub enum ValidateContextError {
     #[non_exhaustive]
     NotReadyToBeCommitted,
 
+    #[error("block descends from invalid ancestor {0}")]
+    InvalidAncestorBlock(block::Hash),
+
     #[error(
         "verified-commitment-trees fast path has no valid supplied root for height \
          {height:?}: the note-commitment frontier is frozen, so this block cannot be \
@@ -988,6 +991,11 @@ mod tests {
             ValidateContextError::NotReadyToBeCommitted,
         ));
         assert_eq!(transient_context_error.misbehavior_score(), 0);
+
+        let invalid_ancestor_error = CommitBlockError::ValidateContextError(Box::new(
+            ValidateContextError::InvalidAncestorBlock(block::Hash([1; 32])),
+        ));
+        assert_eq!(invalid_ancestor_error.misbehavior_score(), 0);
 
         let dup_err = CommitBlockError::Duplicate {
             hash_or_height: None,

@@ -1123,10 +1123,13 @@ proptest! {
             prop_assert!(result.is_ok(), "unexpected failed finalized block commit: {:?}", result);
 
             let actual_action = runtime
-                .block_on(timeout(
-                    CHAIN_TIP_UPDATE_WAIT_LIMIT,
-                    chain_tip_change.wait_for_tip_change(),
-                ))
+                .block_on(async {
+                    timeout(
+                        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+                        chain_tip_change.wait_for_tip_change(),
+                    )
+                    .await
+                })
                 .expect("tip change arrives because the committed block updates the channel")
                 .expect("tip sender remains open while the state service is alive");
 
@@ -1148,10 +1151,13 @@ proptest! {
             prop_assert!(result.is_ok(), "unexpected failed non-finalized block commit: {:?}", result);
 
             let actual_action = runtime
-                .block_on(timeout(
-                    CHAIN_TIP_UPDATE_WAIT_LIMIT,
-                    chain_tip_change.wait_for_tip_change(),
-                ))
+                .block_on(async {
+                    timeout(
+                        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+                        chain_tip_change.wait_for_tip_change(),
+                    )
+                    .await
+                })
                 .expect("tip change arrives because the committed block updates the channel")
                 .expect("tip sender remains open while the state service is alive");
 

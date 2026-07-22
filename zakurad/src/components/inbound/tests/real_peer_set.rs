@@ -1227,14 +1227,15 @@ mod submitblock_test {
         .await
         .expect("block gossip task should process the submitted block");
 
-        // Check that the block was processed as a mnined block by the gossip task
-        let captured_logs = logs.lock().unwrap();
-        let log_output = String::from_utf8(captured_logs.clone()).unwrap();
+        // Check that the block was processed as a mined block by the gossip task.
+        let log_output = {
+            let captured_logs = logs.lock().unwrap();
+            String::from_utf8(captured_logs.clone()).unwrap()
+        };
 
         assert!(log_output.contains("initializing block gossip task"));
         assert!(log_output.contains("sending mined block broadcast"));
 
-        std::mem::drop(captured_logs);
         gossip_task_handle.abort();
         let gossip_task_error = gossip_task_handle
             .await

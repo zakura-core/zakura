@@ -1,6 +1,6 @@
 [package]
 name = "zakura-consensus"
-version = "3.0.1-rc0"
+version = "4.0.0"
 authors.workspace = true
 description = "Implementation of Zcash consensus checks for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -65,13 +65,13 @@ libzcash_script = { workspace = true }
 zcash_script = { workspace = true }
 zcash_primitives = { workspace = true }
 
-tower-fallback = { package = "zakura-tower-fallback", path = "../tower-fallback/", version = "1.0.1-rc0" }
-tower-batch-control = { package = "zakura-tower-batch-control", path = "../tower-batch-control/", version = "1.0.1-rc0" }
+tower-fallback = { package = "zakura-tower-fallback", path = "../tower-fallback/", version = "1.0.1" }
+tower-batch-control = { package = "zakura-tower-batch-control", path = "../tower-batch-control/", version = "1.0.1" }
 
-zakura-script = { path = "../zakura-script", version = "1.0.2-rc0" }
-zakura-state = { path = "../zakura-state", version = "4.0.0-rc0" }
-zakura-node-services = { path = "../zakura-node-services", version = "2.0.0-rc0" }
-zakura-chain = { path = "../zakura-chain", version = "1.2.1-rc0" }
+zakura-script = { path = "../zakura-script", version = "2.0.0" }
+zakura-state = { path = "../zakura-state", version = "4.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "2.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "2.0.0" }
 
 zcash_protocol.workspace = true
 
@@ -96,9 +96,9 @@ tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 tracing-error = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-zakura-state = { path = "../zakura-state", version = "4.0.0-rc0", features = ["proptest-impl"] }
-zakura-chain = { path = "../zakura-chain", version = "1.2.1-rc0", features = ["proptest-impl"] }
-zakura-test = { path = "../zakura-test/", version = "1.0.1-rc0" }
+zakura-state = { path = "../zakura-state", version = "4.0.0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "2.0.0", features = ["proptest-impl"] }
+zakura-test = { path = "../zakura-test/", version = "1.0.1" }
 
 criterion = { workspace = true, features = ["html_reports"] }
 

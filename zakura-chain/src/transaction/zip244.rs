@@ -843,6 +843,7 @@ pub(super) struct Zip244SighashCache {
     scriptpubkeys: Blake2bHash,
     sequence: Blake2bHash,
     outputs: Blake2bHash,
+    transparent_output_count: usize,
     single_outputs: Vec<Blake2bHash>,
     txins: Vec<Option<Blake2bHash>>,
     transparent_bundle_present: bool,
@@ -878,6 +879,7 @@ impl Zip244SighashCache {
             scriptpubkeys: hash_scriptpubkeys(previous_outputs),
             sequence,
             outputs,
+            transparent_output_count: parts.outputs.len(),
             single_outputs: parts
                 .outputs
                 .iter()
@@ -931,6 +933,11 @@ impl Zip244SighashCache {
         )
     }
 
+    /// Returns whether `input_index` has a corresponding transparent output.
+    pub(super) fn has_corresponding_output(&self, input_index: usize) -> bool {
+        input_index < self.transparent_output_count
+    }
+
     fn transparent_sig_digest(
         &self,
         hash_type: CanonicalHashType,
@@ -972,7 +979,7 @@ impl Zip244SighashCache {
                 .single_outputs
                 .get(index)
                 .copied()
-                .unwrap_or_else(|| hash_outputs(&[])),
+                .expect("SIGHASH_SINGLE input has a corresponding transparent output"),
             Some(_) if none => hash_outputs(&[]),
             _ => self.outputs,
         };

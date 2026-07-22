@@ -6,6 +6,7 @@ use color_eyre::eyre::{Result, WrapErr};
 use lazy_static::lazy_static;
 use rand::{seq::IteratorRandom, thread_rng};
 use std::io::ErrorKind;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::{
     block::{Block, Height, MAX_BLOCK_BYTES},
@@ -1282,18 +1283,31 @@ fn zip244_sighash() -> Result<()> {
             (HashType::NONE_ANYONECANPAY, test.sighash_none_anyone),
             (HashType::SINGLE_ANYONECANPAY, test.sighash_single_anyone),
         ] {
-            let Some(expected) = expected else {
+            let Some(input_index) = test.transparent_input else {
+                assert!(
+                    expected.is_none(),
+                    "test #{i}: transparent sighash without input"
+                );
                 continue;
             };
-            let input_index = usize::try_from(
-                test.transparent_input
-                    .expect("transparent sighash vector has an input index"),
-            )
-            .expect("u32 input index fits in usize");
-            let result = hex::encode(sighasher.sighash(
-                hash_type,
-                Some((input_index, test.script_pubkeys[input_index].clone())),
-            ));
+            let input_index = usize::try_from(input_index).expect("u32 input index fits in usize");
+            let input = Some((input_index, test.script_pubkeys[input_index].clone()));
+            let Some(expected) = expected else {
+                assert!(
+                    hash_type == HashType::SINGLE || hash_type == HashType::SINGLE_ANYONECANPAY,
+                    "test #{i}: only SIGHASH_SINGLE can require a corresponding output",
+                );
+                assert!(
+                    input_index >= transaction.outputs().len(),
+                    "test #{i}: missing SIGHASH_SINGLE digest requires a missing output",
+                );
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| sighasher.sighash(hash_type, input))).is_err(),
+                    "test #{i}: SIGHASH_SINGLE without a corresponding output must fail",
+                );
+                continue;
+            };
+            let result = hex::encode(sighasher.sighash(hash_type, input));
             assert_eq!(
                 hex::encode(expected),
                 result,

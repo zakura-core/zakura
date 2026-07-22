@@ -197,7 +197,7 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            runner: ${{ vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
+            runner: zakura-release-x64-64-core
             platform: linux/amd64
             target_triple: x86_64-unknown-linux-gnu
           - name: linux-aarch64
@@ -225,7 +225,7 @@ jobs:
           short_sha="$(git rev-parse --short=12 HEAD)"
           docker buildx build \
             --platform "${{ matrix.platform }}" \
-            --target release \
+            --target release-zakurad \
             --file ./docker/Dockerfile \
             --build-arg "FEATURES=${FEATURES}" \
             --build-arg "SHORT_SHA=${short_sha}" \
@@ -469,7 +469,7 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            runner: ${{ vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
+            runner: zakura-release-x64-64-core
             platform: linux/amd64
             docker_tag_suffix: amd64
           - name: linux-aarch64
@@ -600,7 +600,7 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            runner: ${{ vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
+            runner: zakura-release-x64-64-core
             platform: linux/amd64
             docker_tag_suffix: amd64
     steps:

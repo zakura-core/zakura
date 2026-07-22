@@ -3,10 +3,11 @@
 
 # If you want to include a file in the Docker image, add it to .dockerignore.
 #
-# We use 4 (TODO: 5) stages:
+# We use 5 (TODO: 6) stages:
 # - deps: installs build dependencies and sets default values
 # - tests: prepares a test image
-# - release: builds release binaries
+# - release-zakurad: builds the standalone release binary
+# - release: adds the maintenance binaries used by the runtime image
 # - runtime: prepares the release image
 # - TODO: Add a `monitoring` stage
 #
@@ -130,11 +131,11 @@ COPY --link --chown=${UID}:${GID} ./docker/entrypoint.sh /usr/local/bin/entrypoi
 ENTRYPOINT [ "entrypoint.sh", "test" ]
 CMD [ "cargo", "test" ]
 
-# This stage builds the zakurad release binaries.
+# This stage builds the standalone zakurad release binary.
 #
 # It also adds `cache mounts` as this stage is completely independent from the
 # `test` stage. The resulting binaries are used in the `runtime` stage.
-FROM deps AS release
+FROM deps AS release-zakurad
 
 ARG SHORT_SHA
 ARG FEATURES
@@ -167,8 +168,38 @@ RUN --mount=type=bind,source=tower-batch-control,target=tower-batch-control \
     --mount=type=cache,target=${CARGO_TARGET_DIR} \
     --mount=type=cache,target=${CARGO_HOME} \
     [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
-    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad --bin zakura-rollback-state --bin zakura-prune-state && \
-    cp ${CARGO_TARGET_DIR}/release/zakurad /usr/local/bin && \
+    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad && \
+    cp ${CARGO_TARGET_DIR}/release/zakurad /usr/local/bin
+
+# This stage adds the maintenance binaries used by the runtime image.
+FROM release-zakurad AS release
+
+ARG SHORT_SHA
+ARG FEATURES
+ARG CARGO_HOME
+ARG CARGO_TARGET_DIR
+
+RUN --mount=type=bind,source=tower-batch-control,target=tower-batch-control \
+    --mount=type=bind,source=tower-fallback,target=tower-fallback \
+    --mount=type=bind,source=deploy/zakura-watchdog,target=deploy/zakura-watchdog \
+    --mount=type=bind,source=xtask,target=xtask \
+    --mount=type=bind,source=zakura-chain,target=zakura-chain \
+    --mount=type=bind,source=zakura-consensus,target=zakura-consensus \
+    --mount=type=bind,source=zakura-jsonl-trace,target=zakura-jsonl-trace \
+    --mount=type=bind,source=zakura-network,target=zakura-network \
+    --mount=type=bind,source=zakura-node-services,target=zakura-node-services \
+    --mount=type=bind,source=zakura-rpc,target=zakura-rpc \
+    --mount=type=bind,source=zakura-script,target=zakura-script \
+    --mount=type=bind,source=zakura-state,target=zakura-state \
+    --mount=type=bind,source=zakura-test,target=zakura-test \
+    --mount=type=bind,source=zakura-utils,target=zakura-utils \
+    --mount=type=bind,source=zakurad,target=zakurad \
+    --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
+    --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
+    --mount=type=cache,target=${CARGO_TARGET_DIR} \
+    --mount=type=cache,target=${CARGO_HOME} \
+    [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
+    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakura-rollback-state --bin zakura-prune-state && \
     cp ${CARGO_TARGET_DIR}/release/zakura-rollback-state /usr/local/bin && \
     cp ${CARGO_TARGET_DIR}/release/zakura-prune-state /usr/local/bin
 

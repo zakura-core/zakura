@@ -5,22 +5,28 @@
 use std::{
     collections::{BTreeSet, HashMap},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use chrono::{TimeZone, Utc};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::{sync::watch, time::Instant};
 use zakura_chain::block;
 use zakura_header_chain::{
     apply_transition, audit_store, ApplyResult, AuxDelivery, AuxDelta, ChainScore, ChangeSet,
     CommittedTransition, CounterExhausted, EligibilityReason, EngineConfig, EngineMetadata,
     EngineMode, EngineSnapshot, EvidenceId, FinalityRecord, FinalitySource, Frontier,
     FullStateEvidenceAuthority, FullStateFinalized, HeaderLocator, HeaderNode, NoChangeReceipt,
-    RecoveryFailure, RecoveryPlan, RecoveryRepair, StaleReceipt, StoreAuditRead, StoreError,
-    StoreRead, SystemClock, TransitionContext, TransitionEvent, TransitionFailure,
+    RecoveryFailure, RecoveryPlan, RecoveryRepair, SourceId, StaleReceipt, StoreAuditRead,
+    StoreError, StoreRead, SystemClock, TransitionContext, TransitionEvent, TransitionFailure,
     TransitionRequest, ValidationContextRecord, ValidationLease, VerifiedChainChanged,
     VerifiedChangeCause, VerifiedHeaderRef,
+};
+
+use crate::{
+    RetainedPathLease, RetainedPathLeaseOutcome, RetainedPathPage, RetainedPathReadOutcome,
+    MAX_RETAINED_PATH_LEASES,
 };
 
 use super::{
@@ -44,6 +50,7 @@ use super::{
 };
 
 const METADATA_KEY: &[u8] = b"";
+const RETAINED_PATH_LEASE_IDLE: Duration = Duration::from_secs(30);
 
 pub(in crate::service) mod migration;
 
@@ -168,12 +175,112 @@ impl Publisher {
 pub struct HeaderChainRuntime {
     store: HeaderChainStore,
     publisher: Publisher,
+    leases: Arc<Mutex<RetainedPathLeaseRegistry>>,
 }
 
 /// Read-only coherent queries serialized against durable header transitions.
 #[derive(Clone, Debug)]
 pub(crate) struct HeaderChainReader {
     store: HeaderChainStore,
+    leases: Arc<Mutex<RetainedPathLeaseRegistry>>,
+}
+
+#[derive(Debug, Default)]
+struct RetainedPathLeaseRegistry {
+    next_lease_id: u64,
+    by_peer: HashMap<SourceId, RetainedPathLease>,
+}
+
+impl RetainedPathLeaseRegistry {
+    fn expire(&mut self, now: Instant) {
+        self.by_peer.retain(|_, lease| lease.idle_deadline > now);
+    }
+
+    fn insert(
+        &mut self,
+        peer: SourceId,
+        session_id: u64,
+        frontiers: (Frontier, Frontier),
+        path: Arc<[block::Hash]>,
+        generation: zakura_header_chain::HeaderGeneration,
+        now: Instant,
+    ) -> RetainedPathLeaseOutcome {
+        self.expire(now);
+        if self
+            .by_peer
+            .get(&peer)
+            .is_some_and(|lease| lease.session_id == session_id)
+        {
+            return RetainedPathLeaseOutcome::Busy;
+        }
+        self.by_peer.remove(&peer);
+        if self.by_peer.len() >= MAX_RETAINED_PATH_LEASES {
+            return RetainedPathLeaseOutcome::Busy;
+        }
+        let Some(lease_id) = self.next_lease_id.checked_add(1) else {
+            return RetainedPathLeaseOutcome::Busy;
+        };
+        self.next_lease_id = lease_id;
+        let lease = RetainedPathLease {
+            lease_id,
+            peer,
+            session_id,
+            target: frontiers.0,
+            common_ancestor: frontiers.1,
+            path,
+            generation,
+            idle_deadline: now + RETAINED_PATH_LEASE_IDLE,
+        };
+        self.by_peer.insert(peer, lease.clone());
+        RetainedPathLeaseOutcome::Acquired(lease)
+    }
+
+    fn get(
+        &mut self,
+        peer: SourceId,
+        session_id: u64,
+        lease_id: u64,
+        now: Instant,
+    ) -> Option<RetainedPathLease> {
+        self.expire(now);
+        let lease = self.by_peer.get(&peer)?;
+        if lease.session_id != session_id || lease.lease_id != lease_id {
+            return None;
+        }
+        Some(lease.clone())
+    }
+
+    fn renew(&mut self, peer: SourceId, session_id: u64, lease_id: u64, now: Instant) -> bool {
+        let Some(lease) = self.by_peer.get_mut(&peer) else {
+            return false;
+        };
+        if lease.session_id != session_id || lease.lease_id != lease_id {
+            return false;
+        }
+        lease.idle_deadline = now + RETAINED_PATH_LEASE_IDLE;
+        true
+    }
+
+    fn release(&mut self, peer: SourceId, session_id: u64, lease_id: u64) -> bool {
+        let matches = self
+            .by_peer
+            .get(&peer)
+            .is_some_and(|lease| lease.session_id == session_id && lease.lease_id == lease_id);
+        if matches {
+            self.by_peer.remove(&peer);
+        }
+        matches
+    }
+
+    fn active_references(&mut self, now: Instant) -> Vec<block::Hash> {
+        self.expire(now);
+        self.by_peer
+            .values()
+            .flat_map(|lease| {
+                std::iter::once(lease.common_ancestor.hash).chain(lease.path.iter().copied())
+            })
+            .collect()
+    }
 }
 
 impl HeaderChainReader {
@@ -190,6 +297,145 @@ impl HeaderChainReader {
         HeaderLocator::for_selected_path(&snapshot, |height| self.store.selected_hash(height))
             .map_err(HeaderChainStoreError::Store)
     }
+
+    pub(crate) fn acquire_retained_path(
+        &self,
+        peer: SourceId,
+        session_id: u64,
+        target_tip_hash: block::Hash,
+        locator_hashes: &[block::Hash],
+    ) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
+        if locator_hashes.is_empty()
+            || locator_hashes.len() > zakura_header_chain::MAX_HEADER_LOCATOR_HASHES
+        {
+            return Err(HeaderChainStoreError::Store(StoreError::Incoherent(
+                "retained path locator count is outside protocol bounds",
+            )));
+        }
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let snapshot = self.store.snapshot()?;
+        let Some(target_node) = self.store.node(target_tip_hash)? else {
+            return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
+        };
+        let target = Frontier::new(target_node.height, target_tip_hash);
+        let mut reverse_path = vec![target];
+        let mut current = target_node;
+        while current.height > snapshot.frontiers.finalized.height {
+            let Some(parent) = self.store.node(current.parent_hash)? else {
+                return Ok(RetainedPathLeaseOutcome::HistoryPruned);
+            };
+            if parent.height.next().ok() != Some(current.height) {
+                return Err(HeaderChainStoreError::Store(StoreError::Incoherent(
+                    "retained target path has non-contiguous heights",
+                )));
+            }
+            reverse_path.push(Frontier::new(parent.height, parent.hash));
+            current = parent;
+        }
+        if reverse_path.last().copied() != Some(snapshot.frontiers.finalized) {
+            return Ok(RetainedPathLeaseOutcome::HistoryPruned);
+        }
+        reverse_path.reverse();
+        let common_index = locator_hashes.iter().find_map(|locator_hash| {
+            reverse_path
+                .iter()
+                .position(|frontier| frontier.hash == *locator_hash)
+        });
+        let Some(common_index) = common_index else {
+            return Ok(RetainedPathLeaseOutcome::NoLocatorIntersection);
+        };
+        let common_ancestor = reverse_path[common_index];
+        let path: Arc<[block::Hash]> = reverse_path[common_index.saturating_add(1)..]
+            .iter()
+            .map(|frontier| frontier.hash)
+            .collect();
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        Ok(leases.insert(
+            peer,
+            session_id,
+            (target, common_ancestor),
+            path,
+            snapshot.header_generation,
+            Instant::now(),
+        ))
+    }
+
+    pub(crate) fn read_retained_path(
+        &self,
+        peer: SourceId,
+        session_id: u64,
+        lease_id: u64,
+        after_hash: block::Hash,
+        max_count: u32,
+    ) -> Result<RetainedPathReadOutcome, HeaderChainStoreError> {
+        if max_count == 0 {
+            return Err(HeaderChainStoreError::Store(StoreError::Incoherent(
+                "retained path page count is zero",
+            )));
+        }
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let lease = leases.get(peer, session_id, lease_id, Instant::now());
+        let Some(lease) = lease else {
+            return Ok(RetainedPathReadOutcome::Unavailable);
+        };
+        let start = if after_hash == lease.common_ancestor.hash {
+            0
+        } else {
+            let Some(index) = lease.path.iter().position(|hash| *hash == after_hash) else {
+                return Ok(RetainedPathReadOutcome::Unavailable);
+            };
+            index.saturating_add(1)
+        };
+        let count = usize::try_from(max_count).unwrap_or(usize::MAX);
+        let end = start.saturating_add(count).min(lease.path.len());
+        let mut nodes = Vec::with_capacity(end.saturating_sub(start));
+        let mut aux_deliveries = Vec::with_capacity(end.saturating_sub(start));
+        for hash in &lease.path[start..end] {
+            let node = self.store.node(*hash)?.ok_or(StoreError::Incoherent(
+                "active retained path node is absent",
+            ))?;
+            nodes.push(node);
+            aux_deliveries.push(self.store.aux_deliveries(*hash)?);
+        }
+        let renewed = leases.renew(peer, session_id, lease_id, Instant::now());
+        debug_assert!(renewed, "the lease registry is locked across the page read");
+        Ok(RetainedPathReadOutcome::Page(RetainedPathPage {
+            lease_id,
+            common_ancestor: lease.common_ancestor,
+            target: lease.target,
+            nodes,
+            aux_deliveries,
+            complete: end == lease.path.len(),
+        }))
+    }
+
+    pub(crate) fn release_retained_path(
+        &self,
+        peer: SourceId,
+        session_id: u64,
+        lease_id: u64,
+    ) -> Result<bool, HeaderChainStoreError> {
+        Ok(self
+            .leases
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .release(peer, session_id, lease_id))
+    }
 }
 
 impl HeaderChainRuntime {
@@ -202,6 +448,7 @@ impl HeaderChainRuntime {
     pub(crate) fn reader(&self) -> HeaderChainReader {
         HeaderChainReader {
             store: self.store.clone(),
+            leases: self.leases.clone(),
         }
     }
 
@@ -309,6 +556,22 @@ impl HeaderChainRuntime {
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let mut retention_references = context.retention_references.to_vec();
+        retention_references.extend(
+            self.leases
+                .lock()
+                .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+                .active_references(Instant::now()),
+        );
+        retention_references.sort_unstable_by_key(|hash| hash.0);
+        retention_references.dedup();
+        let context = TransitionContext {
+            config: context.config,
+            clock: context.clock,
+            full_state_authority: context.full_state_authority,
+            startup_capability: context.startup_capability,
+            retention_references: &retention_references,
+        };
         let before = self.store.snapshot()?;
         if let Some(pin) = before.alarms.migrated_pin_refuted {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
@@ -325,7 +588,7 @@ impl HeaderChainRuntime {
             }));
         }
         fault(FaultPoint::AfterVersionCheck)?;
-        let plan = match apply_transition(&self.store, request, context) {
+        let plan = match apply_transition(&self.store, request, &context) {
             Ok(plan) => plan,
             Err(TransitionFailure::Stale { current }) => {
                 return Ok(ApplyResult::Stale(StaleReceipt {
@@ -444,6 +707,7 @@ impl HeaderChainStore {
             HeaderChainRuntime {
                 store: self,
                 publisher,
+                leases: Arc::new(Mutex::new(RetainedPathLeaseRegistry::default())),
             },
             report,
         ))
@@ -529,6 +793,7 @@ impl HeaderChainStore {
             HeaderChainRuntime {
                 store: self,
                 publisher,
+                leases: Arc::new(Mutex::new(RetainedPathLeaseRegistry::default())),
             },
             report,
         ))
@@ -589,6 +854,7 @@ impl HeaderChainStore {
                 clock: &SystemClock,
                 full_state_authority: Some(&authority),
                 startup_capability: None,
+                retention_references: &[],
             };
             let plan = apply_transition(
                 &self,
@@ -631,6 +897,7 @@ impl HeaderChainStore {
                 clock: &SystemClock,
                 full_state_authority: Some(&authority),
                 startup_capability: None,
+                retention_references: &[],
             };
             let plan = apply_transition(
                 &self,
@@ -667,6 +934,7 @@ impl HeaderChainStore {
             HeaderChainRuntime {
                 store: self,
                 publisher,
+                leases: Arc::new(Mutex::new(RetainedPathLeaseRegistry::default())),
             },
             report,
         ))
@@ -1817,6 +2085,203 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
+        let db_config = Config::ephemeral();
+        let (engine_config, anchor, metadata) = fixture();
+        let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+        let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+        store
+            .initialize(metadata, anchor.clone())
+            .expect("the empty schema initializes");
+        let mut child_header = *anchor.header;
+        child_header.previous_block_hash = anchor.hash;
+        let child_header = Arc::new(child_header);
+        let child = VerifiedHeaderRef {
+            height: anchor.height.next().expect("genesis has a successor"),
+            hash: child_header.hash(),
+            header: child_header,
+        };
+        let (runtime, _) = store
+            .startup_reconciled(
+                &engine_config,
+                anchor_frontier,
+                Vec::new(),
+                vec![child.clone()],
+            )
+            .expect("the selected child path reconciles");
+        let reader = runtime.reader();
+        let owner = SourceId::from_digest([1; 32]);
+        let acquired = reader
+            .acquire_retained_path(owner, 7, child.hash, &[anchor.hash])
+            .expect("the coherent target path is readable");
+        let RetainedPathLeaseOutcome::Acquired(lease) = acquired else {
+            panic!("the exact retained target should acquire a lease");
+        };
+        assert_eq!(lease.target, Frontier::new(child.height, child.hash));
+        assert_eq!(lease.common_ancestor, anchor_frontier);
+        assert_eq!(lease.path.as_ref(), &[child.hash]);
+        assert_eq!(
+            lease.generation,
+            runtime.publisher().snapshot().header_generation
+        );
+        assert_eq!(
+            reader
+                .acquire_retained_path(owner, 7, child.hash, &[anchor.hash])
+                .expect("the lease bound is a normal outcome"),
+            RetainedPathLeaseOutcome::Busy
+        );
+        assert_eq!(
+            reader
+                .read_retained_path(owner, 8, lease.lease_id, anchor.hash, 1)
+                .expect("a mismatched session is non-fatal"),
+            RetainedPathReadOutcome::Unavailable
+        );
+        let RetainedPathReadOutcome::Page(page) = reader
+            .read_retained_path(owner, 7, lease.lease_id, anchor.hash, 1)
+            .expect("the lease page is readable")
+        else {
+            panic!("the current owner should read its lease");
+        };
+        assert_eq!(page.nodes.len(), 1);
+        assert_eq!(page.nodes[0].hash, child.hash);
+        assert_eq!(page.aux_deliveries, vec![Vec::new()]);
+        assert!(page.complete);
+
+        let before = runtime.publisher().snapshot();
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: before.state_version,
+                    event: TransitionEvent::OperatorInvalidate(
+                        zakura_header_chain::OperatorInvalidate {
+                            target: child.hash,
+                            id: zakura_header_chain::OperatorInvalidationId::new([3; 16]),
+                            operator_reason_digest: [4; 32],
+                            evidence: EvidenceId::from_digest([3; 32]),
+                        },
+                    ),
+                },
+                &TransitionContext {
+                    config: &engine_config,
+                    clock: &SystemClock,
+                    full_state_authority: None,
+                    startup_capability: None,
+                    retention_references: &[],
+                },
+            )
+            .expect("the selected path can change while the lease is active");
+        assert_eq!(
+            runtime.publisher().snapshot().frontiers.header_best,
+            anchor_frontier
+        );
+        let RetainedPathReadOutcome::Page(page_after_reselection) = reader
+            .read_retained_path(owner, 7, lease.lease_id, anchor.hash, 1)
+            .expect("the immutable lease survives reselection")
+        else {
+            panic!("the lease remains available after reselection");
+        };
+        assert_eq!(page_after_reselection.nodes[0].hash, child.hash);
+
+        assert_eq!(
+            reader
+                .acquire_retained_path(
+                    SourceId::from_digest([2; 32]),
+                    7,
+                    block::Hash([0xfe; 32]),
+                    &[anchor.hash],
+                )
+                .expect("an absent target is a normal outcome"),
+            RetainedPathLeaseOutcome::TargetNotRetained
+        );
+        assert_eq!(
+            reader
+                .acquire_retained_path(
+                    SourceId::from_digest([2; 32]),
+                    7,
+                    child.hash,
+                    &[block::Hash([0xfd; 32])],
+                )
+                .expect("a disjoint locator is a normal outcome"),
+            RetainedPathLeaseOutcome::NoLocatorIntersection
+        );
+        let RetainedPathLeaseOutcome::Acquired(target_intersection) = reader
+            .acquire_retained_path(
+                SourceId::from_digest([2; 32]),
+                7,
+                child.hash,
+                &[child.hash, anchor.hash],
+            )
+            .expect("the first requester-order intersection is selected")
+        else {
+            panic!("the target itself intersects the locator");
+        };
+        assert_eq!(target_intersection.common_ancestor.hash, child.hash);
+        assert!(target_intersection.path.is_empty());
+        assert!(reader
+            .release_retained_path(
+                SourceId::from_digest([2; 32]),
+                7,
+                target_intersection.lease_id,
+            )
+            .expect("the requester-order test lease releases"));
+
+        assert!(reader
+            .release_retained_path(owner, 7, lease.lease_id)
+            .expect("the exact owner can release its lease"));
+        for marker in 1..=MAX_RETAINED_PATH_LEASES {
+            let marker = u8::try_from(marker).expect("the lease cap fits in one byte");
+            assert!(matches!(
+                reader
+                    .acquire_retained_path(
+                        SourceId::from_digest([marker; 32]),
+                        9,
+                        child.hash,
+                        &[anchor.hash],
+                    )
+                    .expect("bounded acquisition returns an outcome"),
+                RetainedPathLeaseOutcome::Acquired(_)
+            ));
+        }
+        assert_eq!(
+            reader
+                .acquire_retained_path(
+                    SourceId::from_digest([0xff; 32]),
+                    9,
+                    child.hash,
+                    &[anchor.hash],
+                )
+                .expect("capacity refusal is a normal outcome"),
+            RetainedPathLeaseOutcome::Busy
+        );
+        let active_references = runtime
+            .leases
+            .lock()
+            .expect("the lease registry mutex is not poisoned")
+            .active_references(Instant::now());
+        assert!(active_references.contains(&anchor.hash));
+        assert!(active_references.contains(&child.hash));
+
+        tokio::time::advance(RETAINED_PATH_LEASE_IDLE + Duration::from_secs(1)).await;
+        assert!(runtime
+            .leases
+            .lock()
+            .expect("the lease registry mutex is not poisoned")
+            .active_references(Instant::now())
+            .is_empty());
+        assert!(matches!(
+            reader
+                .acquire_retained_path(
+                    SourceId::from_digest([0xff; 32]),
+                    10,
+                    child.hash,
+                    &[anchor.hash],
+                )
+                .expect("expired slots are reclaimed"),
+            RetainedPathLeaseOutcome::Acquired(_)
+        ));
+    }
+
     #[test]
     fn startup_reconciles_restored_full_state_before_first_publication() {
         let cache = tempfile::tempdir().expect("the test cache directory is created");
@@ -1984,6 +2449,7 @@ mod tests {
             clock: &SystemClock,
             full_state_authority: Some(&authority),
             startup_capability: None,
+            retention_references: &[],
         };
         let result = runtime.apply(
             TransitionRequest {
@@ -2059,6 +2525,7 @@ mod tests {
             clock: &SystemClock,
             full_state_authority: Some(&authority),
             startup_capability: None,
+            retention_references: &[],
         };
         let request = TransitionRequest {
             expected_version: StateVersion::new(1),
@@ -2250,6 +2717,7 @@ mod tests {
             clock: &SystemClock,
             full_state_authority: None,
             startup_capability: None,
+            retention_references: &[],
         };
         let result = prepared
             .commit(&runtime, &mut live, &context)
@@ -2318,6 +2786,7 @@ mod tests {
                     clock: &SystemClock,
                     full_state_authority: None,
                     startup_capability: None,
+                    retention_references: &[],
                 },
             )
             .expect("the full-state-only mutation commits");
@@ -2380,6 +2849,7 @@ mod tests {
                     clock: &SystemClock,
                     full_state_authority: None,
                     startup_capability: None,
+                    retention_references: &[],
                 },
                 full_state_batch,
                 expected,
@@ -2666,6 +3136,7 @@ mod tests {
                 clock: &SystemClock,
                 full_state_authority: Some(&authority),
                 startup_capability: None,
+                retention_references: &[],
             };
             let request = TransitionRequest {
                 expected_version: StateVersion::new(1),

@@ -262,7 +262,7 @@ pub fn apply_transition<S: StoreRead>(
         &mut graph,
         header_best,
         verified_best,
-        std::iter::empty(),
+        context.retention_references.iter().copied(),
         context.config.limits,
     )?;
     if retention.admission_refused {
@@ -1193,6 +1193,7 @@ mod tests {
             clock,
             full_state_authority,
             startup_capability: None,
+            retention_references: &[],
         }
     }
 

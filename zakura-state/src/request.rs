@@ -1436,6 +1436,42 @@ pub enum ReadRequest {
     /// Returns the exact committed selected-header locator after semantic handoff.
     HeaderLocator,
 
+    /// Acquire one immutable retained path for an exact v8 target.
+    AcquireRetainedHeaderPath {
+        /// Stable requesting peer identity.
+        peer: zakura_header_chain::SourceId,
+        /// Ordered-stream generation that owns the lease.
+        session_id: u64,
+        /// Exact target named by the peer's status.
+        target_tip_hash: block::Hash,
+        /// Locator hashes in requester order.
+        locator_hashes: Vec<block::Hash>,
+    },
+
+    /// Read and renew one bounded hash-keyed page from an immutable lease.
+    ReadRetainedHeaderPath {
+        /// Stable requesting peer identity.
+        peer: zakura_header_chain::SourceId,
+        /// Ordered-stream generation that owns the lease.
+        session_id: u64,
+        /// Exact state-issued lease identity.
+        lease_id: u64,
+        /// Common ancestor or prior page tip.
+        after_hash: block::Hash,
+        /// Maximum nodes returned.
+        max_count: u32,
+    },
+
+    /// Release one retained path owned by this exact peer session.
+    ReleaseRetainedHeaderPath {
+        /// Stable requesting peer identity.
+        peer: zakura_header_chain::SourceId,
+        /// Ordered-stream generation that owns the lease.
+        session_id: u64,
+        /// Exact state-issued lease identity.
+        lease_id: u64,
+    },
+
     /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)
     /// with the per-block commitment roots for the requested heights, in ascending height
     /// order. May return fewer than `count` roots if the node does not hold the whole range.
@@ -1684,6 +1720,9 @@ impl ReadRequest {
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
             ReadRequest::HeadersByHeightRange { .. } => "headers_by_height_range",
             ReadRequest::HeaderLocator => "header_locator",
+            ReadRequest::AcquireRetainedHeaderPath { .. } => "acquire_retained_header_path",
+            ReadRequest::ReadRetainedHeaderPath { .. } => "read_retained_header_path",
+            ReadRequest::ReleaseRetainedHeaderPath { .. } => "release_retained_header_path",
             ReadRequest::BlockRoots { .. } => "block_roots",
             ReadRequest::BestHeaderTip => "best_header_tip",
             ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",

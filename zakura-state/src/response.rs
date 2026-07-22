@@ -459,6 +459,15 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::HeaderLocator`], absent before semantic handoff.
     HeaderLocator(Option<zakura_header_chain::HeaderLocator>),
 
+    /// Response to [`ReadRequest::AcquireRetainedHeaderPath`].
+    RetainedHeaderPathLease(crate::RetainedPathLeaseOutcome),
+
+    /// Response to [`ReadRequest::ReadRetainedHeaderPath`].
+    RetainedHeaderPathPage(crate::RetainedPathReadOutcome),
+
+    /// Response to [`ReadRequest::ReleaseRetainedHeaderPath`].
+    RetainedHeaderPathReleased(bool),
+
     /// Response to [`ReadRequest::BestHeaderTip`].
     BestHeaderTip(Option<(block::Height, block::Hash)>),
 
@@ -661,6 +670,9 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::ChainInfo(_)
             | ReadResponse::Headers(_)
             | ReadResponse::HeaderLocator(_)
+            | ReadResponse::RetainedHeaderPathLease(_)
+            | ReadResponse::RetainedHeaderPathPage(_)
+            | ReadResponse::RetainedHeaderPathReleased(_)
             | ReadResponse::BestHeaderTip(_)
             | ReadResponse::MissingBlockBodies(_)
             | ReadResponse::MissingBlockBodyMetadata(_)

@@ -49,4 +49,6 @@ pub struct TransitionContext<'a> {
     pub full_state_authority: Option<&'a dyn FullStateEvidenceAuthority>,
     /// Startup capability, available only before publication.
     pub startup_capability: Option<&'a StartupCapability>,
+    /// Active retained-path targets that resource eviction must protect.
+    pub retention_references: &'a [zakura_chain::block::Hash],
 }

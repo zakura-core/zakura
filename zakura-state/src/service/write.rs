@@ -180,6 +180,7 @@ impl PreparedFullStateTransition {
             clock: context.clock,
             full_state_authority: Some(&authority),
             startup_capability: context.startup_capability,
+            retention_references: context.retention_references,
         };
         runtime.apply_combined_expected(
             header_request,
@@ -315,6 +316,7 @@ impl HeaderChainWriter {
             clock: &self.clock,
             full_state_authority: None,
             startup_capability: None,
+            retention_references: &[],
         }
     }
 }

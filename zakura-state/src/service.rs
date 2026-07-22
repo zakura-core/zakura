@@ -1913,6 +1913,59 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::HeaderLocator(locator))
             }
 
+            ReadRequest::AcquireRetainedHeaderPath {
+                peer,
+                session_id,
+                target_tip_hash,
+                locator_hashes,
+            } => {
+                let Some(reader) = state.header_chain_reader_receiver.borrow().clone() else {
+                    return Ok(ReadResponse::RetainedHeaderPathLease(
+                        crate::RetainedPathLeaseOutcome::TargetNotRetained,
+                    ));
+                };
+                Ok(ReadResponse::RetainedHeaderPathLease(
+                    reader.acquire_retained_path(
+                        peer,
+                        session_id,
+                        target_tip_hash,
+                        &locator_hashes,
+                    )?,
+                ))
+            }
+
+            ReadRequest::ReadRetainedHeaderPath {
+                peer,
+                session_id,
+                lease_id,
+                after_hash,
+                max_count,
+            } => {
+                let Some(reader) = state.header_chain_reader_receiver.borrow().clone() else {
+                    return Ok(ReadResponse::RetainedHeaderPathPage(
+                        crate::RetainedPathReadOutcome::Unavailable,
+                    ));
+                };
+                Ok(ReadResponse::RetainedHeaderPathPage(
+                    reader.read_retained_path(peer, session_id, lease_id, after_hash, max_count)?,
+                ))
+            }
+
+            ReadRequest::ReleaseRetainedHeaderPath {
+                peer,
+                session_id,
+                lease_id,
+            } => {
+                let released = state
+                    .header_chain_reader_receiver
+                    .borrow()
+                    .clone()
+                    .map(|reader| reader.release_retained_path(peer, session_id, lease_id))
+                    .transpose()?
+                    .unwrap_or(false);
+                Ok(ReadResponse::RetainedHeaderPathReleased(released))
+            }
+
             ReadRequest::BlockRoots {
                 start_height,
                 count,

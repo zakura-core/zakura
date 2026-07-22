@@ -22,6 +22,7 @@ extern crate tracing;
 pub mod config;
 // Most constants are exported by default
 pub mod constants;
+mod header_chain;
 
 // Allow use in external tests
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -46,6 +47,7 @@ pub use error::{
     CommitSemanticallyVerifiedError, DuplicateNullifierError, MissingSproutTipTree, StateInitError,
     StoreIncoherentError, ValidateContextError,
 };
+pub use header_chain::*;
 pub use request::{
     CheckpointVerifiedBlock, CommitSemanticallyVerifiedBlockRequest, HashOrHeight, MappedRequest,
     ReadRequest, Request, SemanticallyVerifiedBlock,

@@ -277,7 +277,12 @@ impl ZakuraDb {
         }
     }
 
-    /// Reconstructs and atomically persists the highest completed checkpoint during format migration.
+    /// Reconstructs and durably persists the highest completed checkpoint during format migration.
+    ///
+    /// Uses a synced RocksDB write so the row is on stable storage before the upgrade driver marks
+    /// the format version on disk (which fsyncs the version file). An unsynced write would leave a
+    /// crash window where the version file says 28.0.2 but the required row is missing; the next
+    /// boot then takes the current-format check path and panics instead of replaying the migration.
     pub(crate) fn reconstruct_and_persist_highest_completed_checkpoint(
         &self,
     ) -> Result<(), HighestCompletedCheckpointError> {
@@ -286,7 +291,7 @@ impl ZakuraDb {
         };
         let mut batch = DiskWriteBatch::new();
         batch.set_highest_completed_checkpoint(self, checkpoint);
-        self.write_batch(batch)?;
+        self.write_batch_sync(batch)?;
         Ok(())
     }
 

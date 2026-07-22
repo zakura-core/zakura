@@ -96,6 +96,11 @@ ARTIFACT_ROOT="$HOME/zakura-perf-lab"
 # longer runs average it out. Every bench.sh run injects this as STOP_HEIGHT;
 # per-run extra-env can still override it.
 BENCH_STOP_HEIGHT="${BENCH_STOP_HEIGHT:-1827210}"
+# --- B-15 frozen cohort (approved 2026-07-22) ---
+COHORT_TAG="${COHORT_TAG:-perf-lab-cohort-1}"
+COHORT_SEED_STOP="${COHORT_SEED_STOP:-1836000}"   # window end 1827210 + margin
+COHORT_PEERS=""                                    # id@ip:8234 pairs, set by cohort.sh peers
+
 BATCH_SIZE=8                                   # D3/D6: bench runs per batch
 WIN_THRESHOLD_PCT="3.0"                        # floor; effective = max(this, 2*NOISE_BAND_PCT)
 # max of the clean pinned long-window A/A samples (0.401 / 8.383 / 8.653,
@@ -660,6 +665,43 @@ if ! grep -q "perf-lab B-14" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.s
   grep -q "perf-lab B-14" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
     || echo "WARN: perf-lab B-14 patch no longer applies upstream — disk-fill risk is back" >&2
 fi
+# B-15 cohort patches: env-overridable bootstrap peers + dev_network tag.
+# python (not sed) — the replacement text carries shell syntax that would need
+# a third escaping layer through sed (the CUR_FORK lesson).
+if ! grep -q "perf-lab cohort" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh; then
+  python3 - ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh <<'PYPATCH'
+# Escape-proof by construction: every sensitive character comes from chr(), so
+# no heredoc/python layer can mangle it (the trace_dir-anchor lesson).
+import sys
+path = sys.argv[1]
+lines = open(path).read().split(chr(10))
+q, d, bs = chr(34), chr(36), chr(92)
+out, done_peers, done_dev = [], False, False
+for i, line in enumerate(lines):
+    out.append(line)
+    if (not done_peers and line == ")"
+            and any("ZAKURA_BOOTSTRAP_PEERS=(" in l for l in lines[max(0, i-10):i])):
+        out += [
+            "# perf-lab cohort: PERF_COHORT_PEERS (space-separated id@ip:port)",
+            "# replaces the public bootstrap list when set",
+            "if [ -n " + q + d + "{PERF_COHORT_PEERS:-}" + q + " ]; then",
+            "  read -r -a ZAKURA_BOOTSTRAP_PEERS <<< " + q + d + "PERF_COHORT_PEERS" + q,
+            "fi",
+        ]
+        done_peers = True
+    if not done_dev and "echo" in line and "trace_dir = " in line:
+        ind = line[:len(line) - len(line.lstrip())]
+        out.append(ind + "[ -n " + q + d + "{PERF_DEV_NETWORK:-}" + q + " ] && echo "
+                   + q + "dev_network = " + bs + q + d + "{PERF_DEV_NETWORK}" + bs + q + q
+                   + "  # perf-lab cohort")
+        done_dev = True
+assert done_peers and done_dev, (done_peers, done_dev)
+open(path, "w").write(chr(10).join(out))
+print("cohort patches applied")
+PYPATCH
+  bash -n ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
+    || echo "WARN: cohort patch broke harness syntax — cohort mode unusable" >&2
+fi
 mkdir -p ${BENCH_OUT_REMOTE}
 echo "remote prep done"
 REMOTE
@@ -818,6 +860,13 @@ cmd_start() {
   done
   build_ref="$(resolve_sha "$build_ref")"
   baseline_ref="$(resolve_sha "$baseline_ref")"
+  # B-15 cohort mode: when COHORT_PEERS is set, bodies flow only from the
+  # frozen cohort over the private dev_network tag; the legacy feed pin is
+  # forced empty. Placed before env_str so per-run args can still override.
+  local cohort_env=""
+  if [ -n "${COHORT_PEERS:-}" ]; then
+    cohort_env=" PERF_COHORT_PEERS='${COHORT_PEERS}' PERF_DEV_NETWORK='${COHORT_TAG}' FEED_PEER=''"
+  fi
   local ip; ip="$(ip_of "$name")"; [ -n "$ip" ] || die "no droplet $name"
   # shellcheck disable=SC2087  # client-side expansion of label/refs is intended
   $SSH "${SSH_OPTS[@]}" "root@$ip" bash -s <<REMOTE
@@ -847,7 +896,7 @@ cd ${CTL_CLONE_REMOTE}
     BUILD_REF='${build_ref}' BASELINE_REF='${baseline_ref}' \
     BENCH_HOME='${BENCH_HOME_REMOTE}' \
     STOP_HEIGHT='${BENCH_STOP_HEIGHT}' \
-    OUT_DIR='${BENCH_OUT_REMOTE}/${label}' DASHBOARD=1${env_str} \
+    OUT_DIR='${BENCH_OUT_REMOTE}/${label}' DASHBOARD=1${cohort_env}${env_str} \
     TARGET_P2P_STACK=zakura BASELINE_P2P_STACK=zakura \
     bash scripts/checkpoint-sync-bench.sh
   echo \$? > ${BENCH_OUT_REMOTE}/${label}.exit

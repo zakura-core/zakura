@@ -56,6 +56,13 @@ cmd_start() {
   done
   build_ref="$(resolve_sha "$build_ref")"
   baseline_ref="$(resolve_sha "$baseline_ref")"
+  # B-15 cohort mode: when COHORT_PEERS is set, bodies flow only from the
+  # frozen cohort over the private dev_network tag; the legacy feed pin is
+  # forced empty. Placed before env_str so per-run args can still override.
+  local cohort_env=""
+  if [ -n "${COHORT_PEERS:-}" ]; then
+    cohort_env=" PERF_COHORT_PEERS='${COHORT_PEERS}' PERF_DEV_NETWORK='${COHORT_TAG}' FEED_PEER=''"
+  fi
   local ip; ip="$(ip_of "$name")"; [ -n "$ip" ] || die "no droplet $name"
   # shellcheck disable=SC2087  # client-side expansion of label/refs is intended
   $SSH "${SSH_OPTS[@]}" "root@$ip" bash -s <<REMOTE
@@ -85,7 +92,7 @@ cd ${CTL_CLONE_REMOTE}
     BUILD_REF='${build_ref}' BASELINE_REF='${baseline_ref}' \
     BENCH_HOME='${BENCH_HOME_REMOTE}' \
     STOP_HEIGHT='${BENCH_STOP_HEIGHT}' \
-    OUT_DIR='${BENCH_OUT_REMOTE}/${label}' DASHBOARD=1${env_str} \
+    OUT_DIR='${BENCH_OUT_REMOTE}/${label}' DASHBOARD=1${cohort_env}${env_str} \
     TARGET_P2P_STACK=zakura BASELINE_P2P_STACK=zakura \
     bash scripts/checkpoint-sync-bench.sh
   echo \$? > ${BENCH_OUT_REMOTE}/${label}.exit

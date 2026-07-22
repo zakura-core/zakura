@@ -122,6 +122,43 @@ if ! grep -q "perf-lab B-14" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.s
   grep -q "perf-lab B-14" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
     || echo "WARN: perf-lab B-14 patch no longer applies upstream — disk-fill risk is back" >&2
 fi
+# B-15 cohort patches: env-overridable bootstrap peers + dev_network tag.
+# python (not sed) — the replacement text carries shell syntax that would need
+# a third escaping layer through sed (the CUR_FORK lesson).
+if ! grep -q "perf-lab cohort" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh; then
+  python3 - ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh <<'PYPATCH'
+# Escape-proof by construction: every sensitive character comes from chr(), so
+# no heredoc/python layer can mangle it (the trace_dir-anchor lesson).
+import sys
+path = sys.argv[1]
+lines = open(path).read().split(chr(10))
+q, d, bs = chr(34), chr(36), chr(92)
+out, done_peers, done_dev = [], False, False
+for i, line in enumerate(lines):
+    out.append(line)
+    if (not done_peers and line == ")"
+            and any("ZAKURA_BOOTSTRAP_PEERS=(" in l for l in lines[max(0, i-10):i])):
+        out += [
+            "# perf-lab cohort: PERF_COHORT_PEERS (space-separated id@ip:port)",
+            "# replaces the public bootstrap list when set",
+            "if [ -n " + q + d + "{PERF_COHORT_PEERS:-}" + q + " ]; then",
+            "  read -r -a ZAKURA_BOOTSTRAP_PEERS <<< " + q + d + "PERF_COHORT_PEERS" + q,
+            "fi",
+        ]
+        done_peers = True
+    if not done_dev and "echo" in line and "trace_dir = " in line:
+        ind = line[:len(line) - len(line.lstrip())]
+        out.append(ind + "[ -n " + q + d + "{PERF_DEV_NETWORK:-}" + q + " ] && echo "
+                   + q + "dev_network = " + bs + q + d + "{PERF_DEV_NETWORK}" + bs + q + q
+                   + "  # perf-lab cohort")
+        done_dev = True
+assert done_peers and done_dev, (done_peers, done_dev)
+open(path, "w").write(chr(10).join(out))
+print("cohort patches applied")
+PYPATCH
+  bash -n ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
+    || echo "WARN: cohort patch broke harness syntax — cohort mode unusable" >&2
+fi
 mkdir -p ${BENCH_OUT_REMOTE}
 echo "remote prep done"
 REMOTE

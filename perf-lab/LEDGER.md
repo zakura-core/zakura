@@ -293,3 +293,12 @@ This file is the sole reporting channel (design D5). Entry template:
   regime still ~15% above live-peer throughput with vastly better precision.
 - EXP-002 restart: aa-cohort4 doubles as the default-knob baseline on SHA
   41368ad4 — only k8/k32 needed, back-to-back, now.
+
+### exp002-k8 (2026-07-22) — WIN-candidate
+
+- k=8 legs: 114.83 / 110.09 pc (1078/1113 s) vs k=1 baseline legs 105.26 /
+  105.17 (aa-cohort4, same SHA 41368ad4, same cadence). Worst-vs-best margin
+  +4.7%; means +6.9%. Both k8 legs ≥3% above both baseline legs → the
+  two-leg WIN test passes. k8's own leg spread (4.1%) is wider than the
+  steady 0.1% — batching may chunk delivery; noted, does not overturn the
+  worst-leg margin.

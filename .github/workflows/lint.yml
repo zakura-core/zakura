@@ -12,6 +12,10 @@ on:
       - .github/workflows/lint.yml
       - supply-chain/**
       - "scripts/**.sh"
+      - ".github/workflows/scripts/**"
+      # ci-python-tests covers these suites, so changes to them must trigger it.
+      - "deploy/**"
+      - ".github/scripts/**"
 
   push:
     branches: [main, "feat/**", "release/**"]
@@ -24,6 +28,10 @@ on:
       - .github/workflows/lint.yml
       - supply-chain/**
       - "scripts/**.sh"
+      - ".github/workflows/scripts/**"
+      # ci-python-tests covers these suites, so changes to them must trigger it.
+      - "deploy/**"
+      - ".github/scripts/**"
 
   # Run the full lint suite when a PR is queued so the merge queue validates the
   # merged result against the latest `main`. `merge_group` ignores path filters,
@@ -176,6 +184,28 @@ jobs:
       - name: Run shellcheck
         run: shellcheck scripts/*.sh
 
+  ci-python-tests:
+    name: ci python tests
+    permissions:
+      contents: read
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+
+      # Stdlib-only, so there is nothing to install.
+      - name: Mempool load harness tests
+        run: python3 .github/workflows/scripts/test_mempool_load.py
+
+      - name: Deployer tests
+        run: python3 deploy/deployer/test_deploy.py
+
+      - name: Continuous-sync tests
+        run: python3 deploy/continuous-sync/tests/test_continuous_sync.py
+
   unused-deps:
     name: unused-deps
     # cargo-udeps needs a clean from-scratch nightly build and is not a
@@ -315,6 +345,7 @@ jobs:
       - docs
       - fmt
       - shellcheck
+      - ci-python-tests
       - unused-deps
       - check-cargo-lock
       - no-test-deps

@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("deploy", SCRIPT_DIR / "deploy.py")
 deploy = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
+# Register before exec: dataclasses resolves a class's module through
+# sys.modules, and raises on Python 3.12+ when a decorated class is defined in
+# a module that was never registered.
+sys.modules["deploy"] = deploy
 SPEC.loader.exec_module(deploy)
 
 

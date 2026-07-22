@@ -1,0 +1,387 @@
+name: Mempool load
+
+# Ephemeral mempool throughput / non-regression test for a PR (or any ref) on
+# DigitalOcean.
+#
+# Boots a droplet from the pre-baked PR-node image (deps + warm cargo cache, see
+# zakura-pr-node-bake.yml), builds zakurad from the chosen ref, generates an
+# isolated local-genesis chain with synthetic premine funds, runs `node_count`
+# zakurad nodes peered on loopback, and blasts funded Orchard transactions at
+# them for `duration_minutes`. Grades throughput, propagation latency,
+# backpressure, and tip convergence, then posts a summary as a PR comment.
+#
+# Set `baseline_ref` to run the same workload twice on the same droplet
+# (baseline first, then the target ref) and get a side-by-side regression table.
+#
+# The chain is synthetic and isolated: local genesis, a per-run network magic,
+# and no public peers. No Mainnet state and no real funds are involved.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to test (exactly one of pr_number / ref)"
+        required: false
+      ref:
+        description: "Branch, tag, or SHA to test (exactly one of pr_number / ref)"
+        required: false
+      baseline_ref:
+        description: "Optional second ref to A/B against (e.g. the merge base)"
+        required: false
+      duration_minutes:
+        description: "How long to sustain the transaction blast, per leg"
+        required: false
+        default: "5"
+      node_count:
+        description: "zakurad nodes on the loopback testnet (2-8)"
+        required: false
+        default: "4"
+      tx_rate:
+        description: "Target transactions per second"
+        required: false
+        default: "10"
+      droplet_size:
+        description: "Droplet size (Orchard proving is CPU-bound)"
+        type: choice
+        # A closed list rather than free text: with no approval step, this is
+        # what stops a typo provisioning something enormous for up to 3 hours.
+        options: [c-4, c-8, c-16, c-32]
+        default: c-16
+      kresko_ref:
+        description: "Kresko ref for the load generator (pinned; see scripts/kresko/)"
+        required: false
+        # Pinned, not `main`: the zakura-compat patch is generated against this
+        # tree. A moving ref makes `git apply` fail, or worse, apply to a
+        # changed file. Bump deliberately after re-running the local rehearsal.
+        default: 72fec25d71ba260159826ea54ef88c795f070d35
+      teardown_after_run:
+        description: "Delete the droplet immediately after the run"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: zakura-mempool-load-${{ inputs.pr_number || inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    # Two legs of (build + workload) plus provisioning overhead.
+    timeout-minutes: 180
+    # No environment gate, matching zakura-pr-node.yml: workflow_dispatch
+    # already restricts triggering to accounts with write access. Spend is
+    # bounded instead by the validated input caps below, the droplet_size
+    # choice list, timeout-minutes, teardown_after_run defaulting to true, and
+    # the hourly reaper sweeping the zakura-mempool-load tag.
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs and resolve target
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REF: ${{ inputs.ref }}
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+          NODE_COUNT: ${{ inputs.node_count }}
+          TX_RATE: ${{ inputs.tx_rate }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+        run: |
+          set -euo pipefail
+          if { [ -n "${PR_NUMBER}" ] && [ -n "${REF}" ]; } || { [ -z "${PR_NUMBER}" ] && [ -z "${REF}" ]; }; then
+            echo "provide exactly one of pr_number / ref" >&2
+            exit 1
+          fi
+          # Bound the workload before anything is provisioned: these caps are
+          # what keep a mistyped dispatch from burning hours of paid compute.
+          if [ "${NODE_COUNT}" -lt 2 ] || [ "${NODE_COUNT}" -gt 8 ]; then
+            echo "node_count must be between 2 and 8 (got ${NODE_COUNT})" >&2
+            exit 1
+          fi
+          if [ "${TX_RATE}" -lt 1 ] || [ "${TX_RATE}" -gt 200 ]; then
+            echo "tx_rate must be between 1 and 200 (got ${TX_RATE})" >&2
+            exit 1
+          fi
+          if [ "${DURATION_MINUTES}" -lt 1 ] || [ "${DURATION_MINUTES}" -gt 30 ]; then
+            echo "duration_minutes must be between 1 and 30 (got ${DURATION_MINUTES})" >&2
+            exit 1
+          fi
+          if [ -n "${PR_NUMBER}" ]; then
+            SHA=$(gh pr view "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --json headRefOid --jq .headRefOid)
+            REFSPEC="refs/pull/${PR_NUMBER}/head"
+            PR="${PR_NUMBER}"
+            SLUG="pr${PR_NUMBER}"
+          else
+            SHA=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${REF}" --jq .sha)
+            if [ "${REF}" = "${SHA}" ]; then
+              REFSPEC="${SHA}"
+            else
+              REFSPEC="${REF}"
+            fi
+            PR=$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${REF}" --state open \
+                   --json number --jq '.[0].number // empty' 2>/dev/null || true)
+            SLUG=$(echo "${REF}" | tr -c 'a-zA-Z0-9' '-' | tr -s '-' | sed 's/^-//; s/-$//' | cut -c1-24)
+          fi
+          BASELINE_SHA=""
+          if [ -n "${BASELINE_REF}" ]; then
+            BASELINE_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${BASELINE_REF}" --jq .sha)
+          fi
+          echo "Testing ${SHA} (${REFSPEC}), baseline: ${BASELINE_SHA:-none}, PR: ${PR:-none}"
+          {
+            echo "sha=${SHA}"
+            echo "refspec=${REFSPEC}"
+            echo "baseline_sha=${BASELINE_SHA}"
+            echo "pr=${PR}"
+            echo "slug=${SLUG}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install doctl
+        env:
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          DOCTL_VERSION=1.120.0
+          curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
+          sudo install /tmp/doctl /usr/local/bin/doctl
+          doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
+
+      - name: Write SSH key
+        env:
+          DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+        run: |
+          install -m 600 /dev/null /tmp/do_ssh
+          printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh
+
+      - name: Pick baked image
+        id: baked
+        run: |
+          set -euo pipefail
+          # Reuses the PR-node bake: same deps and warm cargo cache. No chain
+          # state volume -- this workload generates its own chain from genesis.
+          IMAGE=$(doctl compute image list-user --format ID,Name --no-header | \
+            awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | tail -1 | awk '{print $2}')
+          if [ -z "${IMAGE}" ]; then
+            echo "no zakura-pr-node-* image found; run the 'PR node image bake' workflow first" >&2
+            exit 1
+          fi
+          echo "image_id=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Create droplet
+        id: droplet
+        env:
+          DROPLET_SIZE: ${{ inputs.droplet_size || 'c-16' }}
+          SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+          IMAGE_ID: ${{ steps.baked.outputs.image_id }}
+          SLUG: ${{ steps.target.outputs.slug }}
+        run: |
+          set -euo pipefail
+          NAME="zakura-mempool-${SLUG}-${GITHUB_RUN_ID}"
+          # The zakura-mempool-load tag is what the hourly reaper sweeps, so it
+          # must be set at creation -- before anything else can fail.
+          doctl compute droplet create "$NAME" \
+            --region nyc3 \
+            --size "${DROPLET_SIZE}" \
+            --image "${IMAGE_ID}" \
+            --ssh-keys "${SSH_FINGERPRINT}" \
+            --tag-name zakura-mempool-load \
+            --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
+          {
+            echo "id=$(awk '{print $1}' /tmp/droplet.txt)"
+            echo "ip=$(awk '{print $2}' /tmp/droplet.txt)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH
+        id: sshwait
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i /tmp/do_ssh "root@${IP}" true 2>/dev/null; then
+              echo "SSH up"; exit 0
+            fi
+            sleep 10
+          done
+          echo "SSH did not come up in time"; exit 1
+
+      - name: Run the mempool load workload
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+          GH_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.target.outputs.sha }}
+          REFSPEC: ${{ steps.target.outputs.refspec }}
+          BASELINE_REF: ${{ steps.target.outputs.baseline_sha }}
+          NODE_COUNT: ${{ inputs.node_count || '4' }}
+          TX_RATE: ${{ inputs.tx_rate || '10' }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes || '5' }}
+          KRESKO_REF: ${{ inputs.kresko_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          {
+            printf 'GH_REPO=%q\n'        "${GITHUB_REPOSITORY}"
+            printf 'GH_CLONE_TOKEN=%q\n' "${GH_CLONE_TOKEN}"
+            printf 'SHA=%q\n'            "${SHA}"
+            printf 'REFSPEC=%q\n'        "${REFSPEC}"
+            printf 'BASELINE_REF=%q\n'   "${BASELINE_REF}"
+            printf 'NODE_COUNT=%q\n'     "${NODE_COUNT}"
+            printf 'TX_RATE=%q\n'        "${TX_RATE}"
+            printf 'DURATION_SECS=%q\n'  "$(( DURATION_MINUTES * 60 ))"
+            printf 'KRESKO_REPO=%q\n'    "https://github.com/valargroup/kresko.git"
+            printf 'KRESKO_REF=%q\n'     "${KRESKO_REF}"
+          } > /tmp/run.env
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            /tmp/run.env \
+            .github/workflows/scripts/mempool-load-run.sh \
+            .github/workflows/scripts/mempool-load-lab.py \
+            .github/workflows/scripts/mempool-load-monitor.py \
+            .github/workflows/scripts/mempool-load-compare.py \
+            "root@${IP}:/root/"
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            .github/workflows/scripts/kresko/zakura-compat.patch \
+            "root@${IP}:/root/kresko-zakura-compat.patch"
+          rm -f /tmp/run.env
+          # Keepalives: the measured window is long and low-output.
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh "root@${IP}" \
+            'set -euo pipefail; set -a; . /root/run.env; set +a; bash /root/mempool-load-run.sh'
+
+      - name: Collect run outputs
+        if: always() && steps.droplet.outputs.ip != ''
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+        run: |
+          set +e
+          mkdir -p /tmp/out
+          # The droplet-side collect step already applied the artifact
+          # allowlist, so /root/out never contains premine key material.
+          scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            "root@${IP}:/root/out/*" /tmp/out/
+          ls -la /tmp/out
+          true
+
+      - name: Guard against collected key material
+        if: always() && steps.droplet.outputs.ip != ''
+        run: |
+          set -euo pipefail
+          # Defence in depth: the droplet-side allowlist is the primary control,
+          # but nothing is uploaded until this independent check agrees.
+          FOUND=0
+          if find /tmp/out -type f \( -name '*funded_key*' -o -name '*funded_keys*' \
+               -o -name '*treasury_key*' -o -name '*recovery*' \) | grep -q .; then
+            echo "::error::key-material filename found in collected output"
+            find /tmp/out -type f \( -name '*funded_key*' -o -name '*funded_keys*' \
+              -o -name '*treasury_key*' -o -name '*recovery*' \)
+            FOUND=1
+          fi
+          # Content check too: the leak that made this guard necessary was
+          # secret_key_hex inside config.json, a name no filename rule flags.
+          if grep -rlE 'secret_key_hex|bootstrap_treasury_key' /tmp/out 2>/dev/null | grep -q .; then
+            echo "::error::key material found inside collected file contents"
+            grep -rlE 'secret_key_hex|bootstrap_treasury_key' /tmp/out 2>/dev/null
+            FOUND=1
+          fi
+          if [ "$FOUND" -ne 0 ]; then
+            echo "refusing to upload; discarding collected output"
+            rm -rf /tmp/out
+            exit 1
+          fi
+          echo "no key material in collected output"
+
+      - name: Write step summary
+        if: always() && steps.droplet.outputs.ip != ''
+        run: |
+          set -euo pipefail
+          {
+            if [ -f /tmp/out/summary.md ]; then
+              cat /tmp/out/summary.md
+            else
+              printf '## Zakura mempool load run\n\nNo summary was produced — see the job log.\n'
+            fi
+            echo ""
+            if [ -f /tmp/out/run-meta.txt ]; then
+              echo "<!-- $(tr '\n' ' ' < /tmp/out/run-meta.txt) -->"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post PR comment
+        if: always() && steps.target.outputs.pr != '' && steps.droplet.outputs.ip != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR: ${{ steps.target.outputs.pr }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- zakura-mempool-load -->';
+            let summary;
+            try {
+              summary = fs.readFileSync('/tmp/out/summary.md', 'utf8');
+            } catch {
+              summary = '## Zakura mempool load run\n\nNo summary was produced — see the workflow log.';
+            }
+            let meta = '';
+            try {
+              meta = fs.readFileSync('/tmp/out/run-meta.txt', 'utf8').trim().split('\n').join(' | ');
+            } catch { /* optional */ }
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = `${marker}\n${summary}\n\n${meta}\n\n[Workflow run](${runUrl})`;
+            const issue_number = Number(process.env.PR);
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.startsWith(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body,
+              });
+            }
+
+      - name: Upload artifacts
+        if: always() && steps.droplet.outputs.ip != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: zakura-mempool-load-${{ github.run_id }}
+          path: /tmp/out/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Teardown
+        if: always()
+        env:
+          DROPLET_ID: ${{ steps.droplet.outputs.id }}
+          TEARDOWN: ${{ inputs.teardown_after_run }}
+          SSH_FAILED: ${{ steps.sshwait.outcome == 'failure' }}
+        run: |
+          set +e
+          # A droplet we can never SSH into is useless to keep for inspection.
+          if [ "${TEARDOWN}" != "true" ] && [ "${SSH_FAILED}" != "true" ]; then
+            echo "Droplet kept for inspection; the reaper deletes it ~24h after creation."
+            exit 0
+          fi
+          if [ -n "${DROPLET_ID}" ]; then
+            for _ in 1 2 3; do
+              doctl compute droplet delete "${DROPLET_ID}" -f && break
+              sleep 5
+            done
+          fi
+          true

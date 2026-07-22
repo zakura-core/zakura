@@ -1,0 +1,256 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index bb87aba..ece9379 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -27,9 +27,9 @@ chrono = { version = "0.4", default-features = false }
+ # NU7 testnet Zebra crates, pinned to a tagged release so Cargo fetches them
+ # directly (no sibling checkout needed). Cargo.lock pins the exact commit.
+ # For local Zebra co-development, see .cargo/config.toml.example.
+-zebra-chain = { git = "https://github.com/valargroup/zebra", tag = "nu7-testnet-v0.1.0", features = ["internal-miner"] }
+-zebrad = { git = "https://github.com/valargroup/zebra", tag = "nu7-testnet-v0.1.0" }
+-zebra-jsonl-trace = { git = "https://github.com/valargroup/zebra", tag = "nu7-testnet-v0.1.0", version = "0.1.0" }
++zebra-chain = { package = "zakura-chain", path = "ZAKURA_CHECKOUT/zakura-chain", features = ["internal-miner"] }
++zebrad = { package = "zakura", path = "ZAKURA_CHECKOUT/zakurad" }
++zebra-jsonl-trace = { package = "zakura-jsonl-trace", path = "ZAKURA_CHECKOUT/zakura-jsonl-trace" }
+ zcash_primitives = { version = "0.26", features = ["transparent-inputs"] }
+ zcash_protocol = "0.7"
+ zcash_address = "0.10"
+diff --git a/src/commands/genesis.rs b/src/commands/genesis.rs
+index fabf624..df9dfd4 100644
+--- a/src/commands/genesis.rs
++++ b/src/commands/genesis.rs
+@@ -310,6 +310,21 @@ struct PreparedLocalGenesis {
+     payload_local_genesis_files: Vec<(String, Vec<u8>)>,
+ }
+ 
++/// Latest network upgrade to activate on the generated local chain.
++///
++/// Overridable with KRESKO_LATEST_NETWORK_UPGRADE. The default is Nu6_3, not
++/// Nu7: a release-profile node compiles the Nu7 consensus branch id out
++/// entirely (it is test-gated pending librustzcash), so blocks mined at an
++/// Nu7 activation height are rejected with WrongTransactionConsensusBranchId.
++fn local_genesis_upgrade() -> NetworkUpgrade {
++    match std::env::var("KRESKO_LATEST_NETWORK_UPGRADE").ok().as_deref() {
++        Some("nu7") | Some("Nu7") => NetworkUpgrade::Nu7,
++        Some("nu6") | Some("Nu6") => NetworkUpgrade::Nu6,
++        Some("nu5") | Some("Nu5") => NetworkUpgrade::Nu5,
++        _ => NetworkUpgrade::Nu6_3,
++    }
++}
++
+ fn prepare_generated_local_genesis(
+     config: &Config,
+     miner_names: &[String],
+@@ -323,7 +338,7 @@ fn prepare_generated_local_genesis(
+     // for the configured DAA averaging window.
+     let options = LocalTestnetGenesisOptions {
+         network_name: local_network_name(&config.chain_id),
+-        latest_network_upgrade: NetworkUpgrade::Nu7,
++        latest_network_upgrade: local_genesis_upgrade(),
+         disable_pow,
+         target_spacing_secs,
+         seeded_tip_time: None,
+@@ -338,7 +353,7 @@ fn prepare_generated_local_genesis(
+         .network
+         .parameters()
+         .context("generated local genesis did not produce testnet parameters")?;
+-    let activation_height = activation_height(&network_params, NetworkUpgrade::Nu7)?;
++    let activation_height = activation_height(&network_params, local_genesis_upgrade())?;
+     let activation_heights = activation_heights(activation_height);
+ 
+     let genesis_hex = generated
+@@ -401,6 +416,7 @@ fn prepare_generated_local_genesis(
+ 
+     Ok(PreparedLocalGenesis {
+         local_testnet: LocalTestnetParameters {
++            activates_nu7: local_genesis.activation_heights.nu7.is_some(),
+             network_name: local_genesis.network_name.clone(),
+             network_magic: local_genesis.network_magic,
+             target_difficulty_limit: local_genesis.target_difficulty_limit.clone(),
+@@ -436,6 +452,7 @@ fn prepare_generated_local_genesis(
+ }
+ 
+ fn activation_heights(activation_height: u32) -> LocalGenesisActivationHeights {
++    let upgrade = local_genesis_upgrade();
+     LocalGenesisActivationHeights {
+         overwinter: activation_height,
+         sapling: activation_height,
+@@ -445,7 +462,7 @@ fn activation_heights(activation_height: u32) -> LocalGenesisActivationHeights {
+         nu5: activation_height,
+         nu6: activation_height,
+         nu6_1: activation_height,
+-        nu7: activation_height,
++        nu7: (upgrade >= NetworkUpgrade::Nu7).then_some(activation_height),
+     }
+ }
+ 
+diff --git a/src/commands/join_bundle.rs b/src/commands/join_bundle.rs
+index 2372d2f..84fbfbe 100644
+--- a/src/commands/join_bundle.rs
++++ b/src/commands/join_bundle.rs
+@@ -160,6 +160,7 @@ fn render_join_zebrad_config(
+         .with_missing_from(DaaConfig::tuned_25s_defaults());
+     let pow_start_height = payload_pow_start_height(&run_dir.join("payload/local_genesis"))?;
+     let local_testnet = LocalTestnetParameters {
++        activates_nu7: local_genesis.activation_heights.nu7.is_some(),
+         network_name: local_genesis.network_name.clone(),
+         network_magic: local_genesis.network_magic,
+         target_difficulty_limit: local_genesis.target_difficulty_limit.clone(),
+@@ -340,7 +341,7 @@ mod tests {
+                     nu5: 1,
+                     nu6: 1,
+                     nu6_1: 1,
+-                    nu7: 1,
++                    nu7: Some(1),
+                 },
+                 maturity_padding_block_count: 1,
+                 premine_block_count: 1,
+diff --git a/src/config.rs b/src/config.rs
+index 95f316a..b2003de 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -363,7 +363,11 @@ pub struct LocalGenesisActivationHeights {
+     pub nu5: u32,
+     pub nu6: u32,
+     pub nu6_1: u32,
+-    pub nu7: u32,
++    /// None when the target node build has no Nu7 consensus branch id
++    /// (release builds test-gate it), which makes an Nu7 activation
++    /// unminable.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub nu7: Option<u32>,
+ }
+ 
+ impl Config {
+diff --git a/src/pow_tuning.rs b/src/pow_tuning.rs
+index 030fcd1..d52f02e 100644
+--- a/src/pow_tuning.rs
++++ b/src/pow_tuning.rs
+@@ -378,7 +378,7 @@ pub fn benchmark_equihash_solver(inputs: PowBenchInputs) -> Result<PowBenchResul
+         equihash_solutions = equihash_solutions.saturating_add(solved_headers.len());
+         for solved_header in solved_headers {
+             let hash = solved_header.hash();
+-            if solved_header.solution.check(&solved_header).is_ok() {
++            if solved_header.solution.check(&solved_header, &network).is_ok() {
+                 black_box(hash <= max_target);
+                 mining_candidates = mining_candidates.saturating_add(1);
+             }
+diff --git a/src/txblast/mod.rs b/src/txblast/mod.rs
+index 7489907..ece1859 100644
+--- a/src/txblast/mod.rs
++++ b/src/txblast/mod.rs
+@@ -51,10 +51,14 @@ impl consensus::Parameters for TxblastNetworkParams {
+ 
+     fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
+         match self {
+-            Self::LocalGenesis => match nu {
+-                NetworkUpgrade::Nu6_1 => None,
+-                _ => Some(BlockHeight::from_u32(1)),
+-            },
++            // Every upgrade this build knows about is active from height 1,
++            // matching the activation table the config writer puts on the
++            // generated chain (see zebra_config.rs). These two must agree
++            // exactly: if the builder's newest active upgrade differs from the
++            // chain's, every transaction is rejected with "incorrect consensus
++            // branch id". Nu6_1 in particular is active on the chain, so it
++            // must not be excluded here.
++            Self::LocalGenesis => Some(BlockHeight::from_u32(1)),
+             Self::PublicTestnet => consensus::Network::TestNetwork.activation_height(nu),
+             Self::Mainnet => consensus::Network::MainNetwork.activation_height(nu),
+         }
+diff --git a/src/zebra_config.rs b/src/zebra_config.rs
+index 0004f62..36157aa 100644
+--- a/src/zebra_config.rs
++++ b/src/zebra_config.rs
+@@ -79,6 +79,8 @@ pub struct LocalTestnetParameters {
+     pub slow_start_interval: u32,
+     pub pre_blossom_halving_interval: u32,
+     pub activation_height: u32,
++    /// Whether the generated chain activates NU7 (see the activation table below).
++    pub activates_nu7: bool,
+     /// One-time NU6.1 lockbox disbursements emitted in
+     /// `[[network.testnet_parameters.lockbox_disbursements]]`. Kresko's
+     /// default local-genesis path uses a zero-zat synthetic P2SH entry so
+@@ -190,7 +192,7 @@ fn tune_public_block_sync(config: &mut toml::Value) {
+ }
+ 
+ fn zebra_default_config_value() -> Result<toml::Value> {
+-    toml::Value::try_from(zebrad::config::ZebradConfig::default())
++    toml::Value::try_from(zebrad::config::ZakuradConfig::default())
+         .context("failed to serialize Zebra default config")
+ }
+ 
+@@ -512,7 +514,12 @@ pub fn apply_local_testnet_parameters(
+     // NU6.1 is the one-time ZIP-271 lockbox disbursement event. Local genesis
+     // activates it at the same height as NU7 with a zero-zat synthetic
+     // disbursement so Zebra's NU6.1 config validation is explicit.
+-    for upgrade in [
++    // NU7 is included only when the generated chain actually activates it:
++    // a release-profile node compiles the NU7 consensus branch id out (it is
++    // test-gated pending librustzcash), so declaring an NU7 activation the
++    // chain was not built for makes every block at that height unminable
++    // with WrongTransactionConsensusBranchId.
++    let mut upgrades = vec![
+         "Overwinter",
+         "Sapling",
+         "Blossom",
+@@ -521,8 +528,11 @@ pub fn apply_local_testnet_parameters(
+         "NU5",
+         "NU6",
+         "NU6.1",
+-        "NU7",
+-    ] {
++    ];
++    if params.activates_nu7 {
++        upgrades.push("NU7");
++    }
++    for upgrade in upgrades {
+         activation_heights.insert(
+             upgrade.to_string(),
+             toml::Value::Integer(i64::from(params.activation_height)),
+@@ -600,7 +610,12 @@ pub fn verify_local_testnet_parameters(
+         .get("activation_heights")
+         .and_then(toml::Value::as_table)
+         .context("missing network.testnet_parameters.activation_heights table")?;
+-    for upgrade in [
++    // NU7 is included only when the generated chain actually activates it:
++    // a release-profile node compiles the NU7 consensus branch id out (it is
++    // test-gated pending librustzcash), so declaring an NU7 activation the
++    // chain was not built for makes every block at that height unminable
++    // with WrongTransactionConsensusBranchId.
++    let mut upgrades = vec![
+         "Overwinter",
+         "Sapling",
+         "Blossom",
+@@ -609,8 +624,11 @@ pub fn verify_local_testnet_parameters(
+         "NU5",
+         "NU6",
+         "NU6.1",
+-        "NU7",
+-    ] {
++    ];
++    if params.activates_nu7 {
++        upgrades.push("NU7");
++    }
++    for upgrade in upgrades {
+         let height = activation
+             .get(upgrade)
+             .and_then(toml::Value::as_integer)
+@@ -845,7 +863,7 @@ mod tests {
+         // path unless an experiment explicitly asks for it.
+         let default_config = parsed(
+             &toml::to_string_pretty(
+-                &toml::Value::try_from(zebrad::config::ZebradConfig::default())
++                &toml::Value::try_from(zebrad::config::ZakuradConfig::default())
+                     .expect("zebra default should serialize"),
+             )
+             .expect("zebra default should re-serialize"),
+@@ -1151,7 +1169,7 @@ initial_mainnet_peers = []
+         // Trust upstream Zebra to define what fields a config has — kresko
+         // only ever overlays a few mining-friendly knobs.
+         let default_serialized = toml::to_string_pretty(
+-            &toml::Value::try_from(zebrad::config::ZebradConfig::default())
++            &toml::Value::try_from(zebrad::config::ZakuradConfig::default())
+                 .expect("zebra default should serialize"),
+         )
+         .expect("zebra default should re-serialize");

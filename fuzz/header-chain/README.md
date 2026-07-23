@@ -62,8 +62,11 @@ boundary. Explicit hold/release slots retain prepared completions across
 generation retirement or disconnect and require stale releases to have no
 state submission or peer punishment. A named old-response scenario commits a
 different exact branch before release and requires all nine downstream-effect
-sentinels to remain zero. Advisory mutations exercise incomparable work,
-extreme height/retention claims, and pure-requester caps without changing local
+sentinels to remain zero. State dispatch and result hold/release operations
+place a second barrier after the modeled database call; a late success from the
+retired branch must likewise have no coverage, publication, or scheduling
+effect. Advisory mutations exercise incomparable work, extreme
+height/retention claims, and pure-requester caps without changing local
 authority.
 
 `recovery_rows` snapshots all twelve header-engine column families as a raw

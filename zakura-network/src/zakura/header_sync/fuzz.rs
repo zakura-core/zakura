@@ -61,6 +61,12 @@ pub struct HeaderPursuitReplaySummary {
     pub stale_releases: usize,
     /// Unauthenticated status mutations exercised without changing local authority.
     pub advisory_mutations: usize,
+    /// State admission results retained after their write was dispatched.
+    pub held_state_results: usize,
+    /// Held state admission results released through the ownership gate.
+    pub released_state_results: usize,
+    /// Released state results rejected after retirement or scope change.
+    pub stale_state_results: usize,
     /// Downstream effects admitted by current completions; stale scenarios require all zero.
     pub completion_effects: NoEffectsProbe,
 }
@@ -91,6 +97,7 @@ struct PursuitHarness {
     queue: PeerWorkQueue,
     model: HashMap<u8, ModelWork>,
     held: HashMap<u8, HeldCompletion>,
+    held_state: HashMap<u8, HeldCompletion>,
     pending: PendingOwners,
     snapshot: EngineSnapshot,
     observed_at: Instant,
@@ -104,6 +111,7 @@ impl PursuitHarness {
             queue: PeerWorkQueue::default(),
             model: HashMap::new(),
             held: HashMap::new(),
+            held_state: HashMap::new(),
             pending: PendingOwners::default(),
             snapshot: EngineSnapshot {
                 mode: EngineMode::Integrated,
@@ -142,7 +150,10 @@ impl PursuitHarness {
             9 => self.release_completion(marker),
             10 => self.corrupt_advisory(peer_key, marker, flags),
             11 => self.reset_branch(marker),
-            _ => unreachable!("the opcode is reduced modulo twelve"),
+            12 => self.dispatch_state(peer_key, marker, flags),
+            13 => self.hold_state_result(peer_key, marker, flags),
+            14 => self.release_state_result(marker),
+            _ => unreachable!("the opcode is reduced modulo fifteen"),
         }
         self.assert_matches_model();
         assert_eq!(
@@ -569,6 +580,96 @@ impl PursuitHarness {
         }
     }
 
+    fn dispatch_state(&mut self, peer_key: u8, marker: u8, flags: u8) {
+        let supplied_session = session(flags);
+        let supplied_target = target(marker);
+        let Some(ModelWork::Active {
+            session_id,
+            target,
+            owner,
+            phase: HeaderTargetPhase::Preparing,
+            ancestor_bound: true,
+        }) = self.model.get(&peer_key).cloned()
+        else {
+            self.summary.refused_operations += 1;
+            return;
+        };
+        if session_id != supplied_session
+            || target != supplied_target
+            || self
+                .held
+                .values()
+                .any(|completion| completion.owner == owner)
+            || CompletionGate::check(&self.snapshot, &self.pending, source(peer_key), &owner)
+                != CompletionDecision::Current
+        {
+            self.summary.refused_operations += 1;
+            return;
+        }
+        self.queue
+            .active_mut(&peer(peer_key))
+            .expect("the current model request has exact production queue work")
+            .phase = HeaderTargetPhase::Applying;
+        let Some(ModelWork::Active { phase, .. }) = self.model.get_mut(&peer_key) else {
+            unreachable!("the state dispatch matched an active model request");
+        };
+        *phase = HeaderTargetPhase::Applying;
+        self.summary.state_submissions += 1;
+    }
+
+    fn hold_state_result(&mut self, peer_key: u8, marker: u8, flags: u8) {
+        let supplied_session = session(flags);
+        let supplied_target = target(marker);
+        let slot = (flags >> 2).saturating_add(32);
+        let Some(ModelWork::Active {
+            session_id,
+            target,
+            owner,
+            phase: HeaderTargetPhase::Applying,
+            ..
+        }) = self.model.get(&peer_key).cloned()
+        else {
+            self.summary.refused_operations += 1;
+            return;
+        };
+        if session_id != supplied_session
+            || target != supplied_target
+            || self.held_state.contains_key(&slot)
+            || self
+                .held_state
+                .values()
+                .any(|completion| completion.owner == owner)
+        {
+            self.summary.refused_operations += 1;
+            return;
+        }
+        self.held_state
+            .insert(slot, HeldCompletion { peer_key, owner });
+        self.summary.held_state_results += 1;
+    }
+
+    fn release_state_result(&mut self, marker: u8) {
+        let slot = marker % 64;
+        let Some(completion) = self.held_state.remove(&slot) else {
+            self.summary.refused_operations += 1;
+            return;
+        };
+        self.summary.released_state_results += 1;
+        let decision = CompletionGate::check(
+            &self.snapshot,
+            &self.pending,
+            source(completion.peer_key),
+            &completion.owner,
+        );
+        if decision == CompletionDecision::Current {
+            self.record_completion_effects();
+        } else {
+            self.summary.refused_operations += 1;
+            self.summary.stale_state_results += 1;
+        }
+        self.retire_if_exact(completion);
+    }
+
     fn record_completion_effects(&mut self) {
         self.summary.completion_effects.frontier_transitions += 1;
         self.summary.completion_effects.coverage_updates += 1;
@@ -687,10 +788,10 @@ fn hash(marker: u8) -> block::Hash {
 
 fn decode_opcode(byte: u8) -> u8 {
     match byte {
-        0..=11 => byte,
+        0..=14 => byte,
         56..=63 => byte - 56,
-        72..=75 => byte - 64,
-        _ => byte % 12,
+        72..=78 => byte - 64,
+        _ => byte % 15,
     }
 }
 
@@ -844,6 +945,13 @@ mod tests {
                     assert_eq!(first.stale_releases, 1);
                     assert_eq!(first.completion_effects, NoEffectsProbe::default());
                 }
+                "aud_06_late_state_success" => {
+                    assert_eq!(first.state_submissions, 1);
+                    assert_eq!(first.held_state_results, 1);
+                    assert_eq!(first.released_state_results, 1);
+                    assert_eq!(first.stale_state_results, 1);
+                    assert_eq!(first.completion_effects, NoEffectsProbe::default());
+                }
                 "disconnected_held_completion" => {
                     assert_eq!(first.state_submissions, 0);
                     assert_eq!(first.held_completions, 1);
@@ -953,6 +1061,39 @@ mod tests {
         assert_eq!(summary.held_completions, 1);
         assert_eq!(summary.released_completions, 1);
         assert_eq!(summary.stale_releases, 1);
+        assert_eq!(summary.completion_effects, NoEffectsProbe::default());
+        assert_eq!(summary.peer_punishments, 0);
+    }
+
+    #[test]
+    fn aud_06_late_state_success_cannot_publish_cover_or_schedule() {
+        let held_success = [
+            0, 0, 42, 0, // advertise session 1, target 42
+            1, 0, 42, 0, // start exact request
+            2, 0, 42, 0, // bind authenticated ancestry
+            3, 0, 42, 0, // prepare the complete target
+            12, 0, 42, 0, // dispatch the state write
+            13, 0, 42, 0, // hold its success in slot 32
+        ];
+        let mut current = held_success.to_vec();
+        current.extend([
+            14, 0, 32, 0, // release the current state success
+        ]);
+        let current = replay_header_pursuit_bytes(&current);
+        assert_eq!(current.state_submissions, 1);
+        assert_eq!(current.stale_state_results, 0);
+        assert_ne!(current.completion_effects, NoEffectsProbe::default());
+
+        let mut input = held_success.to_vec();
+        input.extend([
+            11, 0, 55, 0, // observe reconciled branch B and retire A
+            14, 0, 32, 0, // release A's old state success
+        ]);
+        let summary = replay_header_pursuit_bytes(&input);
+        assert_eq!(summary.state_submissions, 1);
+        assert_eq!(summary.held_state_results, 1);
+        assert_eq!(summary.released_state_results, 1);
+        assert_eq!(summary.stale_state_results, 1);
         assert_eq!(summary.completion_effects, NoEffectsProbe::default());
         assert_eq!(summary.peer_punishments, 0);
     }

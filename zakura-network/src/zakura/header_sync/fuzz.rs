@@ -1,9 +1,12 @@
 //! Bounded protocol-model replay used by the header-pursuit fuzz target.
 
-use std::{collections::HashMap, num::NonZeroU64};
+use std::{collections::HashMap, num::NonZeroU64, sync::Arc};
 
 use tokio::time::Instant;
-use zakura_chain::{block, work::difficulty::U256};
+use zakura_chain::{
+    block::{self, genesis::regtest_genesis_block},
+    work::difficulty::U256,
+};
 use zakura_header_chain::{
     AlarmSet, BranchId, ChainScore, CompletionDecision, CompletionGate, EngineMode, EngineSnapshot,
     Frontier, FrontierSet, HeaderGeneration, HeaderLocator, PendingOwners, RetiredWork, SourceId,
@@ -71,6 +74,8 @@ pub struct HeaderPursuitReplaySummary {
     pub held_state_failures: usize,
     /// Released state results representing local admission failure.
     pub released_state_failures: usize,
+    /// Equivalent response-page partition matrices completed.
+    pub partition_checks: usize,
     /// Downstream effects admitted by current completions; stale scenarios require all zero.
     pub completion_effects: NoEffectsProbe,
 }
@@ -164,7 +169,8 @@ impl PursuitHarness {
             13 => self.hold_state_result(peer_key, marker, flags),
             14 => self.release_state_result(marker),
             15 => self.hold_state_failure(peer_key, marker, flags),
-            _ => unreachable!("the opcode is reduced modulo sixteen"),
+            16 => self.check_page_partitions(),
+            _ => unreachable!("the opcode is reduced modulo seventeen"),
         }
         self.assert_matches_model();
         assert_eq!(
@@ -714,6 +720,74 @@ impl PursuitHarness {
         self.summary.completion_effects.peer_scores += 1;
     }
 
+    fn check_page_partitions(&mut self) {
+        let anchor = self.snapshot.frontiers.header_best;
+        let mut parent_hash = anchor.hash;
+        let mut entries = Vec::new();
+        for index in 0..4_u8 {
+            let mut header = *regtest_genesis_block().header;
+            header.previous_block_hash = parent_hash;
+            header.nonce.0[0] = index.saturating_add(1);
+            let header = Arc::new(header);
+            parent_hash = header.hash();
+            entries.push(super::HeaderEntry {
+                header,
+                body_size: 0,
+                tree_aux: None,
+            });
+        }
+        let target = parent_hash;
+        let mut template = request(&self.snapshot, self.observed_at, 0, 1, 42);
+        template.target.status.selected_tip_height =
+            block::Height(anchor.height.0.saturating_add(4));
+        template.target.status.selected_tip_hash = target;
+        template.owner.branch.target_tip_hash = target;
+
+        let mut canonical = None;
+        for partition in [vec![4], vec![1, 3], vec![2, 2], vec![1, 1, 2]] {
+            let mut active = template.clone();
+            let mut offset = 0usize;
+            for count in partition {
+                let returned_ancestor = active.staged_tip().unwrap_or(anchor);
+                assert!(
+                    active.accepts_response_page(target, returned_ancestor, count),
+                    "each continuation page preserves exact staged ancestry"
+                );
+                active.common_ancestor.get_or_insert(returned_ancestor);
+                active.entries.extend(
+                    entries[offset..offset.saturating_add(count)]
+                        .iter()
+                        .cloned(),
+                );
+                offset = offset.saturating_add(count);
+            }
+            assert_eq!(offset, entries.len());
+            assert_eq!(
+                active.staged_tip(),
+                Some(Frontier::new(
+                    block::Height(anchor.height.0.saturating_add(4)),
+                    target,
+                ))
+            );
+            active.phase = HeaderTargetPhase::Preparing;
+            let staged_tip = active.staged_tip();
+            let projection = (
+                active.common_ancestor,
+                active.entries,
+                staged_tip,
+                active.phase,
+            );
+            match canonical.as_ref() {
+                Some(expected) => assert_eq!(
+                    &projection, expected,
+                    "page boundaries cannot change complete-target admission"
+                ),
+                None => canonical = Some(projection),
+            }
+        }
+        self.summary.partition_checks += 1;
+    }
+
     fn retire(&mut self, peer_key: u8, owner: WorkOwner) {
         assert_eq!(
             self.pending.remove(source(peer_key), owner.request_id),
@@ -820,10 +894,10 @@ fn hash(marker: u8) -> block::Hash {
 
 fn decode_opcode(byte: u8) -> u8 {
     match byte {
-        0..=15 => byte,
+        0..=16 => byte,
         56..=63 => byte - 56,
-        72..=79 => byte - 64,
-        _ => byte % 16,
+        72..=80 => byte - 64,
+        _ => byte % 17,
     }
 }
 
@@ -993,6 +1067,7 @@ mod tests {
                     assert_eq!(first.stale_state_results, 1);
                     assert_eq!(first.completion_effects, NoEffectsProbe::default());
                 }
+                "page_partitions" => assert_eq!(first.partition_checks, 1),
                 "disconnected_held_completion" => {
                     assert_eq!(first.state_submissions, 0);
                     assert_eq!(first.held_completions, 1);
@@ -1182,6 +1257,14 @@ mod tests {
         }
         let summary = replay_header_pursuit_bytes(&input);
         assert_eq!(summary.advisory_mutations, 4);
+        assert_eq!(summary.state_submissions, 0);
+        assert_eq!(summary.peer_punishments, 0);
+    }
+
+    #[test]
+    fn complete_target_is_independent_of_page_partition() {
+        let summary = replay_header_pursuit_bytes(&[16, 0, 0, 0]);
+        assert_eq!(summary.partition_checks, 1);
         assert_eq!(summary.state_submissions, 0);
         assert_eq!(summary.peer_punishments, 0);
     }

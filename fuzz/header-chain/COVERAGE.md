@@ -22,7 +22,7 @@ the remaining gap. Fuzzer reachability alone is not requirement coverage.
 | Fixed-anchor 999/1,000/1,001 replacement | Planner in both arrival orders | LC-REORG-01 | `fixed_anchor_999_1000_1001` | Covered |
 | Logical crash/reopen | Retained digest and snapshot clone | LC-RECOVER-02, LC-FRONTIER-04 | `crash_reopen`, `aud_incident_late_a_after_b_promotion` | Partial: production disk reopen is a separate target, not periodic inside `fork_transitions` |
 | Block specification mutations | Generated header builder | LC-VAL-02..08 | hard-work and deferred-time classes | Partial: general `time_delta`, commitment cases, and one-invalid-field generation remain open |
-| Page partition equivalence | Target-bound staging/admission | LC-WIRE-03, LC-WIRE-05 | requester reactor tests | Open in the structured fuzz operation language |
+| Page partition equivalence | Target-bound staging/admission | LC-WIRE-03, LC-WIRE-05 | `page_partitions` plus requester reactor tests | Covered |
 
 ## Pursuit and ownership domain
 

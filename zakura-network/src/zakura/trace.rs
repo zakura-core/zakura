@@ -399,6 +399,10 @@ pub mod header_sync_trace {
     pub const FINALIZED_HEIGHT: &str = "finalized_height";
     /// Durable best header tip observed by the header scheduler.
     pub const BEST_HEADER_TIP: &str = "best_header_tip";
+    /// Confirmable root heights missing before the first retained response.
+    pub const ROOT_AUTH_HOLE_HEIGHTS: &str = "root_auth_hole_heights";
+    /// First retained root-carrying response start, when one exists.
+    pub const FIRST_RETAINED_ROOT_HEIGHT: &str = "first_retained_root_height";
     /// Number of header-carried tree-aux roots present on this send/receive.
     pub const TREE_AUX_ROOTS_LEN: &str = "tree_aux_roots_len";
     /// First encoded tree-aux root height.
@@ -462,6 +466,8 @@ pub mod header_sync_trace {
     pub const HEADER_FRONTIER_REANCHORED: &str = "header_frontier_reanchored";
     /// Missing block bodies reported.
     pub const HEADER_MISSING_BODIES_REPORTED: &str = "header_missing_bodies_reported";
+    /// Root-authentication frontier, retained boundary, and exact missing-root count changed.
+    pub const HEADER_ROOT_AUTH_DIAGNOSTICS: &str = "header_root_auth_diagnostics";
     /// The reactor woke because a real retry, timeout, or status deadline expired.
     pub const HEADER_MAINTENANCE_WAKEUP: &str = "header_maintenance_wakeup";
 }

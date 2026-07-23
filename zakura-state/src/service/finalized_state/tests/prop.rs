@@ -148,13 +148,17 @@ fn vct_successor_witness_uses_stored_header_without_body() {
             genesis.hash(),
             std::slice::from_ref(&block1.header),
             &[0],
-            &[roots],
+            std::slice::from_ref(&roots),
         )
         .expect("block 1 header is contextually valid");
     state
         .db
         .write_batch(batch)
         .expect("header range batch writes");
+    state
+        .db
+        .insert_zakura_header_commitment_roots([roots])
+        .expect("authenticated-root fixture writes");
 
     assert!(
         state.db.block(Height(1).into()).is_none(),

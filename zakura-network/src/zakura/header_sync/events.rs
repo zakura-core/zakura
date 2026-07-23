@@ -15,6 +15,19 @@ pub struct HeaderSyncFrontiers {
     pub verified_block_hash: block::Hash,
 }
 
+/// Compact durable header-root authentication progress supplied by state.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderRootAuthState {
+    /// Last height whose supplied roots are authenticated.
+    pub authenticated_height: block::Height,
+    /// Canonical hash at `authenticated_height`.
+    pub authenticated_hash: block::Hash,
+    /// Highest checkpoint whose complete canonical bracket is durable.
+    pub completed_checkpoint_height: block::Height,
+    /// Canonical configured hash at `completed_checkpoint_height`.
+    pub completed_checkpoint_hash: block::Hash,
+}
+
 /// Startup inputs for the dependency-neutral header-sync reactor.
 #[derive(Clone, Debug)]
 pub struct HeaderSyncStartup {
@@ -26,6 +39,8 @@ pub struct HeaderSyncStartup {
     pub frontiers: HeaderSyncFrontiers,
     /// Durable best header tip loaded from storage at startup.
     pub best_header_tip: Option<(block::Height, block::Hash)>,
+    /// Durable header-root authentication state loaded at startup.
+    pub header_root_auth: Option<HeaderRootAuthState>,
     /// Shared sync exchange frontier stream.
     pub frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
     /// Local header-sync advertisement.
@@ -62,6 +77,7 @@ impl HeaderSyncStartup {
             anchor,
             frontiers,
             best_header_tip,
+            header_root_auth: None,
             frontier_updates: None,
             config,
             max_frame_bytes,
@@ -262,6 +278,8 @@ pub enum HeaderSyncEvent {
     },
     /// State finalized or verified-body frontiers changed.
     StateFrontiersChanged(HeaderSyncFrontiers),
+    /// Durable header-root authentication or completed-checkpoint frontier changed.
+    HeaderRootAuthStateChanged(Option<HeaderRootAuthState>),
     /// State needs a bounded re-delivery of VCT supplied roots for a covered height.
     VctRootRepairRequested {
         /// Height whose supplied root is missing or was evicted after rejection.
@@ -298,6 +316,18 @@ pub enum HeaderSyncEvent {
         operation: HeaderSyncOperationIdentity,
         /// Whether state rejected peer data or hit a local resource/channel failure.
         kind: HeaderSyncCommitFailureKind,
+    },
+    /// State durably authenticated roots supplied by an exact wire request.
+    HeaderRootAuthenticationCompleted {
+        /// Exact root-authentication operation that completed.
+        operation: HeaderSyncOperationIdentity,
+    },
+    /// State rejected an exact root-authentication operation.
+    HeaderRootAuthenticationFailed {
+        /// Exact root-authentication operation that failed.
+        operation: HeaderSyncOperationIdentity,
+        /// Stable failure class used for retry and peer attribution.
+        kind: HeaderRootAuthenticationFailureKind,
     },
     /// Node wiring finished or abandoned a `Headers` response to an inbound `GetHeaders`.
     HeaderRangeResponseFinished {
@@ -357,11 +387,16 @@ impl HeaderSyncEvent {
             Self::WireDecodeFailed { .. } => "wire_decode_failed",
             Self::WireProtocolFailure { .. } => "wire_protocol_failure",
             Self::StateFrontiersChanged(_) => "state_frontiers_changed",
+            Self::HeaderRootAuthStateChanged(_) => "header_root_auth_state_changed",
             Self::VctRootRepairRequested { .. } => "vct_root_repair_requested",
             Self::VctRootRepairResolved { .. } => "vct_root_repair_resolved",
             Self::BestHeaderTipLoaded { .. } => "best_header_tip_loaded",
             Self::HeaderRangeOperationCompleted { .. } => "header_range_operation_completed",
             Self::HeaderRangeOperationFailed { .. } => "header_range_operation_failed",
+            Self::HeaderRootAuthenticationCompleted { .. } => {
+                "header_root_authentication_completed"
+            }
+            Self::HeaderRootAuthenticationFailed { .. } => "header_root_authentication_failed",
             Self::HeaderRangeResponseFinished { .. } => "header_range_response_finished",
             Self::HeaderRangeResponseReady { .. } => "header_range_response_ready",
         }
@@ -391,6 +426,17 @@ pub enum HeaderSyncAction {
         payload: HeaderRangePayload,
         /// Whether the range is expected to be finalized by checkpoint policy.
         finalized: bool,
+    },
+    /// Ask state to authenticate roots against already-canonical headers.
+    AuthenticateHeaderRoots {
+        /// Exact root-authentication operation represented by this action.
+        operation: HeaderSyncOperationIdentity,
+        /// Exact compact state snapshot used to schedule this operation.
+        expected_state: HeaderRootAuthState,
+        /// Current authenticated frontier hash.
+        anchor: block::Hash,
+        /// Checked headers and aligned roots, including the successor witness.
+        payload: HeaderRangePayload,
     },
     /// Ask state for the durable best header tip.
     QueryBestHeaderTip,
@@ -506,6 +552,25 @@ pub enum HeaderSyncCommitFailureKind {
     /// The supplied headers failed contextual validation or checkpoint consistency.
     InvalidPeerRange,
     /// Local storage/channel/resource failure; do not score the peer.
+    Local,
+}
+
+/// Root-authentication failure classification returned by node wiring.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HeaderRootAuthenticationFailureKind {
+    /// The compact state snapshot raced newer durable progress; retry without blame.
+    Stale,
+    /// A supplied header no longer matches canonical storage.
+    ///
+    /// Retained coverage is invalidated at and above this height without peer
+    /// blame. Fresh fallback responses are attributed to their supplying peer.
+    CanonicalMismatch {
+        /// First height that differed from canonical storage.
+        height: block::Height,
+    },
+    /// The supplying peer's roots or aligned records were invalid.
+    InvalidPeerRange,
+    /// Local storage/channel/frontier failure; do not score the peer.
     Local,
 }
 

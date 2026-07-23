@@ -5,8 +5,8 @@ use super::super::{
     config::HeaderSyncStatus,
     error::HeaderSyncWireError,
     events::{
-        HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncMisbehavior,
-        HeaderSyncOperationKind, HeaderSyncRequestId,
+        HeaderRootAuthenticationFailureKind, HeaderSyncAction, HeaderSyncCommitFailureKind,
+        HeaderSyncEvent, HeaderSyncMisbehavior, HeaderSyncOperationKind, HeaderSyncRequestId,
     },
     state::RangeRequest,
     validation::count_between,
@@ -58,6 +58,52 @@ impl HeaderSyncReactor {
     pub(super) fn trace_event_received(&self, event: &HeaderSyncEvent) {
         self.emit_trace(hs_trace::HEADER_EVENT_RECEIVED, |row| {
             trace_event_fields(row, event);
+        });
+    }
+
+    pub(super) fn trace_root_auth_diagnostics(&mut self) {
+        let Some(auth) = self.state.header_root_auth else {
+            return;
+        };
+        let first_retained_root_height = auth
+            .authenticated_height
+            .0
+            .checked_add(1)
+            .map(block::Height)
+            .and_then(|start| {
+                self.state
+                    .retained_roots
+                    .range(start..)
+                    .next()
+                    .map(|(&height, _)| height)
+            });
+        let snapshot = super::RootAuthTraceSnapshot {
+            authenticated_height: auth.authenticated_height,
+            completed_checkpoint_height: auth.completed_checkpoint_height,
+            best_header_tip: self.state.best_header_tip,
+            first_retained_root_height,
+            hole_heights: self.state.root_auth_hole_heights(&self.startup, auth),
+        };
+        if self.root_auth_trace_snapshot == Some(snapshot) {
+            return;
+        }
+        self.root_auth_trace_snapshot = Some(snapshot);
+        self.emit_trace(hs_trace::HEADER_ROOT_AUTH_DIAGNOSTICS, |row| {
+            insert_height(row, hs_trace::HEIGHT, snapshot.authenticated_height);
+            insert_height(
+                row,
+                "completed_checkpoint_height",
+                snapshot.completed_checkpoint_height,
+            );
+            insert_height(row, hs_trace::BEST_HEADER_TIP, snapshot.best_header_tip);
+            insert_u64(
+                row,
+                hs_trace::ROOT_AUTH_HOLE_HEIGHTS,
+                u64::from(snapshot.hole_heights),
+            );
+            if let Some(height) = snapshot.first_retained_root_height {
+                insert_height(row, hs_trace::FIRST_RETAINED_ROOT_HEIGHT, height);
+            }
         });
     }
 
@@ -497,6 +543,17 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
             insert_height(row, "finalized_height", frontiers.finalized_height);
             insert_height(row, "verified_block_tip", frontiers.verified_block_tip);
         }
+        HeaderSyncEvent::HeaderRootAuthStateChanged(state) => {
+            insert_optional_str(row, hs_trace::KIND, Some("header_root_auth_state_changed"));
+            if let Some(state) = state {
+                insert_height(row, hs_trace::HEIGHT, state.authenticated_height);
+                insert_height(
+                    row,
+                    "completed_checkpoint_height",
+                    state.completed_checkpoint_height,
+                );
+            }
+        }
         HeaderSyncEvent::VctRootRepairRequested {
             height,
             generation,
@@ -561,6 +618,46 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
                 row,
                 hs_trace::REASON,
                 Some(commit_failure_reason_label(*kind)),
+            );
+        }
+        HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation } => {
+            insert_optional_str(
+                row,
+                hs_trace::KIND,
+                Some("header_root_authentication_completed"),
+            );
+            insert_peer(row, hs_trace::PEER, &operation.wire_request.peer);
+            insert_u64(row, hs_trace::SESSION_ID, operation.wire_request.session_id);
+            insert_u64(
+                row,
+                hs_trace::REQUEST_ID,
+                operation.wire_request.request_id.get(),
+            );
+        }
+        HeaderSyncEvent::HeaderRootAuthenticationFailed { operation, kind } => {
+            insert_optional_str(
+                row,
+                hs_trace::KIND,
+                Some("header_root_authentication_failed"),
+            );
+            insert_peer(row, hs_trace::PEER, &operation.wire_request.peer);
+            insert_u64(row, hs_trace::SESSION_ID, operation.wire_request.session_id);
+            insert_u64(
+                row,
+                hs_trace::REQUEST_ID,
+                operation.wire_request.request_id.get(),
+            );
+            insert_optional_str(
+                row,
+                hs_trace::REASON,
+                Some(match kind {
+                    HeaderRootAuthenticationFailureKind::Stale => "stale",
+                    HeaderRootAuthenticationFailureKind::CanonicalMismatch { .. } => {
+                        "canonical_mismatch"
+                    }
+                    HeaderRootAuthenticationFailureKind::InvalidPeerRange => "invalid_peer_range",
+                    HeaderRootAuthenticationFailureKind::Local => "local",
+                }),
             );
         }
         HeaderSyncEvent::HeaderRangeResponseFinished {
@@ -657,6 +754,24 @@ fn trace_action_fields(row: &mut serde_json::Map<String, Value>, action: &Header
                 row,
                 "operation_kind",
                 Some(operation_kind_label(operation.op_kind)),
+            );
+            insert_height(row, hs_trace::RANGE_START, payload.range().start());
+            insert_u64(
+                row,
+                hs_trace::RANGE_COUNT,
+                u64::from(payload.range().count()),
+            );
+        }
+        HeaderSyncAction::AuthenticateHeaderRoots {
+            operation, payload, ..
+        } => {
+            insert_optional_str(row, hs_trace::KIND, Some("authenticate_header_roots"));
+            insert_peer(row, hs_trace::PEER, &operation.wire_request.peer);
+            insert_u64(row, hs_trace::SESSION_ID, operation.wire_request.session_id);
+            insert_u64(
+                row,
+                hs_trace::REQUEST_ID,
+                operation.wire_request.request_id.get(),
             );
             insert_height(row, hs_trace::RANGE_START, payload.range().start());
             insert_u64(

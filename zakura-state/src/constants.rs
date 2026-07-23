@@ -88,7 +88,7 @@ const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.
-const DATABASE_FORMAT_PATCH_VERSION: u64 = 1;
+const DATABASE_FORMAT_PATCH_VERSION: u64 = 2;
 
 /// Returns the full semantic version of the currently running state database format code.
 ///

@@ -31,7 +31,7 @@ rpc-client = [
 ]
 
 [dependencies]
-zakura-chain = { path = "../zakura-chain" , version = "2.0.0" }
+zakura-chain = { path = "../zakura-chain" , version = "3.0.0" }
 tower = { workspace = true }
 
 # Optional dependencies

@@ -211,4 +211,26 @@ mod tests {
         coverage.retain_current(old_generation, Frontier::new(block::Height(12), hash(2)));
         assert_eq!(coverage.len(), 0, "an anchor change also retires coverage");
     }
+
+    #[test]
+    fn generation_change_conservatively_reuses_no_finalized_or_forward_coverage() {
+        let old_generation = HeaderGeneration::new(4);
+        let new_generation = HeaderGeneration::new(5);
+        let selected = branch(1, 9);
+        let finalized = Frontier::new(block::Height(10), selected.anchor_hash);
+        let mut coverage = CoverageMap::default();
+        coverage.mark(old_generation, range(selected, 1, 10));
+        coverage.mark(old_generation, range(selected, 11, 20));
+        assert_eq!(coverage.len(), 1);
+
+        coverage.retain_current(new_generation, finalized);
+
+        assert_eq!(
+            coverage.len(),
+            0,
+            "without an authenticated reuse proof, generation retirement drops every interval"
+        );
+        assert!(!coverage.covers_tip(new_generation, selected, block::Height(10)));
+        assert!(!coverage.covers_tip(new_generation, selected, block::Height(20)));
+    }
 }

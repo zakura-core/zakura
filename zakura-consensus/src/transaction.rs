@@ -1378,7 +1378,7 @@ impl AsyncChecks {
         let mut block_batch_flush = match block_batch_flush_key {
             Some(key) => async move {
                 tokio::task::yield_now().await;
-                primitives::start_block_transaction_async_checks(key).await;
+                primitives::start_block_transaction_async_checks(key);
             }
             .boxed(),
             None => futures::future::pending().boxed(),

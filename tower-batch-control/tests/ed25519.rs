@@ -247,6 +247,32 @@ async fn sign_and_verify_after_explicit_flush(
     Ok(())
 }
 
+async fn sign_and_verify_after_try_flush(
+    mut verifier: Batch<Verifier, Item>,
+    n: usize,
+) -> Result<(), BoxError> {
+    let mut results = FuturesOrdered::new();
+    for _ in 0..n {
+        let sk = SigningKey::new(thread_rng());
+        let vk_bytes = VerificationKeyBytes::from(&sk);
+        let msg = b"BatchVerifyTest";
+        let sig = sk.sign(&msg[..]);
+
+        verifier.ready().await?;
+        results.push_back(verifier.call((vk_bytes, sig, msg).into()));
+    }
+
+    if !verifier.try_flush()? {
+        return Err("try_flush should queue a flush on a quiet batch".into());
+    }
+
+    while let Some(result) = results.next().await {
+        result?;
+    }
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn batch_flushes_on_max_items_weight() -> Result<(), Report> {
     use tokio::time::timeout;
@@ -313,6 +339,25 @@ async fn batch_flush_on_empty_batch_is_noop() -> Result<(), Report> {
     timeout(
         Duration::from_secs(1),
         sign_and_verify_after_explicit_flush(verifier, 10),
+    )
+    .await
+    .map_err(|e| eyre!(e))?
+    .map_err(|e| eyre!(e))?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_flushes_on_try_flush() -> Result<(), Report> {
+    use tokio::time::timeout;
+    let _init_guard = zakura_test::init();
+
+    // Use a very high max_items and long max_latency. Without the non-blocking
+    // flush, this verification would wait for the latency timer.
+    let verifier = Batch::new(Verifier::default(), 100, 10, Duration::from_secs(1000));
+    timeout(
+        Duration::from_secs(1),
+        sign_and_verify_after_try_flush(verifier, 10),
     )
     .await
     .map_err(|e| eyre!(e))?

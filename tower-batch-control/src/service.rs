@@ -12,7 +12,7 @@ use std::{
 use futures_core::ready;
 use tokio::{
     pin,
-    sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore, TryAcquireError},
     task::JoinHandle,
 };
 use tokio_util::sync::PollSemaphore;
@@ -250,6 +250,39 @@ where
                 span: tracing::Span::current(),
                 _permit,
             })
+            .map_err(|_| self.get_worker_error())
+    }
+
+    /// Explicitly flushes the current pending batch, if queue capacity is
+    /// immediately available.
+    ///
+    /// Non-blocking twin of [`flush`](Self::flush): the flush is queued after
+    /// item requests that have already been sent to this batch worker, and
+    /// `Ok(true)` means the command has been queued, not that the underlying
+    /// batch has completed. Returns `Ok(false)` without queueing when the
+    /// queue is at capacity: a full queue is already flushing batches on size,
+    /// so an explicit flush would add nothing.
+    ///
+    /// If this service holds a readiness reservation from an earlier
+    /// [`poll_ready`](Service::poll_ready) call, the flush consumes it, so
+    /// callers must poll readiness again before the next
+    /// [`call`](Service::call).
+    pub fn try_flush(&mut self) -> Result<bool, crate::BoxError> {
+        let _permit = match self.permit.take() {
+            Some(permit) => permit,
+            None => match self.semaphore.clone_inner().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(TryAcquireError::NoPermits) => return Ok(false),
+                Err(TryAcquireError::Closed) => return Err(self.get_worker_error()),
+            },
+        };
+
+        self.tx
+            .send(Message::Flush {
+                span: tracing::Span::current(),
+                _permit,
+            })
+            .map(|()| true)
             .map_err(|_| self.get_worker_error())
     }
 }

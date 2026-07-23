@@ -98,9 +98,9 @@ pub(crate) fn block_verifier_batch_flush_key<T>(
 /// Records that one block transaction has started its async checks, and
 /// flushes the shared crypto batches when all transactions in the block have
 /// reached that boundary.
-pub(crate) async fn start_block_transaction_async_checks(key: BlockVerifierBatchFlushKey) {
+pub(crate) fn start_block_transaction_async_checks(key: BlockVerifierBatchFlushKey) {
     if block_verifier_batch_flush_ready(key) {
-        flush_block_verifier_batches().await;
+        flush_block_verifier_batches();
     }
 }
 
@@ -129,41 +129,46 @@ fn block_verifier_batch_flush_ready(key: BlockVerifierBatchFlushKey) -> bool {
 ///
 /// The block verifier still awaits every transaction verifier future before
 /// committing a block; this just starts pending batch work before
-/// [`MAX_BATCH_LATENCY`] expires.
-async fn flush_block_verifier_batches() {
+/// [`MAX_BATCH_LATENCY`] expires. Saturated queues are skipped: a full queue
+/// is already flushing batches on size, and waiting for capacity would couple
+/// block latency to unrelated verifier traffic.
+fn flush_block_verifier_batches() {
     if let Some(verifier) = Lazy::get(&ed25519::VERIFIER) {
-        queue_batch_flush("ed25519", verifier.primary().clone().flush().await);
+        queue_batch_flush("ed25519", verifier.primary().clone().try_flush());
     }
 
     if let Some(verifier) = Lazy::get(&sapling::VERIFIER) {
-        queue_batch_flush("sapling", verifier.primary().clone().flush().await);
+        queue_batch_flush("sapling", verifier.primary().clone().try_flush());
     }
 
     if let Some(verifier) = Lazy::get(&halo2::VERIFIER_PRE_NU6_2) {
-        queue_batch_flush("halo2_pre_nu6_2", verifier.primary().clone().flush().await);
+        queue_batch_flush("halo2_pre_nu6_2", verifier.primary().clone().try_flush());
     }
 
     if let Some(verifier) = Lazy::get(&halo2::VERIFIER_NU6_2) {
-        queue_batch_flush("halo2_nu6_2", verifier.primary().clone().flush().await);
+        queue_batch_flush("halo2_nu6_2", verifier.primary().clone().try_flush());
     }
 
     if let Some(verifier) = Lazy::get(&halo2::VERIFIER_NU6_3_ONWARD) {
-        queue_batch_flush(
-            "halo2_nu6_3_onward",
-            verifier.primary().clone().flush().await,
-        );
+        queue_batch_flush("halo2_nu6_3_onward", verifier.primary().clone().try_flush());
     }
 }
 
-/// Logs best-effort flush queueing failures without changing verification
-/// semantics.
-fn queue_batch_flush(verifier: &'static str, result: Result<(), BoxError>) {
-    if let Err(error) = result {
-        tracing::trace!(
-            ?error,
-            verifier,
-            "could not queue explicit block verifier batch flush"
-        );
+/// Logs best-effort flush queueing skips and failures without changing
+/// verification semantics.
+fn queue_batch_flush(verifier: &'static str, result: Result<bool, BoxError>) {
+    match result {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::trace!(verifier, "batch queue saturated, skipping explicit flush");
+        }
+        Err(error) => {
+            tracing::trace!(
+                ?error,
+                verifier,
+                "could not queue explicit block verifier batch flush"
+            );
+        }
     }
 }
 

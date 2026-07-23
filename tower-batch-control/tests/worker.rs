@@ -141,6 +141,27 @@ async fn explicit_flush_waits_for_queue_capacity() {
 }
 
 #[tokio::test]
+async fn try_flush_skips_when_queue_saturated() {
+    let _init_guard = zakura_test::init();
+
+    let (service, mut handle) = mock::pair::<_, ()>();
+    let (mut service, worker) = Batch::pair(service, 1, 1, Duration::from_secs(1000));
+    let mut worker = task::spawn(worker.run());
+
+    handle.allow(2);
+    service.ready().await.unwrap();
+    let _response = service.call(());
+
+    // The queued item holds the only permit, so a non-blocking flush is skipped.
+    let mut flush_service = service.clone();
+    assert!(matches!(flush_service.try_flush(), Ok(false)));
+
+    // Once the worker drains the queue, the permit frees and try_flush queues.
+    assert_pending!(worker.poll());
+    assert!(matches!(flush_service.try_flush(), Ok(true)));
+}
+
+#[tokio::test]
 async fn explicit_flush_completes_zero_weight_items() {
     use tokio::time::timeout;
     let _init_guard = zakura_test::init();

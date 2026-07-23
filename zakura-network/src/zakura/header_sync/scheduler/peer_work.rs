@@ -3,7 +3,7 @@ use std::{cmp::Ordering, collections::HashMap};
 use tokio::time::Instant;
 
 use zakura_header_chain::{
-    EngineSnapshot, Frontier, HeaderLocator, WorkOwner, MAX_STAGED_TARGETS_V1,
+    EngineSnapshot, Frontier, HeaderLocator, SourceId, WorkOwner, MAX_STAGED_TARGETS_V1,
 };
 
 use super::super::{AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId};
@@ -46,6 +46,8 @@ impl AdvertisedHeaderTarget {
 pub struct ActiveHeaderRequest {
     /// Peer whose current session owns the request.
     pub peer: ZakuraPeerId,
+    /// Stable source identity used by completion ownership.
+    pub source: SourceId,
     /// Exact status snapshot being pursued.
     pub target: AdvertisedHeaderTarget,
     /// Exact coherent state locator sent in the request.
@@ -58,12 +60,23 @@ pub struct ActiveHeaderRequest {
     pub common_ancestor: Option<Frontier>,
     /// Complete response pages staged without intermediate state mutation.
     pub entries: Vec<HeaderEntry>,
-    /// True after the complete target has been handed to the admission driver.
-    pub admission_pending: bool,
+    /// Exact phase of complete-target processing.
+    pub phase: HeaderTargetPhase,
     /// Effective count bound preserved across continuation requests.
     pub max_header_count: u32,
     /// Requested auxiliary schema preserved across continuation requests.
     pub tree_aux_schema: AuxSchema,
+}
+
+/// Reactor-owned phase that permits each target preparation and state submission once.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HeaderTargetPhase {
+    /// Response pages are still being received and staged.
+    Receiving,
+    /// The complete target is being validated outside the reactor.
+    Preparing,
+    /// Sealed evidence has passed the gate and one state call is pending.
+    Applying,
 }
 
 impl ActiveHeaderRequest {
@@ -206,8 +219,28 @@ impl PeerWorkQueue {
         matches
     }
 
-    pub(in crate::zakura::header_sync) fn remove(&mut self, peer: &ZakuraPeerId) {
-        self.work_by_peer.remove(peer);
+    pub(in crate::zakura::header_sync) fn remove(
+        &mut self,
+        peer: &ZakuraPeerId,
+    ) -> Option<ActiveHeaderRequest> {
+        match self.work_by_peer.remove(peer) {
+            Some(PeerWorkState::Active(request)) => Some(*request),
+            Some(PeerWorkState::AwaitingLocator { .. }) | None => None,
+        }
+    }
+
+    pub(in crate::zakura::header_sync) fn remove_owner(
+        &mut self,
+        owner: WorkOwner,
+    ) -> Option<ActiveHeaderRequest> {
+        let peer = self
+            .work_by_peer
+            .iter()
+            .find_map(|(peer, work)| match work {
+                PeerWorkState::Active(request) if request.owner == owner => Some(peer.clone()),
+                _ => None,
+            })?;
+        self.remove(&peer)
     }
 
     pub(in crate::zakura::header_sync) fn remove_unstarted(&mut self, peer: &ZakuraPeerId) {
@@ -366,6 +399,7 @@ mod tests {
         .expect("the test projection contains every requested frontier");
         let request = ActiveHeaderRequest {
             peer: peer(1),
+            source: SourceId::from_digest([1; 32]),
             target: replacement.clone(),
             sent_locator: locator.clone(),
             request_id: HeaderSyncRequestId::new(1).expect("one is a nonzero request ID"),
@@ -382,7 +416,7 @@ mod tests {
             },
             common_ancestor: None,
             entries: Vec::new(),
-            admission_pending: false,
+            phase: HeaderTargetPhase::Receiving,
             max_header_count: 1_000,
             tree_aux_schema: AuxSchema::None,
         };

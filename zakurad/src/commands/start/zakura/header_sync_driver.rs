@@ -15,8 +15,8 @@ use zakura_network::zakura::{
     commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange,
     FullStateFrontiers, HeaderEntry, HeaderPathLease, HeaderPathLeaseResult, HeaderPathPage,
     HeaderPathPageResult, HeaderSyncAction, HeaderSyncEvent, HeaderTargetAdmissionResult,
-    HeadersOutcomeCode, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup, ZakuraPeerId, ZakuraTrace,
-    DEFAULT_HS_RANGE,
+    HeaderTargetPreparationResult, HeadersOutcomeCode, ZakuraEndpoint,
+    ZakuraHeaderSyncDriverStartup, ZakuraPeerId, ZakuraTrace, DEFAULT_HS_RANGE,
 };
 
 #[cfg(test)]
@@ -317,18 +317,19 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
             } => {
                 release_header_path(read_state.clone(), &peer, session_id, lease_id).await;
             }
-            HeaderSyncAction::AdmitHeaderTarget {
+            HeaderSyncAction::PrepareHeaderTarget {
                 peer,
+                source,
                 network,
                 owner,
                 common_ancestor,
                 target,
                 entries,
             } => {
-                let result = admit_header_target(
-                    state.clone(),
+                let result = prepare_header_target(
                     read_state.clone(),
                     &peer,
+                    source,
                     network,
                     owner,
                     common_ancestor,
@@ -338,8 +339,26 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 .await;
                 let _ = handles
                     .header_sync
+                    .send(HeaderSyncEvent::HeaderTargetPrepared {
+                        peer,
+                        source,
+                        owner,
+                        result,
+                    })
+                    .await;
+            }
+            HeaderSyncAction::ApplyHeaderTarget {
+                peer,
+                source,
+                owner,
+                insert,
+            } => {
+                let result = apply_header_target(state.clone(), &peer, owner, insert).await;
+                let _ = handles
+                    .header_sync
                     .send(HeaderSyncEvent::HeaderTargetAdmissionReady {
                         peer,
+                        source,
                         owner,
                         result,
                     })
@@ -378,24 +397,17 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn admit_header_target<State, ReadState>(
-    state: State,
+async fn prepare_header_target<ReadState>(
     read_state: ReadState,
     peer: &ZakuraPeerId,
+    source: zakura_header_chain::SourceId,
     network: zakura_chain::parameters::Network,
     owner: zakura_header_chain::WorkOwner,
     common_ancestor: zakura_header_chain::Frontier,
     target: zakura_header_chain::Frontier,
     entries: Vec<HeaderEntry>,
-) -> HeaderTargetAdmissionResult
+) -> HeaderTargetPreparationResult
 where
-    State: Service<
-            zakura_state::Request,
-            Response = zakura_state::Response,
-            Error = zakura_state::BoxError,
-        > + Send
-        + 'static,
-    State::Future: Send + 'static,
     ReadState: Service<
             zakura_state::ReadRequest,
             Response = zakura_state::ReadResponse,
@@ -404,9 +416,6 @@ where
         + 'static,
     ReadState::Future: Send + 'static,
 {
-    let Some(source) = source_id(peer) else {
-        return HeaderTargetAdmissionResult::LocalFailure;
-    };
     let lease = match read_state
         .oneshot(zakura_state::ReadRequest::HeaderValidationLease {
             parent_hash: common_ancestor.hash,
@@ -419,7 +428,7 @@ where
             lease
         }
         Ok(zakura_state::ReadResponse::HeaderValidationLease(_)) => {
-            return HeaderTargetAdmissionResult::Stale;
+            return HeaderTargetPreparationResult::Stale;
         }
         Ok(response) => {
             warn!(
@@ -427,17 +436,17 @@ where
                 ?response,
                 "unexpected header validation lease response"
             );
-            return HeaderTargetAdmissionResult::LocalFailure;
+            return HeaderTargetPreparationResult::LocalFailure;
         }
         Err(error) => {
             warn!(?peer, ?error, "failed to acquire header validation lease");
-            return HeaderTargetAdmissionResult::LocalFailure;
+            return HeaderTargetPreparationResult::LocalFailure;
         }
     };
 
     let prepared = tokio::task::spawn_blocking(move || {
         let rules = zakura_header_chain::HeaderRules::for_validation_lease(network, &lease)
-            .map_err(|_| HeaderTargetAdmissionResult::LocalFailure)?;
+            .map_err(|_| HeaderTargetPreparationResult::LocalFailure)?;
         let headers: Vec<_> = entries.iter().map(|entry| entry.header.clone()).collect();
         let batch = zakura_header_chain::prepare_headers(
             zakura_header_chain::HeaderBatchInput::new(&headers),
@@ -447,18 +456,18 @@ where
         )
         .map_err(|error| match error {
             zakura_header_chain::HeaderFailure::Invalid { .. } => {
-                HeaderTargetAdmissionResult::InvalidHeader
+                HeaderTargetPreparationResult::InvalidHeader
             }
             zakura_header_chain::HeaderFailure::Empty
             | zakura_header_chain::HeaderFailure::InvalidLease
             | zakura_header_chain::HeaderFailure::ClockRange => {
-                HeaderTargetAdmissionResult::LocalFailure
+                HeaderTargetPreparationResult::LocalFailure
             }
         })?;
         let mut aux = Vec::with_capacity(entries.len());
         for (entry, prepared) in entries.iter().zip(batch.headers()) {
             let body_size = zakura_header_chain::BodySizeHint::new(entry.body_size)
-                .map_err(|_| HeaderTargetAdmissionResult::InvalidHeader)?;
+                .map_err(|_| HeaderTargetPreparationResult::InvalidHeader)?;
             let mut hasher = Sha256::new();
             hasher.update(b"zakura-header-aux-delivery-v1");
             hasher.update(source.digest());
@@ -475,7 +484,7 @@ where
                 authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
             });
         }
-        Ok::<_, HeaderTargetAdmissionResult>((batch, aux))
+        Ok::<_, HeaderTargetPreparationResult>((batch, aux))
     })
     .await;
     let (batch, aux) = match prepared {
@@ -483,11 +492,11 @@ where
         Ok(Err(result)) => return result,
         Err(error) => {
             warn!(?peer, ?error, "header target preparation task failed");
-            return HeaderTargetAdmissionResult::LocalFailure;
+            return HeaderTargetPreparationResult::LocalFailure;
         }
     };
 
-    let insert = zakura_header_chain::InsertHeaders {
+    HeaderTargetPreparationResult::Prepared(Box::new(zakura_header_chain::InsertHeaders {
         owner,
         source,
         parent_hash: common_ancestor.hash,
@@ -495,11 +504,28 @@ where
         completion: zakura_header_chain::TargetCompletion::TargetComplete { common_ancestor },
         batch,
         aux,
-    };
+    }))
+}
+
+async fn apply_header_target<State>(
+    state: State,
+    peer: &ZakuraPeerId,
+    owner: zakura_header_chain::WorkOwner,
+    insert: Box<zakura_header_chain::InsertHeaders>,
+) -> HeaderTargetAdmissionResult
+where
+    State: Service<
+            zakura_state::Request,
+            Response = zakura_state::Response,
+            Error = zakura_state::BoxError,
+        > + Send
+        + 'static,
+    State::Future: Send + 'static,
+{
     match state
         .oneshot(zakura_state::Request::ApplyHeaderChainInsert {
             expected_version: owner.state_version,
-            insert: Box::new(insert),
+            insert,
         })
         .await
     {
@@ -1065,11 +1091,16 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
                 insert_cs_str(row, cs_trace::ACTION, "release_header_path");
                 insert_cs_peer(row, cs_trace::PEER, peer);
             }
-            HeaderSyncAction::AdmitHeaderTarget { peer, target, .. } => {
-                insert_cs_str(row, cs_trace::ACTION, "admit_header_target");
+            HeaderSyncAction::PrepareHeaderTarget { peer, target, .. } => {
+                insert_cs_str(row, cs_trace::ACTION, "prepare_header_target");
                 insert_cs_peer(row, cs_trace::PEER, peer);
                 insert_cs_height(row, cs_trace::HEIGHT, target.height);
                 insert_cs_hash(row, cs_trace::HASH, target.hash);
+            }
+            HeaderSyncAction::ApplyHeaderTarget { peer, insert, .. } => {
+                insert_cs_str(row, cs_trace::ACTION, "apply_header_target");
+                insert_cs_peer(row, cs_trace::PEER, peer);
+                insert_cs_hash(row, cs_trace::HASH, insert.target_tip_hash);
             }
             HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
                 insert_cs_str(row, cs_trace::ACTION, "query_missing_block_bodies");

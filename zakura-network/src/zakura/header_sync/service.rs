@@ -338,7 +338,8 @@ pub(crate) async fn drive_header_sync_actions(
             HeaderSyncAction::QueryMissingBlockBodies { .. }
             | HeaderSyncAction::ReadHeaderPath { .. }
             | HeaderSyncAction::ReleaseHeaderPath { .. }
-            | HeaderSyncAction::AdmitHeaderTarget { .. }
+            | HeaderSyncAction::PrepareHeaderTarget { .. }
+            | HeaderSyncAction::ApplyHeaderTarget { .. }
             | HeaderSyncAction::BodyGaps { .. }
             | HeaderSyncAction::HeaderAdvanced { .. }
             | HeaderSyncAction::HeaderReanchored { .. } => {}

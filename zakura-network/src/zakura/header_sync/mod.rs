@@ -20,6 +20,7 @@ pub use events::{
     FullStateFrontiers, HeaderPathLease, HeaderPathLeaseResult, HeaderPathPage,
     HeaderPathPageResult, HeaderSyncAction, HeaderSyncEvent, HeaderSyncHandle,
     HeaderSyncMisbehavior, HeaderSyncRequestId, HeaderSyncStartup, HeaderTargetAdmissionResult,
+    HeaderTargetPreparationResult,
 };
 pub use reactor::spawn_header_sync_reactor;
 pub use scheduler::peer_work::{ActiveHeaderRequest, AdvertisedHeaderTarget};

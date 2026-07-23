@@ -222,10 +222,23 @@ pub enum HeaderSyncEvent {
         /// Page data or an unavailable-lease outcome.
         result: HeaderPathPageResult,
     },
-    /// Requester validation and atomic state admission completed.
+    /// Requester validation completed outside the reactor.
+    HeaderTargetPrepared {
+        /// Peer whose exact active work produced the completion.
+        peer: ZakuraPeerId,
+        /// Stable source identity used by the pending-owner gate.
+        source: zakura_header_chain::SourceId,
+        /// Ownership token echoed by the driver.
+        owner: zakura_header_chain::WorkOwner,
+        /// Sealed evidence or a typed preparation failure.
+        result: HeaderTargetPreparationResult,
+    },
+    /// Atomic state admission completed.
     HeaderTargetAdmissionReady {
         /// Peer whose exact active work produced the completion.
         peer: ZakuraPeerId,
+        /// Stable source identity used by the pending-owner gate.
+        source: zakura_header_chain::SourceId,
         /// Ownership token echoed by the driver.
         owner: zakura_header_chain::WorkOwner,
         /// Commit, stale-work, peer-invalid, or local-failure result.
@@ -245,6 +258,7 @@ impl HeaderSyncEvent {
             Self::HeaderLocatorReady { .. } => "header_locator_ready",
             Self::HeaderPathLeaseReady { .. } => "header_path_lease_ready",
             Self::HeaderPathPageReady { .. } => "header_path_page_ready",
+            Self::HeaderTargetPrepared { .. } => "header_target_prepared",
             Self::HeaderTargetAdmissionReady { .. } => "header_target_admission_ready",
         }
     }
@@ -307,6 +321,19 @@ pub enum HeaderTargetAdmissionResult {
     LocalFailure,
 }
 
+/// Sealed complete-target insertion returned by off-reactor validation.
+#[derive(Clone, Debug)]
+pub enum HeaderTargetPreparationResult {
+    /// All deterministic rules passed and the target is ready for the completion gate.
+    Prepared(Box<zakura_header_chain::InsertHeaders>),
+    /// Durable context changed before preparation completed.
+    Stale,
+    /// A deterministic peer-supplied header rule failed.
+    InvalidHeader,
+    /// Local state, configuration, clock, or task availability failed.
+    LocalFailure,
+}
+
 /// Actions emitted by the header-sync reactor for node wiring.
 #[derive(Clone, Debug)]
 pub enum HeaderSyncAction {
@@ -355,9 +382,11 @@ pub enum HeaderSyncAction {
         lease_id: u64,
     },
     /// Validate all staged pages and submit exactly one complete-target insertion.
-    AdmitHeaderTarget {
+    PrepareHeaderTarget {
         /// Supplying peer.
         peer: ZakuraPeerId,
+        /// Stable source identity used by the pending-owner gate.
+        source: zakura_header_chain::SourceId,
         /// Authenticated network parameters.
         network: Network,
         /// Exact asynchronous ownership fixed by the initial request.
@@ -368,6 +397,17 @@ pub enum HeaderSyncAction {
         target: zakura_header_chain::Frontier,
         /// All response entries in parent-first order.
         entries: Vec<HeaderEntry>,
+    },
+    /// Submit sealed evidence only after the centralized completion gate accepts its owner.
+    ApplyHeaderTarget {
+        /// Supplying peer, retained for result attribution.
+        peer: ZakuraPeerId,
+        /// Stable source identity used by the pending-owner gate.
+        source: zakura_header_chain::SourceId,
+        /// Exact current owner.
+        owner: zakura_header_chain::WorkOwner,
+        /// Sealed insertion produced by `prepare_headers`.
+        insert: Box<zakura_header_chain::InsertHeaders>,
     },
     /// Ask state for missing block-body gaps.
     QueryMissingBlockBodies {

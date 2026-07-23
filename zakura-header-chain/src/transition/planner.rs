@@ -1826,6 +1826,173 @@ mod tests {
     }
 
     #[test]
+    fn aud_13_finalization_and_replacement_match_complete_serial_histories() {
+        use zakura_chain::work::difficulty::{ExpandedDifficulty, U256};
+
+        let (mut base, config) = TestStore::new(EngineMode::Integrated);
+        let clock = ManualClock(Utc::now());
+        let authority = Authority;
+        let anchor = base.graph.finalized();
+        let easy = base
+            .graph
+            .node(anchor.hash)
+            .expect("the anchor exists")
+            .header
+            .difficulty_threshold;
+        let easy_target: U256 = easy
+            .to_expanded()
+            .expect("the fixture target expands")
+            .into();
+        let hard = ExpandedDifficulty::from(easy_target >> 3).into();
+        let incumbent = insert_verified_branch(&mut base.graph, anchor, 2, easy, 0x61);
+        let incumbent_path = path(&base.graph, incumbent).expect("the incumbent path is retained");
+        let shared_finalized = incumbent_path[1];
+        let replacement = insert_verified_branch(&mut base.graph, shared_finalized, 1, hard, 0x62);
+        base.graph
+            .set_body_state(replacement.hash, BodyValidationState::Unknown)
+            .expect("the replacement deliberately has no verified body");
+        synchronize_fixture(&mut base, incumbent);
+        assert_eq!(base.metadata.frontiers.header_best, replacement);
+
+        let invalidation_id = crate::OperatorInvalidationId::new([0x63; 16]);
+        let invalidate = apply_transition(
+            &base,
+            operator_invalidate(&base, replacement.hash, invalidation_id, 0x64),
+            &context(&config, &clock, None),
+        )
+        .expect("the fixture starts with the incumbent selected");
+        base.commit(&invalidate);
+        assert_eq!(base.metadata.frontiers.header_best, incumbent);
+
+        let reconsider =
+            |store: &TestStore| operator_reconsider(store, replacement.hash, invalidation_id, 0x65);
+        let finalize = |store: &TestStore| TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::FullStateFinalized(crate::FullStateFinalized {
+                full_state_transition_id: EvidenceId::from_digest([0x66; 32]),
+                new_finalized: shared_finalized,
+                verified_path_proof: vec![anchor.hash, shared_finalized.hash],
+            }),
+        };
+
+        let initially_planned_reconsider = reconsider(&base);
+        let initially_planned_finalize = finalize(&base);
+        let held_replacement_plan = apply_transition(
+            &base,
+            initially_planned_reconsider.clone(),
+            &context(&config, &clock, None),
+        )
+        .expect("replacement can pause after planning");
+        let held_finality_plan = apply_transition(
+            &base,
+            initially_planned_finalize.clone(),
+            &context(&config, &clock, Some(&authority)),
+        )
+        .expect("finalization can pause after planning");
+        assert_eq!(held_replacement_plan.before(), &base.snapshot());
+        assert_eq!(held_finality_plan.before(), &base.snapshot());
+
+        let mut replacement_then_finality = base.clone();
+        let replacement_plan = apply_transition(
+            &replacement_then_finality,
+            reconsider(&replacement_then_finality),
+            &context(&config, &clock, None),
+        )
+        .expect("replacement can win the first serialized position");
+        replacement_then_finality.commit(&replacement_plan);
+        assert_eq!(
+            replacement_then_finality.metadata.frontiers.header_best,
+            replacement
+        );
+        assert!(matches!(
+            apply_transition(
+                &replacement_then_finality,
+                initially_planned_finalize,
+                &context(&config, &clock, Some(&authority))
+            ),
+            Err(TransitionFailure::Stale { .. })
+        ));
+        let finality_plan = apply_transition(
+            &replacement_then_finality,
+            finalize(&replacement_then_finality),
+            &context(&config, &clock, Some(&authority)),
+        )
+        .expect("finalization replans from the committed replacement snapshot");
+        replacement_then_finality.commit(&finality_plan);
+
+        let mut finality_then_replacement = base.clone();
+        let finality_plan = apply_transition(
+            &finality_then_replacement,
+            finalize(&finality_then_replacement),
+            &context(&config, &clock, Some(&authority)),
+        )
+        .expect("finalization can win the first serialized position");
+        finality_then_replacement.commit(&finality_plan);
+        assert_eq!(
+            finality_then_replacement.metadata.frontiers.finalized,
+            shared_finalized
+        );
+        assert!(matches!(
+            apply_transition(
+                &finality_then_replacement,
+                initially_planned_reconsider,
+                &context(&config, &clock, None)
+            ),
+            Err(TransitionFailure::Stale { .. })
+        ));
+        let replacement_plan = apply_transition(
+            &finality_then_replacement,
+            reconsider(&finality_then_replacement),
+            &context(&config, &clock, None),
+        )
+        .expect("replacement replans from the committed finality snapshot");
+        finality_then_replacement.commit(&replacement_plan);
+
+        let logical_state = |store: &TestStore| {
+            let mut nodes: Vec<_> = store.graph.nodes().cloned().collect();
+            nodes.sort_by_key(|node| node.hash.0);
+            (
+                store.snapshot(),
+                store.selected.clone(),
+                store.verified.clone(),
+                store.finality.clone(),
+                nodes,
+            )
+        };
+        assert_eq!(
+            logical_state(&replacement_then_finality),
+            logical_state(&finality_then_replacement),
+            "both barrier orders converge to one complete serial history"
+        );
+        assert_eq!(
+            replacement_then_finality.metadata.last_transition_id,
+            EvidenceId::from_digest([0x66; 32]),
+            "replacement-then-finality retains the actual last serialized event"
+        );
+        assert_eq!(
+            finality_then_replacement.metadata.last_transition_id,
+            EvidenceId::from_digest([0x65; 32]),
+            "finality-then-replacement retains the actual last serialized event"
+        );
+        assert_eq!(
+            replacement_then_finality.metadata.frontiers.finalized,
+            shared_finalized
+        );
+        assert_eq!(
+            replacement_then_finality.metadata.frontiers.header_best,
+            replacement
+        );
+        assert_eq!(
+            replacement_then_finality.metadata.frontiers.verified_best,
+            incumbent
+        );
+        assert_eq!(
+            replacement_then_finality.metadata.state_version,
+            StateVersion::new(base.metadata.state_version.get().saturating_add(2))
+        );
+    }
+
+    #[test]
     fn headers_only_finalizes_exactly_tip_minus_one_thousand_before_publication() {
         let (store, config) = TestStore::new(EngineMode::HeadersOnly);
         let clock = ManualClock(Utc::now());

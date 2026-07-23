@@ -5311,6 +5311,346 @@ mod tests {
     }
 
     #[test]
+    fn aud_14_body_conclusions_reopen_complete_before_or_after() {
+        for consensus_invalid in [false, true] {
+            for (index, target) in FaultPoint::ALL.into_iter().enumerate() {
+                let cache = tempfile::tempdir().expect("the test cache directory is created");
+                let db_config = Config {
+                    cache_dir: cache.path().to_owned(),
+                    ephemeral: false,
+                    debug_skip_non_finalized_state_backup_task: true,
+                    ..Config::default()
+                };
+                let (engine_config, anchor, metadata) = fixture();
+                let network = engine_config.network.clone();
+                let db = open(&db_config, &network);
+                let store = HeaderChainStore::new(db.clone());
+                store
+                    .initialize(metadata, anchor.clone())
+                    .expect("the empty schema initializes");
+                let (runtime, _) = store
+                    .startup(&engine_config)
+                    .expect("the initial store audits");
+                let initial = runtime.publisher().snapshot();
+                let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+                let lease = runtime
+                    .reader()
+                    .validation_context(anchor.hash)
+                    .expect("the anchor validation context is coherent")
+                    .expect("the initialized anchor is retained");
+                let rules = HeaderRules::for_validation_lease(network.clone(), &lease)
+                    .expect("the authenticated regtest policy is valid");
+                let marker = u8::try_from(index + if consensus_invalid { 0xc0 } else { 0x40 })
+                    .expect("the fault-point list fits in u8");
+                let mut child_header = *anchor.header;
+                child_header.previous_block_hash = anchor.hash;
+                child_header.time += chrono::Duration::seconds(1);
+                child_header.nonce.0[0] = marker;
+                let child_header = Arc::new(child_header);
+                let headers = [child_header.clone()];
+                let batch = zakura_header_chain::prepare_headers(
+                    HeaderBatchInput::new(&headers),
+                    &lease,
+                    &rules,
+                    &SystemClock,
+                )
+                .expect("the body-conclusion fixture header passes production validation");
+                let child = Frontier::new(
+                    anchor
+                        .height
+                        .next()
+                        .expect("the genesis anchor has a next height"),
+                    child_header.hash(),
+                );
+                let owner = WorkOwner {
+                    state_version: initial.state_version,
+                    header_generation: initial.header_generation,
+                    verified_generation: None,
+                    branch: BranchId::new(anchor.hash, child.hash),
+                    session_id: 41,
+                    request_id: NonZeroU64::new(42).expect("forty-two is nonzero"),
+                };
+                let insertion_context = TransitionContext {
+                    config: &engine_config,
+                    clock: &SystemClock,
+                    full_state_authority: None,
+                    startup_capability: None,
+                    retention_references: &[],
+                };
+                runtime
+                    .apply(
+                        TransitionRequest {
+                            expected_version: initial.state_version,
+                            event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                                owner,
+                                source: SourceId::from_digest([marker.wrapping_add(1); 32]),
+                                parent_hash: anchor.hash,
+                                target_tip_hash: child.hash,
+                                completion: TargetCompletion::TargetComplete {
+                                    common_ancestor: anchor_frontier,
+                                },
+                                batch,
+                                aux: Vec::new(),
+                            })),
+                        },
+                        &insertion_context,
+                    )
+                    .expect("the selected body-conclusion fixture commits");
+                let before = runtime.publisher().snapshot();
+                assert_eq!(before.frontiers.header_best, child);
+                assert_eq!(
+                    runtime
+                        .store
+                        .node(child.hash)
+                        .expect("the child node read succeeds")
+                        .expect("the selected child is retained")
+                        .body,
+                    BodyValidationState::Unknown
+                );
+
+                let evidence = EvidenceId::from_digest([marker.wrapping_add(2); 32]);
+                let rule = BodyRuleId::new("aud14.commitment_matching_invalid");
+                let source = SourceId::from_digest([marker.wrapping_add(3); 32]);
+                let event = if consensus_invalid {
+                    TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(
+                        zakura_header_chain::ConsensusBodyInvalid {
+                            hash: child.hash,
+                            evidence,
+                            rule: rule.clone(),
+                            source,
+                        },
+                    ))
+                } else {
+                    TransitionEvent::BodyEvidence(BodyEvidence::Verified(VerifiedBodyEvidence {
+                        hash: child.hash,
+                        evidence,
+                    }))
+                };
+                let authority = Authority(evidence);
+                let context = TransitionContext {
+                    config: &engine_config,
+                    clock: &SystemClock,
+                    full_state_authority: Some(&authority),
+                    startup_capability: None,
+                    retention_references: &[],
+                };
+                let marker_key = [marker; 4];
+                let mut full_state_batch = DiskWriteBatch::new();
+                runtime
+                    .store
+                    .put_raw(
+                        &mut full_state_batch,
+                        ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+                        marker_key,
+                        [marker],
+                    )
+                    .expect("the paired body-conclusion marker can be staged");
+                let memory_swapped = Arc::new(AtomicBool::new(false));
+                let swap_probe = memory_swapped.clone();
+                let result = runtime.apply_combined_with_fault(
+                    TransitionRequest {
+                        expected_version: before.state_version,
+                        event,
+                    },
+                    &context,
+                    full_state_batch,
+                    move || swap_probe.store(true, Ordering::SeqCst),
+                    |point| {
+                        if point == target {
+                            Err(HeaderChainStoreError::InjectedCrash(point))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+                assert!(matches!(
+                    result,
+                    Err(HeaderChainStoreError::InjectedCrash(point)) if point == target
+                ));
+
+                let committed = matches!(
+                    target,
+                    FaultPoint::AfterDbCommit
+                        | FaultPoint::BeforeMemorySwap
+                        | FaultPoint::BeforePublish
+                        | FaultPoint::AfterPublish
+                        | FaultPoint::BeforeReactorObserve
+                );
+                let published = matches!(
+                    target,
+                    FaultPoint::AfterPublish | FaultPoint::BeforeReactorObserve
+                );
+                let committed_version = before
+                    .state_version
+                    .checked_next()
+                    .expect("the short fixture state version can advance");
+                let committed_header_generation = before
+                    .header_generation
+                    .checked_next()
+                    .expect("the short fixture header generation can advance");
+                let selected_after = if consensus_invalid {
+                    anchor_frontier
+                } else {
+                    child
+                };
+                let durable = runtime
+                    .store
+                    .snapshot()
+                    .expect("the body-conclusion snapshot read succeeds");
+                assert_eq!(
+                    durable.state_version,
+                    if committed {
+                        committed_version
+                    } else {
+                        before.state_version
+                    },
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                assert_eq!(
+                    durable.frontiers.header_best,
+                    if committed { selected_after } else { child },
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                assert_eq!(
+                    durable.header_generation,
+                    if committed && consensus_invalid {
+                        committed_header_generation
+                    } else {
+                        before.header_generation
+                    },
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                assert_eq!(
+                    durable.frontiers.verified_best, before.frontiers.verified_best,
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                assert_eq!(
+                    durable.verified_generation, before.verified_generation,
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                let child_node = runtime
+                    .store
+                    .node(child.hash)
+                    .expect("the body-conclusion node read succeeds")
+                    .expect("the body-conclusion child remains retained");
+                let expected_body = if committed {
+                    if consensus_invalid {
+                        BodyValidationState::ConsensusInvalid {
+                            evidence,
+                            rule: rule.clone(),
+                        }
+                    } else {
+                        BodyValidationState::Verified { evidence }
+                    }
+                } else {
+                    BodyValidationState::Unknown
+                };
+                assert_eq!(
+                    child_node.body, expected_body,
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                let invalid_reason = EligibilityReason::ConsensusBodyInvalid {
+                    evidence,
+                    rule: rule.clone(),
+                };
+                assert_eq!(
+                    child_node
+                        .eligibility
+                        .direct_reasons
+                        .contains(&invalid_reason),
+                    committed && consensus_invalid,
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                let marker_cf = runtime
+                    .store
+                    .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                    .expect("the marker column family is open");
+                assert_eq!(
+                    runtime
+                        .store
+                        .db
+                        .raw_get_cf(&marker_cf, &marker_key)
+                        .expect("the paired marker read succeeds")
+                        .is_some(),
+                    committed,
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                assert_eq!(
+                    memory_swapped.load(Ordering::SeqCst),
+                    matches!(
+                        target,
+                        FaultPoint::BeforePublish
+                            | FaultPoint::AfterPublish
+                            | FaultPoint::BeforeReactorObserve
+                    ),
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                assert_eq!(
+                    runtime.publisher().snapshot().frontiers.header_best,
+                    if published { selected_after } else { child },
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                drop(runtime);
+                drop(db);
+
+                let (reopened, report) = HeaderChainStore::new(open(&db_config, &network))
+                    .startup(&engine_config)
+                    .expect("the body-conclusion crash boundary reopens coherently");
+                assert_eq!(
+                    reopened.publisher().snapshot(),
+                    report.current,
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                assert_eq!(
+                    report.current.frontiers.header_best,
+                    if committed { selected_after } else { child },
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                assert_eq!(
+                    report.current.state_version,
+                    if committed {
+                        committed_version
+                    } else {
+                        before.state_version
+                    },
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                let reopened_child = reopened
+                    .store
+                    .node(child.hash)
+                    .expect("the reopened body-conclusion node read succeeds")
+                    .expect("the reopened body-conclusion child remains retained");
+                assert_eq!(
+                    reopened_child.body, expected_body,
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                assert_eq!(
+                    reopened_child
+                        .eligibility
+                        .direct_reasons
+                        .contains(&invalid_reason),
+                    committed && consensus_invalid,
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+                let reopened_marker_cf = reopened
+                    .store
+                    .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                    .expect("the reopened marker column family is open");
+                assert_eq!(
+                    reopened
+                        .store
+                        .db
+                        .raw_get_cf(&reopened_marker_cf, &marker_key)
+                        .expect("the reopened paired marker read succeeds")
+                        .is_some(),
+                    committed,
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn aud_14_deferred_header_reevaluation_reopens_complete_before_or_after() {
         #[derive(Copy, Clone)]
         struct FixedClock(chrono::DateTime<Utc>);

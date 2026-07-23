@@ -334,3 +334,12 @@ This file is the sole reporting channel (design D5). Entry template:
 - spend ~US$9 today. perf-lab-s2 destroyed; frozen serve pair standing.
 - next session queue: exp002-k8-c confirmation → formal WIN; then B-04 (state
   collision check first) / B-06 / B-07 under the steady protocol.
+
+## SESSION 3 (2026-07-22, ~23:58Z)
+
+- origin/main: c3b26d24e (drifted again); serves standing ~8h; band 7.6
+  (steady protocol); batch 3 at 5 of 8.
+- plan: settling run (doubles as k=1 cadence baseline, pinned to current
+  main) → exp002-k8-c confirmation back-to-back → formal WIN if the two-leg
+  test passes again → then B-04 (collision-check PR 390 first) or B-06/B-07.
+- PRs 166/217 still open: batching default stays PROPOSAL.

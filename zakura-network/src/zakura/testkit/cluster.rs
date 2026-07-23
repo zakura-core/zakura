@@ -436,12 +436,14 @@ mod tests {
                                 outcome: crate::zakura::block_sync::test_block_apply_outcome(
                                     BlockApplyResult::Committed,
                                 ),
-                                local_frontier: Some(BlockSyncFrontiers {
-                                    finalized_height: height,
-                                    verified_block_tip: height,
-                                    verified_block_hash: block.hash(),
-                                }),
                             })
+                            .await;
+                        let _ = handle
+                            .send(BlockSyncEvent::ChainTipGrow(BlockSyncFrontiers {
+                                finalized_height: height,
+                                verified_block_tip: height,
+                                verified_block_hash: block.hash(),
+                            }))
                             .await;
                     }
                     BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {

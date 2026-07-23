@@ -184,7 +184,6 @@ pub(super) enum SequencerControlInput {
         eligible_sources: BTreeSet<zakura_header_chain::SourceId>,
         persisted_availability: Option<zakura_header_chain::BodyUnavailableSummary>,
         semantic_current: bool,
-        local_frontier: Option<BlockSyncFrontiers>,
     },
 }
 
@@ -454,7 +453,6 @@ impl SequencerTask {
                 eligible_sources,
                 persisted_availability,
                 semantic_current,
-                local_frontier,
             } => {
                 let (needs_reaction, allow_submit) = self
                     .handle_apply_finished(
@@ -467,7 +465,6 @@ impl SequencerTask {
                         eligible_sources,
                         persisted_availability,
                         semantic_current,
-                        local_frontier,
                     )
                     .await;
                 if allow_submit {
@@ -634,11 +631,10 @@ impl SequencerTask {
         self.reset_epoch = self.reset_epoch.saturating_add(1);
     }
 
-    /// Handle a verifier apply completion: release its verifier slot, fold in
-    /// any embedded `local_frontier` as a frontier advance with
-    /// `release_applied: false`, and on a rejection roll the floor back below the
-    /// bad block so its range is re-requestable. Returns whether the reactor needs
-    /// its serving/query/schedule reaction (the view reaction runs that tail).
+    /// Handle a verifier apply completion: release its verifier slot and, on a
+    /// rejection, roll the floor back below the bad block so its range is
+    /// re-requestable. Committed frontier changes arrive only through the
+    /// authoritative snapshot watch.
     #[allow(clippy::too_many_arguments)]
     async fn handle_apply_finished(
         &mut self,
@@ -651,7 +647,6 @@ impl SequencerTask {
         mut eligible_sources: BTreeSet<zakura_header_chain::SourceId>,
         persisted_availability: Option<zakura_header_chain::BodyUnavailableSummary>,
         semantic_current: bool,
-        local_frontier: Option<BlockSyncFrontiers>,
     ) -> (bool, bool) {
         let result = outcome.result();
         // A stale completion (no live applying entry, or token/hash mismatch)
@@ -701,29 +696,13 @@ impl SequencerTask {
             })
             .await;
         }
-        let accepted_local_frontier = if let Some(frontiers) = local_frontier {
-            // Fold the `local_frontier` advance in as a frontier advance without
-            // releasing committed applying bodies (`release_applied: false`). It is
-            // accepted only when it is not a stale (older-tip) update.
-            if frontiers.verified_block_tip < self.sequencer.verified_tip() {
-                None
-            } else {
-                self.handle_frontier_advance(frontiers, false).await;
-                Some(frontiers)
-            }
-        } else {
-            None
-        };
-
         if matches!(result, BlockApplyResult::Duplicate) && self.sequencer.verified_tip() < height {
-            // Stale duplicate for a height we have not verified to: the reactor
-            // needs the serving/query tail only when the accepted local frontier
-            // actually advanced serving. The body stays attached until a later
-            // frontier update removes it, but the driver has released its decoded
-            // copy, so release the token-aware decode-window charge now.
+            // A duplicate for a height not yet present in the committed snapshot
+            // stays attached until that snapshot advances. The driver has released
+            // its decoded copy, so release the token-aware decode-window charge now.
             self.sequencer
                 .finish_attached_submission(owner, source, token, height, hash);
-            return (accepted_local_frontier.is_some(), true);
+            return (false, true);
         }
         let applying = self
             .sequencer
@@ -769,12 +748,6 @@ impl SequencerTask {
             | BlockApplyResult::Unavailable
             | BlockApplyResult::TimedOut => {}
         }
-        if let Some(frontiers) = accepted_local_frontier {
-            let _ = self
-                .sequencer
-                .release_applied_through(frontiers.verified_block_tip);
-        }
-
         self.release_contiguous_blocks().await;
         (true, true)
     }
@@ -1498,7 +1471,6 @@ mod tests {
                 BTreeSet::new(),
                 None,
                 false,
-                None,
             )
             .await,
             (false, false),

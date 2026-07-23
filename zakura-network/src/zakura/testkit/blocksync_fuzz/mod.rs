@@ -305,12 +305,16 @@ fn spawn_action_driver(
                             outcome: crate::zakura::block_sync::test_block_apply_outcome(
                                 outcome.result,
                             ),
-                            local_frontier: Some(outcome.frontiers),
                         })
                         .await
                         .is_err()
                     {
                         break;
+                    }
+                    if outcome.result == BlockApplyResult::Committed {
+                        let _ = handle
+                            .send(BlockSyncEvent::ChainTipGrow(outcome.frontiers))
+                            .await;
                     }
                     applied = applied.saturating_add(1);
                     if let Some(burst) = commit.burst {

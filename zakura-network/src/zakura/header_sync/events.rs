@@ -169,13 +169,6 @@ pub enum HeaderSyncEvent {
         /// Advisory summary.
         summary: HeaderSyncServiceSummary,
     },
-    /// State committed a full block.
-    FullBlockCommitted {
-        /// Committed height.
-        height: block::Height,
-        /// Committed hash.
-        hash: block::Hash,
-    },
     /// A message decoded on a canonical stream.
     SessionWireMessage {
         /// Sending peer.
@@ -185,8 +178,6 @@ pub enum HeaderSyncEvent {
         /// Decoded message.
         msg: HeaderSyncMessage,
     },
-    /// Full-state frontiers changed.
-    StateFrontiersChanged(FullStateFrontiers),
     /// State returned the selected-path locator for an advertised target.
     HeaderLocatorReady {
         /// Peer whose target requested the locator.
@@ -292,9 +283,7 @@ impl HeaderSyncEvent {
             Self::PeerConnected(_) => "peer_connected",
             Self::PeerDisconnected(_) => "peer_disconnected",
             Self::AdvisoryHeaderSummary { .. } => "advisory_header_summary",
-            Self::FullBlockCommitted { .. } => "full_block_committed",
             Self::SessionWireMessage { .. } => "session_wire_message",
-            Self::StateFrontiersChanged(_) => "state_frontiers_changed",
             Self::HeaderLocatorReady { .. } => "header_locator_ready",
             Self::VctRepairContextReady { .. } => "vct_repair_context_ready",
             Self::HeaderPathLeaseReady { .. } => "header_path_lease_ready",

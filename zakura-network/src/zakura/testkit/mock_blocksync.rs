@@ -611,9 +611,13 @@ async fn drive_mock_block_sync_actions(
                             outcome: crate::zakura::block_sync::test_block_apply_outcome(
                                 outcome.result,
                             ),
-                            local_frontier: Some(outcome.frontiers),
                         })
                         .await;
+                    if outcome.result == BlockApplyResult::Committed {
+                        let _ = handle
+                            .send(BlockSyncEvent::ChainTipGrow(outcome.frontiers))
+                            .await;
+                    }
                 }
                 BlockSyncAction::RecordBodyUnavailable { .. }
                 | BlockSyncAction::RestartBodyAvailability { .. }

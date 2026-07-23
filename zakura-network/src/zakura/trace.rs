@@ -405,8 +405,6 @@ pub mod commit_state_trace {
     pub const IN_FLIGHT_COUNT: &str = "in_flight_count";
     /// Action kind field.
     pub const ACTION: &str = "action";
-    /// Whether an optional frontier was present.
-    pub const LOCAL_FRONTIER: &str = "local_frontier";
 
     /// Driver received a reactor action.
     pub const ACTION_RECEIVED: &str = "action_received";
@@ -435,22 +433,8 @@ pub mod commit_state_trace {
     pub const COMMIT_STALL_BEHIND_PREFIX: &str = "behind_committed_prefix";
     /// Verifier commit finished.
     pub const COMMIT_FINISH: &str = "commit_finish";
-    /// Post-commit frontier query started.
-    pub const FRONTIER_QUERY_START: &str = "frontier_query_start";
-    /// Post-commit frontier query finished.
-    pub const FRONTIER_QUERY_FINISH: &str = "frontier_query_finish";
     /// Driver sent an event back to a reactor.
     pub const REACTOR_EVENT_SENT: &str = "reactor_event_sent";
-    /// Delayed checkpoint frontier refresh attempted.
-    pub const CHECKPOINT_REFRESH_ATTEMPT: &str = "checkpoint_refresh_attempt";
-    /// Delayed checkpoint frontier refresh sent a frontier event.
-    pub const CHECKPOINT_REFRESH_SENT: &str = "checkpoint_refresh_sent";
-    /// Header-sync driver notified block sync about a header tip.
-    pub const BLOCK_SYNC_NOTIFY_SENT: &str = "block_sync_notify_sent";
-    /// Chain-tip mirror observed a watch action.
-    pub const CHAIN_TIP_ACTION: &str = "chain_tip_action";
-    /// Chain-tip mirror derived local frontiers.
-    pub const FRONTIER_DERIVED: &str = "frontier_derived";
 }
 
 /// Cloneable Zakura trace emitter.

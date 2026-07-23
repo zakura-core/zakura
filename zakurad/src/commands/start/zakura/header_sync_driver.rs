@@ -13,12 +13,9 @@ use zakura_chain::{
 use zakura_network::zakura::{
     commit_state_trace as cs_trace, FullStateFrontiers, HeaderEntry, HeaderPathLease,
     HeaderPathLeaseResult, HeaderPathPage, HeaderPathPageResult, HeaderSyncAction, HeaderSyncEvent,
-    HeaderTargetAdmissionResult, HeaderTargetPreparationResult, HeadersOutcomeCode, ZakuraEndpoint,
+    HeaderTargetAdmissionResult, HeaderTargetPreparationResult, HeadersOutcomeCode,
     ZakuraHeaderSyncDriverStartup, ZakuraPeerId, ZakuraTrace, DEFAULT_HS_RANGE,
 };
-
-#[cfg(test)]
-use zakura_network::zakura::{BlockSyncEvent, BlockSyncFrontiers, BlockSyncHandle};
 
 use super::{
     emit_commit_state, insert_cs_hash, insert_cs_height, insert_cs_peer, insert_cs_str,
@@ -774,29 +771,6 @@ fn source_id(peer: &ZakuraPeerId) -> Option<zakura_header_chain::SourceId> {
     Some(zakura_header_chain::SourceId::from_digest(digest))
 }
 
-#[cfg(test)]
-pub(crate) async fn notify_block_sync_header_tip(
-    block_sync: Option<&BlockSyncHandle>,
-    height: block::Height,
-    hash: block::Hash,
-    trace: &ZakuraTrace,
-) {
-    if let Some(block_sync) = block_sync {
-        let _ = block_sync
-            .send(BlockSyncEvent::HeaderTipChanged { height, hash })
-            .await;
-        emit_commit_state(
-            trace,
-            cs_trace::BLOCK_SYNC_NOTIFY_SENT,
-            "header_sync_driver",
-            |row| {
-                insert_cs_height(row, cs_trace::HEIGHT, height);
-                insert_cs_hash(row, cs_trace::HASH, hash);
-            },
-        );
-    }
-}
-
 async fn log_missing_block_bodies<ReadState>(
     read_state: ReadState,
     from: block::Height,
@@ -865,146 +839,6 @@ async fn log_missing_block_bodies<ReadState>(
             );
             warn!(?error, "failed to query Zakura missing block bodies")
         }
-    }
-}
-
-pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
-    mut chain_tip_change: zakura_state::ChainTipChange,
-    _latest_chain_tip: zakura_state::LatestChainTip,
-    read_state: ReadState,
-    header_sync: zakura_network::zakura::HeaderSyncHandle,
-    _endpoint: ZakuraEndpoint,
-    trace: ZakuraTrace,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) where
-    ReadState: Service<
-            zakura_state::ReadRequest,
-            Response = zakura_state::ReadResponse,
-            Error = zakura_state::BoxError,
-        > + Clone
-        + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
-{
-    pin!(shutdown);
-    loop {
-        let action = select! {
-            _ = &mut shutdown => return,
-            action = chain_tip_change.wait_for_tip_change() => {
-                let Ok(action) = action else {
-                    return;
-                };
-                action
-            }
-        };
-        let height = action.best_tip_height();
-        let hash = action.best_tip_hash();
-        emit_commit_state(
-            &trace,
-            cs_trace::CHAIN_TIP_ACTION,
-            "chain_tip_mirror",
-            |row| {
-                insert_cs_str(row, cs_trace::ACTION, tip_action_label(&action));
-                insert_cs_height(row, cs_trace::HEIGHT, height);
-                insert_cs_hash(row, cs_trace::HASH, hash);
-            },
-        );
-
-        emit_commit_state(
-            &trace,
-            cs_trace::STATE_READ_START,
-            "chain_tip_mirror",
-            |row| {
-                insert_cs_str(row, cs_trace::ACTION, "committed_tip_block");
-                insert_cs_height(row, cs_trace::HEIGHT, height);
-                insert_cs_hash(row, cs_trace::HASH, hash);
-            },
-        );
-        match read_state
-            .clone()
-            .oneshot(zakura_state::ReadRequest::Block(hash.into()))
-            .await
-        {
-            Ok(zakura_state::ReadResponse::Block(Some(_))) => {
-                emit_commit_state(
-                    &trace,
-                    cs_trace::STATE_READ_SUCCESS,
-                    "chain_tip_mirror",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "committed_tip_block");
-                        insert_cs_height(row, cs_trace::HEIGHT, height);
-                        insert_cs_hash(row, cs_trace::HASH, hash);
-                        insert_cs_str(row, cs_trace::RESULT, "found");
-                    },
-                );
-                let _ = header_sync
-                    .send(HeaderSyncEvent::FullBlockCommitted { height, hash })
-                    .await;
-                emit_commit_state(
-                    &trace,
-                    cs_trace::REACTOR_EVENT_SENT,
-                    "chain_tip_mirror",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "full_block_committed");
-                        insert_cs_height(row, cs_trace::HEIGHT, height);
-                        insert_cs_hash(row, cs_trace::HASH, hash);
-                    },
-                );
-            }
-            Ok(zakura_state::ReadResponse::Block(None)) => {
-                emit_commit_state(
-                    &trace,
-                    cs_trace::STATE_READ_SUCCESS,
-                    "chain_tip_mirror",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "committed_tip_block");
-                        insert_cs_height(row, cs_trace::HEIGHT, height);
-                        insert_cs_hash(row, cs_trace::HASH, hash);
-                        insert_cs_str(row, cs_trace::RESULT, "missing");
-                    },
-                );
-                debug!(
-                    ?height,
-                    ?hash,
-                    "Zakura full-block mirror could not find committed tip block"
-                );
-            }
-            Ok(response) => {
-                emit_commit_state(
-                    &trace,
-                    cs_trace::STATE_READ_ERROR,
-                    "chain_tip_mirror",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "committed_tip_block");
-                        insert_cs_str(row, cs_trace::REASON, "unexpected_response");
-                    },
-                );
-                warn!(?response, "unexpected block lookup response")
-            }
-            Err(error) => {
-                emit_commit_state(
-                    &trace,
-                    cs_trace::STATE_READ_ERROR,
-                    "chain_tip_mirror",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "committed_tip_block");
-                        insert_cs_str(row, cs_trace::REASON, &format!("{error}"));
-                    },
-                );
-                warn!(?error, "failed to mirror Zakura full-block commit")
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn block_sync_chain_tip_event(
-    action: &zakura_state::TipAction,
-    frontiers: BlockSyncFrontiers,
-) -> BlockSyncEvent {
-    match action {
-        zakura_state::TipAction::Grow { .. } => BlockSyncEvent::ChainTipGrow(frontiers),
-        zakura_state::TipAction::Reset { .. } => BlockSyncEvent::ChainTipReset(frontiers),
     }
 }
 
@@ -1145,13 +979,6 @@ fn header_misbehavior_label(reason: zakura_network::zakura::HeaderSyncMisbehavio
     match reason {
         zakura_network::zakura::HeaderSyncMisbehavior::MalformedMessage => "malformed_message",
         zakura_network::zakura::HeaderSyncMisbehavior::InvalidHeader => "invalid_header",
-    }
-}
-
-fn tip_action_label(action: &zakura_state::TipAction) -> &'static str {
-    match action {
-        zakura_state::TipAction::Grow { .. } => "grow",
-        zakura_state::TipAction::Reset { .. } => "reset",
     }
 }
 

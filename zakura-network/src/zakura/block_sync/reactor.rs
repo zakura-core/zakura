@@ -567,7 +567,6 @@ impl BlockSyncReactor {
                 height,
                 hash,
                 outcome,
-                local_frontier,
             } => {
                 let semantic_current = matches!(
                     outcome.verification(),
@@ -581,7 +580,6 @@ impl BlockSyncReactor {
                     hash,
                     outcome,
                     semantic_current,
-                    local_frontier,
                 )
                 .await
             }
@@ -1442,11 +1440,10 @@ impl BlockSyncReactor {
         hash: block::Hash,
         outcome: BlockApplyOutcome,
         semantic_current: bool,
-        local_frontier: Option<BlockSyncFrontiers>,
     ) {
-        // The whole commit-pipeline body (token validate, embedded local-frontier
-        // advance, applying removal, throughput record, rollback + misbehavior,
-        // drain + submit) runs on the Sequencer task. The reactor
+        // The whole commit-pipeline body (token validate, applying removal,
+        // throughput record, rollback + misbehavior, drain + submit) runs on the
+        // Sequencer task. The reactor
         // forwards the completion and reacts to the resulting progress view
         // (serving/status/query/schedule) on the `view` arm.
         self.trace_apply_finished(
@@ -1475,7 +1472,6 @@ impl BlockSyncReactor {
                 eligible_sources: self.registry.eligible_sources(height),
                 persisted_availability,
                 semantic_current,
-                local_frontier,
             });
         self.trace_sequencer_control_send(
             "apply_finished",
@@ -2763,7 +2759,6 @@ impl BlockSyncReactor {
                 height,
                 hash,
                 outcome,
-                local_frontier,
                 ..
             } => {
                 bs_insert_str(row, bs_trace::KIND, "block_apply_finished");
@@ -2775,9 +2770,6 @@ impl BlockSyncReactor {
                     bs_trace::RESULT,
                     block_apply_result_label(outcome.result()),
                 );
-                if let Some(frontiers) = local_frontier {
-                    bs_insert_frontiers(row, frontiers);
-                }
             }
             BlockSyncEvent::BlockRangeResponseFinished {
                 peer,

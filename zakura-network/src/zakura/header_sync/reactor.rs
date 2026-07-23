@@ -271,15 +271,11 @@ impl HeaderSyncReactor {
             HeaderSyncEvent::PeerConnected(session) => self.handle_peer_connected(session),
             HeaderSyncEvent::PeerDisconnected(peer) => self.handle_peer_disconnected(&peer),
             HeaderSyncEvent::AdvisoryHeaderSummary { .. } => {}
-            HeaderSyncEvent::FullBlockCommitted { .. } => {}
             HeaderSyncEvent::SessionWireMessage {
                 peer,
                 session_id,
                 msg,
             } => self.handle_wire_message(peer, session_id, msg),
-            HeaderSyncEvent::StateFrontiersChanged(frontiers) => {
-                self.startup.frontiers = frontiers;
-            }
             HeaderSyncEvent::HeaderLocatorReady {
                 peer,
                 session_id,

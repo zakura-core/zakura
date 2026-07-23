@@ -70,8 +70,6 @@ pub enum BlockSyncEvent {
         hash: block::Hash,
         /// Typed, evidence-bearing verifier outcome.
         outcome: BlockApplyOutcome,
-        /// Locally observed chain frontier after the apply attempt completed.
-        local_frontier: Option<BlockSyncFrontiers>,
     },
     /// Node wiring finished or abandoned a `Block` response to an inbound `GetBlocks`.
     BlockRangeResponseFinished {

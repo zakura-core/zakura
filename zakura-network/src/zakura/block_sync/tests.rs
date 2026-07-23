@@ -4221,11 +4221,6 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
             eligible_sources: BTreeSet::new(),
             persisted_availability: None,
             semantic_current: true,
-            local_frontier: Some(BlockSyncFrontiers {
-                finalized_height: block::Height(0),
-                verified_block_tip: block::Height(3),
-                verified_block_hash: blocks[2].hash(),
-            }),
         })
         .expect("height 1 completion queues");
 
@@ -4254,11 +4249,6 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
                 eligible_sources: BTreeSet::new(),
                 persisted_availability: None,
                 semantic_current: true,
-                local_frontier: Some(BlockSyncFrontiers {
-                    finalized_height: block::Height(0),
-                    verified_block_tip: block::Height(3),
-                    verified_block_hash: blocks[2].hash(),
-                }),
             })
             .expect("stale checkpoint completion queues");
     }
@@ -6032,24 +6022,15 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
             height: block::Height(1),
             hash: blocks[0].hash(),
             outcome: test_block_apply_outcome(BlockApplyResult::Committed),
-            local_frontier: Some(BlockSyncFrontiers {
-                finalized_height: block::Height(0),
-                verified_block_tip: block::Height(1),
-                verified_block_hash: blocks[0].hash(),
-            }),
         })
         .await
         .expect("apply-finished event queues");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if handle.local_status().servable_high == block::Height(1) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("apply completion frontier advances advertised status");
+    tokio::task::yield_now().await;
+    assert_eq!(
+        handle.local_status().servable_high,
+        block::Height(0),
+        "apply completion releases capacity but cannot publish a frontier before state commits it"
+    );
 
     reactor_task.abort();
 }
@@ -6566,11 +6547,6 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
             height: block::Height(1),
             hash: blocks[0].hash(),
             outcome: test_block_apply_outcome(BlockApplyResult::Duplicate),
-            local_frontier: Some(BlockSyncFrontiers {
-                finalized_height: block::Height(0),
-                verified_block_tip: block::Height(0),
-                verified_block_hash: block::Hash([0; 32]),
-            }),
         })
         .await
         .expect("non-advancing duplicate completion queues");
@@ -7098,11 +7074,6 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
             height: block::Height(1),
             hash: blocks[0].hash(),
             outcome: test_block_apply_outcome(BlockApplyResult::Committed),
-            local_frontier: Some(BlockSyncFrontiers {
-                finalized_height: block::Height(0),
-                verified_block_tip: block::Height(1),
-                verified_block_hash: blocks[0].hash(),
-            }),
         })
         .await
         .expect("apply-finished event queues");
@@ -7115,11 +7086,6 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
             height: block::Height(2),
             hash: blocks[1].hash(),
             outcome: test_block_apply_outcome(BlockApplyResult::Committed),
-            local_frontier: Some(BlockSyncFrontiers {
-                finalized_height: block::Height(0),
-                verified_block_tip: block::Height(2),
-                verified_block_hash: blocks[1].hash(),
-            }),
         })
         .await
         .expect("apply-finished event queues");
@@ -7263,7 +7229,6 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
                 kind: zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable,
                 availability: zakura_header_chain::BodyUnavailableSummary::default(),
             }),
-            local_frontier: None,
         })
         .await
         .expect("apply-finished event queues");
@@ -7570,7 +7535,6 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
             height: block::Height(1),
             hash: blocks[0].hash(),
             outcome: test_block_apply_outcome(BlockApplyResult::Committed),
-            local_frontier: None,
         })
         .await
         .expect("apply-finished event queues");
@@ -9125,7 +9089,6 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
             height: block::Height(3),
             hash: blocks[2].hash(),
             outcome: test_block_apply_outcome(BlockApplyResult::Committed),
-            local_frontier: None,
         })
         .await
         .expect("successor apply result queues");
@@ -9707,7 +9670,6 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
             height: block::Height(1),
             hash: block_hash,
             outcome: test_block_apply_outcome(BlockApplyResult::Duplicate),
-            local_frontier: None,
         })
         .await
         .expect("stale apply-finished event queues");
@@ -9733,7 +9695,6 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
             height: block::Height(1),
             hash: block_hash,
             outcome: test_block_apply_outcome(BlockApplyResult::Duplicate),
-            local_frontier: None,
         })
         .await
         .expect("owner-mismatched apply-finished event queues");
@@ -9745,7 +9706,6 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
             height: block::Height(1),
             hash: block_hash,
             outcome: test_block_apply_outcome(BlockApplyResult::Duplicate),
-            local_frontier: None,
         })
         .await
         .expect("source-mismatched apply-finished event queues");
@@ -9765,7 +9725,6 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
             height: block::Height(1),
             hash: block_hash,
             outcome: test_block_apply_outcome(BlockApplyResult::Committed),
-            local_frontier: None,
         })
         .await
         .expect("current apply-finished event queues");
@@ -10956,7 +10915,6 @@ async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
             height: block::Height(1),
             hash: blocks[0].hash(),
             outcome: test_block_apply_outcome(BlockApplyResult::Rejected),
-            local_frontier: None,
         })
         .await
         .expect("apply-finished event queues");
@@ -13229,7 +13187,6 @@ async fn reactor_ignores_duplicate_response_at_body_download_floor() {
             height: block::Height(2),
             hash,
             outcome: test_block_apply_outcome(BlockApplyResult::Committed),
-            local_frontier: None,
         })
         .await
         .expect("apply result queues");
@@ -13358,7 +13315,6 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
             height: block::Height(2),
             hash,
             outcome: test_block_apply_outcome(BlockApplyResult::Committed),
-            local_frontier: None,
         })
         .await
         .expect("apply result queues");

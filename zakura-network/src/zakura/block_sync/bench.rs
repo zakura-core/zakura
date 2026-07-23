@@ -293,7 +293,7 @@ impl BenchCommitter {
         height: block::Height,
         hash: block::Hash,
     ) {
-        let local_frontier = BlockSyncFrontiers {
+        let frontiers = BlockSyncFrontiers {
             finalized_height: self.finalized_height,
             verified_block_tip: height,
             verified_block_hash: hash,
@@ -309,8 +309,12 @@ impl BenchCommitter {
                 evidence: zakura_header_chain::EvidenceId::from_digest([0xb5; 32]),
             }),
             eligible_sources: std::collections::BTreeSet::new(),
+            persisted_availability: None,
             semantic_current: true,
-            local_frontier: Some(local_frontier),
+        });
+        let _ = self.control.send(SequencerControlInput::FrontierAdvance {
+            frontiers,
+            release_applied: true,
         });
     }
 

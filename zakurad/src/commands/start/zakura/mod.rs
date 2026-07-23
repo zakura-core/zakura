@@ -128,17 +128,14 @@ pub(crate) use block_sync_driver::{
     block_sync_missing_body_window, block_sync_needed_blocks_from_state,
     coalesce_ready_needed_block_queries, coalesce_stale_needed_block_queries,
     commit_block_sync_body, query_block_sync_needed_blocks, BlockApplyClass,
-    ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+    ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
 };
 pub(crate) use frontier::{query_block_sync_frontiers, verified_block_tip_from_state};
 #[cfg(test)]
+pub(crate) use header_sync_driver::{block_roots_cover_range, root_covered_query_best_header_tip};
 pub(crate) use header_sync_driver::{
-    block_roots_cover_range, block_sync_chain_tip_event, notify_block_sync_header_tip,
-    root_covered_query_best_header_tip,
-};
-pub(crate) use header_sync_driver::{
-    drive_zakura_header_sync_actions, mirror_zakura_full_block_commits,
-    zakura_header_sync_driver_startup, ZakuraHeaderSyncDriverHandles,
+    drive_zakura_header_sync_actions, zakura_header_sync_driver_startup,
+    ZakuraHeaderSyncDriverHandles,
 };
 pub(crate) use throughput_probe::{BlocksyncThroughputProbe, BlocksyncThroughputSummary};
 
@@ -183,29 +180,8 @@ pub(crate) fn insert_cs_u64(row: &mut Map<String, Value>, key: &'static str, val
     row.insert(key.to_string(), Value::Number(Number::from(value)));
 }
 
-pub(crate) fn insert_cs_bool(row: &mut Map<String, Value>, key: &'static str, value: bool) {
-    row.insert(key.to_string(), Value::Bool(value));
-}
-
 pub(crate) fn insert_cs_str(row: &mut Map<String, Value>, key: &'static str, value: &str) {
     row.insert(key.to_string(), Value::String(value.to_string()));
-}
-
-pub(crate) fn insert_cs_frontiers(
-    row: &mut Map<String, Value>,
-    frontiers: &zakura_network::zakura::BlockSyncFrontiers,
-) {
-    insert_cs_height(row, cs_trace::FINALIZED_HEIGHT, frontiers.finalized_height);
-    insert_cs_height(
-        row,
-        cs_trace::VERIFIED_BLOCK_TIP,
-        frontiers.verified_block_tip,
-    );
-    insert_cs_hash(
-        row,
-        cs_trace::VERIFIED_BLOCK_HASH,
-        frontiers.verified_block_hash,
-    );
 }
 
 pub(crate) fn block_apply_result_label(result: BlockApplyResult) -> &'static str {

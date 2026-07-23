@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use futures::{
@@ -11,7 +11,6 @@ use futures::{
     FutureExt,
 };
 use sha2::{Digest, Sha256};
-use tokio::time::Instant as TokioInstant;
 use tokio::{pin, select, sync::mpsc};
 use tower::{util::BoxCloneService, Service, ServiceExt};
 use tracing::{debug, warn};
@@ -26,15 +25,10 @@ use zakura_network::zakura::{
 use crate::components::sync;
 
 use super::{
-    block_apply_result_label, block_verify_error_class, emit_commit_state, insert_cs_bool,
-    insert_cs_frontiers, insert_cs_hash, insert_cs_height, insert_cs_peer, insert_cs_str,
-    insert_cs_u64, query_block_sync_frontiers, BlocksyncThroughputProbe,
+    block_apply_result_label, block_verify_error_class, emit_commit_state, insert_cs_hash,
+    insert_cs_height, insert_cs_peer, insert_cs_str, insert_cs_u64, BlocksyncThroughputProbe,
     ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
 };
-
-pub(crate) const ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL: Duration =
-    Duration::from_millis(200);
-const ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_ATTEMPTS: usize = 24;
 
 #[cfg(test)]
 pub(crate) const ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW: u32 =
@@ -58,43 +52,6 @@ struct PendingBlockApply {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BlockApplyCompletion {
     class: BlockApplyClass,
-    checkpoint_refresh_floor: Option<block::Height>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct CheckpointFrontierRefresh {
-    highest_sent: Option<block::Height>,
-    attempts_remaining: usize,
-    next_attempt_at: Option<TokioInstant>,
-}
-
-impl CheckpointFrontierRefresh {
-    fn observe_checkpoint_commit(&mut self, highest_observed_at_apply: block::Height) {
-        self.highest_sent = Some(
-            self.highest_sent
-                .map(|height| height.max(highest_observed_at_apply))
-                .unwrap_or(highest_observed_at_apply),
-        );
-        self.attempts_remaining = ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_ATTEMPTS;
-        if self.next_attempt_at.is_none() {
-            self.next_attempt_at =
-                Some(TokioInstant::now() + ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL);
-        }
-    }
-
-    fn next_attempt_at(&self) -> Option<TokioInstant> {
-        (self.attempts_remaining > 0)
-            .then_some(self.next_attempt_at)
-            .flatten()
-    }
-
-    fn finish_attempt(&mut self, highest_sent: block::Height) {
-        self.highest_sent = Some(highest_sent);
-        self.attempts_remaining = self.attempts_remaining.saturating_sub(1);
-        self.next_attempt_at = (self.attempts_remaining > 0).then_some(
-            TokioInstant::now() + ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL,
-        );
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -152,7 +109,6 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     let mut checkpoint_in_flight = 0usize;
     let mut full_in_flight = 0usize;
     let mut deferred_actions = VecDeque::new();
-    let mut checkpoint_frontier_refresh = CheckpointFrontierRefresh::default();
     let mut shutting_down = false;
 
     loop {
@@ -187,7 +143,6 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     block_sync.clone(),
                     trace.clone(),
                     throughput_probe.clone(),
-                    &mut checkpoint_frontier_refresh,
                 );
                 continue;
             }
@@ -214,7 +169,6 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     block_sync.clone(),
                     trace.clone(),
                     throughput_probe.clone(),
-                    &mut checkpoint_frontier_refresh,
                 );
                 continue;
             }
@@ -256,24 +210,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         block_sync.clone(),
                         trace.clone(),
                         throughput_probe.clone(),
-                        &mut checkpoint_frontier_refresh,
                     );
-                    continue;
-                }
-                _ = async {
-                    match checkpoint_frontier_refresh.next_attempt_at() {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                }, if checkpoint_frontier_refresh.next_attempt_at().is_some() => {
-                    refresh_block_sync_frontiers_for_checkpoint_window(
-                        read_state.clone(),
-                        latest_chain_tip.clone(),
-                        endpoint.clone(),
-                        Some(block_sync.clone()),
-                        trace.clone(),
-                        &mut checkpoint_frontier_refresh,
-                    ).await;
                     continue;
                 }
                 action = actions.recv() => {
@@ -644,11 +581,10 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                             block_sync.clone(),
                             trace.clone(),
                             probe,
-                            &mut checkpoint_frontier_refresh,
                         )
                         .await;
                     } else {
-                        let completed = apply_probe_block_sync_body(
+                        let _completed = apply_probe_block_sync_body(
                             latest_chain_tip.clone(),
                             endpoint.clone(),
                             read_state.clone(),
@@ -659,7 +595,6 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                             pending,
                         )
                         .await;
-                        observe_block_apply_completion(completed, &mut checkpoint_frontier_refresh);
                     }
                     continue;
                 }
@@ -721,7 +656,6 @@ fn abandon_block_apply(
             insert_cs_height(row, cs_trace::HEIGHT, height);
             insert_cs_hash(row, cs_trace::HASH, expected_hash);
             insert_cs_str(row, cs_trace::RESULT, block_apply_result_label(result));
-            insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, false);
         },
     );
 }
@@ -753,7 +687,6 @@ pub(crate) fn abandoned_block_apply_finished_event(
             height,
             hash,
             outcome,
-            local_frontier: None,
         },
     ))
 }
@@ -905,7 +838,6 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
     block_sync: BlockSyncHandle,
     trace: ZakuraTrace,
     throughput_probe: Option<BlocksyncThroughputProbe>,
-    checkpoint_frontier_refresh: &mut CheckpointFrontierRefresh,
 ) where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -921,7 +853,6 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
     BlockVerifier::Future: Send + 'static,
 {
     decrement_in_flight_apply_count(completed.class, checkpoint_in_flight, full_in_flight);
-    observe_block_apply_completion(completed, checkpoint_frontier_refresh);
 
     drain_pending_block_applies(
         handoff,
@@ -1065,7 +996,6 @@ fn release_pending_applies(
                 insert_cs_height(row, cs_trace::HEIGHT, height);
                 insert_cs_hash(row, cs_trace::HASH, expected_hash);
                 insert_cs_str(row, cs_trace::RESULT, block_apply_result_label(result));
-                insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, false);
             },
         );
     }
@@ -1104,15 +1034,6 @@ fn decrement_in_flight_apply_count(
     }
 }
 
-fn observe_block_apply_completion(
-    completed: BlockApplyCompletion,
-    checkpoint_frontier_refresh: &mut CheckpointFrontierRefresh,
-) {
-    if let Some(highest_observed_at_apply) = completed.checkpoint_refresh_floor {
-        checkpoint_frontier_refresh.observe_checkpoint_commit(highest_observed_at_apply);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn drain_ordered_probe_applies<ReadState, BlockVerifier>(
     pending_probe_applies: &mut BTreeMap<block::Height, PendingBlockApply>,
@@ -1123,7 +1044,6 @@ async fn drain_ordered_probe_applies<ReadState, BlockVerifier>(
     block_sync: BlockSyncHandle,
     trace: ZakuraTrace,
     throughput_probe: BlocksyncThroughputProbe,
-    checkpoint_frontier_refresh: &mut CheckpointFrontierRefresh,
 ) where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -1142,7 +1062,7 @@ async fn drain_ordered_probe_applies<ReadState, BlockVerifier>(
         let Some(pending) = pending_probe_applies.remove(&expected_height) else {
             break;
         };
-        let completed = apply_probe_block_sync_body(
+        let _completed = apply_probe_block_sync_body(
             latest_chain_tip.clone(),
             endpoint.clone(),
             read_state.clone(),
@@ -1153,7 +1073,6 @@ async fn drain_ordered_probe_applies<ReadState, BlockVerifier>(
             pending,
         )
         .await;
-        observe_block_apply_completion(completed, checkpoint_frontier_refresh);
     }
 }
 
@@ -1216,9 +1135,9 @@ pub(crate) fn block_apply_class(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_block_sync_body<BlockVerifier, ReadState>(
     block_verifier: BlockVerifier,
-    latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
+    _latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
     _endpoint: Option<ZakuraEndpoint>,
-    read_state: ReadState,
+    _read_state: ReadState,
     block_sync: BlockSyncHandle,
     owner: zakura_header_chain::WorkOwner,
     source: zakura_header_chain::SourceId,
@@ -1248,10 +1167,7 @@ where
             ?expected_hash,
             "Zakura block sync cannot apply body without coinbase height"
         );
-        return BlockApplyCompletion {
-            class,
-            checkpoint_refresh_floor: None,
-        };
+        return BlockApplyCompletion { class };
     };
 
     emit_commit_state(&trace, cs_trace::COMMIT_START, "block_sync_driver", |row| {
@@ -1262,17 +1178,13 @@ where
     });
     let started = Instant::now();
     // Throughput-probe mode (debug only): skip consensus verify+commit and
-    // advance an in-memory synthetic frontier instead, discarding the body. In
-    // normal mode the frontier comes from re-reading committed state below.
-    let (outcome, probe_frontier) = match throughput_probe.as_ref() {
+    // advance its in-memory synthetic frontier, discarding the body.
+    let outcome = match throughput_probe.as_ref() {
         Some(probe) => {
-            let (result, frontier) = probe.apply_block(block.as_ref());
-            (
-                probe_body_outcome(owner, source, expected_hash, result),
-                frontier,
-            )
+            let (result, _) = probe.apply_block(block.as_ref());
+            probe_body_outcome(owner, source, expected_hash, result)
         }
-        None => (
+        None => {
             commit_block_sync_body_with_stall_trace(
                 block_verifier.clone(),
                 block,
@@ -1284,9 +1196,8 @@ where
                 height,
                 expected_hash,
             )
-            .await,
-            None,
-        ),
+            .await
+        }
     };
     let result = outcome.result();
     emit_commit_state(
@@ -1302,35 +1213,6 @@ where
             insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
         },
     );
-    emit_commit_state(
-        &trace,
-        cs_trace::FRONTIER_QUERY_START,
-        "block_sync_driver",
-        |row| {
-            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-            insert_cs_height(row, cs_trace::HEIGHT, height);
-            insert_cs_hash(row, cs_trace::HASH, expected_hash);
-        },
-    );
-    let local_frontier = match throughput_probe.as_ref() {
-        Some(_) => probe_frontier,
-        None => query_block_sync_frontiers(read_state.clone(), latest_chain_tip.clone()).await,
-    };
-    emit_commit_state(
-        &trace,
-        cs_trace::FRONTIER_QUERY_FINISH,
-        "block_sync_driver",
-        |row| {
-            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-            insert_cs_height(row, cs_trace::HEIGHT, height);
-            insert_cs_hash(row, cs_trace::HASH, expected_hash);
-            insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, local_frontier.is_some());
-            if let Some(frontiers) = &local_frontier {
-                insert_cs_frontiers(row, frontiers);
-            }
-        },
-    );
-
     let _ = block_sync.send_control(BlockSyncEvent::BlockApplyFinished {
         owner,
         source,
@@ -1338,7 +1220,6 @@ where
         height,
         hash: expected_hash,
         outcome,
-        local_frontier,
     });
     emit_commit_state(
         &trace,
@@ -1350,23 +1231,10 @@ where
             insert_cs_height(row, cs_trace::HEIGHT, height);
             insert_cs_hash(row, cs_trace::HASH, expected_hash);
             insert_cs_str(row, cs_trace::RESULT, block_apply_result_label(result));
-            insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, local_frontier.is_some());
         },
     );
 
-    BlockApplyCompletion {
-        class,
-        // Probe applies never reach state, so a delayed refresh only adds state reads and makes
-        // probe tests race the refresh timer.
-        checkpoint_refresh_floor: (throughput_probe.is_none()
-            && class == BlockApplyClass::Checkpoint
-            && result == BlockApplyResult::Committed)
-            .then(|| {
-                local_frontier
-                    .map(|frontiers| frontiers.verified_block_tip)
-                    .unwrap_or_else(|| height.previous().unwrap_or(height))
-            }),
-    }
+    BlockApplyCompletion { class }
 }
 
 #[cfg(test)]
@@ -1707,63 +1575,6 @@ fn transient_failure_kind_label(
         zakura_header_chain::TransientBodyFailureKind::Timeout => "timeout",
         zakura_header_chain::TransientBodyFailureKind::ResourceExhausted => "resource_exhausted",
     }
-}
-
-async fn refresh_block_sync_frontiers_for_checkpoint_window<ReadState>(
-    read_state: ReadState,
-    latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
-    _endpoint: Option<ZakuraEndpoint>,
-    block_sync: Option<BlockSyncHandle>,
-    trace: ZakuraTrace,
-    refresh: &mut CheckpointFrontierRefresh,
-) where
-    ReadState: Service<
-            zakura_state::ReadRequest,
-            Response = zakura_state::ReadResponse,
-            Error = zakura_state::BoxError,
-        > + Clone
-        + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
-{
-    let Some(mut highest_sent) = refresh.highest_sent else {
-        return;
-    };
-
-    emit_commit_state(
-        &trace,
-        cs_trace::CHECKPOINT_REFRESH_ATTEMPT,
-        "block_sync_driver",
-        |row| {
-            insert_cs_u64(row, "attempts_remaining", refresh.attempts_remaining as u64);
-            insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, highest_sent);
-        },
-    );
-    let Some(frontiers) =
-        query_block_sync_frontiers(read_state.clone(), latest_chain_tip.clone()).await
-    else {
-        refresh.finish_attempt(highest_sent);
-        return;
-    };
-
-    if frontiers.verified_block_tip <= highest_sent {
-        refresh.finish_attempt(highest_sent);
-        return;
-    }
-
-    highest_sent = frontiers.verified_block_tip;
-    if let Some(block_sync) = &block_sync {
-        let _ = block_sync.send_control(BlockSyncEvent::ChainTipGrow(frontiers));
-    }
-    emit_commit_state(
-        &trace,
-        cs_trace::CHECKPOINT_REFRESH_SENT,
-        "block_sync_driver",
-        |row| {
-            insert_cs_frontiers(row, &frontiers);
-        },
-    );
-    refresh.finish_attempt(highest_sent);
 }
 
 pub(crate) async fn query_block_sync_needed_blocks<ReadState>(
@@ -2166,7 +1977,6 @@ mod tests {
                     height: event_height,
                     hash: event_hash,
                     outcome,
-                    local_frontier: None,
                     ..
                 },
             ) if *height == block1_height
@@ -2194,7 +2004,6 @@ mod tests {
                     height: event_height,
                     hash: event_hash,
                     outcome,
-                    local_frontier: None,
                     ..
                 },
             ) if *height == block2_height

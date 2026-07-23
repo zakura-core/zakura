@@ -128,7 +128,13 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-GEN-05"
 name = "Single frontier publisher"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::Publisher"
+tests = [
+    "IN-05::state_is_only_frontier_publisher",
+    "AUD-15::committed_snapshots_are_the_sole_production_frontier_source",
+]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-TXN-01"

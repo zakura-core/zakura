@@ -415,6 +415,46 @@ async fn committed_snapshots_are_the_sole_production_frontier_source() {
     reactor_task.abort();
 }
 
+#[test]
+fn state_is_only_frontier_publisher() {
+    const BLOCK_DRIVER: &str =
+        include_str!("../../../../zakurad/src/commands/start/zakura/block_sync_driver.rs");
+    const HEADER_DRIVER: &str =
+        include_str!("../../../../zakurad/src/commands/start/zakura/header_sync_driver.rs");
+    const NODE_WIRING: &str = include_str!("../../../../zakurad/src/commands/start.rs");
+    const STATE_PUBLISHER: &str =
+        include_str!("../../../../zakura-state/src/service/finalized_state/header_chain.rs");
+
+    for (name, source) in [
+        ("block-sync driver", BLOCK_DRIVER),
+        ("header-sync driver", HEADER_DRIVER),
+        ("node wiring", NODE_WIRING),
+    ] {
+        for forbidden in [
+            "local_frontier",
+            "publish_frontier",
+            "publish_best_header",
+            "publish_header_reanchor",
+            "mirror_zakura_full_block_commits",
+            "BlockSyncEvent::HeaderTipChanged",
+            "BlockSyncEvent::StateFrontiersChanged",
+            "BlockSyncEvent::ChainTipGrow",
+            "BlockSyncEvent::ChainTipReset",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{name} must not contain the retired frontier publisher `{forbidden}`"
+            );
+        }
+    }
+
+    assert!(
+        STATE_PUBLISHER.contains("pub struct Publisher")
+            && STATE_PUBLISHER.contains("fn publish(&self, snapshot: EngineSnapshot)"),
+        "state must retain the sole committed-snapshot publisher"
+    );
+}
+
 #[tokio::test]
 async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x52; 32]));

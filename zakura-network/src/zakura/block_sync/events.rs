@@ -30,19 +30,22 @@ pub enum BlockSyncEvent {
         /// Exact alarmed selected header; stale requests fail closed.
         hash: block::Hash,
     },
-    /// Header sync advanced the committed header target.
+    /// Test-only direct header-target injection.
+    #[cfg(any(test, feature = "proptest-impl"))]
     HeaderTipChanged {
         /// Current best header height.
         height: block::Height,
         /// Current best header hash.
         hash: block::Hash,
     },
-    /// Locally observed finalized or verified-body frontiers changed.
+    /// Test-only direct frontier injection.
+    #[cfg(any(test, feature = "proptest-impl"))]
     StateFrontiersChanged(BlockSyncFrontiers),
-    /// State grew the verified body chain tip.
+    /// Test-only direct growth injection.
+    #[cfg(any(test, feature = "proptest-impl"))]
     ChainTipGrow(BlockSyncFrontiers),
-    /// State reset the verified body chain tip after a rollback, best-chain switch,
-    /// activation boundary, or coalesced multi-block tip update.
+    /// Test-only direct reset injection.
+    #[cfg(any(test, feature = "proptest-impl"))]
     ChainTipReset(BlockSyncFrontiers),
     /// Driver returned body-missing metadata bound to the exact queried snapshot.
     ScopedNeededBlocks {

@@ -533,15 +533,19 @@ impl BlockSyncReactor {
             BlockSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
             BlockSyncEvent::PeerDisconnected(peer) => self.handle_peer_disconnected(peer),
             BlockSyncEvent::RetryBodyAvailability { hash } => self.retry_body_availability(hash),
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::HeaderTipChanged { height, hash } => {
                 self.handle_header_tip_changed(height, hash).await
             }
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::StateFrontiersChanged(frontiers) => {
                 self.handle_state_frontiers_changed(frontiers).await
             }
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::ChainTipGrow(frontiers) => {
                 self.handle_state_frontiers_changed(frontiers).await
             }
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::ChainTipReset(frontiers) => {
                 self.handle_chain_tip_reset(frontiers, true).await
             }
@@ -2725,19 +2729,23 @@ impl BlockSyncReactor {
                 bs_insert_str(row, bs_trace::KIND, "retry_body_availability");
                 bs_insert_hash(row, bs_trace::HASH, *hash);
             }
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::HeaderTipChanged { height, hash } => {
                 bs_insert_str(row, bs_trace::KIND, "header_tip_changed");
                 bs_insert_height(row, bs_trace::HEIGHT, *height);
                 bs_insert_hash(row, bs_trace::HASH, *hash);
             }
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::StateFrontiersChanged(frontiers) => {
                 bs_insert_str(row, bs_trace::KIND, "state_frontiers_changed");
                 bs_insert_frontiers(row, frontiers);
             }
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::ChainTipGrow(frontiers) => {
                 bs_insert_str(row, bs_trace::KIND, "chain_tip_grow");
                 bs_insert_frontiers(row, frontiers);
             }
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::ChainTipReset(frontiers) => {
                 bs_insert_str(row, bs_trace::KIND, "chain_tip_reset");
                 bs_insert_frontiers(row, frontiers);

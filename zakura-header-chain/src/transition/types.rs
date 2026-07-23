@@ -275,13 +275,11 @@ pub type PreparedAuxDelivery = AuxDelivery;
 /// Completion contract attached to one atomic header insertion.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TargetCompletion {
-    /// Native-v8 target was completed from this exact common ancestor.
-    V8Complete {
+    /// Peer-advertised target was completed from this exact common ancestor.
+    TargetComplete {
         /// Exact locator intersection.
         common_ancestor: Frontier,
     },
-    /// One legacy-v7 response is its own atomic range.
-    V7AtomicRange,
     /// Headers came from authenticated internal full-state evidence.
     InternalFullState,
 }

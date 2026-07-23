@@ -10,8 +10,8 @@ use crate::{
     EligibilityDelta, EligibilityReason, EngineLimits, EngineMetadata, EngineMode, EngineSnapshot,
     EventAdmission, EvidenceId, FinalityRecord, FinalitySource, Frontier, FrontierSet, GraphError,
     HeaderNode, HeaderValidationState, IndexChanges, MemHeaderStore, ProjectionDelta,
-    RetentionPlan, StateVersion, StoreError, StoreRead, TransitionCause, TransitionContext,
-    TransitionEvent, TransitionRequest, WorkOwner,
+    RetentionPlan, StateVersion, StoreError, StoreRead, TargetCompletion, TransitionCause,
+    TransitionContext, TransitionEvent, TransitionRequest, WorkOwner,
 };
 
 /// A complete write set plus the private projected graph it was verified against.
@@ -448,6 +448,13 @@ fn apply_event<S: StoreRead>(
                 || lease.parent.hash != event.parent_hash
             {
                 return Err(TransitionFailure::StalePreparation);
+            }
+            if let TargetCompletion::TargetComplete { common_ancestor } = event.completion {
+                if common_ancestor != lease.parent {
+                    return Err(TransitionFailure::InvalidEvidence(
+                        "target completion ancestor does not match the validation lease",
+                    ));
+                }
             }
             let mut parent = lease.parent;
             for prepared in event.batch.headers() {
@@ -1250,7 +1257,9 @@ mod tests {
                 source: SourceId::from_digest([3; 32]),
                 parent_hash: store.lease.parent.hash,
                 target_tip_hash: target,
-                completion: TargetCompletion::V7AtomicRange,
+                completion: TargetCompletion::TargetComplete {
+                    common_ancestor: store.lease.parent,
+                },
                 batch,
                 aux: Vec::new(),
             }),
@@ -1713,6 +1722,26 @@ mod tests {
 
         let startup = super::super::StartupCapability::new();
         assert_eq!(std::mem::size_of_val(&startup), 0);
+    }
+
+    #[test]
+    fn peer_target_completion_must_match_the_validation_lease_ancestor() {
+        let (store, config) = TestStore::new(EngineMode::HeadersOnly);
+        let clock = ManualClock(Utc::now());
+        let mut request = insertion(&store, 1, EvidenceId::from_digest([0x64; 32]));
+        let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
+            panic!("the fixture constructs a header insertion");
+        };
+        insert.completion = TargetCompletion::TargetComplete {
+            common_ancestor: Frontier::new(store.lease.parent.height, block::Hash([0x65; 32])),
+        };
+
+        assert!(matches!(
+            apply_transition(&store, request, &context(&config, &clock, None)),
+            Err(TransitionFailure::InvalidEvidence(
+                "target completion ancestor does not match the validation lease"
+            ))
+        ));
     }
 
     #[test]

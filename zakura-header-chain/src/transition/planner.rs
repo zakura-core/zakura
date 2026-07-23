@@ -2195,6 +2195,137 @@ mod tests {
     }
 
     #[test]
+    fn finality_atomic_prune_rebase_projection_generation() {
+        use zakura_chain::work::difficulty::{ExpandedDifficulty, U256};
+
+        let (mut store, config) = TestStore::new(EngineMode::Integrated);
+        let clock = ManualClock(Utc::now());
+        let authority = Authority;
+        let old_finalized = store.graph.finalized();
+        let easy = store
+            .graph
+            .node(old_finalized.hash)
+            .expect("the anchor exists")
+            .header
+            .difficulty_threshold;
+        let easy_target: U256 = easy
+            .to_expanded()
+            .expect("the fixture target expands")
+            .into();
+        let hard = ExpandedDifficulty::from(easy_target >> 3).into();
+
+        let verified_tip = insert_verified_branch(&mut store.graph, old_finalized, 3, easy, 0x71);
+        let verified_path =
+            path(&store.graph, verified_tip).expect("the verified fixture path is retained");
+        let new_finalized = verified_path[1];
+        let selected_tip = insert_verified_branch(&mut store.graph, old_finalized, 2, hard, 0x72);
+        synchronize_fixture(&mut store, verified_tip);
+        assert_eq!(store.metadata.frontiers.header_best, selected_tip);
+        assert!(
+            !store.selected.contains(&new_finalized),
+            "the selected history deliberately conflicts with the full-state anchor"
+        );
+        let old_selected = store.selected.clone();
+        let old_verified = store.verified.clone();
+        let before = store.snapshot();
+        let retained_tip_coordinate = store
+            .graph
+            .node(verified_tip.hash)
+            .expect("the retained tip exists")
+            .work_coordinate();
+        let new_anchor_coordinate = store
+            .graph
+            .node(new_finalized.hash)
+            .expect("the new anchor exists")
+            .work_coordinate();
+
+        let plan = apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::FullStateFinalized(crate::FullStateFinalized {
+                    full_state_transition_id: EvidenceId::from_digest([0x73; 32]),
+                    new_finalized,
+                    verified_path_proof: vec![old_finalized.hash, new_finalized.hash],
+                }),
+            },
+            &context(&config, &clock, Some(&authority)),
+        )
+        .expect("authenticated full-state finality transitions both histories atomically");
+
+        let changes = plan.change_set();
+        assert_eq!(changes.metadata.frontiers.finalized, new_finalized);
+        assert_eq!(changes.metadata.frontiers.header_best, verified_tip);
+        assert_eq!(changes.metadata.frontiers.verified_best, verified_tip);
+        assert_eq!(
+            changes.metadata.header_best_score.suffix_work,
+            retained_tip_coordinate
+                .suffix_after(new_anchor_coordinate)
+                .expect("the retained tip descends from the new anchor"),
+            "selection work is rebased to the new finalized anchor"
+        );
+        assert_eq!(
+            changes.delete_nodes.len(),
+            old_selected.len(),
+            "the old anchor and every node on the conflicting selected history are pruned"
+        );
+        assert!(old_selected
+            .iter()
+            .all(|frontier| changes.delete_nodes.contains(&frontier.hash)));
+        assert!(old_verified
+            .iter()
+            .skip(1)
+            .all(|frontier| !changes.delete_nodes.contains(&frontier.hash)));
+        assert_eq!(
+            changes.selected_projection,
+            ProjectionDelta {
+                remove_from: Some(old_finalized.height),
+                put: verified_path[1..].to_vec(),
+            }
+        );
+        assert_eq!(
+            changes.verified_projection,
+            ProjectionDelta {
+                remove_from: Some(old_finalized.height),
+                put: verified_path[1..].to_vec(),
+            }
+        );
+        assert_eq!(
+            changes.metadata.state_version,
+            before
+                .state_version
+                .checked_next()
+                .expect("the fixture version can advance")
+        );
+        assert_eq!(
+            changes.metadata.header_generation,
+            before
+                .header_generation
+                .checked_next()
+                .expect("the fixture generation can advance")
+        );
+        assert_eq!(
+            changes.metadata.verified_generation,
+            before
+                .verified_generation
+                .checked_next()
+                .expect("the fixture generation can advance")
+        );
+        assert_eq!(
+            changes.finality_append,
+            Some(FinalityRecord {
+                previous: old_finalized,
+                current: new_finalized,
+                source: FinalitySource::FullState {
+                    evidence: EvidenceId::from_digest([0x73; 32]),
+                },
+                epoch: FinalityEpoch::new(1),
+            })
+        );
+        verify_plan(&store, &plan).expect("the complete atomic finality plan is coherent");
+    }
+
+    #[test]
     fn headers_only_finalizes_exactly_tip_minus_one_thousand_before_publication() {
         let (store, config) = TestStore::new(EngineMode::HeadersOnly);
         let clock = ManualClock(Utc::now());

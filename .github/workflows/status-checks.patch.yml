@@ -9,8 +9,9 @@ on:
   pull_request:
     branches: [main, "feat/**", "release/**"]
     paths-ignore:
-      # This MUST be an exact inverse of paths in lint.yml, tests-unit.yml, and test-crates.yml
-      # to ensure mutual exclusion - only one set of workflows runs
+      # This MUST be an exact inverse of paths in lint.yml, tests-unit.yml,
+      # test-crates.yml, and semver-checks.yml to ensure mutual exclusion -
+      # only one set of workflows runs
       - '**/*.rs'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
@@ -21,6 +22,7 @@ on:
       - .github/workflows/lint.yml
       - .github/workflows/tests-unit.yml
       - .github/workflows/test-crates.yml
+      - .github/workflows/semver-checks.yml
 
 permissions:
   contents: read
@@ -43,3 +45,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo "No crate build needed - no Rust files modified"
+
+  semver-checks:
+    name: semver-checks
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "No semver checks needed - no Rust files modified"

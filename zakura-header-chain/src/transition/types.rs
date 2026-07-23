@@ -307,6 +307,13 @@ pub enum TargetCompletion {
         /// Exact locator intersection.
         common_ancestor: Frontier,
     },
+    /// One already-selected interior header was redelivered solely to replace auxiliary metadata.
+    SelectedAuxiliaryRepair {
+        /// Exact selected predecessor used as the single-entry locator.
+        common_ancestor: Frontier,
+        /// Exact already-selected header whose metadata was redelivered.
+        selected_target: Frontier,
+    },
     /// Headers came from authenticated internal full-state evidence.
     InternalFullState,
 }
@@ -680,7 +687,14 @@ impl TransitionEvent {
     /// Return this event's stable idempotency identity when it carries durable evidence.
     pub fn idempotency_key(&self) -> Option<EvidenceId> {
         match self {
-            Self::InsertHeaders(event) => Some(event.batch.evidence()),
+            Self::InsertHeaders(event) => match event.completion {
+                TargetCompletion::SelectedAuxiliaryRepair { .. } => {
+                    event.aux.first().map(|delivery| delivery.delivery_id)
+                }
+                TargetCompletion::TargetComplete { .. } | TargetCompletion::InternalFullState => {
+                    Some(event.batch.evidence())
+                }
+            },
             Self::VerifiedChainChanged(event) => Some(event.full_state_transition_id),
             Self::BodyEvidence(BodyEvidence::PayloadMismatch(event)) => Some(event.evidence),
             Self::BodyEvidence(BodyEvidence::ConsensusInvalid(event)) => Some(event.evidence),

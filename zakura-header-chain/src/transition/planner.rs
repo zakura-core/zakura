@@ -449,12 +449,17 @@ fn apply_event<S: StoreRead>(
             {
                 return Err(TransitionFailure::StalePreparation);
             }
-            if let TargetCompletion::TargetComplete { common_ancestor } = event.completion {
-                if common_ancestor != lease.parent {
-                    return Err(TransitionFailure::InvalidEvidence(
-                        "target completion ancestor does not match the validation lease",
-                    ));
-                }
+            let common_ancestor = match event.completion {
+                TargetCompletion::TargetComplete { common_ancestor }
+                | TargetCompletion::SelectedAuxiliaryRepair {
+                    common_ancestor, ..
+                } => Some(common_ancestor),
+                TargetCompletion::InternalFullState => None,
+            };
+            if common_ancestor.is_some_and(|common_ancestor| common_ancestor != lease.parent) {
+                return Err(TransitionFailure::InvalidEvidence(
+                    "target completion ancestor does not match the validation lease",
+                ));
             }
             let mut parent = lease.parent;
             for prepared in event.batch.headers() {
@@ -494,15 +499,46 @@ fn apply_event<S: StoreRead>(
                     | crate::InsertResult::AlreadyPresent(frontier) => frontier,
                 };
             }
-            if parent.hash != event.target_tip_hash
-                || event.owner.branch.target_tip_hash != event.target_tip_hash
-            {
+            if parent.hash != event.target_tip_hash {
                 return Err(TransitionFailure::InvalidEvidence(
                     "target completion does not end at the pursued hash",
                 ));
             }
+            match event.completion {
+                TargetCompletion::SelectedAuxiliaryRepair {
+                    selected_target, ..
+                } => {
+                    if event.batch.headers().len() != 1
+                        || event.aux.len() != 1
+                        || event.aux[0].tree_aux.is_none()
+                        || selected_target != parent
+                        || event.owner.branch.target_tip_hash
+                            != store.snapshot()?.frontiers.header_best.hash
+                        || store.selected_hash(selected_target.height)?
+                            != Some(selected_target.hash)
+                        || graph
+                            .ancestor(event.owner.branch.target_tip_hash, selected_target.height)?
+                            != Some(selected_target)
+                    {
+                        return Err(TransitionFailure::InvalidEvidence(
+                            "auxiliary repair is not one exact selected header",
+                        ));
+                    }
+                }
+                TargetCompletion::TargetComplete { .. } | TargetCompletion::InternalFullState => {
+                    if event.owner.branch.target_tip_hash != event.target_tip_hash {
+                        return Err(TransitionFailure::InvalidEvidence(
+                            "target completion does not end at the pursued hash",
+                        ));
+                    }
+                }
+            }
             for delivery in &event.aux {
-                if delivery.owner != event.owner || graph.node(delivery.header_hash).is_none() {
+                if delivery.owner != event.owner
+                    || delivery.source != event.source
+                    || delivery.authentication != crate::AuxAuthentication::Unauthenticated
+                    || graph.node(delivery.header_hash).is_none()
+                {
                     return Err(TransitionFailure::InvalidEvidence(
                         "auxiliary delivery does not match the admitted target",
                     ));
@@ -1881,6 +1917,95 @@ mod tests {
     }
 
     #[test]
+    fn selected_auxiliary_repair_adds_only_one_exact_provenance_record() {
+        let (mut store, config) = TestStore::new(EngineMode::Integrated);
+        let clock = ManualClock(Utc::now());
+        let anchor = store.metadata.frontiers.finalized;
+        let insert = insertion(&store, 2, EvidenceId::from_digest([0x66; 32]));
+        let TransitionEvent::InsertHeaders(initial) = &insert.event else {
+            panic!("the fixture constructs a header insertion");
+        };
+        let repaired = initial.batch.headers()[0].clone();
+        let selected_target = Frontier::new(repaired.height, repaired.hash);
+        let inserted = apply_transition(&store, insert, &context(&config, &clock, None))
+            .expect("the selected fixture branch inserts");
+        store.commit(&inserted);
+
+        store.lease.parent = anchor;
+        store.lease.context_digest = [0x67; 32];
+        let owner = crate::WorkScope::for_body_work(&store.snapshot())
+            .bind(8, NonZeroU64::new(9).expect("nine is nonzero"));
+        let source = SourceId::from_digest([0x68; 32]);
+        let delivery = crate::AuxDelivery {
+            delivery_id: EvidenceId::from_digest([0x69; 32]),
+            header_hash: repaired.hash,
+            source,
+            owner,
+            body_size: crate::BodySizeHint::Unknown,
+            tree_aux: Some(crate::TreeAuxRecordV1 {
+                height: repaired.height,
+                sapling_root: zakura_chain::sapling::tree::Root::default(),
+                orchard_root: zakura_chain::orchard::tree::Root::default(),
+                ironwood_root: zakura_chain::ironwood::tree::Root::default(),
+                sapling_tx_count: 1,
+                orchard_tx_count: 2,
+                ironwood_tx_count: 3,
+                auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0x6a; 32]),
+            }),
+            authentication: crate::AuxAuthentication::Unauthenticated,
+        };
+        let repair = TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::InsertHeaders(Box::new(crate::InsertHeaders {
+                owner,
+                source,
+                parent_hash: anchor.hash,
+                target_tip_hash: repaired.hash,
+                completion: TargetCompletion::SelectedAuxiliaryRepair {
+                    common_ancestor: anchor,
+                    selected_target,
+                },
+                batch: PreparedHeaderBatch::new(
+                    vec![repaired],
+                    store.lease.context_digest,
+                    EvidenceId::from_digest([0x6b; 32]),
+                )
+                .expect("the exact repair batch is nonempty"),
+                aux: vec![delivery],
+            })),
+        };
+
+        assert_eq!(
+            repair.event.idempotency_key(),
+            Some(delivery.delivery_id),
+            "repair replay identity is the new provenance record, not the old header batch"
+        );
+        let repaired = apply_transition(&store, repair, &context(&config, &clock, None))
+            .expect("one exact selected auxiliary repair is admitted");
+        assert_eq!(repaired.change_set.put_nodes.len(), 1);
+        assert_eq!(repaired.change_set.put_nodes[0].hash, selected_target.hash);
+        assert_eq!(
+            repaired.change_set.put_nodes[0].aux_delivery_ids,
+            vec![delivery.delivery_id]
+        );
+        assert!(repaired.change_set.delete_nodes.is_empty());
+        assert!(repaired.change_set.selected_projection.put.is_empty());
+        assert!(repaired.change_set.verified_projection.put.is_empty());
+        assert_eq!(
+            repaired.change_set.metadata.header_generation,
+            store.metadata.header_generation
+        );
+        assert_eq!(
+            repaired.change_set.metadata.verified_generation,
+            store.metadata.verified_generation
+        );
+        assert_eq!(
+            repaired.change_set.aux_changes,
+            vec![crate::AuxDelta::Put(Box::new(delivery))]
+        );
+    }
+
+    #[test]
     fn apply_transition_is_the_only_public_dag_mutation_entry_point() {
         let graph_source = include_str!("../graph.rs");
         for old_entry in [
@@ -2079,14 +2204,13 @@ mod tests {
             }),
             authentication: crate::AuxAuthentication::Unauthenticated,
         };
+        insert_event.source = delivery.source;
         let second_delivery = crate::AuxDelivery {
             delivery_id: EvidenceId::from_digest([0xc1; 32]),
-            source: SourceId::from_digest([0xc2; 32]),
             ..delivery
         };
         let third_delivery = crate::AuxDelivery {
             delivery_id: EvidenceId::from_digest([0xc3; 32]),
-            source: SourceId::from_digest([0xc4; 32]),
             ..delivery
         };
         insert_event

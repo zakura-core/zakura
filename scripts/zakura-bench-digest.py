@@ -316,16 +316,19 @@ def nearest_rank(sorted_values, quantile):
     return sorted_values[rank - 1]
 
 
-def per_block_stats(trace_path):
-    """Summarize per-block commit latency from a commit_state.jsonl file.
+def parse_commit_trace(trace_path):
+    """Parse commit_state.jsonl into block, header-range, and stall records.
 
-    Returns `(by_class, slowest, stalls, non_committed)` where `by_class` maps
-    apply_class ("checkpoint"/"full") to latency stats over committed
-    `commit_finish` rows, `slowest` lists the worst blocks, `stalls` counts
-    `commit_stalled` rows by reason, and `non_committed` counts the other
-    commit results (duplicate / rejected / timed_out).
+    The trace table is shared by two drivers: the block-sync driver (per-block
+    `block_submit_queued`/`commit_start`/`commit_finish` rows keyed by height,
+    with `apply_class` checkpoint|full) and the header-sync driver
+    (`commit_header_range` rows with `range_count`, no height). Returns
+    `(queued_ts, start_ts, finishes, headers, stalls, non_committed)` where
+    `finishes` maps height to `(ts, elapsed_ms, apply_class)` for committed
+    blocks and `headers` lists `(elapsed_ms, range_count)` per committed range.
     """
-    finishes = defaultdict(list)  # apply_class -> [(elapsed_ms, height)]
+    queued_ts, start_ts, finishes = {}, {}, {}
+    headers = []
     stalls = defaultdict(int)
     non_committed = defaultdict(int)
     with open(trace_path, encoding="utf-8", errors="replace") as trace:
@@ -335,39 +338,54 @@ def per_block_stats(trace_path):
             except ValueError:
                 continue
             event = row.get("event")
-            if event == "commit_stalled":
+            if row.get("source") == "header_sync_driver":
+                if event == "commit_finish" and row.get("result") == "committed":
+                    elapsed = row.get("elapsed_ms")
+                    if isinstance(elapsed, (int, float)):
+                        headers.append((float(elapsed), int(row.get("range_count") or 0)))
+                continue
+            height = row.get("height")
+            if event == "block_submit_queued" and height is not None:
+                queued_ts.setdefault(height, row.get("ts"))
+            elif event == "commit_start" and height is not None:
+                start_ts.setdefault(height, row.get("ts"))
+            elif event == "commit_stalled":
                 stalls[row.get("commit_stall_reason", "unknown")] += 1
-                continue
-            if event != "commit_finish":
-                continue
-            if row.get("result") != "committed":
-                non_committed[row.get("result") or "unknown"] += 1
-                continue
-            elapsed = row.get("elapsed_ms")
-            if not isinstance(elapsed, (int, float)):
-                continue
-            finishes[row.get("apply_class") or "unknown"].append(
-                (float(elapsed), row.get("height"))
-            )
+            elif event == "commit_finish":
+                if row.get("result") != "committed":
+                    non_committed[row.get("result") or "unknown"] += 1
+                    continue
+                elapsed = row.get("elapsed_ms")
+                if height is None or not isinstance(elapsed, (int, float)):
+                    continue
+                finishes[height] = (
+                    row.get("ts"),
+                    float(elapsed),
+                    row.get("apply_class") or "unknown",
+                )
+    return queued_ts, start_ts, finishes, headers, dict(stalls), dict(non_committed)
 
-    by_class = {}
-    slowest = []
-    for apply_class, samples in finishes.items():
-        values = sorted(ms for ms, _ in samples)
-        by_class[apply_class] = {
-            "blocks": len(values),
-            "mean_ms": sum(values) / len(values),
-            "p50_ms": nearest_rank(values, 0.50),
-            "p90_ms": nearest_rank(values, 0.90),
-            "p99_ms": nearest_rank(values, 0.99),
-            "max_ms": values[-1],
-        }
-        slowest.extend(
-            (ms, height, apply_class)
-            for ms, height in sorted(samples, key=lambda s: s[0], reverse=True)[:5]
-        )
-    slowest.sort(key=lambda s: s[0], reverse=True)
-    return by_class, slowest[:5], dict(stalls), dict(non_committed)
+
+def latency_stats(values):
+    """Distribution stats dict for an ascending list of millisecond values."""
+    return {
+        "count": len(values),
+        "mean_ms": sum(values) / len(values),
+        "p50_ms": nearest_rank(values, 0.50),
+        "p90_ms": nearest_rank(values, 0.90),
+        "p99_ms": nearest_rank(values, 0.99),
+        "max_ms": values[-1],
+    }
+
+
+def steady_bps(finish_ts):
+    """Blocks/s over the span of finish timestamps (µs); None when unknowable."""
+    if len(finish_ts) < 2:
+        return None
+    span = (max(finish_ts) - min(finish_ts)) / 1e6
+    if span <= 0:
+        return None
+    return (len(finish_ts) - 1) / span
 
 
 def fmt_ms(value):
@@ -385,43 +403,160 @@ def cmd_latency(args):
 
     trace_path = Path(args.traces, "commit_state.jsonl") if args.traces else None
     if trace_path and trace_path.is_file():
-        by_class, slowest, stalls, non_committed = per_block_stats(trace_path)
-        report["per_block"] = {
-            "by_apply_class": by_class,
-            "slowest": [
-                {"elapsed_ms": ms, "height": height, "apply_class": apply_class}
-                for ms, height, apply_class in slowest
-            ],
-            "stalls": stalls,
-            "non_committed_results": non_committed,
-        }
-        if by_class:
+        queued_ts, start_ts, finishes, headers, stalls, non_committed = (
+            parse_commit_trace(trace_path)
+        )
+        by_class = defaultdict(list)  # class -> [(height, ts, elapsed_ms)]
+        for height, (ts, elapsed, apply_class) in finishes.items():
+            by_class[apply_class].append((height, ts, elapsed))
+        report["stalls"] = stalls
+        report["non_committed_results"] = non_committed
+
+        checkpoint_rows = by_class.get("checkpoint")
+        if checkpoint_rows:
+            residence = sorted(ms for _, _, ms in checkpoint_rows)
+            stats = latency_stats(residence)
+            bps = steady_bps([ts for _, ts, _ in checkpoint_rows if ts is not None])
+            takeaway = f"**Takeaway:** committed {stats['count']:,} blocks"
+            if bps:
+                takeaway += (
+                    f" at **{bps:.0f} blocks/s** steady"
+                    f" (**{1000.0 / bps:.1f} ms/block** marginal cost)"
+                )
+            takeaway += f". Median pipeline residence is **{fmt_ms(stats['p50_ms'])} ms**"
+            if bps:
+                takeaway += f" ≈ {stats['p50_ms'] / 1000.0 * bps:.0f} blocks of arrival time"
+            takeaway += (
+                " — checkpoint-range batching (400-block ranges commit together),"
+                " not per-block processing cost.\n\n"
+            )
+            out.write(takeaway)
+
             out.write(
-                "**Per-block apply latency** (driver commit_start→commit_finish:"
-                " verify + contextual checks + state commit)\n\n"
+                "**Block pipeline residence** (submitted→committed; checkpoint"
+                " mode batches ranges, so this is batching + head-of-line, not"
+                " processing cost)\n\n"
             )
             out.write(
-                "| apply class | blocks | mean ms | p50 | p90 | p99 | max |\n"
+                "| segment | blocks | mean | p50 | p90 | p99 | max |\n"
                 "|---|---:|---:|---:|---:|---:|---:|\n"
             )
-            for apply_class, stats in sorted(by_class.items()):
-                out.write(
-                    f"| {apply_class} | {stats['blocks']:,} "
-                    f"| {fmt_ms(stats['mean_ms'])} | {fmt_ms(stats['p50_ms'])} "
-                    f"| {fmt_ms(stats['p90_ms'])} | {fmt_ms(stats['p99_ms'])} "
-                    f"| {fmt_ms(stats['max_ms'])} |\n"
-                )
-            out.write("\nslowest blocks: ")
-            out.write(
-                ", ".join(
-                    f"{height} ({fmt_ms(ms)} ms, {apply_class})"
-                    for ms, height, apply_class in slowest
-                )
-                or "none"
+            queue_waits = sorted(
+                (start_ts[h] - queued_ts[h]) / 1000.0
+                for h, _, _ in checkpoint_rows
+                if h in queued_ts and h in start_ts
+                and start_ts[h] is not None and queued_ts[h] is not None
             )
-            out.write("\n")
-        else:
+            # the driver queue is normally negligible; give it a row only when
+            # it is a meaningful share of residence, else a one-line note
+            queue_stats = latency_stats(queue_waits) if queue_waits else None
+            if queue_stats and queue_stats["p50_ms"] >= max(1.0, 0.05 * stats["p50_ms"]):
+                out.write(
+                    f"| driver queue (queued→submitted) | {queue_stats['count']:,} "
+                    f"| {fmt_ms(queue_stats['mean_ms'])} | {fmt_ms(queue_stats['p50_ms'])} "
+                    f"| {fmt_ms(queue_stats['p90_ms'])} | {fmt_ms(queue_stats['p99_ms'])} "
+                    f"| {fmt_ms(queue_stats['max_ms'])} |\n"
+                )
+                queue_note = None
+            else:
+                queue_note = (
+                    f"driver queue wait: negligible (p50 {fmt_ms(queue_stats['p50_ms'])} ms)"
+                    if queue_stats
+                    else None
+                )
+            out.write(
+                f"| residence (submitted→committed) | {stats['count']:,} "
+                f"| {fmt_ms(stats['mean_ms'])} | {fmt_ms(stats['p50_ms'])} "
+                f"| {fmt_ms(stats['p90_ms'])} | {fmt_ms(stats['p99_ms'])} "
+                f"| {fmt_ms(stats['max_ms'])} |\n"
+            )
+            if queue_note:
+                out.write(f"\n{queue_note}\n")
+            slowest = sorted(checkpoint_rows, key=lambda r: -r[2])[:5]
+            out.write(
+                "\nslowest: "
+                + ", ".join(f"{h} ({fmt_ms(ms)} ms)" for h, _, ms in slowest)
+                + "\n"
+            )
+            report["checkpoint_residence"] = {
+                "stats": stats,
+                "steady_bps": bps,
+                "queue_wait": queue_stats,
+                "slowest": [
+                    {"height": h, "elapsed_ms": ms} for h, _, ms in slowest
+                ],
+            }
+
+        full_rows = by_class.get("full")
+        if full_rows:
+            values = sorted(ms for _, _, ms in full_rows)
+            stats = latency_stats(values)
+            bps = steady_bps([ts for _, ts, _ in full_rows if ts is not None])
+            out.write("\n**Per-block verify+commit latency** (full class)\n\n")
+            if bps:
+                out.write(
+                    f"**Takeaway:** verified+committed {stats['count']:,} blocks at"
+                    f" **{bps:.0f} blocks/s** (**{1000.0 / bps:.1f} ms/block** marginal"
+                    " cost); per-block latency below is true verification+commit"
+                    " cost (no range batching).\n\n"
+                )
+            out.write(
+                "| blocks | mean | p50 | p90 | p99 | max |\n"
+                "|---:|---:|---:|---:|---:|---:|\n"
+            )
+            out.write(
+                f"| {stats['count']:,} | {fmt_ms(stats['mean_ms'])} "
+                f"| {fmt_ms(stats['p50_ms'])} | {fmt_ms(stats['p90_ms'])} "
+                f"| {fmt_ms(stats['p99_ms'])} | {fmt_ms(stats['max_ms'])} |\n"
+            )
+            slowest = sorted(full_rows, key=lambda r: -r[2])[:5]
+            out.write(
+                "\nslowest: "
+                + ", ".join(f"{h} ({fmt_ms(ms)} ms)" for h, _, ms in slowest)
+                + "\n"
+            )
+            report["full_per_block"] = {
+                "stats": stats,
+                "steady_bps": bps,
+                "slowest": [
+                    {"height": h, "elapsed_ms": ms} for h, _, ms in slowest
+                ],
+            }
+        elif checkpoint_rows:
+            out.write(
+                "\n**Per-block verify+commit latency** — _not applicable:"
+                " checkpoint mode skips per-block verification; run with"
+                " `verify_mode: semantic` for true per-block cost percentiles._\n"
+            )
+
+        other = {
+            cls: rows
+            for cls, rows in by_class.items()
+            if cls not in ("checkpoint", "full")
+        }
+        if other:
+            counts = ", ".join(f"{cls}: {len(rows)}" for cls, rows in sorted(other.items()))
+            out.write(f"\n_(unclassified block commit rows: {counts})_\n")
+
+        if not finishes:
             out.write("_(commit_state.jsonl has no successful commit_finish rows)_\n")
+
+        if headers:
+            header_ms = sorted(ms for ms, _ in headers)
+            per_range = sum(count for _, count in headers) / len(headers)
+            out.write(
+                f"\n**Header-range commits** (parallel header pipeline):"
+                f" {len(headers):,} ranges × ~{per_range:.0f} headers,"
+                f" mean {fmt_ms(sum(header_ms) / len(header_ms))} ms,"
+                f" p99 {fmt_ms(nearest_rank(header_ms, 0.99))} ms.\n"
+            )
+            report["header_ranges"] = {
+                "ranges": len(headers),
+                "mean_headers_per_range": per_range,
+                "mean_ms": sum(header_ms) / len(header_ms),
+                "p99_ms": nearest_rank(header_ms, 0.99),
+            }
+
         if stalls:
             breakdown = ", ".join(f"{reason}: {n}" for reason, n in sorted(stalls.items()))
             out.write(f"\n⚠ commit stalls (>30s): {breakdown}\n")

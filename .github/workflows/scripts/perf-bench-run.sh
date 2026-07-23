@@ -396,9 +396,10 @@ ERRS="$(grep -iE 'panic|ERROR committing|resetting state queue' "$LOGF" 2>/dev/n
     echo '```'
   fi
 } > "$OUT_DIR/leg-summary.md"
-[[ -f "$OUT_DIR/verdict.md" ]] && { echo ""; cat "$OUT_DIR/verdict.md"; } >> "$OUT_DIR/leg-summary.md"
-[[ -f "$OUT_DIR/latency.md" ]] && { echo ""; cat "$OUT_DIR/latency.md"; } >> "$OUT_DIR/leg-summary.md"
+# section order: CPU profile first, then block latency, verdict as the closer
 [[ -f "$OUT_DIR/profile.md" ]] && { echo ""; cat "$OUT_DIR/profile.md"; } >> "$OUT_DIR/leg-summary.md"
+[[ -f "$OUT_DIR/latency.md" ]] && { echo ""; cat "$OUT_DIR/latency.md"; } >> "$OUT_DIR/leg-summary.md"
+[[ -f "$OUT_DIR/verdict.md" ]] && { echo ""; cat "$OUT_DIR/verdict.md"; } >> "$OUT_DIR/leg-summary.md"
 
 # package traces + trim logs for scp
 ( cd "$OUT_DIR" && tar -cf - zakura-traces | zstd -T0 -q -f -o zakura-traces.tar.zst && rm -rf zakura-traces ) || true

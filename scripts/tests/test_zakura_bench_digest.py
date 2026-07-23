@@ -176,6 +176,30 @@ def commit_row(**overrides):
     return json.dumps(row)
 
 
+def block_lifecycle(height, queued_ts, start_ts, finish_ts, elapsed_ms, **finish_overrides):
+    """The three driver rows (queued/start/finish) for one committed block."""
+    return [
+        json.dumps({"event": "block_submit_queued", "height": height, "ts": queued_ts}),
+        json.dumps({"event": "commit_start", "height": height, "ts": start_ts}),
+        commit_row(height=height, ts=finish_ts, elapsed_ms=elapsed_ms, **finish_overrides),
+    ]
+
+
+def header_range_row(elapsed_ms, range_count):
+    return json.dumps(
+        {
+            "event": "commit_finish",
+            "source": "header_sync_driver",
+            "action": "commit_header_range",
+            "result": "committed",
+            "elapsed_ms": elapsed_ms,
+            "range_count": range_count,
+            "range_start": 1707211,
+            "ts": 5000,
+        }
+    )
+
+
 class LatencyTests(unittest.TestCase):
     def run_latency(self, traces="", metrics="", json_out=""):
         args = SimpleNamespace(
@@ -183,42 +207,106 @@ class LatencyTests(unittest.TestCase):
         )
         return run_command(digest.cmd_latency, args)
 
-    def test_per_block_stats_split_by_apply_class(self):
+    def write_trace(self, tmp, rows):
+        (Path(tmp) / "commit_state.jsonl").write_text("\n".join(rows) + "\n")
+
+    def test_checkpoint_residence_with_takeaway_and_header_ranges(self):
+        rows = []
+        # 3 blocks finishing 1s apart (steady 1 blk/s), negligible queue wait
+        for i, elapsed in enumerate([1000, 2000, 3000]):
+            rows += block_lifecycle(
+                1707211 + i,
+                queued_ts=1_000_000 * i + 100,
+                start_ts=1_000_000 * i + 300,  # 0.2ms queue wait
+                finish_ts=1_000_000 * (i + 1),
+                elapsed_ms=elapsed,
+            )
+        rows += [
+            header_range_row(10, 60),
+            header_range_row(30, 72),
+            commit_row(height=1707216, result="rejected"),
+            json.dumps(
+                {
+                    "event": "commit_stalled",
+                    "height": 1707217,
+                    "commit_stall_reason": "contiguous_head",
+                }
+            ),
+            "not json at all",
+        ]
         with tempfile.TemporaryDirectory() as tmp:
-            rows = [
-                commit_row(height=1707211, elapsed_ms=10),
-                commit_row(height=1707212, elapsed_ms=20),
-                commit_row(height=1707213, elapsed_ms=30),
-                commit_row(height=1707214, elapsed_ms=500, apply_class="full"),
-                commit_row(height=1707215, result="duplicate"),
-                commit_row(height=1707216, result="rejected"),
-                json.dumps(
-                    {
-                        "event": "commit_stalled",
-                        "height": 1707217,
-                        "commit_stall_reason": "contiguous_head",
-                    }
-                ),
-                "not json at all",
-            ]
-            (Path(tmp) / "commit_state.jsonl").write_text("\n".join(rows) + "\n")
+            self.write_trace(tmp, rows)
             json_out = Path(tmp) / "latency.json"
             output = self.run_latency(traces=tmp, json_out=str(json_out))
-
-            self.assertIn("| checkpoint | 3 | 20.0 | 20.0 | 30.0 | 30.0 | 30.0 |", output)
-            self.assertIn("| full | 1 | 500 | 500 | 500 | 500 | 500 |", output)
-            self.assertIn("1707214 (500 ms, full)", output)
-            self.assertIn("commit stalls (>30s): contiguous_head: 1", output)
-            self.assertIn("non-committed results: rejected: 1", output)
-            self.assertIn("duplicate commits: 1", output)
-
             report = json.loads(json_out.read_text())
-            self.assertEqual(report["per_block"]["by_apply_class"]["checkpoint"]["blocks"], 3)
-            self.assertEqual(report["per_block"]["stalls"], {"contiguous_head": 1})
-            self.assertEqual(
-                report["per_block"]["non_committed_results"],
-                {"duplicate": 1, "rejected": 1},
+
+        self.assertIn("**Takeaway:** committed 3 blocks at **1 blocks/s** steady", output)
+        self.assertIn("(**1000.0 ms/block** marginal cost)", output)
+        self.assertIn("Median pipeline residence is **2,000 ms**", output)
+        # collapsed: exactly one residence row, queue demoted to a note
+        self.assertIn("| residence (submitted→committed) | 3 | 2,000 | 2,000 |", output)
+        self.assertNotIn("| driver queue (queued→submitted) |", output)
+        self.assertIn("driver queue wait: negligible (p50 0.2 ms)", output)
+        self.assertIn("slowest: 1707213 (3,000 ms), 1707212 (2,000 ms)", output)
+        self.assertIn("not applicable: checkpoint mode skips per-block verification", output)
+        self.assertIn(
+            "**Header-range commits** (parallel header pipeline): 2 ranges × ~66 headers,"
+            " mean 20.0 ms, p99 30.0 ms.",
+            output,
+        )
+        self.assertIn("commit stalls (>30s): contiguous_head: 1", output)
+        self.assertIn("non-committed results: rejected: 1", output)
+
+        self.assertEqual(report["checkpoint_residence"]["stats"]["count"], 3)
+        self.assertEqual(report["checkpoint_residence"]["queue_wait"]["count"], 3)
+        self.assertEqual(report["header_ranges"]["ranges"], 2)
+        self.assertEqual(report["stalls"], {"contiguous_head": 1})
+
+    def test_significant_queue_wait_gets_its_own_row(self):
+        rows = []
+        for i in range(2):
+            rows += block_lifecycle(
+                1707211 + i,
+                queued_ts=1_000_000 * i,
+                start_ts=1_000_000 * i + 500_000,  # 500ms queue wait
+                finish_ts=1_000_000 * (i + 1),
+                elapsed_ms=1000,
             )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_trace(tmp, rows)
+            output = self.run_latency(traces=tmp)
+        self.assertIn("| driver queue (queued→submitted) | 2 | 500 | 500 |", output)
+        self.assertNotIn("negligible", output)
+
+    def test_full_class_renders_per_block_latency(self):
+        rows = []
+        for i, elapsed in enumerate([10, 20, 500]):
+            rows += block_lifecycle(
+                1707211 + i,
+                queued_ts=1_000_000 * i,
+                start_ts=1_000_000 * i + 100,
+                finish_ts=1_000_000 * (i + 1),
+                elapsed_ms=elapsed,
+                apply_class="full",
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_trace(tmp, rows)
+            json_out = Path(tmp) / "latency.json"
+            output = self.run_latency(traces=tmp, json_out=str(json_out))
+            report = json.loads(json_out.read_text())
+        self.assertIn("**Per-block verify+commit latency** (full class)", output)
+        self.assertIn("true verification+commit cost (no range batching)", output)
+        self.assertIn("| 3 | 177 | 20.0 | 500 | 500 | 500 |", output)
+        self.assertIn("slowest: 1707213 (500 ms)", output)
+        self.assertNotIn("not applicable", output)
+        self.assertEqual(report["full_per_block"]["stats"]["count"], 3)
+
+    def test_unclassified_block_rows_are_surfaced(self):
+        rows = [commit_row(height=1707211, apply_class=None, elapsed_ms=5)]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_trace(tmp, rows)
+            output = self.run_latency(traces=tmp)
+        self.assertIn("_(unclassified block commit rows: unknown: 1)_", output)
 
     def test_stage_timings_from_metrics_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:

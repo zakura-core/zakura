@@ -2274,6 +2274,40 @@ mod tests {
     }
 
     #[test]
+    fn header_acceptance_cannot_construct_body_or_state_validity() {
+        let (store, config) = TestStore::new(EngineMode::Integrated);
+        let clock = ManualClock(Utc::now());
+        let before = store.snapshot();
+        let plan = apply_transition(
+            &store,
+            insertion(&store, 2, EvidenceId::from_digest([0xaf; 32])),
+            &context(&config, &clock, None),
+        )
+        .expect("the prepared header-only target is accepted");
+
+        assert!(
+            plan.change_set
+                .put_nodes
+                .iter()
+                .all(|node| node.body == BodyValidationState::Unknown),
+            "header acceptance creates no body-valid fact"
+        );
+        assert_eq!(
+            plan.change_set.metadata.frontiers.verified_best, before.frontiers.verified_best,
+            "header acceptance cannot advance full-state validity"
+        );
+        assert_eq!(
+            plan.change_set.metadata.verified_generation, before.verified_generation,
+            "header acceptance cannot publish a state-valid generation"
+        );
+        assert!(
+            plan.change_set.verified_projection.put.is_empty()
+                && plan.change_set.verified_projection.remove_from.is_none(),
+            "header acceptance cannot mutate the verified projection"
+        );
+    }
+
+    #[test]
     fn selected_auxiliary_repair_adds_only_one_exact_provenance_record() {
         let (mut store, config) = TestStore::new(EngineMode::Integrated);
         let clock = ManualClock(Utc::now());

@@ -1497,9 +1497,10 @@ async fn best_tip_state_error_precedes_async_verification_errors() {
         .activation_height(&Network::Mainnet)
         .expect("Canopy activation height is specified");
     let fund_height = (height - 1).expect("fake source fund block height is too small");
+    const SCRIPT_SHOULD_SUCCEED: bool = false;
     let (input, output, known_utxos) = mock_transparent_transfer(
         fund_height,
-        false,
+        SCRIPT_SHOULD_SUCCEED,
         0,
         Amount::try_from(10001).expect("invalid value"),
     );

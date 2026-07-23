@@ -3,9 +3,15 @@ name: Test Docker Config
 on:
   pull_request:
     branches: [main, "feat/**", "release/**"]
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened]
     paths:
-      - "**/*.rs"
+      - "zakurad/src/**"
+      - "zakura-network/src/config.rs"
+      - "zakura-network/src/config/**"
+      - "zakura-rpc/src/config.rs"
+      - "zakura-rpc/src/config/**"
+      - "zakura-state/src/config.rs"
+      - "**/build.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
       - .dockerignore
@@ -13,6 +19,7 @@ on:
       - docker/entrypoint.sh
       - docker/**/*.toml
       - zakurad/tests/common/configs/**
+      - .github/workflows/release-binaries.yml
       - .github/workflows/test-docker.yml
 
   schedule:
@@ -24,6 +31,13 @@ on:
   push:
     branches: [main, "feat/**", "release/**"]
     paths:
+      - "zakurad/src/**"
+      - "zakura-network/src/config.rs"
+      - "zakura-network/src/config/**"
+      - "zakura-rpc/src/config.rs"
+      - "zakura-rpc/src/config/**"
+      - "zakura-state/src/config.rs"
+      - "**/build.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
       - .dockerignore
@@ -31,6 +45,7 @@ on:
       - docker/entrypoint.sh
       - docker/**/*.toml
       - zakurad/tests/common/configs/**
+      - .github/workflows/release-binaries.yml
       - .github/workflows/test-docker.yml
 
 # Ensures that only one workflow task will run at a time. Previous builds, if
@@ -54,7 +69,6 @@ env:
 jobs:
   test-docker-image:
     name: Test Runtime Docker Image
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'A-release')
     runs-on: ${{ vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:

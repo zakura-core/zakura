@@ -1,6 +1,6 @@
 # Header-sync VCT root authentication
 
-Status: proposed
+Status: in-progress
 
 ## 1. Summary
 
@@ -909,129 +909,7 @@ Disadvantages:
 
 Decision: reject in favor of checkpoint-gated promotion.
 
-## 20. Implementation sequence
-
-### Phase 0: simplify existing boundaries
-
-Complete on `main`:
-
-- backward header sync was removed in
-  [PR #227](https://github.com/zakura-core/zakura/pull/227);
-- exact operation identity was added in
-  [PR #246](https://github.com/zakura-core/zakura/pull/246);
-- checked, aligned range payloads were added in
-  [PR #298](https://github.com/zakura-core/zakura/pull/298) and hardened in
-  [PR #309](https://github.com/zakura-core/zakura/pull/309);
-- commitment-root index access was centralized in
-  [PR #307](https://github.com/zakura-core/zakura/pull/307);
-- history-tree snapshot decoding was made fallible in
-  [PR #316](https://github.com/zakura-core/zakura/pull/316).
-
-1. Remove the backward header-sync lane, its work-queue priority, buffering paths,
-   tracing, and tests.
-2. Enforce the forward-only startup invariant from Section 10.
-3. Carry `HeaderSyncRequestIdentity` through buffering and driver actions.
-4. Assign distinct operation identities to header commit and root authentication.
-5. Include the exact operation identity in every completion event.
-6. Replace range-derived pending-operation removal with exact identity matching,
-   retaining range coverage only as a post-success scheduling optimization.
-7. Introduce checked range geometry and payload types that keep headers, body-size
-   hints, and optional roots aligned while separating scheduling policy.
-8. Centralize commitment-root index reads, disk-row conversions, batch writes, and
-   deletion policy behind state-owned helpers.
-9. Add fallible history-tree snapshot decoding and coherence errors for restart
-   recovery.
-
-### Phase 1: establish the persistence boundary
-
-Implemented in draft
-[PR #323](https://github.com/zakura-core/zakura/pull/323).
-
-1. Add the database format transition from Section 6.1.
-2. Add the minimal durable `HeaderRootAuthFrontier` representation needed by that
-   transition.
-3. Initialize or rebase the frontier from the verified body history tree and its
-   canonical tip.
-4. Restore the frontier at startup using fallible snapshot decoding and coherence
-   checks.
-5. Introduce or complete `VerifiedHeaderCommitmentRoots` with private fields.
-6. Add a write helper that accepts only the verified type and atomically persists
-   promoted roots with the frontier.
-7. Stop `CommitHeaderRange` from writing raw peer roots.
-8. Ensure serving reads only authenticated or body-derived rows.
-9. Preserve committed-body precedence.
-
-### Phase 2: add the state-owned frontier
-
-Implemented in draft
-[PR #323](https://github.com/zakura-core/zakura/pull/323).
-
-1. Reuse the in-memory `HighestCompletedCheckpointTracker`.
-2. Advance the completed-checkpoint snapshot only after a durable bracket-closing
-   header commit.
-3. Reconstruct the completed-checkpoint snapshot from the canonical header store.
-4. Add defensive reconstruction for the durable authentication frontier and the
-   in-memory checkpoint tracker.
-5. Publish both snapshots to header sync using a watch or existing frontier event.
-
-### Phase 3: add root authentication requests
-
-Implemented in draft
-[PR #323](https://github.com/zakura-core/zakura/pull/323).
-
-1. Add `AuthenticateHeaderRoots`.
-2. Validate canonical stored header hashes before cryptographic verification.
-3. Call `verify_supplied_roots_from_parts`.
-4. Persist only the confirmed prefix.
-5. Return typed peer, stale, and local outcomes.
-
-### Phase 4: schedule overlap
-
-Implemented in draft
-[PR #323](https://github.com/zakura-core/zakura/pull/323).
-
-1. Add a root-authentication work priority or lane.
-2. Request from `confirmed_height + 1`.
-3. Include one successor witness.
-4. Start the next request at the previous response's final header.
-5. Share responses with header discovery when their frontiers align.
-6. Gate promotion on the state-published `HighestCompletedCheckpoint`.
-7. Require the successor witness itself to be covered by that frontier.
-
-### Phase 5: retain forward root payloads
-
-1. Replace the one-shot `reusable_payload` path with a reactor-owned retained
-   payload store limited by the VCT handoff region.
-2. Make adjacent root-carrying forward requests overlap by one header so every
-   retained authentication range contains its own terminal successor witness and
-   remains attributable to one peer.
-3. Insert complete root-carrying payloads only after their headers commit, including
-   payloads ahead of the current completed checkpoint.
-4. Preserve exact peer, session, and request attribution with each payload.
-5. Consume contiguous retained coverage from `confirmed_height + 1` before
-   scheduling authentication network work, but only when the successor witness is
-   covered by `HighestCompletedCheckpoint`.
-6. Make `AuthenticateRoots` requests fallback-only for missing, invalidated, or
-   rejected coverage.
-7. Prune consumed payloads and invalidate affected payloads on frontier rebase,
-   checkpoint rollback, canonical mismatch, and peer-session retirement.
-
-### Phase 6: integrate VCT consumption
-
-1. Make `PeerSource` read only authenticated roots.
-2. Retain body-time checks as defense in depth.
-3. Keep bounded repair for missing authenticated rows.
-4. Verify the embedded final frontier against the authenticated checkpoint root.
-
-### Phase 7: remove obsolete provisional behavior
-
-1. Remove provisional-root terminology and reads.
-2. Remove body-commit invalidation of unauthenticated database rows.
-3. Simplify repair events that existed only because invalid roots were discovered
-   late.
-4. Update the main VCT design document and changelog.
-
-## 21. Test plan
+## 20. Test plan
 
 ### Chain verifier
 
@@ -1135,7 +1013,7 @@ Implemented in draft
   `C`.
 - The embedded frontier must match the authenticated last-checkpoint roots.
 
-## 22. Metrics and diagnostics
+## 21. Metrics and diagnostics
 
 The primary health metric is `sync.header.root_auth.lead_blocks`. It is the
 authenticated root height minus the verified body tip, saturated at zero. During
@@ -1248,7 +1126,7 @@ Logs for failures should include:
 
 Do not log complete root payloads at warning or error level.
 
-## 23. Resulting invariants
+## 22. Resulting invariants
 
 After implementation:
 
@@ -1275,3 +1153,163 @@ After implementation:
 15. Retained roots never enter the authoritative index without state authentication.
 16. Body verification remains the final proof that authenticated auxiliary values
     match downloaded transactions.
+
+## 23. Implementation sequence
+
+This section is for historical references and implementation tracking only.
+Not intended for human review.
+
+- Draft [PR #323](https://github.com/zakura-core/zakura/pull/323) implemented
+  Phases 1–4 with a second durable completed-checkpoint row and its own
+  database migration. It was closed without merging.
+- The sealed verified-root type and the in-memory completed-checkpoint tracker
+  landed on `main` independently, in
+  [PR #346](https://github.com/zakura-core/zakura/pull/346) and
+  [PR #351](https://github.com/zakura-core/zakura/pull/351).
+- [PR #352](https://github.com/zakura-core/zakura/pull/352) superseded PR #323:
+  it rebuilt root authentication on the in-memory tracker and delivered the
+  remainder of Phases 1–4 together with Phase 5 in a single PR, rather than as
+  staged follow-ups. Within that PR, state authentication and network
+  scheduling were built first, the checkpoint tracker was then switched to the
+  in-memory form, and forward-payload retention and restart catch-up came last.
+
+Each phase below records where its items actually landed.
+
+### Phase 0: simplify existing boundaries
+
+Complete on `main`:
+
+- backward header sync was removed in
+  [PR #227](https://github.com/zakura-core/zakura/pull/227);
+- exact operation identity was added in
+  [PR #246](https://github.com/zakura-core/zakura/pull/246);
+- checked, aligned range payloads were added in
+  [PR #298](https://github.com/zakura-core/zakura/pull/298) and hardened in
+  [PR #309](https://github.com/zakura-core/zakura/pull/309);
+- commitment-root index access was centralized in
+  [PR #307](https://github.com/zakura-core/zakura/pull/307);
+- history-tree snapshot decoding was made fallible in
+  [PR #316](https://github.com/zakura-core/zakura/pull/316).
+
+1. Remove the backward header-sync lane, its work-queue priority, buffering paths,
+   tracing, and tests.
+2. Enforce the forward-only startup invariant from Section 10.
+3. Carry `HeaderSyncRequestIdentity` through buffering and driver actions.
+4. Assign distinct operation identities to header commit and root authentication.
+5. Include the exact operation identity in every completion event.
+6. Replace range-derived pending-operation removal with exact identity matching,
+   retaining range coverage only as a post-success scheduling optimization.
+7. Introduce checked range geometry and payload types that keep headers, body-size
+   hints, and optional roots aligned while separating scheduling policy.
+8. Centralize commitment-root index reads, disk-row conversions, batch writes, and
+   deletion policy behind state-owned helpers.
+9. Add fallible history-tree snapshot decoding and coherence errors for restart
+   recovery.
+
+### Phase 1: establish the persistence boundary
+
+`VerifiedHeaderCommitmentRoots` (item 5) landed on `main` in
+[PR #346](https://github.com/zakura-core/zakura/pull/346). The remaining items
+are implemented in [PR #352](https://github.com/zakura-core/zakura/pull/352),
+which supersedes closed draft
+[PR #323](https://github.com/zakura-core/zakura/pull/323).
+
+1. Add the database format transition from Section 6.1.
+2. Add the minimal durable `HeaderRootAuthFrontier` representation needed by that
+   transition.
+3. Initialize or rebase the frontier from the verified body history tree and its
+   canonical tip.
+4. Restore the frontier at startup using fallible snapshot decoding and coherence
+   checks.
+5. Introduce or complete `VerifiedHeaderCommitmentRoots` with private fields.
+6. Add a write helper that accepts only the verified type and atomically persists
+   promoted roots with the frontier.
+7. Stop `CommitHeaderRange` from writing raw peer roots.
+8. Ensure serving reads only authenticated or body-derived rows.
+9. Preserve committed-body precedence.
+
+### Phase 2: add the state-owned frontier
+
+`HighestCompletedCheckpointTracker` landed on `main` in
+[PR #351](https://github.com/zakura-core/zakura/pull/351). Snapshot
+publication, restart reconstruction, and defensive recovery are implemented in
+[PR #352](https://github.com/zakura-core/zakura/pull/352). The dedicated
+durable completed-checkpoint row from PR #323 and
+[PR #348](https://github.com/zakura-core/zakura/pull/348) was dropped in favor
+of the in-memory tracker.
+
+1. Reuse the in-memory `HighestCompletedCheckpointTracker`.
+2. Advance the completed-checkpoint snapshot only after a durable bracket-closing
+   header commit.
+3. Reconstruct the completed-checkpoint snapshot from the canonical header store.
+4. Add defensive reconstruction for the durable authentication frontier and the
+   in-memory checkpoint tracker.
+5. Publish both snapshots to header sync using a watch or existing frontier event.
+
+### Phase 3: add root authentication requests
+
+Implemented in
+[PR #352](https://github.com/zakura-core/zakura/pull/352).
+
+1. Add `AuthenticateHeaderRoots`.
+2. Validate canonical stored header hashes before cryptographic verification.
+3. Call `verify_supplied_roots_from_parts`.
+4. Persist only the confirmed prefix.
+5. Return typed peer, stale, and local outcomes.
+
+### Phase 4: schedule overlap
+
+Implemented in
+[PR #352](https://github.com/zakura-core/zakura/pull/352).
+
+1. Add a root-authentication work priority or lane.
+2. Request from `confirmed_height + 1`.
+3. Include one successor witness.
+4. Start the next request at the previous response's final header.
+5. Share responses with header discovery when their frontiers align.
+6. Gate promotion on the state-published `HighestCompletedCheckpoint`.
+7. Require the successor witness itself to be covered by that frontier.
+
+### Phase 5: retain forward root payloads
+
+Implemented in
+[PR #352](https://github.com/zakura-core/zakura/pull/352), in the same PR as
+Phases 3 and 4, together with post-restart catch-up for the intentionally
+unrestored retained store.
+
+1. Replace the one-shot `reusable_payload` path with a reactor-owned retained
+   payload store limited by the VCT handoff region.
+2. Make adjacent root-carrying forward requests overlap by one header so every
+   retained authentication range contains its own terminal successor witness and
+   remains attributable to one peer.
+3. Insert complete root-carrying payloads only after their headers commit, including
+   payloads ahead of the current completed checkpoint.
+4. Preserve exact peer, session, and request attribution with each payload.
+5. Consume contiguous retained coverage from `confirmed_height + 1` before
+   scheduling authentication network work, but only when the successor witness is
+   covered by `HighestCompletedCheckpoint`.
+6. Make `AuthenticateRoots` requests fallback-only for missing, invalidated, or
+   rejected coverage.
+7. Prune consumed payloads and invalidate affected payloads on frontier rebase,
+   checkpoint rollback, canonical mismatch, and peer-session retirement.
+
+### Phase 6: integrate VCT consumption
+
+Not yet implemented; planned as a follow-up to
+[PR #352](https://github.com/zakura-core/zakura/pull/352).
+
+1. Make `PeerSource` read only authenticated roots.
+2. Retain body-time checks as defense in depth.
+3. Keep bounded repair for missing authenticated rows.
+4. Verify the embedded final frontier against the authenticated checkpoint root.
+
+### Phase 7: remove obsolete provisional behavior
+
+Not yet implemented; planned as a follow-up to
+[PR #352](https://github.com/zakura-core/zakura/pull/352).
+
+1. Remove provisional-root terminology and reads.
+2. Remove body-commit invalidation of unauthenticated database rows.
+3. Simplify repair events that existed only because invalid roots were discovered
+   late.
+4. Update the main VCT design document and changelog.

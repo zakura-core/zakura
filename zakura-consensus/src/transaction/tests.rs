@@ -1544,7 +1544,8 @@ async fn best_tip_state_error_precedes_async_verification_errors() {
             .await
             .expect("verifier should call mock state service with correct request");
 
-        // Let the invalid script check win if it is incorrectly polled concurrently.
+        // Delay the state error to verify that the rejecting script is not polled before
+        // the best-tip response is received.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         best_tip_request.respond(Err::<zakura_state::Response, zakura_state::BoxError>(
             make_validate_context_error().into(),

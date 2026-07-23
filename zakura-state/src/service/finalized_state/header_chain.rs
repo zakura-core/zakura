@@ -188,6 +188,7 @@ pub(crate) struct HeaderChainReader {
 /// One atomically read selected-path window with exact auxiliary provenance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SelectedAuxWindow {
+    pub(crate) snapshot: EngineSnapshot,
     pub(crate) current: HeaderNode,
     pub(crate) current_deliveries: Vec<AuxDelivery>,
     pub(crate) successor: Option<(HeaderNode, Vec<AuxDelivery>)>,
@@ -424,6 +425,10 @@ impl HeaderChainReader {
             Err(_) => None,
         };
         Ok(Some(SelectedAuxWindow {
+            snapshot: self
+                .store
+                .snapshot()
+                .map_err(HeaderChainStoreError::Store)?,
             current,
             current_deliveries,
             successor,
@@ -2290,6 +2295,11 @@ mod tests {
             .selected_aux_window(child.height, child.hash)
             .expect("the exact selected auxiliary window is coherent")
             .expect("the selected child is retained");
+        assert_eq!(
+            window.snapshot,
+            runtime.publisher().snapshot(),
+            "the auxiliary window carries the snapshot read under the same transition lock"
+        );
         assert_eq!(window.current.hash, child.hash);
         assert!(window.current_deliveries.is_empty());
         let (window_successor, successor_deliveries) =

@@ -90,6 +90,8 @@ impl NextVctBlock {
 /// One atomically selected current delivery and its optional direct-successor witness.
 #[derive(Clone, Debug)]
 pub(crate) struct VctAuxWindow {
+    /// Exact committed snapshot under which both deliveries were selected.
+    pub(crate) snapshot: zakura_header_chain::EngineSnapshot,
     /// Exact auxiliary delivery whose roots are folded for the current block.
     pub(crate) current: AuxDelivery,
     /// Exact direct-successor witness used for one-header-later authentication.

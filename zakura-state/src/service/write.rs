@@ -21,11 +21,12 @@ use zakura_chain::{
     parallel::tree::NoteCommitmentTrees,
 };
 use zakura_header_chain::{
-    ApplyResult, BodyEvidence, CheckpointSet, EngineConfig, EngineConfigError, EngineMode,
-    EngineSnapshot, EvidenceId, Frontier, FullStateEvidenceAuthority, FullStateFinalized,
-    OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, StateVersion, StoreError,
-    StoreRead, SystemClock, TransitionContext, TransitionEvent, TransitionRequest, TrustedAnchor,
-    VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
+    ApplyResult, AuxAuthentication, AuxEvidence, BodyEvidence, CheckpointSet, EngineConfig,
+    EngineConfigError, EngineMode, EngineSnapshot, EvidenceId, Frontier,
+    FullStateEvidenceAuthority, FullStateFinalized, OperatorInvalidate, OperatorInvalidationId,
+    OperatorReconsider, StateVersion, StoreError, StoreRead, SystemClock, TransitionContext,
+    TransitionEvent, TransitionRequest, TrustedAnchor, VerifiedBodyEvidence, VerifiedChainChanged,
+    VerifiedChangeCause, VerifiedHeaderRef, WorkScope,
 };
 
 use crate::{
@@ -256,7 +257,11 @@ impl HeaderChainWriter {
             let delivery = select_vct_aux_delivery(deliveries)?;
             NextVctBlock::from_delivery(successor.header, successor.height, delivery)
         });
-        Some(VctAuxWindow { current, successor })
+        Some(VctAuxWindow {
+            snapshot: window.snapshot,
+            current,
+            successor,
+        })
     }
 
     fn attach_at_semantic_handoff(
@@ -370,6 +375,71 @@ impl HeaderChainWriter {
             },
             &context,
         )
+    }
+
+    fn reject_vct_aux(
+        &self,
+        window: &VctAuxWindow,
+        rejection: VctAuxRejection,
+        failure: crate::error::VctCommitFailure,
+    ) -> Result<Option<ApplyResult>, HeaderChainStoreError> {
+        let deliveries = match rejection {
+            VctAuxRejection::Current => vec![window.current],
+            VctAuxRejection::Successor => window
+                .successor
+                .as_ref()
+                .and_then(|successor| successor.delivery)
+                .into_iter()
+                .collect(),
+            VctAuxRejection::Ambiguous => {
+                let Some(successor) = window
+                    .successor
+                    .as_ref()
+                    .and_then(|successor| successor.delivery)
+                else {
+                    return Ok(None);
+                };
+                vec![window.current, successor]
+            }
+            VctAuxRejection::None => return Ok(None),
+        };
+        if deliveries.is_empty() {
+            return Ok(None);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura.vct.aux.rejection.v1");
+        hasher.update([match failure {
+            crate::error::VctCommitFailure::CurrentRoots => 1,
+            crate::error::VctCommitFailure::SuccessorBoundary => 2,
+        }]);
+        for delivery in &deliveries {
+            hasher.update(delivery.delivery_id.digest());
+            hasher.update(delivery.header_hash.0);
+        }
+        let evidence = EvidenceId::from_digest(hasher.finalize().into());
+        let first = deliveries
+            .first()
+            .expect("the empty auxiliary rejection returned above");
+        let owner = WorkScope::for_body_work(&window.snapshot)
+            .bind(first.owner.session_id, first.owner.request_id);
+        let authority = PreparedAuthority(evidence);
+        let mut context = self.context();
+        context.full_state_authority = Some(&authority);
+
+        self.runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: window.snapshot.state_version,
+                    event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence {
+                        owner,
+                        deliveries,
+                        authentication: AuxAuthentication::Rejected { evidence },
+                    })),
+                },
+                &context,
+            )
+            .map(Some)
     }
 }
 
@@ -1147,7 +1217,8 @@ impl WriteBlockWorkerTask {
                     if let (Some(window), Some(failure)) =
                         (vct_aux_for_outcome.as_ref(), error.vct_failure())
                     {
-                        let attribution = match window.classify_failure(failure) {
+                        let rejection = window.classify_failure(failure);
+                        let attribution = match rejection {
                             VctAuxRejection::Current => "current",
                             VctAuxRejection::Successor => "successor",
                             VctAuxRejection::Ambiguous => "ambiguous",
@@ -1163,6 +1234,33 @@ impl WriteBlockWorkerTask {
                             attribution,
                             "VCT: classified exact auxiliary verification failure"
                         );
+
+                        if let Some(writer) = header_chain.as_ref() {
+                            match writer.reject_vct_aux(window, rejection, failure) {
+                                Ok(Some(ApplyResult::Committed(_) | ApplyResult::NoChange(_))) => {
+                                    if matches!(
+                                        rejection,
+                                        VctAuxRejection::Current | VctAuxRejection::Ambiguous
+                                    ) {
+                                        finalized_state
+                                            .invalidate_vct_fast_root(ordered_block.0.height);
+                                    }
+                                }
+                                Ok(Some(ApplyResult::Stale(receipt))) => {
+                                    tracing::debug!(
+                                        ?receipt,
+                                        "VCT: ignored stale auxiliary rejection"
+                                    );
+                                }
+                                Ok(None) => {}
+                                Err(rejection_error) => {
+                                    tracing::error!(
+                                        ?rejection_error,
+                                        "VCT: could not persist auxiliary rejection"
+                                    );
+                                }
+                            }
+                        }
                     }
 
                     // Retryable VCT root stalls (an absent/evicted root, or one not yet
@@ -1563,7 +1661,7 @@ mod tests {
         service::{
             finalized_state::{
                 header_chain::{HeaderChainStore, HeaderChainStoreError},
-                FinalizedState, VctAuxWindow,
+                FinalizedState, VctAuxRejection, VctAuxWindow,
             },
             non_finalized_state::NonFinalizedState,
             write::{
@@ -1575,11 +1673,12 @@ mod tests {
         CheckpointVerifiedBlock, Config,
     };
     use zakura_header_chain::{
-        AlarmSet, BodyUnavailableSummary, BodyValidationState, ChainScore, CheckpointSet,
-        EngineConfig, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch, Frontier, FrontierSet,
-        HeaderChainDiskVersion, HeaderGeneration, HeaderNode, HeaderValidationState, StateVersion,
-        SuffixWork, TransientBodyFailure, TransientBodyFailureKind, TransitionFailure,
-        TrustedAnchor, VerifiedGeneration, WorkCoordinate,
+        AlarmSet, ApplyResult, AuxAuthentication, BodyUnavailableSummary, BodyValidationState,
+        ChainScore, CheckpointSet, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot,
+        EvidenceId, FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderGeneration,
+        HeaderNode, HeaderValidationState, StateVersion, SuffixWork, TransientBodyFailure,
+        TransientBodyFailureKind, TransitionFailure, TrustedAnchor, VerifiedGeneration,
+        WorkCoordinate, WorkScope,
     };
 
     #[test]
@@ -1658,6 +1757,20 @@ mod tests {
         );
 
         let window = VctAuxWindow {
+            snapshot: EngineSnapshot {
+                mode: EngineMode::Integrated,
+                state_version: StateVersion::new(1),
+                header_generation: HeaderGeneration::new(2),
+                verified_generation: VerifiedGeneration::new(3),
+                frontiers: FrontierSet {
+                    finalized: Frontier::new(block::Height(0), block::Hash([0; 32])),
+                    header_best: Frontier::new(block::Height(1), block::Hash([1; 32])),
+                    verified_best: Frontier::new(block::Height(0), block::Hash([0; 32])),
+                },
+                header_best_score: ChainScore::new(SuffixWork::zero(), block::Hash([1; 32])),
+                oldest_retained_height: block::Height(0),
+                alarms: AlarmSet::default(),
+            },
             current: authenticated,
             successor: None,
         };
@@ -1789,6 +1902,57 @@ mod tests {
                 )
             ))
         ));
+    }
+
+    #[test]
+    fn stale_vct_aux_rejection_has_zero_durable_effects() {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        )
+        .expect("the fixture finalized state opens");
+        let anchor = zakura_test::vectors::BLOCK_MAINNET_434873_BYTES
+            .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
+            .expect("the anchor block deserializes");
+        let anchor_height = anchor
+            .coinbase_height()
+            .expect("the anchor has a coinbase height");
+        let writer = header_writer(&finalized_state, &network, anchor_height, &anchor);
+        let before = writer.runtime.publisher().snapshot();
+        let mut stale = before.clone();
+        stale.state_version = StateVersion::new(0);
+        let current = zakura_header_chain::AuxDelivery {
+            delivery_id: EvidenceId::from_digest([0x73; 32]),
+            header_hash: anchor.hash(),
+            source: zakura_header_chain::SourceId::from_digest([0x74; 32]),
+            owner: WorkScope::for_body_work(&stale)
+                .bind(1, std::num::NonZeroU64::new(1).expect("one is nonzero")),
+            body_size: zakura_header_chain::BodySizeHint::Unknown,
+            tree_aux: None,
+            authentication: AuxAuthentication::Unauthenticated,
+        };
+        let result = writer
+            .reject_vct_aux(
+                &VctAuxWindow {
+                    snapshot: stale,
+                    current,
+                    successor: None,
+                },
+                VctAuxRejection::Current,
+                crate::error::VctCommitFailure::CurrentRoots,
+            )
+            .expect("stale auxiliary evidence returns a typed receipt");
+
+        assert!(matches!(result, Some(ApplyResult::Stale(_))));
+        assert_eq!(
+            writer.runtime.publisher().snapshot(),
+            before,
+            "stale auxiliary evidence publishes and mutates nothing"
+        );
     }
 
     #[test]

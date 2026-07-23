@@ -866,7 +866,8 @@ impl FinalizedState {
                     let exact_vct_roots = vct_aux_window
                         .as_ref()
                         .and_then(|window| window.current_roots(height, block.hash()));
-                    let vct_roots = match vct_aux_window {
+                    let has_exact_vct_aux = vct_aux_window.is_some();
+                    let vct_roots = match vct_aux_window.as_ref() {
                         Some(_) => exact_vct_roots,
                         None => self.vct.source().and_then(|v| {
                             if vct_last_checkpoint_height.is_some_and(|last_checkpoint_height| {
@@ -1028,6 +1029,7 @@ impl FinalizedState {
                                         height,
                                         error,
                                         crate::error::VctCommitFailure::CurrentRoots,
+                                        !has_exact_vct_aux,
                                     ),
                                     commitment_aux_verify::CommitmentRootVerificationError::SuccessorBoundary {
                                         error,
@@ -1036,6 +1038,7 @@ impl FinalizedState {
                                         height,
                                         error,
                                         crate::error::VctCommitFailure::SuccessorBoundary,
+                                        !has_exact_vct_aux,
                                     ),
                                 }
                             })?;
@@ -1397,6 +1400,13 @@ impl FinalizedState {
             .is_some_and(|v| v.vct_root_needs_successor(height, &self.network()))
     }
 
+    /// Retire the provisional height-cache entry after an exact current delivery is rejected.
+    pub(crate) fn invalidate_vct_fast_root(&self, height: block::Height) {
+        if let Some(v) = self.vct.source() {
+            v.invalidate_fast_root(height);
+        }
+    }
+
     /// Verify checkpoint handoff frontiers against this block's supplied roots.
     #[allow(clippy::too_many_arguments)]
     fn vct_verify_last_checkpoint_frontier_roots(
@@ -1418,6 +1428,7 @@ impl FinalizedState {
                 height,
                 ValidateContextError::VctSuppliedRootUnavailable { height },
                 crate::error::VctCommitFailure::CurrentRoots,
+                true,
             ));
         }
 
@@ -1440,15 +1451,19 @@ impl FinalizedState {
         height: block::Height,
         error: ValidateContextError,
         failure: crate::error::VctCommitFailure,
+        invalidate_provisional_cache: bool,
     ) -> CommitCheckpointVerifiedError {
-        if let Some(v) = self.vct.source() {
-            v.invalidate_fast_root(height);
+        if invalidate_provisional_cache {
+            if let Some(v) = self.vct.source() {
+                v.invalidate_fast_root(height);
+            }
         }
         metrics::counter!("state.vct.root.rejected.count").increment(1);
         tracing::warn!(
             ?height,
             ?error,
-            "VCT: supplied commitment root failed verification; evicted so it is never re-read"
+            invalidate_provisional_cache,
+            "VCT: supplied commitment root failed verification"
         );
         CommitCheckpointVerifiedError::from(ValidateContextError::VctSuppliedRootUnavailable {
             height,

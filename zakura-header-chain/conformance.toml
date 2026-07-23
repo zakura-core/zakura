@@ -610,7 +610,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-WORK-01"
 name = "Generation-scoped forward work"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::WorkScope"
+tests = ["IN-05::all_work_types_require_generation_and_branch", "AUD-08::aud_08_old_coverage_misses_until_the_exact_reset_branch_completes", "IN-05::generation_or_anchor_change_retires_retry_work_before_reuse", "IN-05::generation_change_retires_unstarted_targets_before_new_scheduling", "AUD-06::aud_06_07_live_reactor_ignores_results_retired_by_a_committed_snapshot", "AUD-09::aud_09_every_repair_phase_retires_before_new_generation_work", "IN-05::generation_change_retires_served_path_before_late_page_completion", "IN-05::work_queue_separates_scopes_and_retires_obsolete_reservations", "IN-05::reactor_reset_mid_download_drops_stale_anchors_and_releases_budget", "IN-05::committed_reanchor_releases_stale_submitted_bodies", "IN-05::stale_retry_completion_releases_only_exact_infrastructure"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-WORK-02"

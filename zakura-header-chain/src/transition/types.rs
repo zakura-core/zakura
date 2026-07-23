@@ -314,8 +314,6 @@ pub enum TargetCompletion {
         /// Exact already-selected header whose metadata was redelivered.
         selected_target: Frontier,
     },
-    /// Headers came from authenticated internal full-state evidence.
-    InternalFullState,
 }
 
 /// Atomically insert one complete prepared header range.
@@ -664,11 +662,6 @@ impl TransitionEvent {
     /// Return the authority gate fixed for this event category.
     pub fn admission(&self) -> EventAdmission {
         match self {
-            Self::InsertHeaders(event)
-                if matches!(event.completion, TargetCompletion::InternalFullState) =>
-            {
-                EventAdmission::IntegratedFullState
-            }
             Self::VerifiedChainChanged(_)
             | Self::BodyEvidence(_)
             | Self::BodySupplierDiscovered(_)
@@ -691,9 +684,7 @@ impl TransitionEvent {
                 TargetCompletion::SelectedAuxiliaryRepair { .. } => {
                     event.aux.first().map(|delivery| delivery.delivery_id)
                 }
-                TargetCompletion::TargetComplete { .. } | TargetCompletion::InternalFullState => {
-                    Some(event.batch.evidence())
-                }
+                TargetCompletion::TargetComplete { .. } => Some(event.batch.evidence()),
             },
             Self::VerifiedChainChanged(event) => Some(event.full_state_transition_id),
             Self::BodyEvidence(BodyEvidence::PayloadMismatch(event)) => Some(event.evidence),

@@ -459,10 +459,9 @@ fn apply_event<S: StoreRead>(
                 TargetCompletion::TargetComplete { common_ancestor }
                 | TargetCompletion::SelectedAuxiliaryRepair {
                     common_ancestor, ..
-                } => Some(common_ancestor),
-                TargetCompletion::InternalFullState => None,
+                } => common_ancestor,
             };
-            if common_ancestor.is_some_and(|common_ancestor| common_ancestor != lease.parent) {
+            if common_ancestor != lease.parent {
                 return Err(TransitionFailure::InvalidEvidence(
                     "target completion ancestor does not match the validation lease",
                 ));
@@ -531,7 +530,7 @@ fn apply_event<S: StoreRead>(
                         ));
                     }
                 }
-                TargetCompletion::TargetComplete { .. } | TargetCompletion::InternalFullState => {
+                TargetCompletion::TargetComplete { .. } => {
                     if event.owner.branch.target_tip_hash != event.target_tip_hash {
                         return Err(TransitionFailure::InvalidEvidence(
                             "target completion does not end at the pursued hash",

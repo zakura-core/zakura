@@ -20,7 +20,8 @@ fn anchor_strategy() -> impl Strategy<Value = Anchor> {
     prop_oneof![
         9 => Just(Anchor::Natural),
         1 => Just(Anchor::Genesis),
-        1 => (1..=TRUNK_LEN as u32).prop_map(Anchor::TrunkAt),
+        1 => (1..=u32::try_from(TRUNK_LEN).expect("the trunk length fits in u32"))
+            .prop_map(Anchor::TrunkAt),
     ]
 }
 
@@ -38,6 +39,9 @@ fn operation_strategy() -> impl Strategy<Value = Op> {
                 len,
                 anchor,
             }),
+        3 => (source_strategy(), 0..TRUNK_LEN)
+            .prop_map(|(source, index)| Op::Verify { source, index }),
+        2 => (1..=8usize).prop_map(|count| Op::Finalize { count }),
         1 => Just(Op::Reopen),
     ]
 }

@@ -13,10 +13,11 @@ use zakura_chain::{
 use zakura_header_chain::{
     audit_store, AlarmSet, ApplyResult, BodyValidationState, BranchId, ChainScore, CheckpointSet,
     EngineConfig, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch, Frontier, FrontierSet,
-    HeaderBatchInput, HeaderChainDiskVersion, HeaderGeneration, HeaderNode, HeaderRules,
-    HeaderValidationState, InsertHeaders, SourceId, StateVersion, StoreAuditRead, StoreRead,
-    SuffixWork, SystemClock, TargetCompletion, TransitionContext, TransitionEvent,
-    TransitionRequest, TrustedAnchor, VerifiedGeneration, WorkCoordinate, WorkOwner,
+    FullStateEvidenceAuthority, FullStateFinalized, HeaderBatchInput, HeaderChainDiskVersion,
+    HeaderGeneration, HeaderNode, HeaderRules, HeaderValidationState, InsertHeaders, SourceId,
+    StateVersion, StoreAuditRead, StoreRead, SuffixWork, SystemClock, TargetCompletion,
+    TransitionContext, TransitionEvent, TransitionRequest, TrustedAnchor, VerifiedChainChanged,
+    VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef, WorkCoordinate, WorkOwner,
 };
 
 use super::{
@@ -72,6 +73,13 @@ pub(super) enum Op {
         len: usize,
         anchor: Anchor,
     },
+    Verify {
+        source: Source,
+        index: usize,
+    },
+    Finalize {
+        count: usize,
+    },
     Reopen,
 }
 
@@ -81,6 +89,15 @@ struct ModelNode {
     height: block::Height,
     block_work: Work,
     cumulative_work: U256,
+    body_verified: bool,
+}
+
+struct Authority(EvidenceId);
+
+impl FullStateEvidenceAuthority for Authority {
+    fn authorizes(&self, evidence: EvidenceId) -> bool {
+        evidence == self.0
+    }
 }
 
 pub(super) struct Harness {
@@ -89,6 +106,8 @@ pub(super) struct Harness {
     db_config: Config,
     runtime: Option<HeaderChainRuntime>,
     model: HashMap<block::Hash, ModelNode>,
+    finalized: Frontier,
+    verified_path: Vec<Frontier>,
     next_request_id: u64,
     _tempdir: tempfile::TempDir,
 }
@@ -171,6 +190,7 @@ impl Harness {
                 height: frontier.height,
                 block_work: anchor_work,
                 cumulative_work: U256::zero(),
+                body_verified: false,
             },
         );
         let harness = Self {
@@ -179,6 +199,8 @@ impl Harness {
             db_config,
             runtime: Some(runtime),
             model,
+            finalized: frontier,
+            verified_path: vec![frontier],
             next_request_id: 1,
             _tempdir: tempdir,
         };
@@ -200,6 +222,8 @@ impl Harness {
                 len,
                 anchor,
             } => self.insert_headers(source, offset, len, anchor),
+            Op::Verify { source, index } => self.verify(source, index),
+            Op::Finalize { count } => self.finalize(count),
             Op::Reopen => self.reopen(),
         }
         self.assert_coherent();
@@ -285,6 +309,129 @@ impl Harness {
         self.apply_model(&rows);
     }
 
+    fn verify(&mut self, source: Source, index: usize) {
+        let path = self.path_rows(source, index);
+        let suffix_start = if self.finalized == self.config.bootstrap_anchor.frontier {
+            0
+        } else {
+            let Some(position) = path
+                .iter()
+                .position(|header| header.hash == self.finalized.hash)
+            else {
+                return;
+            };
+            position + 1
+        };
+        let suffix = path[suffix_start..].to_vec();
+        if suffix.is_empty() {
+            return;
+        }
+        let snapshot = self.runtime().publisher().snapshot();
+        let evidence = self.next_evidence(0x60);
+        let authority = Authority(evidence);
+        let new_path = suffix
+            .iter()
+            .map(|header| VerifiedHeaderRef {
+                height: header.height,
+                hash: header.hash,
+                header: header.header.clone(),
+            })
+            .collect();
+        let result = self
+            .runtime()
+            .apply(
+                TransitionRequest {
+                    expected_version: snapshot.state_version,
+                    event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+                        full_state_transition_id: evidence,
+                        old_tip: *self
+                            .verified_path
+                            .last()
+                            .expect("the verified model path includes finality"),
+                        new_path,
+                        cause: VerifiedChangeCause::Reset,
+                    }),
+                },
+                &TransitionContext {
+                    config: &self.config,
+                    clock: &SystemClock,
+                    full_state_authority: Some(&authority),
+                    startup_capability: None,
+                    retention_references: &[],
+                },
+            )
+            .expect("authenticated body-valid full-state evidence reaches the writer");
+        assert!(matches!(
+            result,
+            ApplyResult::Committed(_) | ApplyResult::NoChange(_)
+        ));
+        self.apply_model(&suffix);
+        for header in &suffix {
+            self.model
+                .get_mut(&header.hash)
+                .expect("the verified suffix is retained by the model")
+                .body_verified = true;
+        }
+        self.verified_path = std::iter::once(self.finalized)
+            .chain(
+                suffix
+                    .iter()
+                    .map(|header| Frontier::new(header.height, header.hash)),
+            )
+            .collect();
+    }
+
+    fn finalize(&mut self, count: usize) {
+        if count == 0 || self.verified_path.len() <= 1 {
+            return;
+        }
+        let advance = count.min(self.verified_path.len() - 1);
+        let new_finalized = self.verified_path[advance];
+        let proof = self.verified_path[..=advance]
+            .iter()
+            .map(|frontier| frontier.hash)
+            .collect();
+        let snapshot = self.runtime().publisher().snapshot();
+        let evidence = self.next_evidence(0x70);
+        let authority = Authority(evidence);
+        let result = self
+            .runtime()
+            .apply(
+                TransitionRequest {
+                    expected_version: snapshot.state_version,
+                    event: TransitionEvent::FullStateFinalized(FullStateFinalized {
+                        full_state_transition_id: evidence,
+                        new_finalized,
+                        verified_path_proof: proof,
+                    }),
+                },
+                &TransitionContext {
+                    config: &self.config,
+                    clock: &SystemClock,
+                    full_state_authority: Some(&authority),
+                    startup_capability: None,
+                    retention_references: &[],
+                },
+            )
+            .expect("authenticated full-state finality reaches the writer");
+        assert!(matches!(result, ApplyResult::Committed(_)));
+
+        let retained: HashSet<_> = self
+            .model
+            .keys()
+            .copied()
+            .filter(|hash| self.descends_from(*hash, new_finalized.hash))
+            .collect();
+        self.model.retain(|hash, _| retained.contains(hash));
+        self.finalized = new_finalized;
+        self.verified_path.drain(..advance);
+        assert_eq!(
+            self.verified_path.first().copied(),
+            Some(self.finalized),
+            "the verified projection is rebased to new finality"
+        );
+    }
+
     fn reopen(&mut self) {
         let before = self.logical_dump();
         drop(
@@ -338,8 +485,24 @@ impl Harness {
                     height: row.height,
                     block_work: row.work(),
                     cumulative_work,
+                    body_verified: false,
                 },
             );
+        }
+    }
+
+    fn descends_from(&self, mut hash: block::Hash, ancestor: block::Hash) -> bool {
+        loop {
+            if hash == ancestor {
+                return true;
+            }
+            let Some(node) = self.model.get(&hash) else {
+                return false;
+            };
+            if node.height <= self.model[&ancestor].height {
+                return false;
+            }
+            hash = node.parent;
         }
     }
 
@@ -373,6 +536,10 @@ impl Harness {
             assert_eq!(node.height, expected.height);
             assert_eq!(node.block_work, expected.block_work);
             assert_eq!(
+                matches!(node.body, BodyValidationState::Verified { .. }),
+                expected.body_verified
+            );
+            assert_eq!(
                 node.work_coordinate().cumulative_work(),
                 expected
                     .cumulative_work
@@ -390,6 +557,7 @@ impl Harness {
         }
 
         let child_parents: HashSet<_> = self.model.values().map(|node| node.parent).collect();
+        let finalized_work = self.model[&self.finalized.hash].cumulative_work;
         let candidate_hashes: HashSet<_> = self
             .model
             .keys()
@@ -401,14 +569,29 @@ impl Harness {
             .map(|hash| {
                 let node = &self.model[hash];
                 (
-                    ChainScore::new(SuffixWork::new(node.cumulative_work), *hash),
+                    ChainScore::new(
+                        SuffixWork::new(
+                            node.cumulative_work
+                                .checked_sub(finalized_work)
+                                .expect("retained work is never below finalized work"),
+                        ),
+                        *hash,
+                    ),
                     Frontier::new(node.height, *hash),
                 )
             })
             .max_by_key(|(score, _)| *score)
-            .expect("the model always retains the genesis candidate");
+            .expect("the model always retains the finalized candidate");
         assert_eq!(durable.header_best_score, expected_score);
         assert_eq!(durable.frontiers.header_best, expected_tip);
+        assert_eq!(durable.frontiers.finalized, self.finalized);
+        assert_eq!(
+            durable.frontiers.verified_best,
+            *self
+                .verified_path
+                .last()
+                .expect("the verified model path includes finality")
+        );
         assert_eq!(
             runtime
                 .store
@@ -421,23 +604,51 @@ impl Harness {
                 .store
                 .verified_projection()
                 .expect("the verified projection is readable"),
-            vec![durable.frontiers.finalized]
+            self.verified_path
         );
     }
 
     fn path_to(&self, mut hash: block::Hash) -> Vec<Frontier> {
-        let finalized = self.config.bootstrap_anchor.frontier;
         let mut path = Vec::new();
         loop {
             let node = &self.model[&hash];
             path.push(Frontier::new(node.height, hash));
-            if hash == finalized.hash {
+            if hash == self.finalized.hash {
                 break;
             }
             hash = node.parent;
         }
         path.reverse();
         path
+    }
+
+    fn path_rows(&self, source: Source, index: usize) -> Vec<FabHeader> {
+        match source {
+            Source::Trunk => {
+                self.universe.trunk[..=index.min(self.universe.trunk.len() - 1)].to_vec()
+            }
+            Source::Branch(branch) => {
+                let branch = branch % self.universe.branches.len();
+                let branch_def = &self.universe.branches[branch];
+                let trunk_tip = if branch == 3 {
+                    self.universe.branches[0].fork_parent.0
+                } else {
+                    branch_def.fork_parent.0
+                };
+                let fork_height =
+                    usize::try_from(trunk_tip.0).expect("the bounded fork height fits in usize");
+                let mut path = self.universe.trunk[..fork_height].to_vec();
+                if branch == 3 {
+                    path.extend(self.universe.branches[0].headers[..2].iter().cloned());
+                }
+                path.extend(
+                    branch_def.headers[..=index.min(branch_def.headers.len() - 1)]
+                        .iter()
+                        .cloned(),
+                );
+                path
+            }
+        }
     }
 
     fn rows(&self, source: Source) -> &[FabHeader] {
@@ -463,7 +674,13 @@ impl Harness {
             Anchor::Genesis => self.universe.genesis.hash(),
             Anchor::TrunkAt(height) => {
                 self.universe
-                    .trunk_at(height.clamp(1, self.universe.trunk.len() as u32))
+                    .trunk_at(
+                        height.clamp(
+                            1,
+                            u32::try_from(self.universe.trunk.len())
+                                .expect("the bounded trunk length fits in u32"),
+                        ),
+                    )
                     .hash
             }
         }
@@ -473,6 +690,18 @@ impl Harness {
         self.runtime
             .as_ref()
             .expect("the coherence runtime is absent only during reopen")
+    }
+
+    fn next_evidence(&mut self, domain: u8) -> EvidenceId {
+        let counter =
+            u8::try_from(self.next_request_id).expect("the bounded operation sequence fits in u8");
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .expect("the bounded coherence sequence cannot exhaust identities");
+        let mut digest = [counter; 32];
+        digest[0] = domain;
+        EvidenceId::from_digest(digest)
     }
 
     fn logical_dump(&self) -> Vec<(usize, Vec<u8>, Vec<u8>)> {

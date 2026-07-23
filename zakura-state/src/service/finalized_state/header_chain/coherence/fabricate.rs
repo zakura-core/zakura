@@ -161,7 +161,7 @@ impl Universe {
             &[Spacing::Fast; TRUNK_LEN],
             0x10,
         );
-        let fork_index = FORK_HEIGHT as usize - 1;
+        let fork_index = usize::try_from(FORK_HEIGHT).expect("the fork height fits in usize") - 1;
         let fork_parent = (trunk[fork_index].height, trunk[fork_index].hash);
         let fork_context = extend_context(genesis_context, &trunk[..=fork_index]);
 
@@ -251,7 +251,7 @@ impl Universe {
     }
 
     pub fn trunk_at(&self, height: u32) -> &FabHeader {
-        &self.trunk[height as usize - 1]
+        &self.trunk[usize::try_from(height).expect("the bounded height fits in usize") - 1]
     }
 }
 

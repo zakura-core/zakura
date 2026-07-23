@@ -64,6 +64,15 @@ fn fork_aware_write_path_upholds_invariants_across_forks_rejections_and_reopen()
             len: 5,
             anchor: Anchor::TrunkAt(50),
         },
+        Op::Verify {
+            source: Source::Branch(2),
+            index: 20,
+        },
+        Op::Finalize { count: 10 },
+        Op::Verify {
+            source: Source::Branch(3),
+            index: 4,
+        },
         Op::Reopen,
     ]);
 }

@@ -4,6 +4,8 @@
 mod fabricate;
 #[path = "coherence/harness.rs"]
 mod harness;
+#[path = "coherence/prop.rs"]
+mod prop;
 
 use harness::{Anchor, Harness, Op, Source};
 

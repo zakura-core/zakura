@@ -42,14 +42,15 @@ pub fn spawn_header_sync_reactor(
         target_height: header_sync_candidate_target(state.best_header_tip),
         admitted_node_ids: Vec::new(),
         backed_off_node_ids: Vec::new(),
-        backed_off_until: Vec::new(),
     });
+    let (backoff_deadlines_tx, backoff_deadlines_rx) = watch::channel(Vec::new());
     let handle = HeaderSyncHandle {
         events: events_tx,
         lifecycle: lifecycle_tx,
         tip: tip_rx,
         peers: peers_rx,
         candidates: candidates_rx,
+        backoff_deadlines: backoff_deadlines_rx,
     };
     let reactor = HeaderSyncReactor {
         startup,
@@ -66,6 +67,7 @@ pub fn spawn_header_sync_reactor(
         tip: tip_tx,
         peers: peers_tx,
         candidates: candidates_tx,
+        backoff_deadlines: backoff_deadlines_tx,
     };
     let task = tokio::spawn(reactor.run());
 
@@ -88,6 +90,7 @@ pub(super) struct HeaderSyncReactor {
     tip: watch::Sender<(block::Height, block::Hash)>,
     peers: watch::Sender<ServicePeerSnapshot>,
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
+    backoff_deadlines: watch::Sender<Vec<(NodeId, std::time::Instant)>>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -614,11 +617,22 @@ impl HeaderSyncReactor {
             .map(|(node_id, _)| *node_id)
             .collect();
 
+        // The real per-peer expiries ride a separate internal channel so the
+        // ordered-session demand can wake at the reactor's deadline instead of
+        // inventing one at sampling time.
+        self.backoff_deadlines.send_if_modified(|current| {
+            if *current == backed_off_until {
+                return false;
+            }
+
+            *current = backed_off_until;
+            true
+        });
+
         let candidate_state = ZakuraHeaderSyncCandidateState {
             target_height: header_sync_candidate_target(self.state.best_header_tip),
             admitted_node_ids,
             backed_off_node_ids,
-            backed_off_until,
         };
         self.candidates.send_if_modified(|current| {
             if *current == candidate_state {

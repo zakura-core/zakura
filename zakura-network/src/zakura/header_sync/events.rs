@@ -83,6 +83,7 @@ pub struct HeaderSyncHandle {
     pub(super) tip: watch::Receiver<(block::Height, block::Hash)>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) candidates: watch::Receiver<ZakuraHeaderSyncCandidateState>,
+    pub(super) backoff_deadlines: watch::Receiver<Vec<(iroh::NodeId, std::time::Instant)>>,
 }
 
 impl HeaderSyncHandle {
@@ -140,6 +141,19 @@ impl HeaderSyncHandle {
     /// Return the currently cached header-sync candidate hints.
     pub fn candidate_state(&self) -> ZakuraHeaderSyncCandidateState {
         self.candidates.borrow().clone()
+    }
+
+    /// Return the reactor's real advisory-backoff expiry for `node_id`, if it
+    /// is currently backed off.
+    pub(crate) fn advisory_backoff_deadline(
+        &self,
+        node_id: &iroh::NodeId,
+    ) -> Option<std::time::Instant> {
+        self.backoff_deadlines
+            .borrow()
+            .iter()
+            .find(|(backed_off, _)| backed_off == node_id)
+            .map(|(_, until)| *until)
     }
 }
 

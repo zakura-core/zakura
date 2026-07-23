@@ -1228,6 +1228,8 @@ fn test_header_sync_handle() -> (HeaderSyncHandle, mpsc::UnboundedReceiver<Heade
     let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
     let (_candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
     (
         HeaderSyncHandle {
             events,
@@ -1235,6 +1237,7 @@ fn test_header_sync_handle() -> (HeaderSyncHandle, mpsc::UnboundedReceiver<Heade
             tip,
             peers,
             candidates,
+            backoff_deadlines,
         },
         lifecycle_rx,
     )
@@ -1247,12 +1250,15 @@ fn ordered_session_demand_bounds_advisory_backoff_and_waits_for_slots() {
     let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let (peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
     let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
     let handle = HeaderSyncHandle {
         events,
         lifecycle,
         tip,
         peers,
         candidates,
+        backoff_deadlines,
     };
     let service = HeaderSyncService::new(handle);
     let (peer, node_id) = node_peer();
@@ -1311,12 +1317,15 @@ fn advisory_backoff_retry_targets_the_real_deadline() {
     let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
     let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
     let handle = HeaderSyncHandle {
         events,
         lifecycle,
         tip,
         peers,
         candidates,
+        backoff_deadlines,
     };
     let service = HeaderSyncService::new(handle);
     let (peer, node_id) = node_peer();
@@ -1325,9 +1334,9 @@ fn advisory_backoff_retry_targets_the_real_deadline() {
     let deadline = before + std::time::Duration::from_secs(10);
     candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
         backed_off_node_ids: vec![node_id],
-        backed_off_until: vec![(node_id, deadline)],
         ..ZakuraHeaderSyncCandidateState::default()
     });
+    backoff_deadlines_tx.send_replace(vec![(node_id, deadline)]);
 
     let demand = service.ordered_session_demand(
         1,
@@ -1353,12 +1362,15 @@ fn expired_advisory_backoff_opens_even_with_stale_candidate_state() {
     let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
     let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
     let handle = HeaderSyncHandle {
         events,
         lifecycle,
         tip,
         peers,
         candidates,
+        backoff_deadlines,
     };
     let service = HeaderSyncService::new(handle);
     let (peer, node_id) = node_peer();
@@ -1366,9 +1378,9 @@ fn expired_advisory_backoff_opens_even_with_stale_candidate_state() {
     let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
     candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
         backed_off_node_ids: vec![node_id],
-        backed_off_until: vec![(node_id, expired)],
         ..ZakuraHeaderSyncCandidateState::default()
     });
+    backoff_deadlines_tx.send_replace(vec![(node_id, expired)]);
 
     assert!(matches!(
         service.ordered_session_demand(
@@ -1393,12 +1405,15 @@ async fn transient_session_exit_keeps_connection_ownership_across_reopen_gap() {
     let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
     let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
     let handle = HeaderSyncHandle {
         events,
         lifecycle,
         tip,
         peers,
         candidates,
+        backoff_deadlines,
     };
     let service = HeaderSyncService::new(handle);
     let (peer_id, node_id) = node_peer();
@@ -1462,12 +1477,15 @@ async fn transient_session_exit_survives_stale_reactor_snapshot() {
     let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let (peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
     let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
     let handle = HeaderSyncHandle {
         events,
         lifecycle,
         tip,
         peers,
         candidates,
+        backoff_deadlines,
     };
     let service = HeaderSyncService::new(handle);
     let (peer_id, node_id) = node_peer();

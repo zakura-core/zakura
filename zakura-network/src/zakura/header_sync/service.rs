@@ -502,13 +502,13 @@ impl Service for HeaderSyncService {
         let Some(node_id) = header_peer_node_id(peer) else {
             return OrderedSessionDemand::Retire;
         };
-        let candidate_state = self.header_sync.candidate_state();
-        if candidate_state.backed_off_node_ids.contains(&node_id) {
-            let deadline = candidate_state
-                .backed_off_until
-                .iter()
-                .find(|(backed_off, _)| *backed_off == node_id)
-                .map(|(_, until)| *until);
+        if self
+            .header_sync
+            .candidate_state()
+            .backed_off_node_ids
+            .contains(&node_id)
+        {
+            let deadline = self.header_sync.advisory_backoff_deadline(&node_id);
             let now = Instant::now();
             match deadline {
                 // Wake at the reactor's real backoff expiry: `install_demand_wait`

@@ -13,7 +13,7 @@ commitment-root index.
 This design makes `zakura-state` the owner of a single, durable, ascending
 root authentication frontier. Header discovery remains responsible for
 finding and committing valid headers. Root-carrying header responses are retained
-in reactor memory through the VCT handoff region until the state-owned
+in reactor memory through the last checkpoint height, until the state-owned
 authentication frontier can consume them. Authentication and promotion remain gated
 by completed-checkpoint coverage, so retained payloads above the current completed
 checkpoint wait until that frontier advances. A root-authentication network lane
@@ -173,16 +173,17 @@ without forcing the same roots to be downloaded again: committed root-carrying
 payloads wait in reactor memory until their predecessor becomes the durable
 authentication frontier and their successor is covered by a completed checkpoint.
 The dedicated authentication request path is recovery for gaps and invalid
-payloads, not the steady-state supply path. After restart, it is also a bounded
-catch-up lane: it eagerly queues overlapping requests across the missing durable
-header lead, assigns them incrementally as peer slots become available, and keeps
-the network window full while state authenticates one range at a time.
+payloads, not the steady-state supply path. Under normal operation, retained
+payloads keep the durable authentication frontier within one response batch of the
+durable header tip. A larger lag is a regression signal, not a steady-state mode.
+After restart, a retained miss fills a bounded window with overlapping
+`AuthenticateRoots` ranges from `confirmed_height + 1`. Peer requests run in
+parallel while state continues to authenticate serially.
 
-During catch-up, `AuthenticateRoots` closes the gap below the durable header tip.
-Forward header discovery may pause so peer slots prefer that work; pausing Forward
-does not pause root recovery or discard already committed headers. The body-download
-target is published separately from the durable best-header tip and never advances
-past root-authenticated coverage in the VCT region.
+Forward discovery continues while fallback recovery runs. The body-download target
+is published separately from the durable best-header tip. In the VCT region it
+never advances past root-authenticated coverage and waits for a 400-block
+authenticated lead before each advance.
 
 ### 5.3 Why state owns the frontier
 
@@ -461,14 +462,12 @@ On each authentication-frontier or completed-checkpoint update, the reactor firs
 looks for retained contiguous coverage starting at `confirmed_height + 1` and
 ending with a successor witness at or below the completed checkpoint. A hit is
 dispatched directly to state. A miss schedules overlapping `AuthenticateRoots`
-network requests. The reactor eagerly fills the bounded resident authentication
-window across the gap; peer slots consume that work incrementally, and subsequent
-scheduler passes refill the window. This is neither one unbounded request nor a
-one-request-at-a-time retry loop. State still admits exactly one authentication
-operation at a time, so prefetched responses wait buffered until the durable
-frontier reaches their start. An invalid retained response is discarded, attributed
-to its supplying peer, and replaced from another peer; stale or local state errors
-do not prove the retained roots invalid.
+network recovery across a bounded resident window. Peer slots download those
+ranges concurrently, while state still admits exactly one authentication operation
+at a time. Later scheduler passes refill the window as authentication advances. An
+invalid retained response is discarded, attributed to its supplying peer, and
+replaced from another peer; stale or local state errors do not prove the retained
+roots invalid.
 
 The missing suffix ends at the first retained start when one exists: the fallback
 range includes that height as its successor witness, then authentication reconnects
@@ -529,12 +528,12 @@ This forward-only checkpoint gating keeps:
 - authenticated root rows free from branch rollback;
 - checkpoint-backed authentication immutable.
 
-The durable best-header tip and the body-download target are distinct during VCT
-catch-up. Before publishing a higher body target, header sync first builds a
-`CATCHUP_MIN_LEAD` authenticated-root lead (one checkpoint bracket by default).
-Each published target is at or below the authenticated frontier, so body sync
-cannot enter an unauthenticated hole. VCT remains fail-closed as a final safety
-check, but its bounded two-height repair is not the normal post-restart gap closer.
+The durable best-header tip and the body-download target are distinct in the VCT
+region. Header sync publishes a higher authenticated body target only after the
+authentication frontier has built at least a 400-block lead over the current target.
+This cushion lets bodies continue through short authentication delays and repeated
+early restarts. Every published target remains authenticated, so body sync cannot
+enter an unauthenticated gap. VCT remains fail-closed as a final safety check.
 
 ## 11. Reorganizations
 
@@ -650,30 +649,22 @@ Startup performs:
 4. verify that the frontier is not behind the authoritative body history tree;
 5. if bodies advanced farther, rebase to the body-derived history tree;
 6. load the durable best-header tip independently from the root-covered body target;
-7. enter catch-up from `confirmed_height + 1`, because the pre-restart retained
-   store is intentionally not restored.
+7. resume retained-first authentication from `confirmed_height + 1`; the
+   pre-restart retained store is intentionally not restored.
 
 No unverified candidate roots are restored.
 
-Catch-up defines its network gap as the confirmable heights between
-`confirmed_height + 1` and the minimum of the completed checkpoint, durable
-best-header tip, and VCT handoff. If a post-restart retained response starts inside
-that interval, its start is the reconnect boundary.
-
-Each scheduler pass queues as many overlapping `AuthenticateRoots` batches as fit
-the resident authentication budget. Free peer slots take those batches before
-Forward work. Responses can therefore arrive in parallel, but durable
-authentication remains serial and ascending. Later passes refill released resident
-capacity until the gap closes. New Forward scheduling pauses while a confirmable
-restart gap exists; in-flight Forward work can finish, and Forward resumes when a
-successor header is needed or catch-up reaches its boundary.
+If retained coverage is absent after restart, the reactor requests one overlapping
+window from `confirmed_height + 1`, bounded by resident capacity, the completed
+checkpoint, durable best-header tip, VCT handoff, and advertised response size.
+Each later frontier advance refills released capacity if retained coverage is still
+absent. Forward discovery continues in parallel; authentication work retains peer
+scheduling priority and durable authentication remains serial and ascending.
 
 The shared body-download target starts from root-covered state, not merely the
-durable header tip. Header-root advancement publishes a new body target only after
-the authenticated frontier has rebuilt `CATCHUP_MIN_LEAD`; every published target
-is itself authenticated. This prevents body sync from racing into the emptied
-post-restart root gap. A VCT repair may use one idle peer, but it does not stop the
-scheduler from assigning catch-up work to other peers.
+durable header tip. Header-root advancement publishes a new authenticated body
+target after rebuilding a 400-block lead. This prevents body sync from racing into
+a missing root range and preserves a small restart cushion.
 
 If the frontier snapshot is missing or fails coherence checks, state can defensively
 reconstruct it from:
@@ -1129,16 +1120,16 @@ Implemented in draft
 - Restart resumes at `confirmed_height + 1`.
 - The first post-restart fallback starts at `confirmed_height + 1` and includes its
   successor witness; it does not re-request `confirmed_height`.
-- The reactor eagerly fills its bounded authentication request window across the
-  restart gap and refills it incrementally as peer slots and resident capacity free.
-- Forward tip extension pauses only while a confirmable catch-up gap exists;
-  `AuthenticateRoots` refetch continues and in-flight Forward work may finish.
+- A retained miss fills the bounded fallback window with overlapping ranges; later
+  scheduler passes refill released capacity.
+- Forward tip extension continues while fallback recovery runs.
 - No unverified tip root survives restart.
 - Restart may re-fetch roots that existed only in the pre-restart retained store.
 - Root payloads committed by new Forward responses after restart remain retained
-  above the gap and become usable when catch-up reaches their exact start.
-- The body-download target stays at or below authenticated coverage and is released
-  only after the configured minimum authenticated lead has been rebuilt.
+  above a missing range and become usable when authentication reaches their exact
+  start.
+- The body-download target stays at or below authenticated coverage and advances
+  after a 400-block authenticated lead is available.
 - The final peer-promoted root is at `C - 1`, confirmed by checkpoint header `C`;
   the embedded frontier and handoff-body checks establish the authoritative state at
   `C`.
@@ -1152,6 +1143,18 @@ checkpoint sync it should normally be positive and large enough to absorb tempor
 network or verification delays. A value of zero is not automatically an error at the
 chain tip or during startup, but zero combined with body-sync root retries means the
 authentication lane has failed to stay ahead.
+
+Each `header_root_auth_diagnostics` JSONL trace row records:
+
+- `best_header_tip`;
+- `root_auth_hole_heights`: the exact confirmable missing-root count between
+  `authenticated_height + 1` and the first retained response, capped by the
+  completed checkpoint, durable header tip, and VCT handoff;
+- `first_retained_root_height`, when retained coverage exists above the frontier.
+
+The reactor emits a row whenever any of these values changes. This trace diagnostic
+shares the same range-bound calculation as fallback scheduling, so offline plots do
+not need to reconstruct the retained-store boundary.
 
 The bounded retained pipeline is exposed through these gauges:
 
@@ -1171,12 +1174,6 @@ The bounded retained pipeline is exposed through these gauges:
   in-flight, buffered, retained, and authenticating root ranges. Overlap witnesses
   are counted in adjacent ranges, so this measures retained lead size rather than
   unique heights.
-- `sync.header.root_auth.catchup.active`: whether the reactor is closing a
-  confirmable gap under the durable header tip;
-- `sync.header.root_auth.catchup.hole_heights`: the remaining confirmable gap before
-  the retained reconnect boundary or current checkpoint/header bound;
-- `sync.header.root_auth.catchup.prefetched`: overlapping fallback batches added to
-  the bounded catch-up window.
 
 The retained-store and fallback counters are:
 
@@ -1191,7 +1188,9 @@ The retained-store and fallback counters are:
   `frontier_rebased`, `checkpoint_rebased`, `canonical_mismatch`,
   `invalid_roots`, and `session_retired`;
 - `sync.header.root_auth.fallback.requested{reason=...}`: overlapping network
-  recovery requested because of `missing`, `invalid_roots`, or `restart`;
+  recovery requested because of `missing` or `invalid_roots`;
+- `sync.header.root_auth.fallback.prefetched`: fallback batches added to the bounded
+  resident window;
 - `sync.header.root_auth.completed`: state operations that reported success. Durable
   progress is still accepted only from the state watch, so this counter alone does not
   prove frontier advancement.

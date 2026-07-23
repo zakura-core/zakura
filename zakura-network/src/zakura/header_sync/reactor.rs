@@ -68,6 +68,7 @@ pub fn spawn_header_sync_reactor(
         tip: tip_tx,
         peers: peers_tx,
         candidates: candidates_tx,
+        root_auth_trace_snapshot: None,
     };
     let task = tokio::spawn(reactor.run());
 
@@ -90,6 +91,16 @@ pub(super) struct HeaderSyncReactor {
     tip: watch::Sender<(block::Height, block::Hash)>,
     peers: watch::Sender<ServicePeerSnapshot>,
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
+    root_auth_trace_snapshot: Option<RootAuthTraceSnapshot>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct RootAuthTraceSnapshot {
+    authenticated_height: block::Height,
+    completed_checkpoint_height: block::Height,
+    best_header_tip: block::Height,
+    first_retained_root_height: Option<block::Height>,
+    hole_heights: u32,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -157,6 +168,7 @@ impl HeaderSyncReactor {
             });
             self.refresh_body_sync_target();
         }
+        self.trace_root_auth_diagnostics();
 
         let exit_reason;
         loop {
@@ -245,6 +257,7 @@ impl HeaderSyncReactor {
         let kind = event.metrics_label();
         metrics::counter!("sync.header.reactor.event_started", "kind" => kind).increment(1);
         self.handle_event_inner(event).await;
+        self.trace_root_auth_diagnostics();
         metrics::counter!("sync.header.reactor.event_finished", "kind" => kind).increment(1);
     }
 
@@ -2712,10 +2725,7 @@ impl HeaderSyncReactor {
 
         self.try_start_retained_root_authentication();
         self.state.refresh_root_auth_range(&self.startup);
-        let catchup_active = self.state.root_auth_catchup_active(&self.startup);
-        if !catchup_active {
-            self.state.refresh_forward_range(&self.startup);
-        }
+        self.state.refresh_forward_range(&self.startup);
         self.schedule_vct_repair();
 
         // Sorted once, not per pass: scheduling only fills a peer's in-flight slots,
@@ -3010,22 +3020,6 @@ impl HeaderSyncReactor {
                 .saturating_sub(self.state.verified_block_tip.0)
         });
         metrics::gauge!("sync.header.root_auth.lead_blocks").set(f64::from(auth_lead));
-        let catchup_hole = self.state.root_auth_catchup_hole_heights(&self.startup);
-        metrics::gauge!("sync.header.root_auth.catchup.hole_heights").set(f64::from(catchup_hole));
-        let waiting_for_body_lead = self.state.header_root_auth.is_some_and(|auth| {
-            let handoff_root = block::Height(
-                self.startup
-                    .network
-                    .checkpoint_list()
-                    .max_height()
-                    .0
-                    .saturating_sub(1),
-            );
-            auth.authenticated_height < handoff_root
-                && self.state.body_sync_target.0 < self.state.best_header_tip
-        });
-        metrics::gauge!("sync.header.root_auth.catchup.active")
-            .set(f64::from(catchup_hole > 0 || waiting_for_body_lead));
     }
 
     fn schedule_vct_repair(&mut self) -> bool {
@@ -3214,7 +3208,7 @@ impl HeaderSyncReactor {
                 if auth.authenticated_height >= handoff_root {
                     (self.state.best_header_tip, self.state.best_header_hash)
                 } else if auth.authenticated_height.0.saturating_sub(current_height.0)
-                    >= ROOT_AUTH_CATCHUP_MIN_LEAD
+                    >= ROOT_AUTH_MIN_BODY_LEAD
                 {
                     (auth.authenticated_height, auth.authenticated_hash)
                 } else {

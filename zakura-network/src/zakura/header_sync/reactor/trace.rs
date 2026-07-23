@@ -61,6 +61,52 @@ impl HeaderSyncReactor {
         });
     }
 
+    pub(super) fn trace_root_auth_diagnostics(&mut self) {
+        let Some(auth) = self.state.header_root_auth else {
+            return;
+        };
+        let first_retained_root_height = auth
+            .authenticated_height
+            .0
+            .checked_add(1)
+            .map(block::Height)
+            .and_then(|start| {
+                self.state
+                    .retained_roots
+                    .range(start..)
+                    .next()
+                    .map(|(&height, _)| height)
+            });
+        let snapshot = super::RootAuthTraceSnapshot {
+            authenticated_height: auth.authenticated_height,
+            completed_checkpoint_height: auth.completed_checkpoint_height,
+            best_header_tip: self.state.best_header_tip,
+            first_retained_root_height,
+            hole_heights: self.state.root_auth_hole_heights(&self.startup, auth),
+        };
+        if self.root_auth_trace_snapshot == Some(snapshot) {
+            return;
+        }
+        self.root_auth_trace_snapshot = Some(snapshot);
+        self.emit_trace(hs_trace::HEADER_ROOT_AUTH_DIAGNOSTICS, |row| {
+            insert_height(row, hs_trace::HEIGHT, snapshot.authenticated_height);
+            insert_height(
+                row,
+                "completed_checkpoint_height",
+                snapshot.completed_checkpoint_height,
+            );
+            insert_height(row, hs_trace::BEST_HEADER_TIP, snapshot.best_header_tip);
+            insert_u64(
+                row,
+                hs_trace::ROOT_AUTH_HOLE_HEIGHTS,
+                u64::from(snapshot.hole_heights),
+            );
+            if let Some(height) = snapshot.first_retained_root_height {
+                insert_height(row, hs_trace::FIRST_RETAINED_ROOT_HEIGHT, height);
+            }
+        });
+    }
+
     pub(super) fn trace_action_dispatched(&self, action: &HeaderSyncAction) {
         self.emit_trace(hs_trace::HEADER_ACTION_DISPATCHED, |row| {
             trace_action_fields(row, action);

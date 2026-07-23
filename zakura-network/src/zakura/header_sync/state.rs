@@ -20,7 +20,7 @@ pub(super) const VCT_ROOT_REPAIR_MAX_ATTEMPTS: usize = 6;
 pub(super) const VCT_ROOT_REPAIR_MAX_WALL_TIME: Duration = Duration::from_secs(240);
 pub(super) const RETAINED_ROOT_LOCAL_MAX_ATTEMPTS: u32 = 6;
 pub(super) const RETAINED_ROOT_LOCAL_MAX_WALL_TIME: Duration = Duration::from_secs(240);
-pub(super) const ROOT_AUTH_CATCHUP_MIN_LEAD: u32 = 400;
+pub(super) const ROOT_AUTH_MIN_BODY_LEAD: u32 = 400;
 pub(super) const VCT_ROOT_REPAIR_BACKOFFS: [Duration; VCT_ROOT_REPAIR_MAX_ATTEMPTS] = [
     Duration::from_secs(0),
     Duration::from_secs(1),
@@ -41,7 +41,6 @@ pub(super) struct HeaderSyncCore {
     pub(super) body_sync_target: (block::Height, block::Hash),
     pub(super) header_root_auth: Option<HeaderRootAuthState>,
     pub(super) root_auth_waiting_for_watch: bool,
-    pub(super) root_auth_restart_pending: bool,
     pub(super) last_header_progress_at: Instant,
     pub(super) peers: HashMap<ZakuraPeerId, PeerHeaderState>,
     pub(super) parked_peers: HashSet<ZakuraPeerId>,
@@ -96,7 +95,6 @@ impl HeaderSyncCore {
             body_sync_target,
             header_root_auth: startup.header_root_auth,
             root_auth_waiting_for_watch: false,
-            root_auth_restart_pending: startup.header_root_auth.is_some(),
             last_header_progress_at: Instant::now(),
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
@@ -258,9 +256,7 @@ impl HeaderSyncCore {
         {
             return;
         }
-        let Some(end) = self.root_auth_catchup_end(startup) else {
-            return;
-        };
+        let end = self.root_auth_fallback_end(startup, auth, start);
         let batch_count = clamp_header_sync_request_count(
             startup.config.advertised_max_headers_per_response(),
             startup.config.advertised_max_headers_per_response(),
@@ -299,7 +295,7 @@ impl HeaderSyncCore {
             }
             let range = CheckedHeaderRange::from_count(batch_start, count)
                 .expect("bounded root-authentication batch has checked geometry");
-            self.schedule.ensure(
+            if self.schedule.ensure(
                 RangeRequest {
                     range,
                     anchor_hash: (batch_start == start).then_some(auth.authenticated_hash),
@@ -308,8 +304,9 @@ impl HeaderSyncCore {
                     priority: RangePriority::AuthenticateRoots,
                 },
                 RangePriority::AuthenticateRoots,
-            );
-            added = added.saturating_add(1);
+            ) {
+                added = added.saturating_add(1);
+            }
             remaining = remaining.saturating_sub(count);
             if range.end() >= end {
                 break;
@@ -320,24 +317,31 @@ impl HeaderSyncCore {
             return;
         }
 
-        metrics::counter!("sync.header.root_auth.catchup.prefetched").increment(added);
         metrics::counter!("sync.header.root_auth.retain.miss").increment(1);
-        let reason = if self.root_auth_restart_pending {
-            self.root_auth_restart_pending = false;
-            "restart"
-        } else {
-            "missing"
-        };
-        metrics::counter!("sync.header.root_auth.fallback.requested", "reason" => reason)
+        metrics::counter!("sync.header.root_auth.fallback.requested", "reason" => "missing")
             .increment(1);
+        metrics::counter!("sync.header.root_auth.fallback.prefetched").increment(added);
     }
 
-    pub(super) fn root_auth_catchup_end(
+    pub(super) fn root_auth_hole_heights(
         &self,
         startup: &HeaderSyncStartup,
-    ) -> Option<block::Height> {
-        let auth = self.header_root_auth?;
-        let start = next_height(auth.authenticated_height)?;
+        auth: HeaderRootAuthState,
+    ) -> u32 {
+        let Some(start) = next_height(auth.authenticated_height) else {
+            return 0;
+        };
+        self.root_auth_fallback_end(startup, auth, start)
+            .0
+            .saturating_sub(start.0)
+    }
+
+    fn root_auth_fallback_end(
+        &self,
+        startup: &HeaderSyncStartup,
+        auth: HeaderRootAuthState,
+        start: block::Height,
+    ) -> block::Height {
         let mut end = auth
             .completed_checkpoint_height
             .min(self.best_header_tip)
@@ -345,21 +349,7 @@ impl HeaderSyncCore {
         if let Some((&retained_start, _)) = self.retained_roots.range(start..=end).next() {
             end = retained_start;
         }
-        (count_between(start, end) >= 2).then_some(end)
-    }
-
-    pub(super) fn root_auth_catchup_active(&self, startup: &HeaderSyncStartup) -> bool {
-        self.root_auth_catchup_end(startup).is_some()
-    }
-
-    pub(super) fn root_auth_catchup_hole_heights(&self, startup: &HeaderSyncStartup) -> u32 {
-        let Some(auth) = self.header_root_auth else {
-            return 0;
-        };
-        self.root_auth_catchup_end(startup).map_or(0, |end| {
-            end.0
-                .saturating_sub(auth.authenticated_height.0.saturating_add(1))
-        })
+        end
     }
 
     fn root_auth_coverage_expected_from_forward(&self, start: block::Height) -> bool {
@@ -416,7 +406,6 @@ impl HeaderSyncCore {
             .remove(&(RangePriority::AuthenticateRoots, start));
         self.retained_roots
             .insert(start, RetainedRootPayload::new(wire_request, payload));
-        self.root_auth_restart_pending = false;
         metrics::counter!("sync.header.root_auth.retain.admitted").increment(1);
         true
     }

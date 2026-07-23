@@ -8,7 +8,7 @@ use super::{
     state::{
         BufferedHeaderRange, HeaderSyncCore, OutstandingPhase, OutstandingRange, PendingOperation,
         RangePriority, RangePurpose, RangeRequest, RootAuthSource, VctRootRepair,
-        RETAINED_ROOT_LOCAL_MAX_ATTEMPTS, ROOT_AUTH_CATCHUP_MIN_LEAD, VCT_ROOT_REPAIR_BACKOFFS,
+        RETAINED_ROOT_LOCAL_MAX_ATTEMPTS, ROOT_AUTH_MIN_BODY_LEAD, VCT_ROOT_REPAIR_BACKOFFS,
         VCT_ROOT_REPAIR_MAX_WALL_TIME,
     },
     validation::*,
@@ -568,6 +568,15 @@ fn root_auth_ranges_overlap_once_and_stay_checkpoint_covered() {
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
 
+    assert_eq!(
+        state.root_auth_hole_heights(
+            &startup,
+            startup
+                .header_root_auth
+                .expect("test authentication state exists")
+        ),
+        5
+    );
     state.refresh_root_auth_range(&startup);
     let first = state
         .schedule
@@ -598,7 +607,7 @@ fn root_auth_ranges_overlap_once_and_stay_checkpoint_covered() {
 }
 
 #[test]
-fn root_auth_catchup_prefetches_full_hole_with_overlaps() {
+fn root_auth_miss_prefetches_bounded_overlapping_ranges() {
     let network = Network::Mainnet;
     let anchor = (block::Height(0), network.genesis_hash());
     let mut startup = startup_for(
@@ -615,6 +624,15 @@ fn root_auth_catchup_prefetches_full_hole_with_overlaps() {
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
 
+    assert_eq!(
+        state.root_auth_hole_heights(
+            &startup,
+            startup
+                .header_root_auth
+                .expect("test authentication state exists")
+        ),
+        9
+    );
     state.refresh_root_auth_range(&startup);
 
     let ranges: Vec<_> = state
@@ -780,7 +798,7 @@ fn retained_payload_waits_for_checkpoint_and_suppresses_fallback() {
 }
 
 #[test]
-fn root_auth_catchup_stops_at_first_retained_start() {
+fn root_auth_fallback_stops_at_first_retained_start() {
     let network = Network::Mainnet;
     let anchor = (block::Height(0), network.genesis_hash());
     let mut startup = startup_for(
@@ -796,8 +814,6 @@ fn root_auth_catchup_stops_at_first_retained_start() {
         completed_checkpoint_hash: block::Hash([4; 32]),
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
-    state.refresh_root_auth_range(&startup);
-    assert_eq!(state.schedule.authenticate_roots.len(), 3);
     let payload = HeaderRangePayload::new(
         HeaderRangeEntry::from_parallel(
             block::Height(3),
@@ -819,6 +835,15 @@ fn root_auth_catchup_stops_at_first_retained_start() {
         },
         payload,
     ));
+    assert_eq!(
+        state.root_auth_hole_heights(
+            &startup,
+            startup
+                .header_root_auth
+                .expect("test authentication state exists")
+        ),
+        2
+    );
 
     state.refresh_root_auth_range(&startup);
 
@@ -838,13 +863,10 @@ fn root_auth_catchup_stops_at_first_retained_start() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn body_target_waits_for_minimum_authenticated_lead() {
+async fn body_target_waits_for_authenticated_lead() {
     let network = Network::Mainnet;
     let anchor = (block::Height(0), network.genesis_hash());
-    let best = (
-        block::Height(ROOT_AUTH_CATCHUP_MIN_LEAD.saturating_mul(2)),
-        block::Hash([8; 32]),
-    );
+    let best = (block::Height(800), block::Hash([8; 32]));
     let mut startup = startup_for(network, anchor, Some(best));
     startup.header_root_auth = Some(HeaderRootAuthState {
         authenticated_height: anchor.0,
@@ -858,7 +880,7 @@ async fn body_target_waits_for_minimum_authenticated_lead() {
         .handle
         .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(
             HeaderRootAuthState {
-                authenticated_height: block::Height(ROOT_AUTH_CATCHUP_MIN_LEAD.saturating_sub(1)),
+                authenticated_height: block::Height(ROOT_AUTH_MIN_BODY_LEAD.saturating_sub(1)),
                 authenticated_hash: block::Hash([3; 32]),
                 completed_checkpoint_height: best.0,
                 completed_checkpoint_hash: best.1,
@@ -875,7 +897,7 @@ async fn body_target_waits_for_minimum_authenticated_lead() {
         .handle
         .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(
             HeaderRootAuthState {
-                authenticated_height: block::Height(ROOT_AUTH_CATCHUP_MIN_LEAD),
+                authenticated_height: block::Height(ROOT_AUTH_MIN_BODY_LEAD),
                 authenticated_hash: block::Hash([4; 32]),
                 completed_checkpoint_height: best.0,
                 completed_checkpoint_hash: best.1,
@@ -888,11 +910,53 @@ async fn body_target_waits_for_minimum_authenticated_lead() {
         if let HeaderSyncAction::HeaderAdvanced { height, hash } =
             next_action(&mut fixture.actions).await
         {
-            assert_eq!(height, block::Height(ROOT_AUTH_CATCHUP_MIN_LEAD));
+            assert_eq!(height, block::Height(ROOT_AUTH_MIN_BODY_LEAD));
             assert_eq!(hash, block::Hash([4; 32]));
             break;
         }
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn root_auth_state_trace_records_exact_hole_height() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let best = (block::Height(4), block::Hash([4; 32]));
+    let auth = HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: best.0,
+        completed_checkpoint_hash: best.1,
+    };
+    let mut capture =
+        TraceCapture::for_test("root_auth_state_trace_records_exact_hole_height").unwrap();
+    let mut startup = startup_for(network, anchor, Some(best));
+    startup.header_root_auth = Some(auth);
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let fixture = spawn_test_reactor(startup);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(auth)))
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    capture.flush().await;
+    capture
+        .reader()
+        .unwrap()
+        .table(HEADER_SYNC_TABLE.table())
+        .assert_row(
+            hs_trace::HEADER_ROOT_AUTH_DIAGNOSTICS,
+            &[
+                (hs_trace::HEIGHT, TraceValue::U64(0)),
+                (hs_trace::BEST_HEADER_TIP, TraceValue::U64(4)),
+                (hs_trace::ROOT_AUTH_HOLE_HEIGHTS, TraceValue::U64(3)),
+            ],
+        );
+
+    let _ = capture.finish().await.unwrap();
 }
 
 #[test]
@@ -3350,7 +3414,7 @@ async fn restart_rebuilds_schedule_from_durable_best_tip_and_peer_status() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn restart_catchup_pauses_forward_tip_extension() {
+async fn restart_prefetch_keeps_forward_tip_extension_active() {
     let network = Network::Mainnet;
     let anchor = (block::Height(0), network.genesis_hash());
     let best = (block::Height(4), block::Hash([4; 32]));
@@ -3366,10 +3430,18 @@ async fn restart_catchup_pauses_forward_tip_extension() {
     let peer_id = peer(42);
 
     connect_peer(&fixture, peer_id.clone()).await;
-    advertise_tip(&fixture, peer_id, block::Height(0), block::Height(8), 2, 4).await;
+    advertise_tip(
+        &fixture,
+        peer_id,
+        block::Height(0),
+        block::Height(500),
+        2,
+        4,
+    )
+    .await;
 
     let mut starts = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         let (_, _, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
         starts.push((start, count));
     }
@@ -3379,25 +3451,8 @@ async fn restart_catchup_pauses_forward_tip_extension() {
             (block::Height(1), 2),
             (block::Height(2), 2),
             (block::Height(3), 2),
+            (block::Height(5), 2),
         ]
-    );
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(25), async {
-            loop {
-                if matches!(
-                    next_action(&mut fixture.actions).await,
-                    HeaderSyncAction::SendMessage {
-                        msg: HeaderSyncMessage::GetHeaders { .. },
-                        ..
-                    }
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .is_err(),
-        "catch-up must not schedule Forward work above the durable tip"
     );
 }
 

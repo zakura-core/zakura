@@ -85,7 +85,7 @@ impl HeaderWorkQueue {
         self.ensure(range, RangePriority::Forward);
     }
 
-    pub(super) fn ensure(&mut self, range: RangeRequest, priority: RangePriority) {
+    pub(super) fn ensure(&mut self, range: RangeRequest, priority: RangePriority) -> bool {
         if self.is_covered(range)
             || self
                 .active_starts
@@ -94,17 +94,18 @@ impl HeaderWorkQueue {
                 .pending_starts
                 .contains(&(priority, range.start_height()))
         {
-            return;
+            return false;
         }
         let queue = match priority {
             RangePriority::Forward => &mut self.forward,
             RangePriority::AuthenticateRoots => &mut self.authenticate_roots,
-            RangePriority::Repair => return,
+            RangePriority::Repair => return false,
         };
         queue.push_back(range);
         self.pending_starts.insert((priority, range.start_height()));
         self.oldest_missing_since.get_or_insert_with(Instant::now);
         metrics::counter!("sync.header.work.added", "lane" => priority.label()).increment(1);
+        true
     }
 
     pub(super) fn next_for_peer(

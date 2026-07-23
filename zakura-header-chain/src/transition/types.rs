@@ -570,17 +570,6 @@ pub struct MigratedPinRefutation {
     pub rule: BodyRuleId,
 }
 
-/// Authenticated local checkpoint advancement.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct AdvanceLocalCheckpoint {
-    /// Exact configured checkpoint.
-    pub checkpoint: Frontier,
-    /// Digest of authenticated local configuration.
-    pub authenticated_config_digest: [u8; 32],
-    /// Stable transition identity.
-    pub evidence: EvidenceId,
-}
-
 /// Auxiliary metadata authentication update.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuxEvidence {
@@ -652,8 +641,6 @@ pub enum TransitionEvent {
     FullStateFinalized(FullStateFinalized),
     /// Integrated full state refuted an imported headers-only pin.
     MigratedPinRefutation(MigratedPinRefutation),
-    /// Authenticated local checkpoint advancement.
-    AdvanceLocalCheckpoint(AdvanceLocalCheckpoint),
     /// Hash-scoped auxiliary evidence.
     AuxEvidence(Box<AuxEvidence>),
     /// Reevaluate all locally due future-time deferrals.
@@ -693,7 +680,6 @@ impl TransitionEvent {
             | Self::OperatorBodyRetry(_)
             | Self::OperatorInvalidate(_)
             | Self::OperatorReconsider(_)
-            | Self::AdvanceLocalCheckpoint(_)
             | Self::ReevaluateDeferred => EventAdmission::AnyMode,
         }
     }
@@ -720,7 +706,6 @@ impl TransitionEvent {
             Self::OperatorReconsider(event) => Some(event.evidence),
             Self::FullStateFinalized(event) => Some(event.full_state_transition_id),
             Self::MigratedPinRefutation(event) => Some(event.full_state_transition_id),
-            Self::AdvanceLocalCheckpoint(event) => Some(event.evidence),
             Self::AuxEvidence(event) => match event.authentication {
                 AuxAuthentication::Unauthenticated => None,
                 AuxAuthentication::Authenticated { evidence, .. }
@@ -1049,7 +1034,6 @@ mod tests {
             "OperatorReconsider(OperatorReconsider)",
             "FullStateFinalized(FullStateFinalized)",
             "MigratedPinRefutation(MigratedPinRefutation)",
-            "AdvanceLocalCheckpoint(AdvanceLocalCheckpoint)",
             "AuxEvidence(Box<AuxEvidence>)",
             "ReevaluateDeferred",
             "Recover(RecoveryEvidence)",

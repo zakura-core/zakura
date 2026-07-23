@@ -760,30 +760,6 @@ fn apply_event<S: StoreRead>(
                 ));
             }
         }
-        TransitionEvent::AdvanceLocalCheckpoint(event) => {
-            if event.authenticated_config_digest != context.config.trust_anchor_digest()
-                || context
-                    .config
-                    .local_checkpoints
-                    .hash(event.checkpoint.height)
-                    != Some(event.checkpoint.hash)
-            {
-                return Err(TransitionFailure::InvalidEvidence(
-                    "local checkpoint is not authenticated configuration",
-                ));
-            }
-            for hash in graph.hashes_at_height(event.checkpoint.height) {
-                if hash != event.checkpoint.hash {
-                    graph.add_reason(
-                        hash,
-                        EligibilityReason::CheckpointConflict {
-                            height: event.checkpoint.height,
-                            expected: event.checkpoint.hash,
-                        },
-                    )?;
-                }
-            }
-        }
         TransitionEvent::AuxEvidence(event) => {
             if event.deliveries.is_empty() || event.deliveries.len() > 2 {
                 return Err(TransitionFailure::InvalidEvidence(
@@ -1540,6 +1516,86 @@ mod tests {
                 .parent_hash,
             expected_parent.hash
         );
+    }
+
+    #[test]
+    fn insertion_enforces_every_immutable_configured_checkpoint() {
+        let (store, config) = TestStore::new(EngineMode::Integrated);
+        let clock = ManualClock(Utc::now());
+        let request = insertion(&store, 1, EvidenceId::from_digest([0x44; 32]));
+        let child = match &request.event {
+            TransitionEvent::InsertHeaders(event) => Frontier::new(
+                store
+                    .lease
+                    .parent
+                    .height
+                    .next()
+                    .expect("the fixture anchor has a next height"),
+                event.target_tip_hash,
+            ),
+            _ => unreachable!("the insertion fixture constructs one header event"),
+        };
+
+        let mut matching_store = store.clone();
+        let mut matching_config = config.clone();
+        matching_config.local_checkpoints =
+            CheckpointSet::new([child]).expect("the matching checkpoint fixture is unique");
+        matching_store.metadata.anchor_manifest_digest = matching_config.trust_anchor_digest();
+        matching_store.lease = ValidationLease::new(
+            matching_store.lease.parent,
+            matching_store.lease.predecessors.clone(),
+            matching_config.trust_anchor_digest(),
+        );
+        let matching_request = insertion(&matching_store, 1, EvidenceId::from_digest([0x44; 32]));
+        let matching = apply_transition(
+            &matching_store,
+            matching_request,
+            &context(&matching_config, &clock, None),
+        )
+        .expect("an insertion matching the immutable configured checkpoint commits");
+        assert_eq!(matching.change_set.metadata.frontiers.header_best, child);
+        assert!(matching
+            .projected
+            .node(child.hash)
+            .expect("the matching checkpoint child is retained")
+            .eligibility
+            .direct_reasons
+            .is_empty());
+
+        let expected = Frontier::new(child.height, block::Hash([0x45; 32]));
+        let mut conflicting_store = store;
+        let mut conflicting_config = config;
+        conflicting_config.local_checkpoints =
+            CheckpointSet::new([expected]).expect("the conflicting checkpoint fixture is unique");
+        conflicting_store.metadata.anchor_manifest_digest =
+            conflicting_config.trust_anchor_digest();
+        conflicting_store.lease = ValidationLease::new(
+            conflicting_store.lease.parent,
+            conflicting_store.lease.predecessors.clone(),
+            conflicting_config.trust_anchor_digest(),
+        );
+        let conflicting_request =
+            insertion(&conflicting_store, 1, EvidenceId::from_digest([0x44; 32]));
+        let conflicting = apply_transition(
+            &conflicting_store,
+            conflicting_request,
+            &context(&conflicting_config, &clock, None),
+        )
+        .expect("a conflicting header is retained only as checkpoint evidence");
+        assert_eq!(
+            conflicting.change_set.metadata.frontiers.header_best,
+            conflicting_store.metadata.frontiers.header_best
+        );
+        assert!(conflicting
+            .projected
+            .node(child.hash)
+            .expect("the conflicting checkpoint child is retained")
+            .eligibility
+            .direct_reasons
+            .contains(&EligibilityReason::CheckpointConflict {
+                height: child.height,
+                expected: expected.hash,
+            }));
     }
 
     fn insert_verified_branch(

@@ -2426,6 +2426,7 @@ async fn registry_miss_retry_accumulates_budget_for_the_same_block() {
 /// work. Dispatch is limited to one hash per loop step so the retry timer remains reachable.
 #[tokio::test]
 async fn registry_miss_retry_allows_bounded_reserve_dispatch() {
+    // Keep negative request assertions fast while still allowing the mock service to be polled.
     let (
         mut chain_sync,
         _sync_status,
@@ -2435,6 +2436,8 @@ async fn registry_miss_retry_allows_bounded_reserve_dispatch() {
         _mock_chain_tip_sender,
     ) = setup_chain_sync_with_options(Height(0), Duration::from_millis(50));
 
+    // Seed the state produced after a required download returns NotFoundRegistry. Calling the
+    // handler directly keeps this test focused on sync-round scheduling rather than peer routing.
     let missing_hash = block::Hash::from([0xAB; 32]);
     chain_sync
         .handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::DownloadFailed {
@@ -2444,6 +2447,8 @@ async fn registry_miss_retry_allows_bounded_reserve_dispatch() {
         .await
         .expect("a registry miss within budget should stay within the retry loop");
 
+    // Two ordered hashes distinguish bounded progress from the normal full-reserve dispatch:
+    // the first must be queued now, while the second must remain deferred.
     let first_reserve_hash = block::Hash::from([0x11; 32]);
     let second_reserve_hash = block::Hash::from([0x22; 32]);
     let reserve = [first_reserve_hash, second_reserve_hash]
@@ -2454,22 +2459,30 @@ async fn registry_miss_retry_allows_bounded_reserve_dispatch() {
         let sync_round = chain_sync.sync_round(reserve);
         tokio::pin!(sync_round);
 
+        // Poll the sync round while observing its peer-set requests. The round should remain live
+        // because the registry retry is still scheduled for its future backoff deadline.
         tokio::select! {
             result = &mut sync_round => {
                 panic!("the sync round should still be waiting, got {result:?}")
             }
             request = async {
+                // Regression check: a pending retry must not globally suppress unrelated work.
                 let request = peer_set
                     .expect_request(zn::Request::BlocksByHash(
                         iter::once(first_reserve_hash).collect(),
                     ))
                     .await;
+
+                // Bounded-dispatch check: do not queue the second reserve hash before returning to
+                // the select loop, where the registry retry timer can be polled.
                 peer_set.expect_no_requests().await;
                 request
             } => request,
         }
     };
 
+    // The first request is deliberately left unanswered; cancel its download task before dropping
+    // the mock request handle so the test exits without leaving in-flight work behind.
     chain_sync.downloads.cancel_all();
     drop(first_request);
 }

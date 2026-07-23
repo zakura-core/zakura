@@ -340,6 +340,23 @@ impl HeaderChainWriter {
             retention_references: &[],
         }
     }
+
+    fn record_body_unavailable(
+        &self,
+        expected_version: StateVersion,
+        failure: zakura_header_chain::TransientBodyFailure,
+    ) -> Result<ApplyResult, HeaderChainStoreError> {
+        let authority = PreparedAuthority(failure.evidence);
+        let mut context = self.context();
+        context.full_state_authority = Some(&authority);
+        self.runtime.apply(
+            TransitionRequest {
+                expected_version,
+                event: TransitionEvent::BodyEvidence(BodyEvidence::Transient(failure)),
+            },
+            &context,
+        )
+    }
 }
 
 fn verified_path(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
@@ -1197,15 +1214,7 @@ impl WriteBlockWorkerTask {
                         .as_ref()
                         .ok_or(HeaderChainStoreError::Uninitialized)
                         .and_then(|writer| {
-                            writer.runtime.apply(
-                                TransitionRequest {
-                                    expected_version,
-                                    event: TransitionEvent::BodyEvidence(BodyEvidence::Transient(
-                                        failure,
-                                    )),
-                                },
-                                &writer.context(),
-                            )
+                            writer.record_body_unavailable(expected_version, failure)
                         });
                     let _ = rsp_tx.send(result);
                     None
@@ -1473,7 +1482,10 @@ mod tests {
     use crate::{
         arbitrary::Prepare,
         service::{
-            finalized_state::{header_chain::HeaderChainStore, FinalizedState},
+            finalized_state::{
+                header_chain::{HeaderChainStore, HeaderChainStoreError},
+                FinalizedState,
+            },
             non_finalized_state::NonFinalizedState,
             write::{
                 commit_contextual_finalization, commit_operator_change, verified_path,
@@ -1484,9 +1496,10 @@ mod tests {
         CheckpointVerifiedBlock, Config,
     };
     use zakura_header_chain::{
-        AlarmSet, BodyValidationState, ChainScore, CheckpointSet, EngineConfig, EngineMetadata,
-        EngineMode, EvidenceId, FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion,
-        HeaderGeneration, HeaderNode, HeaderValidationState, StateVersion, SuffixWork,
+        AlarmSet, BodyUnavailableSummary, BodyValidationState, ChainScore, CheckpointSet,
+        EngineConfig, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch, Frontier, FrontierSet,
+        HeaderChainDiskVersion, HeaderGeneration, HeaderNode, HeaderValidationState, StateVersion,
+        SuffixWork, TransientBodyFailure, TransientBodyFailureKind, TransitionFailure,
         TrustedAnchor, VerifiedGeneration, WorkCoordinate,
     };
 
@@ -1555,6 +1568,48 @@ mod tests {
             .startup(&config)
             .expect("the fixture header store audits");
         HeaderChainWriter::new(runtime, config)
+    }
+
+    #[test]
+    fn production_body_unavailability_writer_authenticates_exact_evidence() {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        )
+        .expect("the fixture finalized state opens");
+        let anchor = zakura_test::vectors::BLOCK_MAINNET_434873_BYTES
+            .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
+            .expect("the anchor block deserializes");
+        let anchor_height = anchor
+            .coinbase_height()
+            .expect("the anchor has a coinbase height");
+        let writer = header_writer(&finalized_state, &network, anchor_height, &anchor);
+        let result = writer.record_body_unavailable(
+            StateVersion::new(1),
+            TransientBodyFailure {
+                hash: anchor.hash(),
+                evidence: EvidenceId::from_digest([0x72; 32]),
+                kind: TransientBodyFailureKind::Storage,
+                availability: BodyUnavailableSummary {
+                    attempts: 1,
+                    suppliers: 1,
+                    alarmed: false,
+                },
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(HeaderChainStoreError::Transition(
+                TransitionFailure::InvalidEvidence(
+                    "body retry evidence cannot regress an already verified body"
+                )
+            ))
+        ));
     }
 
     #[test]

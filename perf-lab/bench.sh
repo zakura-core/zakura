@@ -100,6 +100,9 @@ cd ${CTL_CLONE_REMOTE}
 echo \$! > ${BENCH_OUT_REMOTE}/${label}.pid
 disown
 REMOTE
+  # tripwire: a silent fallback to public peers invalidated 2 days of cohort
+  # attribution (2026-07-23 incident) — state the substrate on every start
+  if [ -n "${COHORT_PEERS:-}" ]; then echo "substrate: COHORT (${COHORT_TAG})"; else echo "substrate: PUBLIC bootstrap peers (no cohort injection)"; fi
   echo "started bench '$label' on $name (BUILD_REF=$build_ref vs BASELINE_REF=$baseline_ref)"
 }
 

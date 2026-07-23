@@ -417,3 +417,93 @@ This file is the sole reporting channel (design D5). Entry template:
   k8 legs >= 3% above the highest plateau k=1 leg (94.86) -> both >= 97.7.
   Expected if yesterday's +9% mean effect is real: ~101-103. Batch 3:
   settle2 = 7 of 8; k8-c collect will be 8 (boundary).
+
+## EXP-002 — WIN CONFIRMED (request batching, k=8) — with substrate correction
+
+**Verdict: WIN.** Raising the block-sync request batch size from 1 to 8
+blocks per response is faster on every measurement taken, across two days
+and two different bench droplets, at the same code SHA (c3b26d24). The
+pre-registered confirmation bar tonight (both k=8 legs >= 3% above the
+highest same-night k=1 leg, i.e. >= 97.7) PASSED: 112.68 and 98.28.
+
+Evidence (post-commit blk/s over the standard 120k window):
+
+| night | droplet | k=1 legs | k=8 legs | worst-k8 vs best-k1 |
+|---|---|---|---|---|
+| 07-22 | s2-era | 105.26, 105.17 | 114.83, 110.09 | +4.6% |
+| 07-23 | s3 | 91.53, 94.79, 94.86 (plateau; first cold leg 84.45 excluded) | 112.68, 98.28 | +3.6% |
+
+Every k=8 leg beat every same-night k=1 plateau leg: 10 pairwise
+comparisons, 10 wins, 0 losses. k=32 regressed on 07-22 (99.59, 104.71) —
+the inverted-U peaks at or near k=8. Mean effect ~+9-12%; worst-leg margin
++3.6-4.6%.
+
+**Substrate correction (material, discovered tonight):** all EXP-002 runs —
+both nights — actually measured against the 7 PUBLIC Zakura bootstrap
+peers, NOT the frozen cohort (see incident below). Each night is an
+internally consistent A/B on its own substrate, and the cross-night
+reproduction spans droplets and days on the real network — which is the
+deployment-relevant environment. What we do NOT have is a cohort-grade
+deterministic measurement of the effect size; that remains open (optional
+strengthener, next session).
+
+**PROPOSAL (for Adam):** change `DEFAULT_BS_BLOCKS_PER_RESPONSE` from 1 to
+8 — zakura-network/src/zakura/block_sync/config.rs:7 (the doc comment at
+:3-7 already describes the HOL-blocking trade this knob embodies).
+One-line default change; both sides of the protocol already negotiate k.
+Risk class yellow (protocol behavior change). Suggested gating: land after
+PRs 166/217 (they touch adjacent block-sync surfaces), and optionally a
+cohort-grade A/B once the (now-fixed) cohort lane is validated.
+
+## INCIDENT — cohort injection silently regressed; serves never carried EXP-002
+
+- Timeline: cohort peers captured into config.env 07-22 10:49 (6b28e1c32);
+  WIPED back to empty 07-22 13:31 by a55742b79 — a plan-regeneration
+  clobber in the very commit that announced the cohort protocol (the plan's
+  fenced config.env block still held the empty placeholder; regeneration is
+  byte-authoritative, so the stale plan silently undid the live config).
+- aa-cohort1-3 (17:34-18:56 that evening) still ran ON-cohort — the
+  launching shell carried COHORT_PEERS in its environment, masking the
+  wipe. From aa-cohort4 (21:29) onward every run — the whole EXP-002 sweep
+  and tonight's settle1/settle2/k8-c — silently fell back to public
+  bootstrap peers (verified in every collected node config: dev_network
+  None + public 7-peer bootstrap list).
+- Consequences for prior conclusions: the "cohort steady ~105 / cache
+  regime" narrative attributed serve-side thermal behavior to numbers that
+  were actually public-peer measurements from aa-cohort4 onward; the
+  0.00/7.60/0.00 A/A band samples (aa-cohort1-3) WERE genuine cohort runs.
+  NOISE_BAND_PCT=7.6 stays (it is the max of genuine samples). Tonight's
+  "cold plateau ~94" vs yesterday's "~105" is public-network / droplet
+  variance, not cohort cache state.
+- Fixes applied tonight (all committed): canonical plan config.env block
+  now carries the real peers (root cause); bench.sh start banner now
+  prints `substrate: COHORT (...)` or `substrate: PUBLIC bootstrap peers`
+  on every start so a silent fallback is impossible to miss; regenerated
+  config.env/bench.sh verified surgical.
+- The frozen serves have served exactly 3 runs (aa-cohort1-3) and idle
+  since, at ~$1/h standing. Kept per Adam's standing approval — but worth
+  a decision: validate the fixed cohort lane next session (one A/A pair)
+  or tear the serves down.
+
+## BATCH 3 (8 collects) — closed
+
+settle-fail(no-collect, not counted), aa5, aa6, exp002-base, exp002-k8,
+exp002-k32 [5 pre-carried], settle1 [6], settle2 [7], exp002-k8-c [8].
+Outcomes: EXP-002 confirmed WIN (above); settling protocol exercised; the
+download outage cost ~2h and produced B-16 v2. Batch spend ~$4 droplet-hours
++ ~$1 serve idle. Counter reset.
+
+## SESSION 3 — CLOSED (2026-07-23 ~06:40Z)
+
+- Delivered: EXP-002 WIN CONFIRMED + finalized proposal; snapshot-download
+  outage root-caused (CDN kills long 32G single streams; origin file
+  intact) and permanently fixed (B-16 v2 resumable fetch, offline-verified,
+  baked into provisioning); cohort-injection incident discovered,
+  root-caused to the commit level, fixed at the canonical-plan level, and
+  tripwired against recurrence.
+- perf-lab-s3 destroyed at close. Serves perf-lab-serve-a/b KEPT (standing
+  approval). Program spend to date ~$26.
+- Next session queue: validate cohort lane (one on-cohort A/A; expect the
+  substrate banner to say COHORT), optionally cohort-grade EXP-002
+  effect-size measurement, then B-04 (gh pr diff 390 collision-check
+  first), B-06 verifier batch sizes, B-07 rayon pool sizing.

@@ -1,33 +1,24 @@
 {
   "schema": 1,
   "session": 3,
-  "batch_runs_used": 5,
+  "session_status": "closed 2026-07-23T06:40Z",
+  "batch_runs_used": 0,
   "next_exp_id": 3,
   "droplets": {
     "perf-lab-serve-a": {
       "ip": "138.197.91.62",
       "created_at": "2026-07-22T07:55:00Z",
       "role": "cohort-serve",
-      "status": "frozen-serving"
+      "status": "frozen-serving; has carried only aa-cohort1-3 (injection incident, see ledger 2026-07-23)"
     },
     "perf-lab-serve-b": {
       "ip": "159.203.134.228",
       "created_at": "2026-07-22T06:56:00Z",
       "role": "cohort-serve",
-      "status": "frozen-serving"
-    },
-    "perf-lab-s3": {
-      "ip": "159.65.252.35",
-      "created_at": "2026-07-23T00:00:00Z",
-      "role": "bench"
+      "status": "frozen-serving; has carried only aa-cohort1-3 (injection incident, see ledger 2026-07-23)"
     }
   },
-  "in_flight": {
-    "settle1": {
-      "droplet": "perf-lab-s3",
-      "exp": "settling run + k=1 cadence baseline",
-      "started_at": "2026-07-23T00:02:00Z"
-    }
-  },
-  "noise_band_pct": 7.6
+  "in_flight": {},
+  "noise_band_pct": 7.6,
+  "next_session_first_step": "validate cohort lane: one A/A on-cohort; start banner must print 'substrate: COHORT (perf-lab-cohort-1)' and collected node config must show dev_network Some + 2 cohort bootstrap peers"
 }

@@ -1819,7 +1819,18 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
-    proptest!(ProptestConfig::with_cases(1),
+    // Keep this regression seed isolated because the default source-level
+    // persistence file is replayed by every property in this module.
+    let mut proptest_config = ProptestConfig::with_cases(1);
+    proptest_config.failure_persistence = Some(Box::new(
+        proptest::test_runner::FileFailurePersistence::Direct(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/proptest-regressions/service/finalized_state/tests/",
+            "vct_mode_switches_continue_from_safe_boundaries.txt",
+        )),
+    ));
+
+    proptest!(proptest_config,
         |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
             let blocks: Vec<_> = chain.iter().collect();
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;

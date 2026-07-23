@@ -1,0 +1,5 @@
+# Seeds for the VCT mode-switch property test.
+#
+# This file is intentionally test-specific because source-level proptest
+# regression files are replayed by every property in the source module.
+cc b55f47639c7edbc02f595c09d7b3a612e969826bf6dbe49ca725f2f50016e692 # no Sapling frontier change across the VCT absent band

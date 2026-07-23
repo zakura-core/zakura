@@ -626,7 +626,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-WORK-03"
 name = "Stale-anchor recovery"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::HeaderSyncReactor::observe_latest_committed_snapshot"
+tests = ["IN-07::stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or_score", "IN-07::serialized_apply_commits_before_receipt_and_reopens_exactly", "IN-05::stale_version_and_owner_fail_before_any_plan_effect", "PW-04::wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable", "PW-04::only_malformed_protocol_and_invalid_header_default_to_header_peer_fault"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-ERR-01"

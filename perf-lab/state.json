@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "session": 1,
+  "session": 3,
   "batch_runs_used": 5,
   "next_exp_id": 3,
   "droplets": {
@@ -15,8 +15,19 @@
       "created_at": "2026-07-22T06:56:00Z",
       "role": "cohort-serve",
       "status": "frozen-serving"
+    },
+    "perf-lab-s3": {
+      "ip": "159.65.252.35",
+      "created_at": "2026-07-23T00:00:00Z",
+      "role": "bench"
     }
   },
-  "in_flight": {},
+  "in_flight": {
+    "settle1": {
+      "droplet": "perf-lab-s3",
+      "exp": "settling run + k=1 cadence baseline",
+      "started_at": "2026-07-23T00:02:00Z"
+    }
+  },
   "noise_band_pct": 7.6
 }

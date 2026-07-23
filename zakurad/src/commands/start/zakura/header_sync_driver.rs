@@ -291,15 +291,18 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
             HeaderSyncAction::AcquireHeaderPath {
                 peer,
                 session_id,
+                scope,
                 request,
             } => {
                 let result =
-                    acquire_header_path(read_state.clone(), &peer, session_id, &request).await;
+                    acquire_header_path(read_state.clone(), &peer, session_id, scope, &request)
+                        .await;
                 let _ = handles
                     .header_sync
                     .send(HeaderSyncEvent::HeaderPathLeaseReady {
                         peer,
                         session_id,
+                        scope,
                         request,
                         result,
                     })
@@ -309,6 +312,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 peer,
                 session_id,
                 lease_id,
+                scope,
                 request_id,
                 target_tip_hash,
                 after_hash,
@@ -319,6 +323,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     &peer,
                     session_id,
                     lease_id,
+                    scope,
                     after_hash,
                     max_header_count,
                 )
@@ -328,6 +333,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     .send(HeaderSyncEvent::HeaderPathPageReady {
                         peer,
                         session_id,
+                        scope,
                         request_id,
                         target_tip_hash,
                         result,
@@ -338,8 +344,9 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 peer,
                 session_id,
                 lease_id,
+                scope,
             } => {
-                release_header_path(read_state.clone(), &peer, session_id, lease_id).await;
+                release_header_path(read_state.clone(), &peer, session_id, lease_id, scope).await;
             }
             HeaderSyncAction::PrepareHeaderTarget {
                 peer,
@@ -615,6 +622,7 @@ async fn acquire_header_path<ReadState>(
     read_state: ReadState,
     peer: &ZakuraPeerId,
     session_id: u64,
+    scope: zakura_header_chain::WorkScope,
     request: &zakura_network::zakura::GetHeaders,
 ) -> HeaderPathLeaseResult
 where
@@ -634,6 +642,7 @@ where
             peer: source,
             session_id,
             target_tip_hash: request.target_tip_hash,
+            scope,
             locator_hashes: request.locator_hashes.clone(),
         })
         .await
@@ -644,6 +653,7 @@ where
                     lease_id: lease.lease_id,
                     common_ancestor: lease.common_ancestor,
                     target: lease.target,
+                    scope: lease.scope,
                 })
             }
             zakura_state::RetainedPathLeaseOutcome::TargetNotRetained => {
@@ -679,6 +689,7 @@ async fn read_header_path<ReadState>(
     peer: &ZakuraPeerId,
     session_id: u64,
     lease_id: u64,
+    scope: zakura_header_chain::WorkScope,
     after_hash: block::Hash,
     max_header_count: u32,
 ) -> HeaderPathPageResult
@@ -699,6 +710,7 @@ where
             peer: source,
             session_id,
             lease_id,
+            scope,
             after_hash,
             max_count: max_header_count,
         })
@@ -706,10 +718,11 @@ where
     {
         Ok(zakura_state::ReadResponse::RetainedHeaderPathPage(
             zakura_state::RetainedPathReadOutcome::Page(page),
-        )) => HeaderPathPageResult::Page(HeaderPathPage {
+        )) => HeaderPathPageResult::Page(Box::new(HeaderPathPage {
             lease_id: page.lease_id,
             common_ancestor: page.common_ancestor,
             target: page.target,
+            scope: page.scope,
             entries: page
                 .nodes
                 .into_iter()
@@ -720,7 +733,7 @@ where
                 })
                 .collect(),
             complete: page.complete,
-        }),
+        })),
         Ok(zakura_state::ReadResponse::RetainedHeaderPathPage(
             zakura_state::RetainedPathReadOutcome::Unavailable,
         )) => HeaderPathPageResult::Unavailable,
@@ -744,6 +757,7 @@ async fn release_header_path<ReadState>(
     peer: &ZakuraPeerId,
     session_id: u64,
     lease_id: u64,
+    scope: zakura_header_chain::WorkScope,
 ) where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -761,6 +775,7 @@ async fn release_header_path<ReadState>(
             peer: source,
             session_id,
             lease_id,
+            scope,
         })
         .await
     {

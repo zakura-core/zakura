@@ -155,11 +155,13 @@ enum ServedPathState {
         session_id: u64,
         request_id: HeaderSyncRequestId,
         target_tip_hash: block::Hash,
+        scope: zakura_header_chain::WorkScope,
     },
     Active {
         session_id: u64,
         lease_id: u64,
         target: zakura_header_chain::Frontier,
+        scope: zakura_header_chain::WorkScope,
         next_after: zakura_header_chain::Frontier,
         pending_request: Option<(HeaderSyncRequestId, u32)>,
     },
@@ -305,18 +307,21 @@ impl HeaderSyncReactor {
             HeaderSyncEvent::HeaderPathLeaseReady {
                 peer,
                 session_id,
+                scope,
                 request,
                 result,
-            } => self.handle_header_path_lease_ready(peer, session_id, request, result),
+            } => self.handle_header_path_lease_ready(peer, session_id, scope, request, result),
             HeaderSyncEvent::HeaderPathPageReady {
                 peer,
                 session_id,
+                scope,
                 request_id,
                 target_tip_hash,
                 result,
             } => self.handle_header_path_page_ready(
                 peer,
                 session_id,
+                scope,
                 request_id,
                 target_tip_hash,
                 result,
@@ -542,6 +547,7 @@ impl HeaderSyncReactor {
                     session_id: owner_session,
                     lease_id,
                     target,
+                    scope,
                     next_after,
                     pending_request,
                     ..
@@ -572,6 +578,7 @@ impl HeaderSyncReactor {
                         peer: peer.clone(),
                         session_id,
                         lease_id: *lease_id,
+                        scope: *scope,
                         request_id,
                         target_tip_hash: request.target_tip_hash,
                         after_hash: next_after.hash,
@@ -585,17 +592,30 @@ impl HeaderSyncReactor {
             }
         }
 
+        let Some(local) = self.committed_snapshot.as_ref() else {
+            self.send_headers_outcome(
+                &peer,
+                request.request_id,
+                request.target_tip_hash,
+                HeadersOutcomeCode::Busy,
+            );
+            return;
+        };
+        let scope =
+            zakura_header_chain::WorkScope::for_header_target(local, request.target_tip_hash);
         self.served_paths.insert(
             peer.clone(),
             ServedPathState::Acquiring {
                 session_id,
                 request_id,
                 target_tip_hash: request.target_tip_hash,
+                scope,
             },
         );
         if !self.dispatch_action(HeaderSyncAction::AcquireHeaderPath {
             peer: peer.clone(),
             session_id,
+            scope,
             request: request.clone(),
         }) {
             self.served_paths.remove(&peer);
@@ -1136,6 +1156,7 @@ impl HeaderSyncReactor {
         &mut self,
         peer: ZakuraPeerId,
         session_id: u64,
+        scope: zakura_header_chain::WorkScope,
         request: GetHeaders,
         result: HeaderPathLeaseResult,
     ) {
@@ -1143,7 +1164,7 @@ impl HeaderSyncReactor {
             .expect("state echoes a request accepted by the bounded decoder");
         let Some(state) = self.served_paths.remove(&peer) else {
             if let HeaderPathLeaseResult::Acquired(lease) = result {
-                self.release_lease(peer, session_id, lease.lease_id);
+                self.release_lease(peer, session_id, lease.lease_id, lease.scope);
             }
             return;
         };
@@ -1151,17 +1172,19 @@ impl HeaderSyncReactor {
             session_id: expected_session,
             request_id: expected_request,
             target_tip_hash: expected_target,
+            scope: expected_scope,
         } = state
         else {
             self.served_paths.insert(peer.clone(), state);
             if let HeaderPathLeaseResult::Acquired(lease) = result {
-                self.release_lease(peer, session_id, lease.lease_id);
+                self.release_lease(peer, session_id, lease.lease_id, lease.scope);
             }
             return;
         };
         if expected_session != session_id
             || expected_request != request_id
             || expected_target != request.target_tip_hash
+            || expected_scope != scope
         {
             self.served_paths.insert(
                 peer.clone(),
@@ -1169,10 +1192,11 @@ impl HeaderSyncReactor {
                     session_id: expected_session,
                     request_id: expected_request,
                     target_tip_hash: expected_target,
+                    scope: expected_scope,
                 },
             );
             if let HeaderPathLeaseResult::Acquired(lease) = result {
-                self.release_lease(peer, session_id, lease.lease_id);
+                self.release_lease(peer, session_id, lease.lease_id, lease.scope);
             }
             return;
         }
@@ -1189,12 +1213,13 @@ impl HeaderSyncReactor {
             }
             HeaderPathLeaseResult::Acquired(lease)
                 if lease.target.hash == request.target_tip_hash
-                    && request.locator_hashes.contains(&lease.common_ancestor.hash) =>
+                    && request.locator_hashes.contains(&lease.common_ancestor.hash)
+                    && lease.scope == scope =>
             {
                 lease
             }
             HeaderPathLeaseResult::Acquired(lease) => {
-                self.release_lease(peer, session_id, lease.lease_id);
+                self.release_lease(peer, session_id, lease.lease_id, lease.scope);
                 return;
             }
         };
@@ -1205,6 +1230,7 @@ impl HeaderSyncReactor {
                 session_id,
                 lease_id: lease.lease_id,
                 target: lease.target,
+                scope: lease.scope,
                 next_after: lease.common_ancestor,
                 pending_request: Some((request_id, max_header_count)),
             },
@@ -1213,6 +1239,7 @@ impl HeaderSyncReactor {
             peer: peer.clone(),
             session_id,
             lease_id: lease.lease_id,
+            scope: lease.scope,
             request_id,
             target_tip_hash: lease.target.hash,
             after_hash: lease.common_ancestor.hash,
@@ -1226,6 +1253,7 @@ impl HeaderSyncReactor {
         &mut self,
         peer: ZakuraPeerId,
         session_id: u64,
+        scope: zakura_header_chain::WorkScope,
         request_id: HeaderSyncRequestId,
         target_tip_hash: block::Hash,
         result: HeaderPathPageResult,
@@ -1237,6 +1265,7 @@ impl HeaderSyncReactor {
             session_id: expected_session,
             lease_id,
             target,
+            scope: expected_scope,
             next_after,
             pending_request,
         } = state
@@ -1245,6 +1274,7 @@ impl HeaderSyncReactor {
             return;
         };
         if expected_session != session_id
+            || expected_scope != scope
             || target.hash != target_tip_hash
             || pending_request.is_none_or(|(pending_id, _)| pending_id != request_id)
         {
@@ -1254,6 +1284,7 @@ impl HeaderSyncReactor {
                     session_id: expected_session,
                     lease_id,
                     target,
+                    scope: expected_scope,
                     next_after,
                     pending_request,
                 },
@@ -1267,17 +1298,18 @@ impl HeaderSyncReactor {
                 target_tip_hash,
                 HeadersOutcomeCode::Busy,
             );
-            self.release_lease(peer, session_id, lease_id);
+            self.release_lease(peer, session_id, lease_id, expected_scope);
             return;
         };
         if page.lease_id != lease_id
             || page.target != target
+            || page.scope != expected_scope
             || page.common_ancestor != next_after
             || pending_request.is_some_and(|(_, max_count)| {
                 page.entries.len() > usize::try_from(max_count).unwrap_or(usize::MAX)
             })
         {
-            self.release_lease(peer, session_id, lease_id);
+            self.release_lease(peer, session_id, lease_id, expected_scope);
             return;
         }
 
@@ -1290,7 +1322,7 @@ impl HeaderSyncReactor {
                 .map(block::Height)
                 .filter(|height| *height <= block::Height::MAX)
             else {
-                self.release_lease(peer, session_id, lease_id);
+                self.release_lease(peer, session_id, lease_id, expected_scope);
                 return;
             };
             zakura_header_chain::Frontier::new(height, last.header.hash())
@@ -1314,7 +1346,7 @@ impl HeaderSyncReactor {
             .transpose()
             .is_ok_and(|result| result.is_some());
         if complete || !sent {
-            self.release_lease(peer, session_id, lease_id);
+            self.release_lease(peer, session_id, lease_id, expected_scope);
         } else {
             self.served_paths.insert(
                 peer,
@@ -1322,6 +1354,7 @@ impl HeaderSyncReactor {
                     session_id,
                     lease_id,
                     target,
+                    scope: expected_scope,
                     next_after,
                     pending_request: None,
                 },
@@ -1672,6 +1705,34 @@ impl HeaderSyncReactor {
     }
 
     fn retire_obsolete_work(&mut self, snapshot: &zakura_header_chain::EngineSnapshot) {
+        let obsolete_served_paths: Vec<_> = self
+            .served_paths
+            .iter()
+            .filter_map(|(peer, state)| {
+                let (target_tip_hash, scope) = match state {
+                    ServedPathState::Acquiring {
+                        target_tip_hash,
+                        scope,
+                        ..
+                    } => (*target_tip_hash, *scope),
+                    ServedPathState::Active { target, scope, .. } => (target.hash, *scope),
+                };
+                (scope
+                    != zakura_header_chain::WorkScope::for_header_target(snapshot, target_tip_hash))
+                .then(|| peer.clone())
+            })
+            .collect();
+        for peer in obsolete_served_paths {
+            match self.served_paths.remove(&peer) {
+                Some(ServedPathState::Active {
+                    session_id,
+                    lease_id,
+                    scope,
+                    ..
+                }) => self.release_lease(peer, session_id, lease_id, scope),
+                Some(ServedPathState::Acquiring { .. }) | None => {}
+            }
+        }
         self.body_retries
             .retain_current(snapshot.header_generation, snapshot.frontiers.finalized);
         for task in self.vct_repairs.retain_current(snapshot) {
@@ -1806,19 +1867,27 @@ impl HeaderSyncReactor {
         let Some(ServedPathState::Active {
             session_id,
             lease_id,
+            scope,
             ..
         }) = self.served_paths.remove(peer)
         else {
             return;
         };
-        self.release_lease(peer.clone(), session_id, lease_id);
+        self.release_lease(peer.clone(), session_id, lease_id, scope);
     }
 
-    fn release_lease(&self, peer: ZakuraPeerId, session_id: u64, lease_id: u64) {
+    fn release_lease(
+        &self,
+        peer: ZakuraPeerId,
+        session_id: u64,
+        lease_id: u64,
+        scope: zakura_header_chain::WorkScope,
+    ) {
         let _ = self.dispatch_action(HeaderSyncAction::ReleaseHeaderPath {
             peer,
             session_id,
             lease_id,
+            scope,
         });
     }
 
@@ -3604,8 +3673,12 @@ mod tests {
     #[tokio::test]
     async fn retained_path_pages_keep_one_target_and_release_after_completion() {
         let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown.clone());
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let (_snapshots_tx, snapshots_rx) = watch::channel(Some(committed_snapshot(anchor)));
+        startup.committed_snapshots = Some(snapshots_rx);
         let (handle, mut actions, task) =
-            spawn_header_sync_reactor(startup(shutdown.clone())).expect("the fixture starts");
+            spawn_header_sync_reactor(startup).expect("the fixture starts");
         assert!(matches!(
             next_action(&mut actions).await,
             HeaderSyncAction::QueryMissingBlockBodies { .. }
@@ -3618,6 +3691,7 @@ mod tests {
             ))
             .await
             .expect("the reactor remains available");
+        let _initial_status = outbound.recv().await.expect("initial status is sent");
 
         let mut first_header = *regtest_genesis_block().header;
         let common =
@@ -3639,21 +3713,27 @@ mod tests {
             })
             .await
             .expect("the request reaches the reactor");
-        assert!(matches!(
-            next_action(&mut actions).await,
-            HeaderSyncAction::AcquireHeaderPath { ref request, .. } if request == &first_request
-        ));
+        let scope = match next_action(&mut actions).await {
+            HeaderSyncAction::AcquireHeaderPath {
+                request: actual,
+                scope,
+                ..
+            } if actual == first_request => scope,
+            other => panic!("expected retained-path acquisition, got {other:?}"),
+        };
 
         let stale_request = request(99, target.hash, common.hash);
         handle
             .send(HeaderSyncEvent::HeaderPathLeaseReady {
                 peer: peer.clone(),
                 session_id: 0,
+                scope,
                 request: stale_request,
                 result: HeaderPathLeaseResult::Acquired(HeaderPathLease {
                     lease_id: 99,
                     common_ancestor: common,
                     target,
+                    scope,
                 }),
             })
             .await
@@ -3667,11 +3747,13 @@ mod tests {
             .send(HeaderSyncEvent::HeaderPathLeaseReady {
                 peer: peer.clone(),
                 session_id: 0,
+                scope,
                 request: first_request,
                 result: HeaderPathLeaseResult::Acquired(HeaderPathLease {
                     lease_id: 9,
                     common_ancestor: common,
                     target,
+                    scope,
                 }),
             })
             .await
@@ -3691,6 +3773,7 @@ mod tests {
             .send(HeaderSyncEvent::HeaderPathPageReady {
                 peer: peer.clone(),
                 session_id: 0,
+                scope,
                 request_id: HeaderSyncRequestId::new(99).expect("99 is nonzero"),
                 target_tip_hash: target.hash,
                 result: HeaderPathPageResult::Unavailable,
@@ -3702,19 +3785,21 @@ mod tests {
             .send(HeaderSyncEvent::HeaderPathPageReady {
                 peer: peer.clone(),
                 session_id: 0,
+                scope,
                 request_id: HeaderSyncRequestId::new(1).expect("one is nonzero"),
                 target_tip_hash: target.hash,
-                result: HeaderPathPageResult::Page(HeaderPathPage {
+                result: HeaderPathPageResult::Page(Box::new(HeaderPathPage {
                     lease_id: 9,
                     common_ancestor: common,
                     target,
+                    scope,
                     entries: vec![HeaderEntry {
                         header: first_header,
                         body_size: 0,
                         tree_aux: None,
                     }],
                     complete: false,
-                }),
+                })),
             })
             .await
             .expect("the first page reaches the reactor");
@@ -3765,19 +3850,21 @@ mod tests {
             .send(HeaderSyncEvent::HeaderPathPageReady {
                 peer: peer.clone(),
                 session_id: 0,
+                scope,
                 request_id: HeaderSyncRequestId::new(2).expect("two is nonzero"),
                 target_tip_hash: target.hash,
-                result: HeaderPathPageResult::Page(HeaderPathPage {
+                result: HeaderPathPageResult::Page(Box::new(HeaderPathPage {
                     lease_id: 9,
                     common_ancestor: continuation_ancestor,
                     target,
+                    scope,
                     entries: vec![HeaderEntry {
                         header: second_header,
                         body_size: 0,
                         tree_aux: None,
                     }],
                     complete: true,
-                }),
+                })),
             })
             .await
             .expect("the completion reaches the reactor");
@@ -3812,10 +3899,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_change_retires_served_path_before_late_page_completion() {
+        let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown.clone());
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let initial = committed_snapshot(anchor);
+        let (snapshots_tx, snapshots_rx) = watch::channel(Some(initial.clone()));
+        startup.committed_snapshots = Some(snapshots_rx);
+        let (handle, mut actions, task) =
+            spawn_header_sync_reactor(startup).expect("the serving fixture starts");
+        assert!(matches!(
+            next_action(&mut actions).await,
+            HeaderSyncAction::QueryMissingBlockBodies { .. }
+        ));
+
+        let (send, mut outbound) = framed_channel(8);
+        let peer = peer();
+        handle
+            .send(HeaderSyncEvent::PeerConnected(
+                HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
+            ))
+            .await
+            .expect("the peer connects");
+        let _initial_status = outbound.recv().await.expect("initial status is sent");
+
+        let target = zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x61; 32]));
+        let request = request(1, target.hash, anchor.hash);
+        handle
+            .send(HeaderSyncEvent::SessionWireMessage {
+                peer: peer.clone(),
+                session_id: 0,
+                msg: HeaderSyncMessage::GetHeaders(request.clone()),
+            })
+            .await
+            .expect("the request reaches the reactor");
+        let scope = match next_action(&mut actions).await {
+            HeaderSyncAction::AcquireHeaderPath {
+                request: actual,
+                scope,
+                ..
+            } if actual == request => scope,
+            other => panic!("expected retained-path acquisition, got {other:?}"),
+        };
+        handle
+            .send(HeaderSyncEvent::HeaderPathLeaseReady {
+                peer: peer.clone(),
+                session_id: 0,
+                scope,
+                request,
+                result: HeaderPathLeaseResult::Acquired(HeaderPathLease {
+                    lease_id: 17,
+                    common_ancestor: anchor,
+                    target,
+                    scope,
+                }),
+            })
+            .await
+            .expect("the lease reaches the reactor");
+        assert!(matches!(
+            next_action(&mut actions).await,
+            HeaderSyncAction::ReadHeaderPath {
+                lease_id: 17,
+                scope: action_scope,
+                ..
+            } if action_scope == scope
+        ));
+
+        let mut advanced = initial;
+        advanced.state_version = advanced
+            .state_version
+            .checked_next()
+            .expect("the fixture state version has a successor");
+        advanced.header_generation = advanced
+            .header_generation
+            .checked_next()
+            .expect("the fixture header generation has a successor");
+        snapshots_tx
+            .send(Some(advanced))
+            .expect("the snapshot receiver remains live");
+        assert!(matches!(
+            next_action(&mut actions).await,
+            HeaderSyncAction::ReleaseHeaderPath {
+                lease_id: 17,
+                scope: action_scope,
+                ..
+            } if action_scope == scope
+        ));
+
+        handle
+            .send(HeaderSyncEvent::HeaderPathPageReady {
+                peer,
+                session_id: 0,
+                scope,
+                request_id: HeaderSyncRequestId::new(1).expect("one is nonzero"),
+                target_tip_hash: target.hash,
+                result: HeaderPathPageResult::Page(Box::new(HeaderPathPage {
+                    lease_id: 17,
+                    common_ancestor: anchor,
+                    target,
+                    scope,
+                    entries: Vec::new(),
+                    complete: true,
+                })),
+            })
+            .await
+            .expect("the late page reaches the reactor");
+        assert!(
+            time::timeout(std::time::Duration::from_millis(20), outbound.recv())
+                .await
+                .is_err(),
+            "a retired page cannot produce a wire response"
+        );
+        assert!(
+            time::timeout(std::time::Duration::from_millis(20), actions.recv())
+                .await
+                .is_err(),
+            "a retired page has no release, punishment, or follow-on action"
+        );
+
+        shutdown.cancel();
+        task.await.expect("the reactor exits cleanly");
+    }
+
+    #[tokio::test]
     async fn every_unservable_path_result_is_a_correlated_explicit_outcome() {
         let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown.clone());
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let (_snapshots_tx, snapshots_rx) = watch::channel(Some(committed_snapshot(anchor)));
+        startup.committed_snapshots = Some(snapshots_rx);
         let (handle, mut actions, task) =
-            spawn_header_sync_reactor(startup(shutdown.clone())).expect("the fixture starts");
+            spawn_header_sync_reactor(startup).expect("the fixture starts");
         assert!(matches!(
             next_action(&mut actions).await,
             HeaderSyncAction::QueryMissingBlockBodies { .. }
@@ -3828,6 +4042,7 @@ mod tests {
             ))
             .await
             .expect("the reactor remains available");
+        let _initial_status = outbound.recv().await.expect("initial status is sent");
 
         for (offset, outcome) in [
             HeadersOutcomeCode::TargetNotRetained,
@@ -3849,15 +4064,19 @@ mod tests {
                 })
                 .await
                 .expect("the request reaches the reactor");
-            assert!(matches!(
-                next_action(&mut actions).await,
-                HeaderSyncAction::AcquireHeaderPath { request: ref actual, .. }
-                    if actual == &request
-            ));
+            let scope = match next_action(&mut actions).await {
+                HeaderSyncAction::AcquireHeaderPath {
+                    request: actual,
+                    scope,
+                    ..
+                } if actual == request => scope,
+                other => panic!("expected retained-path acquisition, got {other:?}"),
+            };
             handle
                 .send(HeaderSyncEvent::HeaderPathLeaseReady {
                     peer: peer.clone(),
                     session_id: 0,
+                    scope,
                     request,
                     result: HeaderPathLeaseResult::Outcome(outcome),
                 })

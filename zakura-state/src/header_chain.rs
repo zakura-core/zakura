@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tokio::time::Instant;
 use zakura_chain::block;
-use zakura_header_chain::{AuxDelivery, Frontier, HeaderGeneration, HeaderNode, SourceId};
+use zakura_header_chain::{AuxDelivery, Frontier, HeaderNode, SourceId, WorkScope};
 
 pub use zakura_header_chain::{
     AlarmSet as HeaderChainAlarmSet, BodyUnavailableSummary as HeaderChainBodyUnavailableSummary,
@@ -33,8 +33,8 @@ pub struct RetainedPathLease {
     pub common_ancestor: Frontier,
     /// Immutable hashes strictly after the ancestor through the target.
     pub path: Arc<[block::Hash]>,
-    /// Header generation observed while the snapshot was acquired.
-    pub generation: HeaderGeneration,
+    /// Exact generation and branch observed while the snapshot was acquired.
+    pub scope: WorkScope,
     /// Bounded inactivity deadline.
     pub idle_deadline: Instant,
 }
@@ -43,7 +43,7 @@ pub struct RetainedPathLease {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RetainedPathLeaseOutcome {
     /// The exact snapshot was acquired.
-    Acquired(RetainedPathLease),
+    Acquired(Box<RetainedPathLease>),
     /// The target was absent when state took the coherent snapshot.
     TargetNotRetained,
     /// No locator hash lies on the exact target path.
@@ -63,6 +63,8 @@ pub struct RetainedPathPage {
     pub common_ancestor: Frontier,
     /// Exact target fixed when the lease was acquired.
     pub target: Frontier,
+    /// Exact generation and branch fixed by the lease.
+    pub scope: WorkScope,
     /// Hash-keyed nodes in path order.
     pub nodes: Vec<HeaderNode>,
     /// Hash-keyed auxiliary deliveries parallel to `nodes`.
@@ -75,7 +77,7 @@ pub struct RetainedPathPage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RetainedPathReadOutcome {
     /// A bounded page was read and the lease deadline renewed.
-    Page(RetainedPathPage),
+    Page(Box<RetainedPathPage>),
     /// The lease is absent, expired, or no longer owned by this session.
     Unavailable,
 }

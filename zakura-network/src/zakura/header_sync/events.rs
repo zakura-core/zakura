@@ -204,6 +204,8 @@ pub enum HeaderSyncEvent {
         peer: ZakuraPeerId,
         /// Ordered-stream generation that owns the request.
         session_id: u64,
+        /// Exact generation and branch that owns the request.
+        scope: zakura_header_chain::WorkScope,
         /// Exact request whose state read completed.
         request: GetHeaders,
         /// Acquired lease or explicit wire outcome.
@@ -215,6 +217,8 @@ pub enum HeaderSyncEvent {
         peer: ZakuraPeerId,
         /// Ordered-stream generation that owns the lease.
         session_id: u64,
+        /// Exact generation and branch fixed by the lease.
+        scope: zakura_header_chain::WorkScope,
         /// Exact request correlation identifier.
         request_id: HeaderSyncRequestId,
         /// Exact snapshot-bound target.
@@ -316,13 +320,15 @@ pub struct HeaderPathLease {
     pub common_ancestor: zakura_header_chain::Frontier,
     /// Exact retained target fixed by the lease.
     pub target: zakura_header_chain::Frontier,
+    /// Exact generation and branch fixed by the lease.
+    pub scope: zakura_header_chain::WorkScope,
 }
 
 /// Network-facing state result for one retained target page.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeaderPathPageResult {
     /// One fully assembled hash-keyed page.
-    Page(HeaderPathPage),
+    Page(Box<HeaderPathPage>),
     /// The lease expired or became unavailable before the read.
     Unavailable,
 }
@@ -336,6 +342,8 @@ pub struct HeaderPathPage {
     pub common_ancestor: zakura_header_chain::Frontier,
     /// Exact retained target fixed by the lease.
     pub target: zakura_header_chain::Frontier,
+    /// Exact generation and branch fixed by the lease.
+    pub scope: zakura_header_chain::WorkScope,
     /// Canonical headers and parallel advisory metadata.
     pub entries: Vec<HeaderEntry>,
     /// Whether this page reaches the immutable target.
@@ -395,6 +403,8 @@ pub enum HeaderSyncAction {
         peer: ZakuraPeerId,
         /// Ordered-stream generation that owns the request.
         session_id: u64,
+        /// Exact generation and branch that owns the request.
+        scope: zakura_header_chain::WorkScope,
         /// Exact request to snapshot in state.
         request: GetHeaders,
     },
@@ -406,6 +416,8 @@ pub enum HeaderSyncAction {
         session_id: u64,
         /// State-issued lease identity.
         lease_id: u64,
+        /// Exact generation and branch fixed by the lease.
+        scope: zakura_header_chain::WorkScope,
         /// Exact wire request identifier.
         request_id: HeaderSyncRequestId,
         /// Exact snapshot-bound target.
@@ -423,6 +435,8 @@ pub enum HeaderSyncAction {
         session_id: u64,
         /// State-issued lease identity.
         lease_id: u64,
+        /// Exact generation and branch fixed by the lease.
+        scope: zakura_header_chain::WorkScope,
     },
     /// Validate all staged pages and submit exactly one complete-target insertion.
     PrepareHeaderTarget {

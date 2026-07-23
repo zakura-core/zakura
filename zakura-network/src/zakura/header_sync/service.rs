@@ -355,12 +355,14 @@ pub(crate) async fn drive_header_sync_actions(
             HeaderSyncAction::AcquireHeaderPath {
                 peer,
                 session_id,
+                scope,
                 request,
             } => {
                 let _ = handle
                     .send(HeaderSyncEvent::HeaderPathLeaseReady {
                         peer,
                         session_id,
+                        scope,
                         request,
                         result: HeaderPathLeaseResult::Outcome(
                             HeadersOutcomeCode::TargetNotRetained,

@@ -2063,6 +2063,7 @@ impl Service<ReadRequest> for ReadStateService {
                 peer,
                 session_id,
                 target_tip_hash,
+                scope,
                 locator_hashes,
             } => {
                 let Some(reader) = state.header_chain_reader_receiver.borrow().clone() else {
@@ -2076,6 +2077,7 @@ impl Service<ReadRequest> for ReadStateService {
                         session_id,
                         target_tip_hash,
                         &locator_hashes,
+                        scope,
                     )?,
                 ))
             }
@@ -2084,6 +2086,7 @@ impl Service<ReadRequest> for ReadStateService {
                 peer,
                 session_id,
                 lease_id,
+                scope,
                 after_hash,
                 max_count,
             } => {
@@ -2093,7 +2096,9 @@ impl Service<ReadRequest> for ReadStateService {
                     ));
                 };
                 Ok(ReadResponse::RetainedHeaderPathPage(
-                    reader.read_retained_path(peer, session_id, lease_id, after_hash, max_count)?,
+                    reader.read_retained_path(
+                        peer, session_id, lease_id, scope, after_hash, max_count,
+                    )?,
                 ))
             }
 
@@ -2101,12 +2106,13 @@ impl Service<ReadRequest> for ReadStateService {
                 peer,
                 session_id,
                 lease_id,
+                scope,
             } => {
                 let released = state
                     .header_chain_reader_receiver
                     .borrow()
                     .clone()
-                    .map(|reader| reader.release_retained_path(peer, session_id, lease_id))
+                    .map(|reader| reader.release_retained_path(peer, session_id, lease_id, scope))
                     .transpose()?
                     .unwrap_or(false);
                 Ok(ReadResponse::RetainedHeaderPathReleased(released))

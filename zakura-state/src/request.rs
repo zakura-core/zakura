@@ -1485,6 +1485,8 @@ pub enum ReadRequest {
         session_id: u64,
         /// Exact target named by the peer's status.
         target_tip_hash: block::Hash,
+        /// Exact generation and branch captured before the state read.
+        scope: zakura_header_chain::WorkScope,
         /// Locator hashes in requester order.
         locator_hashes: Vec<block::Hash>,
     },
@@ -1497,6 +1499,8 @@ pub enum ReadRequest {
         session_id: u64,
         /// Exact state-issued lease identity.
         lease_id: u64,
+        /// Exact generation and branch fixed by the lease.
+        scope: zakura_header_chain::WorkScope,
         /// Common ancestor or prior page tip.
         after_hash: block::Hash,
         /// Maximum nodes returned.
@@ -1511,6 +1515,8 @@ pub enum ReadRequest {
         session_id: u64,
         /// Exact state-issued lease identity.
         lease_id: u64,
+        /// Exact generation and branch fixed by the lease.
+        scope: zakura_header_chain::WorkScope,
     },
 
     /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)

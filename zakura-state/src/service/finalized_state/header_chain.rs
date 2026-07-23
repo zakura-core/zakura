@@ -298,7 +298,7 @@ impl RetainedPathLeaseRegistry {
         session_id: u64,
         frontiers: (Frontier, Frontier),
         path: Arc<[block::Hash]>,
-        generation: zakura_header_chain::HeaderGeneration,
+        scope: zakura_header_chain::WorkScope,
         now: Instant,
     ) -> RetainedPathLeaseOutcome {
         self.expire(now);
@@ -324,11 +324,11 @@ impl RetainedPathLeaseRegistry {
             target: frontiers.0,
             common_ancestor: frontiers.1,
             path,
-            generation,
+            scope,
             idle_deadline: now + RETAINED_PATH_LEASE_IDLE,
         };
         self.by_peer.insert(peer, lease.clone());
-        RetainedPathLeaseOutcome::Acquired(lease)
+        RetainedPathLeaseOutcome::Acquired(Box::new(lease))
     }
 
     fn get(
@@ -357,11 +357,16 @@ impl RetainedPathLeaseRegistry {
         true
     }
 
-    fn release(&mut self, peer: SourceId, session_id: u64, lease_id: u64) -> bool {
-        let matches = self
-            .by_peer
-            .get(&peer)
-            .is_some_and(|lease| lease.session_id == session_id && lease.lease_id == lease_id);
+    fn release(
+        &mut self,
+        peer: SourceId,
+        session_id: u64,
+        lease_id: u64,
+        scope: zakura_header_chain::WorkScope,
+    ) -> bool {
+        let matches = self.by_peer.get(&peer).is_some_and(|lease| {
+            lease.session_id == session_id && lease.lease_id == lease_id && lease.scope == scope
+        });
         if matches {
             self.by_peer.remove(&peer);
         }
@@ -669,6 +674,7 @@ impl HeaderChainReader {
         session_id: u64,
         target_tip_hash: block::Hash,
         locator_hashes: &[block::Hash],
+        scope: zakura_header_chain::WorkScope,
     ) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
         if locator_hashes.is_empty()
             || locator_hashes.len() > zakura_header_chain::MAX_HEADER_LOCATOR_HASHES
@@ -683,6 +689,9 @@ impl HeaderChainReader {
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
         let snapshot = self.store.snapshot()?;
+        if scope != zakura_header_chain::WorkScope::for_header_target(&snapshot, target_tip_hash) {
+            return Ok(RetainedPathLeaseOutcome::Busy);
+        }
         let Some(target_node) = self.store.node(target_tip_hash)? else {
             return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
         };
@@ -727,7 +736,7 @@ impl HeaderChainReader {
             session_id,
             (target, common_ancestor),
             path,
-            snapshot.header_generation,
+            scope,
             Instant::now(),
         ))
     }
@@ -737,6 +746,7 @@ impl HeaderChainReader {
         peer: SourceId,
         session_id: u64,
         lease_id: u64,
+        scope: zakura_header_chain::WorkScope,
         after_hash: block::Hash,
         max_count: u32,
     ) -> Result<RetainedPathReadOutcome, HeaderChainStoreError> {
@@ -758,6 +768,9 @@ impl HeaderChainReader {
         let Some(lease) = lease else {
             return Ok(RetainedPathReadOutcome::Unavailable);
         };
+        if lease.scope != scope {
+            return Ok(RetainedPathReadOutcome::Unavailable);
+        }
         let (start, page_ancestor) = if after_hash == lease.common_ancestor.hash {
             (0, lease.common_ancestor)
         } else {
@@ -785,14 +798,15 @@ impl HeaderChainReader {
         }
         let renewed = leases.renew(peer, session_id, lease_id, Instant::now());
         debug_assert!(renewed, "the lease registry is locked across the page read");
-        Ok(RetainedPathReadOutcome::Page(RetainedPathPage {
+        Ok(RetainedPathReadOutcome::Page(Box::new(RetainedPathPage {
             lease_id,
             common_ancestor: page_ancestor,
             target: lease.target,
+            scope: lease.scope,
             nodes,
             aux_deliveries,
             complete: end == lease.path.len(),
-        }))
+        })))
     }
 
     pub(crate) fn release_retained_path(
@@ -800,12 +814,13 @@ impl HeaderChainReader {
         peer: SourceId,
         session_id: u64,
         lease_id: u64,
+        scope: zakura_header_chain::WorkScope,
     ) -> Result<bool, HeaderChainStoreError> {
         Ok(self
             .leases
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .release(peer, session_id, lease_id))
+            .release(peer, session_id, lease_id, scope))
     }
 }
 
@@ -2792,8 +2807,12 @@ mod tests {
         ));
 
         let owner = SourceId::from_digest([1; 32]);
+        let lease_scope = zakura_header_chain::WorkScope::for_header_target(
+            &runtime.publisher().snapshot(),
+            grandchild.hash,
+        );
         let acquired = reader
-            .acquire_retained_path(owner, 7, grandchild.hash, &[anchor.hash])
+            .acquire_retained_path(owner, 7, grandchild.hash, &[anchor.hash], lease_scope)
             .expect("the coherent target path is readable");
         let RetainedPathLeaseOutcome::Acquired(lease) = acquired else {
             panic!("the exact retained target should acquire a lease");
@@ -2804,24 +2823,47 @@ mod tests {
         );
         assert_eq!(lease.common_ancestor, anchor_frontier);
         assert_eq!(lease.path.as_ref(), &[child.hash, grandchild.hash]);
+        assert_eq!(lease.scope, lease_scope);
+        let mut wrong_scope = lease_scope;
+        wrong_scope.header_generation = wrong_scope
+            .header_generation
+            .checked_next()
+            .expect("the fixture generation has a successor");
         assert_eq!(
-            lease.generation,
-            runtime.publisher().snapshot().header_generation
+            reader
+                .acquire_retained_path(
+                    SourceId::from_digest([0xee; 32]),
+                    7,
+                    grandchild.hash,
+                    &[anchor.hash],
+                    wrong_scope,
+                )
+                .expect("a stale acquisition scope is a normal refusal"),
+            RetainedPathLeaseOutcome::Busy
         );
         assert_eq!(
             reader
-                .acquire_retained_path(owner, 7, grandchild.hash, &[anchor.hash])
+                .acquire_retained_path(owner, 7, grandchild.hash, &[anchor.hash], lease_scope,)
                 .expect("the lease bound is a normal outcome"),
             RetainedPathLeaseOutcome::Busy
         );
         assert_eq!(
             reader
-                .read_retained_path(owner, 8, lease.lease_id, anchor.hash, 1)
+                .read_retained_path(owner, 8, lease.lease_id, lease_scope, anchor.hash, 1)
                 .expect("a mismatched session is non-fatal"),
             RetainedPathReadOutcome::Unavailable
         );
+        assert_eq!(
+            reader
+                .read_retained_path(owner, 7, lease.lease_id, wrong_scope, anchor.hash, 1)
+                .expect("a mismatched branch scope is non-fatal"),
+            RetainedPathReadOutcome::Unavailable
+        );
+        assert!(!reader
+            .release_retained_path(owner, 7, lease.lease_id, wrong_scope)
+            .expect("a mismatched release scope is non-fatal"));
         let RetainedPathReadOutcome::Page(page) = reader
-            .read_retained_path(owner, 7, lease.lease_id, anchor.hash, 1)
+            .read_retained_path(owner, 7, lease.lease_id, lease_scope, anchor.hash, 1)
             .expect("the lease page is readable")
         else {
             panic!("the current owner should read its lease");
@@ -2829,10 +2871,11 @@ mod tests {
         assert_eq!(page.nodes.len(), 1);
         assert_eq!(page.nodes[0].hash, child.hash);
         assert_eq!(page.common_ancestor, anchor_frontier);
+        assert_eq!(page.scope, lease_scope);
         assert_eq!(page.aux_deliveries, vec![vec![delivery]]);
         assert!(!page.complete);
         let RetainedPathReadOutcome::Page(continuation) = reader
-            .read_retained_path(owner, 7, lease.lease_id, child.hash, 1)
+            .read_retained_path(owner, 7, lease.lease_id, lease_scope, child.hash, 1)
             .expect("the continuation page is readable")
         else {
             panic!("the current owner should read its continuation");
@@ -2871,7 +2914,7 @@ mod tests {
             anchor_frontier
         );
         let RetainedPathReadOutcome::Page(page_after_reselection) = reader
-            .read_retained_path(owner, 7, lease.lease_id, anchor.hash, 1)
+            .read_retained_path(owner, 7, lease.lease_id, lease_scope, anchor.hash, 1)
             .expect("the immutable lease survives reselection")
         else {
             panic!("the lease remains available after reselection");
@@ -2885,6 +2928,10 @@ mod tests {
                     7,
                     block::Hash([0xfe; 32]),
                     &[anchor.hash],
+                    zakura_header_chain::WorkScope::for_header_target(
+                        &runtime.publisher().snapshot(),
+                        block::Hash([0xfe; 32]),
+                    ),
                 )
                 .expect("an absent target is a normal outcome"),
             RetainedPathLeaseOutcome::TargetNotRetained
@@ -2896,6 +2943,10 @@ mod tests {
                     7,
                     child.hash,
                     &[block::Hash([0xfd; 32])],
+                    zakura_header_chain::WorkScope::for_header_target(
+                        &runtime.publisher().snapshot(),
+                        child.hash,
+                    ),
                 )
                 .expect("a disjoint locator is a normal outcome"),
             RetainedPathLeaseOutcome::NoLocatorIntersection
@@ -2906,6 +2957,10 @@ mod tests {
                 7,
                 child.hash,
                 &[child.hash, anchor.hash],
+                zakura_header_chain::WorkScope::for_header_target(
+                    &runtime.publisher().snapshot(),
+                    child.hash,
+                ),
             )
             .expect("the first requester-order intersection is selected")
         else {
@@ -2918,11 +2973,12 @@ mod tests {
                 SourceId::from_digest([2; 32]),
                 7,
                 target_intersection.lease_id,
+                target_intersection.scope,
             )
             .expect("the requester-order test lease releases"));
 
         assert!(reader
-            .release_retained_path(owner, 7, lease.lease_id)
+            .release_retained_path(owner, 7, lease.lease_id, lease_scope)
             .expect("the exact owner can release its lease"));
         for marker in 1..=MAX_RETAINED_PATH_LEASES {
             let marker = u8::try_from(marker).expect("the lease cap fits in one byte");
@@ -2933,6 +2989,10 @@ mod tests {
                         9,
                         child.hash,
                         &[anchor.hash],
+                        zakura_header_chain::WorkScope::for_header_target(
+                            &runtime.publisher().snapshot(),
+                            child.hash,
+                        ),
                     )
                     .expect("bounded acquisition returns an outcome"),
                 RetainedPathLeaseOutcome::Acquired(_)
@@ -2945,6 +3005,10 @@ mod tests {
                     9,
                     child.hash,
                     &[anchor.hash],
+                    zakura_header_chain::WorkScope::for_header_target(
+                        &runtime.publisher().snapshot(),
+                        child.hash,
+                    ),
                 )
                 .expect("capacity refusal is a normal outcome"),
             RetainedPathLeaseOutcome::Busy
@@ -2971,6 +3035,10 @@ mod tests {
                     10,
                     child.hash,
                     &[anchor.hash],
+                    zakura_header_chain::WorkScope::for_header_target(
+                        &runtime.publisher().snapshot(),
+                        child.hash,
+                    ),
                 )
                 .expect("expired slots are reclaimed"),
             RetainedPathLeaseOutcome::Acquired(_)

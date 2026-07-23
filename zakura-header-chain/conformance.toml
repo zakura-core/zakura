@@ -538,7 +538,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-BODY-01"
 name = "Body-payload mismatch"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::BodyPayloadMismatch"
+tests = ["IN-02::in_02_each_commitment_mismatch_scores_body_delivery_only_and_keeps_header", "IN-02::reactor_rejects_block_hash_mismatch_without_hard_drop_for_size_mismatch", "DF-02::df_02_full_state_failures_have_exact_intentional_difference_types", "AUD-03::body_evidence_matrix_preserves_typed_effect_boundaries", "AUD-14::aud_14_no_change_crash_points_preserve_the_paired_full_state_transaction"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-BODY-02"

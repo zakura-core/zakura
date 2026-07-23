@@ -185,6 +185,7 @@ impl FuzzStore {
             operation,
             branch,
             HeaderValidationState::Valid,
+            false,
         )
     }
 
@@ -195,6 +196,7 @@ impl FuzzStore {
         operation: usize,
         branch: u8,
         validation: HeaderValidationState,
+        hard_work: bool,
     ) -> TransitionRequest {
         let lease = self.lease(parent);
         let evidence = evidence(operation, branch);
@@ -203,6 +205,12 @@ impl FuzzStore {
         for offset in 1..=count {
             let mut header = *regtest_genesis_block().header;
             header.previous_block_hash = parent_hash;
+            if hard_work {
+                header.difficulty_threshold =
+                    zakura_chain::work::difficulty::CompactDifficulty::from_le_bytes(
+                        0x1d00_ffff_u32.to_le_bytes(),
+                    );
+            }
             header.nonce.0[..8].copy_from_slice(&operation_u64(operation).to_le_bytes());
             header.nonce.0[8] = branch;
             header.nonce.0[9..13].copy_from_slice(&offset.to_le_bytes());
@@ -421,7 +429,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     let bounded = &bytes[..bytes.len().min(512)];
     let mode = if bounded
         .first()
-        .is_some_and(|byte| decode_fork_operation(*byte) & 1 == 1)
+        .is_some_and(|byte| decode_fork_operation(*byte).0 & 1 == 1)
     {
         EngineMode::HeadersOnly
     } else {
@@ -438,7 +446,16 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     assert_exhaustive_oracle(&store);
 
     for (operation, encoded) in bounded.iter().copied().enumerate() {
-        let byte = decode_fork_operation(encoded);
+        if bounded.first() == Some(&b'A')
+            && encoded == b'\n'
+            && operation.saturating_add(1) == bounded.len()
+        {
+            no_effects = no_effects.saturating_add(1);
+            transcript.update(b"corpus-newline");
+            assert_exhaustive_oracle(&store);
+            continue;
+        }
+        let (byte, hard_work) = decode_fork_operation(encoded);
         let before = store.snapshot();
         let before_selected = store.selected.clone();
         let before_verified = store.verified.clone();
@@ -446,8 +463,22 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         let branch = byte.rotate_left(3);
         let branch_key = (byte & 0x07).saturating_add((byte & 0x80) >> 4);
         let request = match (byte >> 3) & 0x0f {
-            0 => store.insertion(store.branch_parent(branch_key), count, operation, branch),
-            1 => store.insertion(store.retained_parent(branch), count, operation, branch),
+            0 => store.insertion_with_validation(
+                store.branch_parent(branch_key),
+                count,
+                operation,
+                branch,
+                HeaderValidationState::Valid,
+                hard_work,
+            ),
+            1 => store.insertion_with_validation(
+                store.retained_parent(branch),
+                count,
+                operation,
+                branch,
+                HeaderValidationState::Valid,
+                hard_work,
+            ),
             2 => {
                 let mut request = store.insertion(
                     store.metadata.frontiers.header_best,
@@ -566,6 +597,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                 operation,
                 branch,
                 HeaderValidationState::DeferredUntil(clock.now() + Duration::seconds(1)),
+                hard_work,
             ),
             11 => {
                 clock.advance(u32::from(branch).saturating_add(1));
@@ -667,12 +699,13 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     }
 }
 
-fn decode_fork_operation(byte: u8) -> u8 {
+fn decode_fork_operation(byte: u8) -> (u8, bool) {
     match byte {
-        b'A' => 4,
-        b'B' => 9,
-        b'C' => 1,
-        _ => byte,
+        b'A' => (4, false),
+        b'B' => (9, false),
+        b'C' => (1, false),
+        b'D' => (9, true),
+        _ => (byte, false),
     }
 }
 
@@ -1058,6 +1091,25 @@ mod tests {
     }
 
     #[test]
+    fn shorter_higher_work_branch_replaces_a_taller_incumbent() {
+        let incumbent = replay_fork_transition_bytes(&[4]);
+        let replacement = replay_fork_transition_bytes(b"AD");
+        assert_eq!(
+            replacement.snapshot.frontiers.header_best.height,
+            block::Height(2)
+        );
+        assert!(
+            replacement.snapshot.header_best_score.suffix_work
+                > incumbent.snapshot.header_best_score.suffix_work,
+            "selection follows locally computed cumulative work rather than height"
+        );
+        assert_ne!(
+            replacement.snapshot.frontiers.header_best.hash,
+            incumbent.snapshot.frontiers.header_best.hash
+        );
+    }
+
+    #[test]
     #[should_panic(expected = "selected projection must exactly match parent links")]
     fn exhaustive_oracle_rejects_a_projection_gap() {
         let mut store = FuzzStore::new(EngineMode::Integrated);
@@ -1177,6 +1229,12 @@ mod tests {
                     "../../fuzz/header-chain/corpus/fork_transitions/aud_01_losing_branch_promotion"
                 ),
             ),
+            (
+                "aud_02_shorter_higher_work",
+                include_bytes!(
+                    "../../fuzz/header-chain/corpus/fork_transitions/aud_02_shorter_higher_work"
+                ),
+            ),
         ];
         for (name, bytes) in corpus {
             let first = replay_fork_transition_bytes(bytes);
@@ -1186,6 +1244,12 @@ mod tests {
                 assert_eq!(
                     first.snapshot.frontiers.header_best.height,
                     block::Height(6)
+                );
+            }
+            if *name == "aud_02_shorter_higher_work" {
+                assert_eq!(
+                    first.snapshot.frontiers.header_best.height,
+                    block::Height(2)
                 );
             }
         }

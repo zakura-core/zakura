@@ -40,11 +40,13 @@ feature-gated replay function runs the production planner and independently
 rebuilds retained indexes, eligibility, work ordering, and projections after
 every operation. Sixteen bounded branch slots retain exact fork tips across
 later operations, so a losing fork can be deliberately extended and promoted
-instead of only being created once. Candidate-pressure operations cross the
-exact tip cap in a bounded fixture and independently predict the lowest
-work/raw-hash eviction, including the case where the newly offered tip is
-discarded without a durable delete. The replay function is also used by
-deterministic corpus tests.
+instead of only being created once. A bounded harder-target class changes the
+canonical header target and locally recomputed block work together, permitting
+shorter-higher-work comparisons without substituting height for work.
+Candidate-pressure operations cross the exact tip cap in a bounded fixture and
+independently predict the lowest work/raw-hash eviction, including the case
+where the newly offered tip is discarded without a durable delete. The replay
+function is also used by deterministic corpus tests.
 
 `header_pursuit` consumes at most 512 bytes as four-byte operations over twenty
 logical peers. It drives the production peer work queue, response-page and

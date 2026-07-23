@@ -4580,8 +4580,6 @@ async fn wake_debug_mempool(rpc_client: &RpcRequestClient) -> Result<()> {
 #[ignore]
 #[cfg(not(target_os = "windows"))]
 async fn disconnects_from_misbehaving_peers() -> Result<()> {
-    use std::sync::{atomic::AtomicBool, Arc};
-
     use common::regtest::MiningRpcMethods;
     use zakura_chain::parameters::testnet::{self, ConfiguredActivationHeights};
     use zakura_rpc::client::PeerInfo;
@@ -4624,10 +4622,14 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
     config.state.ephemeral = true;
     config.network.initial_testnet_peers = [].into();
     config.network.crawl_new_peer_interval = Duration::from_secs(5);
+    // Invalid blocks log the full custom network at warn level. Keep the
+    // expected logs from filling the child process pipes while this test polls
+    // the nodes over RPC.
+    config.tracing.filter = Some("error".to_string());
 
     let rpc_listen_addr = config.rpc.listen_addr.unwrap();
-    // Use a longer timeout because `generate [500]` mines 500 blocks in a single
-    // RPC call, which can exceed the default timeout at ~400ms per block.
+    // Mining 500 blocks in one RPC call can exceed the default request timeout
+    // on slower CI runners.
     let rpc_client_1 =
         RpcRequestClient::new_with_timeout(rpc_listen_addr, Duration::from_secs(15 * 60));
 
@@ -4637,28 +4639,12 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
         "starting a zakurad child on incompatible custom Testnet"
     );
 
-    let is_finished = Arc::new(AtomicBool::new(false));
-
-    {
-        let is_finished = Arc::clone(&is_finished);
-        let config = config.clone();
-        let (zakurad_failure_messages, zakurad_ignore_messages) =
-            test_type.zakurad_failure_messages();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut zakurad_child = testdir()?
-                .with_exact_config(&config)?
-                .spawn_child(args!["start"])?
-                .bypass_test_capture(true)
-                .with_timeout(test_type.zakurad_timeout())
-                .with_failure_regex_iter(zakurad_failure_messages, zakurad_ignore_messages);
-
-            while !is_finished.load(std::sync::atomic::Ordering::SeqCst) {
-                zakurad_child.wait_for_stdout_line(Some("zebraA1".to_string()));
-            }
-
-            Ok(())
-        });
-    }
+    let (zakurad_failure_messages, zakurad_ignore_messages) = test_type.zakurad_failure_messages();
+    let mut zakurad_child_1 = testdir()?
+        .with_exact_config(&config)?
+        .spawn_child(args!["start"])?
+        .with_timeout(test_type.zakurad_timeout())
+        .with_failure_regex_iter(zakurad_failure_messages, zakurad_ignore_messages);
 
     let network2 = testnet::Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
@@ -4685,7 +4671,7 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
     config.state.ephemeral = true;
 
     let rpc_listen_addr = config.rpc.listen_addr.unwrap();
-    let rpc_client_2 = RpcRequestClient::new(rpc_listen_addr);
+    let rpc_client_2 = RpcRequestClient::new_with_timeout(rpc_listen_addr, EXTENDED_LAUNCH_DELAY);
 
     tracing::info!(
         ?rpc_listen_addr,
@@ -4693,94 +4679,93 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
         "starting a zakurad child on the default Testnet"
     );
 
-    {
-        let is_finished = Arc::clone(&is_finished);
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let (zakurad_failure_messages, zakurad_ignore_messages) =
-                test_type.zakurad_failure_messages();
-            let mut zakurad_child = testdir()?
-                .with_exact_config(&config)?
-                .spawn_child(args!["start"])?
-                .bypass_test_capture(true)
-                .with_timeout(test_type.zakurad_timeout())
-                .with_failure_regex_iter(zakurad_failure_messages, zakurad_ignore_messages);
+    let (zakurad_failure_messages, zakurad_ignore_messages) = test_type.zakurad_failure_messages();
+    let mut zakurad_child_2 = testdir()?
+        .with_exact_config(&config)?
+        .spawn_child(args!["start"])?
+        .with_timeout(test_type.zakurad_timeout())
+        .with_failure_regex_iter(zakurad_failure_messages, zakurad_ignore_messages);
 
-            while !is_finished.load(std::sync::atomic::Ordering::SeqCst) {
-                zakurad_child.wait_for_stdout_line(Some("zebraB2".to_string()));
-            }
+    let test_result: Result<()> = async {
+        tracing::info!("waiting for zakurad nodes to connect");
 
-            Ok(())
-        });
-    }
+        let (peer_info_1, peer_info_2) = tokio::time::timeout(EXTENDED_LAUNCH_DELAY, async {
+            loop {
+                let peer_info_1 = rpc_client_1
+                    .json_result_from_call::<Vec<PeerInfo>>("getpeerinfo", "[]")
+                    .await;
+                let peer_info_2 = rpc_client_2
+                    .json_result_from_call::<Vec<PeerInfo>>("getpeerinfo", "[]")
+                    .await;
 
-    tracing::info!("waiting for zakurad nodes to connect");
-
-    let peer_info = tokio::time::timeout(EXTENDED_LAUNCH_DELAY, async {
-        loop {
-            if let Ok(peer_info) = rpc_client_2
-                .json_result_from_call::<Vec<PeerInfo>>("getpeerinfo", "[]")
-                .await
-            {
-                if !peer_info.is_empty() {
-                    break peer_info;
+                if let (Ok(peer_info_1), Ok(peer_info_2)) = (peer_info_1, peer_info_2) {
+                    if !peer_info_1.is_empty() && !peer_info_2.is_empty() {
+                        break (peer_info_1, peer_info_2);
+                    }
                 }
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .map_err(|_| eyre!("zakurad nodes did not connect before the launch timeout"))?;
-
-    tracing::info!(
-        ?peer_info,
-        "found peer connection, committing genesis block"
-    );
-
-    let genesis_block = network1.block_parsed_iter().next().unwrap();
-    rpc_client_1.submit_block(genesis_block.clone()).await?;
-    rpc_client_2.submit_block(genesis_block).await?;
-
-    // Call the `generate` method to mine blocks in the zakurad instance where PoW is disabled
-    tracing::info!("committed genesis block, mining blocks with invalid PoW");
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    rpc_client_1.call("generate", "[500]").await?;
-
-    tracing::info!("wait for misbehavior messages to flush into address updater channel");
-
-    tokio::time::sleep(Duration::from_secs(30)).await;
-
-    tracing::info!("calling getpeerinfo to confirm Zakura has dropped the peer connection");
-
-    // Call `getpeerinfo` to check that the zakurad instances have disconnected
-    for i in 0..600 {
-        let peer_info: Vec<PeerInfo> = rpc_client_2
-            .json_result_from_call("getpeerinfo", "[]")
-            .await
-            .map_err(|err| eyre!(err))?;
-
-        if peer_info.is_empty() {
-            break;
-        } else if i % 10 == 0 {
-            tracing::info!(?peer_info, "has not yet disconnected from misbehaving peer");
-        }
-
-        rpc_client_1.call("generate", "[1]").await?;
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-
-    let peer_info: Vec<PeerInfo> = rpc_client_2
-        .json_result_from_call("getpeerinfo", "[]")
+        })
         .await
-        .map_err(|err| eyre!(err))?;
+        .map_err(|_| eyre!("zakurad nodes did not connect before the launch timeout"))?;
 
-    tracing::info!(?peer_info, "called getpeerinfo");
+        tracing::info!(
+            ?peer_info_1,
+            ?peer_info_2,
+            "found peer connection, committing genesis block"
+        );
 
-    assert!(peer_info.is_empty(), "should have no peers");
+        let genesis_block = network1.block_parsed_iter().next().unwrap();
+        rpc_client_1.submit_block(genesis_block.clone()).await?;
+        rpc_client_2.submit_block(genesis_block).await?;
 
-    is_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Mine a long chain so the second node's syncer requests invalid-PoW
+        // blocks from its peer.
+        tracing::info!("committed genesis block, mining blocks with invalid PoW");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        rpc_client_1.generate(500).await?;
+
+        tokio::time::timeout(EXTENDED_LAUNCH_DELAY, async {
+            loop {
+                let peer_info_1: Vec<PeerInfo> = rpc_client_1
+                    .json_result_from_call("getpeerinfo", "[]")
+                    .await
+                    .map_err(|err| eyre!(err))?;
+                let peer_info_2: Vec<PeerInfo> = rpc_client_2
+                    .json_result_from_call("getpeerinfo", "[]")
+                    .await
+                    .map_err(|err| eyre!(err))?;
+
+                if peer_info_1.is_empty() && peer_info_2.is_empty() {
+                    return Ok::<(), color_eyre::Report>(());
+                }
+
+                tracing::debug!(
+                    ?peer_info_1,
+                    ?peer_info_2,
+                    "has not yet disconnected from misbehaving peer"
+                );
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| eyre!("nodes did not disconnect before the launch timeout"))??;
+
+        Ok(())
+    }
+    .await;
+
+    // Always stop both processes so their piped output reaches EOF. The old
+    // detached output readers could remain blocked forever after this test
+    // finished, hanging the entire nextest shard.
+    let child_1_cleanup = zakurad_child_1.kill_and_consume_output(true);
+    let child_2_cleanup = zakurad_child_2.kill_and_consume_output(true);
+
+    test_result?;
+    child_1_cleanup.wrap_err("failed to stop the PoW-disabled zakurad child")?;
+    child_2_cleanup.wrap_err("failed to stop the PoW-enabled zakurad child")?;
 
     Ok(())
 }

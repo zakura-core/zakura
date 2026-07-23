@@ -886,6 +886,18 @@ pub enum Request {
         insert: Box<zakura_header_chain::InsertHeaders>,
     },
 
+    /// Persist one retryable body-availability result through the serialized
+    /// fork-aware header-chain writer.
+    ///
+    /// This request deliberately accepts only transient evidence. Deterministic
+    /// consensus invalidity remains constructible only at the full verifier boundary.
+    RecordHeaderChainBodyUnavailable {
+        /// Durable version that owned the body retry attempt.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Exact body and bounded retry-episode summary.
+        failure: zakura_header_chain::TransientBodyFailure,
+    },
+
     /// Performs contextual validation of the given semantically verified block,
     /// committing it to the state if successful.
     ///
@@ -1175,6 +1187,9 @@ impl Request {
     pub fn variant_name(&self) -> &'static str {
         match self {
             Request::ApplyHeaderChainInsert { .. } => "apply_header_chain_insert",
+            Request::RecordHeaderChainBodyUnavailable { .. } => {
+                "record_header_chain_body_unavailable"
+            }
             Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::AwaitUtxo(_) => "await_utxo",
@@ -1786,6 +1801,7 @@ impl TryFrom<Request> for ReadRequest {
             }
 
             Request::ApplyHeaderChainInsert { .. }
+            | Request::RecordHeaderChainBodyUnavailable { .. }
             | Request::CommitSemanticallyVerifiedBlock(_)
             | Request::CommitCheckpointVerifiedBlock(_)
             | Request::InvalidateBlock(_)

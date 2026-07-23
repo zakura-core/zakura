@@ -1039,6 +1039,32 @@ impl StateService {
         rsp_rx
     }
 
+    fn send_header_chain_body_unavailable(
+        &self,
+        expected_version: zakura_header_chain::StateVersion,
+        failure: zakura_header_chain::TransientBodyFailure,
+    ) -> oneshot::Receiver<Result<zakura_header_chain::ApplyResult, HeaderChainStoreError>> {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        let Some(sender) = &self.block_write_sender.non_finalized else {
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+            return rsp_rx;
+        };
+        if let Err(tokio::sync::mpsc::error::SendError(message)) =
+            sender.send(NonFinalizedWriteMessage::RecordHeaderChainBodyUnavailable {
+                expected_version,
+                failure,
+                rsp_tx,
+            })
+        {
+            let NonFinalizedWriteMessage::RecordHeaderChainBodyUnavailable { rsp_tx, .. } = message
+            else {
+                unreachable!("the failed send returns the same body-availability message");
+            };
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+        }
+        rsp_rx
+    }
+
     /// Assert some assumptions about the semantically verified `block` before it is queued.
     fn assert_block_can_be_validated(&self, block: &SemanticallyVerifiedBlock) {
         // required by `Request::CommitSemanticallyVerifiedBlock` call
@@ -1191,6 +1217,20 @@ impl Service<Request> for StateService {
                         .await
                         .map_err(|_| BoxError::from("header-chain writer exited"))?
                         .map(Response::HeaderChainInsertApplied)
+                        .map_err(BoxError::from)
+                }
+                .boxed()
+            }
+            Request::RecordHeaderChainBodyUnavailable {
+                expected_version,
+                failure,
+            } => {
+                let rsp_rx = self.send_header_chain_body_unavailable(expected_version, failure);
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| BoxError::from("header-chain writer exited"))?
+                        .map(Response::HeaderChainBodyUnavailableRecorded)
                         .map_err(BoxError::from)
                 }
                 .boxed()

@@ -573,6 +573,14 @@ fn apply_event<S: StoreRead>(
                     "body retry evidence has no failed attempt",
                 ));
             }
+            if matches!(
+                graph.node(event.hash).map(|node| &node.body),
+                Some(BodyValidationState::Verified { .. })
+            ) {
+                return Err(TransitionFailure::InvalidEvidence(
+                    "body retry evidence cannot regress an already verified body",
+                ));
+            }
             graph.set_body_state(
                 event.hash,
                 BodyValidationState::Unavailable(event.availability),
@@ -2113,6 +2121,47 @@ mod tests {
         )
         .expect("authentication replay is idempotent");
         assert!(replay.is_no_change());
+    }
+
+    #[test]
+    fn transient_body_evidence_cannot_regress_a_verified_body() {
+        let (mut store, config) = TestStore::new(EngineMode::Integrated);
+        let clock = ManualClock(Utc::now());
+        store
+            .graph
+            .set_body_state(
+                store.metadata.frontiers.verified_best.hash,
+                BodyValidationState::Verified {
+                    evidence: EvidenceId::from_digest([0xbf; 32]),
+                },
+            )
+            .expect("the fixture body becomes verified");
+        let request = TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::BodyEvidence(BodyEvidence::Transient(
+                crate::TransientBodyFailure {
+                    hash: store.metadata.frontiers.verified_best.hash,
+                    evidence: EvidenceId::from_digest([0xc0; 32]),
+                    kind: crate::TransientBodyFailureKind::Timeout,
+                    availability: crate::BodyUnavailableSummary {
+                        attempts: 1,
+                        suppliers: 1,
+                        alarmed: false,
+                    },
+                },
+            )),
+        };
+
+        let result = apply_transition(&store, request, &context(&config, &clock, Some(&Authority)));
+        assert!(
+            matches!(
+                result,
+                Err(TransitionFailure::InvalidEvidence(
+                    "body retry evidence cannot regress an already verified body"
+                ))
+            ),
+            "unexpected transition result: {result:?}"
+        );
     }
 
     #[test]

@@ -776,6 +776,12 @@ pub enum NonFinalizedWriteMessage {
         insert: Box<zakura_header_chain::InsertHeaders>,
         rsp_tx: oneshot::Sender<Result<ApplyResult, HeaderChainStoreError>>,
     },
+    /// One retryable body-availability result admitted by integrated full state.
+    RecordHeaderChainBodyUnavailable {
+        expected_version: StateVersion,
+        failure: zakura_header_chain::TransientBodyFailure,
+        rsp_tx: oneshot::Sender<Result<ApplyResult, HeaderChainStoreError>>,
+    },
     /// A newly downloaded and semantically verified block prepared for
     /// contextual validation and insertion into the non-finalized state.
     Commit(QueuedSemanticallyVerified),
@@ -1175,6 +1181,28 @@ impl WriteBlockWorkerTask {
                                 TransitionRequest {
                                     expected_version,
                                     event: TransitionEvent::InsertHeaders(*insert),
+                                },
+                                &writer.context(),
+                            )
+                        });
+                    let _ = rsp_tx.send(result);
+                    None
+                }
+                NonFinalizedWriteMessage::RecordHeaderChainBodyUnavailable {
+                    expected_version,
+                    failure,
+                    rsp_tx,
+                } => {
+                    let result = header_chain
+                        .as_ref()
+                        .ok_or(HeaderChainStoreError::Uninitialized)
+                        .and_then(|writer| {
+                            writer.runtime.apply(
+                                TransitionRequest {
+                                    expected_version,
+                                    event: TransitionEvent::BodyEvidence(BodyEvidence::Transient(
+                                        failure,
+                                    )),
                                 },
                                 &writer.context(),
                             )

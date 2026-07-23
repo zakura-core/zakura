@@ -40,6 +40,9 @@ pub enum Response {
     /// Response to [`Request::ApplyHeaderChainInsert`].
     HeaderChainInsertApplied(zakura_header_chain::ApplyResult),
 
+    /// Result of persisting one retryable header-chain body-availability result.
+    HeaderChainBodyUnavailableRecorded(zakura_header_chain::ApplyResult),
+
     /// Response to [`Request::CommitSemanticallyVerifiedBlock`] and [`Request::CommitCheckpointVerifiedBlock`]
     /// indicating that a block was successfully committed to the state.
     Committed(block::Hash),

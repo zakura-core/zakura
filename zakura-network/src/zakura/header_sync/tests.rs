@@ -1369,6 +1369,72 @@ async fn transient_session_exit_keeps_connection_ownership_across_reopen_gap() {
     assert!(!service.owns_connection_for_peer(&peer_id, conn_id));
 }
 
+#[tokio::test]
+async fn transient_session_exit_survives_stale_reactor_snapshot() {
+    // The reactor processes a session's `PeerDisconnected` asynchronously:
+    // right after the service-side teardown records a gap claim, the published
+    // slot snapshot can still count the just-exited session in the last free
+    // slot. While the reactor also still lists the node as admitted, that
+    // "occupied" slot is the session's own, so the claim must keep the
+    // connection owned instead of letting discovery close it mid-gap.
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer_id, node_id) = node_peer();
+    let conn_id = 4;
+    let (peer, peer_send) =
+        header_sync_peer_with_conn(peer_id.clone(), conn_id, CancellationToken::new());
+
+    service.add_peer(peer);
+    match lifecycle_rx.recv().await {
+        Some(HeaderSyncEvent::PeerConnected(session)) if session.peer_id() == &peer_id => {}
+        event => panic!("expected header-sync peer connection, got {event:?}"),
+    }
+    // The reactor's published view: this node admitted, and its session
+    // occupying the last outbound slot.
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        admitted_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+    peers_tx.send_replace(ServicePeerSnapshot {
+        outbound_slots_free: 0,
+        ..ServicePeerSnapshot::default()
+    });
+    assert!(service.owns_connection_for_peer(&peer_id, conn_id));
+
+    // The session exits while the reactor's snapshot is still stale: slots
+    // read full and the node still reads admitted.
+    drop(peer_send);
+    match tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle_rx.recv()).await {
+        Ok(Some(HeaderSyncEvent::PeerDisconnected(disconnected))) if disconnected == peer_id => {}
+        event => panic!("expected header-sync peer disconnection, got {event:?}"),
+    }
+    assert!(
+        service.owns_connection_for_peer(&peer_id, conn_id),
+        "a stale full-slots snapshot that still lists this node must not release the gap claim"
+    );
+
+    // Once the reactor catches up it publishes both watches together. If the
+    // node is gone from the admitted set while slots stay full, the slot is
+    // genuinely taken by someone else and the claim stops holding the
+    // connection.
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState::default());
+    assert!(
+        !service.owns_connection_for_peer(&peer_id, conn_id),
+        "full slots occupied by other sessions must release the gap claim"
+    );
+}
+
 fn header_sync_peer_with_conn(
     peer_id: ZakuraPeerId,
     conn_id: ZakuraConnId,

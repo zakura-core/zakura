@@ -549,10 +549,28 @@ impl Service for HeaderSyncService {
         else {
             return false;
         };
-        matches!(
+        if matches!(
             self.ordered_session_demand(conn_id, peer, ZAKURA_CAP_HEADER_SYNC, direction),
             OrderedSessionDemand::OpenNow
-        )
+        ) {
+            return true;
+        }
+
+        // The demand reads the reactor-published slot snapshot, and the reactor
+        // processes the session's `PeerDisconnected` asynchronously: right after
+        // the teardown that recorded this claim, a stale snapshot can still
+        // count the just-exited session in the last slot. The reactor derives
+        // that snapshot and `admitted_node_ids` from the same peer map and
+        // publishes both together, so while it still lists this node as
+        // admitted, the "occupied" slot is this session's own and the claim is
+        // honored. A genuinely re-admitted session would have replaced the
+        // claim in `add_peer`, so this fallback can only apply during the lag.
+        header_peer_node_id(peer).is_some_and(|node_id| {
+            self.header_sync
+                .candidate_state()
+                .admitted_node_ids
+                .contains(&node_id)
+        })
     }
 
     fn wants_peer(

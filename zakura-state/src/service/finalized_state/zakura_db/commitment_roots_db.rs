@@ -1146,7 +1146,9 @@ mod tests {
     };
     use zakura_chain::{
         block::Block,
-        parallel::commitment_aux_verify::verify_supplied_roots_from_parts,
+        parallel::commitment_aux_verify::{
+            normalize_unauthenticated_commitment_fields, verify_supplied_roots_from_parts,
+        },
         parameters::{testnet, Network, NetworkUpgrade},
         serialization::ZcashDeserializeInto,
         work::difficulty::ParameterDifficulty,
@@ -1423,7 +1425,14 @@ mod tests {
         db.write_verified_header_commitment_roots(verified)
             .expect("canonical verified prefix promotes");
 
-        assert_eq!(db.commitment_roots(roots.height), Some(roots.clone()));
+        assert_eq!(
+            db.commitment_roots(roots.height),
+            Some(normalize_unauthenticated_commitment_fields(
+                &db.network(),
+                roots.clone()
+            )),
+            "pre-NU5 auth_data_root is cleared on promotion"
+        );
         let frontier = db
             .validate_header_root_auth_state()
             .expect("promoted frontier is coherent")
@@ -1719,7 +1728,14 @@ mod tests {
             .expect("valid one-lag delivery authenticates");
         assert_eq!(result.authenticated, start..=start);
         assert_eq!(result.state.authenticated_height, start);
-        assert_eq!(db.commitment_roots(start), Some(roots));
+        assert_eq!(
+            db.commitment_roots(start),
+            Some(normalize_unauthenticated_commitment_fields(
+                &db.network(),
+                roots
+            )),
+            "pre-NU5 auth_data_root is cleared on promotion"
+        );
     }
 
     #[test]
@@ -1879,7 +1895,14 @@ mod tests {
 
         assert_eq!(result.authenticated, Height(1)..=Height(1));
         assert_eq!(result.state.authenticated_height, Height(1));
-        assert_eq!(db.commitment_roots(Height(1)), Some(roots));
+        assert_eq!(
+            db.commitment_roots(Height(1)),
+            Some(normalize_unauthenticated_commitment_fields(
+                &db.network(),
+                roots
+            )),
+            "pre-NU5 auth_data_root is cleared on promotion"
+        );
     }
 
     #[test]

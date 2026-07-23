@@ -522,7 +522,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-INT-03"
 name = "Full-block integration"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::service::write::PreparedFullStateTransition"
+tests = ["IN-01::full_commit_ensures_exact_node_body_and_independent_selection", "DF-01::df_01_generated_nu5_graph_matches_full_state_before_finalization", "AUD-14::aud_14_verified_grow_and_reset_reopen_complete_before_or_after"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-INT-04"

@@ -5,7 +5,13 @@ use std::{num::NonZeroU32, sync::Arc};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use zakura_chain::{block, parameters::NetworkKind, work::difficulty::Work};
+use zakura_chain::{
+    block::{self, merkle::AuthDataRoot},
+    ironwood, orchard,
+    parameters::NetworkKind,
+    sapling,
+    work::difficulty::Work,
+};
 
 use crate::{
     BodyRuleId, BodyUnavailableSummary, BranchId, ChainScore, EligibilityState, EngineMode,
@@ -263,10 +269,31 @@ pub struct AuxDelivery {
     pub owner: WorkOwner,
     /// Advisory bounded body size.
     pub body_size: BodySizeHint,
-    /// Optional schema-specific payload digest.
-    pub payload_digest: Option<[u8; 32]>,
+    /// Complete schema-1 record retained for later one-header-later authentication.
+    pub tree_aux: Option<TreeAuxRecordV1>,
     /// Current authentication state.
     pub authentication: AuxAuthentication,
+}
+
+/// Immutable schema-1 commitment inputs for one inferred block height.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TreeAuxRecordV1 {
+    /// Exact inferred height of this record.
+    pub height: block::Height,
+    /// End-of-block Sapling note-commitment root.
+    pub sapling_root: sapling::tree::Root,
+    /// End-of-block Orchard root, empty below NU5.
+    pub orchard_root: orchard::tree::Root,
+    /// End-of-block Ironwood root, empty before configured NU7.
+    pub ironwood_root: ironwood::tree::Root,
+    /// Per-block Sapling shielded transaction count.
+    pub sapling_tx_count: u64,
+    /// Per-block Orchard shielded transaction count, zero below NU5.
+    pub orchard_tx_count: u64,
+    /// Per-block Ironwood shielded transaction count, zero before configured NU7.
+    pub ironwood_tx_count: u64,
+    /// ZIP-244 authorizing-data root, all zero below NU5.
+    pub auth_data_root: AuthDataRoot,
 }
 
 /// Prepared auxiliary input admitted alongside a header batch.
@@ -549,7 +576,7 @@ pub struct RecoveryEvidence {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransitionEvent {
     /// Prepared header admission.
-    InsertHeaders(InsertHeaders),
+    InsertHeaders(Box<InsertHeaders>),
     /// Full-state selected path changed.
     VerifiedChainChanged(VerifiedChainChanged),
     /// Body delivery/verification evidence.
@@ -565,7 +592,7 @@ pub enum TransitionEvent {
     /// Authenticated local checkpoint advancement.
     AdvanceLocalCheckpoint(AdvanceLocalCheckpoint),
     /// Hash-scoped auxiliary evidence.
-    AuxEvidence(AuxEvidence),
+    AuxEvidence(Box<AuxEvidence>),
     /// Reevaluate all locally due future-time deferrals.
     ReevaluateDeferred,
     /// Startup-only reconstruction or audit repair.
@@ -587,11 +614,12 @@ impl TransitionEvent {
     /// Return the authority gate fixed for this event category.
     pub fn admission(&self) -> EventAdmission {
         match self {
-            Self::InsertHeaders(InsertHeaders {
-                completion: TargetCompletion::InternalFullState,
-                ..
-            })
-            | Self::VerifiedChainChanged(_)
+            Self::InsertHeaders(event)
+                if matches!(event.completion, TargetCompletion::InternalFullState) =>
+            {
+                EventAdmission::IntegratedFullState
+            }
+            Self::VerifiedChainChanged(_)
             | Self::BodyEvidence(_)
             | Self::FullStateFinalized(_)
             | Self::MigratedPinRefutation(_)
@@ -937,7 +965,7 @@ mod tests {
             .next()
             .expect("the production type surface precedes its tests");
         for variant in [
-            "InsertHeaders(InsertHeaders)",
+            "InsertHeaders(Box<InsertHeaders>)",
             "VerifiedChainChanged(VerifiedChainChanged)",
             "BodyEvidence(BodyEvidence)",
             "OperatorInvalidate(OperatorInvalidate)",
@@ -945,7 +973,7 @@ mod tests {
             "FullStateFinalized(FullStateFinalized)",
             "MigratedPinRefutation(MigratedPinRefutation)",
             "AdvanceLocalCheckpoint(AdvanceLocalCheckpoint)",
-            "AuxEvidence(AuxEvidence)",
+            "AuxEvidence(Box<AuxEvidence>)",
             "ReevaluateDeferred",
             "Recover(RecoveryEvidence)",
         ] {

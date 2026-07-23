@@ -1325,7 +1325,7 @@ mod tests {
         let target = batch.headers().last().expect("the batch is nonempty").hash;
         TransitionRequest {
             expected_version: store.metadata.state_version,
-            event: TransitionEvent::InsertHeaders(crate::InsertHeaders {
+            event: TransitionEvent::InsertHeaders(Box::new(crate::InsertHeaders {
                 owner: WorkOwner {
                     state_version: store.metadata.state_version,
                     header_generation: store.metadata.header_generation,
@@ -1342,7 +1342,7 @@ mod tests {
                 },
                 batch,
                 aux: Vec::new(),
-            }),
+            })),
         }
     }
 
@@ -1986,7 +1986,7 @@ mod tests {
                 source: SourceId::from_digest([0xad; 32]),
                 owner,
                 body_size: BodySizeHint::Unknown,
-                payload_digest: None,
+                tree_aux: None,
                 authentication: AuxAuthentication::Unauthenticated,
             })));
         assert_eq!(
@@ -2011,7 +2011,16 @@ mod tests {
             source: SourceId::from_digest([0xb2; 32]),
             owner: insert_event.owner,
             body_size: crate::BodySizeHint::Unknown,
-            payload_digest: Some([0xb3; 32]),
+            tree_aux: Some(crate::TreeAuxRecordV1 {
+                height: block::Height(1),
+                sapling_root: zakura_chain::sapling::tree::Root::default(),
+                orchard_root: zakura_chain::orchard::tree::Root::default(),
+                ironwood_root: zakura_chain::ironwood::tree::Root::default(),
+                sapling_tx_count: 3,
+                orchard_tx_count: 4,
+                ironwood_tx_count: 5,
+                auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0xb3; 32]),
+            }),
             authentication: crate::AuxAuthentication::Unauthenticated,
         };
         insert_event.aux.push(delivery);
@@ -2036,11 +2045,11 @@ mod tests {
         };
         let request = |delivery, authentication| TransitionRequest {
             expected_version: store.metadata.state_version,
-            event: TransitionEvent::AuxEvidence(crate::AuxEvidence {
+            event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence {
                 owner: repair_owner,
                 delivery,
                 authentication,
-            }),
+            })),
         };
 
         let mut changed_provenance = delivery;
@@ -2103,7 +2112,7 @@ mod tests {
             &store,
             TransitionRequest {
                 expected_version: store.metadata.state_version,
-                event: TransitionEvent::AuxEvidence(crate::AuxEvidence {
+                event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence {
                     owner: WorkOwner {
                         state_version: store.metadata.state_version,
                         header_generation: store.metadata.header_generation,
@@ -2115,7 +2124,7 @@ mod tests {
                         ..delivery
                     },
                     authentication,
-                }),
+                })),
             },
             &context(&config, &clock, Some(&Authority)),
         )

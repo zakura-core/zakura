@@ -404,45 +404,23 @@ impl HeaderSyncMessage {
     }
 }
 
-/// Immutable schema-1 commitment inputs for one inferred block height.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TreeAuxRecordV1 {
-    /// Exact inferred height of this record.
-    pub height: block::Height,
-    /// End-of-block Sapling note-commitment root.
-    pub sapling_root: sapling::tree::Root,
-    /// End-of-block Orchard root, empty below NU5.
-    pub orchard_root: orchard::tree::Root,
-    /// End-of-block Ironwood root, empty before configured NU7.
-    pub ironwood_root: ironwood::tree::Root,
-    /// Per-block Sapling shielded transaction count.
-    pub sapling_tx_count: u64,
-    /// Per-block Orchard shielded transaction count, zero below NU5.
-    pub orchard_tx_count: u64,
-    /// Per-block Ironwood shielded transaction count, zero before configured NU7.
-    pub ironwood_tx_count: u64,
-    /// ZIP-244 authorizing-data root, all zero below NU5.
-    pub auth_data_root: AuthDataRoot,
+pub use zakura_header_chain::TreeAuxRecordV1;
+
+trait TreeAuxWire: Sized {
+    /// Validate the inferred height and all activation-dependent canonical defaults.
+    fn validate_for(
+        &self,
+        expected_height: block::Height,
+        network: &Network,
+    ) -> Result<(), HeaderSyncWireError>;
+
+    fn encode_to<W: io::Write>(&self, writer: &mut W) -> Result<(), HeaderSyncWireError>;
+
+    fn decode_from<R: io::Read>(reader: &mut R) -> Result<Self, HeaderSyncWireError>;
 }
 
-impl TreeAuxRecordV1 {
-    /// Return a stable digest of the exact canonical schema-1 payload.
-    pub fn payload_digest(&self) -> [u8; 32] {
-        let mut bytes = Vec::with_capacity(TREE_AUX_SCHEMA_V1_BYTES);
-        self.encode_to(&mut bytes)
-            .expect("serializing into an in-memory vector cannot fail");
-        let digest = blake2b_simd::Params::new()
-            .hash_length(32)
-            .personal(b"ZHeaderAuxV1____")
-            .hash(&bytes);
-        digest
-            .as_bytes()
-            .try_into()
-            .expect("the configured digest length is exactly 32 bytes")
-    }
-
-    /// Validate the inferred height and all activation-dependent canonical defaults.
-    pub fn validate_for(
+impl TreeAuxWire for TreeAuxRecordV1 {
+    fn validate_for(
         &self,
         expected_height: block::Height,
         network: &Network,
@@ -894,7 +872,7 @@ impl HeaderSyncCodec {
                 header,
                 body_size,
                 tree_aux: if tree_aux_schema == AuxSchema::V1 {
-                    Some(aux[index].clone())
+                    Some(aux[index])
                 } else {
                     None
                 },

@@ -7,8 +7,10 @@ use std::{num::NonZeroU64, sync::Arc};
 use chrono::{DateTime, TimeZone, Utc};
 use thiserror::Error;
 use zakura_chain::{
-    block,
+    block::{self, merkle::AuthDataRoot},
+    ironwood, orchard,
     parameters::NetworkKind,
+    sapling,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
     work::difficulty::U256,
 };
@@ -17,8 +19,8 @@ use zakura_header_chain::{
     BodyValidationState, BranchId, ChainScore, EligibilityReason, EligibilityState, EngineMetadata,
     EngineMode, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
     HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode, HeaderValidationState,
-    OperatorInvalidationId, SourceId, StateVersion, SuffixWork, VerifiedGeneration, WorkCoordinate,
-    WorkOwner,
+    OperatorInvalidationId, SourceId, StateVersion, SuffixWork, TreeAuxRecordV1,
+    VerifiedGeneration, WorkCoordinate, WorkOwner,
 };
 
 const MAX_HEADER_BYTES: usize = 2 * 1024;
@@ -70,6 +72,9 @@ pub enum HeaderChainValueError {
     /// A UTF-8 rule identifier was malformed.
     #[error("invalid UTF-8 rule identifier")]
     RuleId,
+    /// An auxiliary commitment-tree root was not canonically encoded.
+    #[error("invalid {0} auxiliary commitment-tree root")]
+    TreeAuxRoot(&'static str),
 }
 
 /// Explicit stable value codec used instead of implementation-derived serialization.
@@ -643,9 +648,16 @@ fn put_aux(encoder: &mut Encoder, value: AuxDelivery) {
         BodySizeHint::Unknown => 0,
         BodySizeHint::Known(size) => size.get(),
     });
-    encoder.bool(value.payload_digest.is_some());
-    if let Some(digest) = value.payload_digest {
-        encoder.fixed(&digest);
+    encoder.bool(value.tree_aux.is_some());
+    if let Some(aux) = value.tree_aux {
+        encoder.u32(aux.height.0);
+        encoder.fixed(&<[u8; 32]>::from(aux.sapling_root));
+        encoder.fixed(&<[u8; 32]>::from(aux.orchard_root));
+        encoder.fixed(&<[u8; 32]>::from(aux.ironwood_root));
+        encoder.u64(aux.sapling_tx_count);
+        encoder.u64(aux.orchard_tx_count);
+        encoder.u64(aux.ironwood_tx_count);
+        encoder.fixed(&<[u8; 32]>::from(aux.auth_data_root));
     }
     match value.authentication {
         AuxAuthentication::Unauthenticated => encoder.u8(0),
@@ -674,7 +686,24 @@ fn get_aux(decoder: &mut Decoder<'_>) -> Result<AuxDelivery, HeaderChainValueErr
             field: "body_size",
             length: usize::MAX,
         })?;
-    let payload_digest = decoder.bool()?.then(|| decoder.array()).transpose()?;
+    let tree_aux = decoder
+        .bool()?
+        .then(|| {
+            Ok(TreeAuxRecordV1 {
+                height: block::Height(decoder.u32()?),
+                sapling_root: sapling::tree::Root::try_from(decoder.array()?)
+                    .map_err(|_| HeaderChainValueError::TreeAuxRoot("Sapling"))?,
+                orchard_root: orchard::tree::Root::try_from(decoder.array()?)
+                    .map_err(|_| HeaderChainValueError::TreeAuxRoot("Orchard"))?,
+                ironwood_root: ironwood::tree::Root::try_from(decoder.array()?)
+                    .map_err(|_| HeaderChainValueError::TreeAuxRoot("Ironwood"))?,
+                sapling_tx_count: decoder.u64()?,
+                orchard_tx_count: decoder.u64()?,
+                ironwood_tx_count: decoder.u64()?,
+                auth_data_root: AuthDataRoot::from(decoder.array()?),
+            })
+        })
+        .transpose()?;
     let authentication = match decoder.u8()? {
         0 => AuxAuthentication::Unauthenticated,
         1 => AuxAuthentication::Authenticated {
@@ -697,7 +726,7 @@ fn get_aux(decoder: &mut Decoder<'_>) -> Result<AuxDelivery, HeaderChainValueErr
         source,
         owner,
         body_size,
-        payload_digest,
+        tree_aux,
         authentication,
     })
 }
@@ -1085,7 +1114,16 @@ mod tests {
             source: SourceId::from_digest([8; 32]),
             owner,
             body_size: BodySizeHint::Known(NonZeroU32::new(9).expect("nine is nonzero")),
-            payload_digest: Some([10; 32]),
+            tree_aux: Some(TreeAuxRecordV1 {
+                height: block::Height(10),
+                sapling_root: sapling::tree::Root::default(),
+                orchard_root: orchard::tree::Root::default(),
+                ironwood_root: ironwood::tree::Root::default(),
+                sapling_tx_count: 11,
+                orchard_tx_count: 12,
+                ironwood_tx_count: 13,
+                auth_data_root: AuthDataRoot::from([14; 32]),
+            }),
             authentication: AuxAuthentication::Authenticated {
                 evidence: EvidenceId::from_digest([11; 32]),
                 boundary_hash: block::Hash([12; 32]),
@@ -1094,6 +1132,13 @@ mod tests {
         assert_eq!(
             HeaderAuxDeliveryDisk::decode(&aux.encode().expect("aux encodes")),
             Ok(aux)
+        );
+        let mut malformed_aux = aux.encode().expect("aux encodes");
+        const SAPLING_ROOT_OFFSET: usize = 32 + 32 + 32 + 105 + 4 + 1 + 4;
+        malformed_aux[SAPLING_ROOT_OFFSET..SAPLING_ROOT_OFFSET + 32].fill(0xff);
+        assert_eq!(
+            HeaderAuxDeliveryDisk::decode(&malformed_aux),
+            Err(HeaderChainValueError::TreeAuxRoot("Sapling"))
         );
 
         let finality = HeaderFinalityRecordDisk(FinalityRecord {
@@ -1166,7 +1211,7 @@ mod tests {
                 digest(&bytes),
             ],
             [
-                "329b695b06b38c807523cbc452661423cb0ead8df60d641d635d516c3ee3dd33",
+                "186354a36e1b19a6cead350807f3bba93f1bd723114a838f1e38c8b6a2a80696",
                 "b887bf384510dfb1a255221a8c97066617cb145eaf3e272ad70dc94cd17a3802",
                 "a07e697728327c41b90f4ff71890e737d20f32337b2ce84a059659957fa3b483",
             ]

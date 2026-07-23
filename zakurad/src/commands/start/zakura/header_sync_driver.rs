@@ -480,7 +480,7 @@ where
                 source,
                 owner,
                 body_size,
-                payload_digest: entry.tree_aux.as_ref().map(|aux| aux.payload_digest()),
+                tree_aux: entry.tree_aux,
                 authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
             });
         }

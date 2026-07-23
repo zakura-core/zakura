@@ -1103,7 +1103,7 @@ mod tests {
                 request_id: NonZeroU64::new(1).expect("one is nonzero"),
             },
             body_size: BodySizeHint::Unknown,
-            payload_digest: None,
+            tree_aux: None,
             authentication: AuxAuthentication::Unauthenticated,
         });
         assert!(violations(&store, &config)

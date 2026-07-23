@@ -1180,7 +1180,7 @@ impl WriteBlockWorkerTask {
                             writer.runtime.apply(
                                 TransitionRequest {
                                     expected_version,
-                                    event: TransitionEvent::InsertHeaders(*insert),
+                                    event: TransitionEvent::InsertHeaders(insert),
                                 },
                                 &writer.context(),
                             )

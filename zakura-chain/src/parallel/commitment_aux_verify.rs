@@ -110,7 +110,11 @@ where
         .map_err(|error| (height, error))?;
         verify_supplied_orchard_root_below_nu5(network, height, &roots.orchard_root)
             .map_err(|error| (height, error))?;
+        verify_supplied_orchard_tx_below_nu5(network, height, roots.orchard_tx)
+            .map_err(|error| (height, error))?;
         verify_supplied_ironwood_root_below_nu6_3(network, height, &roots.ironwood_root)
+            .map_err(|error| (height, error))?;
+        verify_supplied_ironwood_tx_below_nu6_3(network, height, roots.ironwood_tx)
             .map_err(|error| (height, error))?;
 
         // Header H + 1 authenticates roots for H, so the final item is only a boundary check.
@@ -262,6 +266,29 @@ pub fn verify_supplied_orchard_root_below_nu5(
     Ok(())
 }
 
+/// Verifies that a supplied Orchard transaction count is zero before NU5.
+pub fn verify_supplied_orchard_tx_below_nu5(
+    network: &Network,
+    height: Height,
+    orchard_tx: u64,
+) -> Result<(), SuppliedRootsError> {
+    if let Some(nu5_height) = NetworkUpgrade::Nu5.activation_height(network) {
+        if height >= nu5_height {
+            return Ok(());
+        }
+    }
+
+    if orchard_tx != 0 {
+        return Err(CommitmentError::InvalidPreNu5OrchardTxCount {
+            expected: 0,
+            actual: orchard_tx,
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
 /// Verifies a supplied Ironwood root for a pre-Ironwood (pre-`Nu6_3`) block.
 pub fn verify_supplied_ironwood_root_below_nu6_3(
     network: &Network,
@@ -279,6 +306,29 @@ pub fn verify_supplied_ironwood_root_below_nu6_3(
         return Err(CommitmentError::InvalidPreNu6_3IronwoodRoot {
             expected: <[u8; 32]>::from(expected),
             actual: <[u8; 32]>::from(*ironwood_root),
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Verifies that a supplied Ironwood transaction count is zero before Nu6_3.
+pub fn verify_supplied_ironwood_tx_below_nu6_3(
+    network: &Network,
+    height: Height,
+    ironwood_tx: u64,
+) -> Result<(), SuppliedRootsError> {
+    if let Some(nu6_3_height) = NetworkUpgrade::Nu6_3.activation_height(network) {
+        if height >= nu6_3_height {
+            return Ok(());
+        }
+    }
+
+    if ironwood_tx != 0 {
+        return Err(CommitmentError::InvalidPreNu6_3IronwoodTxCount {
+            expected: 0,
+            actual: ironwood_tx,
         }
         .into());
     }
@@ -499,6 +549,47 @@ mod tests {
     }
 
     #[test]
+    fn pins_orchard_tx_to_zero_below_nu5_and_defers_above() {
+        let nu5 = NetworkUpgrade::Nu5
+            .activation_height(&Mainnet)
+            .expect("mainnet has NU5");
+        let pre_nu5 = Height(nu5.0 - 1);
+
+        verify_supplied_orchard_tx_below_nu5(&Mainnet, pre_nu5, 0)
+            .expect("a zero Orchard transaction count is accepted below NU5");
+        let error = verify_supplied_orchard_tx_below_nu5(&Mainnet, pre_nu5, 1)
+            .expect_err("a non-zero Orchard transaction count must be rejected below NU5");
+        assert!(
+            matches!(
+                error,
+                SuppliedRootsError::InvalidHeaderCommitment(
+                    CommitmentError::InvalidPreNu5OrchardTxCount { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-NU5 Orchard count error, got: {error:?}"
+        );
+
+        verify_supplied_orchard_tx_below_nu5(&Mainnet, nu5, 1)
+            .expect("at NU5 the Orchard transaction count is authenticated by the MMR");
+    }
+
+    #[test]
+    fn pins_orchard_tx_to_zero_when_nu5_is_unconfigured() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu5: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        verify_supplied_orchard_tx_below_nu5(&network, Height(1), 0)
+            .expect("a zero Orchard transaction count is accepted when NU5 is unconfigured");
+        verify_supplied_orchard_tx_below_nu5(&network, Height(1), 1)
+            .expect_err("a non-zero Orchard transaction count is rejected without NU5");
+    }
+
+    #[test]
     fn pins_ironwood_root_to_empty_below_nu6_3_and_defers_above() {
         let network = Network::new_regtest(RegtestParameters {
             activation_heights: ConfiguredActivationHeights {
@@ -527,6 +618,50 @@ mod tests {
 
         verify_supplied_ironwood_root_below_nu6_3(&network, Height(1_000), &wrong)
             .expect("at Nu6_3 the root is authenticated by the MMR, not pinned here");
+    }
+
+    #[test]
+    fn pins_ironwood_tx_to_zero_below_nu6_3_and_defers_above() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu6_3: Some(1_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        verify_supplied_ironwood_tx_below_nu6_3(&network, Height(999), 0)
+            .expect("a zero Ironwood transaction count is accepted below Nu6_3");
+        let error = verify_supplied_ironwood_tx_below_nu6_3(&network, Height(999), 1)
+            .expect_err("a non-zero Ironwood transaction count must be rejected below Nu6_3");
+        assert!(
+            matches!(
+                error,
+                SuppliedRootsError::InvalidHeaderCommitment(
+                    CommitmentError::InvalidPreNu6_3IronwoodTxCount { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-Nu6_3 Ironwood count error, got: {error:?}"
+        );
+
+        verify_supplied_ironwood_tx_below_nu6_3(&network, Height(1_000), 1)
+            .expect("at Nu6_3 the Ironwood transaction count is authenticated by the MMR");
+    }
+
+    #[test]
+    fn pins_ironwood_tx_to_zero_when_nu6_3_is_unconfigured() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu6_3: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        verify_supplied_ironwood_tx_below_nu6_3(&network, Height(1), 0)
+            .expect("a zero Ironwood transaction count is accepted when Nu6_3 is unconfigured");
+        verify_supplied_ironwood_tx_below_nu6_3(&network, Height(1), 1)
+            .expect_err("a non-zero Ironwood transaction count is rejected without Nu6_3");
     }
 
     #[test]

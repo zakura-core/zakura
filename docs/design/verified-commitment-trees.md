@@ -234,13 +234,17 @@ orchard_root, ironwood_root, sapling_tx, orchard_tx, ironwood_tx, auth_data_root
 `ZcashSerialize`/`ZcashDeserialize`. It lives in `zakura-chain` so `zakura-network` and
 `zakura-state` share one type without a dependency cycle. `orchard_root` is the empty/default
 root below NU5, and `ironwood_root` is the empty/default root below `Nu6_3` (§6.1). The
+corresponding transaction counts are pinned to zero before those activations, and
+`sapling_tx` below Heartwood and `auth_data_root` below NU5 are body-verified-only because
+the applicable headers do not commit to those fields. The
 deserializer treats `height` as an unvalidated `u32`: a wrong or out-of-range height simply
 fails to match any local header during verification (§6), so it is harmless; malformed root
 bytes are rejected by the root parsers.
 
-The payload carries **no trust**: a recipient re-verifies every root against its own
-checkpoint-committed headers (§6) before folding it in, so a forwarding/serving node is
-exactly as trustworthy as an originating one.
+The payload carries **no trust**: a recipient applies the epoch-specific direct pins and
+re-verifies applicable fields against its own checkpoint-committed headers (§6) before
+folding them in. The pre-Heartwood Sapling transaction count becomes authoritative only when
+the downloaded body is verified, as does the pre-NU5 auth-data root.
 
 ### 5.2 The final frontier last checkpoint height (embedded)
 

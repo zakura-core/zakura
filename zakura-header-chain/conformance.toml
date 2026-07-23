@@ -151,7 +151,18 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-GEN-03"
 name = "Branch-scoped work identity"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::WorkOwner"
+tests = [
+    "IN-05::all_work_types_require_generation_and_branch",
+    "IN-05::response_completion_requires_the_reserved_branch_scope",
+    "IN-05::stale_locator_completion_cannot_rebase_onto_a_new_generation",
+    "IN-05::generation_change_retires_served_path_before_late_page_completion",
+    "IN-05::aud_08_old_coverage_misses_until_the_exact_reset_branch_completes",
+    "IN-05::generation_or_anchor_change_retires_retry_work_before_reuse",
+    "IN-06::aud_09_every_repair_phase_retires_before_new_generation_work",
+]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-GEN-04"

@@ -328,6 +328,19 @@ impl ZakuraDb {
         Some(Arc::new(tree))
     }
 
+    #[allow(clippy::unwrap_in_result)]
+    fn latest_stored_sapling_tree(
+        &self,
+        height: &Height,
+    ) -> Option<Arc<sapling::tree::NoteCommitmentTree>> {
+        let sapling_trees = self.db.cf_handle("sapling_note_commitment_tree").unwrap();
+        let (_stored_height, tree) = self
+            .db
+            .zs_prev_key_value_back_from(&sapling_trees, height)?;
+
+        Some(Arc::new(tree))
+    }
+
     /// Returns the Sapling note commitment trees in the supplied range, in increasing height order.
     pub fn sapling_tree_by_height_range<R>(
         &self,
@@ -469,6 +482,19 @@ impl ZakuraDb {
         Some(Arc::new(tree))
     }
 
+    #[allow(clippy::unwrap_in_result)]
+    fn latest_stored_orchard_tree(
+        &self,
+        height: &Height,
+    ) -> Option<Arc<orchard::tree::NoteCommitmentTree>> {
+        let orchard_trees = self.db.cf_handle("orchard_note_commitment_tree").unwrap();
+        let (_stored_height, tree) = self
+            .db
+            .zs_prev_key_value_back_from(&orchard_trees, height)?;
+
+        Some(Arc::new(tree))
+    }
+
     /// Returns the Orchard note commitment trees in the supplied range, in increasing height order.
     pub fn orchard_tree_by_height_range<R>(
         &self,
@@ -606,6 +632,19 @@ impl ZakuraDb {
             .expect(
                 "Ironwood note commitment trees must exist for all heights below the finalized tip",
             );
+
+        Some(Arc::new(tree))
+    }
+
+    #[allow(clippy::unwrap_in_result)]
+    fn latest_stored_ironwood_tree(
+        &self,
+        height: &Height,
+    ) -> Option<Arc<ironwood::tree::NoteCommitmentTree>> {
+        let ironwood_trees = self.db.cf_handle("ironwood_note_commitment_tree").unwrap();
+        let (_stored_height, tree) = self
+            .db
+            .zs_prev_key_value_back_from(&ironwood_trees, height)?;
 
         Some(Arc::new(tree))
     }
@@ -848,20 +887,41 @@ impl DiskWriteBatch {
             return Ok(());
         }
 
-        let prev_sapling_tree = prev_note_commitment_trees.as_ref().map_or_else(
-            || zakura_db.sapling_tree_for_tip(),
-            |prev_trees| prev_trees.sapling.clone(),
-        );
-        let prev_orchard_tree = prev_note_commitment_trees.as_ref().map_or_else(
-            || zakura_db.orchard_tree_for_tip(),
-            |prev_trees| prev_trees.orchard.clone(),
-        );
-        let prev_ironwood_tree = prev_note_commitment_trees.as_ref().map_or_else(
-            || zakura_db.ironwood_tree_for_tip(),
-            |prev_trees| prev_trees.ironwood.clone(),
-        );
+        // After a restart inside the VCT absent band, the in-memory frontiers
+        // are unavailable and the tip lookups return empty trees. At the
+        // handoff, compare the verified frontiers with the last physically
+        // stored trees below the absent band. This preserves sparse-tree
+        // deduplication when no shielded notes were added during the band.
+        let is_vct_handoff = fast_write.sync_below == Some(*height);
+
+        let prev_sapling_tree = if is_vct_handoff {
+            zakura_db.latest_stored_sapling_tree(height)
+        } else {
+            Some(prev_note_commitment_trees.as_ref().map_or_else(
+                || zakura_db.sapling_tree_for_tip(),
+                |prev_trees| prev_trees.sapling.clone(),
+            ))
+        };
+        let prev_orchard_tree = if is_vct_handoff {
+            zakura_db.latest_stored_orchard_tree(height)
+        } else {
+            Some(prev_note_commitment_trees.as_ref().map_or_else(
+                || zakura_db.orchard_tree_for_tip(),
+                |prev_trees| prev_trees.orchard.clone(),
+            ))
+        };
+        let prev_ironwood_tree = if is_vct_handoff {
+            zakura_db.latest_stored_ironwood_tree(height)
+        } else {
+            Some(prev_note_commitment_trees.as_ref().map_or_else(
+                || zakura_db.ironwood_tree_for_tip(),
+                |prev_trees| prev_trees.ironwood.clone(),
+            ))
+        };
         // Store the Sapling tree, anchor, and any new subtrees only if they have changed
-        if height.is_min() || prev_sapling_tree != note_commitment_trees.sapling {
+        if height.is_min()
+            || prev_sapling_tree.is_none_or(|prev_tree| prev_tree != note_commitment_trees.sapling)
+        {
             self.create_sapling_tree(zakura_db, height, &note_commitment_trees.sapling);
 
             if let Some(subtree) = note_commitment_trees.sapling_subtree {
@@ -870,7 +930,9 @@ impl DiskWriteBatch {
         }
 
         // Store the Orchard tree, anchor, and any new subtrees only if they have changed
-        if height.is_min() || prev_orchard_tree != note_commitment_trees.orchard {
+        if height.is_min()
+            || prev_orchard_tree.is_none_or(|prev_tree| prev_tree != note_commitment_trees.orchard)
+        {
             self.create_orchard_tree(zakura_db, height, &note_commitment_trees.orchard);
 
             if let Some(subtree) = note_commitment_trees.orchard_subtree {
@@ -879,7 +941,10 @@ impl DiskWriteBatch {
         }
 
         // Store the Ironwood tree, anchor, and any new subtrees only if they have changed
-        if height.is_min() || prev_ironwood_tree != note_commitment_trees.ironwood {
+        if height.is_min()
+            || prev_ironwood_tree
+                .is_none_or(|prev_tree| prev_tree != note_commitment_trees.ironwood)
+        {
             self.create_ironwood_tree(zakura_db, height, &note_commitment_trees.ironwood);
 
             if let Some(subtree) = note_commitment_trees.ironwood_subtree {

@@ -351,7 +351,9 @@ pub enum BlockSyncMisbehavior {
     GetBlocksTooLong,
     /// A peer exceeded this node's inbound `GetBlocks` serving budget.
     GetBlocksSpam,
-    /// A peer supplied a body whose hash or size does not match committed metadata.
+    /// A peer supplied a body whose payload does not match its requested header.
+    BodyPayloadMismatch(zakura_header_chain::BodyPayloadMismatch),
+    /// A peer supplied another invalid block payload.
     InvalidBlock,
     /// A peer supplied a body outside the tolerated scheduling-size deviation.
     SizeMismatch,

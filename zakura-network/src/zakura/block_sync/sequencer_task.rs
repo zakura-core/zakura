@@ -746,14 +746,25 @@ impl SequencerTask {
                 let released = self.work.reset_above(self.sequencer.floor());
                 self.budget.release(released);
                 let _ = self.sequencer.drop_reorder_from(height);
-                // A `Rejected` result means consensus found the body invalid.
-                // Attribute it to the delivering peer so repeat offenders are
-                // scored and eventually disconnected. `Unavailable` and
-                // `TimedOut` are local/transient failures, so they are not scored.
+                // A `Rejected` result is a peer-attributable bad body delivery.
+                // Attribute it to the delivering peer. `Unavailable` and `TimedOut`
+                // are local/transient failures, so they are not scored.
                 if matches!(result, BlockApplyResult::Rejected) && attribution_matches {
+                    let reason = match outcome.verification() {
+                        zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(mismatch) => {
+                            BlockSyncMisbehavior::BodyPayloadMismatch(*mismatch)
+                        }
+                        zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(_) => {
+                            BlockSyncMisbehavior::InvalidBlock
+                        }
+                        zakura_header_chain::BodyVerificationOutcome::Verified(_)
+                        | zakura_header_chain::BodyVerificationOutcome::Retryable(_) => {
+                            unreachable!("only rejected outcomes reach peer scoring")
+                        }
+                    };
                     self.send_action(BlockSyncAction::Misbehavior {
                         peer: applying.source_peer.clone(),
-                        reason: BlockSyncMisbehavior::InvalidBlock,
+                        reason,
                     })
                     .await;
                 }
@@ -1516,6 +1527,116 @@ mod tests {
         task.handle_accept_body(old_body);
         assert_eq!(task.sequencer.reorder_len(), 0);
         assert_eq!(task.sequencer.applying_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn in_02_each_commitment_mismatch_scores_body_delivery_only_and_keeps_header() {
+        let kinds = [
+            zakura_header_chain::BodyCommitmentKind::HeaderHash,
+            zakura_header_chain::BodyCommitmentKind::TransactionMerkleRoot,
+            zakura_header_chain::BodyCommitmentKind::AuthDataRoot,
+            zakura_header_chain::BodyCommitmentKind::Other("test.other_commitment"),
+        ];
+        for (index, kind) in kinds.into_iter().enumerate() {
+            for attribution_matches in [true, false] {
+                let frontiers = BlockSyncFrontiers {
+                    finalized_height: block::Height(0),
+                    verified_block_tip: block::Height(0),
+                    verified_block_hash: block::Hash([0; 32]),
+                };
+                let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let (_body_tx, body_rx) = mpsc::channel(1);
+                let (_control_tx, control_rx) = mpsc::unbounded_channel();
+                let (actions, mut actions_rx) = mpsc::channel(4);
+                let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+                let mut task = SequencerTask::new(
+                    Sequencer::new(block::Height(0), 1),
+                    ByteBudget::new(123),
+                    Arc::new(WorkQueue::new(block::Height(0))),
+                    Arc::new(PeerRegistry::new()),
+                    actions,
+                    ThroughputMeter::new(Instant::now()),
+                    frontiers,
+                    Some(super::test_work_scope()),
+                    crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                    body_rx,
+                    control_rx,
+                    input_bytes.clone(),
+                    input_decoded_bytes.clone(),
+                    view_tx,
+                    Duration::from_secs(1),
+                    ZakuraTrace::noop(),
+                );
+
+                let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+                body.leave_queue();
+                task.handle_accept_body(body);
+                task.submit_pending_blocks().await;
+                let BlockSyncAction::SubmitBlock {
+                    owner,
+                    source,
+                    token,
+                    block,
+                } = actions_rx.recv().await.expect("body is submitted")
+                else {
+                    panic!("expected a body submission");
+                };
+                let height = block.coinbase_height().expect("test block has height");
+                let hash = block.hash();
+                let attributed_source = if attribution_matches {
+                    source
+                } else {
+                    zakura_header_chain::SourceId::from_digest([9; 32])
+                };
+                let marker = u8::try_from(index).expect("the mismatch matrix fits in u8");
+                let mismatch = zakura_header_chain::BodyPayloadMismatch {
+                    evidence: zakura_header_chain::EvidenceId::from_digest(
+                        [marker.wrapping_add(0x80); 32],
+                    ),
+                    requested: hash,
+                    delivered: block::Hash([marker.wrapping_add(0x40); 32]),
+                    kind,
+                    source: attributed_source,
+                };
+                let mut outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+
+                assert_eq!(
+                    task.handle_apply_finished(
+                        owner,
+                        source,
+                        token,
+                        height,
+                        hash,
+                        &mut outcome,
+                        BTreeSet::new(),
+                        None,
+                        true,
+                    )
+                    .await,
+                    (true, true),
+                    "a current mismatch retires the bad body and requests more work"
+                );
+                assert!(!task.sequencer.applying_contains(height));
+                assert_eq!(task.sequencer.in_flight_submission_count(), 0);
+
+                if attribution_matches {
+                    assert!(matches!(
+                        actions_rx.recv().await,
+                        Some(BlockSyncAction::Misbehavior {
+                            peer,
+                            reason: BlockSyncMisbehavior::BodyPayloadMismatch(actual),
+                        }) if peer == ZakuraPeerId::new(vec![1; 32])
+                            .expect("test peer ID is valid")
+                            && actual == mismatch
+                    ));
+                }
+                assert!(
+                    actions_rx.try_recv().is_err(),
+                    "payload mismatch can emit only exact-supplier scoring, never eligibility state"
+                );
+            }
+        }
     }
 
     #[tokio::test]

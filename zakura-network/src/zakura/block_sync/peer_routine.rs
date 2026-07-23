@@ -168,6 +168,49 @@ fn record_decoded_memory_size(block: &block::Block, body_wire_bytes: Option<u64>
     decoded_attributed_memory_size_bytes
 }
 
+fn header_hash_payload_mismatch(
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
+    requested: block::Hash,
+    delivered: block::Hash,
+) -> zakura_header_chain::BodyPayloadMismatch {
+    let mut hasher = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"ZkBodyMismatch1_")
+        .to_state();
+    hasher.update(&owner.state_version.get().to_le_bytes());
+    hasher.update(&owner.header_generation.get().to_le_bytes());
+    match owner.verified_generation {
+        Some(generation) => {
+            hasher.update(&[1]);
+            hasher.update(&generation.get().to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.update(&owner.branch.anchor_hash.0);
+    hasher.update(&owner.branch.target_tip_hash.0);
+    hasher.update(&owner.session_id.to_le_bytes());
+    hasher.update(&owner.request_id.get().to_le_bytes());
+    hasher.update(&source.digest());
+    hasher.update(&requested.0);
+    hasher.update(&delivered.0);
+    zakura_header_chain::BodyPayloadMismatch {
+        evidence: zakura_header_chain::EvidenceId::from_digest(
+            hasher
+                .finalize()
+                .as_bytes()
+                .try_into()
+                .expect("the configured payload-mismatch digest is exactly 32 bytes"),
+        ),
+        requested,
+        delivered,
+        kind: zakura_header_chain::BodyCommitmentKind::HeaderHash,
+        source,
+    }
+}
+
 /// Outcome classification for finishing an outstanding request.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Disposition {
@@ -1340,10 +1383,24 @@ impl PeerRoutine {
             tracing::debug!(peer = ?self.peer, ?height, "ignoring duplicate block-sync body frame");
             return;
         }
-        if outstanding.request.expected_hash(height) != Some(hash) {
-            self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
-                .await;
-            return;
+        match outstanding.request.expected_hash(height) {
+            Some(requested) if requested != hash => {
+                let mismatch = header_hash_payload_mismatch(
+                    outstanding.request.owner,
+                    self.source,
+                    requested,
+                    hash,
+                );
+                self.report_misbehavior(BlockSyncMisbehavior::BodyPayloadMismatch(mismatch))
+                    .await;
+                return;
+            }
+            Some(_) => {}
+            None => {
+                self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
+                    .await;
+                return;
+            }
         }
         let outstanding_owner = outstanding.request.owner;
         if self.work.owner_for_height(height) != Some(outstanding_owner) {

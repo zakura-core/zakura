@@ -71,28 +71,6 @@ fn forked_block(block: &Arc<block::Block>, nonce_tag: u8) -> Arc<block::Block> {
     Arc::new(fork)
 }
 
-fn block_with_bad_merkle_root(
-    block: &Arc<block::Block>,
-    extra_tx: &Arc<block::Block>,
-) -> Arc<block::Block> {
-    let mut bad_block = block.as_ref().clone();
-    bad_block
-        .transactions
-        .push(extra_tx.transactions[0].clone());
-
-    assert_eq!(bad_block.hash(), block.hash());
-    assert_eq!(bad_block.coinbase_height(), block.coinbase_height());
-    assert_ne!(
-        bad_block
-            .transactions
-            .iter()
-            .collect::<block::merkle::Root>(),
-        bad_block.header.merkle_root
-    );
-
-    Arc::new(bad_block)
-}
-
 /// Build `count` internally-consistent blocks at the sequential heights
 /// `1..=count`.
 ///
@@ -755,7 +733,10 @@ async fn drain_parent_first_actions(
                 *verified_tip = height;
             }
             BlockSyncAction::Misbehavior {
-                reason: BlockSyncMisbehavior::InvalidBlock | BlockSyncMisbehavior::UnsolicitedBlock,
+                reason:
+                    BlockSyncMisbehavior::BodyPayloadMismatch(_)
+                    | BlockSyncMisbehavior::InvalidBlock
+                    | BlockSyncMisbehavior::UnsolicitedBlock,
                 ..
             } => {}
             BlockSyncAction::QueryNeededBlocks { .. } => {}
@@ -5935,7 +5916,6 @@ async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
             action => panic!("unexpected action before submit: {action:?}"),
         }
     }
-
     reactor_task.abort();
 }
 
@@ -10314,7 +10294,20 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
         match next_action(&mut actions).await {
             BlockSyncAction::Misbehavior { peer, reason } => {
                 assert_eq!(peer, peer_id);
-                assert_eq!(reason, BlockSyncMisbehavior::InvalidBlock);
+                assert!(matches!(
+                    reason,
+                    BlockSyncMisbehavior::BodyPayloadMismatch(
+                        zakura_header_chain::BodyPayloadMismatch {
+                            requested,
+                            delivered,
+                            kind: zakura_header_chain::BodyCommitmentKind::HeaderHash,
+                            source,
+                            ..
+                        }
+                    ) if requested == block::Hash([222; 32])
+                        && delivered == blocks[1].hash()
+                        && source == zakura_header_chain::SourceId::from_digest([48; 32])
+                ));
                 break;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
@@ -10739,14 +10732,26 @@ async fn reactor_rejects_block_hash_mismatch_without_hard_drop_for_size_mismatch
     loop {
         match next_action(&mut actions).await {
             BlockSyncAction::Misbehavior { reason, .. } => {
-                assert_eq!(reason, BlockSyncMisbehavior::InvalidBlock);
+                assert!(matches!(
+                    reason,
+                    BlockSyncMisbehavior::BodyPayloadMismatch(
+                        zakura_header_chain::BodyPayloadMismatch {
+                            requested,
+                            delivered,
+                            kind: zakura_header_chain::BodyCommitmentKind::HeaderHash,
+                            source,
+                            ..
+                        }
+                    ) if requested == block::Hash([9; 32])
+                        && delivered == mainnet_block(&BLOCK_MAINNET_1_BYTES).hash()
+                        && source == zakura_header_chain::SourceId::from_digest([41; 32])
+                ));
                 break;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before invalid-block report: {action:?}"),
         }
     }
-
     reactor_task.abort();
 }
 
@@ -10859,7 +10864,7 @@ async fn scheduled_get_blocks_is_sent_once_via_session() {
 }
 
 #[tokio::test]
-async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
+async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalidity() {
     let request_bytes: u32 = 10_000;
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
@@ -10867,13 +10872,6 @@ async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
     };
 
     let blocks = mainnet_blocks_1_to_3();
-    // A body that keeps block 1's header (so it passes the reactor's hash and
-    // height gates) but carries an extra transaction, so its merkle root no
-    // longer matches the header. The reactor no longer recomputes the merkle
-    // root at ingress, so this body reaches consensus, which rejects it.
-    let bad_body = block_with_bad_merkle_root(&blocks[0], &blocks[1]);
-    assert_eq!(bad_body.hash(), blocks[0].hash());
-
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -10920,15 +10918,14 @@ async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
 
     bad_inbound
         .send(
-            BlockSyncMessage::Block(bad_body)
+            BlockSyncMessage::Block(blocks[0].clone())
                 .encode_frame()
-                .expect("bad block frame encodes"),
+                .expect("block frame encodes"),
         )
         .await
-        .expect("bad block frame queues");
+        .expect("block frame queues");
 
-    // The merkle-invalid body is no longer filtered at ingress: it is buffered
-    // and submitted to consensus.
+    // The commitment-matching body is buffered and submitted to consensus.
     let (submit_owner, submit_source, submit_token) = loop {
         match next_action(&mut actions).await {
             BlockSyncAction::SubmitBlock {
@@ -10945,10 +10942,13 @@ async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
         }
     };
 
-    // Consensus rejects the invalid body. The reactor must attribute the
-    // rejection to the peer that delivered it and score the peer as misbehavior,
-    // rather than silently rolling back scheduling state and letting the peer
-    // keep feeding invalid bodies for needed heights.
+    // Model a deterministic consensus rule failure after the commitments match.
+    let invalid = zakura_header_chain::ConsensusBodyInvalid {
+        hash: blocks[0].hash(),
+        evidence: zakura_header_chain::EvidenceId::from_digest([0xa5; 32]),
+        rule: zakura_header_chain::BodyRuleId::new("test.consensus_invalid"),
+        source: submit_source,
+    };
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
             owner: submit_owner,
@@ -10956,7 +10956,7 @@ async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
             token: submit_token,
             height: block::Height(1),
             hash: blocks[0].hash(),
-            outcome: test_block_apply_outcome(BlockApplyResult::Rejected),
+            outcome: BlockApplyOutcome::consensus_invalid(invalid),
         })
         .await
         .expect("apply-finished event queues");

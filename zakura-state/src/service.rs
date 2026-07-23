@@ -52,7 +52,7 @@ use crate::{
     service::{
         block_iter::any_ancestor_blocks,
         chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip},
-        finalized_state::{FinalizedState, ZakuraDb},
+        finalized_state::{DatabaseWriterMetadata, FinalizedState, ZakuraDb},
         non_finalized_state::{Chain, NonFinalizedState},
         pending_utxos::PendingUtxos,
         queued_blocks::QueuedBlocks,
@@ -338,18 +338,41 @@ impl StateService {
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
     ) -> (Self, ReadStateService, LatestChainTip, ChainTipChange) {
+        Self::new_with_database_writer_metadata(
+            config,
+            network,
+            max_checkpoint_height,
+            checkpoint_verify_concurrency_limit,
+            DatabaseWriterMetadata::default_zakura(),
+        )
+        .await
+    }
+
+    /// Creates a new state service, recording explicit writer metadata in the
+    /// writable finalized database.
+    pub async fn new_with_database_writer_metadata(
+        config: Config,
+        network: &Network,
+        max_checkpoint_height: block::Height,
+        checkpoint_verify_concurrency_limit: usize,
+        database_writer_metadata: DatabaseWriterMetadata,
+    ) -> (Self, ReadStateService, LatestChainTip, ChainTipChange) {
         let (finalized_state, finalized_tip, timer) = {
             let config = config.clone();
             let network = network.clone();
             tokio::task::spawn_blocking(move || {
                 let timer = CodeTimer::start();
-                let finalized_state = FinalizedState::new(&config, &network)
-                    .expect(
-                        "opening the read-write finalized state database failed; check that the \
+                let finalized_state = FinalizedState::new_with_database_writer_metadata(
+                    &config,
+                    &network,
+                    database_writer_metadata,
+                )
+                .expect(
+                    "opening the read-write finalized state database failed; check that the \
                      state cache directory is writable and not locked by another Zakura instance, \
                      and that there is free disk space",
-                    )
-                    .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
+                )
+                .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
                 timer.finish_desc("opening finalized state database");
 
                 let timer = CodeTimer::start();
@@ -2254,6 +2277,38 @@ pub async fn init(
             network,
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
+        )
+        .await;
+
+    (
+        BoxService::new(state_service),
+        read_only_state_service,
+        latest_chain_tip,
+        chain_tip_change,
+    )
+}
+
+/// Initialize a state service from the provided [`Config`] and explicit node
+/// software metadata.
+pub async fn init_with_database_writer_metadata(
+    config: Config,
+    network: &Network,
+    max_checkpoint_height: block::Height,
+    checkpoint_verify_concurrency_limit: usize,
+    database_writer_metadata: DatabaseWriterMetadata,
+) -> (
+    BoxService<Request, Response, BoxError>,
+    ReadStateService,
+    LatestChainTip,
+    ChainTipChange,
+) {
+    let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
+        StateService::new_with_database_writer_metadata(
+            config,
+            network,
+            max_checkpoint_height,
+            checkpoint_verify_concurrency_limit,
+            database_writer_metadata,
         )
         .await;
 

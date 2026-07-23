@@ -96,7 +96,7 @@ use zakura_chain::block::{self, genesis::regtest_genesis_block};
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_network::types::PeerServices;
 use zakura_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
-use zakura_state::StorageMode;
+use zakura_state::{DatabaseWriterMetadata, StorageMode};
 
 use zakura::{
     drive_block_sync_actions, drive_vct_root_repairs, drive_zakura_header_sync_actions,
@@ -106,7 +106,7 @@ use zakura::{
 };
 
 use crate::{
-    application::{build_version, user_agent, LAST_WARN_ERROR_LOG_SENDER},
+    application::{build_version, release_version, user_agent, LAST_WARN_ERROR_LOG_SENDER},
     components::{
         health,
         inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
@@ -372,13 +372,20 @@ impl StartCmd {
         state_config.checkpoint_sync = config.consensus.checkpoint_sync;
         state_config.vct_fast_sync = config.consensus.vct_fast_sync_enabled();
 
+        let database_writer_metadata = DatabaseWriterMetadata::new(
+            "Zakura",
+            build_version().to_string(),
+            format!("v{}", release_version()),
+        );
+
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
-            zakura_state::init(
+            zakura_state::init_with_database_writer_metadata(
                 state_config,
                 &config.network.network,
                 max_checkpoint_height,
                 config.sync.checkpoint_verify_concurrency_limit
                     * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
+                database_writer_metadata,
             )
             .await;
 

@@ -26,12 +26,11 @@ use crate::{
 ///
 /// - each note-commitment root is either pinned to its pre-activation value or folded into
 ///   the applicable ZIP-221 history leaf;
-/// - Orchard and Ironwood transaction counts are pinned to zero before activation and folded
-///   into their applicable history leaves afterward;
-/// - the auth-data root is body-verified-only below NU5 and committed by the current header
-///   from NU5 onward;
-/// - the Sapling transaction count is folded into the V1 history leaf from Heartwood onward,
-///   but is body-verified-only below Heartwood.
+/// - Sapling, Orchard, and Ironwood transaction counts are pinned to zero before activation and
+///   folded into their applicable history leaves afterward (Sapling counts enter the V1 leaf at
+///   Heartwood; below Heartwood they are body-verified-only and cleared on promotion);
+/// - the auth-data root is body-verified-only below NU5 (cleared on promotion) and committed by
+///   the current header from NU5 onward.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockCommitmentRoots {
     /// The block height these roots are for.
@@ -52,8 +51,9 @@ pub struct BlockCommitmentRoots {
     /// The per-block shielded transaction counts are the *only* ZIP-221 history-leaf inputs
     /// the header and roots don't already provide (everything else — hash, time,
     /// difficulty/work, height — is header-derived). From Heartwood onward a wrong count
-    /// changes the leaf and fails the header commitment check. Below Heartwood ZIP-221 does
-    /// not exist, so this field is body-verified-only.
+    /// changes the leaf and fails the header commitment check. Below Sapling the count is
+    /// pinned to zero; between Sapling and Heartwood ZIP-221 does not exist yet, so the field
+    /// is body-verified-only and cleared to zero when the row is promoted.
     pub sapling_tx: u64,
     /// Number of this block's transactions carrying Orchard shielded data
     /// (`Block::orchard_transactions_count`); pinned to zero below NU5 and authenticated by
@@ -70,7 +70,7 @@ pub struct BlockCommitmentRoots {
     /// (`hashBlockCommitments = BLAKE2b(chainHistoryRoot ‖ authDataRoot ‖ 0)`) without
     /// downloading this block's body. A wrong value fails verification against the current
     /// header from NU5 onward. Below NU5 the header commits the chain-history root directly,
-    /// so this field is body-verified-only.
+    /// so this field is body-verified-only and cleared to the all-zero root on promotion.
     pub auth_data_root: AuthDataRoot,
 }
 

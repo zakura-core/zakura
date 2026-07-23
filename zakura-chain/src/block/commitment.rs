@@ -420,6 +420,11 @@ pub enum CommitmentError {
     InvalidPreNu5OrchardTxCount { expected: u64, actual: u64 },
 
     #[error(
+        "invalid pre-Sapling sapling transaction count: expected {expected}, actual: {actual}"
+    )]
+    InvalidPreSaplingSaplingTxCount { expected: u64, actual: u64 },
+
+    #[error(
         "invalid pre-Nu6_3 ironwood root: expected the empty-tree root {:?}, actual: {:?}",
         hex::encode(expected),
         hex::encode(actual)

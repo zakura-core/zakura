@@ -217,10 +217,16 @@ implements this rule. It also performs the direct checks needed outside the
 applicable ZIP-221 history-tree versions:
 
 - Sapling roots below Heartwood;
+- zero Sapling transaction counts below Sapling;
 - empty Orchard roots below NU5;
 - zero Orchard transaction counts below NU5;
 - empty Ironwood roots below NU6.3;
 - zero Ironwood transaction counts below NU6.3.
+
+Confirmed rows also clear body-verified-only fields before promotion:
+`sapling_tx` below Heartwood and `auth_data_root` below NU5 become canonical
+zeros, so authenticated storage never retains peer-controlled bytes for those
+slots.
 
 The wire payload already contains the remaining header-only leaf inputs:
 
@@ -230,10 +236,11 @@ The wire payload already contains the remaining header-only leaf inputs:
 
 The `sapling_tx` field below Heartwood and `auth_data_root` below NU5 are
 body-verified-only. ZIP-221 does not exist below Heartwood, and pre-NU5 headers
-do not commit to the auth-data root, so those fields remain unauthenticated
-after the row's roots and pre-activation fields pass header-layer checks.
-Bodies are still required later to prove that all transaction counts and the
-auth-data root match the downloaded body (I-16).
+do not commit to the auth-data root. Authentication clears those fields to
+canonical zeros when confirming a row, so later readers of the authoritative
+index do not have to re-derive which fields were header-bound. Bodies are still
+required later to prove that all transaction counts and the auth-data root match
+the downloaded body (I-16).
 
 ## 6. Architecture and ownership
 

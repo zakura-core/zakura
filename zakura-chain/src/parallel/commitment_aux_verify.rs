@@ -108,6 +108,8 @@ where
             &roots.sapling_root,
         )
         .map_err(|error| (height, error))?;
+        verify_supplied_sapling_tx_below_sapling(network, height, roots.sapling_tx)
+            .map_err(|error| (height, error))?;
         verify_supplied_orchard_root_below_nu5(network, height, &roots.orchard_root)
             .map_err(|error| (height, error))?;
         verify_supplied_orchard_tx_below_nu5(network, height, roots.orchard_tx)
@@ -138,7 +140,13 @@ where
         .map_err(Arc::new)
         .map_err(SuppliedRootsError::from)
         .map_err(|error| (height, error))?;
-        confirmed_roots.push((*roots).clone());
+        // Persist only header-authenticated (or pre-activation-pinned) field values under the
+        // verified banner. Body-verified-only fields are cleared to canonical empties so a peer
+        // cannot poison currently-dead or unauthenticated slots that are later re-served.
+        confirmed_roots.push(normalize_unauthenticated_commitment_fields(
+            network,
+            (*roots).clone(),
+        ));
         confirmed_hashes.push(block::Hash::from(*header));
     }
 
@@ -240,6 +248,58 @@ pub fn verify_supplied_sapling_root_below_heartwood_from_header(
     }
 
     Ok(())
+}
+
+/// Verifies that a supplied Sapling transaction count is zero before Sapling.
+pub fn verify_supplied_sapling_tx_below_sapling(
+    network: &Network,
+    height: Height,
+    sapling_tx: u64,
+) -> Result<(), SuppliedRootsError> {
+    if let Some(sapling_height) = NetworkUpgrade::Sapling.activation_height(network) {
+        if height >= sapling_height {
+            return Ok(());
+        }
+    }
+
+    if sapling_tx != 0 {
+        return Err(CommitmentError::InvalidPreSaplingSaplingTxCount {
+            expected: 0,
+            actual: sapling_tx,
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Clears body-verified-only fields so authenticated rows never persist peer-controlled bytes
+/// that the header layer does not bind.
+///
+/// - `sapling_tx` below Heartwood (ZIP-221 does not exist yet; pre-Sapling is also pinned to zero)
+/// - `auth_data_root` below NU5 (headers commit the chain-history root directly)
+///
+/// Heartwood+ `sapling_tx` and NU5+ `auth_data_root` are left intact: those values were checked
+/// against the applicable header commitment / history leaf before confirmation.
+pub fn normalize_unauthenticated_commitment_fields(
+    network: &Network,
+    mut roots: BlockCommitmentRoots,
+) -> BlockCommitmentRoots {
+    let below_heartwood = NetworkUpgrade::Heartwood
+        .activation_height(network)
+        .is_none_or(|heartwood| roots.height < heartwood);
+    if below_heartwood {
+        roots.sapling_tx = 0;
+    }
+
+    let below_nu5 = NetworkUpgrade::Nu5
+        .activation_height(network)
+        .is_none_or(|nu5| roots.height < nu5);
+    if below_nu5 {
+        roots.auth_data_root = AuthDataRoot::from([0u8; 32]);
+    }
+
+    roots
 }
 
 /// Verifies a supplied Orchard root for a pre-NU5 block.
@@ -574,6 +634,87 @@ mod tests {
     }
 
     #[test]
+    fn pins_sapling_tx_to_zero_below_sapling_and_defers_above() {
+        let sapling = NetworkUpgrade::Sapling
+            .activation_height(&Mainnet)
+            .expect("mainnet has Sapling");
+        let pre_sapling = Height(sapling.0 - 1);
+
+        verify_supplied_sapling_tx_below_sapling(&Mainnet, pre_sapling, 0)
+            .expect("a zero Sapling transaction count is accepted below Sapling");
+        let error = verify_supplied_sapling_tx_below_sapling(&Mainnet, pre_sapling, 1)
+            .expect_err("a non-zero Sapling transaction count must be rejected below Sapling");
+        assert!(
+            matches!(
+                error,
+                SuppliedRootsError::InvalidHeaderCommitment(
+                    CommitmentError::InvalidPreSaplingSaplingTxCount { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-Sapling Sapling count error, got: {error:?}"
+        );
+
+        verify_supplied_sapling_tx_below_sapling(&Mainnet, sapling, 1)
+            .expect("at Sapling the count is body-verified until Heartwood, not pinned here");
+    }
+
+    #[test]
+    fn clears_unauthenticated_fields_when_confirming_roots() {
+        let sapling = NetworkUpgrade::Sapling
+            .activation_height(&Mainnet)
+            .expect("mainnet has Sapling")
+            .0;
+        let heartwood = NetworkUpgrade::Heartwood
+            .activation_height(&Mainnet)
+            .expect("mainnet has Heartwood")
+            .0;
+        assert!(
+            sapling + 1 < heartwood,
+            "fixture needs a Sapling height strictly below Heartwood"
+        );
+
+        let mut pre_heartwood = roots_from_block(
+            &mainnet_block_at(sapling),
+            mainnet_sapling_root_at(sapling),
+            orchard::tree::NoteCommitmentTree::default().root(),
+        );
+        pre_heartwood.height = Height(sapling);
+        pre_heartwood.sapling_tx = 7;
+        pre_heartwood.auth_data_root = AuthDataRoot::from([0xAA; 32]);
+
+        let normalized =
+            normalize_unauthenticated_commitment_fields(&Mainnet, pre_heartwood.clone());
+        assert_eq!(
+            normalized.sapling_tx, 0,
+            "pre-Heartwood sapling_tx must not be persisted under the verified banner"
+        );
+        assert_eq!(
+            normalized.auth_data_root,
+            AuthDataRoot::from([0u8; 32]),
+            "pre-NU5 auth_data_root must not be persisted under the verified banner"
+        );
+
+        let mut heartwood_roots = roots_from_block(
+            &mainnet_block_at(heartwood),
+            mainnet_sapling_root_at(heartwood),
+            orchard::tree::NoteCommitmentTree::default().root(),
+        );
+        heartwood_roots.sapling_tx = 3;
+        heartwood_roots.auth_data_root = AuthDataRoot::from([0xBB; 32]);
+        let normalized_heartwood =
+            normalize_unauthenticated_commitment_fields(&Mainnet, heartwood_roots.clone());
+        assert_eq!(
+            normalized_heartwood.sapling_tx, 3,
+            "Heartwood+ sapling_tx is authenticated by the history leaf and must be kept"
+        );
+        assert_eq!(
+            normalized_heartwood.auth_data_root,
+            AuthDataRoot::from([0u8; 32]),
+            "Heartwood is still pre-NU5, so auth_data_root is cleared"
+        );
+    }
+
+    #[test]
     fn pins_orchard_tx_to_zero_when_nu5_is_unconfigured() {
         let network = Network::new_regtest(RegtestParameters {
             activation_heights: ConfiguredActivationHeights {
@@ -687,9 +828,11 @@ mod tests {
         let verified = verify_supplied_roots_from_parts(&Mainnet, empty_history_tree(), items)
             .expect("real roots verify against the headers");
 
+        let expected_confirmed =
+            normalize_unauthenticated_commitment_fields(&Mainnet, act_roots.clone());
         assert_eq!(
             verified.confirmed_roots(),
-            std::slice::from_ref(&act_roots),
+            std::slice::from_ref(&expected_confirmed),
             "a two-header range only confirms the first header's roots"
         );
         assert_eq!(

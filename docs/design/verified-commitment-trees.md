@@ -235,8 +235,11 @@ orchard_root, ironwood_root, sapling_tx, orchard_tx, ironwood_tx, auth_data_root
 `zakura-state` share one type without a dependency cycle. `orchard_root` is the empty/default
 root below NU5, and `ironwood_root` is the empty/default root below `Nu6_3` (§6.1). The
 corresponding transaction counts are pinned to zero before those activations, and
-`sapling_tx` below Heartwood and `auth_data_root` below NU5 are body-verified-only because
-the applicable headers do not commit to those fields. The
+`sapling_tx` is pinned to zero before Sapling. Below Heartwood, `sapling_tx` is
+also body-verified-only (ZIP-221 does not exist yet); `auth_data_root` below NU5
+is body-verified-only because the applicable headers do not commit to that field.
+On promotion, those body-verified-only fields are cleared to canonical zeros so
+authenticated rows never retain peer-controlled values for unbound slots. The
 deserializer treats `height` as an unvalidated `u32`: a wrong or out-of-range height simply
 fails to match any local header during verification (§6), so it is harmless; malformed root
 bytes are rejected by the root parsers.

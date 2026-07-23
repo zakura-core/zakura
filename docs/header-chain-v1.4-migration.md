@@ -14,9 +14,12 @@ upgrade of the predecessor header overlay.
   sync does not relay blocks. Configuration parsing rejects the stale field;
   remove it before starting the upgraded node.
 - `getblockchaininfo.header_chain` reports the authoritative engine mode,
-  `header_best` (header-valid only), `verified_best`, finalized frontier, and
-  persistent alarms. In headers-only mode it also displays the irreversible
-  1,000-deep local-finality warning.
+  `header_best` (the best eligible header chain, not a fully valid Zcash chain
+  or body-validity claim), `verified_best`, finalized frontier, and persistent
+  alarms. In headers-only mode it also displays the irreversible 1,000-deep
+  local-finality warning, including the eclipse/incomplete-view risk, rejection
+  of later conflicting greater-work branches, settled-upgrade pin requirement,
+  and resynchronization procedure for a pin refuted after integrated migration.
 
 The supported headers-only-to-integrated engine-mode migration remains
 non-rollback and preserves migrated pins. It is separate from predecessor

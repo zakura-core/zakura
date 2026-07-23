@@ -3651,6 +3651,8 @@ pub struct HeaderChainInfo {
     /// Monotonic durable state version.
     #[getter(copy)]
     state_version: u64,
+    /// Meaning and validity boundary of `header_best`.
+    header_best_semantics: String,
     /// Best locally header-valid frontier; this is not a body-validity claim.
     header_best: HeaderChainFrontierInfo,
     /// Best fully body-verified frontier on the selected path.
@@ -3684,7 +3686,7 @@ impl HeaderChainInfo {
         };
         let finality_warning = matches!(snapshot.mode, zakura_state::HeaderChainMode::HeadersOnly)
             .then(|| {
-                "headers-only finality is an irreversible local trust decision made 1,000 headers behind header_best".to_string()
+                "headers-only finality is an irreversible local trust decision made 1,000 headers behind header_best; an eclipsed or incomplete view can pin the wrong header-valid branch, and later conflicting greater-work branches are rejected; correctness is relative to the durable finality history, settled-upgrade pins still apply, and a pin refuted after migration to integrated mode requires deleting the migrated header store and resynchronizing".to_string()
             });
         let header_best_body_unavailable = snapshot
             .alarms
@@ -3705,6 +3707,9 @@ impl HeaderChainInfo {
         Self {
             mode: mode.to_string(),
             state_version: snapshot.state_version.get(),
+            header_best_semantics:
+                "best eligible header chain; not a fully valid Zcash chain or body-validity claim"
+                    .to_string(),
             header_best: snapshot.frontiers.header_best.into(),
             verified_best: snapshot.frontiers.verified_best.into(),
             finalized: snapshot.frontiers.finalized.into(),

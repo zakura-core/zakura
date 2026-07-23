@@ -7,7 +7,10 @@ spec_version = "1.4"
 [[rule]]
 id = "LC-SCOPE-01"
 name = "Best-header semantics"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_rpc::HeaderChainInfo"
+tests = ["DF-02::header_chain_info_exposes_mode_frontiers_and_persistent_alarms"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-SCOPE-02"
@@ -22,7 +25,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-SCOPE-08"
 name = "Headers-only finality disclosure"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_rpc::HeaderChainInfo"
+tests = ["DG-07::headers_only_finalizes_exactly_tip_minus_one_thousand_before_publication", "DG-07::migrated_headers_only_pin_refutation_is_durable_and_fail_closed", "DF-02::header_chain_info_exposes_mode_frontiers_and_persistent_alarms"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-SCOPE-04"
@@ -83,14 +89,17 @@ status = "unimplemented"
 [[rule]]
 id = "LC-FRONTIER-03"
 name = "Selection is not verification"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::MemHeaderStore::select_header_best"
+tests = ["DG-02::body_availability_does_not_override_header_work_or_mark_other_bodies"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-FRONTIER-04"
 name = "Durable frontier publication"
 status = "implemented"
 owner = "zakura_state::HeaderChainRuntime"
-tests = ["DG-03::every_named_crash_point_reopens_to_complete_before_or_after"]
+tests = ["DG-03::every_named_crash_point_reopens_to_complete_before_or_after", "AUD-15::committed_snapshots_are_the_sole_production_frontier_source", "DF-02::get_blockchain_info_response_with_an_arbitrary_chain_tip"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

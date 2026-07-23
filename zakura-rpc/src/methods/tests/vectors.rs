@@ -92,13 +92,30 @@ fn header_chain_info_exposes_mode_frontiers_and_persistent_alarms() {
     let info = HeaderChainInfo::from_snapshot(snapshot, now);
     assert_eq!(info.mode(), "headers-only");
     assert_eq!(info.state_version(), 21);
+    assert_eq!(
+        info.header_best_semantics(),
+        "best eligible header chain; not a fully valid Zcash chain or body-validity claim"
+    );
     assert_eq!(info.header_best().height(), Height(15));
     assert_eq!(info.verified_best().height(), Height(12));
     assert_eq!(info.finalized().height(), Height(10));
-    assert!(
-        info.finality_warning().is_some(),
-        "headers-only mode must disclose its irreversible local trust decision"
-    );
+    let warning = info
+        .finality_warning()
+        .as_ref()
+        .expect("headers-only mode must disclose its irreversible local trust decision");
+    for required_disclosure in [
+        "irreversible local trust decision",
+        "eclipsed or incomplete view",
+        "conflicting greater-work branches are rejected",
+        "durable finality history",
+        "settled-upgrade pins still apply",
+        "deleting the migrated header store and resynchronizing",
+    ] {
+        assert!(
+            warning.contains(required_disclosure),
+            "headers-only warning must disclose {required_disclosure:?}"
+        );
+    }
     assert!(info.alarms().resource_stalled());
     let unavailable = info
         .alarms()
@@ -121,6 +138,10 @@ fn header_chain_info_exposes_mode_frontiers_and_persistent_alarms() {
 
     let json = serde_json::to_value(info).expect("header-chain status serializes");
     assert_eq!(json["mode"], "headers-only");
+    assert_eq!(
+        json["header_best_semantics"],
+        "best eligible header chain; not a fully valid Zcash chain or body-validity claim"
+    );
     assert_eq!(json["header_best"]["height"], 15);
     assert_eq!(json["verified_best"]["height"], 12);
     assert_eq!(json["finalized"]["height"], 10);

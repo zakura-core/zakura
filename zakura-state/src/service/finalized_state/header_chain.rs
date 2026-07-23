@@ -5311,6 +5311,344 @@ mod tests {
     }
 
     #[test]
+    fn aud_14_deferred_header_reevaluation_reopens_complete_before_or_after() {
+        #[derive(Copy, Clone)]
+        struct FixedClock(chrono::DateTime<Utc>);
+
+        impl zakura_header_chain::Clock for FixedClock {
+            fn now(&self) -> chrono::DateTime<Utc> {
+                self.0
+            }
+        }
+
+        for (index, target) in FaultPoint::ALL.into_iter().enumerate() {
+            let cache = tempfile::tempdir().expect("the test cache directory is created");
+            let db_config = Config {
+                cache_dir: cache.path().to_owned(),
+                ephemeral: false,
+                debug_skip_non_finalized_state_backup_task: true,
+                ..Config::default()
+            };
+            let (engine_config, anchor, metadata) = fixture();
+            let network = engine_config.network.clone();
+            let db = open(&db_config, &network);
+            let store = HeaderChainStore::new(db.clone());
+            store
+                .initialize(metadata, anchor.clone())
+                .expect("the empty schema initializes");
+            let (runtime, _) = store
+                .startup(&engine_config)
+                .expect("the initial store audits");
+            let initial = runtime.publisher().snapshot();
+            let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+            let lease = runtime
+                .reader()
+                .validation_context(anchor.hash)
+                .expect("the anchor validation context is coherent")
+                .expect("the initialized anchor is retained");
+            let rules = HeaderRules::for_validation_lease(network.clone(), &lease)
+                .expect("the authenticated regtest policy is valid");
+            let marker = u8::try_from(index + 0xa0).expect("the fault-point list fits in u8");
+            let preparation_clock = FixedClock(anchor.header.time);
+            let mut future_header = *anchor.header;
+            future_header.previous_block_hash = anchor.hash;
+            future_header.time += chrono::Duration::hours(3);
+            future_header.nonce.0[0] = marker;
+            let future_header = Arc::new(future_header);
+            let headers = [future_header.clone()];
+            let batch = zakura_header_chain::prepare_headers(
+                HeaderBatchInput::new(&headers),
+                &lease,
+                &rules,
+                &preparation_clock,
+            )
+            .expect("the locally future header is admitted as deferred");
+            let deferred_until = future_header.time - chrono::Duration::hours(2);
+            assert_eq!(
+                batch.headers()[0].validation,
+                HeaderValidationState::DeferredUntil(deferred_until)
+            );
+            let future = Frontier::new(
+                anchor
+                    .height
+                    .next()
+                    .expect("the genesis anchor has a next height"),
+                future_header.hash(),
+            );
+            let owner = WorkOwner {
+                state_version: initial.state_version,
+                header_generation: initial.header_generation,
+                verified_generation: None,
+                branch: BranchId::new(anchor.hash, future.hash),
+                session_id: 31,
+                request_id: NonZeroU64::new(32).expect("thirty-two is nonzero"),
+            };
+            let insertion_context = TransitionContext {
+                config: &engine_config,
+                clock: &preparation_clock,
+                full_state_authority: None,
+                startup_capability: None,
+                retention_references: &[],
+            };
+            runtime
+                .apply(
+                    TransitionRequest {
+                        expected_version: initial.state_version,
+                        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                            owner,
+                            source: SourceId::from_digest([marker.wrapping_add(1); 32]),
+                            parent_hash: anchor.hash,
+                            target_tip_hash: future.hash,
+                            completion: TargetCompletion::TargetComplete {
+                                common_ancestor: anchor_frontier,
+                            },
+                            batch,
+                            aux: Vec::new(),
+                        })),
+                    },
+                    &insertion_context,
+                )
+                .expect("the deferred header insertion commits");
+            let before = runtime.publisher().snapshot();
+            assert_eq!(before.frontiers.header_best, anchor_frontier);
+            assert_eq!(
+                runtime
+                    .store
+                    .node(future.hash)
+                    .expect("the deferred node read succeeds")
+                    .expect("the deferred node is retained")
+                    .validation,
+                HeaderValidationState::DeferredUntil(deferred_until)
+            );
+            assert_eq!(
+                runtime
+                    .store
+                    .deferred_entries()
+                    .expect("the deferred index is readable"),
+                vec![(deferred_until, future.hash)]
+            );
+
+            let reevaluation_clock = FixedClock(deferred_until);
+            let context = TransitionContext {
+                config: &engine_config,
+                clock: &reevaluation_clock,
+                full_state_authority: None,
+                startup_capability: None,
+                retention_references: &[],
+            };
+            let marker_key = [marker; 4];
+            let mut full_state_batch = DiskWriteBatch::new();
+            runtime
+                .store
+                .put_raw(
+                    &mut full_state_batch,
+                    ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+                    marker_key,
+                    [marker],
+                )
+                .expect("the paired reevaluation marker can be staged");
+            let memory_swapped = Arc::new(AtomicBool::new(false));
+            let swap_probe = memory_swapped.clone();
+            let result = runtime.apply_combined_with_fault(
+                TransitionRequest {
+                    expected_version: before.state_version,
+                    event: TransitionEvent::ReevaluateDeferred,
+                },
+                &context,
+                full_state_batch,
+                move || swap_probe.store(true, Ordering::SeqCst),
+                |point| {
+                    if point == target {
+                        Err(HeaderChainStoreError::InjectedCrash(point))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(HeaderChainStoreError::InjectedCrash(point)) if point == target
+            ));
+
+            let committed = matches!(
+                target,
+                FaultPoint::AfterDbCommit
+                    | FaultPoint::BeforeMemorySwap
+                    | FaultPoint::BeforePublish
+                    | FaultPoint::AfterPublish
+                    | FaultPoint::BeforeReactorObserve
+            );
+            let published = matches!(
+                target,
+                FaultPoint::AfterPublish | FaultPoint::BeforeReactorObserve
+            );
+            let committed_version = before
+                .state_version
+                .checked_next()
+                .expect("the short fixture state version can advance");
+            let committed_header_generation = before
+                .header_generation
+                .checked_next()
+                .expect("the short fixture header generation can advance");
+            let durable = runtime
+                .store
+                .snapshot()
+                .expect("the reevaluation snapshot read succeeds");
+            assert_eq!(
+                durable.state_version,
+                if committed {
+                    committed_version
+                } else {
+                    before.state_version
+                },
+                "{target:?}"
+            );
+            assert_eq!(
+                durable.frontiers.header_best,
+                if committed { future } else { anchor_frontier },
+                "{target:?}"
+            );
+            assert_eq!(
+                durable.header_generation,
+                if committed {
+                    committed_header_generation
+                } else {
+                    before.header_generation
+                },
+                "{target:?}"
+            );
+            assert_eq!(
+                durable.frontiers.verified_best, before.frontiers.verified_best,
+                "{target:?}"
+            );
+            assert_eq!(
+                durable.verified_generation, before.verified_generation,
+                "{target:?}"
+            );
+            assert_eq!(
+                runtime
+                    .store
+                    .node(future.hash)
+                    .expect("the future node read succeeds")
+                    .expect("the future node remains retained")
+                    .validation,
+                if committed {
+                    HeaderValidationState::Valid
+                } else {
+                    HeaderValidationState::DeferredUntil(deferred_until)
+                },
+                "{target:?}"
+            );
+            assert_eq!(
+                runtime
+                    .store
+                    .deferred_entries()
+                    .expect("the deferred index is readable"),
+                if committed {
+                    Vec::new()
+                } else {
+                    vec![(deferred_until, future.hash)]
+                },
+                "{target:?}"
+            );
+            let marker_cf = runtime
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the marker column family is open");
+            assert_eq!(
+                runtime
+                    .store
+                    .db
+                    .raw_get_cf(&marker_cf, &marker_key)
+                    .expect("the paired marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+            assert_eq!(
+                memory_swapped.load(Ordering::SeqCst),
+                matches!(
+                    target,
+                    FaultPoint::BeforePublish
+                        | FaultPoint::AfterPublish
+                        | FaultPoint::BeforeReactorObserve
+                ),
+                "{target:?}"
+            );
+            assert_eq!(
+                runtime.publisher().snapshot().frontiers.header_best,
+                if published { future } else { anchor_frontier },
+                "{target:?}"
+            );
+            drop(runtime);
+            drop(db);
+
+            let (reopened, report) = HeaderChainStore::new(open(&db_config, &network))
+                .startup(&engine_config)
+                .expect("the deferred reevaluation crash boundary reopens coherently");
+            assert_eq!(
+                reopened.publisher().snapshot(),
+                report.current,
+                "{target:?}"
+            );
+            assert_eq!(
+                report.current.frontiers.header_best,
+                if committed { future } else { anchor_frontier },
+                "{target:?}"
+            );
+            assert_eq!(
+                report.current.state_version,
+                if committed {
+                    committed_version
+                } else {
+                    before.state_version
+                },
+                "{target:?}"
+            );
+            assert_eq!(
+                reopened
+                    .store
+                    .node(future.hash)
+                    .expect("the reopened future node read succeeds")
+                    .expect("the reopened future node remains retained")
+                    .validation,
+                if committed {
+                    HeaderValidationState::Valid
+                } else {
+                    HeaderValidationState::DeferredUntil(deferred_until)
+                },
+                "{target:?}"
+            );
+            assert_eq!(
+                reopened
+                    .store
+                    .deferred_entries()
+                    .expect("the reopened deferred index is readable"),
+                if committed {
+                    Vec::new()
+                } else {
+                    vec![(deferred_until, future.hash)]
+                },
+                "{target:?}"
+            );
+            let reopened_marker_cf = reopened
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the reopened marker column family is open");
+            assert_eq!(
+                reopened
+                    .store
+                    .db
+                    .raw_get_cf(&reopened_marker_cf, &marker_key)
+                    .expect("the reopened paired marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
     fn aud_14_aux_authentication_reopens_complete_before_or_after() {
         const AUX_FAULT_POINTS: [FaultPoint; 11] = [
             FaultPoint::AfterSnapshot,

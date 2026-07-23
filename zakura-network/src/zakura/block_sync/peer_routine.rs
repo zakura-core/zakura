@@ -1211,21 +1211,27 @@ impl PeerRoutine {
     }
 
     /// Handle the peer closing its send side of the stream. Honest peers close
-    /// *connections*, not lone streams; a stream-only EOF while we still hold
-    /// unanswered requests is the same signal as the liveness stall and must not
-    /// reset the park/second-stall state machine — otherwise a peer could take
-    /// work, deliver nothing, EOF before the liveness deadline, and be readmitted
-    /// fresh forever. Frames are processed in-order in this task, so at EOF
-    /// everything the peer sent has already been counted. The liveness grace does
-    /// not apply: it waits for in-flight frames stuck behind our full outbound
-    /// queue, and a closed stream has none.
+    /// *connections*, not lone streams; a stream-only EOF while block-progress
+    /// liveness is still armed is the same signal as the liveness stall and must
+    /// not reset the park/second-stall state machine — otherwise a peer could
+    /// take work, deliver nothing, let its requests time out (which drains
+    /// `outstanding` without disarming liveness), EOF before the liveness
+    /// deadline, and be readmitted fresh forever. An armed deadline with empty
+    /// `outstanding` can only mean charged requests were consumed without
+    /// accepted progress — every answered-everything path disarms it — and
+    /// `DownloadWindow::check_liveness` parks at that deadline
+    /// regardless of `outstanding`, so parking here only moves the already
+    /// scheduled outcome earlier. Frames are processed in-order in this task, so
+    /// at EOF everything the peer sent has already been counted. The liveness
+    /// grace does not apply: it waits for in-flight frames stuck behind our full
+    /// outbound queue, and a closed stream has none.
     fn handle_remote_stream_closed(&mut self, now: Instant) -> Result<(), SinkReject> {
-        if self.window.outstanding.is_empty() {
+        if self.window.outstanding.is_empty() && self.window.block_liveness_deadline.is_none() {
             return Ok(());
         }
         self.no_progress_stall(
             now,
-            "block-sync peer closed the stream with outstanding requests unanswered",
+            "block-sync peer closed the stream with its requests unanswered",
         )
     }
 

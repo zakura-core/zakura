@@ -79,9 +79,15 @@ fastmod --fixed-strings '1.58' '1.65'
 
 ## Create the Release PR
 
-- [ ] Push the reviewed fragments and README updates into a new branch
-      for example: `bump-v1.0.0` - this needs to be different to the tag name
-- [ ] Create a release PR by adding `&template=release-checklist.md` to the comparing url ([Example](https://github.com/zakura-core/zakura/compare/bump-v1.0.0?expand=1&template=release-checklist.md)).
+- [ ] If a release-capable maintainer has asked you to hold releases, stop
+      here until they lift the hold — a security hotfix may be in flight for
+      the same version, invisible to you under embargo.
+- [ ] Push the reviewed fragments and README updates into a new branch named
+      `release/v<version>`, for example `release/v1.0.0` (CI triggers match
+      `release/**`; any name different from the tag works, but never
+      `hotfix/v*` — that namespace is reserved for the
+      [hotfix release process](https://github.com/zakura-core/zakura/blob/main/docs/security-hotfix-release.md)).
+- [ ] Create a release PR by adding `&template=release-checklist.md` to the comparing url ([Example](https://github.com/zakura-core/zakura/compare/release/v1.0.0?expand=1&template=release-checklist.md)).
 - [ ] Freeze the [`batched` queue](https://dashboard.mergify.com/github/valargroup/repo/zakura/queues) using Mergify.
 - [ ] Mark all the release PRs as `Critical` priority, so they go in the `urgent` Mergify queue.
 - [ ] Mark all non-release PRs with `do-not-merge`, because Mergify checks approved PRs against every commit, even when a queue is frozen.

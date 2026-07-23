@@ -157,9 +157,22 @@ the right to withhold reproduction details for counterfeiting-class bugs.
 | Base | When | Notes |
 | --- | --- | --- |
 | `hotfix/vX.Y.Z` cut from the last release tag | Default for solo, and whenever `main` has unreleased work operators shouldn't absorb mid-emergency | Minimal auditable diff; **mechanically simplest solo**: direct maintainer push, no PR review rule, no Mergify interaction. The branch must be named for the exact tag it releases — the `Create release` validate job enforces this. Fix must be forward-merged to `main` right after release. |
-| `main` | `main` is essentially the last release plus safe changes | Direct pushes to `main` are blocked for everyone; org admins can open the PR for the record and bypass-merge it. Freeze the Mergify `batched` queue first. |
+| `main` | `main` is essentially the last release plus safe changes | Direct pushes to `main` are blocked for everyone: at T-0, open a public PR **from `hotfix/vX.Y.Z`** and **squash-merge** it — the only method the `main` ruleset allows, and safe in this order because `Create release` tags the squash commit _after_ the merge. Freeze the Mergify `batched` queue first. |
 
 Record the choice and reasoning in the advisory.
+
+**Branch namespace rule.** Whatever the base, the hotfix process creates
+exactly two kinds of branches: `security/<codename>` in the private clone and
+staging repo, and `hotfix/vX.Y.Z` on the public repo — in main-base mode the
+T-0 PR branch is also named `hotfix/vX.Y.Z`. Never push to `release/v*` or
+`bump-v*`: those names belong to the regular release process, and under
+embargo neither side can see the other coming. Disjoint namespaces make a
+hotfix-vs-regular branch collision structurally impossible — at v1.0.3's T-0
+the hotfix and a concurrent regular release both claimed `release/v1.0.3`,
+and only an accidental non-fast-forward rejection surfaced it. Same-version
+collisions at the tag level are handled by the hold-releases heads-up
+([the day before](#the-day-before)) and the T-0 collision checks
+(see [Caveats](#caveats-and-risks), item 12).
 
 ### What the branch must contain before T-0
 
@@ -172,7 +185,14 @@ T-0 involves zero authoring — only pushing and clicking. The branch carries:
 2. **The complete release prep**, per the
    [hotfix release checklist](../.github/PULL_REQUEST_TEMPLATE/hotfix-release-checklist.md):
    - `zakura` package version bump (hotfixes are `patch`) and changed-crate
-     bumps (`cargo release version ...`);
+     bumps (`cargo release version ...`). When de-rc'ing an rc line to its
+     stable version, two things need explicit care: re-run
+     `cargo semver-checks` against the published **stable** baselines —
+     post-rc changes can raise the required bump level (v1.0.3's planned
+     patch de-rcs became three major bumps this way) — and normalize
+     internal dependency requirements, because `dependent-version = "fix"`
+     leaves stale `^X.Y.Z-rcN` requirements in place when the stable version
+     still matches them;
    - the stored config snapshot
      (`zakurad/tests/common/configs/v<version>.toml` — `last_config_is_stored`
      fails without it);
@@ -191,7 +211,11 @@ T-0 involves zero authoring — only pushing and clicking. The branch carries:
      already old, the hotfix ships with a short remaining runway — check it,
      state it in the release notes and announcement, and plan the next
      scheduled release accordingly;
-   - `make pre-release` passing, packaging checked with `--verify`.
+   - `make pre-release` passing, packaging checked with `--verify` — run
+     both in a **dedicated worktree** (`git worktree add ../zakura-verify
+     <commit>`): at v1.0.3, a branch checkout under a still-running
+     background test chain invalidated a completed verification pass and
+     forced a full re-run.
 3. **Commit messages written for public consumption** — world-readable at T-0.
    Recommended: accurate but minimal conventional commits
    ("fix(consensus): harden <area> validation"), detail deferred to the
@@ -228,11 +252,35 @@ never for anything public.
       force-push) is active.
 - [ ] `gh` authenticated; crates.io login current; minisign secret key
       accessible; you can reach the announcement channels.
+- [ ] The hotfix-branch forward-merge path is executable as written. The
+      `main` ruleset allows only squash and rebase, but the post-release
+      forward-merge needs a **merge commit**
+      (see [Post-release](#post-release)): either keep `merge` permanently
+      in the ruleset's allowed merge methods (recommended — the merge button
+      still defaults to squash) or verify the temporary-edit procedure in a
+      drill. At v1.0.3 this conflict was discovered live, mid-T-0.
 
 ### The day before
 
+This checklist is a hard gate: skipping or compressing any item is an
+explicit decision, recorded in the advisory with the reasoning — the same
+rule the canary soak already applies. At v1.0.3 the whole list collapsed
+into the incident hour with nothing recorded; the rc drills two days earlier
+are what made that survivable.
+
 - [ ] Staging rehearsals green **on the final commit** — CI suites and the
       tag dress rehearsal; soak criteria met.
+- [ ] Quiet heads-up to every release-capable maintainer: "a security
+      release is being prepared — hold releases until further notice." This
+      leaks only the schedule, which is public by design (non-goal 2), and
+      it is the main defense against two release trains claiming the same
+      version: under embargo you are invisible to a teammate correctly
+      running the regular checklist (this happened at v1.0.3's T-0).
+- [ ] Decide who executes the public T-0 triggers (branch push, PR merge,
+      workflow dispatch, promotion): the operator runs them directly by
+      default; if an agent drives the release, pre-authorize its T-0 command
+      set now — permission prompts mid-incident are unplanned friction at
+      exactly the wrong moment.
 - [ ] Optional [pre-announcement](#pre-announcement) published.
 - [ ] Main-base only: freeze the Mergify `batched` queue.
 - [ ] Partner/upstream notifications sent per `SECURITY.md`
@@ -249,8 +297,8 @@ Complete, verified assets exist before the tag does. Times from recent
 
 | Clock | Step |
 | --- | --- |
-| T-0 | Push `hotfix/vX.Y.Z` (or bypass-merge to `main`). |
-| T+2 | Dispatch `Create release` **from the hotfix branch** (or `main`) with the exact tag. |
+| T-0 | Branch base: push `hotfix/vX.Y.Z`. Main base: open the public PR from `hotfix/vX.Y.Z` and squash-merge it into `main`. |
+| T+2 | Dispatch `Create release` **from the hotfix branch** (or `main`, for main base) with the exact tag. |
 | T+2–25 | Hands-off build. Meanwhile: fresh checkout for crates publish, final announcement text. |
 | T+25 | Approve the `release` environment (yourself — this is your deliberate stop-and-check point, not a formality: right commit? right tag?). |
 | T+30 | Tag + complete pre-release published; tag-push run starts Docker publishing. |
@@ -306,9 +354,19 @@ warrants a pre-announcement.
 ### Post-release
 
 - [ ] Hotfix base: forward-merge `hotfix/vX.Y.Z` into `main` via a normal
-      public PR, immediately. Use a **merge commit** (admin merge), not a
-      squash, so the tagged commit becomes an ancestor of `main`.
-- [ ] Main base: un-freeze Mergify.
+      public PR, immediately, using a **merge commit** so the tagged commit
+      becomes an ancestor of `main`. Never squash it: a squash copies the
+      content but orphans the tagged commit, breaking later `BASE_TAG`
+      ancestry checks (both rc-drill forward-merges, #350 and #354, were
+      squashed by accident). The `main` ruleset only offers squash and
+      rebase, so this depends on the merge-method standing precondition: if
+      `merge` is not permanently allowed there, temporarily add it (Settings
+      → Rules → `main` → Require a pull request → allowed merge methods, or
+      `gh api --method PUT repos/zakura-core/zakura/rulesets/<id>` with the
+      amended rule), merge with the dropdown set to "Create a merge commit"
+      — **the button defaults to squash** — then revert the ruleset edit.
+- [ ] Main base: nothing to forward-merge — the fix entered `main` at T-0 as
+      the squash commit the tag points to. Un-freeze Mergify.
 - [ ] Confirm installer-metadata/post-release automation completed as usual.
 - [ ] Delete embargoed branches, rehearsal tags, and the private rehearsal
       release from the staging repo **before the next release preparation
@@ -383,6 +441,17 @@ without full detail).
     for fixes with observable behavior changes (peering, message patterns),
     consider whether the canary itself leaks.
 11. **Unrehearsed processes rot.** Drills (below) are part of the process.
+12. **A concurrent regular release can claim your version.** The embargo
+    blinds both sides: at v1.0.3's T-0, a teammate correctly following the
+    public checklist pushed their own `release/v1.0.3` and release PR at the
+    same hour — caught only because our branch push happened to be rejected
+    non-fast-forward. Had their dispatch run first, the version would have
+    shipped without the fix and been burned (tags are immutable, never
+    reused). Defenses, in depth: the branch namespace rule (the hotfix
+    process never touches `release/v*`), the hold-releases heads-up the day
+    before, and checking for open release PRs, `release/v*`/`bump-v*`
+    branches, and running `Create release` dispatches before pushing
+    anything at T-0.
 
 ## Drills
 

@@ -704,11 +704,13 @@ impl ValidateContextError {
                 };
                 BodyVerificationClass::PayloadMismatch(kind)
             }
-            Self::NonSequentialBlock { .. } => consensus("context.non_sequential_block"),
-            Self::TimeTooEarly { .. } => consensus("context.time_too_early"),
-            Self::TimeTooLate { .. } => consensus("context.time_too_late"),
-            Self::InvalidDifficultyThreshold { .. } => {
-                consensus("context.invalid_difficulty_threshold")
+            Self::NonSequentialBlock { .. } => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
+            }
+            Self::TimeTooEarly { .. }
+            | Self::TimeTooLate { .. }
+            | Self::InvalidDifficultyThreshold { .. } => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
             Self::DuplicateTransparentSpend { .. } => {
                 consensus("context.duplicate_transparent_spend")
@@ -848,13 +850,16 @@ mod tests {
             BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
         );
         assert_eq!(
-            ValidateContextError::NonSequentialBlock {
-                candidate_height: Height(7),
-                parent_height: Height(5),
+            ValidateContextError::DuplicateTransparentSpend {
+                outpoint: transparent::OutPoint {
+                    hash: [3; 32].into(),
+                    index: 0,
+                },
+                location: "test chain",
             }
             .body_verification_class(),
             BodyVerificationClass::ConsensusInvalid(zakura_header_chain::BodyRuleId::new(
-                "context.non_sequential_block"
+                "context.duplicate_transparent_spend"
             ))
         );
         assert_eq!(

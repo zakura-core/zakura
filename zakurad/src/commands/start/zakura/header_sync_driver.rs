@@ -75,12 +75,7 @@ pub(crate) async fn zakura_header_sync_driver_startup(
     let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
     let verified_block_tip =
         verified_block_tip_from_state(finalized_tip, verified_block_tip, empty_state_tip);
-    let best_header_tip = root_covered_best_header_tip_or_verified(
-        read_state,
-        best_header_tip.unwrap_or(empty_state_tip),
-        verified_block_tip,
-    )
-    .await?;
+    let best_header_tip = best_header_tip.unwrap_or(empty_state_tip);
 
     Ok(ZakuraHeaderSyncDriverStartup {
         frontiers: HeaderSyncFrontiers {
@@ -159,6 +154,7 @@ async fn drive_header_root_auth_watch_updates<Deliver, Delivery>(
     }
 }
 
+#[cfg(test)]
 async fn root_covered_best_header_tip_or_verified<ReadState>(
     read_state: ReadState,
     best_header_tip: (block::Height, block::Hash),
@@ -205,6 +201,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn root_covered_query_best_header_tip<ReadState>(
     read_state: ReadState,
     best_header_tip: (block::Height, block::Hash),
@@ -233,6 +230,7 @@ where
     root_covered_best_header_tip_or_verified(read_state, best_header_tip, verified_block_tip).await
 }
 
+#[cfg(test)]
 pub(crate) fn block_roots_cover_range(
     start_height: block::Height,
     count: u32,
@@ -1217,13 +1215,6 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             tip_hash,
                             count,
                         );
-                        publish_header_frontier(
-                            &handles.endpoint,
-                            tip_height,
-                            tip_hash,
-                            FrontierChange::HeaderAdvanced,
-                            &trace,
-                        );
                     }
                     Ok(response) => {
                         emit_commit_state(
@@ -1404,37 +1395,12 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
                     },
                 );
-                let started = Instant::now();
                 match read_state
                     .clone()
                     .oneshot(zakura_state::ReadRequest::BestHeaderTip)
                     .await
                 {
-                    Ok(zakura_state::ReadResponse::BestHeaderTip(Some(best_header_tip))) => {
-                        let (tip_height, tip_hash) = match root_covered_query_best_header_tip(
-                            read_state.clone(),
-                            best_header_tip,
-                        )
-                        .await
-                        {
-                            Ok(tip) => tip,
-                            Err(error) => {
-                                trace_state_read_error(
-                                    &trace,
-                                    "query_best_header_tip_roots",
-                                    None,
-                                    best_header_tip.0,
-                                    1,
-                                    &format!("{error}"),
-                                    started,
-                                );
-                                warn!(
-                                    ?error,
-                                    "failed to apply Zakura root coverage to best header tip"
-                                );
-                                continue;
-                            }
-                        };
+                    Ok(zakura_state::ReadResponse::BestHeaderTip(Some((tip_height, tip_hash)))) => {
                         emit_commit_state(
                             &trace,
                             cs_trace::STATE_READ_SUCCESS,
@@ -1452,13 +1418,6 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 tip_hash,
                             })
                             .await;
-                        publish_header_frontier(
-                            &handles.endpoint,
-                            tip_height,
-                            tip_hash,
-                            FrontierChange::HeaderAdvanced,
-                            &trace,
-                        );
                     }
                     Ok(zakura_state::ReadResponse::BestHeaderTip(None)) => {}
                     Ok(response) => {

@@ -8,7 +8,8 @@ use super::{
     state::{
         BufferedHeaderRange, HeaderSyncCore, OutstandingPhase, OutstandingRange, PendingOperation,
         RangePriority, RangePurpose, RangeRequest, RootAuthSource, VctRootRepair,
-        RETAINED_ROOT_LOCAL_MAX_ATTEMPTS, VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME,
+        RETAINED_ROOT_LOCAL_MAX_ATTEMPTS, ROOT_AUTH_CATCHUP_MIN_LEAD, VCT_ROOT_REPAIR_BACKOFFS,
+        VCT_ROOT_REPAIR_MAX_WALL_TIME,
     },
     validation::*,
     wire::*,
@@ -597,7 +598,7 @@ fn root_auth_ranges_overlap_once_and_stay_checkpoint_covered() {
 }
 
 #[test]
-fn root_auth_fallback_schedules_exactly_one_range() {
+fn root_auth_catchup_prefetches_full_hole_with_overlaps() {
     let network = Network::Mainnet;
     let anchor = (block::Height(0), network.genesis_hash());
     let mut startup = startup_for(
@@ -624,11 +625,13 @@ fn root_auth_fallback_schedules_exactly_one_range() {
         .collect();
     assert_eq!(
         ranges,
-        vec![(block::Height(1), block::Height(3), Some(anchor.1))]
-    );
-    assert_eq!(
-        state.schedule.range_count(RangePriority::AuthenticateRoots),
-        1
+        vec![
+            (block::Height(1), block::Height(3), Some(anchor.1)),
+            (block::Height(3), block::Height(5), None),
+            (block::Height(5), block::Height(7), None),
+            (block::Height(7), block::Height(9), None),
+            (block::Height(9), block::Height(10), None),
+        ]
     );
 }
 
@@ -774,6 +777,122 @@ fn retained_payload_waits_for_checkpoint_and_suppresses_fallback() {
     auth.completed_checkpoint_hash = block::Hash([2; 32]);
     assert!(state.retained_ready(auth, Instant::now()).is_some());
     assert_eq!(state.retained_heights(), 2);
+}
+
+#[test]
+fn root_auth_catchup_stops_at_first_retained_start() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(
+        network,
+        anchor,
+        Some((block::Height(4), block::Hash([4; 32]))),
+    );
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(4),
+        completed_checkpoint_hash: block::Hash([4; 32]),
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    state.refresh_root_auth_range(&startup);
+    assert_eq!(state.schedule.authenticate_roots.len(), 3);
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(3),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_3_BYTES),
+                mainnet_header(&BLOCK_MAINNET_4_BYTES),
+            ],
+            vec![0, 0],
+            roots_from_height(block::Height(3), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    assert!(state.admit_retained_root_payload(
+        HeaderSyncWireRequestIdentity {
+            peer: peer(233),
+            session_id: 1,
+            request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+        },
+        payload,
+    ));
+
+    state.refresh_root_auth_range(&startup);
+
+    let ranges: Vec<_> = state
+        .schedule
+        .authenticate_roots
+        .iter()
+        .map(|range| (range.start_height(), range.end_height()))
+        .collect();
+    assert_eq!(
+        ranges,
+        vec![
+            (block::Height(1), block::Height(2)),
+            (block::Height(2), block::Height(3)),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn body_target_waits_for_minimum_authenticated_lead() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let best = (
+        block::Height(ROOT_AUTH_CATCHUP_MIN_LEAD.saturating_mul(2)),
+        block::Hash([8; 32]),
+    );
+    let mut startup = startup_for(network, anchor, Some(best));
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: best.0,
+        completed_checkpoint_hash: best.1,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(
+            HeaderRootAuthState {
+                authenticated_height: block::Height(ROOT_AUTH_CATCHUP_MIN_LEAD.saturating_sub(1)),
+                authenticated_hash: block::Hash([3; 32]),
+                completed_checkpoint_height: best.0,
+                completed_checkpoint_hash: best.1,
+            },
+        )))
+        .await
+        .unwrap();
+    while tokio::time::timeout(std::time::Duration::from_millis(20), fixture.actions.recv())
+        .await
+        .is_ok()
+    {}
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(
+            HeaderRootAuthState {
+                authenticated_height: block::Height(ROOT_AUTH_CATCHUP_MIN_LEAD),
+                authenticated_hash: block::Hash([4; 32]),
+                completed_checkpoint_height: best.0,
+                completed_checkpoint_hash: best.1,
+            },
+        )))
+        .await
+        .unwrap();
+
+    loop {
+        if let HeaderSyncAction::HeaderAdvanced { height, hash } =
+            next_action(&mut fixture.actions).await
+        {
+            assert_eq!(height, block::Height(ROOT_AUTH_CATCHUP_MIN_LEAD));
+            assert_eq!(hash, block::Hash([4; 32]));
+            break;
+        }
+    }
 }
 
 #[test]
@@ -3230,6 +3349,58 @@ async fn restart_rebuilds_schedule_from_durable_best_tip_and_peer_status() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn restart_catchup_pauses_forward_tip_extension() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let best = (block::Height(4), block::Hash([4; 32]));
+    let mut startup = startup_for(network, anchor, Some(best));
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: best.0,
+        completed_checkpoint_hash: best.1,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(42);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id, block::Height(0), block::Height(8), 2, 4).await;
+
+    let mut starts = Vec::new();
+    for _ in 0..3 {
+        let (_, _, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+        starts.push((start, count));
+    }
+    assert_eq!(
+        starts,
+        vec![
+            (block::Height(1), 2),
+            (block::Height(2), 2),
+            (block::Height(3), 2),
+        ]
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), async {
+            loop {
+                if matches!(
+                    next_action(&mut fixture.actions).await,
+                    HeaderSyncAction::SendMessage {
+                        msg: HeaderSyncMessage::GetHeaders { .. },
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_err(),
+        "catch-up must not schedule Forward work above the durable tip"
+    );
+}
+
 fn mainnet_repair_event(generation: u64) -> HeaderSyncEvent {
     let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
@@ -3497,6 +3668,50 @@ async fn vct_repair_scheduler_skips_peers_with_insufficient_response_capacity() 
     let (requested_peer, _request_id, start_height, count) =
         next_outbound_get_headers(&mut fixture.actions).await;
     assert_eq!(requested_peer, capable_peer);
+    assert_eq!((start_height, count), (block::Height(1), 2));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn vct_repair_does_not_starve_root_auth_on_other_peer() {
+    let best = (
+        block::Height(4),
+        mainnet_block(&BLOCK_MAINNET_4_BYTES).hash(),
+    );
+    let mut startup = startup_for(
+        Network::Mainnet,
+        (block::Height(0), Network::Mainnet.genesis_hash()),
+        Some(best),
+    );
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(0),
+        authenticated_hash: Network::Mainnet.genesis_hash(),
+        completed_checkpoint_height: best.0,
+        completed_checkpoint_hash: best.1,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let repair_peer = peer(107);
+    let auth_peer = peer(108);
+
+    fixture.handle.send(mainnet_repair_event(1)).await.unwrap();
+    connect_peer(&fixture, repair_peer.clone()).await;
+    advertise_tip(
+        &fixture,
+        repair_peer.clone(),
+        block::Height(0),
+        best.0,
+        2,
+        1,
+    )
+    .await;
+    let (assigned_repair_peer, _, _, _) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(assigned_repair_peer, repair_peer);
+
+    connect_peer(&fixture, auth_peer.clone()).await;
+    advertise_tip(&fixture, auth_peer.clone(), block::Height(0), best.0, 2, 1).await;
+    let (assigned_auth_peer, _, start_height, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(assigned_auth_peer, auth_peer);
     assert_eq!((start_height, count), (block::Height(1), 2));
 }
 

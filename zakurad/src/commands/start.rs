@@ -2316,6 +2316,7 @@ mod zakura_header_sync_driver_tests {
             ..zakura_network::Config::for_test(P2pStack::Dual)
         };
         config.zakura.listen_addr = None;
+        let durable_header_tip = (block::Height(5), block::Hash([4; 32]));
         let endpoint = zakura_network::zakura::spawn_zakura_endpoint_with_header_sync_driver(
             &config,
             |_supervisor, _trace| Arc::new(NoopZakuraService) as Arc<dyn ZakuraService>,
@@ -2325,9 +2326,14 @@ mod zakura_header_sync_driver_tests {
                     verified_block_tip: block::Height(0),
                     verified_block_hash: genesis_hash,
                 },
-                best_header_tip: Some((block::Height(0), genesis_hash)),
+                best_header_tip: Some(durable_header_tip),
                 verified_block_tip_hash: genesis_hash,
-                header_root_auth: None,
+                header_root_auth: Some(zakura_network::zakura::HeaderRootAuthState {
+                    authenticated_height: block::Height(0),
+                    authenticated_hash: genesis_hash,
+                    completed_checkpoint_height: durable_header_tip.0,
+                    completed_checkpoint_hash: durable_header_tip.1,
+                }),
             }),
         )
         .await
@@ -2339,6 +2345,13 @@ mod zakura_header_sync_driver_tests {
             .expect("driver startup initializes exchange");
         assert_eq!(initial.frontier.verified_body.height, block::Height(0));
         assert_eq!(initial.frontier.best_header.height, block::Height(0));
+        assert_eq!(
+            endpoint
+                .header_sync()
+                .expect("driver startup starts header sync")
+                .best_header_tip(),
+            durable_header_tip,
+        );
 
         let (action_tx, action_rx) = mpsc::channel(4);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();

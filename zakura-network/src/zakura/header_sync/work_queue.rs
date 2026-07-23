@@ -555,6 +555,7 @@ impl HeaderWorkQueue {
             .max()
     }
 
+    #[cfg(test)]
     pub(super) fn range_count(&self, priority: RangePriority) -> usize {
         self.forward
             .iter()

@@ -2981,7 +2981,15 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         .as_ref()
         .map_or(Some(anchor), |startup| startup.best_header_tip);
     let sync_frontier = header_sync_driver_startup.as_ref().map(|driver_startup| {
-        let best_header_tip = driver_startup.best_header_tip.unwrap_or(anchor);
+        let body_sync_tip = driver_startup.header_root_auth.map_or(
+            driver_startup.best_header_tip.unwrap_or(anchor),
+            |_| {
+                (
+                    driver_startup.frontiers.verified_block_tip,
+                    driver_startup.verified_block_tip_hash,
+                )
+            },
+        );
         let initial = FrontierUpdate {
             frontier: crate::zakura::chain_frontier_from_parts(
                 driver_startup.frontiers.finalized_height,
@@ -2989,7 +2997,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
                     driver_startup.frontiers.verified_block_tip,
                     driver_startup.verified_block_tip_hash,
                 ),
-                Frontier::new(best_header_tip.0, best_header_tip.1),
+                Frontier::new(body_sync_tip.0, body_sync_tip.1),
             ),
             change: FrontierChange::Snapshot,
         };
@@ -3020,7 +3028,15 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     let block_sync_driver_enabled = header_sync_driver_startup.is_some();
     let (block_sync, block_sync_actions, block_sync_task) =
         if let Some(driver_startup) = header_sync_driver_startup.as_ref() {
-            let best_header_tip = driver_startup.best_header_tip.unwrap_or(anchor);
+            let body_sync_tip = driver_startup.header_root_auth.map_or(
+                driver_startup.best_header_tip.unwrap_or(anchor),
+                |_| {
+                    (
+                        driver_startup.frontiers.verified_block_tip,
+                        driver_startup.verified_block_tip_hash,
+                    )
+                },
+            );
             let frontier_updates = sync_frontier
                 .as_ref()
                 .expect("sync frontier is initialized when block sync driver is enabled")
@@ -3031,7 +3047,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
                     verified_block_tip: driver_startup.frontiers.verified_block_tip,
                     verified_block_hash: driver_startup.verified_block_tip_hash,
                 },
-                best_header_tip,
+                body_sync_tip,
                 frontier_updates,
                 config.zakura.block_sync.clone(),
             );

@@ -101,7 +101,7 @@ enum RequesterEventOutcome {
 #[derive(Copy, Clone, Debug)]
 enum BestTipPublication {
     Advanced,
-    Reanchored { old: (block::Height, block::Hash) },
+    Reanchored,
 }
 
 pub(super) fn clamped_request_suffix(
@@ -155,6 +155,7 @@ impl HeaderSyncReactor {
                     .unwrap_or(self.state.verified_block_tip),
                 limit: DEFAULT_HS_RANGE,
             });
+            self.refresh_body_sync_target();
         }
 
         let exit_reason;
@@ -989,9 +990,14 @@ impl HeaderSyncReactor {
         self.state.finalized_height = frontiers.finalized_height;
         self.state.verified_block_tip = frontiers.verified_block_tip;
         self.state.verified_block_hash = frontiers.verified_block_hash;
+        if frontiers.verified_block_tip > self.state.body_sync_target.0 {
+            self.state.body_sync_target =
+                (frontiers.verified_block_tip, frontiers.verified_block_hash);
+        }
         if self.state.best_header_tip <= self.state.verified_block_tip {
             self.state.stale_anchor.reset();
         }
+        self.refresh_body_sync_target();
         self.schedule().await;
     }
 
@@ -1206,8 +1212,9 @@ impl HeaderSyncReactor {
         if self.state.header_root_auth == state {
             if self.state.root_auth_waiting_for_watch {
                 self.state.root_auth_waiting_for_watch = false;
-                self.schedule().await;
             }
+            self.refresh_body_sync_target();
+            self.schedule().await;
             return;
         }
 
@@ -1241,6 +1248,7 @@ impl HeaderSyncReactor {
             self.state.discard_root_auth_pipeline();
         }
         metrics::gauge!("sync.header.work.buffered.count").set(self.state.buffered.len() as f64);
+        self.refresh_body_sync_target();
         self.schedule().await;
     }
 
@@ -2599,14 +2607,8 @@ impl HeaderSyncReactor {
             .pending_operations
             .retain(|_, pending| pending.range.priority != RangePriority::Forward);
         self.cancel_forward_outstanding();
-        self.publish_best_tip(
-            height,
-            hash,
-            BestTipPublication::Reanchored {
-                old: (self.state.best_header_tip, self.state.best_header_hash),
-            },
-        )
-        .await;
+        self.publish_best_tip(height, hash, BestTipPublication::Reanchored)
+            .await;
     }
 
     async fn handle_timeouts(&mut self) {
@@ -2709,12 +2711,12 @@ impl HeaderSyncReactor {
         }
 
         self.try_start_retained_root_authentication();
-        self.state.refresh_forward_range(&self.startup);
         self.state.refresh_root_auth_range(&self.startup);
-
-        if self.schedule_vct_repair() {
-            return;
+        let catchup_active = self.state.root_auth_catchup_active(&self.startup);
+        if !catchup_active {
+            self.state.refresh_forward_range(&self.startup);
         }
+        self.schedule_vct_repair();
 
         // Sorted once, not per pass: scheduling only fills a peer's in-flight slots,
         // it never adds or removes peers, so the set is fixed for this call. A peer
@@ -3008,6 +3010,22 @@ impl HeaderSyncReactor {
                 .saturating_sub(self.state.verified_block_tip.0)
         });
         metrics::gauge!("sync.header.root_auth.lead_blocks").set(f64::from(auth_lead));
+        let catchup_hole = self.state.root_auth_catchup_hole_heights(&self.startup);
+        metrics::gauge!("sync.header.root_auth.catchup.hole_heights").set(f64::from(catchup_hole));
+        let waiting_for_body_lead = self.state.header_root_auth.is_some_and(|auth| {
+            let handoff_root = block::Height(
+                self.startup
+                    .network
+                    .checkpoint_list()
+                    .max_height()
+                    .0
+                    .saturating_sub(1),
+            );
+            auth.authenticated_height < handoff_root
+                && self.state.body_sync_target.0 < self.state.best_header_tip
+        });
+        metrics::gauge!("sync.header.root_auth.catchup.active")
+            .set(f64::from(catchup_hole > 0 || waiting_for_body_lead));
     }
 
     fn schedule_vct_repair(&mut self) -> bool {
@@ -3166,19 +3184,52 @@ impl HeaderSyncReactor {
         metrics::gauge!("sync.header.best_tip.height").set(height.0 as f64);
         match publication {
             BestTipPublication::Advanced => self.trace_frontier_advanced(height, hash),
-            BestTipPublication::Reanchored { .. } => self.trace_frontier_reanchored(height, hash),
+            BestTipPublication::Reanchored => self.trace_frontier_reanchored(height, hash),
         }
         let _ = self.tip.send((height, hash));
-        let action = match publication {
-            BestTipPublication::Advanced => HeaderSyncAction::HeaderAdvanced { height, hash },
-            BestTipPublication::Reanchored { old } => HeaderSyncAction::HeaderReanchored {
+        if matches!(publication, BestTipPublication::Reanchored)
+            && self.state.body_sync_target.0 > height
+        {
+            let old = self.state.body_sync_target;
+            self.state.body_sync_target = (height, hash);
+            let _ = self.dispatch_action(HeaderSyncAction::HeaderReanchored {
                 old,
                 new: (height, hash),
-            },
-        };
-        let _ = self.dispatch_action(action);
+            });
+        } else {
+            self.refresh_body_sync_target();
+        }
         self.publish_candidate_state();
         self.broadcast_status_refresh().await;
+    }
+
+    fn refresh_body_sync_target(&mut self) {
+        let current = self.state.body_sync_target;
+        let current_height = current.0;
+        let candidate = match self.state.header_root_auth {
+            None => (self.state.best_header_tip, self.state.best_header_hash),
+            Some(auth) => {
+                let handoff = self.startup.network.checkpoint_list().max_height();
+                let handoff_root = block::Height(handoff.0.saturating_sub(1));
+                if auth.authenticated_height >= handoff_root {
+                    (self.state.best_header_tip, self.state.best_header_hash)
+                } else if auth.authenticated_height.0.saturating_sub(current_height.0)
+                    >= ROOT_AUTH_CATCHUP_MIN_LEAD
+                {
+                    (auth.authenticated_height, auth.authenticated_hash)
+                } else {
+                    return;
+                }
+            }
+        };
+        if candidate.0 <= current_height {
+            return;
+        }
+        self.state.body_sync_target = candidate;
+        let _ = self.dispatch_action(HeaderSyncAction::HeaderAdvanced {
+            height: candidate.0,
+            hash: candidate.1,
+        });
     }
 
     fn update_verified_block_tip(&mut self, height: block::Height, hash: block::Hash) {
@@ -3290,15 +3341,20 @@ impl HeaderSyncReactor {
             return;
         }
 
-        if self.state.best_header_tip > self.state.verified_block_tip {
+        let body_target = self
+            .state
+            .body_sync_target
+            .0
+            .min(self.state.best_header_tip);
+        if body_target > self.state.verified_block_tip {
             let from =
                 next_height(self.state.verified_block_tip).unwrap_or(self.state.verified_block_tip);
             metrics::gauge!("sync.header.missing_bodies")
-                .set(count_between(from, self.state.best_header_tip) as f64);
-            self.trace_missing_bodies(from, self.state.best_header_tip);
+                .set(count_between(from, body_target) as f64);
+            self.trace_missing_bodies(from, body_target);
             let _ = self.dispatch_action(HeaderSyncAction::BodyGaps {
                 from,
-                to: self.state.best_header_tip,
+                to: body_target,
             });
         }
     }

@@ -58,6 +58,7 @@ struct FuzzStore {
     metadata: EngineMetadata,
     selected: Vec<Frontier>,
     verified: Vec<Frontier>,
+    branches: [Option<Frontier>; 16],
     finality: Vec<FinalityRecord>,
     aux: Vec<AuxDelivery>,
     config: EngineConfig,
@@ -109,6 +110,11 @@ impl FuzzStore {
             metadata,
             selected: vec![frontier],
             verified: vec![frontier],
+            branches: {
+                let mut branches = [None; 16];
+                branches[0] = Some(frontier);
+                branches
+            },
             finality: Vec::new(),
             aux: Vec::new(),
             config,
@@ -137,6 +143,11 @@ impl FuzzStore {
                 AuxDelta::Delete(delivery_id) => self
                     .aux
                     .retain(|existing| existing.delivery_id != *delivery_id),
+            }
+        }
+        for tip in &mut self.branches {
+            if tip.is_some_and(|frontier| self.graph.node(frontier.hash).is_none()) {
+                *tip = None;
             }
         }
     }
@@ -257,6 +268,19 @@ impl FuzzStore {
             .map(|frontier| frontier.hash)
             .unwrap_or(finalized.hash);
         Frontier::new(block::Height(height), hash)
+    }
+
+    fn branch_parent(&self, key: u8) -> Frontier {
+        self.branches[usize::from(key % 16)]
+            .filter(|frontier| self.graph.node(frontier.hash).is_some())
+            .unwrap_or(self.metadata.frontiers.header_best)
+    }
+
+    fn record_branch_tip(&mut self, key: u8, tip: block::Hash) {
+        let Some(node) = self.graph.node(tip) else {
+            return;
+        };
+        self.branches[usize::from(key % 16)] = Some(Frontier::new(node.height, tip));
     }
 
     fn verify_selected_path(&self, operation: usize, branch: u8) -> TransitionRequest {
@@ -395,7 +419,10 @@ impl Clock for ManualClock {
 /// Replay up to 512 structured operations through the production transition engine.
 pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     let bounded = &bytes[..bytes.len().min(512)];
-    let mode = if bounded.first().is_some_and(|byte| byte & 1 == 1) {
+    let mode = if bounded
+        .first()
+        .is_some_and(|byte| decode_fork_operation(*byte) & 1 == 1)
+    {
         EngineMode::HeadersOnly
     } else {
         EngineMode::Integrated
@@ -410,23 +437,17 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     let authority = FuzzAuthority;
     assert_exhaustive_oracle(&store);
 
-    for (operation, byte) in bounded.iter().copied().enumerate() {
+    for (operation, encoded) in bounded.iter().copied().enumerate() {
+        let byte = decode_fork_operation(encoded);
         let before = store.snapshot();
         let before_selected = store.selected.clone();
         let before_verified = store.verified.clone();
         let count = u32::from(byte & 0x07).saturating_add(1);
         let branch = byte.rotate_left(3);
+        let branch_key = (byte & 0x07).saturating_add((byte & 0x80) >> 4);
         let request = match (byte >> 3) & 0x0f {
-            0 | 1 => store.insertion(
-                if byte & 0x08 == 0 {
-                    store.metadata.frontiers.header_best
-                } else {
-                    store.retained_parent(branch)
-                },
-                count,
-                operation,
-                branch,
-            ),
+            0 => store.insertion(store.branch_parent(branch_key), count, operation, branch),
+            1 => store.insertion(store.retained_parent(branch), count, operation, branch),
             2 => {
                 let mut request = store.insertion(
                     store.metadata.frontiers.header_best,
@@ -584,6 +605,10 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                 continue;
             }
         };
+        let inserted_target = match &request.event {
+            crate::TransitionEvent::InsertHeaders(event) => Some(event.target_tip_hash),
+            _ => None,
+        };
         let context = TransitionContext {
             config: &store.config,
             clock: &clock,
@@ -597,6 +622,9 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                 let no_change = plan.is_no_change();
                 let eligibility_changed = !plan.change_set().eligibility_changes.is_empty();
                 store.commit(&plan);
+                if let Some(target) = inserted_target {
+                    store.record_branch_tip(branch_key, target);
+                }
                 assert_eq!(store.snapshot(), plan.change_set().metadata.snapshot());
                 assert_generation_delta(
                     &before,
@@ -636,6 +664,15 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         snapshot: store.snapshot(),
         replay_digest: transcript.finalize().into(),
         retained_digest: retained_digest(&store),
+    }
+}
+
+fn decode_fork_operation(byte: u8) -> u8 {
+    match byte {
+        b'A' => 4,
+        b'B' => 9,
+        b'C' => 1,
+        _ => byte,
     }
 }
 
@@ -836,6 +873,13 @@ fn assert_exhaustive_oracle(store: &FuzzStore) {
         independent_path(store, store.metadata.frontiers.verified_best),
         "the verified projection must exactly match parent links"
     );
+    for tip in store.branches.iter().flatten() {
+        assert_eq!(
+            store.graph.node(tip.hash).map(|node| node.height),
+            Some(tip.height),
+            "every named branch tip is an exact retained frontier"
+        );
+    }
 }
 
 fn independent_path(store: &FuzzStore, tip: Frontier) -> Vec<Frontier> {
@@ -886,6 +930,14 @@ fn retained_digest(store: &FuzzStore) -> [u8; 32] {
         hasher.update(b"verified");
         hasher.update(frontier.height.0.to_le_bytes());
         hasher.update(frontier.hash.0);
+    }
+    for (key, tip) in store.branches.iter().enumerate() {
+        hasher.update(b"branch");
+        hasher.update([u8::try_from(key).expect("the branch registry has sixteen entries")]);
+        if let Some(tip) = tip {
+            hasher.update(tip.height.0.to_le_bytes());
+            hasher.update(tip.hash.0);
+        }
     }
     hasher.finalize().into()
 }
@@ -977,6 +1029,32 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.pressure_checks, 1);
         assert_eq!(first.no_effects, 1);
+    }
+
+    #[test]
+    fn named_losing_branch_can_be_extended_past_the_incumbent() {
+        let incumbent = replay_fork_transition_bytes(&[4]);
+        assert_eq!(
+            incumbent.snapshot.frontiers.header_best.height,
+            block::Height(5)
+        );
+
+        let losing_fork = replay_fork_transition_bytes(&[4, 9]);
+        assert_eq!(
+            losing_fork.snapshot.frontiers.header_best, incumbent.snapshot.frontiers.header_best,
+            "the shorter named fork is retained without replacing the incumbent"
+        );
+
+        let promoted = replay_fork_transition_bytes(&[4, 9, 1, 1]);
+        assert_eq!(
+            promoted.snapshot.frontiers.header_best.height,
+            block::Height(6),
+            "later work extends the exact named losing branch past the incumbent"
+        );
+        assert_ne!(
+            promoted.snapshot.frontiers.header_best.hash,
+            incumbent.snapshot.frontiers.header_best.hash
+        );
     }
 
     #[test]
@@ -1093,11 +1171,23 @@ mod tests {
                 "evict_pressure",
                 include_bytes!("../../fuzz/header-chain/corpus/fork_transitions/evict_pressure"),
             ),
+            (
+                "aud_01_losing_branch_promotion",
+                include_bytes!(
+                    "../../fuzz/header-chain/corpus/fork_transitions/aud_01_losing_branch_promotion"
+                ),
+            ),
         ];
         for (name, bytes) in corpus {
             let first = replay_fork_transition_bytes(bytes);
             let second = replay_fork_transition_bytes(bytes);
             assert_eq!(first, second, "{name} must replay deterministically");
+            if *name == "aud_01_losing_branch_promotion" {
+                assert_eq!(
+                    first.snapshot.frontiers.header_best.height,
+                    block::Height(6)
+                );
+            }
         }
     }
 }

@@ -1,8 +1,9 @@
 # Gate PRs on cargo-semver-checks against the latest STABLE crates.io release
-# of each publishable workspace crate. A PR that changes a published API must
-# carry the corresponding version bump in the same PR — the check passes once
-# the bump level covers the change, so an intentional break plus its major
-# bump is green, and a second break in the same cycle needs no further bump.
+# of each changed publishable workspace crate and its publishable reverse
+# dependencies. A PR that changes a published API must carry the corresponding
+# version bump in the same PR — the check passes once the bump level covers the
+# change, so an intentional break plus its major bump is green, and a second
+# break in the same cycle needs no further bump.
 #
 # Retro driver: v1.0.3 shipped with semver debt discovered on release day
 # (#361 forced zakura-chain 2.0.0 / zakura-consensus 4.0.0 / zakura-script
@@ -30,13 +31,8 @@ on:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
       - .github/workflows/semver-checks.yml
-  push:
-    branches: [main]
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - .github/workflows/semver-checks.yml
+      - .github/workflows/scripts/affected_semver_packages.py
+      - .github/workflows/scripts/test_affected_semver_packages.py
   workflow_dispatch:
 
 permissions:
@@ -54,9 +50,43 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
+      - name: Find crates affected by this change
+        id: affected
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 .github/workflows/scripts/test_affected_semver_packages.py
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            packages="$(
+              python3 .github/workflows/scripts/affected_semver_packages.py --all
+            )"
+          else
+            packages="$(
+              python3 .github/workflows/scripts/affected_semver_packages.py \
+                --base "$BASE_SHA" \
+                --head "$GITHUB_SHA"
+            )"
+          fi
+
+          {
+            echo "packages<<EOF"
+            echo "$packages"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ -n "$packages" ]]; then
+            echo "Checking affected packages:"
+            echo "$packages"
+          else
+            echo "No publishable crates need semver checks."
+          fi
+
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        if: steps.affected.outputs.packages != ''
         id: toolchain
         with:
           toolchain: stable
@@ -70,9 +100,10 @@ jobs:
       # target-dir cleaner deletes unrecognized target/ entries before
       # saving, so this cache needs its own steps. Keyed on the rustc
       # version: the rustdoc JSON format (and the tool's own invalidation)
-      # rotates with the toolchain. The run_id suffix makes every main run
-      # save a fresh entry; restores prefix-match the newest one.
+      # rotates with the toolchain. The run_id suffix makes every manual main
+      # run save a fresh entry; restores prefix-match the newest one.
       - name: Restore baseline rustdoc cache
+        if: steps.affected.outputs.packages != ''
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: target/semver-checks/cache
@@ -82,16 +113,25 @@ jobs:
       # Deliberately unpinned (like cargo-hack): cargo-semver-checks must
       # track new stable rustdoc formats; pin only if a regression forces it.
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
+        if: steps.affected.outputs.packages != ''
         with:
           tool: cargo-semver-checks
 
       - uses: ./.github/actions/setup-zakura-build
+        if: steps.affected.outputs.packages != ''
 
-      - name: Check workspace crates against stable crates.io baselines
-        run: cargo semver-checks --workspace --default-features
+      - name: Check affected crates against stable crates.io baselines
+        if: steps.affected.outputs.packages != ''
+        env:
+          PACKAGES: ${{ steps.affected.outputs.packages }}
+        run: |
+          while IFS= read -r package; do
+            [[ -n "$package" ]] || continue
+            cargo semver-checks --package "$package" --default-features
+          done <<< "$PACKAGES"
 
       - name: Save baseline rustdoc cache
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && steps.affected.outputs.packages != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: target/semver-checks/cache

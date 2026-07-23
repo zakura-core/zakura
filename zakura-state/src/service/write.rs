@@ -240,25 +240,18 @@ impl HeaderChainWriter {
         }
     }
 
-    fn vct_successor(
-        &self,
-        db: &ZakuraDb,
-        height: block::Height,
-        hash: block::Hash,
-    ) -> Option<NextVctBlock> {
-        let successor = self
+    fn vct_successor(&self, height: block::Height, hash: block::Hash) -> Option<NextVctBlock> {
+        let window = self
             .runtime
             .reader()
-            .selected_successor(height, hash)
+            .selected_aux_window(height, hash)
             .ok()??;
-        let roots = db
-            .supplied_commitment_roots_by_height_range(successor.height..=successor.height)
-            .into_iter()
-            .next()?;
+        let (successor, deliveries) = window.successor?;
+        let aux = select_vct_aux_delivery(deliveries)?.tree_aux?;
         Some(NextVctBlock::from_header(
             successor.header,
             successor.height,
-            roots.auth_data_root,
+            aux.auth_data_root,
         ))
     }
 
@@ -374,6 +367,29 @@ impl HeaderChainWriter {
             &context,
         )
     }
+}
+
+fn select_vct_aux_delivery(
+    deliveries: Vec<zakura_header_chain::AuxDelivery>,
+) -> Option<zakura_header_chain::AuxDelivery> {
+    deliveries
+        .into_iter()
+        .filter(|delivery| {
+            delivery.tree_aux.is_some()
+                && !matches!(
+                    delivery.authentication,
+                    zakura_header_chain::AuxAuthentication::Rejected { .. }
+                )
+        })
+        .min_by_key(|delivery| {
+            (
+                !matches!(
+                    delivery.authentication,
+                    zakura_header_chain::AuxAuthentication::Authenticated { .. }
+                ),
+                delivery.delivery_id,
+            )
+        })
 }
 
 fn verified_path(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
@@ -1072,11 +1088,7 @@ impl WriteBlockWorkerTask {
                 finalized_state.vct_fast_needs_successor(ordered_block.0.height);
             let next_vct_block = if needs_vct_successor {
                 header_chain.as_ref().and_then(|writer| {
-                    writer.vct_successor(
-                        &finalized_state.db,
-                        ordered_block.0.height,
-                        ordered_block.0.hash,
-                    )
+                    writer.vct_successor(ordered_block.0.height, ordered_block.0.hash)
                 })
             } else {
                 None
@@ -1539,6 +1551,82 @@ mod tests {
         SuffixWork, TransientBodyFailure, TransientBodyFailureKind, TransitionFailure,
         TrustedAnchor, VerifiedGeneration, WorkCoordinate,
     };
+
+    #[test]
+    fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
+        let delivery = |byte: u8,
+                        authentication: zakura_header_chain::AuxAuthentication,
+                        has_aux: bool| zakura_header_chain::AuxDelivery {
+            delivery_id: EvidenceId::from_digest([byte; 32]),
+            header_hash: block::Hash([1; 32]),
+            source: zakura_header_chain::SourceId::from_digest([byte; 32]),
+            owner: zakura_header_chain::WorkOwner {
+                state_version: StateVersion::new(1),
+                header_generation: HeaderGeneration::new(2),
+                verified_generation: Some(VerifiedGeneration::new(3)),
+                branch: zakura_header_chain::BranchId::new(
+                    block::Hash([4; 32]),
+                    block::Hash([5; 32]),
+                ),
+                session_id: 6,
+                request_id: std::num::NonZeroU64::new(7).expect("seven is nonzero"),
+            },
+            body_size: zakura_header_chain::BodySizeHint::Unknown,
+            tree_aux: has_aux.then_some(zakura_header_chain::TreeAuxRecordV1 {
+                height: block::Height(1),
+                sapling_root: zakura_chain::sapling::tree::Root::default(),
+                orchard_root: zakura_chain::orchard::tree::Root::default(),
+                ironwood_root: zakura_chain::ironwood::tree::Root::default(),
+                sapling_tx_count: 0,
+                orchard_tx_count: 0,
+                ironwood_tx_count: 0,
+                auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0; 32]),
+            }),
+            authentication,
+        };
+        let rejected = delivery(
+            1,
+            zakura_header_chain::AuxAuthentication::Rejected {
+                evidence: EvidenceId::from_digest([8; 32]),
+            },
+            true,
+        );
+        let unauthenticated = delivery(
+            2,
+            zakura_header_chain::AuxAuthentication::Unauthenticated,
+            true,
+        );
+        let authenticated = delivery(
+            3,
+            zakura_header_chain::AuxAuthentication::Authenticated {
+                evidence: EvidenceId::from_digest([9; 32]),
+                boundary_hash: block::Hash([10; 32]),
+            },
+            true,
+        );
+        let incomplete = delivery(
+            0,
+            zakura_header_chain::AuxAuthentication::Authenticated {
+                evidence: EvidenceId::from_digest([11; 32]),
+                boundary_hash: block::Hash([12; 32]),
+            },
+            false,
+        );
+
+        assert_eq!(
+            super::select_vct_aux_delivery(vec![
+                rejected,
+                unauthenticated,
+                authenticated,
+                incomplete,
+            ]),
+            Some(authenticated)
+        );
+        assert_eq!(
+            super::select_vct_aux_delivery(vec![rejected, incomplete]),
+            None
+        );
+    }
 
     fn header_writer(
         finalized_state: &FinalizedState,

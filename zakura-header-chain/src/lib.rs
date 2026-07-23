@@ -27,7 +27,7 @@ pub use frontier::{
 pub use graph::{GraphError, InsertResult, MemHeaderStore};
 pub use ids::{
     BranchId, CounterExhausted, EvidenceId, FinalityEpoch, HeaderGeneration, HeaderId,
-    OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration, WorkOwner,
+    OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration, WorkOwner, WorkScope,
 };
 pub use locator::{HeaderLocator, MAX_HEADER_LOCATOR_HASHES};
 pub use node::{

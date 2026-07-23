@@ -1244,9 +1244,19 @@ mod tests {
         let (actions, mut actions_rx) = mpsc::channel(1);
         actions
             .try_send(BlockSyncAction::QueryNeededBlocks {
+                query_id: std::num::NonZeroU64::new(1).expect("one is nonzero"),
                 from: block::Height(1),
                 limit: 1,
                 best_header_tip: block::Height(1),
+                scope: zakura_header_chain::WorkScope {
+                    state_version: zakura_header_chain::StateVersion::new(0),
+                    header_generation: zakura_header_chain::HeaderGeneration::new(0),
+                    verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(0)),
+                    branch: zakura_header_chain::BranchId::new(
+                        block::Hash([0; 32]),
+                        block::Hash([0; 32]),
+                    ),
+                },
             })
             .expect("test fills the action channel");
         let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));

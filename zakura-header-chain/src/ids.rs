@@ -156,6 +156,46 @@ impl BranchId {
     }
 }
 
+/// Durable generation and branch coordinates captured before asynchronous work is scheduled.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub struct WorkScope {
+    /// Durable state version that scheduled the work.
+    pub state_version: StateVersion,
+    /// Selected-header generation that scheduled the work.
+    pub header_generation: HeaderGeneration,
+    /// Verified-body generation, when the work can affect verified state.
+    pub verified_generation: Option<VerifiedGeneration>,
+    /// Exact anchor/target branch identity.
+    pub branch: BranchId,
+}
+
+impl WorkScope {
+    /// Capture body-affecting work coordinates from one atomic committed snapshot.
+    pub fn for_body_work(snapshot: &crate::EngineSnapshot) -> Self {
+        Self {
+            state_version: snapshot.state_version,
+            header_generation: snapshot.header_generation,
+            verified_generation: Some(snapshot.verified_generation),
+            branch: BranchId::new(
+                snapshot.frontiers.finalized.hash,
+                snapshot.frontiers.header_best.hash,
+            ),
+        }
+    }
+
+    /// Bind these durable coordinates to the exact transport session and request.
+    pub const fn bind(self, session_id: u64, request_id: NonZeroU64) -> WorkOwner {
+        WorkOwner {
+            state_version: self.state_version,
+            header_generation: self.header_generation,
+            verified_generation: self.verified_generation,
+            branch: self.branch,
+            session_id,
+            request_id,
+        }
+    }
+}
+
 /// Complete ownership token attached to every asynchronous or staged work item.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct WorkOwner {
@@ -201,5 +241,23 @@ mod tests {
                 counter: "finality epoch"
             })
         );
+    }
+
+    #[test]
+    fn work_scope_binds_transport_identity_without_changing_durable_coordinates() {
+        let scope = WorkScope {
+            state_version: StateVersion::new(1),
+            header_generation: HeaderGeneration::new(2),
+            verified_generation: Some(VerifiedGeneration::new(3)),
+            branch: BranchId::new(block::Hash([4; 32]), block::Hash([5; 32])),
+        };
+        let request_id = NonZeroU64::new(7).expect("seven is nonzero");
+        let owner = scope.bind(6, request_id);
+        assert_eq!(owner.state_version, scope.state_version);
+        assert_eq!(owner.header_generation, scope.header_generation);
+        assert_eq!(owner.verified_generation, scope.verified_generation);
+        assert_eq!(owner.branch, scope.branch);
+        assert_eq!(owner.session_id, 6);
+        assert_eq!(owner.request_id, request_id);
     }
 }

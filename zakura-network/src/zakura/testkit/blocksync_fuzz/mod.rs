@@ -229,9 +229,11 @@ fn spawn_action_driver(
             };
             match action {
                 BlockSyncAction::QueryNeededBlocks {
+                    query_id,
                     from,
                     limit,
                     best_header_tip,
+                    scope,
                 } => {
                     let start = from;
                     let metas = if limit == 0 {
@@ -248,7 +250,11 @@ fn spawn_action_driver(
                         }
                     };
                     if handle
-                        .send(BlockSyncEvent::NeededBlocks(metas))
+                        .send(BlockSyncEvent::ScopedNeededBlocks {
+                            query_id,
+                            scope,
+                            blocks: metas,
+                        })
                         .await
                         .is_err()
                     {

@@ -9,6 +9,7 @@ use crate::zakura::{
     ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState,
 };
 use iroh::NodeId;
+use std::num::NonZeroU64;
 
 /// Upper bound on how long the Sequencer task will wait to enqueue a verifier
 /// action before abandoning it. Reactor action sends are non-blocking.
@@ -52,6 +53,16 @@ struct RangeResponseTrace {
     total_elapsed: Option<Duration>,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct PendingNeededQuery {
+    query_id: NonZeroU64,
+    scope: zakura_header_chain::WorkScope,
+    from: block::Height,
+    limit: u32,
+    best_header_tip: block::Height,
+    best_header_hash: block::Hash,
+}
+
 /// Spawn a block-sync reactor and return its handle plus action stream.
 pub fn spawn_block_sync_reactor(
     startup: BlockSyncStartup,
@@ -65,6 +76,11 @@ pub fn spawn_block_sync_reactor(
             || (startup.header_tip.is_some() ^ startup.frontier_updates.is_some()),
         "state-backed block sync must have exactly one frontier source",
     );
+
+    let committed_snapshot = startup
+        .committed_snapshots
+        .as_ref()
+        .and_then(|snapshots| snapshots.borrow().clone());
 
     let state = BlockSyncState::new(&startup);
     let (events_tx, events_rx) =
@@ -163,9 +179,11 @@ pub fn spawn_block_sync_reactor(
         verified_block_tip: startup.frontiers.verified_block_tip,
         request_floor: startup.frontiers.verified_block_tip,
         pending_needed_query: None,
+        next_needed_query_id: NonZeroU64::new(1),
         last_reset_epoch: 0,
         last_reaction_epoch: 0,
         last_view: initial_view(startup.frontiers),
+        committed_snapshot,
         startup,
         state,
         registry,
@@ -193,6 +211,8 @@ pub fn spawn_block_sync_reactor(
 pub(super) struct BlockSyncReactor {
     startup: BlockSyncStartup,
     state: BlockSyncState,
+    /// Latest atomic header-engine snapshot used to stamp body-work ownership.
+    committed_snapshot: Option<zakura_header_chain::EngineSnapshot>,
     /// Shared per-peer fact table: servable/caps/outstanding written by the
     /// per-peer pipe-routines; read by producer/candidate/trace. The reactor owns
     /// only entry insert (admission) / remove (teardown).
@@ -237,10 +257,12 @@ pub(super) struct BlockSyncReactor {
     /// download floor, but it is not verified state and must not be used for
     /// serving/status advertisement.
     request_floor: block::Height,
-    /// `(from, limit, best_header_tip, best_header_hash)` for a dispatched
-    /// `QueryNeededBlocks` action whose `NeededBlocks` response has not come
-    /// back yet.
-    pending_needed_query: Option<(block::Height, u32, block::Height, block::Hash)>,
+    /// Exact identity and scope of the dispatched state query whose response has
+    /// not come back yet.
+    pending_needed_query: Option<PendingNeededQuery>,
+    /// Next reactor-local identity assigned to a body-work state query. `None`
+    /// means the identifier space is exhausted and scheduling fails closed.
+    next_needed_query_id: Option<NonZeroU64>,
     /// Last `reset_epoch` the reactor reacted to, so it can tell an advance from
     /// a destructive reset.
     last_reset_epoch: u64,
@@ -259,6 +281,7 @@ impl BlockSyncReactor {
         let mut header_tip_open = header_tip.is_some();
         let mut frontier_updates = self.startup.frontier_updates.clone();
         let mut frontier_updates_open = frontier_updates.is_some();
+        let mut committed_snapshots = self.startup.committed_snapshots.clone();
         set_block_reactor_active_connection_gauge(self.state.peers.len());
         // Metrics/trace snapshot cadence only. Per-peer request timeouts are owned
         // by the routines (each sleeps to its own earliest deadline), so this timer
@@ -293,6 +316,20 @@ impl BlockSyncReactor {
                 event = self.events.recv() => {
                     let Some(event) = event else { break };
                     self.handle_event(event).await;
+                }
+                changed = async {
+                    match committed_snapshots.as_mut() {
+                        Some(snapshots) => snapshots.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_ok() {
+                        self.committed_snapshot = committed_snapshots
+                            .as_ref()
+                            .and_then(|snapshots| snapshots.borrow().clone());
+                    } else {
+                        committed_snapshots = None;
+                    }
                 }
                 changed = async {
                     match header_tip.as_mut() {
@@ -459,6 +496,15 @@ impl BlockSyncReactor {
             BlockSyncEvent::ChainTipReset(frontiers) => {
                 self.handle_chain_tip_reset(frontiers, true).await
             }
+            BlockSyncEvent::ScopedNeededBlocks {
+                query_id,
+                scope,
+                blocks,
+            } => {
+                self.handle_scoped_needed_blocks(query_id, scope, blocks)
+                    .await;
+            }
+            #[cfg(test)]
             BlockSyncEvent::NeededBlocks(blocks) => {
                 self.handle_needed_blocks(blocks).await;
             }
@@ -945,6 +991,32 @@ impl BlockSyncReactor {
         self.publish_candidate_state();
     }
 
+    async fn handle_scoped_needed_blocks(
+        &mut self,
+        query_id: NonZeroU64,
+        scope: zakura_header_chain::WorkScope,
+        blocks: Vec<BlockSyncBlockMeta>,
+    ) {
+        let completion = (query_id, scope);
+        let pending = self
+            .pending_needed_query
+            .map(|pending| (pending.query_id, pending.scope));
+        if pending != Some(completion) {
+            metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks_query")
+                .increment(1);
+            return;
+        }
+        self.pending_needed_query = None;
+
+        if self.body_work_scope() != Some(scope) {
+            metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks")
+                .increment(1);
+            self.query_needed_blocks().await;
+            return;
+        }
+        self.handle_needed_blocks(blocks).await;
+    }
+
     /// Header tip minus verified body tip, emitted as the `body_lag` trace field
     /// only. Downloads gate on byte budget + per-peer slots — never on this lag
     /// (no near-tip pause).
@@ -1223,24 +1295,66 @@ impl BlockSyncReactor {
             return true;
         }
         let limit = self.refill_query_limit_blocks(from);
-        let query = (
-            from,
-            limit,
-            self.state.best_header_tip,
-            self.state.best_header_hash,
-        );
-        if self.pending_needed_query == Some(query) {
-            return true;
-        }
-        let dispatched = self.dispatch_action(BlockSyncAction::QueryNeededBlocks {
+        let Some(scope) = self.body_work_scope() else {
+            tracing::error!("cannot schedule Zakura body work without a committed engine snapshot");
+            return false;
+        };
+        let Some(query_id) = self.next_needed_query_id else {
+            tracing::error!("exhausted Zakura body-work state-query identifiers");
+            return false;
+        };
+        let query = PendingNeededQuery {
+            query_id,
+            scope,
             from,
             limit,
             best_header_tip: self.state.best_header_tip,
+            best_header_hash: self.state.best_header_hash,
+        };
+        if self.pending_needed_query.is_some_and(|pending| {
+            pending.scope == query.scope
+                && pending.from == query.from
+                && pending.limit == query.limit
+                && pending.best_header_tip == query.best_header_tip
+                && pending.best_header_hash == query.best_header_hash
+        }) {
+            return true;
+        }
+        let dispatched = self.dispatch_action(BlockSyncAction::QueryNeededBlocks {
+            query_id,
+            from,
+            limit,
+            best_header_tip: self.state.best_header_tip,
+            scope,
         });
         if dispatched {
             self.pending_needed_query = Some(query);
+            self.next_needed_query_id = query_id.get().checked_add(1).and_then(NonZeroU64::new);
         }
         dispatched
+    }
+
+    fn body_work_scope(&self) -> Option<zakura_header_chain::WorkScope> {
+        let scope = self
+            .committed_snapshot
+            .as_ref()
+            .map(zakura_header_chain::WorkScope::for_body_work);
+        #[cfg(not(test))]
+        {
+            scope
+        }
+        #[cfg(test)]
+        {
+            scope.or(Some(zakura_header_chain::WorkScope {
+                state_version: zakura_header_chain::StateVersion::new(0),
+                header_generation: zakura_header_chain::HeaderGeneration::new(0),
+                verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(0)),
+                branch: zakura_header_chain::BranchId::new(
+                    self.startup.frontiers.verified_block_hash,
+                    self.state.best_header_hash,
+                ),
+            }))
+        }
     }
 
     fn next_needed_block_query_start(&self) -> Option<block::Height> {
@@ -2280,12 +2394,17 @@ impl BlockSyncReactor {
                 bs_insert_str(row, bs_trace::KIND, "chain_tip_reset");
                 bs_insert_frontiers(row, frontiers);
             }
-            BlockSyncEvent::NeededBlocks(blocks) => {
+            BlockSyncEvent::ScopedNeededBlocks { blocks, .. } => {
                 bs_insert_str(row, bs_trace::KIND, "needed_blocks");
                 bs_insert_u64(row, bs_trace::RANGE_COUNT, blocks.len() as u64);
                 if let Some(first) = blocks.first() {
                     bs_insert_height(row, bs_trace::RANGE_START, first.height);
                 }
+            }
+            #[cfg(test)]
+            BlockSyncEvent::NeededBlocks(blocks) => {
+                bs_insert_str(row, bs_trace::KIND, "test_needed_blocks");
+                bs_insert_u64(row, bs_trace::RANGE_COUNT, blocks.len() as u64);
             }
             BlockSyncEvent::BlockApplyFinished {
                 token,
@@ -2336,6 +2455,7 @@ impl BlockSyncReactor {
                 from,
                 limit,
                 best_header_tip,
+                ..
             } => {
                 bs_insert_str(row, bs_trace::KIND, "query_needed_blocks");
                 bs_insert_height(row, bs_trace::RANGE_START, *from);

@@ -386,9 +386,11 @@ mod tests {
                 };
                 match action {
                     BlockSyncAction::QueryNeededBlocks {
+                        query_id,
                         from,
                         limit,
                         best_header_tip,
+                        scope,
                     } => {
                         let metas = if limit == 0 {
                             Vec::new()
@@ -405,7 +407,13 @@ mod tests {
                                 })
                                 .collect()
                         };
-                        let _ = handle.send(BlockSyncEvent::NeededBlocks(metas)).await;
+                        let _ = handle
+                            .send(BlockSyncEvent::ScopedNeededBlocks {
+                                query_id,
+                                scope,
+                                blocks: metas,
+                            })
+                            .await;
                     }
                     BlockSyncAction::SubmitBlock { token, block } => {
                         let height = block.coinbase_height().expect("submitted block has height");

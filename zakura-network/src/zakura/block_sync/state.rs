@@ -40,6 +40,8 @@ pub struct BlockSyncStartup {
     pub header_tip: Option<watch::Receiver<(block::Height, block::Hash)>>,
     /// Shared sync exchange frontier stream used as the moving body-download target.
     pub frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
+    /// Atomic durable header-engine snapshots used to own body work.
+    pub committed_snapshots: Option<watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>>,
     /// Local stream-6 configuration.
     pub config: ZakuraBlockSyncConfig,
     /// Shared shutdown signal owned by the embedding endpoint or test harness.
@@ -63,6 +65,7 @@ impl BlockSyncStartup {
             best_header_tip,
             header_tip: Some(header_tip),
             frontier_updates: None,
+            committed_snapshots: None,
             config,
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
@@ -82,6 +85,7 @@ impl BlockSyncStartup {
             best_header_tip,
             header_tip: None,
             frontier_updates: Some(frontier_updates),
+            committed_snapshots: None,
             config,
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
@@ -114,6 +118,7 @@ impl BlockSyncStartup {
             best_header_tip: (block::Height::MIN, block::Hash([0; 32])),
             header_tip: None,
             frontier_updates: None,
+            committed_snapshots: None,
             config,
             shutdown: CancellationToken::new(),
             state_queries_enabled: false,

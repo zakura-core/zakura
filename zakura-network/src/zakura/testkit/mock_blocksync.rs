@@ -533,9 +533,11 @@ async fn drive_mock_block_sync_actions(
             };
             match action {
                 BlockSyncAction::QueryNeededBlocks {
+                    query_id,
                     from,
                     limit,
                     best_header_tip,
+                    scope,
                 } => {
                     if let Some(gate) = needed_blocks_gate.as_mut() {
                         while !*gate.borrow_and_update() {
@@ -558,7 +560,13 @@ async fn drive_mock_block_sync_actions(
                             Vec::new()
                         }
                     };
-                    let _ = handle.send(BlockSyncEvent::NeededBlocks(metas)).await;
+                    let _ = handle
+                        .send(BlockSyncEvent::ScopedNeededBlocks {
+                            query_id,
+                            scope,
+                            blocks: metas,
+                        })
+                        .await;
                 }
                 BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
                     let blocks = corpus.blocks_in_range(start, count, servable_high);

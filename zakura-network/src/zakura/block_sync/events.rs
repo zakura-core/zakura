@@ -1,4 +1,5 @@
 use super::{request::*, state::*, *};
+use std::num::NonZeroU64;
 
 /// Committed header metadata used by block sync to schedule and validate a body.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -38,7 +39,17 @@ pub enum BlockSyncEvent {
     /// State reset the verified body chain tip after a rollback, best-chain switch,
     /// activation boundary, or coalesced multi-block tip update.
     ChainTipReset(BlockSyncFrontiers),
-    /// Driver returned the current body-missing, header-known heights with committed hashes.
+    /// Driver returned body-missing metadata bound to the exact queried snapshot.
+    ScopedNeededBlocks {
+        /// Reactor-local query identifier echoed by the driver.
+        query_id: NonZeroU64,
+        /// Durable generation and branch coordinates echoed from the query.
+        scope: zakura_header_chain::WorkScope,
+        /// Header-known bodies missing under `scope`.
+        blocks: Vec<BlockSyncBlockMeta>,
+    },
+    /// Ownerless unit-test fixture for the pre-ownership scheduling surface.
+    #[cfg(test)]
     NeededBlocks(Vec<BlockSyncBlockMeta>),
     /// Node wiring finished applying a submitted block body.
     BlockApplyFinished {
@@ -104,12 +115,16 @@ pub type BlockApplyToken = u64;
 pub enum BlockSyncAction {
     /// Ask node wiring to read `missing_block_bodies`, header hashes, and size hints.
     QueryNeededBlocks {
+        /// Reactor-local query identifier the driver must echo with the result.
+        query_id: NonZeroU64,
         /// First height to consider for the next local work-buffer refill.
         from: block::Height,
         /// Maximum number of heights to scan for this refill.
         limit: u32,
         /// Current best header target, used for diagnostics and coalescing.
         best_header_tip: block::Height,
+        /// Atomic durable coordinates that own this state query and its result.
+        scope: zakura_header_chain::WorkScope,
     },
     /// Ask node wiring to read committed bodies for an inbound `GetBlocks`.
     QueryBlocksByHeightRange {

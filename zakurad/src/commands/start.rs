@@ -1562,6 +1562,29 @@ mod zakura_header_sync_driver_tests {
         ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
     };
 
+    fn needed_blocks_query(
+        query_id: u64,
+        from: block::Height,
+        limit: u32,
+        best_header_tip: block::Height,
+    ) -> BlockSyncAction {
+        BlockSyncAction::QueryNeededBlocks {
+            query_id: std::num::NonZeroU64::new(query_id).expect("test query ID is nonzero"),
+            from,
+            limit,
+            best_header_tip,
+            scope: zakura_header_chain::WorkScope {
+                state_version: zakura_header_chain::StateVersion::new(query_id),
+                header_generation: zakura_header_chain::HeaderGeneration::new(query_id),
+                verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(query_id)),
+                branch: zakura_header_chain::BranchId::new(
+                    block::Hash([0; 32]),
+                    block::Hash([0; 32]),
+                ),
+            },
+        }
+    }
+
     fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
         Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
     }
@@ -1601,11 +1624,27 @@ mod zakura_header_sync_driver_tests {
         }
     }
 
+    fn block_sync_startup_with_snapshot(
+        frontiers: BlockSyncFrontiers,
+        best_header_tip: (block::Height, block::Hash),
+        header_tip: tokio::sync::watch::Receiver<(block::Height, block::Hash)>,
+        config: zakura_network::zakura::ZakuraBlockSyncConfig,
+    ) -> zakura_network::zakura::BlockSyncStartup {
+        let mut startup = zakura_network::zakura::BlockSyncStartup::new(
+            frontiers,
+            best_header_tip,
+            header_tip,
+            config,
+        );
+        startup.committed_snapshots = Some(test_committed_snapshots(frontiers, best_header_tip));
+        startup
+    }
+
     fn block_sync_startup_for_test() -> zakura_network::zakura::BlockSyncStartup {
         let (tip_tx, tip_rx) =
             tokio::sync::watch::channel((block::Height(0), block::Hash([0; 32])));
         drop(tip_tx);
-        zakura_network::zakura::BlockSyncStartup::new(
+        block_sync_startup_with_snapshot(
             BlockSyncFrontiers {
                 finalized_height: block::Height(0),
                 verified_block_tip: block::Height(0),
@@ -1615,6 +1654,41 @@ mod zakura_header_sync_driver_tests {
             tip_rx,
             zakura_network::zakura::ZakuraBlockSyncConfig::default(),
         )
+    }
+
+    fn test_committed_snapshots(
+        frontiers: BlockSyncFrontiers,
+        best_header_tip: (block::Height, block::Hash),
+    ) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>> {
+        let finalized = zakura_header_chain::Frontier::new(
+            frontiers.finalized_height,
+            frontiers.verified_block_hash,
+        );
+        let verified = zakura_header_chain::Frontier::new(
+            frontiers.verified_block_tip,
+            frontiers.verified_block_hash,
+        );
+        let header_best = zakura_header_chain::Frontier::new(best_header_tip.0, best_header_tip.1);
+        let (snapshot_tx, snapshot_rx) =
+            tokio::sync::watch::channel(Some(zakura_header_chain::EngineSnapshot {
+                mode: zakura_header_chain::EngineMode::Integrated,
+                state_version: zakura_header_chain::StateVersion::new(1),
+                header_generation: zakura_header_chain::HeaderGeneration::new(1),
+                verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+                frontiers: zakura_header_chain::FrontierSet {
+                    finalized,
+                    header_best,
+                    verified_best: verified,
+                },
+                header_best_score: zakura_header_chain::ChainScore::new(
+                    zakura_header_chain::SuffixWork::zero(),
+                    header_best.hash,
+                ),
+                oldest_retained_height: finalized.height,
+                alarms: Default::default(),
+            }));
+        drop(snapshot_tx);
+        snapshot_rx
     }
 
     fn test_zakura_peer(byte: u8) -> zakura_network::zakura::ZakuraPeerId {
@@ -2171,6 +2245,7 @@ mod zakura_header_sync_driver_tests {
                         from: block::Height(1),
                         limit: 3,
                         best_header_tip: block::Height(3),
+                        ..
                     }
                 ) {
                     break;
@@ -2293,19 +2368,21 @@ mod zakura_header_sync_driver_tests {
     async fn block_sync_driver_coalesces_stale_needed_queries() {
         let (action_tx, mut action_rx) = mpsc::channel(8);
         action_tx
-            .send(BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(1),
-                limit: 1,
-                best_header_tip: block::Height(1),
-            })
+            .send(needed_blocks_query(
+                1,
+                block::Height(1),
+                1,
+                block::Height(1),
+            ))
             .await
             .expect("first query queues");
         action_tx
-            .send(BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(1),
-                limit: 2,
-                best_header_tip: block::Height(2),
-            })
+            .send(needed_blocks_query(
+                2,
+                block::Height(1),
+                2,
+                block::Height(2),
+            ))
             .await
             .expect("stale query queues");
         let deferred_peer =
@@ -2318,11 +2395,12 @@ mod zakura_header_sync_driver_tests {
             .await
             .expect("non-query action queues");
         action_tx
-            .send(BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(3),
-                limit: 6,
-                best_header_tip: block::Height(8),
-            })
+            .send(needed_blocks_query(
+                3,
+                block::Height(3),
+                6,
+                block::Height(8),
+            ))
             .await
             .expect("latest query queues");
 
@@ -2337,6 +2415,7 @@ mod zakura_header_sync_driver_tests {
                 from: block::Height(3),
                 limit: 6,
                 best_header_tip: block::Height(8),
+                ..
             }
         ));
         assert!(matches!(
@@ -2359,11 +2438,12 @@ mod zakura_header_sync_driver_tests {
             .await
             .expect("submit action queues");
         action_tx
-            .send(BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(1),
-                limit: 8,
-                best_header_tip: block::Height(8),
-            })
+            .send(needed_blocks_query(
+                1,
+                block::Height(1),
+                8,
+                block::Height(8),
+            ))
             .await
             .expect("query action queues");
 
@@ -2382,6 +2462,7 @@ mod zakura_header_sync_driver_tests {
                 from: block::Height(1),
                 limit: 8,
                 best_header_tip: block::Height(8),
+                ..
             })
         ));
         assert!(deferred_actions.is_empty());
@@ -2472,11 +2553,12 @@ mod zakura_header_sync_driver_tests {
         ));
 
         action_tx
-            .send(BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(1),
-                limit: 2,
-                best_header_tip: block::Height(2),
-            })
+            .send(needed_blocks_query(
+                1,
+                block::Height(1),
+                2,
+                block::Height(2),
+            ))
             .await
             .expect("driver action channel stays open");
 
@@ -2540,7 +2622,7 @@ mod zakura_header_sync_driver_tests {
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         };
-        let mut startup = zakura_network::zakura::BlockSyncStartup::new(
+        let mut startup = block_sync_startup_with_snapshot(
             initial_frontiers,
             (block::Height(3), block::Hash([3; 32])),
             tip_rx,
@@ -3688,7 +3770,7 @@ mod zakura_header_sync_driver_tests {
         let (tip_tx, tip_rx) =
             tokio::sync::watch::channel((block::Height(10), block::Hash([10; 32])));
         let _tip_tx = tip_tx;
-        let startup = zakura_network::zakura::BlockSyncStartup::new(
+        let startup = block_sync_startup_with_snapshot(
             BlockSyncFrontiers {
                 finalized_height: block::Height(0),
                 verified_block_tip: block::Height(0),
@@ -3712,6 +3794,7 @@ mod zakura_header_sync_driver_tests {
                     from: block::Height(1),
                     limit: 10,
                     best_header_tip: block::Height(10),
+                    ..
                 }
             ),
             "test setup should start with an initial body query, got {startup_action:?}"
@@ -4000,11 +4083,12 @@ mod zakura_header_sync_driver_tests {
             .await
             .expect("driver action channel stays open");
         action_tx
-            .send(BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(1),
-                limit: 1,
-                best_header_tip: block::Height(1),
-            })
+            .send(needed_blocks_query(
+                1,
+                block::Height(1),
+                1,
+                block::Height(1),
+            ))
             .await
             .expect("driver action channel stays open");
 
@@ -4127,7 +4211,7 @@ mod zakura_header_sync_driver_tests {
         let block_hash = block.hash();
         let (_tip_tx, tip_rx) =
             tokio::sync::watch::channel((block::Height(10), block::Hash([10; 32])));
-        let startup = zakura_network::zakura::BlockSyncStartup::new(
+        let startup = block_sync_startup_with_snapshot(
             BlockSyncFrontiers {
                 finalized_height: block::Height(0),
                 verified_block_tip: block::Height(0),
@@ -4151,6 +4235,7 @@ mod zakura_header_sync_driver_tests {
                     from: block::Height(1),
                     limit: 10,
                     best_header_tip: block::Height(10),
+                    ..
                 }
             ),
             "test setup should start with an initial body query, got {startup_action:?}"
@@ -4244,6 +4329,7 @@ mod zakura_header_sync_driver_tests {
                     from: block::Height(2),
                     limit: 9,
                     best_header_tip: block::Height(10),
+                    ..
                 }
             ),
             "delayed checkpoint refresh must send the committed height once state catches up, got {action:?}"
@@ -4261,7 +4347,7 @@ mod zakura_header_sync_driver_tests {
         let block2_hash = block2.hash();
         let (_tip_tx, tip_rx) =
             tokio::sync::watch::channel((block::Height(10), block::Hash([10; 32])));
-        let startup = zakura_network::zakura::BlockSyncStartup::new(
+        let startup = block_sync_startup_with_snapshot(
             BlockSyncFrontiers {
                 finalized_height: block::Height(0),
                 verified_block_tip: block::Height(0),
@@ -4371,6 +4457,7 @@ mod zakura_header_sync_driver_tests {
                     from: block::Height(3),
                     limit: 8,
                     best_header_tip: block::Height(10),
+                    ..
                 }
             ),
             "coalesced delayed checkpoint refresh must send the committed height once state catches up, got {action:?}"
@@ -4826,7 +4913,7 @@ mod zakura_header_sync_driver_tests {
         // Start a live reactor from the stale genesis frontier, with headers
         // already above the checkpoint.
         let (_tip_tx, tip_rx) = tokio::sync::watch::channel(best_header_tip);
-        let startup = zakura_network::zakura::BlockSyncStartup::new(
+        let startup = block_sync_startup_with_snapshot(
             BlockSyncFrontiers {
                 finalized_height: block::Height(0),
                 verified_block_tip: block::Height(0),
@@ -4850,6 +4937,7 @@ mod zakura_header_sync_driver_tests {
                     from: block::Height(1),
                     limit: 20,
                     best_header_tip: block::Height(20),
+                    ..
                 }
             ),
             "stale reactor should start querying from genesis, got {startup_action:?}"
@@ -4953,7 +5041,7 @@ mod zakura_header_sync_driver_tests {
         assert_eq!(restart_frontiers.verified_block_hash, checkpoint_hash);
 
         let (_restart_tip_tx, restart_tip_rx) = tokio::sync::watch::channel(best_header_tip);
-        let restart_startup = zakura_network::zakura::BlockSyncStartup::new(
+        let restart_startup = block_sync_startup_with_snapshot(
             restart_frontiers,
             best_header_tip,
             restart_tip_rx,
@@ -4972,6 +5060,7 @@ mod zakura_header_sync_driver_tests {
                     from: block::Height(11),
                     limit: 10,
                     best_header_tip: block::Height(20),
+                    ..
                 }
             ),
             "fresh reactor should query from the durable checkpoint frontier, got {restart_action:?}"

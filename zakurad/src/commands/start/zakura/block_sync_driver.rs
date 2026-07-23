@@ -288,9 +288,11 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 debug!(?peer, ?reason, "recorded Zakura block-sync peer violation");
             }
             BlockSyncAction::QueryNeededBlocks {
+                query_id,
                 from,
                 limit,
                 best_header_tip,
+                scope,
             } => {
                 emit_commit_state(
                     &trace,
@@ -316,7 +318,11 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                                 insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
                             },
                         );
-                        let _ = block_sync.send_control(BlockSyncEvent::NeededBlocks(blocks));
+                        let _ = block_sync.send_control(BlockSyncEvent::ScopedNeededBlocks {
+                            query_id,
+                            scope,
+                            blocks,
+                        });
                         emit_commit_state(
                             &trace,
                             cs_trace::REACTOR_EVENT_SENT,
@@ -651,11 +657,13 @@ pub(crate) fn coalesce_ready_needed_block_queries(
     while let Some(action) = deferred_actions.pop_front() {
         match action {
             BlockSyncAction::QueryNeededBlocks {
+                query_id,
                 from,
                 limit,
                 best_header_tip,
+                scope,
             } => {
-                latest_query = Some((from, limit, best_header_tip));
+                latest_query = Some((query_id, from, limit, best_header_tip, scope));
             }
             action => retained.push_back(action),
         }
@@ -665,24 +673,27 @@ pub(crate) fn coalesce_ready_needed_block_queries(
     while let Ok(action) = actions.try_recv() {
         match action {
             BlockSyncAction::QueryNeededBlocks {
+                query_id,
                 from,
                 limit,
                 best_header_tip,
+                scope,
             } => {
-                latest_query = Some((from, limit, best_header_tip));
+                latest_query = Some((query_id, from, limit, best_header_tip, scope));
             }
             action => deferred_actions.push_back(action),
         }
     }
 
-    let latest_query =
-        latest_query.map(
-            |(from, limit, best_header_tip)| BlockSyncAction::QueryNeededBlocks {
-                from,
-                limit,
-                best_header_tip,
-            },
-        );
+    let latest_query = latest_query.map(|(query_id, from, limit, best_header_tip, scope)| {
+        BlockSyncAction::QueryNeededBlocks {
+            query_id,
+            from,
+            limit,
+            best_header_tip,
+            scope,
+        }
+    });
 
     if !deferred_actions.is_empty() {
         if let Some(query) = latest_query {
@@ -700,9 +711,11 @@ pub(crate) fn coalesce_stale_needed_block_queries(
     deferred_actions: &mut VecDeque<BlockSyncAction>,
 ) -> BlockSyncAction {
     let BlockSyncAction::QueryNeededBlocks {
+        mut query_id,
         mut from,
         mut limit,
         mut best_header_tip,
+        mut scope,
     } = action
     else {
         return action;
@@ -712,13 +725,17 @@ pub(crate) fn coalesce_stale_needed_block_queries(
     while let Ok(action) = actions.try_recv() {
         match action {
             BlockSyncAction::QueryNeededBlocks {
+                query_id: latest_query_id,
                 from: latest_from,
                 limit: latest_limit,
                 best_header_tip: latest_best_header_tip,
+                scope: latest_scope,
             } => {
+                query_id = latest_query_id;
                 from = latest_from;
                 limit = latest_limit;
                 best_header_tip = latest_best_header_tip;
+                scope = latest_scope;
                 coalesced_count = coalesced_count.saturating_add(1);
             }
             action => deferred_actions.push_back(action),
@@ -730,9 +747,11 @@ pub(crate) fn coalesce_stale_needed_block_queries(
     }
 
     BlockSyncAction::QueryNeededBlocks {
+        query_id,
         from,
         limit,
         best_header_tip,
+        scope,
     }
 }
 
@@ -1548,6 +1567,7 @@ fn trace_block_driver_action(trace: &ZakuraTrace, action: &BlockSyncAction) {
                 from,
                 limit,
                 best_header_tip,
+                ..
             } => {
                 insert_cs_str(row, cs_trace::ACTION, "query_needed_blocks");
                 insert_cs_height(row, cs_trace::RANGE_START, *from);

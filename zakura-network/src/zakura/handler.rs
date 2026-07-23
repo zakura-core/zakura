@@ -3086,6 +3086,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
                 frontier_updates,
                 config.zakura.block_sync.clone(),
             );
+            startup.committed_snapshots = driver_startup.committed_snapshots.clone();
             startup.shutdown = header_sync_shutdown.clone();
             startup.trace = trace.clone();
             let (handle, actions, task) = spawn_block_sync_reactor(startup);

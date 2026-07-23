@@ -11424,7 +11424,94 @@ async fn reactor_far_ahead_header_tip_queries_only_next_refill_window() {
             from: block::Height(1),
             limit: 2,
             best_header_tip: block::Height(50_000),
+            ..
         }
+    ));
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
+    let best_header_tip = block::Height(10);
+    let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (best_header_tip, block::Hash([10; 32])),
+        tip_rx,
+        ZakuraBlockSyncConfig::default(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id: first_query_id,
+        scope: first_scope,
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup must query needed blocks");
+    };
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(Vec::new()))
+        .await
+        .expect("test fixture clears the first pending query");
+    handle
+        .send(BlockSyncEvent::HeaderTipChanged {
+            height: block::Height(11),
+            hash: block::Hash([11; 32]),
+        })
+        .await
+        .expect("header-tip event queues");
+
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id: second_query_id,
+        scope: second_scope,
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("new header tip must query needed blocks");
+    };
+    assert_ne!(first_query_id, second_query_id);
+
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            query_id: first_query_id,
+            scope: first_scope,
+            blocks: Vec::new(),
+        })
+        .await
+        .expect("stale completion queues");
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            query_id: second_query_id,
+            scope: second_scope,
+            blocks: vec![BlockSyncBlockMeta {
+                height: block::Height(1),
+                hash: block::Hash([1; 32]),
+                size: BlockSizeEstimate::Advertised(1_000),
+            }],
+        })
+        .await
+        .expect("matched query completion queues");
+    handle
+        .send(BlockSyncEvent::HeaderTipChanged {
+            height: block::Height(12),
+            hash: block::Hash([12; 32]),
+        })
+        .await
+        .expect("second header-tip event queues");
+    assert!(matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks {
+            query_id,
+            from: block::Height(2),
+            ..
+        } if query_id != first_query_id && query_id != second_query_id
     ));
 
     reactor_task.abort();
@@ -11471,6 +11558,7 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
             from: block::Height(1),
             limit: 8,
             best_header_tip: block::Height(50_000),
+            ..
         }
     ));
 
@@ -11502,6 +11590,7 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
             from,
             limit,
             best_header_tip,
+            ..
         } => {
             assert_eq!(
                 from,

@@ -4628,10 +4628,7 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
     config.tracing.filter = Some("error".to_string());
 
     let rpc_listen_addr = config.rpc.listen_addr.unwrap();
-    // Mining 500 blocks in one RPC call can exceed the default request timeout
-    // on slower CI runners.
-    let rpc_client_1 =
-        RpcRequestClient::new_with_timeout(rpc_listen_addr, Duration::from_secs(15 * 60));
+    let rpc_client_1 = RpcRequestClient::new_with_timeout(rpc_listen_addr, EXTENDED_LAUNCH_DELAY);
 
     tracing::info!(
         ?rpc_listen_addr,
@@ -4689,18 +4686,14 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
     let test_result: Result<()> = async {
         tracing::info!("waiting for zakurad nodes to connect");
 
-        let (peer_info_1, peer_info_2) = tokio::time::timeout(EXTENDED_LAUNCH_DELAY, async {
+        let peer_info = tokio::time::timeout(EXTENDED_LAUNCH_DELAY, async {
             loop {
-                let peer_info_1 = rpc_client_1
+                if let Ok(peer_info) = rpc_client_2
                     .json_result_from_call::<Vec<PeerInfo>>("getpeerinfo", "[]")
-                    .await;
-                let peer_info_2 = rpc_client_2
-                    .json_result_from_call::<Vec<PeerInfo>>("getpeerinfo", "[]")
-                    .await;
-
-                if let (Ok(peer_info_1), Ok(peer_info_2)) = (peer_info_1, peer_info_2) {
-                    if !peer_info_1.is_empty() && !peer_info_2.is_empty() {
-                        break (peer_info_1, peer_info_2);
+                    .await
+                {
+                    if !peer_info.is_empty() {
+                        break peer_info;
                     }
                 }
 
@@ -4711,8 +4704,7 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
         .map_err(|_| eyre!("zakurad nodes did not connect before the launch timeout"))?;
 
         tracing::info!(
-            ?peer_info_1,
-            ?peer_info_2,
+            ?peer_info,
             "found peer connection, committing genesis block"
         );
 
@@ -4720,32 +4712,24 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
         rpc_client_1.submit_block(genesis_block.clone()).await?;
         rpc_client_2.submit_block(genesis_block).await?;
 
-        // Mine a long chain so the second node's syncer requests invalid-PoW
-        // blocks from its peer.
+        // The syncer drops the trailing untrusted FindBlocks hash, then needs
+        // two remaining hashes to select a prospective tip.
         tracing::info!("committed genesis block, mining blocks with invalid PoW");
         tokio::time::sleep(Duration::from_secs(2)).await;
-        rpc_client_1.generate(500).await?;
+        rpc_client_1.generate(3).await?;
 
-        tokio::time::timeout(EXTENDED_LAUNCH_DELAY, async {
+        tokio::time::timeout(test_type.zakurad_timeout(), async {
             loop {
-                let peer_info_1: Vec<PeerInfo> = rpc_client_1
-                    .json_result_from_call("getpeerinfo", "[]")
-                    .await
-                    .map_err(|err| eyre!(err))?;
-                let peer_info_2: Vec<PeerInfo> = rpc_client_2
+                let peer_info: Vec<PeerInfo> = rpc_client_2
                     .json_result_from_call("getpeerinfo", "[]")
                     .await
                     .map_err(|err| eyre!(err))?;
 
-                if peer_info_1.is_empty() && peer_info_2.is_empty() {
+                if peer_info.is_empty() {
                     return Ok::<(), color_eyre::Report>(());
                 }
 
-                tracing::debug!(
-                    ?peer_info_1,
-                    ?peer_info_2,
-                    "has not yet disconnected from misbehaving peer"
-                );
+                tracing::debug!(?peer_info, "has not yet disconnected from misbehaving peer");
 
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }

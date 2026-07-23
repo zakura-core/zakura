@@ -178,18 +178,21 @@ impl BodyRetryEpisode {
         let alarm_due = self.attempts >= ALARM_ATTEMPTS
             || now.signed_duration_since(self.started_at) >= ALARM_AFTER;
         if self.alarmed {
-            self.next_probe_at = now + ALARM_PROBE_INTERVAL;
+            self.next_probe_at = retry_deadline(now, ALARM_PROBE_INTERVAL);
             return RetryUpdate::ProbeAt(self.next_probe_at);
         }
         if all_suppliers_tried && alarm_due {
             self.alarmed = true;
-            self.next_probe_at = now + ALARM_PROBE_INTERVAL;
+            self.next_probe_at = retry_deadline(now, ALARM_PROBE_INTERVAL);
             return RetryUpdate::Alarmed {
                 probe_at: self.next_probe_at,
             };
         }
 
-        self.next_probe_at = now + retry_delay(self.branch, self.header, self.attempts, jitter);
+        self.next_probe_at = retry_deadline(
+            now,
+            retry_delay(self.branch, self.header, self.attempts, jitter),
+        );
         RetryUpdate::RetryAt(self.next_probe_at)
     }
 
@@ -201,6 +204,11 @@ impl BodyRetryEpisode {
             alarmed: self.alarmed,
         }
     }
+}
+
+fn retry_deadline(now: DateTime<Utc>, delay: Duration) -> DateTime<Utc> {
+    now.checked_add_signed(delay)
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
 fn retry_delay<J: RetryJitter>(
@@ -491,5 +499,13 @@ mod tests {
             Frontier::new(block::Height(11), hash(9)),
         );
         assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn retry_deadlines_saturate_at_the_clock_boundary() {
+        assert_eq!(
+            retry_deadline(DateTime::<Utc>::MAX_UTC, Duration::minutes(10)),
+            DateTime::<Utc>::MAX_UTC
+        );
     }
 }

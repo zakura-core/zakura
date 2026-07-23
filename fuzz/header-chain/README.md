@@ -29,12 +29,14 @@ The command invokes `cargo fuzz tmin` with the CI-pinned nightly and prints the
 minimized SHA-256, bounded operation bytes, and a target-specific Rust
 regression template.
 
-`fork_transitions` consumes at most 512 operation bytes. Bits 3–5 select linear
+`fork_transitions` consumes at most 512 operation bytes. Bits 3–6 select linear
 or fork insertion, stale-version work, operator invalidation/reconsideration,
-or crash/reopen; bits 0–2 bound insertion length to 1–8 headers. Invalid
-references are explicit refused operations. The shared feature-gated replay
-function runs the production planner, verifies generation deltas and committed
-snapshots after every operation, and is also used by deterministic corpus tests.
+body invalid/unavailable/verified evidence, deferred insertion/reevaluation,
+clock advancement, or crash/reopen; bits 0–2 bound insertion length to 1–8
+headers. Invalid references are explicit refused operations. The shared
+feature-gated replay function runs the production planner and independently
+rebuilds retained indexes, eligibility, work ordering, and projections after
+every operation. It is also used by deterministic corpus tests.
 
 `header_pursuit` consumes at most 512 bytes as four-byte operations over twenty
 logical peers. It drives the production peer work queue, response-page and

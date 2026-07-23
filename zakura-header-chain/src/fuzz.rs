@@ -1,8 +1,15 @@
 //! Feature-gated entry points shared by libFuzzer and deterministic corpus tests.
 
-use std::{collections::HashMap, num::NonZeroU64, sync::Arc};
+use std::{
+    collections::HashMap,
+    num::NonZeroU64,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
+};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 use zakura_chain::{
     block::{self, genesis::regtest_genesis_block},
@@ -10,14 +17,16 @@ use zakura_chain::{
 };
 
 use crate::{
-    apply_transition, AlarmSet, AuxDelivery, AuxDelta, BranchId, ChainScore, CheckpointSet, Clock,
+    apply_transition, AlarmSet, AuxDelivery, AuxDelta, BodyEvidence, BodyRuleId,
+    BodyUnavailableSummary, BranchId, ChainScore, CheckpointSet, Clock, ConsensusBodyInvalid,
     EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, EvidenceId, FinalityEpoch,
-    FinalityRecord, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderContextFact,
-    HeaderGeneration, HeaderNode, HeaderValidationState, InsertHeaders, MemHeaderStore,
-    OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, PreparedHeader,
+    FinalityRecord, Frontier, FrontierSet, FullStateEvidenceAuthority, HeaderChainDiskVersion,
+    HeaderContextFact, HeaderGeneration, HeaderNode, HeaderValidationState, InsertHeaders,
+    MemHeaderStore, OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, PreparedHeader,
     PreparedHeaderBatch, ProjectionDelta, SourceId, StateVersion, StoreError, StoreRead,
-    SuffixWork, TargetCompletion, TransitionContext, TransitionFailure, TransitionPlan,
-    TransitionRequest, TrustedAnchor, ValidationLease, VerifiedGeneration, WorkOwner,
+    SuffixWork, TargetCompletion, TransientBodyFailure, TransientBodyFailureKind,
+    TransitionContext, TransitionFailure, TransitionPlan, TransitionRequest, TrustedAnchor,
+    ValidationLease, VerifiedBodyEvidence, VerifiedGeneration, WorkOwner,
 };
 
 /// Deterministic summary of one bounded structured-operation replay.
@@ -153,6 +162,23 @@ impl FuzzStore {
         operation: usize,
         branch: u8,
     ) -> TransitionRequest {
+        self.insertion_with_validation(
+            parent,
+            count,
+            operation,
+            branch,
+            HeaderValidationState::Valid,
+        )
+    }
+
+    fn insertion_with_validation(
+        &self,
+        parent: Frontier,
+        count: u32,
+        operation: usize,
+        branch: u8,
+        validation: HeaderValidationState,
+    ) -> TransitionRequest {
         let lease = self.lease(parent);
         let evidence = evidence(operation, branch);
         let mut headers = Vec::with_capacity(usize::try_from(count).unwrap_or(8));
@@ -173,7 +199,7 @@ impl FuzzStore {
                     .difficulty_threshold
                     .to_work()
                     .expect("the fixed target has valid work"),
-                validation: HeaderValidationState::Valid,
+                validation,
             });
             parent_hash = hash;
         }
@@ -282,10 +308,30 @@ impl StoreRead for FuzzStore {
     }
 }
 
-struct FixedClock;
-impl Clock for FixedClock {
+struct ManualClock(AtomicI64);
+
+impl ManualClock {
+    fn new() -> Self {
+        Self(AtomicI64::new(0))
+    }
+
+    fn advance(&self, seconds: u32) {
+        self.0.fetch_add(i64::from(seconds), Ordering::Relaxed);
+    }
+}
+
+struct FuzzAuthority;
+
+impl FullStateEvidenceAuthority for FuzzAuthority {
+    fn authorizes(&self, _evidence: EvidenceId) -> bool {
+        true
+    }
+}
+
+impl Clock for ManualClock {
     fn now(&self) -> DateTime<Utc> {
-        DateTime::<Utc>::UNIX_EPOCH
+        DateTime::from_timestamp(self.0.load(Ordering::Relaxed), 0)
+            .expect("the bounded fuzz clock stays in chrono's supported range")
     }
 }
 
@@ -301,13 +347,15 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     let mut commits = 0u16;
     let mut refused = 0u16;
     let mut transcript = Sha256::new();
+    let clock = ManualClock::new();
+    let authority = FuzzAuthority;
     assert_exhaustive_oracle(&store);
 
     for (operation, byte) in bounded.iter().copied().enumerate() {
         let before = store.snapshot();
         let count = u32::from(byte & 0x07).saturating_add(1);
         let branch = byte.rotate_left(3);
-        let request = match (byte >> 3) & 0x07 {
+        let request = match (byte >> 3) & 0x0f {
             0 | 1 => store.insertion(
                 if byte & 0x08 == 0 {
                     store.metadata.frontiers.header_best
@@ -373,6 +421,77 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                 assert_exhaustive_oracle(&store);
                 continue;
             }
+            6 => {
+                let target = store.retained_parent(branch);
+                if target == store.metadata.frontiers.finalized {
+                    refused = refused.saturating_add(1);
+                    transcript.update([byte, 0]);
+                    assert_exhaustive_oracle(&store);
+                    continue;
+                }
+                TransitionRequest {
+                    expected_version: store.metadata.state_version,
+                    event: crate::TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(
+                        ConsensusBodyInvalid {
+                            hash: target.hash,
+                            evidence: evidence(operation, branch),
+                            rule: BodyRuleId::new("fuzz.body.invalid"),
+                            source: SourceId::from_digest([branch; 32]),
+                        },
+                    )),
+                }
+            }
+            7 => {
+                let target = store.metadata.frontiers.header_best;
+                TransitionRequest {
+                    expected_version: store.metadata.state_version,
+                    event: crate::TransitionEvent::BodyEvidence(BodyEvidence::Transient(
+                        TransientBodyFailure {
+                            hash: target.hash,
+                            evidence: evidence(operation, branch),
+                            kind: TransientBodyFailureKind::VerifierUnavailable,
+                            availability: BodyUnavailableSummary {
+                                started_at: clock.now(),
+                                attempts: u32::from(branch).saturating_add(1),
+                                suppliers: 1,
+                                supplier_set_digest: [branch; 32],
+                                alarmed: byte & 0x80 != 0,
+                                next_probe_at: clock.now() + Duration::seconds(1),
+                            },
+                        },
+                    )),
+                }
+            }
+            8 => {
+                let target = store.retained_parent(branch);
+                TransitionRequest {
+                    expected_version: store.metadata.state_version,
+                    event: crate::TransitionEvent::BodyEvidence(BodyEvidence::Verified(
+                        VerifiedBodyEvidence {
+                            hash: target.hash,
+                            evidence: evidence(operation, branch),
+                        },
+                    )),
+                }
+            }
+            9 => TransitionRequest {
+                expected_version: store.metadata.state_version,
+                event: crate::TransitionEvent::ReevaluateDeferred,
+            },
+            10 => store.insertion_with_validation(
+                store.metadata.frontiers.header_best,
+                count,
+                operation,
+                branch,
+                HeaderValidationState::DeferredUntil(clock.now() + Duration::seconds(1)),
+            ),
+            11 => {
+                clock.advance(u32::from(branch).saturating_add(1));
+                transcript.update(b"clock");
+                transcript.update(clock.now().timestamp().to_le_bytes());
+                assert_exhaustive_oracle(&store);
+                continue;
+            }
             _ => {
                 // Explicit stale/no-op references are part of the operation language.
                 refused = refused.saturating_add(1);
@@ -383,8 +502,8 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         };
         let context = TransitionContext {
             config: &store.config,
-            clock: &FixedClock,
-            full_state_authority: None,
+            clock: &clock,
+            full_state_authority: Some(&authority),
             startup_capability: None,
             retention_references: &[],
         };
@@ -675,6 +794,35 @@ mod tests {
     }
 
     #[test]
+    fn body_and_deferred_operations_have_their_expected_selection_effects() {
+        let body_invalid = replay_fork_transition_bytes(&[10, 48]);
+        assert_eq!(body_invalid.commits, 2);
+        assert_eq!(
+            body_invalid.snapshot.frontiers.header_best.height,
+            block::Height(0)
+        );
+
+        let body_unavailable = replay_fork_transition_bytes(&[10, 56]);
+        assert_eq!(body_unavailable.commits, 2);
+        assert_eq!(
+            body_unavailable.snapshot.frontiers.header_best.height,
+            block::Height(3),
+            "transient body availability must not change header eligibility"
+        );
+
+        let deferred = replay_fork_transition_bytes(&[80]);
+        assert_eq!(
+            deferred.snapshot.frontiers.header_best.height,
+            block::Height(0)
+        );
+        let admitted = replay_fork_transition_bytes(&[80, 88, 72]);
+        assert_eq!(
+            admitted.snapshot.frontiers.header_best.height,
+            block::Height(1)
+        );
+    }
+
+    #[test]
     fn fork_transition_regression_corpus_replays_green() {
         let corpus: &[(&str, &[u8])] = &[
             (
@@ -696,6 +844,20 @@ mod tests {
             (
                 "crash_reopen",
                 include_bytes!("../../fuzz/header-chain/corpus/fork_transitions/crash_reopen"),
+            ),
+            (
+                "body_invalid",
+                include_bytes!("../../fuzz/header-chain/corpus/fork_transitions/body_invalid"),
+            ),
+            (
+                "body_unavailable",
+                include_bytes!("../../fuzz/header-chain/corpus/fork_transitions/body_unavailable"),
+            ),
+            (
+                "deferred_reevaluation",
+                include_bytes!(
+                    "../../fuzz/header-chain/corpus/fork_transitions/deferred_reevaluation"
+                ),
             ),
         ];
         for (name, bytes) in corpus {

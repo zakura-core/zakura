@@ -36,12 +36,12 @@ pub use node::{
 pub use retention::RetentionPlan;
 pub use transition::*;
 pub use validation::{
-    infer_height, validate_commitment_structure, validate_compact_target,
+    infer_height, prepare_headers, validate_commitment_structure, validate_compact_target,
     validate_contextual_difficulty_and_time, validate_encoding_version_hash, validate_future_time,
     validate_hash_filter, validate_link, AdjustedDifficulty, CompactTargetError,
-    ContextualValidationError, HashFilterError, HeaderEncodingError, HeaderHeightError,
-    HeaderLinkError, PowPolicy, PowPolicyError, BLOCK_MAX_TIME_SINCE_MEDIAN,
-    POW_ADJUSTMENT_BLOCK_SPAN, POW_MEDIAN_BLOCK_SPAN,
+    ContextualValidationError, HashFilterError, HeaderBatchInput, HeaderEncodingError,
+    HeaderFailure, HeaderHeightError, HeaderLinkError, HeaderRule, HeaderRules, PowPolicy,
+    PowPolicyError, BLOCK_MAX_TIME_SINCE_MEDIAN, POW_ADJUSTMENT_BLOCK_SPAN, POW_MEDIAN_BLOCK_SPAN,
 };
 
 #[cfg(test)]

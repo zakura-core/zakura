@@ -2422,6 +2422,130 @@ async fn registry_miss_retry_accumulates_budget_for_the_same_block() {
     peer_set.expect_no_requests().await;
 }
 
+/// A registry-miss retry is specific to one hash, so it must not globally stall unrelated reserve
+/// work. Dispatch is limited to one hash per loop step so the retry timer remains reachable.
+#[tokio::test]
+async fn registry_miss_retry_allows_bounded_reserve_dispatch() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync_with_options(Height(0), Duration::from_millis(50));
+
+    let missing_hash = block::Hash::from([0xAB; 32]);
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::DownloadFailed {
+            error: not_found_registry_error(missing_hash),
+            hash: missing_hash,
+        }))
+        .await
+        .expect("a registry miss within budget should stay within the retry loop");
+
+    let first_reserve_hash = block::Hash::from([0x11; 32]);
+    let second_reserve_hash = block::Hash::from([0x22; 32]);
+    let reserve = [first_reserve_hash, second_reserve_hash]
+        .into_iter()
+        .collect();
+
+    let first_request = {
+        let sync_round = chain_sync.sync_round(reserve);
+        tokio::pin!(sync_round);
+
+        tokio::select! {
+            result = &mut sync_round => {
+                panic!("the sync round should still be waiting, got {result:?}")
+            }
+            request = async {
+                let request = peer_set
+                    .expect_request(zn::Request::BlocksByHash(
+                        iter::once(first_reserve_hash).collect(),
+                    ))
+                    .await;
+                peer_set.expect_no_requests().await;
+                request
+            } => request,
+        }
+    };
+
+    chain_sync.downloads.cancel_all();
+    drop(first_request);
+}
+
+/// The audit regression scenario: one required hash registry-misses while later reserve hashes
+/// are available. The missed hash must be retried on its backoff timer without blocking dispatch
+/// of the available reserve.
+#[tokio::test]
+async fn registry_missed_hash_retries_while_reserve_dispatch_continues() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync_with_options(Height(0), Duration::from_millis(50));
+
+    let missing_hash = block::Hash::from([0xAB; 32]);
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::DownloadFailed {
+            error: not_found_registry_error(missing_hash),
+            hash: missing_hash,
+        }))
+        .await
+        .expect("a registry miss within budget should stay within the retry loop");
+
+    let first_reserve_hash = block::Hash::from([0x11; 32]);
+    let second_reserve_hash = block::Hash::from([0x22; 32]);
+    let reserve = [first_reserve_hash, second_reserve_hash]
+        .into_iter()
+        .collect();
+
+    let requests = {
+        let sync_round = chain_sync.sync_round(reserve);
+        tokio::pin!(sync_round);
+
+        tokio::select! {
+            result = &mut sync_round => {
+                panic!("the sync round should still be waiting, got {result:?}")
+            }
+            requests = async {
+                // The first reserve hash is dispatched immediately; the second is deferred while
+                // the registry-miss retry is pending.
+                let first = peer_set
+                    .expect_request(zn::Request::BlocksByHash(
+                        iter::once(first_reserve_hash).collect(),
+                    ))
+                    .await;
+                peer_set.expect_no_requests().await;
+
+                // Wait out the backoff (with margin for a delayed timer under test load): the
+                // timer arm re-dispatches the missed hash, then the next loop step dispatches
+                // the deferred reserve hash.
+                tokio::time::sleep(sync::REGISTRY_MISS_RETRY_BACKOFF + Duration::from_millis(100))
+                    .await;
+                let retry = peer_set
+                    .expect_request(zn::Request::BlocksByHash(
+                        iter::once(missing_hash).collect(),
+                    ))
+                    .await;
+                let second = peer_set
+                    .expect_request(zn::Request::BlocksByHash(
+                        iter::once(second_reserve_hash).collect(),
+                    ))
+                    .await;
+
+                (first, retry, second)
+            } => requests,
+        }
+    };
+
+    chain_sync.downloads.cancel_all();
+    drop(requests);
+}
+
 fn setup() -> (
     // ChainSync
     impl Future<Output = Result<(), Report>> + Send,

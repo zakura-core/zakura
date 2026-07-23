@@ -823,6 +823,73 @@ mod tests {
     }
 
     #[test]
+    fn operator_reconsider_preserves_every_unnamed_reason() {
+        let mut store = anchor_store();
+        let anchor = store.finalized();
+        let target = insert_child(&mut store, anchor.hash, 1);
+        let descendant = insert_child(&mut store, target.hash, 2);
+        let first_id = crate::OperatorInvalidationId::new([1; 16]);
+        let second_id = crate::OperatorInvalidationId::new([2; 16]);
+        let permanent_reasons = [
+            EligibilityReason::SettledUpgradeConflict {
+                height: target.height,
+                expected: block::Hash([3; 32]),
+            },
+            EligibilityReason::CheckpointConflict {
+                height: target.height,
+                expected: block::Hash([4; 32]),
+            },
+            EligibilityReason::FinalityConflict { finalized: anchor },
+        ];
+        for reason in permanent_reasons.clone() {
+            store
+                .add_reason(target.hash, reason)
+                .expect("the operator target is retained");
+        }
+        for id in [first_id, second_id] {
+            store
+                .add_reason(target.hash, EligibilityReason::OperatorInvalid { id })
+                .expect("the operator target is retained");
+        }
+        let body_evidence = EvidenceId::from_digest([5; 32]);
+        let body_rule = BodyRuleId::new("test.operator-reconsider");
+        store
+            .set_consensus_body_invalid(target.hash, body_evidence, body_rule.clone())
+            .expect("intrinsic body invalidity is recorded independently");
+
+        store
+            .remove_operator_invalidation(target.hash, first_id)
+            .expect("the operator target is retained");
+
+        let target_node = store.node(target.hash).expect("the target is retained");
+        assert!(!target_node
+            .eligibility
+            .direct_reasons
+            .contains(&EligibilityReason::OperatorInvalid { id: first_id }));
+        assert!(target_node
+            .eligibility
+            .direct_reasons
+            .contains(&EligibilityReason::OperatorInvalid { id: second_id }));
+        for reason in permanent_reasons {
+            assert!(target_node.eligibility.direct_reasons.contains(&reason));
+        }
+        assert!(target_node.eligibility.direct_reasons.contains(
+            &EligibilityReason::ConsensusBodyInvalid {
+                evidence: body_evidence,
+                rule: body_rule,
+            }
+        ));
+        assert_eq!(
+            store
+                .node(descendant.hash)
+                .expect("the descendant is retained")
+                .eligibility
+                .inherited_from,
+            Some(target.hash)
+        );
+    }
+
+    #[test]
     fn dg_05_fixed_anchor_replacements_cross_999_1000_1001_in_both_orders() {
         fn insert_branch(
             store: &mut MemHeaderStore,

@@ -554,7 +554,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-BODY-03"
 name = "Transient body failures"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::TransientBodyFailure"
+tests = ["IN-02::reactor_retries_unavailable_body_without_scoring_its_supplier", "IN-02::unexpected_verifier_hash_is_retryable_without_supplier_blame", "IN-02::abandoned_pending_apply_events_drain_queued_blocks", "IN-02::production_body_unavailability_writer_authenticates_exact_evidence", "IN-02::transient_body_evidence_cannot_regress_a_verified_body", "DF-02::df_02_full_state_failures_have_exact_intentional_difference_types", "AUD-03::body_evidence_matrix_preserves_typed_effect_boundaries"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-BODY-04"

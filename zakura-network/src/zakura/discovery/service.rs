@@ -157,7 +157,7 @@ pub struct DiscoveryService {
     handle: ZakuraDiscoveryHandle,
     header_sync: Option<HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
-    session_states: Arc<StdMutex<HashMap<(ZakuraPeerId, ZakuraConnId), DiscoverySessionState>>>,
+    session_states: Arc<StdMutex<SessionStateMap>>,
     connection_owners: Arc<StdMutex<Vec<Arc<dyn Service>>>>,
 }
 
@@ -167,18 +167,33 @@ enum DiscoverySessionState {
     Retired,
 }
 
+/// The session-state slot for one `(peer, connection)`, tagged with the stream
+/// session that owns it so a finished exchange cannot retire a newer session
+/// admitted on the same connection.
+#[derive(Clone, Copy, Debug)]
+struct DiscoverySessionRecord {
+    session_id: u64,
+    state: DiscoverySessionState,
+}
+
+type SessionStateMap = HashMap<(ZakuraPeerId, ZakuraConnId), DiscoverySessionRecord>;
+
 fn retire_discovery_session(
-    session_states: &StdMutex<HashMap<(ZakuraPeerId, ZakuraConnId), DiscoverySessionState>>,
+    session_states: &StdMutex<SessionStateMap>,
     peer: &ZakuraPeerId,
     conn_id: ZakuraConnId,
+    session_id: u64,
 ) -> bool {
     let mut session_states = session_states
         .lock()
         .expect("discovery session-state mutex is never poisoned");
-    let Some(state) = session_states.get_mut(&(peer.clone(), conn_id)) else {
+    let Some(record) = session_states.get_mut(&(peer.clone(), conn_id)) else {
         return false;
     };
-    *state = DiscoverySessionState::Retired;
+    if record.session_id != session_id {
+        return false;
+    }
+    record.state = DiscoverySessionState::Retired;
     true
 }
 
@@ -250,7 +265,7 @@ impl Service for DiscoveryService {
             .lock()
             .expect("discovery session-state mutex is never poisoned")
             .get(&(peer.clone(), conn_id))
-            == Some(&DiscoverySessionState::Retired)
+            .is_some_and(|record| record.state == DiscoverySessionState::Retired)
         {
             return OrderedSessionDemand::Retire;
         }
@@ -310,7 +325,13 @@ impl Service for DiscoveryService {
         self.session_states
             .lock()
             .expect("discovery session-state mutex is never poisoned")
-            .insert((peer.id.clone(), conn_id), DiscoverySessionState::Active);
+            .insert(
+                (peer.id.clone(), conn_id),
+                DiscoverySessionRecord {
+                    session_id,
+                    state: DiscoverySessionState::Active,
+                },
+            );
         let service_cancel = discovery_session.cancel_token();
         let connection_cancel = peer.cancel_token();
         let close_cause = peer.close_cause();
@@ -408,7 +429,7 @@ struct DiscoveryExchangeStart {
     service_cancel: CancellationToken,
     connection_cancel: CancellationToken,
     close_cause: CloseCause,
-    session_states: Arc<StdMutex<HashMap<(ZakuraPeerId, ZakuraConnId), DiscoverySessionState>>>,
+    session_states: Arc<StdMutex<SessionStateMap>>,
 }
 
 fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
@@ -506,7 +527,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
                     .await;
             if closes_discovery_only_connection {
                 handle.mark_short_lived_exchange(&peer_node_id).await;
-                retire_discovery_session(&session_states, &peer_id, conn_id);
+                retire_discovery_session(&session_states, &peer_id, conn_id, session_id);
             }
             service_cancel.cancel();
             handle.remove_session(&peer_id, conn_id, session_id).await;
@@ -2161,7 +2182,10 @@ mod tests {
         let conn_id = 9;
         let states = StdMutex::new(HashMap::from([(
             (peer.clone(), conn_id),
-            DiscoverySessionState::Active,
+            DiscoverySessionRecord {
+                session_id: 1,
+                state: DiscoverySessionState::Active,
+            },
         )]));
 
         states
@@ -2169,10 +2193,59 @@ mod tests {
             .expect("test session-state mutex is never poisoned")
             .remove(&(peer.clone(), conn_id));
 
-        assert!(!retire_discovery_session(&states, &peer, conn_id));
+        assert!(!retire_discovery_session(&states, &peer, conn_id, 1));
         assert!(states
             .lock()
             .expect("test session-state mutex is never poisoned")
             .is_empty());
+    }
+
+    #[test]
+    fn stale_exchange_cannot_retire_a_newer_session_on_the_same_connection() {
+        let peer = ZakuraPeerId::new(vec![72; 32]).expect("test peer id is within bounds");
+        let conn_id = 9;
+        let states = StdMutex::new(HashMap::from([(
+            (peer.clone(), conn_id),
+            DiscoverySessionRecord {
+                session_id: 1,
+                state: DiscoverySessionState::Active,
+            },
+        )]));
+
+        // A reopened stream admits session 2 on the same connection while
+        // session 1's exchange is still finishing.
+        states
+            .lock()
+            .expect("test session-state mutex is never poisoned")
+            .insert(
+                (peer.clone(), conn_id),
+                DiscoverySessionRecord {
+                    session_id: 2,
+                    state: DiscoverySessionState::Active,
+                },
+            );
+
+        assert!(
+            !retire_discovery_session(&states, &peer, conn_id, 1),
+            "session 1's finished exchange must not retire session 2's slot"
+        );
+        assert_eq!(
+            states
+                .lock()
+                .expect("test session-state mutex is never poisoned")
+                .get(&(peer.clone(), conn_id))
+                .map(|record| record.state),
+            Some(DiscoverySessionState::Active),
+        );
+
+        assert!(retire_discovery_session(&states, &peer, conn_id, 2));
+        assert_eq!(
+            states
+                .lock()
+                .expect("test session-state mutex is never poisoned")
+                .get(&(peer.clone(), conn_id))
+                .map(|record| record.state),
+            Some(DiscoverySessionState::Retired),
+        );
     }
 }

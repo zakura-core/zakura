@@ -1524,6 +1524,42 @@ impl ZakuraDiscoveryHandle {
         self.self_record.borrow().clone()
     }
 
+    /// Returns a locally authored record that remains valid through the next refresh interval.
+    ///
+    /// A node can keep its native connections longer than the record TTL. Refreshing lazily before
+    /// a discovery exchange prevents a long-running node from sending an expired `Hello` to a new
+    /// peer after its startup record has aged out.
+    pub(crate) async fn current_self_record_for_gossip(
+        &self,
+    ) -> Result<Arc<ZakuraNodeRecord>, DiscoveryWireError> {
+        self.current_self_record_for_gossip_at(current_unix_secs(), current_sequence_tick())
+            .await
+    }
+
+    async fn current_self_record_for_gossip_at(
+        &self,
+        now_unix_secs: u64,
+        wall_clock_sequence: u64,
+    ) -> Result<Arc<ZakuraNodeRecord>, DiscoveryWireError> {
+        let mut inner = self.inner.lock().await;
+        let current = self.current_self_record();
+        if current.body.expires_at_unix_secs
+            > now_unix_secs.saturating_add(inner.config.refresh_interval.as_secs())
+        {
+            return Ok(current);
+        }
+        let record_ttl = inner.config.record_ttl;
+        let record = Arc::new(inner.local.build_self_record(
+            now_unix_secs,
+            wall_clock_sequence,
+            record_ttl,
+        )?);
+        // Publish before releasing the state lock so concurrent refreshers cannot publish a lower
+        // sequence after a newer record.
+        self.self_record_tx.send_replace(record.clone());
+        Ok(record)
+    }
+
     /// Returns the local node id used in authored self-records.
     pub fn local_node_id(&self) -> NodeId {
         self.self_record.borrow().body.node_id
@@ -1830,9 +1866,11 @@ impl ZakuraDiscoveryHandle {
             return Ok(());
         }
 
-        let Some(expires_at_unix_secs) =
-            effective_live_summary_expiry(services.expires_at_unix_secs, now)
-        else {
+        let Some(expires_at_unix_secs) = effective_live_summary_expiry(
+            services.expires_at_unix_secs,
+            now,
+            inner.config.clock_skew_tolerance,
+        ) else {
             if let Some(entry) = inner.active_services.get_mut(&peer_node_id) {
                 entry.live_summaries.clear();
                 if entry.record.is_none() {
@@ -2425,6 +2463,14 @@ impl ZakuraDiscoveryInner {
             .retain(|node_id, _| connected_node_ids.contains(node_id));
         for entry in self.active_services.values_mut() {
             entry.prune_expired_live_summaries(now_unix_secs);
+            if entry
+                .record
+                .as_ref()
+                .is_some_and(|record| record.body.expires_at_unix_secs < now_unix_secs)
+            {
+                entry.record = None;
+                entry.refresh_live_derived_services();
+            }
         }
         self.active_services
             .retain(|_, entry| !entry.is_empty_live_only());
@@ -3329,14 +3375,22 @@ fn push_unique_service(services: &mut Vec<ZakuraServiceId>, service: ZakuraServi
     }
 }
 
-fn effective_live_summary_expiry(declared_expires_at: u64, now_unix_secs: u64) -> Option<u64> {
-    if declared_expires_at <= now_unix_secs {
+fn effective_live_summary_expiry(
+    declared_expires_at: u64,
+    now_unix_secs: u64,
+    clock_skew_tolerance: Duration,
+) -> Option<u64> {
+    let local_expiry = now_unix_secs.saturating_add(DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs());
+    if declared_expires_at > now_unix_secs {
+        return Some(declared_expires_at.min(local_expiry));
+    }
+    if declared_expires_at.saturating_add(clock_skew_tolerance.as_secs()) <= now_unix_secs {
         return None;
     }
-    Some(
-        declared_expires_at
-            .min(now_unix_secs.saturating_add(DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs())),
-    )
+    // This response arrived on the authenticated live stream but is already expired locally. Use
+    // a bounded receipt TTL only inside the accepted skew window; future expiries still honor a
+    // peer's intentionally shorter lifetime.
+    Some(local_expiry)
 }
 
 fn header_sync_candidate_preference(
@@ -6630,6 +6684,38 @@ mod tests {
             .expect("updated record verifies");
     }
 
+    #[tokio::test]
+    async fn self_record_for_gossip_refreshes_before_expiry() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let config = ZakuraDiscoveryConfig {
+            record_ttl: Duration::from_secs(60),
+            refresh_interval: Duration::from_secs(10),
+            ..ZakuraDiscoveryConfig::default()
+        };
+        let handle = discovery_handle_at_with_sequence(
+            local_config_with(secret_key(), vec![test_addr(43)], vec![service(1)]),
+            config,
+            connected_rx,
+            NOW,
+            100,
+        );
+        let initial = handle.current_self_record();
+
+        let still_current = handle
+            .current_self_record_for_gossip_at(NOW + 49, 101)
+            .await
+            .expect("current self-record remains valid past the refresh window");
+        assert_eq!(still_current, initial);
+
+        let refreshed = handle
+            .current_self_record_for_gossip_at(NOW + 50, 102)
+            .await
+            .expect("self-record refresh signs");
+        assert!(refreshed.body.sequence > initial.body.sequence);
+        assert_eq!(refreshed.body.expires_at_unix_secs, NOW + 110);
+        assert_eq!(handle.current_self_record(), refreshed);
+    }
+
     #[test]
     fn derived_sequence_does_not_regress_after_restart() {
         let secret = secret_key();
@@ -6845,6 +6931,54 @@ mod tests {
             cached[0].summary,
             ZakuraLiveServiceSummary::Discovery(updated_summary)
         );
+    }
+
+    #[tokio::test]
+    async fn connected_services_tolerate_clock_skew_with_a_local_receipt_ttl() {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let node_id = secret_key().public();
+        connected_tx.send_replace(vec![peer_id_for(node_id)]);
+
+        handle
+            .import_connected_peer_services_at(
+                first_party_services(
+                    node_id,
+                    NOW - 1,
+                    vec![ServiceSummaryEnvelope::discovery(&discovery_summary())
+                        .expect("test discovery summary encodes")],
+                ),
+                node_id,
+                NOW,
+            )
+            .await
+            .expect("a live first-party summary inside the clock-skew window imports");
+        let cached = handle
+            .live_service_summaries_at(node_id, NOW)
+            .await
+            .expect("clock-skew-tolerant summary remains live");
+        assert_eq!(
+            cached[0].expires_at_unix_secs,
+            NOW + DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs()
+        );
+
+        handle
+            .import_connected_peer_services_at(
+                first_party_services(
+                    node_id,
+                    NOW - DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs() - 1,
+                    vec![ServiceSummaryEnvelope::discovery(&discovery_summary())
+                        .expect("test discovery summary encodes")],
+                ),
+                node_id,
+                NOW,
+            )
+            .await
+            .expect("a stale live summary is ignored without rejecting the connection");
+        assert!(handle
+            .live_service_summaries_at(node_id, NOW)
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -7181,7 +7315,7 @@ mod tests {
             .import_connected_peer_services_at(
                 first_party_services(
                     preferred_id,
-                    now,
+                    now.saturating_sub(DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs()),
                     vec![ServiceSummaryEnvelope::header_sync(&preferred_summary)
                         .expect("test header summary encodes")],
                 ),
@@ -7189,7 +7323,7 @@ mod tests {
                 now,
             )
             .await
-            .expect("expired first-party header summary is dropped");
+            .expect("stale first-party header summary is dropped");
 
         assert_eq!(
             handle
@@ -7746,7 +7880,7 @@ mod tests {
                 .import_connected_peer_services_at(
                     first_party_services(
                         node_id,
-                        now,
+                        now.saturating_sub(DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs()),
                         vec![ServiceSummaryEnvelope {
                             service_id: service.clone(),
                             summary_tag: 999,
@@ -7757,7 +7891,7 @@ mod tests {
                     now,
                 )
                 .await
-                .expect("expired first-party live summary is dropped");
+                .expect("stale first-party live summary is dropped");
         }
 
         assert_eq!(handle.active_services(live_only_node_id).await, None);
@@ -7771,6 +7905,29 @@ mod tests {
             .connected;
         assert!(!stale_candidates.contains(&live_only_node_id));
         assert!(stale_candidates.contains(&record_backed_node_id));
+    }
+
+    #[tokio::test]
+    async fn expired_connected_record_service_membership_is_pruned() {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let record = runtime_record_with(1, service(43), test_addr(43));
+        let node_id = record.body.node_id;
+        let expires_at = record.body.expires_at_unix_secs;
+        connected_tx.send_replace(vec![peer_id_for(node_id)]);
+
+        handle
+            .import_connected_peer_record(record, node_id)
+            .await
+            .expect("connected record imports");
+        assert_eq!(
+            handle.active_services(node_id).await,
+            Some(vec![service(43)])
+        );
+
+        let mut inner = handle.inner.lock().await;
+        inner.sync_active_services(&[node_id], expires_at.saturating_add(1));
+        assert!(!inner.active_services.contains_key(&node_id));
     }
 
     #[tokio::test]

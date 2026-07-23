@@ -743,6 +743,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                 assert_generation_delta(
                     &before,
                     &after,
+                    !no_change,
                     before_selected != store.selected,
                     before_verified != store.verified,
                     eligibility_changed,
@@ -1922,10 +1923,23 @@ fn operation_u64(operation: usize) -> u64 {
 fn assert_generation_delta(
     before: &EngineSnapshot,
     after: &EngineSnapshot,
+    state_changed: bool,
     selected_path_changed: bool,
     verified_path_changed: bool,
     eligibility_changed: bool,
 ) {
+    let expected_state_version = if state_changed {
+        before
+            .state_version
+            .checked_next()
+            .expect("the bounded replay cannot exhaust state versions")
+    } else {
+        before.state_version
+    };
+    assert_eq!(
+        after.state_version, expected_state_version,
+        "state version must advance exactly once for each changed transaction"
+    );
     let finalized_changed = before.frontiers.finalized != after.frontiers.finalized;
     let header_changed = finalized_changed || eligibility_changed || selected_path_changed;
     let verified_changed = finalized_changed || verified_path_changed;

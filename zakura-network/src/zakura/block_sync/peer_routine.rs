@@ -286,7 +286,7 @@ impl PeerRoutine {
     /// Build a pipe-routine for `peer`. The caller (`service::add_peer`) drives
     /// `run()` inside `spawn_supervised_pipe` so a protocol reject cancels the
     /// whole connection. `generation` is the value obtained from
-    /// [`PeerRegistry::admit`](super::peer_registry::PeerRegistry::admit).
+    /// [`PeerRegistry::admit_session`](super::peer_registry::PeerRegistry::admit_session).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         peer: ZakuraPeerId,

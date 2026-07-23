@@ -64,6 +64,10 @@ pub(super) struct Entry {
     /// generation still matches, so an old Drop racing a reset respawn cannot wipe
     /// the live routine's published outstanding.
     pub(super) generation: u64,
+    /// The connection whose session owns the current generation. Set at
+    /// admission and cleared when that connection closes, so a routine
+    /// draining down on a dead connection cannot record a new park.
+    pub(super) conn_id: Option<ZakuraConnId>,
 }
 
 impl Entry {
@@ -84,6 +88,7 @@ impl Entry {
             slots: SlotDiagnostics::default(),
             floor_watchdog_avoid: BTreeMap::new(),
             generation,
+            conn_id: None,
         }
     }
 }
@@ -126,6 +131,30 @@ struct SessionPark {
     deadline: Instant,
 }
 
+/// Outcome of [`PeerRegistry::admit_session`], decided atomically with the
+/// park state under the registry locks.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum SessionAdmission {
+    /// A still-active park refused this admission; the registry is unchanged.
+    Parked,
+    /// The parked connection consumed its expired park: this is its one bounded
+    /// re-admission and the routine starts gated on body work.
+    Readmitted { generation: u64 },
+    /// Ordinary admission with no park in effect for this connection.
+    Fresh { generation: u64 },
+}
+
+impl SessionAdmission {
+    #[cfg(test)]
+    pub(super) fn generation(self) -> u64 {
+        match self {
+            SessionAdmission::Parked => panic!("admission was refused by an active park"),
+            SessionAdmission::Readmitted { generation }
+            | SessionAdmission::Fresh { generation } => generation,
+        }
+    }
+}
+
 /// The shared per-peer fact table. `Arc`-wrapped at the construction site so the
 /// reactor and every routine share one table.
 #[derive(Debug)]
@@ -164,7 +193,9 @@ impl PeerRegistry {
     }
 
     /// Record the connection-local session park at the no-progress decision site.
-    /// A superseded routine cannot park the replacement generation.
+    /// A superseded routine cannot park the replacement generation, and a routine
+    /// whose connection already closed cannot park at all — its cooldown would
+    /// outlive the connection it was scoped to.
     pub(super) fn park_session(
         &self,
         peer: &ZakuraPeerId,
@@ -175,7 +206,7 @@ impl PeerRegistry {
         let peers = self.lock();
         if peers
             .get(peer)
-            .is_none_or(|entry| entry.generation != generation)
+            .is_none_or(|entry| entry.generation != generation || entry.conn_id != Some(conn_id))
         {
             return false;
         }
@@ -247,35 +278,24 @@ impl PeerRegistry {
             .is_some_and(|park| park.conn_id == Some(conn_id) && park.deadline <= now)
     }
 
-    /// Consume an expired park when admitting a stream. Returns whether this is
-    /// the parked connection's one bounded re-admission. A different connection
-    /// clears the stale association and is admitted normally.
-    pub(super) fn take_session_park(
-        &self,
-        peer: &ZakuraPeerId,
-        conn_id: ZakuraConnId,
-        now: Instant,
-    ) -> bool {
-        let mut session_parks = self.lock_session_parks();
-        let Some(park) = session_parks.get(peer).copied() else {
-            return false;
-        };
-        if park.deadline > now {
-            return false;
-        }
-        session_parks.remove(peer);
-        park.conn_id == Some(conn_id)
-    }
-
     /// Disassociate a closed connection from its park while preserving the
-    /// peer-level cooldown. Expired records with no live connection are removed.
+    /// peer-level cooldown, and release the entry's connection ownership so a
+    /// late park from the dying routine is refused. Expired park records with no
+    /// live connection are removed.
     pub(super) fn connection_closed(
         &self,
         peer: &ZakuraPeerId,
         conn_id: ZakuraConnId,
         now: Instant,
     ) {
+        // Same lock order as `park_session`/`admit_session`: peers, then parks.
+        let mut peers = self.lock();
         let mut session_parks = self.lock_session_parks();
+        if let Some(entry) = peers.get_mut(peer) {
+            if entry.conn_id == Some(conn_id) {
+                entry.conn_id = None;
+            }
+        }
         let Some(park) = session_parks.get_mut(peer) else {
             return;
         };
@@ -289,23 +309,39 @@ impl PeerRegistry {
         }
     }
 
-    /// Admit (or re-admit) a peer and allocate a fresh routine generation.
+    /// Admit (or re-admit) a peer and allocate a fresh routine generation,
+    /// atomically with the park state so a park recorded by the previous routine
+    /// is either honored (still active → `Parked`, nothing changes) or consumed
+    /// (expired → `Readmitted`/`Fresh`) — it can never be checked before the
+    /// park lands and then silently left behind after admission.
     ///
     /// On a genuinely new peer this inserts a default entry; on a respawn (reset)
     /// the existing entry's servable/caps/`received_status` are preserved (the
     /// peer stays connected) but its outstanding set is cleared and its generation
-    /// bumped, so the new routine owns the entry. Returns the generation the new
-    /// routine must carry for its `Drop` guard.
-    pub(super) fn admit(
+    /// bumped, so the new routine owns the entry. The returned generation is what
+    /// the new routine must carry for its `Drop` guard. `Readmitted` marks the
+    /// parked connection's one bounded re-admission; an expired park held by a
+    /// different connection is cleared and admitted as `Fresh`.
+    pub(super) fn admit_session(
         &self,
         peer: &ZakuraPeerId,
         direction: ServicePeerDirection,
         config: &super::ZakuraBlockSyncConfig,
-    ) -> u64 {
+        conn_id: ZakuraConnId,
+        now: Instant,
+    ) -> SessionAdmission {
+        let mut peers = self.lock();
+        let mut session_parks = self.lock_session_parks();
+        if session_parks
+            .get(peer)
+            .is_some_and(|park| park.deadline > now)
+        {
+            return SessionAdmission::Parked;
+        }
+
         let generation = self
             .next_generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut peers = self.lock();
         peers
             .entry(peer.clone())
             .and_modify(|entry| {
@@ -313,9 +349,21 @@ impl PeerRegistry {
                 entry.outstanding.clear();
                 entry.floor_watchdog_avoid.clear();
                 entry.generation = generation;
+                entry.conn_id = Some(conn_id);
             })
-            .or_insert_with(|| Entry::new(direction, config, generation));
-        generation
+            .or_insert_with(|| Entry {
+                conn_id: Some(conn_id),
+                ..Entry::new(direction, config, generation)
+            });
+
+        let readmitted = session_parks
+            .remove(peer)
+            .is_some_and(|park| park.conn_id == Some(conn_id));
+        if readmitted {
+            SessionAdmission::Readmitted { generation }
+        } else {
+            SessionAdmission::Fresh { generation }
+        }
     }
 
     /// Remove a peer's entry entirely (disconnect/teardown/admission-reject).
@@ -743,7 +791,15 @@ mod floor_bias_tests {
         available: usize,
         bbr_rtprop_ms: Option<u64>,
     ) {
-        let generation = reg.admit(peer, ServicePeerDirection::Outbound, config);
+        let generation = reg
+            .admit_session(
+                peer,
+                ServicePeerDirection::Outbound,
+                config,
+                1,
+                Instant::now(),
+            )
+            .generation();
         reg.upsert_status(
             peer,
             generation,
@@ -885,7 +941,13 @@ mod floor_bias_tests {
         let config = super::super::ZakuraBlockSyncConfig::default();
         let reg = PeerRegistry::new();
         let peer = peer(1);
-        reg.admit(&peer, ServicePeerDirection::Outbound, &config);
+        reg.admit_session(
+            &peer,
+            ServicePeerDirection::Outbound,
+            &config,
+            1,
+            Instant::now(),
+        );
         let now = Instant::now();
 
         reg.avoid_floor_height_until(
@@ -926,15 +988,14 @@ mod floor_bias_tests {
 
     #[test]
     fn expired_session_park_is_consumed_by_same_connection_readmission() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
         let reg = PeerRegistry::new();
         let peer = peer(2);
         let conn_id = 7;
         let now = Instant::now();
-        let generation = reg.admit(
-            &peer,
-            ServicePeerDirection::Outbound,
-            &super::super::ZakuraBlockSyncConfig::default(),
-        );
+        let generation = reg
+            .admit_session(&peer, ServicePeerDirection::Outbound, &config, conn_id, now)
+            .generation();
 
         assert!(reg.park_session(
             &peer,
@@ -952,12 +1013,108 @@ mod floor_bias_tests {
             conn_id,
             now + std::time::Duration::from_secs(2),
         ));
-        assert!(reg.take_session_park(&peer, conn_id, now + std::time::Duration::from_secs(2)));
+        assert!(matches!(
+            reg.admit_session(
+                &peer,
+                ServicePeerDirection::Outbound,
+                &config,
+                conn_id,
+                now + std::time::Duration::from_secs(2),
+            ),
+            SessionAdmission::Readmitted { .. }
+        ));
         assert!(!reg.has_expired_session_park(
             &peer,
             conn_id,
             now + std::time::Duration::from_secs(2),
         ));
+    }
+
+    #[test]
+    fn active_park_atomically_refuses_admission() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let peer = peer(5);
+        let conn_id = 7;
+        let now = Instant::now();
+        let generation = reg
+            .admit_session(&peer, ServicePeerDirection::Outbound, &config, conn_id, now)
+            .generation();
+        let deadline = now + std::time::Duration::from_secs(1);
+        assert!(reg.park_session(&peer, conn_id, generation, deadline));
+
+        // A park that is still in its cooldown refuses admission outright and
+        // stays recorded, so the cooldown cannot be silently bypassed.
+        assert_eq!(
+            reg.admit_session(&peer, ServicePeerDirection::Outbound, &config, conn_id, now),
+            SessionAdmission::Parked,
+        );
+        assert_eq!(reg.peer_park_deadline(&peer, now), Some(deadline));
+    }
+
+    #[test]
+    fn expired_park_from_a_different_connection_admits_fresh() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let peer = peer(6);
+        let old_conn_id = 7;
+        let new_conn_id = 8;
+        let now = Instant::now();
+        let generation = reg
+            .admit_session(
+                &peer,
+                ServicePeerDirection::Outbound,
+                &config,
+                old_conn_id,
+                now,
+            )
+            .generation();
+        assert!(reg.park_session(
+            &peer,
+            old_conn_id,
+            generation,
+            now + std::time::Duration::from_secs(1),
+        ));
+
+        let later = now + std::time::Duration::from_secs(2);
+        assert!(matches!(
+            reg.admit_session(
+                &peer,
+                ServicePeerDirection::Outbound,
+                &config,
+                new_conn_id,
+                later
+            ),
+            SessionAdmission::Fresh { .. }
+        ));
+        // The stale association is cleared: the old connection no longer holds
+        // the expired-park body-work gate.
+        assert!(!reg.has_expired_session_park(&peer, old_conn_id, later));
+    }
+
+    #[test]
+    fn routine_on_a_closed_connection_cannot_park() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let peer = peer(7);
+        let conn_id = 7;
+        let now = Instant::now();
+        let generation = reg
+            .admit_session(&peer, ServicePeerDirection::Outbound, &config, conn_id, now)
+            .generation();
+
+        reg.connection_closed(&peer, conn_id, now);
+
+        // A late park from the routine draining down on the dead connection is
+        // refused, so no cooldown (or forever-retained park record) outlives
+        // the connection it was scoped to.
+        assert!(!reg.park_session(
+            &peer,
+            conn_id,
+            generation,
+            now + std::time::Duration::from_secs(1),
+        ));
+        assert!(!reg.is_peer_parked(&peer, now));
     }
 
     #[test]
@@ -968,11 +1125,15 @@ mod floor_bias_tests {
         let new_conn_id = 8;
         let now = Instant::now();
         let deadline = now + std::time::Duration::from_secs(1);
-        let generation = reg.admit(
-            &peer,
-            ServicePeerDirection::Outbound,
-            &super::super::ZakuraBlockSyncConfig::default(),
-        );
+        let generation = reg
+            .admit_session(
+                &peer,
+                ServicePeerDirection::Outbound,
+                &super::super::ZakuraBlockSyncConfig::default(),
+                old_conn_id,
+                now,
+            )
+            .generation();
 
         assert!(reg.park_session(&peer, old_conn_id, generation, deadline));
         reg.connection_closed(&peer, old_conn_id, now);
@@ -996,9 +1157,13 @@ mod floor_bias_tests {
         let reg = PeerRegistry::new();
         let peer = peer(4);
         let config = super::super::ZakuraBlockSyncConfig::default();
-        let old_generation = reg.admit(&peer, ServicePeerDirection::Outbound, &config);
-        let _new_generation = reg.admit(&peer, ServicePeerDirection::Outbound, &config);
         let now = Instant::now();
+        let old_generation = reg
+            .admit_session(&peer, ServicePeerDirection::Outbound, &config, 7, now)
+            .generation();
+        let _new_generation = reg
+            .admit_session(&peer, ServicePeerDirection::Outbound, &config, 7, now)
+            .generation();
 
         assert!(!reg.park_session(
             &peer,

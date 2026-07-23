@@ -1,4 +1,4 @@
-use super::{config::*, events::*, wire::*, *};
+use super::{config::*, events::*, peer_registry::SessionAdmission, wire::*, *};
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError,
     OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer, PeerStreamSession,
@@ -601,20 +601,28 @@ impl Service for BlockSyncService {
                 }
             }
 
-            let (routine_generation, re_admitted_after_no_progress) = if let Some(wiring) =
-                &self.inner.routine_wiring
-            {
-                let generation = wiring
-                    .registry
-                    .admit(&peer_id, peer.direction, &wiring.config);
-                let re_admitted =
-                    wiring
-                        .registry
-                        .take_session_park(&peer_id, conn_id, Instant::now());
-                (Some(generation), re_admitted)
-            } else {
-                (None, false)
-            };
+            // Admission is atomic with the park state: a park recorded by the
+            // predecessor routine after the entry-point `peer_is_parked` check
+            // is honored here instead of being silently bypassed.
+            let (routine_generation, re_admitted_after_no_progress) =
+                if let Some(wiring) = &self.inner.routine_wiring {
+                    match wiring.registry.admit_session(
+                        &peer_id,
+                        peer.direction,
+                        &wiring.config,
+                        conn_id,
+                        Instant::now(),
+                    ) {
+                        SessionAdmission::Parked => {
+                            service_cancel_token.cancel();
+                            return;
+                        }
+                        SessionAdmission::Readmitted { generation } => (Some(generation), true),
+                        SessionAdmission::Fresh { generation } => (Some(generation), false),
+                    }
+                } else {
+                    (None, false)
+                };
             let old_record = active_peers.insert(
                 peer_id.clone(),
                 BlockSyncPeerRecord {

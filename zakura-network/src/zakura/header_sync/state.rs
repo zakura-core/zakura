@@ -462,12 +462,30 @@ impl HeaderSyncCore {
     /// On real auth-tip advancement, mark ranges complete. Otherwise retire them
     /// so the schedule slot is freed without claiming success (e.g. rebase).
     pub(super) fn clear_inflight_root_auth(&mut self, auth_advanced: bool) {
+        self.clear_inflight_root_auth_where(auth_advanced, |_| true);
+    }
+
+    /// Complete only root-auth operations whose driver completion was observed.
+    ///
+    /// The durable state watch can advance before the driver releases its serial
+    /// authentication task. Keeping unobserved operations pending prevents the
+    /// reactor from admitting the next state operation into that occupied slot.
+    pub(super) fn clear_completed_inflight_root_auth(&mut self) {
+        self.clear_inflight_root_auth_where(true, |pending| pending.completion_observed);
+    }
+
+    fn clear_inflight_root_auth_where(
+        &mut self,
+        auth_advanced: bool,
+        should_clear: impl Fn(&PendingOperation) -> bool,
+    ) {
         let auth_operations: Vec<_> = self
             .pending_operations
             .iter()
             .filter_map(|(operation, pending)| {
-                (operation.op_kind == HeaderSyncOperationKind::AuthenticateRoots)
-                    .then_some((operation.clone(), pending.range))
+                (operation.op_kind == HeaderSyncOperationKind::AuthenticateRoots
+                    && should_clear(pending))
+                .then_some((operation.clone(), pending.range))
             })
             .collect();
         for (operation, range) in auth_operations {

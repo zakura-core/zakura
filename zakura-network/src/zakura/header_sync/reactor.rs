@@ -1223,18 +1223,21 @@ impl HeaderSyncReactor {
         self.state.header_root_auth = state;
         self.state.root_auth_waiting_for_watch = false;
 
-        // Clear in-flight auth when the tip advanced or the pipeline was invalidated.
-        // Checkpoint-only advances leave pending ops alone (same auth target).
-        let should_clear_inflight_root_auth = auth_advanced || !pipeline_compatible;
-        if should_clear_inflight_root_auth {
-            self.state.clear_inflight_root_auth(auth_advanced);
-        }
-
         if pipeline_compatible {
+            // State publishes this watch update before the driver receives the
+            // authentication response. Only release operations whose driver
+            // completion has also arrived, so the next serial state operation
+            // cannot race the still-occupied driver slot.
+            if auth_advanced {
+                self.state.clear_completed_inflight_root_auth();
+            }
             let auth = state.expect("a compatible authentication update has a state");
             self.state.prune_root_auth_pipeline(auth, auth_advanced);
             self.drain_buffered_with_permit(None).await;
         } else {
+            // A rebase invalidates speculative work regardless of whether its
+            // driver completion has arrived.
+            self.state.clear_inflight_root_auth(false);
             self.state.discard_root_auth_pipeline();
         }
         metrics::gauge!("sync.header.work.buffered.count").set(self.state.buffered.len() as f64);
@@ -1266,9 +1269,24 @@ impl HeaderSyncReactor {
             return;
         }
         pending.completion_observed = true;
-        // Durable frontier progress is accepted only from the state watch. Keep
-        // this operation pending so the old frontier cannot schedule a duplicate.
+        let confirmed_height = block::Height(
+            pending
+                .range
+                .end_height()
+                .0
+                .checked_sub(1)
+                .expect("root authentication ranges contain a successor witness"),
+        );
+        let watch_already_advanced = self
+            .state
+            .header_root_auth
+            .is_some_and(|auth| auth.authenticated_height >= confirmed_height);
         metrics::counter!("sync.header.root_auth.completed").increment(1);
+        if watch_already_advanced {
+            self.state.clear_completed_inflight_root_auth();
+            self.drain_buffered_with_permit(None).await;
+            self.schedule().await;
+        }
     }
 
     async fn handle_header_root_authentication_failed(
@@ -2348,6 +2366,9 @@ impl HeaderSyncReactor {
     }
 
     fn try_start_retained_root_authentication(&mut self) -> bool {
+        if self.state.root_auth_waiting_for_watch {
+            return false;
+        }
         let Some(auth) = self.state.header_root_auth else {
             return false;
         };

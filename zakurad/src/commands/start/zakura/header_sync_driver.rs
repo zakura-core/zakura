@@ -1320,7 +1320,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         .header_sync
                         .send(header_root_authentication_failed(
                             operation,
-                            HeaderRootAuthenticationFailureKind::Local,
+                            HeaderRootAuthenticationFailureKind::Stale,
                         ))
                         .await
                         .is_err()

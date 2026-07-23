@@ -5021,6 +5021,342 @@ mod tests {
     }
 
     #[test]
+    fn aud_14_aux_authentication_reopens_complete_before_or_after() {
+        const AUX_FAULT_POINTS: [FaultPoint; 11] = [
+            FaultPoint::AfterSnapshot,
+            FaultPoint::AfterVersionCheck,
+            // Auxiliary evidence changes an existing delivery row, not its header node.
+            FaultPoint::AfterEachIndexWrite,
+            FaultPoint::AfterProjectionWrite,
+            FaultPoint::AfterMetadataWrite,
+            FaultPoint::BeforeDbCommit,
+            FaultPoint::AfterDbCommit,
+            FaultPoint::BeforeMemorySwap,
+            FaultPoint::BeforePublish,
+            FaultPoint::AfterPublish,
+            FaultPoint::BeforeReactorObserve,
+        ];
+
+        for (index, target) in AUX_FAULT_POINTS.into_iter().enumerate() {
+            let cache = tempfile::tempdir().expect("the test cache directory is created");
+            let db_config = Config {
+                cache_dir: cache.path().to_owned(),
+                ephemeral: false,
+                debug_skip_non_finalized_state_backup_task: true,
+                ..Config::default()
+            };
+            let (engine_config, anchor, metadata) = fixture();
+            let network = engine_config.network.clone();
+            let db = open(&db_config, &network);
+            let store = HeaderChainStore::new(db.clone());
+            store
+                .initialize(metadata, anchor.clone())
+                .expect("the empty schema initializes");
+            let (runtime, _) = store
+                .startup(&engine_config)
+                .expect("the initial store audits");
+            let initial = runtime.publisher().snapshot();
+            let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+            let lease = runtime
+                .reader()
+                .validation_context(anchor.hash)
+                .expect("the anchor validation context is coherent")
+                .expect("the initialized anchor is retained");
+            let rules = HeaderRules::for_validation_lease(network.clone(), &lease)
+                .expect("the authenticated regtest policy is valid");
+            let marker = u8::try_from(index + 0xe0).expect("the fault-point list fits in u8");
+
+            let mut current_header = *anchor.header;
+            current_header.previous_block_hash = anchor.hash;
+            current_header.time += chrono::Duration::seconds(1);
+            current_header.nonce.0[0] = marker;
+            let current_header = Arc::new(current_header);
+            let mut boundary_header = *current_header;
+            boundary_header.previous_block_hash = current_header.hash();
+            boundary_header.time += chrono::Duration::seconds(1);
+            boundary_header.nonce.0[0] = marker.wrapping_add(1);
+            let boundary_header = Arc::new(boundary_header);
+            let headers = [current_header.clone(), boundary_header.clone()];
+            let batch = zakura_header_chain::prepare_headers(
+                HeaderBatchInput::new(&headers),
+                &lease,
+                &rules,
+                &SystemClock,
+            )
+            .expect("the auxiliary fixture headers pass production validation");
+            let current_height = anchor
+                .height
+                .next()
+                .expect("the genesis anchor has a next height");
+            let boundary_height = current_height
+                .next()
+                .expect("the first child has a next height");
+            let current = Frontier::new(current_height, current_header.hash());
+            let boundary = Frontier::new(boundary_height, boundary_header.hash());
+            let insertion_owner = WorkOwner {
+                state_version: initial.state_version,
+                header_generation: initial.header_generation,
+                verified_generation: None,
+                branch: BranchId::new(anchor.hash, boundary.hash),
+                session_id: 21,
+                request_id: NonZeroU64::new(22).expect("twenty-two is nonzero"),
+            };
+            let source = SourceId::from_digest([marker.wrapping_add(2); 32]);
+            let delivery = AuxDelivery {
+                delivery_id: EvidenceId::from_digest([marker.wrapping_add(3); 32]),
+                header_hash: current.hash,
+                source,
+                owner: insertion_owner,
+                body_size: zakura_header_chain::BodySizeHint::Unknown,
+                tree_aux: Some(zakura_header_chain::TreeAuxRecordV1 {
+                    height: current.height,
+                    sapling_root: Default::default(),
+                    orchard_root: Default::default(),
+                    ironwood_root: Default::default(),
+                    sapling_tx_count: 1,
+                    orchard_tx_count: 2,
+                    ironwood_tx_count: 3,
+                    auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from(
+                        [marker.wrapping_add(4); 32],
+                    ),
+                }),
+                authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
+            };
+            let insertion_context = TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: None,
+                startup_capability: None,
+                retention_references: &[],
+            };
+            runtime
+                .apply(
+                    TransitionRequest {
+                        expected_version: initial.state_version,
+                        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                            owner: insertion_owner,
+                            source,
+                            parent_hash: anchor.hash,
+                            target_tip_hash: boundary.hash,
+                            completion: TargetCompletion::TargetComplete {
+                                common_ancestor: anchor_frontier,
+                            },
+                            batch,
+                            aux: vec![delivery],
+                        })),
+                    },
+                    &insertion_context,
+                )
+                .expect("the unauthenticated delivery inserts with its exact headers");
+
+            let before = runtime.publisher().snapshot();
+            let evidence = EvidenceId::from_digest([marker.wrapping_add(5); 32]);
+            let authentication = zakura_header_chain::AuxAuthentication::Authenticated {
+                evidence,
+                boundary_hash: boundary.hash,
+            };
+            let authority = Authority(evidence);
+            let context = TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                startup_capability: None,
+                retention_references: &[],
+            };
+            let request = TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::AuxEvidence(Box::new(zakura_header_chain::AuxEvidence {
+                    owner: WorkOwner {
+                        state_version: before.state_version,
+                        header_generation: before.header_generation,
+                        verified_generation: Some(before.verified_generation),
+                        branch: BranchId::new(anchor.hash, boundary.hash),
+                        session_id: insertion_owner.session_id,
+                        request_id: insertion_owner.request_id,
+                    },
+                    deliveries: vec![delivery],
+                    authentication,
+                })),
+            };
+            let marker_key = [marker; 4];
+            let mut full_state_batch = DiskWriteBatch::new();
+            runtime
+                .store
+                .put_raw(
+                    &mut full_state_batch,
+                    ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+                    marker_key,
+                    [marker],
+                )
+                .expect("the paired auxiliary marker can be staged");
+            let memory_swapped = Arc::new(AtomicBool::new(false));
+            let swap_probe = memory_swapped.clone();
+            let result = runtime.apply_combined_with_fault(
+                request,
+                &context,
+                full_state_batch,
+                move || swap_probe.store(true, Ordering::SeqCst),
+                |point| {
+                    if point == target {
+                        Err(HeaderChainStoreError::InjectedCrash(point))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(HeaderChainStoreError::InjectedCrash(point)) if point == target
+            ));
+
+            let committed = matches!(
+                target,
+                FaultPoint::AfterDbCommit
+                    | FaultPoint::BeforeMemorySwap
+                    | FaultPoint::BeforePublish
+                    | FaultPoint::AfterPublish
+                    | FaultPoint::BeforeReactorObserve
+            );
+            let published = matches!(
+                target,
+                FaultPoint::AfterPublish | FaultPoint::BeforeReactorObserve
+            );
+            let committed_version = before
+                .state_version
+                .checked_next()
+                .expect("the short fixture state version can advance");
+            let durable = runtime
+                .store
+                .snapshot()
+                .expect("the auxiliary snapshot read succeeds");
+            assert_eq!(
+                durable.state_version,
+                if committed {
+                    committed_version
+                } else {
+                    before.state_version
+                },
+                "{target:?}"
+            );
+            assert_eq!(durable.frontiers, before.frontiers, "{target:?}");
+            assert_eq!(
+                durable.header_generation, before.header_generation,
+                "{target:?}"
+            );
+            assert_eq!(
+                durable.verified_generation, before.verified_generation,
+                "{target:?}"
+            );
+            let stored_delivery = runtime
+                .store
+                .aux_deliveries(current.hash)
+                .expect("the auxiliary row read succeeds");
+            assert_eq!(stored_delivery.len(), 1, "{target:?}");
+            assert_eq!(
+                stored_delivery[0].authentication,
+                if committed {
+                    authentication
+                } else {
+                    zakura_header_chain::AuxAuthentication::Unauthenticated
+                },
+                "{target:?}"
+            );
+            let current_node = runtime
+                .store
+                .node(current.hash)
+                .expect("the auxiliary header node read succeeds")
+                .expect("the auxiliary header remains retained");
+            assert_eq!(
+                current_node.aux_delivery_ids,
+                vec![delivery.delivery_id],
+                "{target:?}"
+            );
+            let marker_cf = runtime
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the marker column family is open");
+            assert_eq!(
+                runtime
+                    .store
+                    .db
+                    .raw_get_cf(&marker_cf, &marker_key)
+                    .expect("the paired marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+            assert_eq!(
+                memory_swapped.load(Ordering::SeqCst),
+                matches!(
+                    target,
+                    FaultPoint::BeforePublish
+                        | FaultPoint::AfterPublish
+                        | FaultPoint::BeforeReactorObserve
+                ),
+                "{target:?}"
+            );
+            assert_eq!(
+                runtime.publisher().snapshot().state_version,
+                if published {
+                    committed_version
+                } else {
+                    before.state_version
+                },
+                "{target:?}"
+            );
+            drop(runtime);
+            drop(db);
+
+            let (reopened, report) = HeaderChainStore::new(open(&db_config, &network))
+                .startup(&engine_config)
+                .expect("the auxiliary crash boundary reopens coherently");
+            assert_eq!(
+                reopened.publisher().snapshot(),
+                report.current,
+                "{target:?}"
+            );
+            assert_eq!(
+                report.current.state_version,
+                if committed {
+                    committed_version
+                } else {
+                    before.state_version
+                },
+                "{target:?}"
+            );
+            assert_eq!(report.current.frontiers, before.frontiers, "{target:?}");
+            let reopened_delivery = reopened
+                .store
+                .aux_deliveries(current.hash)
+                .expect("the reopened auxiliary row is readable");
+            assert_eq!(reopened_delivery.len(), 1, "{target:?}");
+            assert_eq!(
+                reopened_delivery[0].authentication,
+                if committed {
+                    authentication
+                } else {
+                    zakura_header_chain::AuxAuthentication::Unauthenticated
+                },
+                "{target:?}"
+            );
+            let reopened_marker_cf = reopened
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the reopened marker column family is open");
+            assert_eq!(
+                reopened
+                    .store
+                    .db
+                    .raw_get_cf(&reopened_marker_cf, &marker_key)
+                    .expect("the reopened paired marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
     fn aud_14_no_change_crash_points_preserve_the_paired_full_state_transaction() {
         for (index, target) in FaultPoint::NO_CHANGE.into_iter().enumerate() {
             let cache = tempfile::tempdir().expect("the test cache directory is created");

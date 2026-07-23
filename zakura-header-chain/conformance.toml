@@ -99,7 +99,7 @@ id = "LC-FRONTIER-04"
 name = "Durable frontier publication"
 status = "implemented"
 owner = "zakura_state::HeaderChainRuntime"
-tests = ["DG-03::every_named_crash_point_reopens_to_complete_before_or_after", "AUD-15::committed_snapshots_are_the_sole_production_frontier_source", "DF-02::get_blockchain_info_response_with_an_arbitrary_chain_tip"]
+tests = ["DG-03::aud_14_every_state_writer_crash_point_reopens_complete_before_or_after", "AUD-15::committed_snapshots_are_the_sole_production_frontier_source", "DF-02::get_blockchain_info_response_with_an_arbitrary_chain_tip"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -141,7 +141,7 @@ id = "LC-TXN-01"
 name = "Atomic frontier mutation"
 status = "implemented"
 owner = "zakura_state::HeaderChainRuntime::apply"
-tests = ["DG-03::every_named_crash_point_reopens_to_complete_before_or_after"]
+tests = ["DG-03::aud_14_every_state_writer_crash_point_reopens_complete_before_or_after"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -278,7 +278,7 @@ id = "LC-VAL-10"
 name = "Per-block work calculation"
 status = "implemented"
 owner = "zakura_chain::work::difficulty::Work::try_from"
-tests = ["HV-07::per_block_work_exceeds_u128"]
+tests = ["HV-07::hv_07_per_block_work_exceeds_u128"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -286,7 +286,7 @@ id = "LC-WORKCALC-01"
 name = "Checked cumulative work"
 status = "implemented"
 owner = "zakura_chain::work::difficulty::PartialCumulativeWork::checked_add"
-tests = ["HV-07::checked_cumulative_work_boundary"]
+tests = ["HV-07::hv_07_checked_cumulative_work_boundary"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -365,7 +365,7 @@ id = "LC-REORG-01"
 name = "Finalized-anchor reorganization"
 status = "implemented"
 owner = "zakura_header_chain::MemHeaderStore::select_header_best"
-tests = ["DG-05::fixed_anchor_selection_has_no_incumbent_relative_rollback_horizon"]
+tests = ["DG-05::dg_05_fixed_anchor_replacements_cross_999_1000_1001_in_both_orders"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -426,7 +426,7 @@ id = "LC-RETAIN-04"
 name = "Staged-target limits"
 status = "implemented"
 owner = "zakura_network::AdvertisedHeaderTarget"
-tests = ["PW-05::registry_caps_targets_and_only_supersedes_unstarted_work"]
+tests = ["PW-05::peer_work_queue_caps_targets_and_only_supersedes_unstarted_work"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -555,7 +555,7 @@ id = "LC-WIRE-02"
 name = "Atomic status snapshot"
 status = "implemented"
 owner = "zakura_network::zakura::header_sync::Status::from_snapshot"
-tests = ["PW-01::status_uses_committed_snapshots_and_bounded_cadence"]
+tests = ["PW-01::peer_admission_catches_up_snapshot_before_initial_status"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -563,7 +563,7 @@ id = "LC-WIRE-17"
 name = "Status publication cadence"
 status = "implemented"
 owner = "zakura_network::zakura::header_sync::scheduler::status::StatusPublisher"
-tests = ["PW-07::status_uses_committed_snapshots_and_bounded_cadence", "PW-07::initial_refresh_and_coalesced_change_deadlines_are_bounded"]
+tests = ["PW-07::initial_refresh_and_coalesced_change_deadlines_are_bounded"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -579,7 +579,7 @@ id = "LC-WIRE-04"
 name = "Advertised-target scheduling"
 status = "implemented"
 owner = "zakura_network::ActiveHeaderRequest"
-tests = ["PW-05::unknown_status_targets_remain_eligible_regardless_of_advisory_shape", "PW-05::registry_caps_targets_and_only_supersedes_unstarted_work", "PW-05::target_from_status_supersedes_only_before_exact_locator_publication"]
+tests = ["PW-05::unknown_status_targets_remain_eligible_regardless_of_advisory_shape", "PW-05::peer_work_queue_caps_targets_and_only_supersedes_unstarted_work"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

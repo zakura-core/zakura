@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt, fs,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use serde::Deserialize;
@@ -16,6 +16,7 @@ pub fn run(repo_root: &Path, requested_rule: Option<&str>) -> Result<(), Box<dyn
     let spec = fs::read_to_string(repo_root.join(SPEC_PATH))?;
     let manifest = fs::read_to_string(repo_root.join(MANIFEST_PATH))?;
     let report = validate(&spec, &manifest, &production_expectations())?;
+    validate_repository_evidence(repo_root, &manifest)?;
 
     if let Some(rule_id) = requested_rule {
         let rule = report
@@ -397,10 +398,205 @@ fn validate_manifest_rule(rule: &ManifestRule) -> Result<(), ValidationError> {
                     rule.id
                 )));
             }
+            validate_network_matrix(rule)?;
         }
     }
 
     Ok(())
+}
+
+fn validate_network_matrix(rule: &ManifestRule) -> Result<(), ValidationError> {
+    const NETWORKS: &[&str] = &["mainnet", "testnet", "custom"];
+
+    let mut unique = BTreeSet::new();
+    for network in &rule.networks {
+        if !NETWORKS.contains(&network.as_str()) {
+            return Err(ValidationError(format!(
+                "implemented rule `{}` names unknown network `{network}`",
+                rule.id
+            )));
+        }
+        if !unique.insert(network.as_str()) {
+            return Err(ValidationError(format!(
+                "implemented rule `{}` names network `{network}` more than once",
+                rule.id
+            )));
+        }
+    }
+
+    if unique.contains("mainnet") != unique.contains("testnet") {
+        return Err(ValidationError(format!(
+            "implemented rule `{}` must cover mainnet and testnet together",
+            rule.id
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_repository_evidence(
+    repo_root: &Path,
+    manifest_text: &str,
+) -> Result<(), ValidationError> {
+    let manifest: Manifest = toml::from_str(manifest_text)
+        .map_err(|error| ValidationError(format!("invalid conformance manifest: {error}")))?;
+    let test_functions = collect_test_functions(repo_root)?;
+
+    for rule in manifest
+        .rule
+        .iter()
+        .filter(|rule| rule.status == RuleStatus::Implemented)
+    {
+        let mut unique = BTreeSet::new();
+        for test in &rule.tests {
+            if !unique.insert(test) {
+                return Err(ValidationError(format!(
+                    "implemented rule `{}` names test `{test}` more than once",
+                    rule.id
+                )));
+            }
+            let Some((suite, symbol)) = test.rsplit_once("::") else {
+                return Err(ValidationError(format!(
+                    "implemented rule `{}` test `{test}` has no suite prefix",
+                    rule.id
+                )));
+            };
+            if suite.is_empty() || !valid_rust_identifier(symbol) {
+                return Err(ValidationError(format!(
+                    "implemented rule `{}` has malformed test reference `{test}`",
+                    rule.id
+                )));
+            }
+
+            match test_functions.get(symbol) {
+                None => {
+                    return Err(ValidationError(format!(
+                        "implemented rule `{}` names missing Rust test `{test}`",
+                        rule.id
+                    )));
+                }
+                Some(paths) if paths.len() > 1 => {
+                    return Err(ValidationError(format!(
+                        "implemented rule `{}` test `{test}` is ambiguous across [{}]",
+                        rule.id,
+                        paths
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_test_functions(
+    repo_root: &Path,
+) -> Result<BTreeMap<String, Vec<PathBuf>>, ValidationError> {
+    fn visit(
+        path: &Path,
+        tests: &mut BTreeMap<String, Vec<PathBuf>>,
+    ) -> Result<(), ValidationError> {
+        let entries = fs::read_dir(path).map_err(|error| {
+            ValidationError(format!("failed to read `{}`: {error}", path.display()))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                ValidationError(format!(
+                    "failed to read an entry under `{}`: {error}",
+                    path.display()
+                ))
+            })?;
+            let entry_path = entry.path();
+            let file_type = entry.file_type().map_err(|error| {
+                ValidationError(format!(
+                    "failed to inspect `{}`: {error}",
+                    entry_path.display()
+                ))
+            })?;
+            if file_type.is_dir() {
+                let name = entry.file_name();
+                if name != ".git" && name != "target" {
+                    visit(&entry_path, tests)?;
+                }
+            } else if file_type.is_file()
+                && entry_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    == Some("rs")
+            {
+                let source = fs::read_to_string(&entry_path).map_err(|error| {
+                    ValidationError(format!(
+                        "failed to read `{}`: {error}",
+                        entry_path.display()
+                    ))
+                })?;
+                for symbol in parse_test_function_names(&source) {
+                    tests.entry(symbol).or_default().push(entry_path.clone());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    let mut tests = BTreeMap::new();
+    visit(repo_root, &mut tests)?;
+    Ok(tests)
+}
+
+fn parse_test_function_names(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut has_test_attribute = false;
+    let mut is_ignored = false;
+
+    for line in source.lines() {
+        let line = line.trim();
+        if line.starts_with("#[") {
+            has_test_attribute |= line == "#[test]" || line.starts_with("#[tokio::test");
+            is_ignored |= line.starts_with("#[ignore");
+            continue;
+        }
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if !has_test_attribute {
+            is_ignored = false;
+            continue;
+        }
+
+        if !is_ignored {
+            if let Some(symbol) = rust_function_name(line) {
+                names.push(symbol.to_owned());
+            }
+        }
+        has_test_attribute = false;
+        is_ignored = false;
+    }
+
+    names
+}
+
+fn rust_function_name(line: &str) -> Option<&str> {
+    let (_, suffix) = line.split_once("fn ")?;
+    let symbol_len = suffix
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    let symbol = &suffix[..symbol_len];
+    valid_rust_identifier(symbol).then_some(symbol)
+}
+
+fn valid_rust_identifier(identifier: &str) -> bool {
+    let mut bytes = identifier.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn valid_rule_id(id: &str) -> bool {
@@ -519,6 +715,58 @@ status = "unimplemented"
     }
 
     #[test]
+    fn implemented_test_symbols_exist() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask should live directly under the repository root");
+        let manifest = fs::read_to_string(repo_root.join(MANIFEST_PATH))
+            .expect("checked-in conformance manifest should be readable");
+
+        validate_repository_evidence(repo_root, &manifest)
+            .expect("every claimed test should resolve to one Rust test function");
+    }
+
+    #[test]
+    fn test_symbol_parser_excludes_ignored_tests() {
+        let source = r#"
+#[test]
+fn included() {}
+
+#[tokio::test]
+async fn included_async() {}
+
+#[test]
+#[ignore = "not part of required CI"]
+fn excluded() {}
+
+fn helper() {}
+"#;
+        assert_eq!(
+            parse_test_function_names(source),
+            ["included", "included_async"]
+        );
+    }
+
+    #[test]
+    fn network_matrix_complete() {
+        let paired = ManifestRule {
+            id: "LC-ONE-01".to_owned(),
+            name: "First rule".to_owned(),
+            status: RuleStatus::Implemented,
+            owner: "crate::owner".to_owned(),
+            tests: vec!["HV-01::rule".to_owned()],
+            networks: vec!["mainnet".to_owned(), "testnet".to_owned()],
+        };
+        validate_network_matrix(&paired).expect("the production networks are paired");
+
+        let mut unpaired = paired;
+        unpaired.networks.pop();
+        let error = validate_network_matrix(&unpaired)
+            .expect_err("a single production network must not claim complete coverage");
+        assert!(error.to_string().contains("mainnet and testnet together"));
+    }
+
+    #[test]
     fn version_rule_and_name_mismatches_fail() {
         let wrong_version = MANIFEST.replacen("1.3", "1.2", 1);
         assert!(validate(SPEC, &wrong_version, &EXPECTED).is_err());
@@ -582,8 +830,11 @@ status = "unimplemented"
 
         let complete = incomplete.replace(
             "status = \"implemented\"",
-            "status = \"implemented\"\nowner = \"crate::owner\"\ntests = [\"HV-01::rule\"]\nnetworks = [\"mainnet\"]",
+            "status = \"implemented\"\nowner = \"crate::owner\"\ntests = [\"HV-01::rule\"]\nnetworks = [\"mainnet\", \"testnet\"]",
         );
         validate(SPEC, &complete, &EXPECTED).expect("a complete implementation claim should pass");
+
+        let unknown_network = complete.replace("\"testnet\"", "\"production\"");
+        assert!(validate(SPEC, &unknown_network, &EXPECTED).is_err());
     }
 }

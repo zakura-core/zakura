@@ -13,6 +13,8 @@ on:
       - zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
       - .config/nextest.toml
       - .github/workflows/tests-unit.yml
+      - docs/specs/fork-aware-header-chain-engine.md
+      - zakura-header-chain/conformance.toml
 
   push:
     branches: [main]
@@ -25,6 +27,8 @@ on:
       - zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
       - .config/nextest.toml
       - .github/workflows/tests-unit.yml
+      - docs/specs/fork-aware-header-chain-engine.md
+      - zakura-header-chain/conformance.toml
 
   # Run the full unit-test suite when a PR is queued so the merge queue validates
   # the merged result against the latest `main`. `merge_group` ignores path

@@ -5989,6 +5989,349 @@ mod tests {
     }
 
     #[test]
+    fn aud_14_selected_auxiliary_repair_reopens_complete_before_or_after() {
+        for (index, target) in FaultPoint::ALL.into_iter().enumerate() {
+            let cache = tempfile::tempdir().expect("the test cache directory is created");
+            let db_config = Config {
+                cache_dir: cache.path().to_owned(),
+                ephemeral: false,
+                debug_skip_non_finalized_state_backup_task: true,
+                ..Config::default()
+            };
+            let (engine_config, anchor, metadata) = fixture();
+            let network = engine_config.network.clone();
+            let db = open(&db_config, &network);
+            let store = HeaderChainStore::new(db.clone());
+            store
+                .initialize(metadata, anchor.clone())
+                .expect("the empty schema initializes");
+            let (runtime, _) = store
+                .startup(&engine_config)
+                .expect("the initial store audits");
+            let initial = runtime.publisher().snapshot();
+            let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+            let lease = runtime
+                .reader()
+                .validation_context(anchor.hash)
+                .expect("the anchor validation context is coherent")
+                .expect("the initialized anchor is retained");
+            let rules = HeaderRules::for_validation_lease(network.clone(), &lease)
+                .expect("the authenticated regtest policy is valid");
+            let marker = u8::try_from(index + 0x10).expect("the fault-point list fits in u8");
+            let mut child_header = *anchor.header;
+            child_header.previous_block_hash = anchor.hash;
+            child_header.time += chrono::Duration::seconds(1);
+            child_header.nonce.0[0] = marker;
+            let child_header = Arc::new(child_header);
+            let headers = [child_header.clone()];
+            let insertion_batch = zakura_header_chain::prepare_headers(
+                HeaderBatchInput::new(&headers),
+                &lease,
+                &rules,
+                &SystemClock,
+            )
+            .expect("the selected repair fixture passes production validation");
+            let child = Frontier::new(
+                anchor
+                    .height
+                    .next()
+                    .expect("the genesis anchor has a next height"),
+                child_header.hash(),
+            );
+            let insertion_owner = WorkOwner {
+                state_version: initial.state_version,
+                header_generation: initial.header_generation,
+                verified_generation: None,
+                branch: BranchId::new(anchor.hash, child.hash),
+                session_id: 51,
+                request_id: NonZeroU64::new(52).expect("fifty-two is nonzero"),
+            };
+            let insertion_context = TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: None,
+                startup_capability: None,
+                retention_references: &[],
+            };
+            runtime
+                .apply(
+                    TransitionRequest {
+                        expected_version: initial.state_version,
+                        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                            owner: insertion_owner,
+                            source: SourceId::from_digest([marker.wrapping_add(1); 32]),
+                            parent_hash: anchor.hash,
+                            target_tip_hash: child.hash,
+                            completion: TargetCompletion::TargetComplete {
+                                common_ancestor: anchor_frontier,
+                            },
+                            batch: insertion_batch,
+                            aux: Vec::new(),
+                        })),
+                    },
+                    &insertion_context,
+                )
+                .expect("the selected repair target inserts without auxiliary metadata");
+            let before = runtime.publisher().snapshot();
+            assert_eq!(before.frontiers.header_best, child);
+            assert!(runtime
+                .store
+                .aux_deliveries(child.hash)
+                .expect("the initial auxiliary index is readable")
+                .is_empty());
+
+            let repair_lease = runtime
+                .reader()
+                .validation_context(anchor.hash)
+                .expect("the repair validation context is coherent")
+                .expect("the repair parent remains retained");
+            let repair_rules = HeaderRules::for_validation_lease(network.clone(), &repair_lease)
+                .expect("the authenticated repair policy is valid");
+            let repair_batch = zakura_header_chain::prepare_headers(
+                HeaderBatchInput::new(&headers),
+                &repair_lease,
+                &repair_rules,
+                &SystemClock,
+            )
+            .expect("the selected header redelivery passes production validation");
+            let repair_owner = WorkScope::for_body_work(&before)
+                .bind(53, NonZeroU64::new(54).expect("fifty-four is nonzero"));
+            let source = SourceId::from_digest([marker.wrapping_add(2); 32]);
+            let delivery = AuxDelivery {
+                delivery_id: EvidenceId::from_digest([marker.wrapping_add(3); 32]),
+                header_hash: child.hash,
+                source,
+                owner: repair_owner,
+                body_size: zakura_header_chain::BodySizeHint::Unknown,
+                tree_aux: Some(zakura_header_chain::TreeAuxRecordV1 {
+                    height: child.height,
+                    sapling_root: Default::default(),
+                    orchard_root: Default::default(),
+                    ironwood_root: Default::default(),
+                    sapling_tx_count: 4,
+                    orchard_tx_count: 5,
+                    ironwood_tx_count: 6,
+                    auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from(
+                        [marker.wrapping_add(4); 32],
+                    ),
+                }),
+                authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
+            };
+            let context = TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: None,
+                startup_capability: None,
+                retention_references: &[],
+            };
+            let marker_key = [marker; 4];
+            let mut full_state_batch = DiskWriteBatch::new();
+            runtime
+                .store
+                .put_raw(
+                    &mut full_state_batch,
+                    ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+                    marker_key,
+                    [marker],
+                )
+                .expect("the paired selected-repair marker can be staged");
+            let memory_swapped = Arc::new(AtomicBool::new(false));
+            let swap_probe = memory_swapped.clone();
+            let result = runtime.apply_combined_with_fault(
+                TransitionRequest {
+                    expected_version: before.state_version,
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: repair_owner,
+                        source,
+                        parent_hash: anchor.hash,
+                        target_tip_hash: child.hash,
+                        completion: TargetCompletion::SelectedAuxiliaryRepair {
+                            common_ancestor: anchor_frontier,
+                            selected_target: child,
+                        },
+                        batch: repair_batch,
+                        aux: vec![delivery],
+                    })),
+                },
+                &context,
+                full_state_batch,
+                move || swap_probe.store(true, Ordering::SeqCst),
+                |point| {
+                    if point == target {
+                        Err(HeaderChainStoreError::InjectedCrash(point))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(HeaderChainStoreError::InjectedCrash(point)) if point == target
+            ));
+
+            let committed = matches!(
+                target,
+                FaultPoint::AfterDbCommit
+                    | FaultPoint::BeforeMemorySwap
+                    | FaultPoint::BeforePublish
+                    | FaultPoint::AfterPublish
+                    | FaultPoint::BeforeReactorObserve
+            );
+            let published = matches!(
+                target,
+                FaultPoint::AfterPublish | FaultPoint::BeforeReactorObserve
+            );
+            let committed_version = before
+                .state_version
+                .checked_next()
+                .expect("the short fixture state version can advance");
+            let durable = runtime
+                .store
+                .snapshot()
+                .expect("the selected-repair snapshot read succeeds");
+            assert_eq!(
+                durable.state_version,
+                if committed {
+                    committed_version
+                } else {
+                    before.state_version
+                },
+                "{target:?}"
+            );
+            assert_eq!(durable.frontiers, before.frontiers, "{target:?}");
+            assert_eq!(
+                durable.header_generation, before.header_generation,
+                "{target:?}"
+            );
+            assert_eq!(
+                durable.verified_generation, before.verified_generation,
+                "{target:?}"
+            );
+            let child_node = runtime
+                .store
+                .node(child.hash)
+                .expect("the selected repair node read succeeds")
+                .expect("the selected repair target remains retained");
+            assert_eq!(
+                child_node.aux_delivery_ids,
+                if committed {
+                    vec![delivery.delivery_id]
+                } else {
+                    Vec::new()
+                },
+                "{target:?}"
+            );
+            let stored_deliveries = runtime
+                .store
+                .aux_deliveries(child.hash)
+                .expect("the selected repair auxiliary index is readable");
+            assert_eq!(
+                stored_deliveries,
+                if committed {
+                    vec![delivery]
+                } else {
+                    Vec::new()
+                },
+                "{target:?}"
+            );
+            let marker_cf = runtime
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the marker column family is open");
+            assert_eq!(
+                runtime
+                    .store
+                    .db
+                    .raw_get_cf(&marker_cf, &marker_key)
+                    .expect("the paired marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+            assert_eq!(
+                memory_swapped.load(Ordering::SeqCst),
+                matches!(
+                    target,
+                    FaultPoint::BeforePublish
+                        | FaultPoint::AfterPublish
+                        | FaultPoint::BeforeReactorObserve
+                ),
+                "{target:?}"
+            );
+            assert_eq!(
+                runtime.publisher().snapshot().state_version,
+                if published {
+                    committed_version
+                } else {
+                    before.state_version
+                },
+                "{target:?}"
+            );
+            drop(runtime);
+            drop(db);
+
+            let (reopened, report) = HeaderChainStore::new(open(&db_config, &network))
+                .startup(&engine_config)
+                .expect("the selected-repair crash boundary reopens coherently");
+            assert_eq!(
+                reopened.publisher().snapshot(),
+                report.current,
+                "{target:?}"
+            );
+            assert_eq!(
+                report.current.state_version,
+                if committed {
+                    committed_version
+                } else {
+                    before.state_version
+                },
+                "{target:?}"
+            );
+            assert_eq!(report.current.frontiers, before.frontiers, "{target:?}");
+            let reopened_child = reopened
+                .store
+                .node(child.hash)
+                .expect("the reopened selected repair node read succeeds")
+                .expect("the reopened selected repair target remains retained");
+            assert_eq!(
+                reopened_child.aux_delivery_ids,
+                if committed {
+                    vec![delivery.delivery_id]
+                } else {
+                    Vec::new()
+                },
+                "{target:?}"
+            );
+            assert_eq!(
+                reopened
+                    .store
+                    .aux_deliveries(child.hash)
+                    .expect("the reopened selected repair auxiliary index is readable"),
+                if committed {
+                    vec![delivery]
+                } else {
+                    Vec::new()
+                },
+                "{target:?}"
+            );
+            let reopened_marker_cf = reopened
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the reopened marker column family is open");
+            assert_eq!(
+                reopened
+                    .store
+                    .db
+                    .raw_get_cf(&reopened_marker_cf, &marker_key)
+                    .expect("the reopened paired marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
     fn aud_14_aux_authentication_reopens_complete_before_or_after() {
         const AUX_FAULT_POINTS: [FaultPoint; 11] = [
             FaultPoint::AfterSnapshot,

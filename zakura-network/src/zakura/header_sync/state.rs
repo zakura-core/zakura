@@ -658,8 +658,7 @@ impl HeaderSyncCore {
 
     pub(super) fn retire_stale_auth_operation(&mut self, operation: &HeaderSyncOperationIdentity) {
         if let Some(pending) = self.pending_operations.remove(operation) {
-            if let Some(RootAuthSource::Retained(start)) =
-                pending.root_auth.map(|auth| auth.source)
+            if let Some(RootAuthSource::Retained(start)) = pending.root_auth.map(|auth| auth.source)
             {
                 self.remove_retained_root(start, "session_retired");
             }

@@ -1013,6 +1013,24 @@ pub enum FaultPoint {
     BeforeReactorObserve,
 }
 
+impl FaultPoint {
+    /// Complete ordered state-writer crash surface used by deterministic recovery tests.
+    pub const ALL: [Self; 12] = [
+        Self::AfterSnapshot,
+        Self::AfterVersionCheck,
+        Self::AfterEachNodeWrite,
+        Self::AfterEachIndexWrite,
+        Self::AfterProjectionWrite,
+        Self::AfterMetadataWrite,
+        Self::BeforeDbCommit,
+        Self::AfterDbCommit,
+        Self::BeforeMemorySwap,
+        Self::BeforePublish,
+        Self::AfterPublish,
+        Self::BeforeReactorObserve,
+    ];
+}
+
 /// One RocksDB-backed header DAG with a process-local serialized writer.
 #[derive(Clone, Debug)]
 pub struct HeaderChainStore {
@@ -3720,22 +3738,8 @@ mod tests {
     }
 
     #[test]
-    fn every_named_crash_point_reopens_to_complete_before_or_after() {
-        let fault_points = [
-            FaultPoint::AfterSnapshot,
-            FaultPoint::AfterVersionCheck,
-            FaultPoint::AfterEachNodeWrite,
-            FaultPoint::AfterEachIndexWrite,
-            FaultPoint::AfterProjectionWrite,
-            FaultPoint::AfterMetadataWrite,
-            FaultPoint::BeforeDbCommit,
-            FaultPoint::AfterDbCommit,
-            FaultPoint::BeforeMemorySwap,
-            FaultPoint::BeforePublish,
-            FaultPoint::AfterPublish,
-            FaultPoint::BeforeReactorObserve,
-        ];
-        for (index, target) in fault_points.into_iter().enumerate() {
+    fn aud_14_every_state_writer_crash_point_reopens_complete_before_or_after() {
+        for (index, target) in FaultPoint::ALL.into_iter().enumerate() {
             let cache = tempfile::tempdir().expect("the test cache directory is created");
             let db_config = Config {
                 cache_dir: cache.path().to_owned(),

@@ -1804,11 +1804,20 @@ mod tests {
     use std::sync::Arc;
 
     use zakura_chain::{
-        block::{self, genesis::regtest_genesis_block},
-        parameters::{Network, NetworkUpgrade},
+        block::{
+            self, genesis::regtest_genesis_block, Block, ChainHistoryBlockTxAuthCommitmentHash,
+        },
+        fmt::HexDebug,
+        history_tree::HistoryTree,
+        parameters::{
+            testnet::{ConfiguredActivationHeights, ConfiguredCheckpoints, ParametersBuilder},
+            Network, NetworkUpgrade, GENESIS_PREVIOUS_BLOCK_HASH,
+        },
         serialization::ZcashDeserializeInto,
         transaction::{arbitrary::transaction_to_fake_v5, Transaction},
+        transparent,
         value_balance::ValueBalance,
+        work::{difficulty::ParameterDifficulty as _, equihash},
     };
 
     use crate::{
@@ -2226,6 +2235,8 @@ mod tests {
                 NetworkUpgrade::Sapling,
                 NetworkUpgrade::Blossom,
                 NetworkUpgrade::Heartwood,
+                NetworkUpgrade::Canopy,
+                NetworkUpgrade::Nu5,
             ] {
                 let height = upgrade
                     .activation_height(&network)
@@ -2233,29 +2244,27 @@ mod tests {
                 let parent_height = height
                     .previous()
                     .expect("the tested upgrades activate after genesis");
-                let parent = blocks
-                    .get(&parent_height.0)
-                    .expect("the parent activation vector exists")
-                    .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
-                    .expect("the parent activation vector deserializes");
+                let vector_height = blocks
+                    .range(height.0..)
+                    .next()
+                    .map(|(height, _)| *height)
+                    .expect("an activation or post-activation vector exists");
                 let candidate = blocks
-                    .get(&height.0)
-                    .expect("the activation vector exists")
+                    .get(&vector_height)
+                    .expect("the selected activation vector exists")
                     .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
                     .expect("the activation vector deserializes");
-                assert_eq!(candidate.header.previous_block_hash, parent.hash());
+                if vector_height == height.0 {
+                    let parent = blocks
+                        .get(&parent_height.0)
+                        .expect("the exact activation vector has its parent vector")
+                        .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
+                        .expect("the parent activation vector deserializes");
+                    assert_eq!(candidate.header.previous_block_hash, parent.hash());
+                }
 
-                let parent_frontier = Frontier::new(parent_height, parent.hash());
-                let config = EngineConfig::new(
-                    EngineMode::Integrated,
-                    network.clone(),
-                    TrustedAnchor {
-                        frontier: parent_frontier,
-                        header: parent.header.clone(),
-                    },
-                    CheckpointSet::default(),
-                )
-                .expect("the historical activation parent is a coherent trusted anchor");
+                let parent_frontier =
+                    Frontier::new(parent_height, candidate.header.previous_block_hash);
                 let spacing = NetworkUpgrade::target_spacing_for_height(&network, height);
                 let context_times: Vec<_> = (1..=POW_ADJUSTMENT_BLOCK_SPAN)
                     .map(|offset| {
@@ -2311,11 +2320,7 @@ mod tests {
                         }
                     })
                     .collect();
-                let lease = ValidationLease::new(
-                    parent_frontier,
-                    predecessors,
-                    config.trust_anchor_digest(),
-                );
+                let lease = ValidationLease::new(parent_frontier, predecessors, [0x51; 32]);
                 let rules = HeaderRules::for_validation_lease(network.clone(), &lease)
                     .expect("production network parameters require proof of work");
                 let batch = zakura_header_chain::prepare_headers(
@@ -2341,6 +2346,266 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn df_01_generated_nu5_graph_matches_full_state_before_finalization() {
+        let _init_guard = zakura_test::init();
+        fn network(checkpoint_blocks: Option<&[Arc<Block>]>) -> Network {
+            let builder = ParametersBuilder::default()
+                .with_activation_heights(ConfiguredActivationHeights {
+                    before_overwinter: Some(1),
+                    overwinter: Some(10),
+                    sapling: Some(15),
+                    blossom: Some(20),
+                    heartwood: Some(25),
+                    canopy: Some(30),
+                    nu5: Some(35),
+                    nu6: Some(100),
+                    nu6_1: Some(110),
+                    nu6_2: Some(120),
+                    nu6_3: Some(130),
+                    nu7: Some(140),
+                })
+                .expect("the compressed activation schedule is ordered")
+                .with_disable_pow(true)
+                .extend_funding_streams();
+            let builder = if let Some(blocks) = checkpoint_blocks {
+                let genesis_hash = blocks
+                    .first()
+                    .expect("the generated checkpoint chain contains genesis")
+                    .hash();
+                builder
+                    .with_genesis_hash(genesis_hash)
+                    .expect("the generated genesis hash is canonical")
+                    .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(
+                        blocks
+                            .iter()
+                            .map(|block| {
+                                (
+                                    block
+                                        .coinbase_height()
+                                        .expect("every generated checkpoint has a height"),
+                                    block.hash(),
+                                )
+                            })
+                            .collect(),
+                    ))
+                    .expect("the generated checkpoints are ordered")
+            } else {
+                builder
+            };
+            builder
+                .to_network()
+                .expect("the compressed custom network is valid")
+        }
+
+        fn chain(network: &Network) -> Vec<Arc<Block>> {
+            let sapling_root = zakura_chain::sapling::tree::NoteCommitmentTree::default().root();
+            let orchard_root = zakura_chain::orchard::tree::NoteCommitmentTree::default().root();
+            let ironwood_root = zakura_chain::ironwood::tree::NoteCommitmentTree::default().root();
+            let mut history_tree = HistoryTree::default();
+            let mut previous_hash = GENESIS_PREVIOUS_BLOCK_HASH;
+            let mut blocks = Vec::new();
+
+            for height in (0..=40).map(block::Height) {
+                let upgrade = NetworkUpgrade::current(network, height);
+                let input = transparent::Input::Coinbase {
+                    height,
+                    data: if height == block::Height(0) {
+                        transparent::GENESIS_COINBASE_SCRIPT_SIG.to_vec()
+                    } else {
+                        format!("DF-01 {height:?}").into_bytes()
+                    },
+                    sequence: 0,
+                };
+                let transaction = match upgrade {
+                    NetworkUpgrade::Genesis | NetworkUpgrade::BeforeOverwinter => Transaction::V1 {
+                        inputs: vec![input],
+                        outputs: Vec::new(),
+                        lock_time: zakura_chain::transaction::LockTime::unlocked(),
+                    },
+                    NetworkUpgrade::Overwinter => Transaction::V3 {
+                        inputs: vec![input],
+                        outputs: Vec::new(),
+                        lock_time: zakura_chain::transaction::LockTime::unlocked(),
+                        expiry_height: height,
+                        joinsplit_data: None,
+                    },
+                    NetworkUpgrade::Sapling
+                    | NetworkUpgrade::Blossom
+                    | NetworkUpgrade::Heartwood
+                    | NetworkUpgrade::Canopy => Transaction::V4 {
+                        inputs: vec![input],
+                        outputs: Vec::new(),
+                        lock_time: zakura_chain::transaction::LockTime::unlocked(),
+                        expiry_height: height,
+                        joinsplit_data: None,
+                        sapling_shielded_data: None,
+                    },
+                    NetworkUpgrade::Nu5 => Transaction::V5 {
+                        network_upgrade: upgrade,
+                        lock_time: zakura_chain::transaction::LockTime::unlocked(),
+                        expiry_height: height,
+                        inputs: vec![input],
+                        outputs: Vec::new(),
+                        sapling_shielded_data: None,
+                        orchard_shielded_data: None,
+                    },
+                    _ => unreachable!("the deterministic graph stops during NU5"),
+                };
+                let transactions = vec![Arc::new(transaction)];
+                let merkle_root = transactions.iter().cloned().collect();
+                let time = chrono::DateTime::from_timestamp(
+                    1_700_000_000_i64 + i64::from(height.0) * 150,
+                    0,
+                )
+                .expect("the deterministic timestamp is in range");
+                let header = zakura_chain::block::Header {
+                    version: 4,
+                    previous_block_hash: previous_hash,
+                    merkle_root,
+                    commitment_bytes: HexDebug([0; 32]),
+                    time,
+                    difficulty_threshold: network.target_difficulty_limit().to_compact(),
+                    nonce: HexDebug([0; 32]),
+                    solution: equihash::Solution::for_proposal(),
+                };
+                let mut block = Arc::new(Block {
+                    header: Arc::new(header),
+                    transactions,
+                });
+                let commitment = match upgrade {
+                    NetworkUpgrade::Sapling | NetworkUpgrade::Blossom => {
+                        <[u8; 32]>::from(sapling_root)
+                    }
+                    NetworkUpgrade::Heartwood
+                        if NetworkUpgrade::Heartwood.activation_height(network) == Some(height) =>
+                    {
+                        [0; 32]
+                    }
+                    NetworkUpgrade::Heartwood | NetworkUpgrade::Canopy => history_tree
+                        .hash()
+                        .expect("the history tree exists after Heartwood activation")
+                        .into(),
+                    NetworkUpgrade::Nu5 => {
+                        let history_root =
+                            history_tree.hash().expect("the history tree exists at NU5");
+                        ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                            &history_root,
+                            &block.auth_data_root(),
+                        )
+                        .into()
+                    }
+                    _ => [0; 32],
+                };
+                Arc::make_mut(&mut Arc::make_mut(&mut block).header).commitment_bytes =
+                    commitment.into();
+                previous_hash = block.hash();
+                history_tree
+                    .push(
+                        network,
+                        block.clone(),
+                        &sapling_root,
+                        &orchard_root,
+                        &ironwood_root,
+                    )
+                    .expect("the deterministic history tree advances");
+                blocks.push(block);
+            }
+            blocks
+        }
+
+        let preliminary = network(None);
+        let preliminary_chain = chain(&preliminary);
+        let network = network(Some(&preliminary_chain));
+        let chain = chain(&network);
+        assert_eq!(network.genesis_hash(), chain[0].hash());
+        assert_eq!(
+            chain.iter().map(|block| block.hash()).collect::<Vec<_>>(),
+            preliminary_chain
+                .iter()
+                .map(|block| block.hash())
+                .collect::<Vec<_>>(),
+            "installing generated checkpoints must not change the generated graph"
+        );
+
+        let mut finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        )
+        .expect("the differential finalized state opens");
+        let mut live = NonFinalizedState::new(&network);
+        for block in chain.iter().take(31) {
+            finalized_state
+                .commit_finalized_direct(
+                    CheckpointVerifiedBlock::from(block.clone()).into(),
+                    None,
+                    None,
+                    "DF-01 generated Canopy anchor",
+                )
+                .expect("the generated finalized prefix commits");
+        }
+        let canopy_anchor = Frontier::new(block::Height(30), chain[30].hash());
+        let writer = HeaderChainWriter::attach_at_semantic_handoff(&finalized_state, &live)
+            .expect("the header engine attaches at the exact full-state Canopy anchor");
+        assert_eq!(
+            writer.runtime.publisher().snapshot().frontiers.finalized,
+            canopy_anchor
+        );
+
+        for (index, block) in chain.into_iter().enumerate().skip(31) {
+            let height = block
+                .coinbase_height()
+                .expect("the generated block has a coinbase height");
+            let parent_hash = block.header.previous_block_hash;
+            let lease = writer
+                .runtime
+                .reader()
+                .validation_context(parent_hash)
+                .expect("the exact generated parent context read succeeds")
+                .expect("the exact generated parent is retained");
+            let rules = HeaderRules::for_validation_lease(network.clone(), &lease)
+                .expect("the custom network authenticates its PoW waiver");
+            let batch = zakura_header_chain::prepare_headers(
+                HeaderBatchInput::new(std::slice::from_ref(&block.header)),
+                &lease,
+                &rules,
+                &SystemClock,
+            )
+            .unwrap_or_else(|error| {
+                panic!("generated header {height:?} must pass the shared observable rules: {error}")
+            });
+            assert_eq!(batch.headers()[0].height, height);
+            assert_eq!(batch.headers()[0].hash, block.hash());
+
+            let mut staged = live.clone();
+            if index == 31 {
+                staged
+                    .commit_new_chain(block.clone().prepare(), &finalized_state.db)
+                    .expect("the first generated body enters full state");
+            } else {
+                staged
+                    .commit_block(block.clone().prepare(), &finalized_state.db)
+                    .expect("the next generated body enters full state");
+            }
+            let accepted = Frontier::new(height, block.hash());
+            commit_verified_change(&writer, &mut live, staged, accepted);
+            assert_selected_header_matches_full_state(&writer, &live);
+        }
+
+        assert_eq!(
+            NetworkUpgrade::current(
+                &network,
+                live.best_chain()
+                    .expect("the generated full-state graph has a best chain")
+                    .non_finalized_tip()
+                    .0,
+            ),
+            NetworkUpgrade::Nu5
+        );
     }
 
     #[test]

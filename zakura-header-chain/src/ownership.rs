@@ -178,6 +178,39 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default, Eq, PartialEq)]
+    struct NoEffectsProbe {
+        frontier_writes: usize,
+        coverage_writes: usize,
+        retry_writes: usize,
+        repair_writes: usize,
+        scheduler_writes: usize,
+        publication_writes: usize,
+        body_task_writes: usize,
+        peer_score_writes: usize,
+    }
+
+    fn probe_completion(
+        current: &EngineSnapshot,
+        pending: &PendingOwners,
+        source: SourceId,
+        owner: &WorkOwner,
+    ) -> (CompletionDecision, NoEffectsProbe) {
+        let decision = CompletionGate::check(current, pending, source, owner);
+        let mut probe = NoEffectsProbe::default();
+        if decision == CompletionDecision::Current {
+            probe.frontier_writes += 1;
+            probe.coverage_writes += 1;
+            probe.retry_writes += 1;
+            probe.repair_writes += 1;
+            probe.scheduler_writes += 1;
+            probe.publication_writes += 1;
+            probe.body_task_writes += 1;
+            probe.peer_score_writes += 1;
+        }
+        (decision, probe)
+    }
+
     #[test]
     fn every_generation_branch_session_request_and_pending_mismatch_is_stale() {
         let current = snapshot();
@@ -249,5 +282,58 @@ mod tests {
         let removed = pending.apply_retirement(&retired, &current);
         assert_eq!(removed.len(), 2);
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn all_owner_mismatches_have_zero_effects() {
+        let current = snapshot();
+        let source = SourceId::from_digest([3; 32]);
+        let expected = owner(&current);
+        let mut pending = PendingOwners::default();
+        pending.insert(source, expected);
+        let (decision, live_probe) = probe_completion(&current, &pending, source, &expected);
+        assert_eq!(decision, CompletionDecision::Current);
+        assert_ne!(live_probe, NoEffectsProbe::default());
+
+        let mut cases = Vec::new();
+        let mut changed_snapshot = current.clone();
+        changed_snapshot.state_version = StateVersion::new(10);
+        cases.push((changed_snapshot, source, expected, pending.clone()));
+        let mut changed_snapshot = current.clone();
+        changed_snapshot.header_generation = HeaderGeneration::new(10);
+        cases.push((changed_snapshot, source, expected, pending.clone()));
+        let mut changed_snapshot = current.clone();
+        changed_snapshot.verified_generation = VerifiedGeneration::new(10);
+        cases.push((changed_snapshot, source, expected, pending.clone()));
+        let mut changed_snapshot = current.clone();
+        changed_snapshot.frontiers.finalized.hash = block::Hash([4; 32]);
+        cases.push((changed_snapshot, source, expected, pending.clone()));
+
+        let mut changed_owner = expected;
+        changed_owner.branch.anchor_hash = block::Hash([4; 32]);
+        cases.push((current.clone(), source, changed_owner, pending.clone()));
+        let mut changed_owner = expected;
+        changed_owner.branch.target_tip_hash = block::Hash([4; 32]);
+        cases.push((current.clone(), source, changed_owner, pending.clone()));
+        let mut changed_owner = expected;
+        changed_owner.session_id = 99;
+        cases.push((current.clone(), source, changed_owner, pending.clone()));
+        let mut changed_owner = expected;
+        changed_owner.request_id = NonZeroU64::new(99).expect("ninety-nine is nonzero");
+        cases.push((current.clone(), source, changed_owner, pending.clone()));
+        cases.push((
+            current.clone(),
+            SourceId::from_digest([4; 32]),
+            expected,
+            pending.clone(),
+        ));
+        cases.push((current.clone(), source, expected, PendingOwners::default()));
+
+        for (case_current, case_source, case_owner, case_pending) in cases {
+            let (decision, probe) =
+                probe_completion(&case_current, &case_pending, case_source, &case_owner);
+            assert!(matches!(decision, CompletionDecision::Stale(_)));
+            assert_eq!(probe, NoEffectsProbe::default());
+        }
     }
 }

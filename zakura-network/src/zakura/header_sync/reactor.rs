@@ -10,6 +10,7 @@ use zakura_chain::block;
 
 use super::{
     scheduler::{
+        coverage::{BranchRange, CoverageMap},
         peer_work::{HeaderTargetPhase, PeerWorkPriority, PeerWorkQueue, QueueWorkResult},
         status::StatusPublisher,
     },
@@ -94,6 +95,7 @@ pub fn spawn_header_sync_reactor(
         committed_snapshot,
         peer_state: HashMap::new(),
         peer_work_queue: PeerWorkQueue::default(),
+        coverage: CoverageMap::default(),
         pending_owners: zakura_header_chain::PendingOwners::default(),
         served_paths: HashMap::new(),
     };
@@ -137,6 +139,7 @@ struct HeaderSyncReactor {
     committed_snapshot: Option<zakura_header_chain::EngineSnapshot>,
     peer_state: HashMap<ZakuraPeerId, PeerState>,
     peer_work_queue: PeerWorkQueue,
+    coverage: CoverageMap,
     pending_owners: zakura_header_chain::PendingOwners,
     served_paths: HashMap<ZakuraPeerId, ServedPathState>,
 }
@@ -354,6 +357,18 @@ impl HeaderSyncReactor {
         }
         if !eligible {
             self.peer_work_queue.remove_unstarted(&peer);
+            return;
+        }
+        let branch = zakura_header_chain::BranchId::new(
+            local.frontiers.finalized.hash,
+            status.selected_tip_hash,
+        );
+        if self
+            .coverage
+            .covers_tip(local.header_generation, branch, status.selected_tip_height)
+        {
+            self.peer_work_queue.remove_unstarted(&peer);
+            metrics::counter!("sync.header.target.covered").increment(1);
             return;
         }
         match self.peer_work_queue.stage(
@@ -623,9 +638,26 @@ impl HeaderSyncReactor {
         {
             return;
         }
+        let admitted_range = if result == HeaderTargetAdmissionResult::Applied {
+            active
+                .common_ancestor
+                .zip(active.staged_tip())
+                .and_then(|(common_ancestor, target)| {
+                    BranchRange::new(
+                        owner.branch,
+                        next_height(common_ancestor.height),
+                        target.height,
+                    )
+                })
+        } else {
+            None
+        };
         self.retire_peer_work(&peer);
         match result {
             HeaderTargetAdmissionResult::Applied => {
+                if let Some(range) = admitted_range {
+                    self.coverage.mark(owner.header_generation, range);
+                }
                 metrics::counter!("sync.header.target.admitted").increment(1);
             }
             HeaderTargetAdmissionResult::InvalidHeader => {
@@ -1004,6 +1036,8 @@ impl HeaderSyncReactor {
     }
 
     fn observe_committed_snapshot(&mut self, snapshot: zakura_header_chain::EngineSnapshot) {
+        self.coverage
+            .retain_current(snapshot.header_generation, snapshot.frontiers.finalized);
         if let Some(previous) = self.committed_snapshot.as_ref() {
             let retired = zakura_header_chain::RetiredWork {
                 header_generation_changed: previous.header_generation != snapshot.header_generation,
@@ -1421,7 +1455,7 @@ mod tests {
             .send(HeaderSyncEvent::SessionWireMessage {
                 peer: peer.clone(),
                 session_id: 0,
-                msg: HeaderSyncMessage::Status(remote_status),
+                msg: HeaderSyncMessage::Status(remote_status.clone()),
             })
             .await
             .expect("the target status reaches the reactor");
@@ -1628,13 +1662,27 @@ mod tests {
         );
         handle
             .send(HeaderSyncEvent::HeaderTargetAdmissionReady {
-                peer,
+                peer: peer.clone(),
                 source,
                 owner,
                 result: HeaderTargetAdmissionResult::Applied,
             })
             .await
             .expect("the admission result reaches the reactor");
+        handle
+            .send(HeaderSyncEvent::SessionWireMessage {
+                peer,
+                session_id: 0,
+                msg: HeaderSyncMessage::Status(remote_status),
+            })
+            .await
+            .expect("the duplicate covered target reaches the reactor");
+        assert!(
+            time::timeout(std::time::Duration::from_millis(20), actions.recv())
+                .await
+                .is_err(),
+            "exact current coverage suppresses a duplicate locator query"
+        );
 
         drop(snapshots_tx);
         shutdown.cancel();

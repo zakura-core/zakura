@@ -3,40 +3,56 @@ name: Test Docker Config
 on:
   pull_request:
     branches: [main, "feat/**", "release/**"]
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened]
     paths:
-      - "**/*.rs"
+      - "zakurad/src/**"
+      - "zakura-network/src/config.rs"
+      - "zakura-network/src/config/**"
+      - "zakura-rpc/src/config.rs"
+      - "zakura-rpc/src/config/**"
+      - "zakura-state/src/config.rs"
+      - "**/build.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      - .dockerignore
       - docker/Dockerfile
       - docker/entrypoint.sh
       - docker/**/*.toml
       - zakurad/tests/common/configs/**
+      - .github/workflows/release-binaries.yml
       - .github/workflows/test-docker.yml
 
   schedule:
-    # Keep release-mode Docker coverage off the critical PR path.
-    - cron: "0 9 * * *"
+    # Catch Docker and runner-image drift without rebuilding on every Rust merge.
+    - cron: "0 9 * * 1"
 
   workflow_dispatch:
 
   push:
     branches: [main, "feat/**", "release/**"]
     paths:
-      - "**/*.rs"
+      - "zakurad/src/**"
+      - "zakura-network/src/config.rs"
+      - "zakura-network/src/config/**"
+      - "zakura-rpc/src/config.rs"
+      - "zakura-rpc/src/config/**"
+      - "zakura-state/src/config.rs"
+      - "**/build.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      - .dockerignore
       - docker/Dockerfile
       - docker/entrypoint.sh
       - docker/**/*.toml
       - zakurad/tests/common/configs/**
+      - .github/workflows/release-binaries.yml
       - .github/workflows/test-docker.yml
 
 # Ensures that only one workflow task will run at a time. Previous builds, if
 # already in process, will get cancelled. Only the latest commit will be allowed
 # to run, cancelling any workflows in between
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -51,217 +67,155 @@ env:
   COLORBT_SHOW_HIDDEN: 1
 
 jobs:
-  build-docker-image:
-    name: Build Docker Image
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'A-release')
-    permissions:
-      contents: read
-      id-token: write
-      statuses: write
+  test-docker-image:
+    name: Test Runtime Docker Image
     runs-on: ${{ vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      # The `tests` target image bakes in the full `target/release` build tree, which
-      # overflows the ~14 GB free on a standard ubuntu-latest runner. Reclaim space by
-      # removing preinstalled toolchains we don't use for this build.
-      - name: Free up runner disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
-          df -h /
-      - name: Inject slug/short variables
-        uses: rlespinasse/github-slug-action@ef93b2ea4b6405d06fd8684fc3ff795d262ecae8 #v5.7.0
-        with:
-          short-length: 7
+      - name: Resolve image metadata
+        id: image
+        run: echo "short_sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c #v4.2.0
-      - name: Build & push
-        id: docker_build
+      - name: Build runtime image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a #v7.3.0
         with:
-          target: tests
+          target: runtime
           context: .
           file: docker/Dockerfile
-          tags: zakurad-test:${{ github.sha }}
+          load: true
+          tags: zakurad-runtime-test:${{ github.sha }}
           build-args: |
-            SHORT_SHA=${{ env.GITHUB_SHA_SHORT }}
-            CARGO_INCREMENTAL=1
-          outputs: type=docker,dest=${{ runner.temp }}/zakurad-test.tar
+            FEATURES=${{ vars.RUST_PROD_FEATURES || 'default-release-binaries' }}
+            SHORT_SHA=${{ steps.image.outputs.short_sha }}
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
-        with:
-          name: zakurad-test
-          path: ${{ runner.temp }}/zakurad-test.tar
-
-  test-configurations:
-    name: Test ${{ matrix.name }}
-    needs: build-docker-image
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'A-release')
-    permissions:
-      contents: read
-      actions: read
-      checks: read
-    runs-on: ${{ vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Privilege drop verification - runs 'id' to verify non-root user
-          - id: privilege-drop
-            name: Privilege drop
-            env_vars: ""
-            test_cmd: id
-            grep_patterns: -e "uid=10001\\(zebra\\).*gid=10001\\(zebra\\)"
-
-          - id: rollback-tool
-            name: Rollback tool
-            env_vars: ""
-            test_cmd: zakura-rollback-state --help
-            grep_patterns: -e "rollback.*finalized.*state|Rollback.*finalized.*state|zakura-rollback-state"
-
-          - id: prune-tool
-            name: Prune tool
-            env_vars: ""
-            test_cmd: zakura-prune-state --help
-            grep_patterns: -e "prune.*finalized.*state|Prune.*finalized.*state|zakura-prune-state"
-
-          # Basic network configurations
-          - id: default-conf
-            name: Default config
-            env_vars: ""
-            grep_patterns: -e "resolved seed peer IP addresses.*mainnet"
-
-          - id: testnet-conf
-            name: Testnet config
-            env_vars: -e ZAKURA_NETWORK__NETWORK=Testnet
-            grep_patterns: -e "resolved seed peer IP addresses.*testnet"
-
-          # Only runs when using the image is built with the `tests` target, because the `runtime` target
-          # doesn't have the custom config file available in the tests/common/configs directory
-          - id: custom-conf
-            name: Custom config
-            env_vars: -e CONFIG_FILE_PATH=/home/zebra/zakurad/tests/common/configs/custom-conf.toml
-            grep_patterns: -e "extra_coinbase_data:\\sSome\\(ExtraCoinbaseData\\(\\\"Do you even shield\\?\\\"\\)\\)"
-
-          # RPC configuration tests
-          - id: rpc-conf
-            name: RPC config
-            env_vars: -e ZAKURA_RPC__LISTEN_ADDR=0.0.0.0:8232
-            grep_patterns: -e "Opened RPC endpoint at.*0.0.0.0:8232"
-
-          - id: rpc-custom-conf
-            name: RPC with custom port
-            env_vars: -e ZAKURA_RPC__LISTEN_ADDR=127.0.0.1:28232
-            grep_patterns: -e "Opened RPC endpoint at.*127.0.0.1:28232"
-
-          # Custom directory tests
-          - id: rpc-cookie-conf
-            name: RPC with custom cookie dir
-            env_vars: -e ZAKURA_RPC__LISTEN_ADDR=0.0.0.0:8232 -e ZAKURA_RPC__ENABLE_COOKIE_AUTH=true -e ZAKURA_RPC__COOKIE_DIR=/home/zebra/.config/cookie
-            grep_patterns: -e "RPC auth cookie written to disk"
-
-          # Custom directory tests
-          - id: custom-dirs-conf
-            name: Custom cache and cookie directories
-            env_vars: -e ZAKURA_STATE__CACHE_DIR=/tmp/zakura-cache
-            grep_patterns: -e "Opened Zakura state cache at /tmp/zakura-cache"
-
-          # Feature-based configurations
-          - id: prometheus-feature
-            name: Prometheus metrics
-            env_vars: -e FEATURES=prometheus -e ZAKURA_METRICS__ENDPOINT_ADDR=0.0.0.0:9999
-            grep_patterns: -e "0.0.0.0:9999"
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-
-      # `docker load` of the `tests` image needs more space than the ~14 GB free on a
-      # standard ubuntu-latest runner. Reclaim space by removing unused toolchains.
-      - name: Free up runner disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
-          df -h /
-
-      - name: Download artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
-        with:
-          name: zakurad-test
-          path: ${{ runner.temp }}
-
-      - name: Load image
-        run: |
-          docker load --input ${{ runner.temp }}/zakurad-test.tar
-          docker image ls -a
-
-      - name: Run ${{ matrix.name }} test
-        # Only run custom-conf test if the config file exists in the built image
-        if: ${{ matrix.id != 'custom-conf' || hashFiles('zakurad/tests/common/configs/custom-conf.toml') != '' }}
+      - name: Test image contract
         env:
-          TEST_CMD: ${{ matrix.test_cmd }}
+          IMAGE: zakurad-runtime-test:${{ github.sha }}
         run: |
-          # For one-shot commands (like 'id'), run directly and check output
-          if [ -n "$TEST_CMD" ]; then
-            OUTPUT=$(docker run --rm ${{ matrix.env_vars }} zakurad-test:${{ github.sha }} $TEST_CMD)
-            echo "Output: $OUTPUT"
-            if echo "$OUTPUT" | grep --extended-regexp ${{ matrix.grep_patterns }}; then
-              echo "SUCCESS: Found expected pattern in output"
+          set -euo pipefail
+
+          id_output=$(docker run --rm "$IMAGE" id)
+          echo "$id_output"
+          grep -Eq 'uid=10001\(zebra\).*gid=10001\(zebra\)' <<< "$id_output"
+
+          docker run --rm "$IMAGE" zakurad --version
+          docker run --rm "$IMAGE" zakura-rollback-state --help >/dev/null
+          docker run --rm "$IMAGE" zakura-prune-state --help >/dev/null
+
+      - name: Test default startup
+        env:
+          IMAGE: zakurad-runtime-test:${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          container=zakura-default-config
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if (( status != 0 )); then
+              docker logs "$container" 2>&1 || true
+            fi
+            docker rm --force "$container" >/dev/null 2>&1 || true
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          docker run --detach --name "$container" "$IMAGE" zakurad start
+
+          for _ in {1..60}; do
+            logs=$(docker logs "$container" 2>&1)
+            if grep -Fq "No config file provided, using default configuration" <<< "$logs" &&
+              grep -Fq "Zcash network: Mainnet" <<< "$logs" &&
+              grep -Fq "Opened Zakura state cache at /home/zebra/.cache/zakura" <<< "$logs"; then
               exit 0
-            else
-              echo "FAILURE: Expected pattern not found in output"
+            fi
+
+            if [[ $(docker inspect --format '{{.State.Running}}' "$container") != true ]]; then
+              echo "default-config container exited before startup completed" >&2
               exit 1
             fi
+            sleep 1
+          done
+
+          echo "default-config container did not start within 60 seconds" >&2
+          exit 1
+
+      - name: Test combined configuration overrides
+        env:
+          IMAGE: zakurad-runtime-test:${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          container=zakura-config-overrides
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if (( status != 0 )); then
+              docker logs "$container" 2>&1 || true
+            fi
+            docker rm --force "$container" >/dev/null 2>&1 || true
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          docker run \
+            --detach \
+            --name "$container" \
+            --volume "$GITHUB_WORKSPACE/zakurad/tests/common/configs/custom-conf.toml:/tmp/custom-conf.toml:ro" \
+            --env CONFIG_FILE_PATH=/tmp/custom-conf.toml \
+            --env ZAKURA_NETWORK__NETWORK=Testnet \
+            --env ZAKURA_RPC__LISTEN_ADDR=127.0.0.1:28232 \
+            --env ZAKURA_RPC__ENABLE_COOKIE_AUTH=true \
+            --env ZAKURA_RPC__COOKIE_DIR=/tmp/zakura-cookie \
+            --env ZAKURA_STATE__CACHE_DIR=/tmp/zakura-cache \
+            --env ZAKURA_METRICS__ENDPOINT_ADDR=0.0.0.0:9999 \
+            "$IMAGE" \
+            zakurad start
+
+          ready=false
+          for _ in {1..60}; do
+            logs=$(docker logs "$container" 2>&1)
+            if grep -Fq "INFO: Using config file at /tmp/custom-conf.toml" <<< "$logs" &&
+              grep -Fq "Zcash network: Testnet" <<< "$logs" &&
+              grep -Fq 'extra_coinbase_data: Some(ExtraCoinbaseData("Do you even shield?"))' <<< "$logs" &&
+              grep -Fq "Opened Zakura state cache at /tmp/zakura-cache" <<< "$logs" &&
+              grep -Fq "Trying to open metrics endpoint at 0.0.0.0:9999" <<< "$logs" &&
+              grep -Fq "RPC auth cookie written to disk" <<< "$logs" &&
+              grep -Fq "Opened RPC endpoint at 127.0.0.1:28232" <<< "$logs"; then
+              ready=true
+              break
+            fi
+
+            if [[ $(docker inspect --format '{{.State.Running}}' "$container") != true ]]; then
+              echo "config-overrides container exited before startup completed" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [[ "$ready" != true ]]; then
+            echo "config-overrides container did not start within 60 seconds" >&2
+            exit 1
           fi
 
-          # For long-running commands (zakurad start), run detached and follow logs
-          docker run ${{ matrix.env_vars }} --detach --name ${{ matrix.id }} -t zakurad-test:${{ github.sha }} zakurad start
-          # Use a subshell to handle the broken pipe error gracefully
-          (
-            trap "" PIPE;
-            docker logs \
-            --tail all \
-            --follow \
-            ${{ matrix.id }} | \
-            tee --output-error=exit /dev/stderr | \
-            grep --max-count=1 --extended-regexp --color=always \
-            ${{ matrix.grep_patterns }}
-          )
-          LOGS_EXIT_STATUS=$?
-
-          # Display grep status for debugging
-          echo "grep exit status: $LOGS_EXIT_STATUS"
-
-          docker stop ${{ matrix.id }}
-
-          EXIT_STATUS=$(docker wait ${{ matrix.id }} || echo "Error retrieving exit status");
-          echo "docker exit status: $EXIT_STATUS";
-
-          # If grep didn't find the pattern, fail immediately
-          if [ $LOGS_EXIT_STATUS -ne 0 ]; then
-              echo "ERROR: Failed to find the expected pattern in logs. Check grep_patterns.";
-              exit 1;
-          else
-            echo "SUCCESS: Found the expected pattern in logs.";
-            # Exit successfully if grep passed, even if docker stop resulted in SIGKILL (137 or 139)
-            exit 0;
-          fi
+          test "$(docker exec "$container" stat --format '%u:%g' /tmp/zakura-cache)" = "10001:10001"
+          test "$(docker exec "$container" stat --format '%u:%g' /tmp/zakura-cookie)" = "10001:10001"
+          docker exec "$container" test -f /tmp/zakura-cookie/.cookie
 
   test-docker-config-success:
     name: Test Docker Config Success
     runs-on: ubuntu-latest
     if: always()
     needs:
-      - build-docker-image
-      - test-configurations
+      - test-docker-image
     timeout-minutes: 30
     steps:
       - name: Decide whether the needed jobs succeeded or failed
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          allowed-skips: build-docker-image,test-configurations
+          allowed-skips: test-docker-image

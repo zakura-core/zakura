@@ -256,35 +256,66 @@ impl<E: std::error::Error + 'static> From<BoxError> for LayeredStateError<E> {
 /// An error describing why a `CommitCheckpointVerifiedBlock` request failed.
 #[derive(Debug, Error, Clone)]
 #[error("could not commit checkpoint-verified block")]
-pub struct CommitCheckpointVerifiedError(#[from] CommitBlockError);
+pub struct CommitCheckpointVerifiedError {
+    #[source]
+    inner: CommitBlockError,
+    vct_failure: Option<VctCommitFailure>,
+}
+
+/// Exact VCT verification input implicated by a failed checkpoint commit.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VctCommitFailure {
+    /// A direct current-root check or fold failed.
+    CurrentRoots,
+    /// The successor boundary rejected the candidate containing the current roots.
+    SuccessorBoundary,
+}
 
 impl CommitCheckpointVerifiedError {
     /// Returns the [`CommitBlockError`] describing why the commit failed.
     pub fn inner(&self) -> &CommitBlockError {
-        &self.0
+        &self.inner
     }
 
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&KnownBlock> {
-        self.0.duplicate_location()
+        self.inner.duplicate_location()
     }
 
     /// Returns the missing VCT supplied-root height for retryable root-fetch stalls.
     pub fn vct_supplied_root_unavailable_height(&self) -> Option<block::Height> {
-        self.0.vct_supplied_root_unavailable_height()
+        self.inner.vct_supplied_root_unavailable_height()
     }
 
     /// Returns the height for any retryable VCT root stall (absent/evicted root, or one
     /// not yet verifiable for lack of a stored successor header). See
     /// [`ValidateContextError::vct_retryable_height`].
     pub fn vct_retryable_height(&self) -> Option<block::Height> {
-        self.0.vct_retryable_height()
+        self.inner.vct_retryable_height()
+    }
+
+    pub(crate) fn with_vct_failure(mut self, failure: VctCommitFailure) -> Self {
+        self.vct_failure = Some(failure);
+        self
+    }
+
+    pub(crate) fn vct_failure(&self) -> Option<VctCommitFailure> {
+        self.vct_failure
+    }
+}
+
+impl From<CommitBlockError> for CommitCheckpointVerifiedError {
+    fn from(inner: CommitBlockError) -> Self {
+        Self {
+            inner,
+            vct_failure: None,
+        }
     }
 }
 
 impl From<ValidateContextError> for CommitCheckpointVerifiedError {
     fn from(value: ValidateContextError) -> Self {
-        Self(CommitBlockError::ValidateContextError(Box::new(value)))
+        CommitBlockError::ValidateContextError(Box::new(value)).into()
     }
 }
 
@@ -899,12 +930,20 @@ mod tests {
     #[test]
     fn checkpoint_error_exposes_retryable_vct_root_height() {
         let height = Height(42);
-        let retryable: CommitCheckpointVerifiedError =
-            ValidateContextError::VctSuppliedRootUnavailable { height }.into();
+        let retryable =
+            CommitCheckpointVerifiedError::from(ValidateContextError::VctSuppliedRootUnavailable {
+                height,
+            })
+            .with_vct_failure(VctCommitFailure::SuccessorBoundary);
         assert_eq!(
             retryable.vct_supplied_root_unavailable_height(),
             Some(height),
             "checkpoint commit errors expose retryable VCT root misses"
+        );
+        assert_eq!(
+            retryable.vct_failure(),
+            Some(VctCommitFailure::SuccessorBoundary),
+            "checkpoint errors preserve the exact VCT verifier stage"
         );
 
         let non_retryable: CommitCheckpointVerifiedError =

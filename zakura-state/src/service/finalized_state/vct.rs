@@ -22,12 +22,13 @@ use zakura_chain::{
     parameters::{Network, NetworkUpgrade},
     sapling, sprout,
 };
-use zakura_header_chain::AuxDelivery;
+use zakura_header_chain::{AuxAuthentication, AuxDelivery};
 
 use super::{
     commitment_aux::{CommitmentRootSource, FinalFrontiers, PeerSource},
     ZakuraDb,
 };
+use crate::error::VctCommitFailure;
 
 /// A VCT successor header used to authenticate the current block's supplied
 /// note-commitment roots.
@@ -95,6 +96,19 @@ pub(crate) struct VctAuxWindow {
     pub(crate) successor: Option<NextVctBlock>,
 }
 
+/// Exact metadata deliveries implicated by a failed VCT verification.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VctAuxRejection {
+    /// Only the current roots are proven bad.
+    Current,
+    /// Only the successor auth-data root is proven bad.
+    Successor,
+    /// Either of two unauthenticated deliveries may have caused the boundary mismatch.
+    Ambiguous,
+    /// No mutable metadata delivery can be blamed safely.
+    None,
+}
+
 impl VctAuxWindow {
     /// Return the exact current roots when the delivery still agrees with the block.
     pub(crate) fn current_roots(
@@ -112,6 +126,48 @@ impl VctAuxWindow {
             aux.orchard_root,
             aux.ironwood_root,
         ))
+    }
+
+    /// Attribute a verifier failure without weakening already authenticated evidence.
+    pub(crate) fn classify_failure(&self, failure: VctCommitFailure) -> VctAuxRejection {
+        classify_vct_aux_failure(
+            self.current,
+            self.successor
+                .as_ref()
+                .and_then(|successor| successor.delivery),
+            failure,
+        )
+    }
+}
+
+fn classify_vct_aux_failure(
+    current: AuxDelivery,
+    successor: Option<AuxDelivery>,
+    failure: VctCommitFailure,
+) -> VctAuxRejection {
+    let current_unauthenticated = current.authentication == AuxAuthentication::Unauthenticated;
+    if failure == VctCommitFailure::CurrentRoots {
+        return if current_unauthenticated {
+            VctAuxRejection::Current
+        } else {
+            VctAuxRejection::None
+        };
+    }
+
+    let Some(successor) = successor else {
+        return if current_unauthenticated {
+            VctAuxRejection::Current
+        } else {
+            VctAuxRejection::None
+        };
+    };
+    let successor_unauthenticated = successor.authentication == AuxAuthentication::Unauthenticated;
+
+    match (current_unauthenticated, successor_unauthenticated) {
+        (true, true) => VctAuxRejection::Ambiguous,
+        (true, false) => VctAuxRejection::Current,
+        (false, true) => VctAuxRejection::Successor,
+        (false, false) => VctAuxRejection::None,
     }
 }
 
@@ -610,12 +666,87 @@ fn final_frontiers_bytes(height: block::Height, trees: &NoteCommitmentTrees) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::{io::Write, num::NonZeroU64};
 
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    fn aux_delivery(byte: u8, authentication: AuxAuthentication) -> AuxDelivery {
+        AuxDelivery {
+            delivery_id: zakura_header_chain::EvidenceId::from_digest([byte; 32]),
+            header_hash: block::Hash([byte; 32]),
+            source: zakura_header_chain::SourceId::from_digest([byte; 32]),
+            owner: zakura_header_chain::WorkOwner {
+                state_version: zakura_header_chain::StateVersion::new(1),
+                header_generation: zakura_header_chain::HeaderGeneration::new(2),
+                verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(3)),
+                branch: zakura_header_chain::BranchId::new(
+                    block::Hash([4; 32]),
+                    block::Hash([5; 32]),
+                ),
+                session_id: 6,
+                request_id: NonZeroU64::new(7).expect("seven is nonzero"),
+            },
+            body_size: zakura_header_chain::BodySizeHint::Unknown,
+            tree_aux: None,
+            authentication,
+        }
+    }
+
+    #[test]
+    fn vct_boundary_failure_attribution_never_weakens_authenticated_evidence() {
+        let unauthenticated = aux_delivery(1, AuxAuthentication::Unauthenticated);
+        let authenticated = aux_delivery(
+            2,
+            AuxAuthentication::Authenticated {
+                evidence: zakura_header_chain::EvidenceId::from_digest([3; 32]),
+                boundary_hash: block::Hash([4; 32]),
+            },
+        );
+
+        assert_eq!(
+            classify_vct_aux_failure(
+                unauthenticated,
+                Some(authenticated),
+                VctCommitFailure::SuccessorBoundary,
+            ),
+            VctAuxRejection::Current,
+        );
+        assert_eq!(
+            classify_vct_aux_failure(
+                authenticated,
+                Some(unauthenticated),
+                VctCommitFailure::SuccessorBoundary,
+            ),
+            VctAuxRejection::Successor,
+        );
+        assert_eq!(
+            classify_vct_aux_failure(
+                unauthenticated,
+                Some(unauthenticated),
+                VctCommitFailure::SuccessorBoundary,
+            ),
+            VctAuxRejection::Ambiguous,
+        );
+        assert_eq!(
+            classify_vct_aux_failure(
+                authenticated,
+                Some(authenticated),
+                VctCommitFailure::SuccessorBoundary,
+            ),
+            VctAuxRejection::None,
+        );
+        assert_eq!(
+            classify_vct_aux_failure(
+                unauthenticated,
+                Some(authenticated),
+                VctCommitFailure::CurrentRoots,
+            ),
+            VctAuxRejection::Current,
+        );
+    }
 
     /// The tracked provenance record for the embedded Mainnet frontier.
     const MAINNET_FRONTIER_PROVENANCE: &[u8] = include_bytes!("vct/mainnet-frontier.json");

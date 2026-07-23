@@ -111,11 +111,11 @@ pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
     MAX_ON_DISK_HEIGHT,
 };
-pub(crate) use vct::VctAuxWindow;
 pub use vct::{
     generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
     GeneratorError, NextVctBlock,
 };
+pub(crate) use vct::{VctAuxRejection, VctAuxWindow};
 pub use zakura_db::commitment_roots_db::COMMITMENT_ROOTS_BY_HEIGHT;
 pub use zakura_db::ZakuraDb;
 
@@ -1021,10 +1021,22 @@ impl FinalizedState {
                                         error,
                                         ..
                                     } => error.into(),
-                                    commitment_aux_verify::CommitmentRootVerificationError::SuppliedRoot {
+                                    commitment_aux_verify::CommitmentRootVerificationError::CurrentRoots {
                                         error,
                                         ..
-                                    } => self.vct_reject_supplied_root(height, error),
+                                    } => self.vct_reject_supplied_root(
+                                        height,
+                                        error,
+                                        crate::error::VctCommitFailure::CurrentRoots,
+                                    ),
+                                    commitment_aux_verify::CommitmentRootVerificationError::SuccessorBoundary {
+                                        error,
+                                        ..
+                                    } => self.vct_reject_supplied_root(
+                                        height,
+                                        error,
+                                        crate::error::VctCommitFailure::SuccessorBoundary,
+                                    ),
                                 }
                             })?;
 
@@ -1405,6 +1417,7 @@ impl FinalizedState {
             return Err(self.vct_reject_supplied_root(
                 height,
                 ValidateContextError::VctSuppliedRootUnavailable { height },
+                crate::error::VctCommitFailure::CurrentRoots,
             ));
         }
 
@@ -1426,6 +1439,7 @@ impl FinalizedState {
         &self,
         height: block::Height,
         error: ValidateContextError,
+        failure: crate::error::VctCommitFailure,
     ) -> CommitCheckpointVerifiedError {
         if let Some(v) = self.vct.source() {
             v.invalidate_fast_root(height);
@@ -1436,7 +1450,10 @@ impl FinalizedState {
             ?error,
             "VCT: supplied commitment root failed verification; evicted so it is never re-read"
         );
-        ValidateContextError::VctSuppliedRootUnavailable { height }.into()
+        CommitCheckpointVerifiedError::from(ValidateContextError::VctSuppliedRootUnavailable {
+            height,
+        })
+        .with_vct_failure(failure)
     }
 
     /// Test-only: enable fast mode reading roots/frontiers from an arbitrary

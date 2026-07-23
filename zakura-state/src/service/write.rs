@@ -38,7 +38,7 @@ use crate::{
                 migration::{initialize_header_chain_reconciled, HeaderChainInitializationError},
                 HeaderChainReader, HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError,
             },
-            DiskWriteBatch, FinalizedState, NextVctBlock, VctAuxWindow, ZakuraDb,
+            DiskWriteBatch, FinalizedState, NextVctBlock, VctAuxRejection, VctAuxWindow, ZakuraDb,
         },
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
@@ -1118,6 +1118,7 @@ impl WriteBlockWorkerTask {
             // validated header, so this check does not require the successor body.
             let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
             let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
+            let vct_aux_for_outcome = vct_aux_window.clone();
 
             // Try committing the block
             match finalized_state.commit_finalized_with_aux(
@@ -1143,6 +1144,27 @@ impl WriteBlockWorkerTask {
                     chain_tip_sender.set_finalized_tip(tip_block);
                 }
                 Err((ordered_block, error)) => {
+                    if let (Some(window), Some(failure)) =
+                        (vct_aux_for_outcome.as_ref(), error.vct_failure())
+                    {
+                        let attribution = match window.classify_failure(failure) {
+                            VctAuxRejection::Current => "current",
+                            VctAuxRejection::Successor => "successor",
+                            VctAuxRejection::Ambiguous => "ambiguous",
+                            VctAuxRejection::None => "none",
+                        };
+                        metrics::counter!(
+                            "state.vct.aux.verification_failure.count",
+                            "attribution" => attribution
+                        )
+                        .increment(1);
+                        tracing::warn!(
+                            ?failure,
+                            attribution,
+                            "VCT: classified exact auxiliary verification failure"
+                        );
+                    }
+
                     // Retryable VCT root stalls (an absent/evicted root, or one not yet
                     // verifiable for lack of a stored successor header) park-and-retry the same
                     // block in place rather than resetting the queue. An absent root can only

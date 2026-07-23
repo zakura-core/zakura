@@ -634,12 +634,18 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-ERR-01"
 name = "Error-category preservation"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::HeaderSyncReactor::handle_typed_failure"
+tests = ["PW-04::driver_preserves_every_header_preparation_failure_category", "PW-04::oversized_body_hint_is_malformed_metadata_not_an_invalid_header", "PW-04::taxonomy_has_stable_exhaustive_metric_and_attribution_labels", "PW-04::typed_taxonomy_scores_only_exact_attributed_header_peer_faults", "PW-04::wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable", "PW-04::unsolicited_and_mismatched_responses_are_protocol_rejected"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-ERR-02"
 name = "Peer-fault boundary"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainError::is_automatic_header_peer_fault"
+tests = ["PW-04::only_malformed_protocol_and_invalid_header_default_to_header_peer_fault", "PW-04::typed_taxonomy_scores_only_exact_attributed_header_peer_faults", "PW-04::wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable", "PW-04::oversized_body_hint_is_malformed_metadata_not_an_invalid_header", "IN-07::stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or_score"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-AUX-01"

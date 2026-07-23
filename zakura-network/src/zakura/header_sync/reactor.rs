@@ -2404,13 +2404,23 @@ impl HeaderSyncReactor {
         None
     }
 
+    /// Prefer authenticating the next root-auth frontier from a retained payload.
+    ///
+    /// After a successful forward commit that carried tree-aux roots, the reactor
+    /// may keep that exact peer payload in `retained_roots`. When the authenticated
+    /// tip advances to the height just before that payload, reuse it here instead of
+    /// scheduling a fresh peer fetch (the buffered/fallback root-auth path).
+    ///
+    /// Returns `true` only after an `AuthenticateHeaderRoots` action was admitted.
     fn try_start_retained_root_authentication(&mut self) -> bool {
+        // Wait for the frontier watch to catch up before launching another auth.
         if self.state.root_auth_waiting_for_watch {
             return false;
         }
         let Some(auth) = self.state.header_root_auth else {
             return false;
         };
+        // Root auth is serial: one in-flight AuthenticateRoots at a time.
         if self
             .state
             .pending_operations
@@ -2419,11 +2429,13 @@ impl HeaderSyncReactor {
         {
             return false;
         }
-        let handoff = self.startup.network.checkpoint_list().max_height();
+        let last_checkpoint_height = self.startup.network.checkpoint_list().max_height();
+        // Need a retained batch that starts at authenticated_height+1, is ready to
+        // retry, and still fits under the completed-checkpoint / handoff ceilings.
         let Some((start, retained)) = self.state.retained_ready(auth, Instant::now()) else {
             return false;
         };
-        let Some(range) = retained_root_auth_range(auth, &retained.payload, handoff) else {
+        let Some(range) = retained_root_auth_range(auth, &retained.payload, last_checkpoint_height) else {
             return false;
         };
         let wire_request = retained.wire_request.clone();
@@ -2439,6 +2451,7 @@ impl HeaderSyncReactor {
             payload,
         };
         if !self.dispatch_action(action) {
+            // Channel backpressure: brief delay, then schedule() will retry.
             if let Some(retained) = self.state.retained_roots.get_mut(&start) {
                 retained.retry_at = Some(Instant::now() + Duration::from_millis(100));
             }

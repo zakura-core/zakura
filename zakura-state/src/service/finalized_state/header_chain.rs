@@ -52,6 +52,9 @@ use super::{
 const METADATA_KEY: &[u8] = b"";
 const RETAINED_PATH_LEASE_IDLE: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+#[path = "header_chain/coherence.rs"]
+mod coherence;
 #[cfg(any(test, feature = "header-fuzz"))]
 mod fuzz;
 pub(in crate::service) mod migration;

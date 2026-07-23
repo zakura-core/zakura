@@ -435,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn every_repair_phase_is_retired_before_new_generation_work() {
+    fn aud_09_every_repair_phase_retires_before_new_generation_work() {
         let snapshot = snapshot();
         let peer = SourceId::from_digest([8; 32]);
         let transition = EvidenceId::from_digest([9; 32]);
@@ -447,15 +447,29 @@ mod tests {
             RepairPhase::StateDispatched { transition },
         ];
         for phase in phases {
-            let mut task = task(&snapshot);
-            task.phase = phase;
+            let mut old_task = task(&snapshot);
+            old_task.phase = phase;
             let mut queue = VctRepairQueue::default();
-            assert_eq!(queue.insert(task.clone()), None);
+            assert_eq!(queue.insert(old_task.clone()), None);
             let mut changed = snapshot.clone();
             changed.state_version = StateVersion::new(4);
             changed.header_generation = HeaderGeneration::new(5);
-            assert_eq!(queue.retain_current(&changed), vec![task]);
+            changed.frontiers.header_best =
+                Frontier::new(changed.frontiers.header_best.height, hash(3));
+            assert_eq!(queue.retain_current(&changed), vec![old_task.clone()]);
             assert!(queue.is_empty(), "phase {phase:?} survived retirement");
+
+            let replacement = task(&changed);
+            assert_eq!(queue.insert(replacement.clone()), None);
+            assert_eq!(
+                queue.scheduled(),
+                Some(&replacement),
+                "new exact-branch repair schedules only after old phase retirement"
+            );
+            assert!(
+                queue.get(old_task.owner).is_none(),
+                "old phase ownership cannot alias replacement work"
+            );
         }
     }
 }

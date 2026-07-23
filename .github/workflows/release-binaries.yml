@@ -15,6 +15,10 @@
 # docs/security-hotfix-release.md — builds and assembles a complete release
 # in that repo without publishing anything.
 #
+# The canonical repository uses Depot builders by default. Set the repository
+# variable RELEASE_BUILD_BACKEND to github for an immediate Buildx fallback.
+# Other repositories default to GitHub unless they opt into Depot explicitly.
+#
 # The tag must match the `zakura` package version: release binaries are built
 # in Docker without `.git`, so `zakurad --version` reports CARGO_PKG_VERSION,
 # and a tag pushed without bumping the package version ships binaries that
@@ -48,12 +52,12 @@ on:
         type: boolean
         default: false
       build_backend:
-        description: "Docker build backend"
+        description: "Docker build backend override (defaults by repository)"
         required: false
         type: string
-        default: github
+        default: ""
       depot_project_id:
-        description: "Depot project used when build_backend is depot"
+        description: "Depot project override used when build_backend is depot"
         required: false
         type: string
         default: ""
@@ -73,18 +77,19 @@ on:
         type: boolean
         default: false
       build_backend:
-        description: "Docker build backend used by a dry run"
+        description: "Docker build backend (auto uses the repository default)"
         required: false
         type: choice
         options:
+          - auto
           - github
           - depot
-        default: github
+        default: auto
       depot_project_id:
-        description: "Depot project used when build_backend is depot"
+        description: "Depot project override (leave empty for repository default)"
         required: false
         type: string
-        default: gjcfbjk8wc
+        default: ""
       publish_assets_to_release:
         description: "Upload zakurad assets to the GitHub release tag (use to repair an existing release)"
         required: false
@@ -112,6 +117,8 @@ jobs:
       release_tag: ${{ steps.resolve.outputs.release_tag }}
       checkout_ref: ${{ steps.resolve.outputs.checkout_ref }}
       assets_published: ${{ steps.resolve.outputs.assets_published }}
+      build_backend: ${{ steps.resolve.outputs.build_backend }}
+      depot_project_id: ${{ steps.resolve.outputs.depot_project_id }}
     steps:
       - name: Resolve release tag
         id: resolve
@@ -121,8 +128,10 @@ jobs:
           INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
           INPUT_CHECKOUT_REF: ${{ inputs.checkout_ref }}
           DRY_RUN: ${{ inputs.dry_run }}
-          BUILD_BACKEND: ${{ inputs.build_backend }}
-          DEPOT_PROJECT_ID: ${{ inputs.depot_project_id }}
+          INPUT_BUILD_BACKEND: ${{ inputs.build_backend }}
+          INPUT_DEPOT_PROJECT_ID: ${{ inputs.depot_project_id }}
+          DEFAULT_BUILD_BACKEND: ${{ vars.RELEASE_BUILD_BACKEND || (github.repository == 'zakura-core/zakura' && 'depot' || 'github') }}
+          DEFAULT_DEPOT_PROJECT_ID: ${{ vars.DEPOT_PROJECT_ID || (github.repository == 'zakura-core/zakura' && 'gjcfbjk8wc' || '') }}
           STAGE_RELEASE_ASSETS: ${{ inputs.stage_release_assets }}
           GITHUB_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
@@ -157,15 +166,16 @@ jobs:
             exit 1
           fi
 
-          build_backend="${BUILD_BACKEND:-github}"
+          if [ -n "$INPUT_BUILD_BACKEND" ] && [ "$INPUT_BUILD_BACKEND" != "auto" ]; then
+            build_backend="$INPUT_BUILD_BACKEND"
+          else
+            build_backend="$DEFAULT_BUILD_BACKEND"
+          fi
+          depot_project_id="${INPUT_DEPOT_PROJECT_ID:-$DEFAULT_DEPOT_PROJECT_ID}"
           case "$build_backend" in
             github) ;;
             depot)
-              if [ "$DRY_RUN" != "true" ]; then
-                echo "The Depot backend is restricted to dry-run mode." >&2
-                exit 1
-              fi
-              if [ -z "$DEPOT_PROJECT_ID" ]; then
+              if [ -z "$depot_project_id" ]; then
                 echo "A Depot project ID is required for the Depot backend." >&2
                 exit 1
               fi
@@ -175,9 +185,6 @@ jobs:
               exit 1
               ;;
           esac
-
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
-          echo "checkout_ref=$checkout_ref" >> "$GITHUB_OUTPUT"
 
           assets_published=false
           # A tag created by create-release.yml already has its complete asset
@@ -211,7 +218,13 @@ jobs:
               fi
             done
           fi
-          echo "assets_published=$assets_published" >> "$GITHUB_OUTPUT"
+          {
+            echo "release_tag=$release_tag"
+            echo "checkout_ref=$checkout_ref"
+            echo "build_backend=$build_backend"
+            echo "depot_project_id=$depot_project_id"
+            echo "assets_published=$assets_published"
+          } >> "$GITHUB_OUTPUT"
 
   check-release-version:
     name: Check release tag matches package version
@@ -266,11 +279,11 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            runner: ${{ inputs.dry_run && 'ubuntu-latest' || vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
+            runner: ${{ needs.resolve-release.outputs.build_backend == 'depot' && 'ubuntu-latest' || vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
             platform: linux/amd64
             target_triple: x86_64-unknown-linux-gnu
           - name: linux-aarch64
-            runner: ${{ inputs.dry_run && 'ubuntu-24.04-arm' || vars.DOCKER_BUILD_RUNNER_ARM64 || 'ubuntu-24.04-arm' }}
+            runner: ${{ needs.resolve-release.outputs.build_backend == 'depot' && 'ubuntu-24.04-arm' || vars.DOCKER_BUILD_RUNNER_ARM64 || 'ubuntu-24.04-arm' }}
             platform: linux/arm64
             target_triple: aarch64-unknown-linux-gnu
     steps:
@@ -280,17 +293,17 @@ jobs:
           ref: ${{ needs.resolve-release.outputs.checkout_ref }}
 
       - name: Set up Docker Buildx
-        if: ${{ inputs.build_backend != 'depot' }}
+        if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c #v4.0.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
 
       - name: Set up Depot Buildx
-        if: ${{ inputs.build_backend == 'depot' }}
+        if: ${{ needs.resolve-release.outputs.build_backend == 'depot' }}
         uses: depot/use-action@9bda29f1fc3163c06fc15f375887a341096a5639 # v1
         with:
-          project: ${{ inputs.depot_project_id }}
+          project: ${{ needs.resolve-release.outputs.depot_project_id }}
           version: 2.101.75
 
       - name: Build release binary
@@ -553,11 +566,11 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            runner: ${{ inputs.dry_run && 'ubuntu-latest' || vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
+            runner: ${{ needs.resolve-release.outputs.build_backend == 'depot' && 'ubuntu-latest' || vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
             platform: linux/amd64
             docker_tag_suffix: amd64
           - name: linux-aarch64
-            runner: ${{ inputs.dry_run && 'ubuntu-24.04-arm' || vars.DOCKER_BUILD_RUNNER_ARM64 || 'ubuntu-24.04-arm' }}
+            runner: ${{ needs.resolve-release.outputs.build_backend == 'depot' && 'ubuntu-24.04-arm' || vars.DOCKER_BUILD_RUNNER_ARM64 || 'ubuntu-24.04-arm' }}
             platform: linux/arm64
             docker_tag_suffix: arm64
     steps:
@@ -567,17 +580,17 @@ jobs:
           ref: ${{ needs.resolve-release.outputs.checkout_ref }}
 
       - name: Set up Docker Buildx
-        if: ${{ inputs.build_backend != 'depot' }}
+        if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c #v4.0.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
 
       - name: Set up Depot Buildx
-        if: ${{ inputs.build_backend == 'depot' }}
+        if: ${{ needs.resolve-release.outputs.build_backend == 'depot' }}
         uses: depot/use-action@9bda29f1fc3163c06fc15f375887a341096a5639 # v1
         with:
-          project: ${{ inputs.depot_project_id }}
+          project: ${{ needs.resolve-release.outputs.depot_project_id }}
           version: 2.101.75
 
       # Repo guard: only the canonical repository publishes to Docker Hub.
@@ -699,7 +712,7 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            runner: ${{ inputs.dry_run && 'ubuntu-latest' || vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
+            runner: ${{ needs.resolve-release.outputs.build_backend == 'depot' && 'ubuntu-latest' || vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
             platform: linux/amd64
             docker_tag_suffix: amd64
     steps:
@@ -709,17 +722,17 @@ jobs:
           ref: ${{ needs.resolve-release.outputs.checkout_ref }}
 
       - name: Set up Docker Buildx
-        if: ${{ inputs.build_backend != 'depot' }}
+        if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c #v4.0.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
 
       - name: Set up Depot Buildx
-        if: ${{ inputs.build_backend == 'depot' }}
+        if: ${{ needs.resolve-release.outputs.build_backend == 'depot' }}
         uses: depot/use-action@9bda29f1fc3163c06fc15f375887a341096a5639 # v1
         with:
-          project: ${{ inputs.depot_project_id }}
+          project: ${{ needs.resolve-release.outputs.depot_project_id }}
           version: 2.101.75
 
       # Repo guard: only the canonical repository publishes to Docker Hub.

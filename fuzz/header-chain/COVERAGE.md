@@ -43,7 +43,7 @@ the remaining gap. Fuzzer reachability alone is not requirement coverage.
 | --- | --- | --- | --- | --- |
 | `header_codec` | Sole codec and four fixed discriminants | LC-SCOPE-09, LC-WIRE-01, LC-WIRE-06 | golden/truncation/discriminant corpus | Covered |
 | `recovery_rows` | Twelve RocksDB families and startup audit | LC-RECOVER-01..03, LC-TXN-01 | row mutation, migration, and refutation seeds | Covered for bounded mutations and mode transitions |
-| State-writer crash harness | `FaultPoint::ALL` and `FaultPoint::NO_CHANGE` durable/memory/publication handoffs | LC-TXN-01, LC-FRONTIER-04, LC-RECOVER-02 | durable AUD-14 | Partial: body-state, no-change, requester insertion, and authenticated finality/history/pruning shapes with paired full-state batches are covered; remaining transition variants and cross-process response/reactor boundaries remain open |
+| State-writer crash harness | `FaultPoint::ALL` and `FaultPoint::NO_CHANGE` durable/memory/publication handoffs | LC-TXN-01, LC-FRONTIER-04, LC-RECOVER-02 | durable AUD-14 | Partial: body-state, no-change, requester insertion, authenticated finality/history/pruning, and reversible operator invalidation/reconsideration shapes with paired full-state batches are covered; remaining transition variants and cross-process response/reactor boundaries remain open |
 | Header/full-state differential | Combined full-state/header writer before finalization | LC-PARITY-01..03, LC-SELECT-01..03 | `df_01_body_valid_fork_graph_matches_full_state_before_finalization` | Partial: both production network configurations compare body-valid fork work, equal-work raw-hash order, and selected tips; direct observable-header acceptance vectors and activation-boundary graph generation remain open |
 
 ## Named audit status

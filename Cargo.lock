@@ -8793,7 +8793,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "bech32",
  "bitflags 2.13.0",
@@ -8926,7 +8926,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -9076,7 +9076,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "bincode",
  "chrono",

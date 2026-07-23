@@ -586,7 +586,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-AVAIL-01"
 name = "Body acquisition retries"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::BodyRetryEpisode::record_failure"
+tests = ["IN-03::exact_backoff_caps_then_alarms_and_probes_every_ten_minutes", "IN-03::jitter_and_final_delay_are_clamped_and_a_new_supplier_starts_a_fresh_episode", "IN-03::seeded_jitter_is_reproducible_and_within_the_normative_bound", "IN-03::body_retry_backoff_is_exact_and_supplier_local", "IN-03::reactor_retries_unavailable_body_without_scoring_its_supplier", "DG-02::body_availability_does_not_override_header_work_or_mark_other_bodies"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-AVAIL-02"

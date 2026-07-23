@@ -393,3 +393,14 @@ This file is the sole reporting channel (design D5). Entry template:
   origin/main (anchors, syntax, idempotency, gate message intact). NOT
   applied to s3 mid-run (rewriting a running script corrupts it; s3's master
   is cached so it never downloads again). Future droplets get it at provision.
+
+### settle1 landed cold — second settling pass (2026-07-23 ~04:15Z)
+
+- settle1 (k=1, both legs c3b26d24): 84.45 -> 94.86 post-commit blk/s,
+  ascending and 12% apart — the cohort warm-up curve after the serves idled
+  through the download outage, not a regression (same SHA measured 105.26/
+  105.17 yesterday once settled). Per the steady protocol the k=8
+  confirmation must wait for two agreeing k=1 legs.
+- settle2 started back-to-back, same pinned SHA (binary cached, no build).
+  Batch 3: settle1 = 6 of 8, settle2 will be 7, exp002-k8-c 8 — boundary
+  lands exactly on the confirmation.

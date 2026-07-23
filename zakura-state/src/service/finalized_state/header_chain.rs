@@ -149,6 +149,7 @@ pub struct Publisher {
 
 impl Publisher {
     fn new(snapshot: EngineSnapshot) -> Self {
+        record_published_snapshot(&snapshot);
         let (sender, _) = watch::channel(snapshot);
         Self {
             sender,
@@ -176,6 +177,7 @@ impl Publisher {
     }
 
     fn publish(&self, snapshot: EngineSnapshot) {
+        record_published_snapshot(&snapshot);
         self.sender.send_replace(snapshot.clone());
         self.mirrors
             .lock()
@@ -189,6 +191,63 @@ impl Publisher {
                 }
             });
     }
+}
+
+fn record_published_snapshot(snapshot: &EngineSnapshot) {
+    metrics::gauge!("sync.header_chain.frontier.finalized_height")
+        .set(f64::from(snapshot.frontiers.finalized.height.0));
+    metrics::gauge!("sync.header_chain.frontier.header_best_height")
+        .set(f64::from(snapshot.frontiers.header_best.height.0));
+    metrics::gauge!("sync.header_chain.frontier.verified_best_height")
+        .set(f64::from(snapshot.frontiers.verified_best.height.0));
+    metrics::gauge!("sync.header_chain.frontier.divergence").set(f64::from(
+        snapshot
+            .frontiers
+            .header_best
+            .height
+            .0
+            .saturating_sub(snapshot.frontiers.verified_best.height.0),
+    ));
+    // Metric gauges are approximate floating-point telemetry; the durable counters remain exact.
+    metrics::gauge!("sync.header_chain.generation.header")
+        .set(snapshot.header_generation.get() as f64);
+    // Metric gauges are approximate floating-point telemetry; the durable counters remain exact.
+    metrics::gauge!("sync.header_chain.generation.verified")
+        .set(snapshot.verified_generation.get() as f64);
+    metrics::gauge!("sync.header_chain.alarm.resource_stalled").set(
+        if snapshot.alarms.resource_stalled {
+            1.0
+        } else {
+            0.0
+        },
+    );
+    metrics::gauge!("sync.header_chain.alarm.migrated_pin_refuted").set(
+        if snapshot.alarms.migrated_pin_refuted.is_some() {
+            1.0
+        } else {
+            0.0
+        },
+    );
+
+    tracing::info!(
+        mode = ?snapshot.mode,
+        state_version = snapshot.state_version.get(),
+        header_generation = snapshot.header_generation.get(),
+        verified_generation = snapshot.verified_generation.get(),
+        finalized_height = snapshot.frontiers.finalized.height.0,
+        finalized_hash = ?snapshot.frontiers.finalized.hash,
+        header_best_height = snapshot.frontiers.header_best.height.0,
+        header_best_hash = ?snapshot.frontiers.header_best.hash,
+        verified_best_height = snapshot.frontiers.verified_best.height.0,
+        verified_best_hash = ?snapshot.frontiers.verified_best.hash,
+        resource_stalled = snapshot.alarms.resource_stalled,
+        body_unavailable = snapshot
+            .alarms
+            .header_best_body_unavailable
+            .is_some_and(|alarm| alarm.alarmed),
+        migrated_pin_refuted = ?snapshot.alarms.migrated_pin_refuted,
+        "published committed Zakura header-chain snapshot"
+    );
 }
 
 /// An audited durable store paired with its only production publisher.

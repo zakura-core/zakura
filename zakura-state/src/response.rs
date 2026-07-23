@@ -465,6 +465,9 @@ pub enum ReadResponse {
     /// The response to a `FindBlockHeaders` request.
     BlockHeaders(Vec<block::CountedHeader>),
 
+    /// Response to [`ReadRequest::HeaderChainSnapshot`], absent before semantic handoff.
+    HeaderChainSnapshot(Option<zakura_header_chain::EngineSnapshot>),
+
     /// Response to [`ReadRequest::HeaderLocator`], absent before semantic handoff.
     HeaderLocator(Option<zakura_header_chain::HeaderLocator>),
 
@@ -684,6 +687,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::AddressesTransactionIds(_)
             | ReadResponse::AddressUtxos(_)
             | ReadResponse::ChainInfo(_)
+            | ReadResponse::HeaderChainSnapshot(_)
             | ReadResponse::HeaderLocator(_)
             | ReadResponse::HeaderValidationLease(_)
             | ReadResponse::VctRepairContext(_)

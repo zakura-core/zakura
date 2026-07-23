@@ -6,6 +6,15 @@ use tokio::time::Instant;
 use zakura_chain::block;
 use zakura_header_chain::{AuxDelivery, Frontier, HeaderGeneration, HeaderNode, SourceId};
 
+pub use zakura_header_chain::{
+    AlarmSet as HeaderChainAlarmSet, BodyUnavailableSummary as HeaderChainBodyUnavailableSummary,
+    ChainScore as HeaderChainScore, EngineMode as HeaderChainMode,
+    EngineSnapshot as HeaderChainSnapshot, Frontier as HeaderChainFrontier,
+    FrontierSet as HeaderChainFrontierSet, HeaderGeneration as HeaderChainGeneration,
+    StateVersion as HeaderChainStateVersion, SuffixWork as HeaderChainSuffixWork,
+    VerifiedGeneration as HeaderChainVerifiedGeneration,
+};
+
 /// Maximum simultaneous retained target-path leases.
 pub const MAX_RETAINED_PATH_LEASES: usize = zakura_header_chain::MAX_STAGED_TARGETS_V1;
 

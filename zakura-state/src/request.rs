@@ -1447,6 +1447,9 @@ pub enum ReadRequest {
         stop: Option<block::Hash>,
     },
 
+    /// Returns the latest atomic committed header-engine snapshot after semantic handoff.
+    HeaderChainSnapshot,
+
     /// Returns the exact committed selected-header locator after semantic handoff.
     HeaderLocator,
 
@@ -1746,6 +1749,7 @@ impl ReadRequest {
             ReadRequest::BlockLocator => "block_locator",
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
+            ReadRequest::HeaderChainSnapshot => "header_chain_snapshot",
             ReadRequest::HeaderLocator => "header_locator",
             ReadRequest::HeaderValidationLease { .. } => "header_validation_lease",
             ReadRequest::VctRepairContext { .. } => "vct_repair_context",

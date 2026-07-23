@@ -1018,13 +1018,20 @@ where
         let debug_force_finished_sync = self.debug_force_finished_sync;
         let network = &self.network;
 
-        let (usage_info_rsp, is_pruned_rsp, tip_pool_values_rsp, chain_tip_difficulty) = {
+        let (
+            usage_info_rsp,
+            is_pruned_rsp,
+            tip_pool_values_rsp,
+            header_chain_snapshot_rsp,
+            chain_tip_difficulty,
+        ) = {
             use zakura_state::ReadRequest::*;
             let state_call = |request| self.read_state.clone().oneshot(request);
             tokio::join!(
                 state_call(UsageInfo),
                 state_call(IsPruned),
                 state_call(TipPoolValues),
+                state_call(HeaderChainSnapshot),
                 chain_tip_difficulty(network.clone(), self.read_state.clone(), true)
             )
         };
@@ -1057,6 +1064,16 @@ where
         };
 
         let now = Utc::now();
+        let header_chain_snapshot = match header_chain_snapshot_rsp.map_misc_error()? {
+            ReadResponse::HeaderChainSnapshot(snapshot) => snapshot,
+            _ => unreachable!("unmatched response to a HeaderChainSnapshot request"),
+        };
+        let header_chain = header_chain_snapshot
+            .clone()
+            .map(|snapshot| HeaderChainInfo::from_snapshot(snapshot, now));
+        let header_height = header_chain_snapshot
+            .as_ref()
+            .map_or(tip_height, |snapshot| snapshot.frontiers.header_best.height);
         let (estimated_height, verification_progress) = self
             .latest_chain_tip
             .best_tip_height_and_block_time()
@@ -1137,7 +1154,7 @@ where
             value_pools: GetBlockchainInfoBalance::value_pools(value_balance, None),
             upgrades,
             consensus,
-            headers: tip_height,
+            headers: header_height,
             difficulty,
             verification_progress,
             // TODO: store work in the finalized state for each height (#7109)
@@ -1146,6 +1163,7 @@ where
             size_on_disk,
             // TODO: Investigate whether this needs to be implemented (it's sprout-only in zcashd)
             commitments: 0,
+            header_chain,
         };
 
         Ok(response)
@@ -3574,6 +3592,130 @@ pub struct GetBlockchainInfoResponse {
     /// Branch IDs of the current and upcoming consensus rules
     #[getter(copy)]
     consensus: TipConsensusBranch,
+
+    /// Zakura's authoritative header-chain state after semantic handoff.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    header_chain: Option<HeaderChainInfo>,
+}
+
+/// One hash-qualified frontier in the authoritative header-chain state.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+pub struct HeaderChainFrontierInfo {
+    /// Exact frontier height.
+    #[getter(copy)]
+    height: Height,
+    /// Exact frontier hash.
+    #[serde(with = "hex")]
+    #[getter(copy)]
+    hash: block::Hash,
+}
+
+/// Persistent selected-tip body-unavailability alarm details.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+pub struct HeaderChainBodyUnavailableInfo {
+    /// Exact selected header whose body is unavailable.
+    #[getter(copy)]
+    height: Height,
+    /// Exact selected header hash.
+    #[serde(with = "hex")]
+    #[getter(copy)]
+    hash: block::Hash,
+    /// Current retry episode age in seconds.
+    #[getter(copy)]
+    age_seconds: u64,
+    /// Failed deliveries in the current episode.
+    #[getter(copy)]
+    attempts: u32,
+    /// Currently known eligible body suppliers.
+    #[getter(copy)]
+    suppliers: u32,
+}
+
+/// Persistent alarms from the authoritative header-chain state.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+pub struct HeaderChainAlarmInfo {
+    /// Protected paths prevented resource-bound enforcement.
+    #[getter(copy)]
+    resource_stalled: bool,
+    /// The selected header exhausted its current body-supplier retry episode.
+    header_best_body_unavailable: Option<HeaderChainBodyUnavailableInfo>,
+    /// An imported headers-only trust pin was refuted by deterministic body validation.
+    migrated_pin_refuted: Option<HeaderChainFrontierInfo>,
+}
+
+/// User-facing view of the sole committed header-chain publisher.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+pub struct HeaderChainInfo {
+    /// `integrated` or `headers-only`.
+    mode: String,
+    /// Monotonic durable state version.
+    #[getter(copy)]
+    state_version: u64,
+    /// Best locally header-valid frontier; this is not a body-validity claim.
+    header_best: HeaderChainFrontierInfo,
+    /// Best fully body-verified frontier on the selected path.
+    verified_best: HeaderChainFrontierInfo,
+    /// Irreversible local finality frontier.
+    finalized: HeaderChainFrontierInfo,
+    /// Headers-only mode's irreversible local trust warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finality_warning: Option<String>,
+    /// Persistent engine alarms.
+    alarms: HeaderChainAlarmInfo,
+}
+
+impl From<zakura_state::HeaderChainFrontier> for HeaderChainFrontierInfo {
+    fn from(frontier: zakura_state::HeaderChainFrontier) -> Self {
+        Self {
+            height: frontier.height,
+            hash: frontier.hash,
+        }
+    }
+}
+
+impl HeaderChainInfo {
+    fn from_snapshot(
+        snapshot: zakura_state::HeaderChainSnapshot,
+        now: chrono::DateTime<Utc>,
+    ) -> Self {
+        let mode = match snapshot.mode {
+            zakura_state::HeaderChainMode::Integrated => "integrated",
+            zakura_state::HeaderChainMode::HeadersOnly => "headers-only",
+        };
+        let finality_warning = matches!(snapshot.mode, zakura_state::HeaderChainMode::HeadersOnly)
+            .then(|| {
+                "headers-only finality is an irreversible local trust decision made 1,000 headers behind header_best".to_string()
+            });
+        let header_best_body_unavailable = snapshot
+            .alarms
+            .header_best_body_unavailable
+            .filter(|summary| summary.alarmed)
+            .map(|summary| HeaderChainBodyUnavailableInfo {
+                height: snapshot.frontiers.header_best.height,
+                hash: snapshot.frontiers.header_best.hash,
+                age_seconds: u64::try_from(
+                    now.signed_duration_since(summary.started_at)
+                        .num_seconds()
+                        .max(0),
+                )
+                .unwrap_or(u64::MAX),
+                attempts: summary.attempts,
+                suppliers: summary.suppliers,
+            });
+        Self {
+            mode: mode.to_string(),
+            state_version: snapshot.state_version.get(),
+            header_best: snapshot.frontiers.header_best.into(),
+            verified_best: snapshot.frontiers.verified_best.into(),
+            finalized: snapshot.frontiers.finalized.into(),
+            finality_warning,
+            alarms: HeaderChainAlarmInfo {
+                resource_stalled: snapshot.alarms.resource_stalled,
+                header_best_body_unavailable,
+                migrated_pin_refuted: snapshot.alarms.migrated_pin_refuted.map(Into::into),
+            },
+        }
+    }
 }
 
 impl Default for GetBlockchainInfoResponse {
@@ -3597,6 +3739,7 @@ impl Default for GetBlockchainInfoResponse {
             pruned: false,
             size_on_disk: 0,
             commitments: 0,
+            header_chain: None,
         }
     }
 }
@@ -3639,6 +3782,7 @@ impl GetBlockchainInfoResponse {
             pruned,
             size_on_disk,
             commitments,
+            header_chain: None,
         }
     }
 }

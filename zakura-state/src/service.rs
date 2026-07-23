@@ -2113,6 +2113,10 @@ impl Service<ReadRequest> for ReadStateService {
                 ))
             }
 
+            ReadRequest::HeaderChainSnapshot => Ok(ReadResponse::HeaderChainSnapshot(
+                state.header_chain_snapshot_receiver.borrow().clone(),
+            )),
+
             ReadRequest::MissingBlockBodies { from, limit } => {
                 let verified_block_tip = read::tip_height(state.latest_best_chain(), &state.db);
                 let best_header_tip = state

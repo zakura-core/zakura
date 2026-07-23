@@ -407,6 +407,12 @@ proptest! {
                         .respond(Err(BoxError::from("no chain tip available yet")));
 
                     state
+                        .expect_request(zakura_state::ReadRequest::HeaderChainSnapshot)
+                        .await
+                        .expect("getblockchaininfo should read the authoritative header snapshot")
+                        .respond(zakura_state::ReadResponse::HeaderChainSnapshot(None));
+
+                    state
                         .expect_request(zakura_state::ReadRequest::ChainInfo)
                         .await
                         .expect("getblockchaininfo should call mock state service with correct request")
@@ -458,6 +464,29 @@ proptest! {
         let block_hash = block.hash();
         let expected_size_on_disk = 1_000;
         let expected_is_pruned = true;
+        let header_height = block_height.next().unwrap_or(block_height);
+        let header_hash = block::Hash([0xa5; 32]);
+        let header_frontier =
+            zakura_state::HeaderChainFrontier::new(header_height, header_hash);
+        let verified_frontier =
+            zakura_state::HeaderChainFrontier::new(block_height, block_hash);
+        let header_snapshot = zakura_state::HeaderChainSnapshot {
+            mode: zakura_state::HeaderChainMode::Integrated,
+            state_version: zakura_state::HeaderChainStateVersion::new(7),
+            header_generation: zakura_state::HeaderChainGeneration::new(8),
+            verified_generation: zakura_state::HeaderChainVerifiedGeneration::new(9),
+            frontiers: zakura_state::HeaderChainFrontierSet {
+                finalized: verified_frontier,
+                header_best: header_frontier,
+                verified_best: verified_frontier,
+            },
+            header_best_score: zakura_state::HeaderChainScore::new(
+                zakura_state::HeaderChainSuffixWork::zero(),
+                header_hash,
+            ),
+            oldest_retained_height: block_height,
+            alarms: zakura_state::HeaderChainAlarmSet::default(),
+        };
 
         // check no requests were made during this test
         runtime.block_on(async move {
@@ -488,6 +517,14 @@ proptest! {
                         });
 
                     state
+                        .expect_request(zakura_state::ReadRequest::HeaderChainSnapshot)
+                        .await
+                        .expect("getblockchaininfo should read the authoritative header snapshot")
+                        .respond(zakura_state::ReadResponse::HeaderChainSnapshot(Some(
+                            header_snapshot,
+                        )));
+
+                    state
                         .expect_request(zakura_state::ReadRequest::ChainInfo)
                         .await
                         .expect("getblockchaininfo should call mock state service with correct request")
@@ -511,6 +548,14 @@ proptest! {
                     prop_assert_eq!(info.chain, network.bip70_network_name());
                     prop_assert_eq!(info.blocks, block_height);
                     prop_assert_eq!(info.best_block_hash, block_hash);
+                    prop_assert_eq!(info.headers, header_height);
+                    prop_assert_eq!(
+                        info.header_chain
+                            .expect("the committed header snapshot is user-visible")
+                            .header_best
+                            .hash,
+                        header_hash
+                    );
                     prop_assert_eq!(info.size_on_disk, expected_size_on_disk);
                     prop_assert_eq!(info.pruned, expected_is_pruned);
                     prop_assert!(info.estimated_height < Height::MAX);
@@ -598,6 +643,12 @@ proptest! {
                     .await
                     .expect("getblockchaininfo should call mock state service with correct request")
                     .respond(Err(BoxError::from("tip values not available")));
+
+                state
+                    .expect_request(zakura_state::ReadRequest::HeaderChainSnapshot)
+                    .await
+                    .expect("getblockchaininfo should read the authoritative header snapshot")
+                    .respond(zakura_state::ReadResponse::HeaderChainSnapshot(None));
 
                 state
                     .expect_request(zakura_state::ReadRequest::ChainInfo)

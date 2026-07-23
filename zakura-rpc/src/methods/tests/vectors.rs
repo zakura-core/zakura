@@ -51,6 +51,124 @@ use super::super::*;
 use config::mining;
 use types::long_poll::LONG_POLL_ID_LENGTH;
 
+#[test]
+fn header_chain_info_exposes_mode_frontiers_and_persistent_alarms() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+        .expect("the fixed time is valid")
+        .with_timezone(&chrono::Utc);
+    let finalized = zakura_state::HeaderChainFrontier::new(Height(10), Hash([0x10; 32]));
+    let verified = zakura_state::HeaderChainFrontier::new(Height(12), Hash([0x12; 32]));
+    let header_best = zakura_state::HeaderChainFrontier::new(Height(15), Hash([0x15; 32]));
+    let migrated_pin = zakura_state::HeaderChainFrontier::new(Height(9), Hash([0x09; 32]));
+    let snapshot = zakura_state::HeaderChainSnapshot {
+        mode: zakura_state::HeaderChainMode::HeadersOnly,
+        state_version: zakura_state::HeaderChainStateVersion::new(21),
+        header_generation: zakura_state::HeaderChainGeneration::new(22),
+        verified_generation: zakura_state::HeaderChainVerifiedGeneration::new(23),
+        frontiers: zakura_state::HeaderChainFrontierSet {
+            finalized,
+            header_best,
+            verified_best: verified,
+        },
+        header_best_score: zakura_state::HeaderChainScore::new(
+            zakura_state::HeaderChainSuffixWork::zero(),
+            header_best.hash,
+        ),
+        oldest_retained_height: finalized.height,
+        alarms: zakura_state::HeaderChainAlarmSet {
+            resource_stalled: true,
+            header_best_body_unavailable: Some(zakura_state::HeaderChainBodyUnavailableSummary {
+                started_at: now - chrono::Duration::seconds(12),
+                attempts: 10,
+                suppliers: 3,
+                supplier_set_digest: [0x44; 32],
+                alarmed: true,
+                next_probe_at: now + chrono::Duration::minutes(10),
+            }),
+            migrated_pin_refuted: Some(migrated_pin),
+        },
+    };
+
+    let info = HeaderChainInfo::from_snapshot(snapshot, now);
+    assert_eq!(info.mode(), "headers-only");
+    assert_eq!(info.state_version(), 21);
+    assert_eq!(info.header_best().height(), Height(15));
+    assert_eq!(info.verified_best().height(), Height(12));
+    assert_eq!(info.finalized().height(), Height(10));
+    assert!(
+        info.finality_warning().is_some(),
+        "headers-only mode must disclose its irreversible local trust decision"
+    );
+    assert!(info.alarms().resource_stalled());
+    let unavailable = info
+        .alarms()
+        .header_best_body_unavailable()
+        .as_ref()
+        .expect("the persistent body alarm is visible");
+    assert_eq!(unavailable.height(), Height(15));
+    assert_eq!(unavailable.hash(), Hash([0x15; 32]));
+    assert_eq!(unavailable.age_seconds(), 12);
+    assert_eq!(unavailable.attempts(), 10);
+    assert_eq!(unavailable.suppliers(), 3);
+    assert_eq!(
+        info.alarms()
+            .migrated_pin_refuted()
+            .as_ref()
+            .expect("the migrated-pin incident is visible")
+            .height(),
+        Height(9)
+    );
+
+    let json = serde_json::to_value(info).expect("header-chain status serializes");
+    assert_eq!(json["mode"], "headers-only");
+    assert_eq!(json["header_best"]["height"], 15);
+    assert_eq!(json["verified_best"]["height"], 12);
+    assert_eq!(json["finalized"]["height"], 10);
+    assert_eq!(
+        json["alarms"]["header_best_body_unavailable"]["suppliers"],
+        3
+    );
+}
+
+#[test]
+fn integrated_header_chain_info_omits_headers_only_warning_and_inactive_alarm() {
+    let now = chrono::Utc::now();
+    let frontier = zakura_state::HeaderChainFrontier::new(Height(0), Hash([0x01; 32]));
+    let snapshot = zakura_state::HeaderChainSnapshot {
+        mode: zakura_state::HeaderChainMode::Integrated,
+        state_version: zakura_state::HeaderChainStateVersion::new(1),
+        header_generation: zakura_state::HeaderChainGeneration::new(1),
+        verified_generation: zakura_state::HeaderChainVerifiedGeneration::new(1),
+        frontiers: zakura_state::HeaderChainFrontierSet {
+            finalized: frontier,
+            header_best: frontier,
+            verified_best: frontier,
+        },
+        header_best_score: zakura_state::HeaderChainScore::new(
+            zakura_state::HeaderChainSuffixWork::zero(),
+            frontier.hash,
+        ),
+        oldest_retained_height: frontier.height,
+        alarms: zakura_state::HeaderChainAlarmSet {
+            header_best_body_unavailable: Some(zakura_state::HeaderChainBodyUnavailableSummary {
+                alarmed: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    };
+
+    let info = HeaderChainInfo::from_snapshot(snapshot, now);
+    assert_eq!(info.mode(), "integrated");
+    assert!(info.finality_warning().is_none());
+    assert!(
+        info.alarms().header_best_body_unavailable().is_none(),
+        "only a fired persistent alarm is user-visible"
+    );
+    let json = serde_json::to_value(info).expect("header-chain status serializes");
+    assert!(json.get("finality_warning").is_none());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getinfo() {
     let _init_guard = zakura_test::init();

@@ -363,6 +363,19 @@ impl BlockSyncReactor {
                 } => {
                     if changed.is_ok() {
                         let previous_scope = self.body_work_scope();
+                        let previous_body_alarm =
+                            self.committed_snapshot.as_ref().and_then(|snapshot| {
+                                snapshot
+                                    .alarms
+                                    .header_best_body_unavailable
+                                    .filter(|summary| summary.alarmed)
+                                    .map(|_| {
+                                        (
+                                            zakura_header_chain::WorkScope::for_body_work(snapshot),
+                                            snapshot.frontiers.header_best.hash,
+                                        )
+                                    })
+                            });
                         self.committed_snapshot = committed_snapshots
                             .as_ref()
                             .and_then(|snapshots| snapshots.borrow().clone());
@@ -371,6 +384,21 @@ impl BlockSyncReactor {
                             &self.registry,
                             self.committed_snapshot.as_ref(),
                         );
+                        let current_alarm_hash =
+                            self.committed_snapshot.as_ref().and_then(|snapshot| {
+                                snapshot
+                                    .alarms
+                                    .header_best_body_unavailable
+                                    .filter(|summary| summary.alarmed)
+                                    .map(|_| snapshot.frontiers.header_best.hash)
+                            });
+                        if let Some((scope, hash)) = previous_body_alarm
+                            .filter(|(_, hash)| Some(*hash) != current_alarm_hash)
+                        {
+                            let _ = self
+                                .sequencer_control
+                                .send(SequencerControlInput::BodyAlarmCleared { scope, hash });
+                        }
                         let current_scope = self.body_work_scope();
                         if current_scope != previous_scope {
                             let released = match current_scope {

@@ -149,6 +149,11 @@ pub(super) enum SequencerControlInput {
     WorkScopeChanged {
         scope: Option<zakura_header_chain::WorkScope>,
     },
+    /// A committed transition cleared the persistent alarm for this exact work.
+    BodyAlarmCleared {
+        scope: zakura_header_chain::WorkScope,
+        hash: block::Hash,
+    },
     /// A verified-tip advance (frontier growth/commit).
     FrontierAdvance {
         frontiers: BlockSyncFrontiers,
@@ -408,6 +413,12 @@ impl SequencerTask {
                 }
                 let verified_tip = self.sequencer.verified_tip();
                 let _ = self.sequencer.reset_to(verified_tip, false);
+                true
+            }
+            SequencerControlInput::BodyAlarmCleared { scope, hash } => {
+                self.body_retries
+                    .remove(scope.header_generation, scope.branch, hash);
+                self.registry.clear_body_retry(scope, hash);
                 true
             }
             SequencerControlInput::FrontierAdvance {

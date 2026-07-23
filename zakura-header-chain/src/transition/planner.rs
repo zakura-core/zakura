@@ -1183,8 +1183,9 @@ mod tests {
 
     use chrono::{DateTime, Utc};
     use zakura_chain::{
-        block::genesis::regtest_genesis_block,
+        block::{genesis::regtest_genesis_block, Block},
         parameters::{testnet::RegtestParameters, Network},
+        serialization::ZcashDeserialize,
     };
 
     use super::*;
@@ -1591,6 +1592,117 @@ mod tests {
                 height: child.height,
                 expected: expected.hash,
             }));
+
+        let conflicting_child = conflicting
+            .projected
+            .node(child.hash)
+            .expect("the conflicting checkpoint child is retained");
+        let mut descendant_header = *conflicting_child.header;
+        descendant_header.previous_block_hash = conflicting_child.hash;
+        descendant_header.nonce.0[0] ^= 1;
+        let descendant_header = Arc::new(descendant_header);
+        let descendant_work = descendant_header
+            .difficulty_threshold
+            .to_work()
+            .expect("the fixture target has exact work");
+        let mut descendant_graph = conflicting.projected.clone();
+        let descendant = descendant_graph
+            .insert(
+                descendant_header,
+                descendant_work,
+                HeaderValidationState::Valid,
+                [],
+                BodyValidationState::Unknown,
+            )
+            .expect("the checkpoint-conflicting descendant links");
+        let descendant = match descendant {
+            crate::InsertResult::Inserted(frontier) => descendant_graph
+                .node(frontier.hash)
+                .expect("the inserted descendant is retained"),
+            crate::InsertResult::AlreadyPresent(_) => {
+                unreachable!("the descendant nonce is unique in this fixture")
+            }
+        };
+        assert_eq!(descendant.eligibility.inherited_from, Some(child.hash));
+        assert!(!descendant.is_eligible());
+        let mut committed_conflict = conflicting_store.clone();
+        committed_conflict.commit(&conflicting);
+        let reconsider = apply_transition(
+            &committed_conflict,
+            operator_reconsider(
+                &committed_conflict,
+                child.hash,
+                crate::OperatorInvalidationId::new([0x46; 16]),
+                0x47,
+            ),
+            &context(&conflicting_config, &clock, None),
+        )
+        .expect("operator reconsider can remove only a matching operator reason");
+        assert!(reconsider
+            .projected
+            .node(child.hash)
+            .expect("the checkpoint conflict remains retained")
+            .eligibility
+            .direct_reasons
+            .contains(&EligibilityReason::CheckpointConflict {
+                height: child.height,
+                expected: expected.hash,
+            }));
+        assert_eq!(
+            reconsider.change_set.metadata.frontiers.header_best,
+            committed_conflict.metadata.frontiers.header_best
+        );
+    }
+
+    #[test]
+    fn production_settled_pins_create_exact_permanent_conflict_reasons() {
+        let clock = ManualClock(Utc::now());
+        for (network, bytes) in [
+            (
+                Network::Mainnet,
+                zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice(),
+            ),
+            (
+                Network::new_default_testnet(),
+                zakura_test::vectors::BLOCK_TESTNET_GENESIS_BYTES.as_slice(),
+            ),
+        ] {
+            let genesis = Arc::<Block>::zcash_deserialize(bytes)
+                .expect("the production genesis vector is canonical");
+            let frontier = Frontier::new(block::Height(0), genesis.hash());
+            let config = EngineConfig::new(
+                EngineMode::Integrated,
+                network.clone(),
+                TrustedAnchor {
+                    frontier,
+                    header: genesis.header.clone(),
+                },
+                CheckpointSet::default(),
+            )
+            .expect("the production configuration installs its settled pin");
+            let pin = config
+                .settled_manifest
+                .pin_for_network(&network)
+                .expect("the release manifest has a production pin");
+            assert!(anchor_reasons(
+                &context(&config, &clock, None),
+                pin.activation.height,
+                pin.activation.hash,
+            )
+            .is_empty());
+            let conflicting_hash = block::Hash([0x55; 32]);
+            assert_eq!(
+                anchor_reasons(
+                    &context(&config, &clock, None),
+                    pin.activation.height,
+                    conflicting_hash,
+                ),
+                vec![EligibilityReason::SettledUpgradeConflict {
+                    height: pin.activation.height,
+                    expected: pin.activation.hash,
+                }]
+            );
+        }
     }
 
     fn insert_verified_branch(

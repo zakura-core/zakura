@@ -361,7 +361,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-ANCHOR-03"
 name = "Post-anchor validation context"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::HeaderChainStore::validation_context"
+tests = ["HV-06::later_anchor_predecessor_context_has_exact_one_to_twenty_eight_boundary", "HV-06::later_anchor_predecessor_context_rejects_gap_hash_and_link_corruption", "HV-06::clean_store_initializes_only_from_finalized_full_state", "HV-06::atomic_finality_context_can_use_a_newly_staged_anchor_path", "HV-06::aud_14_finality_advance_reopens_complete_before_or_after"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-ANCHOR-04"

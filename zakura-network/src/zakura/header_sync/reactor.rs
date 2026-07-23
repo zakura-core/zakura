@@ -2510,6 +2510,136 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or_score() {
+        let mut startup = startup(CancellationToken::new());
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let initial = committed_snapshot(anchor);
+        let (snapshots_tx, snapshots_rx) = watch::channel(Some(initial.clone()));
+        startup.committed_snapshots = Some(snapshots_rx);
+        let (handle, mut actions, mut reactor) =
+            build_header_sync_reactor(startup).expect("the stale-anchor fixture builds");
+        let peer = peer();
+        let (send, mut outbound) = framed_channel(8);
+        reactor.handle_event(HeaderSyncEvent::PeerConnected(
+            HeaderSyncPeerSession::from_parts_with_session_id(
+                peer.clone(),
+                7,
+                send,
+                CancellationToken::new(),
+            ),
+        ));
+        let initial_status = outbound
+            .recv()
+            .await
+            .expect("the initial committed status is sent");
+        assert!(matches!(
+            handle
+                .codec()
+                .decode_frame(initial_status, None)
+                .expect("the initial status decodes"),
+            HeaderSyncMessage::Status(_)
+        ));
+
+        let (source, owner, old_range) =
+            seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
+        reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
+            peer: peer.clone(),
+            source,
+            owner,
+            result: HeaderTargetAdmissionResult::Stale,
+        });
+
+        assert!(reactor.peer_work_queue.active(&peer).is_none());
+        assert!(reactor.pending_owners.is_empty());
+        assert!(!reactor.coverage.covers_tip(
+            owner.header_generation,
+            old_range.branch,
+            old_range.end
+        ));
+        assert!(
+            actions.try_recv().is_err(),
+            "a stale local anchor neither retries work nor scores its peer"
+        );
+
+        let replacement =
+            zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0xb3; 32]));
+        let mut committed = initial.clone();
+        committed.state_version = initial
+            .state_version
+            .checked_next()
+            .expect("the fixture state version advances");
+        committed.header_generation = initial
+            .header_generation
+            .checked_next()
+            .expect("the fixture header generation advances");
+        committed.verified_generation = initial
+            .verified_generation
+            .checked_next()
+            .expect("the fixture verified generation advances");
+        committed.frontiers.finalized = replacement;
+        committed.frontiers.header_best = replacement;
+        committed.frontiers.verified_best = replacement;
+        committed.header_best_score = zakura_header_chain::ChainScore::new(
+            zakura_header_chain::SuffixWork::zero(),
+            replacement.hash,
+        );
+        committed.oldest_retained_height = replacement.height;
+        snapshots_tx
+            .send(Some(committed.clone()))
+            .expect("the durable snapshot receiver remains live");
+        let durable = reactor
+            .startup
+            .committed_snapshots
+            .as_ref()
+            .and_then(|snapshots| snapshots.borrow().clone())
+            .expect("the committed watch exposes the winning anchor");
+        reactor.observe_latest_committed_snapshot(durable);
+
+        assert_eq!(reactor.committed_snapshot, Some(committed.clone()));
+        assert_eq!(
+            handle.best_header_tip(),
+            (replacement.height, replacement.hash)
+        );
+        assert!(reactor.peer_work_queue.active(&peer).is_none());
+        assert!(reactor.pending_owners.is_empty());
+        assert!(
+            actions.try_recv().is_err(),
+            "re-anchoring does not hot-retry the impossible owner"
+        );
+
+        time::advance(std::time::Duration::from_secs(1)).await;
+        reactor.refresh_statuses();
+        let refreshed = outbound
+            .recv()
+            .await
+            .expect("the bounded status floor eventually publishes the new anchor");
+        let HeaderSyncMessage::Status(status) = handle
+            .codec()
+            .decode_frame(refreshed, None)
+            .expect("the refreshed status decodes")
+        else {
+            panic!("the re-anchor publication must be Status");
+        };
+        assert_eq!(status.work_anchor_height, replacement.height);
+        assert_eq!(status.work_anchor_hash, replacement.hash);
+        assert_eq!(status.selected_tip_height, replacement.height);
+        assert_eq!(status.selected_tip_hash, replacement.hash);
+        assert!(
+            !reactor
+                .peer_state
+                .get(&peer)
+                .and_then(|state| state.status_publisher.as_ref())
+                .expect("the connected peer retains its publisher")
+                .due(Instant::now()),
+            "one refreshed publication satisfies the changed status"
+        );
+        assert!(
+            actions.try_recv().is_err(),
+            "status refresh emits neither a retry nor peer punishment"
+        );
+    }
+
     #[test]
     fn aud_14_reactor_restart_drops_old_preparation_and_admission_completions() {
         let shutdown = CancellationToken::new();

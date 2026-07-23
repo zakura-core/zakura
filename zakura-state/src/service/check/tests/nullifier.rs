@@ -8,16 +8,14 @@ use proptest::prelude::*;
 use zakura_chain::{
     block::{Block, Height},
     fmt::TypeNameToDebug,
-    orchard,
-    parameters::NetworkUpgrade::Nu5,
+    ironwood, orchard,
+    parameters::NetworkUpgrade::{Nu5, Nu6_3},
     primitives::Groth16Proof,
     sapling::{self, FieldNotPresent, PerSpendAnchor, TransferData::*},
     serialization::ZcashDeserializeInto,
     sprout::JoinSplit,
     transaction::{JoinSplitData, LockTime, Transaction},
 };
-
-use zakura_chain::{ironwood, parameters::NetworkUpgrade::Nu6_3, primitives::Halo2Proof};
 
 use crate::{
     arbitrary::Prepare,
@@ -1473,6 +1471,10 @@ fn transaction_v5_with_orchard_shielded_data(
         orchard_shielded_data.actions = authorized_actions.try_into().expect(
             "unexpected invalid orchard::ShieldedData: must have at least one AuthorizedAction",
         );
+        orchard_shielded_data.proof.0.resize(
+            ::orchard::Proof::expected_proof_size(orchard_shielded_data.actions.len()),
+            0,
+        );
 
         // set value balance to 0 to pass the chain value pool checks
         let zero_amount = 0.try_into().expect("unexpected invalid zero amount");
@@ -1506,21 +1508,16 @@ fn transaction_v6_with_ironwood_shielded_data(
     let authorized_actions: Vec<_> = authorized_actions.into_iter().collect();
 
     if let Some(ref mut ironwood_shielded_data) = ironwood_shielded_data {
-        const SINGLE_ACTION_ORCHARD_PROOF_SIZE: usize = 4_992;
-
-        assert_eq!(
-            authorized_actions.len(),
-            1,
-            "test helper uses the single action Orchard proof size"
-        );
-
         ironwood_shielded_data.actions = authorized_actions.try_into().expect(
             "unexpected invalid ironwood::ShieldedData: must have at least one AuthorizedAction",
+        );
+        ironwood_shielded_data.proof.0.resize(
+            ::orchard::Proof::expected_proof_size(ironwood_shielded_data.actions.len()),
+            0,
         );
 
         let zero_amount = 0.try_into().expect("unexpected invalid zero amount");
         ironwood_shielded_data.value_balance = zero_amount;
-        ironwood_shielded_data.proof = Halo2Proof(vec![0; SINGLE_ACTION_ORCHARD_PROOF_SIZE]);
     }
 
     Transaction::V6 {

@@ -47,6 +47,8 @@ pub(crate) enum BlockApplyClass {
 
 #[derive(Clone, Debug)]
 struct PendingBlockApply {
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
     class: BlockApplyClass,
     block: Arc<block::Block>,
@@ -481,11 +483,16 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     }
                 }
             }
-            BlockSyncAction::SubmitBlock { token, block, .. } => {
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => {
                 let class = block_apply_class(block.as_ref(), max_checkpoint_height);
                 let height = block.coinbase_height();
                 if block_sync_handoff.is_yielded_to_legacy() {
-                    abandon_block_apply(&block_sync, token, block.as_ref(), &trace);
+                    abandon_block_apply(&block_sync, owner, source, token, block.as_ref(), &trace);
                     continue;
                 }
                 emit_commit_state(
@@ -514,6 +521,8 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 );
                 if let Some(probe) = throughput_probe.clone() {
                     let pending = PendingBlockApply {
+                        owner,
+                        source,
                         token,
                         class,
                         block,
@@ -549,6 +558,8 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     continue;
                 }
                 pending_applies.push_back(PendingBlockApply {
+                    owner,
+                    source,
                     token,
                     class,
                     block,
@@ -577,12 +588,14 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
 
 fn abandon_block_apply(
     block_sync: &BlockSyncHandle,
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
     block: &block::Block,
     trace: &ZakuraTrace,
 ) {
     let Some((height, expected_hash, result, event)) =
-        abandoned_block_apply_finished_event(token, block)
+        abandoned_block_apply_finished_event(owner, source, token, block)
     else {
         warn!(
             expected_hash = ?block.hash(),
@@ -608,6 +621,8 @@ fn abandon_block_apply(
 }
 
 pub(crate) fn abandoned_block_apply_finished_event(
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
     block: &block::Block,
 ) -> Option<(block::Height, block::Hash, BlockApplyResult, BlockSyncEvent)> {
@@ -620,6 +635,8 @@ pub(crate) fn abandoned_block_apply_finished_event(
         hash,
         result,
         BlockSyncEvent::BlockApplyFinished {
+            owner,
+            source,
             token,
             height,
             hash,
@@ -634,9 +651,12 @@ fn abandoned_pending_apply_finished_events(
 ) -> Vec<(block::Height, block::Hash, BlockApplyResult, BlockSyncEvent)> {
     let mut events = Vec::new();
     while let Some(pending) = pending_applies.pop_front() {
-        if let Some(event) =
-            abandoned_block_apply_finished_event(pending.token, pending.block.as_ref())
-        {
+        if let Some(event) = abandoned_block_apply_finished_event(
+            pending.owner,
+            pending.source,
+            pending.token,
+            pending.block.as_ref(),
+        ) {
             events.push(event);
         } else {
             warn!(
@@ -889,6 +909,8 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
             endpoint.clone(),
             read_state.clone(),
             block_sync.clone(),
+            pending.owner,
+            pending.source,
             pending.token,
             pending.block,
             class,
@@ -944,7 +966,14 @@ fn release_pending_probe_applies(
 ) {
     let pending = std::mem::take(pending_probe_applies);
     for pending in pending.into_values() {
-        abandon_block_apply(block_sync, pending.token, pending.block.as_ref(), trace);
+        abandon_block_apply(
+            block_sync,
+            pending.owner,
+            pending.source,
+            pending.token,
+            pending.block.as_ref(),
+            trace,
+        );
     }
 }
 
@@ -1047,6 +1076,8 @@ where
         endpoint,
         read_state,
         block_sync,
+        pending.owner,
+        pending.source,
         pending.token,
         pending.block,
         pending.class,
@@ -1077,6 +1108,8 @@ pub(crate) async fn apply_block_sync_body<BlockVerifier, ReadState>(
     endpoint: Option<ZakuraEndpoint>,
     read_state: ReadState,
     block_sync: BlockSyncHandle,
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
     block: Arc<block::Block>,
     class: BlockApplyClass,
@@ -1189,6 +1222,8 @@ where
     );
 
     let _ = block_sync.send_control(BlockSyncEvent::BlockApplyFinished {
+        owner,
+        source,
         token,
         height,
         hash: expected_hash,
@@ -1674,6 +1709,23 @@ mod tests {
         Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
     }
 
+    fn test_owner() -> zakura_header_chain::WorkOwner {
+        zakura_header_chain::WorkScope {
+            state_version: zakura_header_chain::StateVersion::new(1),
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(1)),
+            branch: zakura_header_chain::BranchId::new(block::Hash([0; 32]), block::Hash([1; 32])),
+        }
+        .bind(
+            1,
+            std::num::NonZeroU64::new(1).expect("test request ID is nonzero"),
+        )
+    }
+
+    fn test_source() -> zakura_header_chain::SourceId {
+        zakura_header_chain::SourceId::from_digest([2; 32])
+    }
+
     #[test]
     fn abandoned_pending_apply_events_drain_queued_blocks() {
         let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
@@ -1684,11 +1736,15 @@ mod tests {
         let block2_hash = block2.hash();
         let mut pending_applies = VecDeque::from([
             PendingBlockApply {
+                owner: test_owner(),
+                source: test_source(),
                 token: 11,
                 class: BlockApplyClass::Full,
                 block: block1,
             },
             PendingBlockApply {
+                owner: test_owner(),
+                source: test_source(),
                 token: 12,
                 class: BlockApplyClass::Full,
                 block: block2,
@@ -1714,6 +1770,7 @@ mod tests {
                     hash: event_hash,
                     result: BlockApplyResult::TimedOut,
                     local_frontier: None,
+                    ..
                 },
             ) if height == block1_height
                 && hash == block1_hash
@@ -1732,6 +1789,7 @@ mod tests {
                     hash: event_hash,
                     result: BlockApplyResult::TimedOut,
                     local_frontier: None,
+                    ..
                 },
             ) if height == block2_height
                 && hash == block2_hash

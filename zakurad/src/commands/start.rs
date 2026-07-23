@@ -3752,9 +3752,11 @@ mod zakura_header_sync_driver_tests {
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let block_height = block.coinbase_height().expect("test block has height");
         let block_hash = block.hash();
+        let owner = test_block_work_owner();
+        let source = test_block_source();
 
         let Some((height, hash, result, event)) =
-            abandoned_block_apply_finished_event(99, block.as_ref())
+            abandoned_block_apply_finished_event(owner, source, 99, block.as_ref())
         else {
             panic!("test block has a coinbase height");
         };
@@ -3765,12 +3767,17 @@ mod zakura_header_sync_driver_tests {
         assert!(matches!(
             event,
             BlockSyncEvent::BlockApplyFinished {
+                owner: event_owner,
+                source: event_source,
                 token: 99,
                 height,
                 hash,
                 result: BlockApplyResult::TimedOut,
                 local_frontier: None,
-            } if height == block_height && hash == block_hash
+            } if event_owner == owner
+                && event_source == source
+                && height == block_height
+                && hash == block_hash
         ));
     }
 
@@ -3888,6 +3895,8 @@ mod zakura_header_sync_driver_tests {
             None,
             read_state,
             block_sync.clone(),
+            test_block_work_owner(),
+            test_block_source(),
             1,
             block,
             BlockApplyClass::Checkpoint,
@@ -3945,6 +3954,8 @@ mod zakura_header_sync_driver_tests {
             None,
             read_state,
             block_sync,
+            test_block_work_owner(),
+            test_block_source(),
             77,
             block,
             BlockApplyClass::Full,
@@ -4023,6 +4034,8 @@ mod zakura_header_sync_driver_tests {
             None,
             read_state,
             block_sync,
+            test_block_work_owner(),
+            test_block_source(),
             88,
             block,
             BlockApplyClass::Checkpoint,

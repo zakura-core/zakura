@@ -164,6 +164,8 @@ pub(super) enum SequencerControlInput {
     },
     /// A verifier apply completion.
     ApplyFinished {
+        owner: zakura_header_chain::WorkOwner,
+        source: zakura_header_chain::SourceId,
         token: BlockApplyToken,
         height: block::Height,
         hash: block::Hash,
@@ -399,6 +401,8 @@ impl SequencerTask {
                 true
             }
             SequencerControlInput::ApplyFinished {
+                owner,
+                source,
                 token,
                 height,
                 hash,
@@ -406,7 +410,15 @@ impl SequencerTask {
                 local_frontier,
             } => {
                 let needs_reaction = self
-                    .handle_apply_finished(token, height, hash, result, local_frontier)
+                    .handle_apply_finished(
+                        owner,
+                        source,
+                        token,
+                        height,
+                        hash,
+                        result,
+                        local_frontier,
+                    )
                     .await;
                 self.submit_pending_blocks().await;
                 needs_reaction
@@ -568,8 +580,11 @@ impl SequencerTask {
     /// `release_applied: false`, and on a rejection roll the floor back below the
     /// bad block so its range is re-requestable. Returns whether the reactor needs
     /// its serving/query/schedule reaction (the view reaction runs that tail).
+    #[allow(clippy::too_many_arguments)]
     async fn handle_apply_finished(
         &mut self,
+        owner: zakura_header_chain::WorkOwner,
+        source: zakura_header_chain::SourceId,
         token: BlockApplyToken,
         height: block::Height,
         hash: block::Hash,
@@ -579,13 +594,20 @@ impl SequencerTask {
         // A stale completion (no live applying entry, or token/hash mismatch)
         // releases only its exact token-aware in-flight-submission charge and
         // returns; there is no query/schedule tail here, so it needs no reaction.
-        let Some((applying_token, applying_hash)) = self.sequencer.applying_token_hash(height)
+        let Some((applying_owner, applying_source, applying_token, applying_hash)) =
+            self.sequencer.applying_identity(height)
         else {
-            self.sequencer.finish_submission(token, height, hash);
+            self.sequencer
+                .finish_submission(owner, source, token, height, hash);
             return false;
         };
-        if applying_hash != hash || applying_token != token {
-            self.sequencer.finish_submission(token, height, hash);
+        if applying_owner != owner
+            || applying_source != source
+            || applying_hash != hash
+            || applying_token != token
+        {
+            self.sequencer
+                .finish_submission(owner, source, token, height, hash);
             return false;
         }
         let accepted_local_frontier = if let Some(frontiers) = local_frontier {
@@ -609,7 +631,7 @@ impl SequencerTask {
             // frontier update removes it, but the driver has released its decoded
             // copy, so release the token-aware decode-window charge now.
             self.sequencer
-                .finish_attached_submission(token, height, hash);
+                .finish_attached_submission(owner, source, token, height, hash);
             return accepted_local_frontier.is_some();
         }
         let applying = self
@@ -622,7 +644,8 @@ impl SequencerTask {
         if matches!(result, BlockApplyResult::Committed) {
             self.committed_throughput.record(applying.bytes);
         }
-        self.sequencer.finish_submission(token, height, hash);
+        self.sequencer
+            .finish_submission(owner, source, token, height, hash);
         match result {
             BlockApplyResult::Committed | BlockApplyResult::Duplicate => {}
             BlockApplyResult::Rejected

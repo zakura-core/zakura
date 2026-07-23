@@ -53,6 +53,10 @@ pub enum BlockSyncEvent {
     NeededBlocks(Vec<BlockSyncBlockMeta>),
     /// Node wiring finished applying a submitted block body.
     BlockApplyFinished {
+        /// Exact network request that owned the submission.
+        owner: zakura_header_chain::WorkOwner,
+        /// Authenticated body supplier.
+        source: zakura_header_chain::SourceId,
         /// Submission token from the matching [`BlockSyncAction::SubmitBlock`].
         token: BlockApplyToken,
         /// Submitted block height.

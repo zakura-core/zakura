@@ -276,7 +276,12 @@ fn spawn_action_driver(
                         break;
                     }
                 }
-                BlockSyncAction::SubmitBlock { token, block, .. } => {
+                BlockSyncAction::SubmitBlock {
+                    owner,
+                    source,
+                    token,
+                    block,
+                } => {
                     // Model a slow/bursty commit drain: hold the submitted body before
                     // applying so its reserved bytes stay held until
                     // `BlockApplyFinished`, letting the apply backlog build against the
@@ -295,6 +300,8 @@ fn spawn_action_driver(
                     }
                     if handle
                         .send(BlockSyncEvent::BlockApplyFinished {
+                            owner,
+                            source,
                             token,
                             height,
                             hash: block.hash(),

@@ -3786,7 +3786,13 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
     assert_eq!(seq.in_flight_submission_bytes(), 200);
     assert_eq!(seq.applying_buffered_bytes(), 400);
     check(&seq, "detach submitted 2");
-    assert!(seq.finish_submission(item2.token, item2.height, item2.hash));
+    assert!(seq.finish_submission(
+        item2.owner,
+        item2.source,
+        item2.token,
+        item2.height,
+        item2.hash
+    ));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.in_flight_submission_bytes(), 0);
     check(&seq, "finish detached 2");
@@ -3914,6 +3920,8 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     let (token_1, block_1) = &initial_submissions[0];
     control_tx
         .send(SequencerControlInput::ApplyFinished {
+            owner: test_work_owner(),
+            source: zakura_header_chain::SourceId::from_digest([1; 32]),
             token: *token_1,
             height: block::Height(1),
             hash: block_1.hash(),
@@ -3942,6 +3950,8 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     ] {
         control_tx
             .send(SequencerControlInput::ApplyFinished {
+                owner: test_work_owner(),
+                source: zakura_header_chain::SourceId::from_digest([1; 32]),
                 token: *token,
                 height,
                 hash: block.hash(),
@@ -4103,7 +4113,13 @@ fn sequencer_completed_duplicate_releases_attached_decode_window_slot() {
     // A duplicate completion can arrive before the frontier proving that block
     // advances. Keep its applying entry attached, but drop the decoded copy and
     // free the global submission slot because the driver released its Arc.
-    assert!(seq.finish_attached_submission(item.token, item.height, item.hash));
+    assert!(seq.finish_attached_submission(
+        item.owner,
+        item.source,
+        item.token,
+        item.height,
+        item.hash
+    ));
     assert!(seq.applying_contains(block::Height(1)));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.decoded_applying_count(), 0);
@@ -4125,7 +4141,7 @@ fn sequencer_records_and_decrements_submitted_applies() {
     assert!(seq.has_submitted_apply(block::Height(1), hash));
     assert!(seq.submitted_contains(block::Height(1)));
     seq.remove_applying(item.height);
-    assert!(seq.finish_submission(item.token, item.height, item.hash));
+    assert!(seq.finish_submission(item.owner, item.source, item.token, item.height, item.hash));
     assert!(!seq.has_submitted_apply(block::Height(1), hash));
     assert!(!seq.submitted_contains(block::Height(1)));
 }
@@ -4176,13 +4192,33 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
         "detached driver submission still occupies the decode window"
     );
 
-    assert!(!seq.finish_submission(item.token, item.height, block::Hash([99; 32])));
+    assert!(!seq.finish_submission(
+        item.owner,
+        item.source,
+        item.token,
+        item.height,
+        block::Hash([99; 32])
+    ));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
         decoded_attributed_memory_bytes
     );
-    assert!(seq.finish_submission(item.token, item.height, item.hash));
+    let wrong_owner = zakura_header_chain::WorkOwner {
+        request_id: std::num::NonZeroU64::new(item.owner.request_id.get().saturating_add(1))
+            .expect("incremented test request ID is nonzero"),
+        ..item.owner
+    };
+    assert!(!seq.finish_submission(wrong_owner, item.source, item.token, item.height, item.hash));
+    assert!(!seq.finish_submission(
+        item.owner,
+        zakura_header_chain::SourceId::from_digest([99; 32]),
+        item.token,
+        item.height,
+        item.hash
+    ));
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert!(seq.finish_submission(item.owner, item.source, item.token, item.height, item.hash));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -4304,7 +4340,13 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
 
     let first = &old_items[0];
     assert!(
-        !seq.finish_submission(first.token, first.height, block::Hash([99; 32])),
+        !seq.finish_submission(
+            first.owner,
+            first.source,
+            first.token,
+            first.height,
+            block::Hash([99; 32])
+        ),
         "a mismatched completion must not release a detached charge"
     );
     assert_eq!(seq.in_flight_submission_count(), 2);
@@ -4312,7 +4354,13 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
         seq.applying_decoded_attributed_memory_bytes(),
         decoded_attributed_memory_bytes_before_completion
     );
-    assert!(seq.finish_submission(first.token, first.height, first.hash));
+    assert!(seq.finish_submission(
+        first.owner,
+        first.source,
+        first.token,
+        first.height,
+        first.hash
+    ));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -4322,7 +4370,13 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
     assert_eq!(seq.submittable_heights().len(), 1);
 
     let second = &old_items[1];
-    assert!(seq.finish_submission(second.token, second.height, second.hash));
+    assert!(seq.finish_submission(
+        second.owner,
+        second.source,
+        second.token,
+        second.height,
+        second.hash
+    ));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -4402,9 +4456,21 @@ fn sequencer_rejection_release_keeps_detached_submissions_charged() {
         seq.in_flight_submission_bytes_scanned()
     );
 
-    assert!(seq.finish_submission(item2.token, item2.height, item2.hash));
+    assert!(seq.finish_submission(
+        item2.owner,
+        item2.source,
+        item2.token,
+        item2.height,
+        item2.hash
+    ));
     assert_eq!(seq.submittable_heights(), vec![block::Height(1)]);
-    assert!(seq.finish_submission(item3.token, item3.height, item3.hash));
+    assert!(seq.finish_submission(
+        item3.owner,
+        item3.source,
+        item3.token,
+        item3.height,
+        item3.hash
+    ));
     assert_eq!(seq.in_flight_submission_count(), 0);
 }
 
@@ -5656,11 +5722,16 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
         .await
         .expect("block queues");
 
-    let submit_token = loop {
+    let (submit_owner, submit_source, submit_token) = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block, .. } => {
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => {
                 assert_eq!(block.hash(), blocks[0].hash());
-                break token;
+                break (owner, source, token);
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before submit: {action:?}"),
@@ -5679,6 +5750,8 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
 
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
+            owner: submit_owner,
+            source: submit_source,
             token: submit_token,
             height: block::Height(1),
             hash: blocks[0].hash(),
@@ -6193,11 +6266,16 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
     );
 
     send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[0].clone())).await;
-    let submit_token = loop {
+    let (submit_owner, submit_source, submit_token) = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block, .. } => {
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => {
                 assert_eq!(block.hash(), blocks[0].hash());
-                break token;
+                break (owner, source, token);
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before submit: {action:?}"),
@@ -6206,6 +6284,8 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
 
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
+            owner: submit_owner,
+            source: submit_source,
             token: submit_token,
             height: block::Height(1),
             hash: blocks[0].hash(),
@@ -6695,9 +6775,16 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
     let mut saw_refill_query = false;
     while submitted.len() < 2 {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block, .. } => {
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => {
                 submitted.push((
                     block.coinbase_height().expect("test block has height"),
+                    owner,
+                    source,
                     token,
                 ));
             }
@@ -6722,14 +6809,16 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
     assert_eq!(
         submitted
             .iter()
-            .map(|(height, _token)| *height)
+            .map(|(height, ..)| *height)
             .collect::<Vec<_>>(),
         vec![block::Height(1), block::Height(2)]
     );
 
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
-            token: submitted[0].1,
+            owner: submitted[0].1,
+            source: submitted[0].2,
+            token: submitted[0].3,
             height: block::Height(1),
             hash: blocks[0].hash(),
             result: BlockApplyResult::Committed,
@@ -6744,7 +6833,9 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
 
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
-            token: submitted[1].1,
+            owner: submitted[1].1,
+            source: submitted[1].2,
+            token: submitted[1].3,
             height: block::Height(2),
             hash: blocks[1].hash(),
             result: BlockApplyResult::Committed,
@@ -6867,15 +6958,16 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
         )
         .await
         .expect("block queues");
-    let submit_token = loop {
+    let (submit_owner, submit_source, submit_token) = loop {
         match next_action(&mut actions).await {
             BlockSyncAction::SubmitBlock {
+                owner,
+                source,
                 token,
                 block: submitted,
-                ..
             } => {
                 assert_eq!(submitted.hash(), block.hash());
-                break token;
+                break (owner, source, token);
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before submit: {action:?}"),
@@ -6884,6 +6976,8 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
 
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
+            owner: submit_owner,
+            source: submit_source,
             token: submit_token,
             height: block::Height(1),
             hash: block.hash(),
@@ -7108,11 +7202,16 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
     // the height-2 GetBlocks below must arrive regardless (the receipt-time
     // release must wake the budget-blocked fill — a release between the
     // routine's fill-check and its await must not be lost).
-    let token = loop {
+    let (owner, source, token) = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block, .. } => {
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => {
                 assert_eq!(block.coinbase_height(), Some(block::Height(1)));
-                break token;
+                break (owner, source, token);
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before SubmitBlock: {action:?}"),
@@ -7120,6 +7219,8 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
     };
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
+            owner,
+            source,
             token,
             height: block::Height(1),
             hash: blocks[0].hash(),
@@ -8640,11 +8741,16 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
         )
         .await
         .expect("successor body queues");
-    let successor_token = loop {
+    let (successor_owner, successor_source, successor_token) = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block, .. } => {
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => {
                 assert_eq!(block.hash(), blocks[2].hash());
-                break token;
+                break (owner, source, token);
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before successor submit: {action:?}"),
@@ -8668,6 +8774,8 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
 
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
+            owner: successor_owner,
+            source: successor_source,
             token: successor_token,
             height: block::Height(3),
             hash: blocks[2].hash(),
@@ -9152,11 +9260,16 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
         )
         .await
         .expect("first body frame queues");
-    let stale_token = loop {
+    let (stale_owner, stale_source, stale_token) = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block, .. } => {
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => {
                 assert_eq!(block.hash(), block_hash);
-                break token;
+                break (owner, source, token);
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before first submit: {action:?}"),
@@ -9218,11 +9331,16 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
         )
         .await
         .expect("second body frame queues");
-    let current_token = loop {
+    let (current_owner, current_source, current_token) = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block, .. } => {
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => {
                 assert_eq!(block.hash(), block_hash);
-                break token;
+                break (owner, source, token);
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before second submit: {action:?}"),
@@ -9232,6 +9350,8 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
 
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
+            owner: stale_owner,
+            source: stale_source,
             token: stale_token,
             height: block::Height(1),
             hash: block_hash,
@@ -9256,6 +9376,40 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
 
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
+            owner: stale_owner,
+            source: current_source,
+            token: current_token,
+            height: block::Height(1),
+            hash: block_hash,
+            result: BlockApplyResult::Duplicate,
+            local_frontier: None,
+        })
+        .await
+        .expect("owner-mismatched apply-finished event queues");
+    handle
+        .send(BlockSyncEvent::BlockApplyFinished {
+            owner: current_owner,
+            source: zakura_header_chain::SourceId::from_digest([0xfe; 32]),
+            token: current_token,
+            height: block::Height(1),
+            hash: block_hash,
+            result: BlockApplyResult::Duplicate,
+            local_frontier: None,
+        })
+        .await
+        .expect("source-mismatched apply-finished event queues");
+    while let Ok(Some(action)) =
+        tokio::time::timeout(Duration::from_millis(100), actions.recv()).await
+    {
+        if let BlockSyncAction::SubmitBlock { .. } = action {
+            panic!("owner/source mismatch released the current submission: {action:?}");
+        }
+    }
+
+    handle
+        .send(BlockSyncEvent::BlockApplyFinished {
+            owner: current_owner,
+            source: current_source,
             token: current_token,
             height: block::Height(1),
             hash: block_hash,
@@ -10423,11 +10577,16 @@ async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
 
     // The merkle-invalid body is no longer filtered at ingress: it is buffered
     // and submitted to consensus.
-    let submit_token = loop {
+    let (submit_owner, submit_source, submit_token) = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block, .. } => {
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => {
                 assert_eq!(block.hash(), blocks[0].hash());
-                break token;
+                break (owner, source, token);
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before invalid body submit: {action:?}"),
@@ -10440,6 +10599,8 @@ async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
     // keep feeding invalid bodies for needed heights.
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
+            owner: submit_owner,
+            source: submit_source,
             token: submit_token,
             height: block::Height(1),
             hash: blocks[0].hash(),
@@ -12797,9 +12958,14 @@ async fn reactor_ignores_duplicate_response_at_body_download_floor() {
         .await
         .expect("block frame queues");
 
-    let (token, hash) = loop {
+    let (owner, source, token, hash) = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block, .. } => break (token, block.hash()),
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => break (owner, source, token, block.hash()),
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action while waiting for submit: {action:?}"),
         }
@@ -12810,6 +12976,8 @@ async fn reactor_ignores_duplicate_response_at_body_download_floor() {
     // but `body_download_floor` still proves this height was already accepted.
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
+            owner,
+            source,
             token,
             height: block::Height(2),
             hash,
@@ -12923,15 +13091,22 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
     )
     .await;
 
-    let (token, hash) = loop {
+    let (owner, source, token, hash) = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block, .. } => break (token, block.hash()),
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => break (owner, source, token, block.hash()),
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action while waiting for submit: {action:?}"),
         }
     };
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
+            owner,
+            source,
             token,
             height: block::Height(2),
             hash,

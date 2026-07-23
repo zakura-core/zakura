@@ -532,14 +532,24 @@ impl BlockSyncReactor {
                 self.handle_needed_blocks(scope, blocks).await;
             }
             BlockSyncEvent::BlockApplyFinished {
+                owner,
+                source,
                 token,
                 height,
                 hash,
                 result,
                 local_frontier,
             } => {
-                self.handle_block_apply_finished(token, height, hash, result, local_frontier)
-                    .await
+                self.handle_block_apply_finished(
+                    owner,
+                    source,
+                    token,
+                    height,
+                    hash,
+                    result,
+                    local_frontier,
+                )
+                .await
             }
             BlockSyncEvent::BlockRangeResponseReady {
                 peer,
@@ -1239,8 +1249,11 @@ impl BlockSyncReactor {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_block_apply_finished(
         &mut self,
+        owner: zakura_header_chain::WorkOwner,
+        source: zakura_header_chain::SourceId,
         token: BlockApplyToken,
         height: block::Height,
         hash: block::Hash,
@@ -1259,6 +1272,8 @@ impl BlockSyncReactor {
         let send_result = self
             .sequencer_control
             .send(SequencerControlInput::ApplyFinished {
+                owner,
+                source,
                 token,
                 height,
                 hash,

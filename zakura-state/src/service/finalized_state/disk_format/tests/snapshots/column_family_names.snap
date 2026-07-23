@@ -1,6 +1,5 @@
 ---
-source: zebra-state/src/service/finalized_state/disk_format/tests/snapshot.rs
-assertion_line: 77
+source: zakura-state/src/service/finalized_state/disk_format/tests/snapshot.rs
 expression: cf_names
 ---
 [
@@ -17,6 +16,7 @@ expression: cf_names
   "ironwood_note_commitment_subtree",
   "ironwood_note_commitment_tree",
   "ironwood_nullifiers",
+  "node_software_metadata",
   "orchard_anchors",
   "orchard_note_commitment_subtree",
   "orchard_note_commitment_tree",

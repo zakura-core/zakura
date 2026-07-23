@@ -36,6 +36,7 @@ pub mod block;
 pub mod chain;
 pub(crate) mod commitment_roots_db;
 pub mod highest_completed_checkpoint;
+pub mod metadata;
 pub mod metrics;
 
 /// Minimum number of transactions in a block before the per-transaction batch
@@ -61,6 +62,8 @@ pub mod prune;
 pub mod rollback;
 pub mod shielded;
 pub mod transparent;
+
+pub use metadata::DatabaseWriterMetadata;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 // TODO: when the database is split out of zakura-state, always expose these methods.
@@ -145,6 +148,31 @@ impl ZakuraDb {
         column_families_in_code: impl IntoIterator<Item = String>,
         read_only: bool,
     ) -> Result<ZakuraDb, StateInitError> {
+        Self::new_with_database_writer_metadata(
+            config,
+            db_kind,
+            format_version_in_code,
+            network,
+            debug_skip_format_upgrades,
+            column_families_in_code,
+            read_only,
+            Some(&DatabaseWriterMetadata::default_zakura()),
+        )
+    }
+
+    /// Opens or creates the database, recording the supplied node software
+    /// metadata when opened writable.
+    #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
+    pub(crate) fn new_with_database_writer_metadata(
+        config: &Config,
+        db_kind: impl AsRef<str>,
+        format_version_in_code: &Version,
+        network: &Network,
+        debug_skip_format_upgrades: bool,
+        column_families_in_code: impl IntoIterator<Item = String>,
+        read_only: bool,
+        database_writer_metadata: Option<&DatabaseWriterMetadata>,
+    ) -> Result<ZakuraDb, StateInitError> {
         let open_mode = if read_only {
             DbOpenMode::ReadOnly
         } else {
@@ -159,6 +187,7 @@ impl ZakuraDb {
             debug_skip_format_upgrades,
             column_families_in_code,
             open_mode,
+            database_writer_metadata,
         )
     }
 
@@ -183,10 +212,11 @@ impl ZakuraDb {
             false,
             column_families_in_code,
             DbOpenMode::VctSproutValidation,
+            None,
         )
     }
 
-    #[allow(clippy::unwrap_in_result)]
+    #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
     fn new_with_vct_repair_guard(
         config: &Config,
         db_kind: impl AsRef<str>,
@@ -195,6 +225,7 @@ impl ZakuraDb {
         debug_skip_format_upgrades: bool,
         column_families_in_code: impl IntoIterator<Item = String>,
         open_mode: DbOpenMode,
+        database_writer_metadata: Option<&DatabaseWriterMetadata>,
     ) -> Result<ZakuraDb, StateInitError> {
         let read_only = open_mode.is_read_only();
 
@@ -279,6 +310,26 @@ impl ZakuraDb {
             format_change_handle: None,
             db: disk_db,
         };
+
+        if !read_only {
+            if let Some(database_writer_metadata) = database_writer_metadata {
+                let previous_database_writer_metadata = db.database_writer_metadata();
+                info!(
+                    previous_writer = ?previous_database_writer_metadata,
+                    "opened state database with previous node software writer metadata"
+                );
+
+                // This operational metadata is intentionally outside the format-upgrade batches:
+                // if startup exits early, the recorded writer is still useful and harmless.
+                if let Err(source) = db.record_database_writer_metadata(database_writer_metadata) {
+                    warn!(
+                        ?source,
+                        writer = ?database_writer_metadata,
+                        "failed to record current node software writer metadata"
+                    );
+                }
+            }
+        }
 
         // The original Mainnet VCT fast path did not persist historical Sprout frontiers.
         // Never expose an affected database unless this writable startup can synchronously

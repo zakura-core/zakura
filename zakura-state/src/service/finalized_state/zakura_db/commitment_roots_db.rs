@@ -1,8 +1,8 @@
 //! State-owned access to the commitment-root index.
 //!
 //! This module is the lifecycle boundary for commitment-root rows. It keeps
-//! disk-row conversion, contiguous reads, and body, supplied-root,
-//! reorganization, and rollback write policies in one place.
+//! disk-row conversion, contiguous reads, and body, reorganization, and rollback
+//! write policies in one place.
 
 use std::ops::{Bound, RangeBounds, RangeInclusive};
 
@@ -82,14 +82,6 @@ impl ZakuraDb {
         self.contiguous_commitment_roots(range)
     }
 
-    /// Returns supplied roots for the contiguous stored prefix of `range`.
-    pub fn supplied_commitment_roots_by_height_range(
-        &self,
-        range: impl RangeBounds<Height>,
-    ) -> Vec<BlockCommitmentRoots> {
-        self.contiguous_commitment_roots(range)
-    }
-
     fn contiguous_commitment_roots(
         &self,
         range: impl RangeBounds<Height>,
@@ -108,30 +100,6 @@ impl ZakuraDb {
         }
 
         roots
-    }
-
-    /// Persists supplied roots outside a larger header transaction.
-    pub fn insert_supplied_commitment_roots(
-        &self,
-        roots: impl IntoIterator<Item = BlockCommitmentRoots>,
-    ) -> Result<(), rocksdb::Error> {
-        let mut batch = DiskWriteBatch::new();
-        for roots in roots {
-            batch.insert_supplied_commitment_roots(self, &roots);
-        }
-        self.write_batch(batch)
-    }
-
-    /// Deletes supplied roots outside a larger header transaction.
-    pub fn delete_supplied_commitment_roots(
-        &self,
-        heights: impl IntoIterator<Item = Height>,
-    ) -> Result<(), rocksdb::Error> {
-        let mut batch = DiskWriteBatch::new();
-        for height in heights {
-            batch.delete_supplied_commitment_root(self, height);
-        }
-        self.write_batch(batch)
     }
 
     /// Visits root rows in `range` for rollback and migration bookkeeping.
@@ -157,30 +125,6 @@ impl DiskWriteBatch {
             .commitment_roots_cf()
             .with_batch_for_writing(self)
             .zs_insert(&roots.height, &disk_row(roots));
-    }
-
-    /// Inserts a supplied row unless a committed body owns the height.
-    pub(super) fn insert_supplied_commitment_roots(
-        &mut self,
-        db: &ZakuraDb,
-        roots: &BlockCommitmentRoots,
-    ) {
-        if db.contains_height(roots.height) {
-            return;
-        }
-
-        let _ = db
-            .commitment_roots_cf()
-            .with_batch_for_writing(self)
-            .zs_insert(&roots.height, &disk_row(roots));
-    }
-
-    /// Deletes one supplied row.
-    pub(super) fn delete_supplied_commitment_root(&mut self, db: &ZakuraDb, height: Height) {
-        let _ = db
-            .commitment_roots_cf()
-            .with_batch_for_writing(self)
-            .zs_delete(&height);
     }
 
     /// Truncates authoritative rows strictly above a finalized rollback target.

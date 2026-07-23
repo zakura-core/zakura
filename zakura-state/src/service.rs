@@ -1624,9 +1624,10 @@ where
 fn block_roots_by_height_range<C>(
     chain: Option<C>,
     db: &ZakuraDb,
+    header_chain: Option<&finalized_state::header_chain::HeaderChainReader>,
     start: block::Height,
     count: u32,
-) -> Vec<BlockCommitmentRoots>
+) -> Result<Vec<BlockCommitmentRoots>, HeaderChainStoreError>
 where
     C: AsRef<Chain>,
 {
@@ -1639,15 +1640,17 @@ where
         Some(_) => "mixed",
     };
     metrics::counter!("state.block_roots.response", "source" => source).increment(1);
-    let mut roots =
-        Vec::with_capacity(usize::try_from(capped_count).expect("capped root count fits in usize"));
+    let mut roots = Vec::new();
+    let mut selected_aux_roots: Option<std::vec::IntoIter<BlockCommitmentRoots>> = None;
 
     for offset in 0..capped_count {
         let Some(height) = start + i64::from(offset) else {
             break;
         };
 
-        let root = if db
+        let root = if let Some(selected_aux_roots) = selected_aux_roots.as_mut() {
+            selected_aux_roots.next()
+        } else if db
             .finalized_tip_height()
             .is_some_and(|finalized_tip| height <= finalized_tip)
         {
@@ -1696,9 +1699,17 @@ where
                 _ => None,
             }
         } else {
-            db.supplied_commitment_roots_by_height_range(height..=height)
-                .into_iter()
-                .next()
+            if selected_aux_roots.is_none() {
+                let remaining = capped_count.saturating_sub(offset);
+                selected_aux_roots = Some(
+                    header_chain
+                        .map(|reader| reader.selected_block_roots(height, remaining))
+                        .transpose()?
+                        .unwrap_or_default()
+                        .into_iter(),
+                );
+            }
+            selected_aux_roots.as_mut().and_then(Iterator::next)
         };
 
         let Some(root) = root else {
@@ -1712,7 +1723,7 @@ where
         roots.push(root);
     }
 
-    roots
+    Ok(roots)
 }
 
 impl Service<ReadRequest> for ReadStateService {
@@ -2031,9 +2042,10 @@ impl Service<ReadRequest> for ReadStateService {
                     block_roots_by_height_range(
                         state.latest_best_chain(),
                         &state.db,
+                        state.header_chain_reader_receiver.borrow().as_ref(),
                         start_height,
                         count,
-                    )
+                    )?
                 };
 
                 Ok(ReadResponse::BlockRoots(roots))

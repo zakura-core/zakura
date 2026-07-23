@@ -37,7 +37,8 @@ use crate::{
         finalized_state::{
             header_chain::{
                 migration::{initialize_header_chain_reconciled, HeaderChainInitializationError},
-                HeaderChainReader, HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError,
+                select_vct_aux_delivery, HeaderChainReader, HeaderChainRuntime, HeaderChainStore,
+                HeaderChainStoreError,
             },
             DiskWriteBatch, FinalizedState, NextVctBlock, VctAuxRejection, VctAuxWindow, ZakuraDb,
         },
@@ -179,6 +180,12 @@ pub(in crate::service) struct HeaderChainWriter {
     clock: SystemClock,
 }
 
+#[derive(Debug)]
+pub(crate) enum VctAuxWindowRead {
+    Ready(Box<VctAuxWindow>),
+    Missing { height: block::Height },
+}
+
 #[derive(Debug, Error)]
 enum HeaderChainAttachmentError {
     #[error("finalized state has no authenticated genesis header at semantic handoff")]
@@ -208,27 +215,48 @@ impl HeaderChainWriter {
         }
     }
 
-    fn vct_aux_window(&self, height: block::Height, hash: block::Hash) -> Option<VctAuxWindow> {
-        let window = self
-            .runtime
-            .reader()
-            .selected_aux_window(height, hash)
-            .ok()??;
-        let current = select_vct_aux_delivery(window.current_deliveries)?;
-        let current_aux = current.tree_aux?;
+    pub(crate) fn vct_aux_window(
+        &self,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> Result<VctAuxWindowRead, HeaderChainStoreError> {
+        let Some(window) = self.runtime.reader().selected_aux_window(height, hash)? else {
+            return Ok(VctAuxWindowRead::Missing { height });
+        };
+        let Some(current) = select_vct_aux_delivery(window.current_deliveries) else {
+            return Ok(VctAuxWindowRead::Missing { height });
+        };
+        let Some(current_aux) = current.tree_aux else {
+            return Ok(VctAuxWindowRead::Missing { height });
+        };
         if current.header_hash != window.current.hash || current_aux.height != window.current.height
         {
-            return None;
+            return Err(zakura_header_chain::StoreError::Incoherent(
+                "selected VCT delivery disagrees with its retained header",
+            )
+            .into());
         }
-        let successor = window.successor.and_then(|(successor, deliveries)| {
-            let delivery = select_vct_aux_delivery(deliveries)?;
-            NextVctBlock::from_delivery(successor.header, successor.height, delivery)
-        });
-        Some(VctAuxWindow {
+        let successor = match window.successor {
+            Some((successor, deliveries)) => {
+                let Some(delivery) = select_vct_aux_delivery(deliveries) else {
+                    return Ok(VctAuxWindowRead::Missing {
+                        height: successor.height,
+                    });
+                };
+                Some(
+                    NextVctBlock::from_delivery(successor.header, successor.height, delivery)
+                        .ok_or(zakura_header_chain::StoreError::Incoherent(
+                            "selected VCT successor delivery disagrees with its retained header",
+                        ))?,
+                )
+            }
+            None => None,
+        };
+        Ok(VctAuxWindowRead::Ready(Box::new(VctAuxWindow {
             snapshot: window.snapshot,
             current,
             successor,
-        })
+        })))
     }
 
     fn attach_at_semantic_handoff(
@@ -445,29 +473,6 @@ impl HeaderChainWriter {
             },
         ))
     }
-}
-
-fn select_vct_aux_delivery(
-    deliveries: Vec<zakura_header_chain::AuxDelivery>,
-) -> Option<zakura_header_chain::AuxDelivery> {
-    deliveries
-        .into_iter()
-        .filter(|delivery| {
-            delivery.tree_aux.is_some()
-                && !matches!(
-                    delivery.authentication,
-                    zakura_header_chain::AuxAuthentication::Rejected { .. }
-                )
-        })
-        .min_by_key(|delivery| {
-            (
-                !matches!(
-                    delivery.authentication,
-                    zakura_header_chain::AuxAuthentication::Authenticated { .. }
-                ),
-                delivery.delivery_id,
-            )
-        })
 }
 
 fn verified_path(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
@@ -1162,17 +1167,55 @@ impl WriteBlockWorkerTask {
             // block hashes do not bind authorizing data, so an altered same-hash body
             // could supply the wrong auth-data root and make a valid current root look
             // invalid. The buffered body remains in the look-ahead for its own commit.
-            let needs_vct_successor =
-                finalized_state.vct_fast_needs_successor(ordered_block.0.height);
-            let next_block_took_vct_path =
-                finalized_state.vct_fast_will_apply(ordered_block.0.height);
-            let vct_aux_window = if next_block_took_vct_path {
-                header_chain.as_ref().and_then(|writer| {
-                    writer.vct_aux_window(ordered_block.0.height, ordered_block.0.hash)
-                })
+            let requires_exact_vct_roots = header_chain.is_some()
+                && finalized_state.vct_requires_exact_roots(ordered_block.0.height);
+            let vct_aux_window = if requires_exact_vct_roots {
+                match header_chain
+                    .as_ref()
+                    .expect("exact VCT roots are required only with an attached header chain")
+                    .vct_aux_window(ordered_block.0.height, ordered_block.0.hash)
+                {
+                    Ok(VctAuxWindowRead::Ready(window)) => Some(*window),
+                    Ok(VctAuxWindowRead::Missing { height }) => {
+                        let wait = vct_write_manager.on_retryable_error(
+                            height,
+                            true,
+                            false,
+                            ordered_block,
+                        );
+                        std::thread::park_timeout(wait);
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            ?error,
+                            height = ?ordered_block.0.height,
+                            hash = ?ordered_block.0.hash,
+                            "stopping finalized writer after incoherent header auxiliary read"
+                        );
+                        return;
+                    }
+                }
             } else {
                 None
             };
+            let has_exact_vct_roots = vct_aux_window.as_ref().is_some_and(|window| {
+                window
+                    .current_roots(ordered_block.0.height, ordered_block.0.hash)
+                    .is_some()
+            });
+            let next_block_took_vct_path = requires_exact_vct_roots && has_exact_vct_roots;
+            let needs_vct_successor = finalized_state
+                .vct_fast_needs_successor(ordered_block.0.height, has_exact_vct_roots);
+
+            if requires_exact_vct_roots && !has_exact_vct_roots {
+                tracing::error!(
+                    height = ?ordered_block.0.height,
+                    hash = ?ordered_block.0.hash,
+                    "stopping finalized writer after an incoherent ready VCT auxiliary window"
+                );
+                return;
+            }
 
             if needs_vct_successor
                 && vct_aux_window
@@ -1256,6 +1299,7 @@ impl WriteBlockWorkerTask {
                     chain_tip_sender.set_finalized_tip(tip_block);
                 }
                 Err((ordered_block, error)) => {
+                    let mut rejected_aux_height = None;
                     if let (Some(window), Some(failure)) =
                         (vct_aux_for_outcome.as_ref(), error.vct_failure())
                     {
@@ -1280,13 +1324,16 @@ impl WriteBlockWorkerTask {
                         if let Some(writer) = header_chain.as_ref() {
                             match writer.reject_vct_aux(window, rejection, failure) {
                                 Ok(Some(ApplyResult::Committed(_) | ApplyResult::NoChange(_))) => {
-                                    if matches!(
-                                        rejection,
-                                        VctAuxRejection::Current | VctAuxRejection::Ambiguous
-                                    ) {
-                                        finalized_state
-                                            .invalidate_vct_fast_root(ordered_block.0.height);
-                                    }
+                                    rejected_aux_height = match rejection {
+                                        VctAuxRejection::Current | VctAuxRejection::Ambiguous => {
+                                            Some(ordered_block.0.height)
+                                        }
+                                        VctAuxRejection::Successor => window
+                                            .successor
+                                            .as_ref()
+                                            .map(|successor| successor.height),
+                                        VctAuxRejection::None => None,
+                                    };
                                 }
                                 Ok(Some(ApplyResult::Stale(receipt))) => {
                                     tracing::debug!(
@@ -1313,12 +1360,13 @@ impl WriteBlockWorkerTask {
                     // stall just waits for the next header to be stored, so it polls faster.
                     if let Some(height) = error.vct_retryable_height() {
                         let root_unavailable = error.vct_supplied_root_unavailable_height();
+                        let repair_height = rejected_aux_height.unwrap_or(height);
 
                         prev_finalized_note_commitment_trees = prev_note_commitment_trees_for_retry;
                         let wait = vct_write_manager.on_retryable_error(
-                            height,
+                            repair_height,
                             root_unavailable.is_some(),
-                            next_block_took_vct_path,
+                            rejected_aux_height.is_some(),
                             ordered_block,
                         );
                         std::thread::park_timeout(wait);

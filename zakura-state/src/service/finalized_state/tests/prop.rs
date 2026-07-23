@@ -29,7 +29,7 @@ use crate::{
 
 use super::super::{
     commitment_aux, serve_block_roots, vct::validate_final_frontiers_bytes,
-    CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState, NextVctBlock,
+    CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState, NextVctBlock, VctAuxWindow,
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -58,6 +58,100 @@ fn vct_successor_header(block: Arc<Block>) -> NextVctBlock {
 
 fn next_vct_block(block: Arc<Block>) -> Option<NextVctBlock> {
     Some(vct_successor_header(block))
+}
+
+fn exact_vct_aux_window(
+    block: &Arc<Block>,
+    height: Height,
+    roots: (
+        zakura_chain::sapling::tree::Root,
+        zakura_chain::orchard::tree::Root,
+        zakura_chain::ironwood::tree::Root,
+    ),
+    successor: &Arc<Block>,
+) -> VctAuxWindow {
+    use std::num::NonZeroU64;
+    use zakura_header_chain::{
+        AlarmSet, AuxAuthentication, AuxDelivery, BodySizeHint, BranchId, ChainScore, EngineMode,
+        EngineSnapshot, EvidenceId, Frontier, FrontierSet, HeaderGeneration, SourceId,
+        StateVersion, SuffixWork, TreeAuxRecordV1, VerifiedGeneration, WorkOwner,
+    };
+
+    let hash = block.hash();
+    let successor_height = height.next().expect("the VCT fixture has a successor");
+    let successor_hash = successor.hash();
+    let frontier = Frontier::new(height, hash);
+    let snapshot = EngineSnapshot {
+        mode: EngineMode::Integrated,
+        state_version: StateVersion::new(1),
+        header_generation: HeaderGeneration::new(1),
+        verified_generation: VerifiedGeneration::new(1),
+        frontiers: FrontierSet {
+            finalized: frontier,
+            header_best: Frontier::new(successor_height, successor_hash),
+            verified_best: frontier,
+        },
+        header_best_score: ChainScore::new(SuffixWork::zero(), successor_hash),
+        oldest_retained_height: height,
+        alarms: AlarmSet::default(),
+    };
+    let owner = WorkOwner {
+        state_version: snapshot.state_version,
+        header_generation: snapshot.header_generation,
+        verified_generation: Some(snapshot.verified_generation),
+        branch: BranchId::new(hash, successor_hash),
+        session_id: 1,
+        request_id: NonZeroU64::new(1).expect("one is nonzero"),
+    };
+    let mut current_delivery_id = [0; 32];
+    current_delivery_id[..4].copy_from_slice(&height.0.to_le_bytes());
+    let mut successor_delivery_id = current_delivery_id;
+    successor_delivery_id[4] = 1;
+    let current = AuxDelivery {
+        delivery_id: EvidenceId::from_digest(current_delivery_id),
+        header_hash: hash,
+        source: SourceId::from_digest([1; 32]),
+        owner,
+        body_size: BodySizeHint::Unknown,
+        tree_aux: Some(TreeAuxRecordV1 {
+            height,
+            sapling_root: roots.0,
+            orchard_root: roots.1,
+            ironwood_root: roots.2,
+            sapling_tx_count: 0,
+            orchard_tx_count: 0,
+            ironwood_tx_count: 0,
+            auth_data_root: block.auth_data_root(),
+        }),
+        authentication: AuxAuthentication::Unauthenticated,
+    };
+    let successor_delivery = AuxDelivery {
+        delivery_id: EvidenceId::from_digest(successor_delivery_id),
+        header_hash: successor_hash,
+        source: SourceId::from_digest([2; 32]),
+        owner,
+        body_size: BodySizeHint::Unknown,
+        tree_aux: Some(TreeAuxRecordV1 {
+            height: successor_height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: 0,
+            orchard_tx_count: 0,
+            ironwood_tx_count: 0,
+            auth_data_root: successor.auth_data_root(),
+        }),
+        authentication: AuxAuthentication::Unauthenticated,
+    };
+    VctAuxWindow {
+        snapshot,
+        current,
+        successor: NextVctBlock::from_delivery(
+            successor.header.clone(),
+            successor_height,
+            successor_delivery,
+        ),
+    }
 }
 
 /// A handoff frontier over empty trees at `height`, for sources whose test does not
@@ -518,6 +612,47 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             // was already validated by its predecessor's look-ahead, so it is skipped.
             prop_assert_eq!(fast.vct_prevalidated_count(), (last - seed - 1) as u64, "every fast block after the first skips its redundant own commitment check");
 
+            // Production does not have a height-keyed root source. Prove that the same
+            // consensus result is driven solely by exact hash-scoped auxiliary windows.
+            let mut exact = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            exact.enable_vct_fast_source(
+                Box::new(commitment_aux::FixtureSource::new(
+                    HashMap::new(),
+                    test_handoff_frontiers(Height::MAX),
+                )),
+                true,
+            );
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                if i <= seed {
+                    exact
+                        .commit_finalized_direct(cv.into(), None, None, "vct exact seed")
+                        .expect("the pre-VCT prefix recomputes normally");
+                    continue;
+                }
+                let height_u32 = u32::try_from(i).expect("the bounded fixture height fits in u32");
+                let roots = fixture
+                    .get(&height_u32)
+                    .copied()
+                    .expect("the exact fast range has roots");
+                let window = exact_vct_aux_window(
+                    &blocks[i].block,
+                    Height(height_u32),
+                    roots,
+                    &blocks[i + 1].block,
+                );
+                exact
+                    .commit_finalized_direct_with_exact_aux_for_test(
+                        cv.into(),
+                        window,
+                        "vct exact auxiliary",
+                    )
+                    .expect("exact hash-scoped auxiliary roots commit");
+            }
+            prop_assert_eq!(exact.db.vct_anchor_digest(), golden_anchors, "exact auxiliary anchors must match legacy");
+            prop_assert_eq!(exact.db.history_tree().hash(), golden_history, "exact auxiliary history must match legacy");
+            prop_assert_eq!(exact.vct_fast_count(), (last - seed) as u64, "every exact auxiliary height took the fast path");
+
             // A trusted local fixture may commit its tip root without a successor: it is
             // not adversarial and the root is checked in arrears when a successor arrives.
             let mut no_successor = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
@@ -529,7 +664,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
                     .commit_finalized_direct(cv.into(), None, next, "vct no-successor seed")
                     .expect("verified fast commit succeeds with successor");
             }
-            prop_assert!(!no_successor.vct_fast_needs_successor(Height(last as u32)), "a trusted fixture tip can commit without a successor");
+            prop_assert!(!no_successor.vct_fast_needs_successor(Height(last as u32), true), "a trusted fixture tip can commit without a successor");
             let cv = CheckpointVerifiedBlock::from(blocks[last].block.clone());
             no_successor
                 .commit_finalized_direct(cv.into(), None, None, "vct trusted fixture no successor")
@@ -606,7 +741,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
 /// driver's gap handling — could trigger this). Instead the committer must refuse with the
 /// retryable `VctSuppliedRootUnavailable` error and leave the database untouched, so the
 /// block can be committed later from a fetched root. This guards the liveness/no-corruption
-/// half of the peer-source fast path (the bad-root rejection half is covered by
+/// half of the untrusted fast path (the bad-root rejection half is covered by
 /// `vct_fast_path_matches_legacy_and_rejects_wrong_roots`).
 #[test]
 #[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and the fixture by height
@@ -816,8 +951,8 @@ fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
 /// whose tip commits on the in-arrears check); this guards the peer path specifically.
 #[test]
 #[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and inserts roots by height
-fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> {
-    use crate::service::finalized_state::commitment_aux::PeerSource;
+fn vct_untrusted_source_defers_unverifiable_tip_root_until_successor() -> Result<()> {
+    use crate::service::finalized_state::commitment_aux::FixtureSource;
     use zakura_chain::parallel::commitment_aux::BlockCommitmentRoots;
 
     let _init_guard = zakura_test::init();
@@ -915,15 +1050,19 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
             Arc::make_mut(&mut Arc::make_mut(&mut target_successor).header).commitment_bytes =
                 target_history_root.bytes_in_serialized_order().into();
 
-            // An untrusted peer source pre-filled with the *correct* roots: the deferral is
-            // about the missing successor, not a bad root. The roots are persisted into the
-            // fast state's own database through the same header-sync write path production
-            // uses, and the peer source reads them back from that database.
+            // An untrusted source pre-filled with the correct roots: the deferral is about
+            // the missing successor, not a bad root.
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
-            fast.db
-                .insert_supplied_commitment_roots(peer_roots)
-                .expect("writing header-sync roots to an ephemeral database succeeds");
-            let source = PeerSource::new(fast.db.clone(), test_handoff_frontiers(Height::MAX));
+            let roots = peer_roots
+                .into_iter()
+                .map(|roots| {
+                    (
+                        roots.height.0,
+                        (roots.sapling_root, roots.orchard_root, roots.ironwood_root),
+                    )
+                })
+                .collect();
+            let source = FixtureSource::new(roots, test_handoff_frontiers(Height::MAX));
             fast.enable_vct_fast_source(Box::new(source), true);
 
             // Commit up to (but not including) the tip target, each with its successor.
@@ -939,9 +1078,9 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
             let sprout_count_before_retries = sprout_tree_before_retries.count();
 
             // The tip target with no successor header must defer, not commit: its own
-            // (correct) root is not yet confirmed, and the peer source is untrusted.
+            // (correct) root is not yet confirmed, and the source is untrusted.
             prop_assert!(
-                fast.vct_fast_needs_successor(Height(tip_target as u32)),
+                fast.vct_fast_needs_successor(Height(tip_target as u32), true),
                 "an untrusted peer tip root needs successor verification"
             );
             let pre_deferral_prevalidated = fast.vct_prevalidated_count();
@@ -995,7 +1134,7 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
             );
             prop_assert!(
                 error.vct_supplied_root_unavailable_height().is_none(),
-                "a non-linking witness is not a root failure — the correct root stays cached: {error:?}"
+                "a non-linking witness is not a root failure — the correct fixture remains available: {error:?}"
             );
             prop_assert_eq!(
                 fast.db.finalized_tip_height(),
@@ -1052,13 +1191,12 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
     Ok(())
 }
 
-/// A wrong peer-supplied root must be recoverable at the same height: the committer rejects and
-/// evicts the bad cached value, leaves the database parked below the height, then commits the
-/// same block once the `tree_aux` driver refills that height with a verifiable root.
+/// A wrong untrusted root must be recoverable at the same height: the committer rejects it,
+/// leaves the database parked below the height, then commits the same block with a replacement.
 #[test]
 #[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and inserts roots by height
-fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
-    use crate::service::finalized_state::commitment_aux::PeerSource;
+fn vct_untrusted_source_bad_root_replacement_commits_same_height() -> Result<()> {
+    use crate::service::finalized_state::commitment_aux::FixtureSource;
     use zakura_chain::parallel::commitment_aux::BlockCommitmentRoots;
 
     let _init_guard = zakura_test::init();
@@ -1135,10 +1273,16 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
             let correct_target_root = correct_target_root.expect("target root was produced");
 
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
-            fast.db
-                .insert_supplied_commitment_roots(peer_roots)
-                .expect("writing header-sync roots to an ephemeral database succeeds");
-            let source = PeerSource::new(fast.db.clone(), test_handoff_frontiers(Height::MAX));
+            let mut roots: std::collections::HashMap<_, _> = peer_roots
+                .into_iter()
+                .map(|roots| {
+                    (
+                        roots.height.0,
+                        (roots.sapling_root, roots.orchard_root, roots.ironwood_root),
+                    )
+                })
+                .collect();
+            let source = FixtureSource::new(roots.clone(), test_handoff_frontiers(Height::MAX));
             fast.enable_vct_fast_source(Box::new(source), true);
 
             for i in 0..target {
@@ -1165,15 +1309,25 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
                 "the rejected root left the database parked below the target"
             );
 
-            // Simulate the `tree_aux` driver refilling the evicted height from another peer:
-            // header sync persists the replacement through the same database write path.
-            fast.db
-                .insert_supplied_commitment_roots([correct_target_root])
-                .expect("refilling the evicted height succeeds");
+            roots.insert(
+                correct_target_root.height.0,
+                (
+                    correct_target_root.sapling_root,
+                    correct_target_root.orchard_root,
+                    correct_target_root.ironwood_root,
+                ),
+            );
+            fast.enable_vct_fast_source(
+                Box::new(FixtureSource::new(
+                    roots,
+                    test_handoff_frontiers(Height::MAX),
+                )),
+                true,
+            );
 
             let cv = CheckpointVerifiedBlock::from(blocks[target].block.clone());
             fast.commit_finalized_direct(cv.into(), None, next, "vct refilled target")
-                .expect("the same height commits once the peer cache is refilled");
+                .expect("the same height commits once the untrusted root is replaced");
             prop_assert_eq!(
                 fast.db.finalized_tip_height(),
                 Some(Height(target as u32)),
@@ -1473,7 +1627,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 handoff_trees.sprout.clone(),
                 handoff_trees.ironwood.clone(),
             );
-            prop_assert!(!fast.vct_fast_needs_successor(handoff), "the trusted handoff frontier authenticates the handoff root without a successor");
+            prop_assert!(!fast.vct_fast_needs_successor(handoff, true), "the trusted handoff frontier authenticates the handoff root without a successor");
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = (i < last)
@@ -2438,16 +2592,10 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
     Ok(())
 }
 
-/// Verified-commitment-trees consumer half of the peer source: a
-/// [`commitment_aux::PeerSource`] whose database is **filled incrementally** (as header
-/// sync persists provisional root ranges when they arrive from peers) drives the fast
-/// path to byte-identical consensus state. Same harness as the DB-produced round-trip,
-/// but the produced roots are written into `commitment_roots_by_height` in two chunks
-/// via [`ZakuraDb::insert_supplied_commitment_roots`] — proving the DB-backed,
-/// header-sync-fed source is a drop-in for the fixture.
+/// An untrusted VCT root fixture drives the fast path to byte-identical consensus state.
 #[test]
 #[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] (the look-ahead) and by height
-fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<()> {
+fn vct_untrusted_fixture_drives_byte_identical_state() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     let network = ParametersBuilder::default()
@@ -2478,7 +2626,7 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
             let blocks: Vec<_> = chain.iter().collect();
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
             let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
-            // The untrusted peer source defers any fast block whose own root has no buffered
+            // The untrusted source defers any fast block whose own root has no buffered
             // successor, so every committed fast block needs `blocks[i + 1]`. Keep `last` one
             // below the chain tip so the deepest commit still has a successor witness.
             let last = ((nu5 + 3) as usize).min(blocks.len().saturating_sub(2));
@@ -2490,7 +2638,7 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
             for block in blocks.iter().take(last + 1) {
                 let cv = CheckpointVerifiedBlock::from(block.block.clone());
                 legacy
-                    .commit_finalized_direct(cv.into(), None, None, "vct peer-source legacy")
+                    .commit_finalized_direct(cv.into(), None, None, "vct fixture legacy")
                     .unwrap();
             }
             let golden_anchors = legacy.db.vct_anchor_digest();
@@ -2502,34 +2650,35 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
                 Height((seed + 1) as u32)..=Height(last as u32),
             );
 
-            // Consume the peer-source-supplied roots in a fresh fast-sync state. Each fast
+            // Consume the untrusted roots in a fresh fast-sync state. Each fast
             // block is committed with its successor buffered, as the write loop does — the
             // untrusted source defers a tip commit with no successor (covered by
             // `vct_peer_source_defers_unverifiable_tip_root_until_successor`).
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
 
-            // Fill the fast state's database incrementally, in two chunks, as header sync
-            // would when successive root ranges arrive from a peer; the peer source reads
-            // them back from that database.
-            let split = produced_roots.len() / 2;
-            fast.db
-                .insert_supplied_commitment_roots(produced_roots[..split].iter().cloned())
-                .expect("writing the first header-sync root chunk succeeds");
-            fast.db
-                .insert_supplied_commitment_roots(produced_roots[split..].iter().cloned())
-                .expect("writing the second header-sync root chunk succeeds");
-            let peer_source =
-                commitment_aux::PeerSource::new(fast.db.clone(), test_handoff_frontiers(Height::MAX));
-            fast.enable_vct_fast_source(Box::new(peer_source), true);
+            let roots = produced_roots
+                .into_iter()
+                .map(|roots| {
+                    (
+                        roots.height.0,
+                        (roots.sapling_root, roots.orchard_root, roots.ironwood_root),
+                    )
+                })
+                .collect();
+            let source = commitment_aux::FixtureSource::new(
+                roots,
+                test_handoff_frontiers(Height::MAX),
+            );
+            fast.enable_vct_fast_source(Box::new(source), true);
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = next_vct_block(blocks[i + 1].block.clone());
-                fast.commit_finalized_direct(cv.into(), None, next, "vct peer-source fast")
-                    .expect("verified fast commit from peer-source roots succeeds");
+                fast.commit_finalized_direct(cv.into(), None, next, "vct fixture fast")
+                    .expect("verified fast commit from untrusted roots succeeds");
             }
 
-            prop_assert_eq!(fast.db.vct_anchor_digest(), golden_anchors, "fast anchors from peer-source roots match legacy");
-            prop_assert_eq!(fast.db.history_tree().hash(), golden_history, "fast history from peer-source roots match legacy");
+            prop_assert_eq!(fast.db.vct_anchor_digest(), golden_anchors, "fast anchors from fixture roots match legacy");
+            prop_assert_eq!(fast.db.history_tree().hash(), golden_history, "fast history from fixture roots match legacy");
     });
 
     Ok(())

@@ -2,7 +2,7 @@
 //!
 //! This module holds the embedded-final-frontier plumbing and run counters for the
 //! verified-commitment-trees fast-sync. On networks with an embedded final frontier,
-//! the default source is the peer `tree_aux` source. `checkpoint_sync = false` or
+//! the default source is exact hash-scoped `tree_aux` data. `checkpoint_sync = false` or
 //! `consensus.vct_fast_sync = false` selects legacy recompute.
 
 pub(super) mod artifact;
@@ -24,10 +24,7 @@ use zakura_chain::{
 };
 use zakura_header_chain::{AuxAuthentication, AuxDelivery};
 
-use super::{
-    commitment_aux::{CommitmentRootSource, FinalFrontiers, PeerSource},
-    ZakuraDb,
-};
+use super::commitment_aux::{CommitmentRootSource, EmbeddedFrontierSource, FinalFrontiers};
 use crate::error::VctCommitFailure;
 
 /// A VCT successor header used to authenticate the current block's supplied
@@ -199,15 +196,14 @@ pub enum FinalFrontiersValidationError {
 /// State for the verified-commitment-trees fast-sync.
 /// (`docs/design/verified-commitment-trees.md`).
 ///
-/// A checkpoint-trusting sync (`checkpoint_sync = true`) uses the peer `tree_aux` source by
+/// A checkpoint-trusting sync (`checkpoint_sync = true`) uses exact header `tree_aux` data by
 /// default on networks with embedded final frontiers; `checkpoint_sync = false` or
 /// `vct_fast_sync = false` opts out to the legacy per-block recompute (no VCT state).
 #[derive(Debug)]
 pub(crate) struct VctState {
     /// `true` when the VCT fast-sync is enabled.
     enabled: bool,
-    /// Where the verified per-block roots and final frontier come from. The
-    /// committer reads roots/final frontier through this seam only.
+    /// Embedded final-frontier authority, plus test-only root fixtures.
     source: Box<dyn CommitmentRootSource>,
     /// Whether roots from this VCT state must be confirmed against a stored successor header
     /// before they are committed.
@@ -226,13 +222,12 @@ pub(crate) struct VctState {
 enum SourceMode {
     /// Legacy recompute committer (no VCT state).
     Legacy,
-    /// Fetch per-block roots from peers — the default where embedded frontiers exist.
-    Peer,
+    /// Consume exact hash-scoped header auxiliary data.
+    HeaderAuxiliary,
 }
 
-/// Resolve the source mode as a pure function, so the peer-source default is
-/// unit-testable without touching embedded-frontier files. The fast verified path
-/// (peer source) is the default whenever the node syncs under checkpoint trust and
+/// Resolve the source mode as a pure function without touching embedded-frontier files.
+/// The exact header-auxiliary path is the default whenever the node syncs under checkpoint trust and
 /// the network has an embedded handoff frontier. `checkpoint_sync = false` or
 /// `vct_fast_sync = false` selects the legacy recompute; a network with no embedded
 /// frontier also falls back to legacy. Storage mode (Archive vs. Pruned) is orthogonal and not
@@ -245,7 +240,7 @@ fn select_source_mode(
     if !checkpoint_sync || !vct_fast_sync || !has_embedded_frontiers {
         SourceMode::Legacy
     } else {
-        SourceMode::Peer
+        SourceMode::HeaderAuxiliary
     }
 }
 
@@ -260,7 +255,6 @@ impl VctState {
         checkpoint_sync: bool,
         vct_fast_sync: bool,
         network: &Network,
-        db: ZakuraDb,
     ) -> Option<Arc<Self>> {
         // Parse the embedded handoff frontier once (None on networks without one, e.g.
         // Testnet). The decision below only needs its presence; the peer arm reuses the
@@ -268,19 +262,15 @@ impl VctState {
         let embedded = embedded_final_frontiers(network);
 
         match select_source_mode(checkpoint_sync, vct_fast_sync, embedded.is_some()) {
-            // Default: the peer (`tree_aux`) source on any network with embedded final
-            // frontiers (Mainnet). Per-block roots arrive from peers into a shared cache
-            // filled by the driver; the committer reads them per height and folds them in,
-            // skipping the recompute. A height the peer cannot supply — or any node with no
-            // serving peers — stays in legacy mode, bit-identical to a legacy committer by
-            // construction.
-            SourceMode::Peer => {
+            // Default: hash-scoped `tree_aux` deliveries from the header-chain store,
+            // authenticated against this embedded handoff frontier.
+            SourceMode::HeaderAuxiliary => {
                 let parsed = embedded?;
                 tracing::info!(
                     handoff_height = parsed.height.0,
-                    "VCT: peer (tree_aux) source enabled by default — roots fetched from peers"
+                    "VCT: exact header auxiliary source enabled by default"
                 );
-                let source = PeerSource::new(db, parsed);
+                let source = EmbeddedFrontierSource::new(parsed);
                 Some(Arc::new(VctState {
                     enabled: true,
                     source: Box::new(source),
@@ -297,13 +287,9 @@ impl VctState {
         }
     }
 
-    /// `true` when the VCT fast-sync is enabled.
-    pub(super) fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
     /// The supplied roots for `height`, when vct mode has a source entry for it
     /// (the signal that this block takes the VCT fast-sync).
+    #[cfg(test)]
     pub(super) fn vct_roots_at_height(
         &self,
         height: block::Height,
@@ -334,18 +320,19 @@ impl VctState {
         &self,
         height: block::Height,
         network: &Network,
+        has_exact_roots: bool,
     ) -> bool {
         self.enabled
-            && self.vct_roots_at_height(height).is_some()
+            && has_exact_roots
+            && height <= self.source.vct_last_checkpoint_height()
             && self.requires_verified_successor
             && self.source.final_frontiers().height != height
             && Some(height) >= NetworkUpgrade::Heartwood.activation_height(network)
     }
 
-    /// Discard the supplied root for `height` after it failed verification, so a re-fetch
-    /// can replace it. See [`CommitmentRootSource::invalidate`].
-    pub(super) fn invalidate_fast_root(&self, height: block::Height) {
-        self.source.invalidate(height);
+    /// `true` when exact header-owned roots are required for `height`.
+    pub(super) fn accepts_exact_roots_at(&self, height: block::Height) -> bool {
+        self.enabled && height <= self.source.vct_last_checkpoint_height()
     }
 
     /// The checkpoint handoff height: the boundary below which the fast path skips
@@ -559,7 +546,7 @@ impl VctCommitState {
 
 /// Fast-path (vct) outputs for the block being committed, passed as one
 /// parameter from the committer down through
-/// `ZakuraDb::write_block` to `ZakuraDb::prepare_trees_batch`.
+/// `super::ZakuraDb::write_block` to `super::ZakuraDb::prepare_trees_batch`.
 ///
 /// The fields are independent: a checkpoint-handoff block sets `sync_below`
 /// but leaves `anchor_roots` `None` (it writes the real frontier via the
@@ -777,21 +764,21 @@ mod tests {
         use SourceMode::*;
         // Args are (checkpoint_sync, vct_fast_sync, has_embedded_frontiers).
 
-        // The default: a checkpoint-trusting sync with VCT fast sync on uses the peer source
+        // The default: a checkpoint-trusting sync with VCT fast sync on uses header auxiliary data
         // wherever embedded frontiers exist (Mainnet). Storage mode (Archive/Pruned) is not an
         // input, so this covers both Archive and Pruned.
-        assert_eq!(select_source_mode(true, true, true), Peer);
+        assert_eq!(select_source_mode(true, true, true), HeaderAuxiliary);
         // `vct_fast_sync = false` keeps checkpoint sync on but forces the legacy recompute,
         // regardless of embedded frontiers.
         assert_eq!(select_source_mode(true, false, true), Legacy);
         assert_eq!(select_source_mode(true, false, false), Legacy);
-        // `checkpoint_sync = false` also fully recomputes the trees: legacy, never peer,
+        // `checkpoint_sync = false` also fully recomputes the trees: legacy, never auxiliary,
         // regardless of the fast-sync knob or embedded frontiers.
         assert_eq!(select_source_mode(false, true, true), Legacy);
         assert_eq!(select_source_mode(false, true, false), Legacy);
         assert_eq!(select_source_mode(false, false, true), Legacy);
         assert_eq!(select_source_mode(false, false, false), Legacy);
-        // No embedded frontiers (e.g. Testnet): legacy, never peer, even under checkpoint sync.
+        // No embedded frontiers (e.g. Testnet): legacy, never auxiliary, even under checkpoint sync.
         assert_eq!(select_source_mode(true, true, false), Legacy);
     }
 
@@ -826,7 +813,7 @@ mod tests {
             false,
         );
         assert!(
-            !trusted.vct_root_needs_successor(height, &network),
+            !trusted.vct_root_needs_successor(height, &network, true),
             "trusted fixture roots can commit without a stored successor header"
         );
 
@@ -838,7 +825,7 @@ mod tests {
             true,
         );
         assert!(
-            untrusted.vct_root_needs_successor(height, &network),
+            untrusted.vct_root_needs_successor(height, &network, true),
             "untrusted roots defer until a stored successor header verifies them"
         );
     }

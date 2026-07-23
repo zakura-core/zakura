@@ -448,12 +448,7 @@ impl FinalizedState {
             read_only,
         )?;
 
-        let vct = VctState::from_config(
-            config.checkpoint_sync,
-            config.vct_fast_sync,
-            network,
-            db.clone(),
-        );
+        let vct = VctState::from_config(config.checkpoint_sync, config.vct_fast_sync, network);
 
         // Re-derive this flag from the durable fast-sync marker, so reopening
         // before the checkpoint handoff still refuses roots below the last
@@ -819,6 +814,29 @@ impl FinalizedState {
         )
     }
 
+    #[cfg(test)]
+    pub(super) fn commit_finalized_direct_with_exact_aux_for_test(
+        &mut self,
+        finalizable_block: FinalizableBlock,
+        vct_aux_window: VctAuxWindow,
+        source: &str,
+    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+        let next_vct_block = vct_aux_window.successor.clone();
+        self.commit_finalized_direct_with_aux(
+            finalizable_block,
+            None,
+            next_vct_block,
+            Some(vct_aux_window),
+            source,
+            |db, batch| {
+                db.header_chain_disk_db()
+                    .write(batch)
+                    .expect("unexpected rocksdb error while writing block");
+                Ok(())
+            },
+        )
+    }
+
     /// Prepare a finalized block and delegate its single durable batch to `commit`.
     pub(in crate::service) fn commit_finalized_direct_with<C>(
         &mut self,
@@ -887,16 +905,16 @@ impl FinalizedState {
                         .source()
                         .map(|v| v.vct_sync_last_checkpoint_height());
 
-                    // In vct mode, if the source has this height's roots at or below the
-                    // last checkpoint height, we skip the per-block note-commitment frontier recompute
-                    // (`update_trees_parallel`). Instead, we validate the peer-supplied roots
-                    // against the successor block's header/MMR.
+                    // Exact hash-scoped roots below the handoff skip the per-block
+                    // note-commitment frontier recompute. Tests can inject an equivalent
+                    // local fixture through the source seam.
                     let exact_vct_roots = vct_aux_window
                         .as_ref()
                         .and_then(|window| window.current_roots(height, block.hash()));
-                    let has_exact_vct_aux = vct_aux_window.is_some();
+                    let vct_roots = exact_vct_roots;
+                    #[cfg(test)]
                     let vct_roots = match vct_aux_window.as_ref() {
-                        Some(_) => exact_vct_roots,
+                        Some(_) => vct_roots,
                         None => self.vct.source().and_then(|v| {
                             if vct_last_checkpoint_height.is_some_and(|last_checkpoint_height| {
                                 height > last_checkpoint_height
@@ -1057,7 +1075,6 @@ impl FinalizedState {
                                         height,
                                         error,
                                         crate::error::VctCommitFailure::CurrentRoots,
-                                        !has_exact_vct_aux,
                                     ),
                                     commitment_aux_verify::CommitmentRootVerificationError::SuccessorBoundary {
                                         error,
@@ -1066,7 +1083,6 @@ impl FinalizedState {
                                         height,
                                         error,
                                         crate::error::VctCommitFailure::SuccessorBoundary,
-                                        !has_exact_vct_aux,
                                     ),
                                 }
                             })?;
@@ -1085,7 +1101,7 @@ impl FinalizedState {
                         } else if self
                             .vct
                             .source()
-                            .is_some_and(|v| v.vct_root_needs_successor(height, &network))
+                            .is_some_and(|v| v.vct_root_needs_successor(height, &network, true))
                         {
                             // Untrusted root at/above Heartwood, no successor to confirm it,
                             // not the last checkpoint: defer rather than persist it unverified. Leaves
@@ -1397,13 +1413,11 @@ impl FinalizedState {
         result.map(|hash| (hash, note_commitment_trees))
     }
 
-    /// POC: `true` when the verified-commitment-trees fast (skip-recompute) path will
-    /// apply to `height` — i.e. fast mode is active *and* the source already holds this
-    /// height's roots, so the committer will fold them in and skip the frontier recompute.
-    pub(crate) fn vct_fast_will_apply(&self, height: block::Height) -> bool {
+    /// `true` when the production VCT path requires exact header-owned roots at `height`.
+    pub(crate) fn vct_requires_exact_roots(&self, height: block::Height) -> bool {
         self.vct
             .source()
-            .is_some_and(|v| v.is_enabled() && v.vct_roots_at_height(height).is_some())
+            .is_some_and(|v| v.accepts_exact_roots_at(height))
     }
 
     /// Clears any cached successor prevalidation.
@@ -1422,17 +1436,14 @@ impl FinalizedState {
     /// checkpoint handoff is exempt because its embedded final frontiers are verified
     /// against this block's roots before the real tip treestate is written; trusted
     /// local fixtures can commit their tip root on the in-arrears check.
-    pub(crate) fn vct_fast_needs_successor(&self, height: block::Height) -> bool {
+    pub(crate) fn vct_fast_needs_successor(
+        &self,
+        height: block::Height,
+        has_exact_roots: bool,
+    ) -> bool {
         self.vct
             .source()
-            .is_some_and(|v| v.vct_root_needs_successor(height, &self.network()))
-    }
-
-    /// Retire the provisional height-cache entry after an exact current delivery is rejected.
-    pub(crate) fn invalidate_vct_fast_root(&self, height: block::Height) {
-        if let Some(v) = self.vct.source() {
-            v.invalidate_fast_root(height);
-        }
+            .is_some_and(|v| v.vct_root_needs_successor(height, &self.network(), has_exact_roots))
     }
 
     /// Verify checkpoint handoff frontiers against this block's supplied roots.
@@ -1456,7 +1467,6 @@ impl FinalizedState {
                 height,
                 ValidateContextError::VctSuppliedRootUnavailable { height },
                 crate::error::VctCommitFailure::CurrentRoots,
-                true,
             ));
         }
 
@@ -1465,8 +1475,7 @@ impl FinalizedState {
 
     /// Reject a supplied fast-path root that failed verification for `height`.
     ///
-    /// Evicts the bad root from the source so it is never re-read, and returns a typed,
-    /// retryable error. In fast mode the note-commitment frontier is frozen, so the
+    /// Returns a typed, retryable error. In fast mode the note-commitment frontier is frozen, so the
     /// committer cannot recompute the root locally (that would fold a wrong root into the
     /// history MMR); it must refuse and leave the database untouched rather than persist
     /// or corrupt state. Roots are not individually re-requested: the hole is only filled
@@ -1479,18 +1488,11 @@ impl FinalizedState {
         height: block::Height,
         error: ValidateContextError,
         failure: crate::error::VctCommitFailure,
-        invalidate_provisional_cache: bool,
     ) -> CommitCheckpointVerifiedError {
-        if invalidate_provisional_cache {
-            if let Some(v) = self.vct.source() {
-                v.invalidate_fast_root(height);
-            }
-        }
         metrics::counter!("state.vct.root.rejected.count").increment(1);
         tracing::warn!(
             ?height,
             ?error,
-            invalidate_provisional_cache,
             "VCT: supplied commitment root failed verification"
         );
         CommitCheckpointVerifiedError::from(ValidateContextError::VctSuppliedRootUnavailable {

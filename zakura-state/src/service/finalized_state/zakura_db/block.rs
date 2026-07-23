@@ -1355,8 +1355,6 @@ impl DiskWriteBatch {
             store_raw_transactions,
             precomputed_raw_txs,
         )?;
-        self.delete_supplied_commitment_root(zakura_db, finalized.height);
-
         // The consensus rules are silent on shielded transactions in the genesis block,
         // because there aren't any in the mainnet or testnet genesis blocks.
         // So this means the genesis anchor is the same as the empty anchor,

@@ -12,7 +12,7 @@ use chrono::{TimeZone, Utc};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{sync::watch, time::Instant};
-use zakura_chain::block;
+use zakura_chain::{block, parallel::commitment_aux::BlockCommitmentRoots};
 use zakura_header_chain::{
     apply_transition, audit_store, ApplyResult, AuxDelivery, AuxDelta, ChainScore, ChangeSet,
     CommittedTransition, CounterExhausted, EligibilityReason, EngineConfig, EngineMetadata,
@@ -53,6 +53,27 @@ const METADATA_KEY: &[u8] = b"";
 const RETAINED_PATH_LEASE_IDLE: Duration = Duration::from_secs(30);
 
 pub(in crate::service) mod migration;
+
+pub(crate) fn select_vct_aux_delivery(deliveries: Vec<AuxDelivery>) -> Option<AuxDelivery> {
+    deliveries
+        .into_iter()
+        .filter(|delivery| {
+            delivery.tree_aux.is_some()
+                && !matches!(
+                    delivery.authentication,
+                    zakura_header_chain::AuxAuthentication::Rejected { .. }
+                )
+        })
+        .min_by_key(|delivery| {
+            (
+                !matches!(
+                    delivery.authentication,
+                    zakura_header_chain::AuxAuthentication::Authenticated { .. }
+                ),
+                delivery.delivery_id,
+            )
+        })
+}
 
 /// Failure at the durable header-chain boundary.
 #[derive(Debug, Error)]
@@ -312,6 +333,70 @@ impl HeaderChainReader {
             )));
         }
         Ok(deliveries)
+    }
+
+    fn selected_aux_delivery(
+        &self,
+        node: &HeaderNode,
+    ) -> Result<Option<AuxDelivery>, HeaderChainStoreError> {
+        Ok(select_vct_aux_delivery(self.coherent_aux_deliveries(node)?))
+    }
+
+    /// Return the contiguous selected-path auxiliary roots starting at `start`.
+    pub(crate) fn selected_block_roots(
+        &self,
+        start: block::Height,
+        count: u32,
+    ) -> Result<Vec<BlockCommitmentRoots>, HeaderChainStoreError> {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let mut roots = Vec::new();
+        for offset in 0..count {
+            let Some(height) = start + i64::from(offset) else {
+                break;
+            };
+            let Some(hash) = self.store.selected_hash(height)? else {
+                break;
+            };
+            let Some(node) = self.store.node(hash)? else {
+                return Err(StoreError::Incoherent(
+                    "selected auxiliary root header is not retained",
+                )
+                .into());
+            };
+            if node.height != height {
+                return Err(StoreError::Incoherent(
+                    "selected auxiliary root header height disagrees with its index",
+                )
+                .into());
+            }
+            let Some(delivery) = self.selected_aux_delivery(&node)? else {
+                break;
+            };
+            let Some(aux) = delivery.tree_aux else {
+                break;
+            };
+            if delivery.header_hash != hash || aux.height != height {
+                return Err(StoreError::Incoherent(
+                    "selected auxiliary root delivery disagrees with its header",
+                )
+                .into());
+            }
+            roots.push(BlockCommitmentRoots {
+                height,
+                sapling_root: aux.sapling_root,
+                orchard_root: aux.orchard_root,
+                ironwood_root: aux.ironwood_root,
+                sapling_tx: aux.sapling_tx_count,
+                orchard_tx: aux.orchard_tx_count,
+                ironwood_tx: aux.ironwood_tx_count,
+                auth_data_root: aux.auth_data_root,
+            });
+        }
+        Ok(roots)
     }
 
     pub(crate) fn validation_context(
@@ -2397,6 +2482,80 @@ mod tests {
                 .expect("a finalized repair height is a normal stale outcome"),
             None
         );
+
+        let aux = zakura_header_chain::TreeAuxRecordV1 {
+            height: child.height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: 13,
+            orchard_tx_count: 14,
+            ironwood_tx_count: 15,
+            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([16; 32]),
+        };
+        let delivery = AuxDelivery {
+            delivery_id: EvidenceId::from_digest([0x91; 32]),
+            header_hash: child.hash,
+            source: SourceId::from_digest([0x92; 32]),
+            owner,
+            body_size: zakura_header_chain::BodySizeHint::Unknown,
+            tree_aux: Some(aux),
+            authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
+        };
+        let mut child_node = runtime
+            .store
+            .node(child.hash)
+            .expect("the selected child row decodes")
+            .expect("the selected child is retained");
+        child_node.aux_delivery_ids.push(delivery.delivery_id);
+        let mut aux_batch = DiskWriteBatch::new();
+        runtime
+            .store
+            .put_value(
+                &mut aux_batch,
+                HEADER_NODE_BY_HASH,
+                child.hash.0,
+                &HeaderNodeDisk::from_domain(&child_node),
+            )
+            .expect("the selected child with auxiliary evidence encodes");
+        runtime
+            .store
+            .put_value(
+                &mut aux_batch,
+                HEADER_AUX_DELIVERY,
+                HeaderAuxDeliveryKey {
+                    header: child.hash,
+                    delivery: delivery.delivery_id,
+                }
+                .as_bytes(),
+                &HeaderAuxDeliveryDisk(delivery),
+            )
+            .expect("the selected auxiliary delivery encodes");
+        runtime
+            .store
+            .db
+            .write(aux_batch)
+            .expect("the coherent selected auxiliary fixture commits");
+        let roots = reader
+            .selected_block_roots(child.height, 2)
+            .expect("selected auxiliary roots are coherent");
+        assert_eq!(roots.len(), 1, "the read stops at the first missing height");
+        assert_eq!(roots[0].height, child.height);
+        assert_eq!(roots[0].sapling_tx, aux.sapling_tx_count);
+        assert_eq!(roots[0].orchard_tx, aux.orchard_tx_count);
+        assert_eq!(roots[0].ironwood_tx, aux.ironwood_tx_count);
+        assert_eq!(roots[0].auth_data_root, aux.auth_data_root);
+        assert!(matches!(
+            crate::service::write::HeaderChainWriter::new(
+                runtime.clone(),
+                engine_config.clone()
+            )
+            .vct_aux_window(child.height, child.hash)
+            .expect("the selected auxiliary window is coherent"),
+            crate::service::write::VctAuxWindowRead::Missing { height }
+                if height == grandchild.height
+        ));
+
         let owner = SourceId::from_digest([1; 32]);
         let acquired = reader
             .acquire_retained_path(owner, 7, grandchild.hash, &[anchor.hash])
@@ -2435,7 +2594,7 @@ mod tests {
         assert_eq!(page.nodes.len(), 1);
         assert_eq!(page.nodes[0].hash, child.hash);
         assert_eq!(page.common_ancestor, anchor_frontier);
-        assert_eq!(page.aux_deliveries, vec![Vec::new()]);
+        assert_eq!(page.aux_deliveries, vec![vec![delivery]]);
         assert!(!page.complete);
         let RetainedPathReadOutcome::Page(continuation) = reader
             .read_retained_path(owner, 7, lease.lease_id, child.hash, 1)

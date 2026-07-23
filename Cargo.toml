@@ -342,8 +342,9 @@ debug = false
 
 [profile.ci-tests]
 inherits = "release"
-# Unit tests need release-mode execution speed, but do not benefit from
-# optimizing across crate boundaries.
+# Unit tests need optimized execution, but do not need the production profile's
+# most expensive code generation or cross-crate optimization.
+opt-level = 2
 lto = "off"
 
 [workspace.lints.rust]

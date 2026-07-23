@@ -2349,10 +2349,11 @@ mod tests {
     };
     use zakura_header_chain::{
         AlarmSet, BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch, BodyRuleId,
-        BodyUnavailableSummary, BodyValidationState, CheckpointSet, EligibilityReason,
+        BodyUnavailableSummary, BodyValidationState, BranchId, CheckpointSet, EligibilityReason,
         EngineConfig, EngineMode, FinalityEpoch, FrontierSet, FullStateEvidenceAuthority,
-        HeaderChainDiskVersion, HeaderGeneration, HeaderValidationState, SourceId, StateVersion,
-        SuffixWork, SystemClock, TransientBodyFailure, TransientBodyFailureKind, TransitionEvent,
+        HeaderBatchInput, HeaderChainDiskVersion, HeaderGeneration, HeaderRules,
+        HeaderValidationState, InsertHeaders, SourceId, StateVersion, SuffixWork, SystemClock,
+        TargetCompletion, TransientBodyFailure, TransientBodyFailureKind, TransitionEvent,
         TrustedAnchor, VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause,
         VerifiedGeneration, WorkCoordinate,
     };
@@ -3901,6 +3902,227 @@ mod tests {
             assert_eq!(
                 reopened.store.snapshot().expect("the snapshot reopens"),
                 report.current,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aud_14_requester_insertion_reopens_complete_before_or_after() {
+        for (index, target) in FaultPoint::ALL.into_iter().enumerate() {
+            let cache = tempfile::tempdir().expect("the test cache directory is created");
+            let db_config = Config {
+                cache_dir: cache.path().to_owned(),
+                ephemeral: false,
+                debug_skip_non_finalized_state_backup_task: true,
+                ..Config::default()
+            };
+            let (engine_config, anchor, metadata) = fixture();
+            let network = engine_config.network.clone();
+            let db = open(&db_config, &network);
+            let store = HeaderChainStore::new(db.clone());
+            store
+                .initialize(metadata.clone(), anchor.clone())
+                .expect("the empty schema initializes");
+            let (runtime, _) = store
+                .startup(&engine_config)
+                .expect("the initial store audits");
+            let anchor_frontier = metadata.frontiers.finalized;
+            let lease = runtime
+                .reader()
+                .validation_context(anchor.hash)
+                .expect("the anchor validation context is coherent")
+                .expect("the initialized anchor is retained");
+            let rules = HeaderRules::for_validation_lease(network.clone(), &lease)
+                .expect("the authenticated regtest policy is valid");
+            let marker = u8::try_from(index + 0x20).expect("the fault-point list fits in u8");
+            let mut child_header = *anchor.header;
+            child_header.previous_block_hash = anchor.hash;
+            child_header.time += chrono::Duration::seconds(1);
+            child_header.nonce.0[0] = marker;
+            let child_header = Arc::new(child_header);
+            let headers = [child_header.clone()];
+            let batch = zakura_header_chain::prepare_headers(
+                HeaderBatchInput::new(&headers),
+                &lease,
+                &rules,
+                &SystemClock,
+            )
+            .expect("the exact next child prepares through production validation");
+            let child = Frontier::new(
+                anchor_frontier
+                    .height
+                    .next()
+                    .expect("the genesis anchor has a next height"),
+                child_header.hash(),
+            );
+            let owner = WorkOwner {
+                state_version: metadata.state_version,
+                header_generation: metadata.header_generation,
+                verified_generation: None,
+                branch: BranchId::new(anchor.hash, child.hash),
+                session_id: 1,
+                request_id: NonZeroU64::new(1).expect("one is nonzero"),
+            };
+            let request = TransitionRequest {
+                expected_version: metadata.state_version,
+                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                    owner,
+                    source: SourceId::from_digest([marker.wrapping_add(1); 32]),
+                    parent_hash: anchor.hash,
+                    target_tip_hash: child.hash,
+                    completion: TargetCompletion::TargetComplete {
+                        common_ancestor: anchor_frontier,
+                    },
+                    batch,
+                    aux: Vec::new(),
+                })),
+            };
+            let context = TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: None,
+                startup_capability: None,
+                retention_references: &[],
+            };
+            let marker_key = [marker; 4];
+            let mut full_state_batch = DiskWriteBatch::new();
+            runtime
+                .store
+                .put_raw(
+                    &mut full_state_batch,
+                    ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+                    marker_key,
+                    [marker],
+                )
+                .expect("the paired full-state marker can be staged");
+            let memory_swapped = Arc::new(AtomicBool::new(false));
+            let swap_probe = memory_swapped.clone();
+            let result = runtime.apply_combined_with_fault(
+                request,
+                &context,
+                full_state_batch,
+                move || swap_probe.store(true, Ordering::SeqCst),
+                |point| {
+                    if point == target {
+                        Err(HeaderChainStoreError::InjectedCrash(point))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(HeaderChainStoreError::InjectedCrash(point)) if point == target
+            ));
+
+            let committed = matches!(
+                target,
+                FaultPoint::AfterDbCommit
+                    | FaultPoint::BeforeMemorySwap
+                    | FaultPoint::BeforePublish
+                    | FaultPoint::AfterPublish
+                    | FaultPoint::BeforeReactorObserve
+            );
+            assert_eq!(
+                runtime
+                    .store
+                    .node(child.hash)
+                    .expect("the child row read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+            assert_eq!(
+                runtime
+                    .store
+                    .selected_hash(child.height)
+                    .expect("the selected projection read succeeds"),
+                committed.then_some(child.hash),
+                "{target:?}"
+            );
+            let marker_cf = runtime
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the marker column family is open");
+            assert_eq!(
+                runtime
+                    .store
+                    .db
+                    .raw_get_cf(&marker_cf, &marker_key)
+                    .expect("the paired marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+            assert_eq!(
+                memory_swapped.load(Ordering::SeqCst),
+                matches!(
+                    target,
+                    FaultPoint::BeforePublish
+                        | FaultPoint::AfterPublish
+                        | FaultPoint::BeforeReactorObserve
+                ),
+                "{target:?}"
+            );
+            assert_eq!(
+                runtime.publisher().snapshot().frontiers.header_best,
+                if matches!(
+                    target,
+                    FaultPoint::AfterPublish | FaultPoint::BeforeReactorObserve
+                ) {
+                    child
+                } else {
+                    anchor_frontier
+                },
+                "{target:?}"
+            );
+            drop(runtime);
+            drop(db);
+
+            let (reopened, report) = HeaderChainStore::new(open(&db_config, &network))
+                .startup(&engine_config)
+                .expect("the requester crash boundary reopens coherently");
+            assert_eq!(
+                report.current.state_version,
+                if committed {
+                    StateVersion::new(2)
+                } else {
+                    StateVersion::new(1)
+                },
+                "{target:?}"
+            );
+            assert_eq!(
+                report.current.frontiers.header_best,
+                if committed { child } else { anchor_frontier },
+                "{target:?}"
+            );
+            assert_eq!(
+                reopened
+                    .store
+                    .node(child.hash)
+                    .expect("the reopened child row read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+            assert_eq!(
+                reopened.publisher().snapshot(),
+                report.current,
+                "{target:?}"
+            );
+            let reopened_marker_cf = reopened
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the reopened marker column family is open");
+            assert_eq!(
+                reopened
+                    .store
+                    .db
+                    .raw_get_cf(&reopened_marker_cf, &marker_key)
+                    .expect("the reopened marker read succeeds")
+                    .is_some(),
+                committed,
                 "{target:?}"
             );
         }

@@ -22,6 +22,7 @@ use std::{
     },
 };
 
+use tokio::sync::oneshot;
 use zakura_chain::{
     block, ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
@@ -640,7 +641,11 @@ impl FinalizedState {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         next_vct_block: Option<NextVctBlock>,
     ) -> Result<
-        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (
+            CheckpointVerifiedBlock,
+            NoteCommitmentTrees,
+            oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
+        ),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
     > {
         let (checkpoint_verified, rsp_tx) = ordered_block;
@@ -669,9 +674,11 @@ impl FinalizedState {
         };
 
         match result {
-            Ok((hash, note_commitment_trees)) => {
-                let _ = rsp_tx.send(Ok(hash));
-                Ok((checkpoint_verified, note_commitment_trees))
+            // Leave the oneshot pending until the write loop publishes auth state and
+            // the chain tip. Callers that await the commit response then wait for a tip
+            // change must not resume between the DB commit and those notifications.
+            Ok((_hash, note_commitment_trees)) => {
+                Ok((checkpoint_verified, note_commitment_trees, rsp_tx))
             }
             Err(error) => Err(((checkpoint_verified, rsp_tx), error)),
         }

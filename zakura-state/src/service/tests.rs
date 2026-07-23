@@ -462,6 +462,46 @@ async fn handoff_trigger_microbench() -> Result<()> {
     Ok(())
 }
 
+/// Checkpoint commits must not answer their oneshot until header-root auth and the
+/// chain tip are published. Tip waiters that await the commit response can otherwise
+/// resume between the DB write and those notifications; under `start_paused` that
+/// race times out on virtual time while the OS write thread is still finishing.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn checkpoint_commit_response_waits_for_auth_and_tip() -> std::result::Result<(), BoxError> {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let (mut state_service, read_state, _, mut chain_tip_change) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
+    let mut header_root_auth = read_state.subscribe_header_root_auth();
+    assert_eq!(*header_root_auth.borrow_and_update(), None);
+
+    let genesis =
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
+
+    assert_eq!(
+        state_service
+            .ready()
+            .await?
+            .call(Request::CommitCheckpointVerifiedBlock(
+                CheckpointVerifiedBlock::from(genesis.clone()),
+            ))
+            .await?,
+        Response::Committed(genesis.hash()),
+    );
+
+    // No tip wait needed: the oneshot must not return until both watches advance.
+    assert!(
+        matches!(header_root_auth.has_changed(), Ok(true)),
+        "commit response must not return until header-root auth is published"
+    );
+    assert!(
+        chain_tip_change.last_tip_change().is_some(),
+        "commit response must not return until the chain tip is published"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn header_only_service_requests_preserve_body_boundary() -> std::result::Result<(), BoxError>
 {

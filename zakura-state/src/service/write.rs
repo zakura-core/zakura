@@ -664,7 +664,7 @@ impl WriteBlockWorkerTask {
                 prev_note_commitment_trees,
                 next_vct_block,
             ) {
-                Ok((finalized, note_commitment_trees)) => {
+                Ok((finalized, note_commitment_trees, rsp_tx)) => {
                     // Whether this successful commit consumed header-carried
                     // tree-aux roots to skip the note-commitment frontier rebuild.
                     if next_block_took_vct_path {
@@ -677,9 +677,11 @@ impl WriteBlockWorkerTask {
                     // the stalled-height gauge if it had been raised.
                     vct_write_manager.on_commit_success();
 
-                    // `commit_finalized` already answered the oneshot, so tip waiters
-                    // can race this path. Publish header-root auth before the tip so
-                    // tip observers always see a current authentication frontier.
+                    // Publish header-root auth before the tip so tip observers always
+                    // see a current authentication frontier. Answer the commit oneshot
+                    // only after both publishes so tip waiters that await the response
+                    // cannot resume between the DB commit and those notifications.
+                    let tip_hash = finalized.hash;
                     let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
 
@@ -699,6 +701,7 @@ impl WriteBlockWorkerTask {
                         }
                     }
                     chain_tip_sender.set_finalized_tip(tip_block);
+                    let _ = rsp_tx.send(Ok(tip_hash));
                 }
                 Err((ordered_block, error)) => {
                     // Retryable VCT root stalls (an absent/evicted root, or one not yet

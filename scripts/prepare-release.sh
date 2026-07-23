@@ -71,7 +71,7 @@ if [ "$no_crates" = 1 ] && [ -z "$suffix" ]; then
   exit 1
 fi
 
-for cmd in cargo git jq awk; do
+for cmd in cargo git jq awk perl; do
   command -v "$cmd" >/dev/null || { echo "Missing required tool: $cmd" >&2; exit 1; }
 done
 cargo release --version >/dev/null 2>&1 \
@@ -109,6 +109,33 @@ echo "Preparing ${release_tag} from base ${base_tag}$( [ "$no_crates" = 1 ] && e
 
 strip_pre() { printf '%s' "${1%%-*}"; }
 
+# Set a crate's version, choosing the tool by direction. cargo-release refuses
+# semver "downgrades", and attaching a prerelease suffix to an already-bumped
+# stable-form version is one (2.0.0-rc1 < 2.0.0). Those versions are
+# unpublished, so the change is safe: edit the manifest directly and rewrite
+# workspace dependency requirements ourselves. Cargo fails closed if a
+# requirement were missed — a "2.0.0" requirement does not match 2.0.0-rc1 —
+# and the post-apply assertion below re-checks every target version.
+set_crate_version() {
+  local crate="$1" manifest_rel="$2" current="$3" target="$4"
+  if [ "$(strip_pre "$current")" = "$(strip_pre "$target")" ] \
+    && [ "$current" = "$(strip_pre "$current")" ]; then
+    echo "(direct manifest edit: cargo-release treats ${current} -> ${target} as a downgrade)"
+    OLD="$current" NEW="$target" perl -pi -e \
+      's/^version = "\Q$ENV{OLD}\E"$/version = "$ENV{NEW}"/ && $done++ unless $done' \
+      "$manifest_rel"
+    local dep_manifest
+    while IFS= read -r dep_manifest; do
+      CRATE="$crate" OLD="$current" NEW="$target" perl -0777 -pi -e \
+        's/(\Q$ENV{CRATE}\E\s*=\s*\{[^}]*?version\s*=\s*")\Q$ENV{OLD}\E(")/$1$ENV{NEW}$2/gs' \
+        "$dep_manifest"
+    done < <(jq -r '.packages[].manifest_path' <<<"$metadata")
+  else
+    cargo release version "$target" \
+      --verbose --execute --no-confirm --allow-branch '*' -p "$crate"
+  fi
+}
+
 bump_level() {
   # bump_level X.Y.Z major|minor
   local core="$1" level="$2" x y
@@ -129,6 +156,18 @@ bump_level() {
 crates_json='[]'
 plan_names=()
 plan_targets=()
+plan_currents=()
+plan_manifests=()
+
+metadata="$(cargo metadata --format-version 1 --no-deps)"
+
+add_to_plan() {
+  # add_to_plan name target current manifest_rel
+  plan_names+=("$1")
+  plan_targets+=("$2")
+  plan_currents+=("$3")
+  plan_manifests+=("$4")
+}
 
 add_crate_row() {
   # add_crate_row name base current target level reason
@@ -141,8 +180,6 @@ add_crate_row() {
 }
 
 if [ "$no_crates" = 0 ]; then
-  metadata="$(cargo metadata --format-version 1 --no-deps)"
-
   while IFS=$'\t' read -r crate manifest_path current_version; do
     [ -n "$crate" ] || continue
     # The zakura package itself is versioned from the release tag below.
@@ -186,8 +223,7 @@ if [ "$no_crates" = 0 ]; then
       else
         add_crate_row "$crate" "$base_version" "$current_version" "$target" \
           "kept" "already bumped on main; prerelease suffix aligned"
-        plan_names+=("$crate")
-        plan_targets+=("$target")
+        add_to_plan "$crate" "$target" "$current_version" "$manifest_rel"
       fi
       continue
     fi
@@ -237,8 +273,7 @@ if [ "$no_crates" = 0 ]; then
     fi
 
     add_crate_row "$crate" "$base_version" "$current_version" "$target" "$level" "$reason"
-    plan_names+=("$crate")
-    plan_targets+=("$target")
+    add_to_plan "$crate" "$target" "$current_version" "$manifest_rel"
   done < <(
     jq -r '
       .packages[]
@@ -327,14 +362,13 @@ fi
 
 # --allow-branch '*' because CI runs on a detached HEAD (and local prep may
 # run on a scratch branch); release.toml's dependent-version = "fix" rewrites
-# workspace-internal requirements alongside each bump.
+# workspace-internal requirements alongside each cargo-release bump.
 if [ "${#plan_names[@]}" -gt 0 ]; then
   for i in "${!plan_names[@]}"; do
     echo
     echo "==> Bumping ${plan_names[$i]} to ${plan_targets[$i]}"
-    cargo release version "${plan_targets[$i]}" \
-      --verbose --execute --no-confirm --allow-branch '*' \
-      -p "${plan_names[$i]}"
+    set_crate_version "${plan_names[$i]}" "${plan_manifests[$i]}" \
+      "${plan_currents[$i]}" "${plan_targets[$i]}"
   done
 fi
 
@@ -343,11 +377,32 @@ fi
 if [ "$zakura_old" != "$version" ]; then
   echo
   echo "==> Bumping zakura to ${version}"
-  cargo release version "$version" \
-    --verbose --execute --no-confirm --allow-branch '*' -p zakura
+  set_crate_version zakura zakurad/Cargo.toml "$zakura_old" "$version"
 else
   echo "zakura package is already at ${version}."
 fi
+
+# Every planned version must have landed exactly; a missed manifest edit
+# would otherwise surface much later (or not at all for a kept requirement).
+echo
+echo "==> Checking applied versions"
+applied="$(cargo metadata --format-version 1 --no-deps)"
+assert_version() {
+  local crate="$1" want="$2" got
+  got="$(jq -r --arg name "$crate" \
+    '.packages[] | select(.name == $name) | .version' <<<"$applied")"
+  if [ "$got" != "$want" ]; then
+    echo "ERROR: ${crate} is at ${got} after the bump, expected ${want}." >&2
+    exit 1
+  fi
+}
+if [ "${#plan_names[@]}" -gt 0 ]; then
+  for i in "${!plan_names[@]}"; do
+    assert_version "${plan_names[$i]}" "${plan_targets[$i]}"
+  done
+fi
+assert_version zakura "$version"
+echo "All applied versions match the plan."
 
 echo
 echo "==> Refreshing Cargo.lock"

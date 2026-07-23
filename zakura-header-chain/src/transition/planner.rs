@@ -708,6 +708,14 @@ fn apply_event<S: StoreRead>(
             )?;
         }
         TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(event)) => {
+            if matches!(
+                graph.node(event.hash).map(|node| &node.body),
+                Some(BodyValidationState::Verified { .. })
+            ) {
+                return Err(TransitionFailure::InvalidEvidence(
+                    "body invalid evidence cannot contradict an already verified body",
+                ));
+            }
             graph.set_consensus_body_invalid(event.hash, event.evidence, event.rule.clone())?;
         }
         TransitionEvent::BodyEvidence(BodyEvidence::Verified(event)) => {

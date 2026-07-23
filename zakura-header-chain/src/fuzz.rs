@@ -20,13 +20,14 @@ use crate::{
     apply_transition, AlarmSet, AuxDelivery, AuxDelta, BodyEvidence, BodyRuleId,
     BodyUnavailableSummary, BranchId, ChainScore, CheckpointSet, Clock, ConsensusBodyInvalid,
     EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, EvidenceId, FinalityEpoch,
-    FinalityRecord, Frontier, FrontierSet, FullStateEvidenceAuthority, HeaderChainDiskVersion,
-    HeaderContextFact, HeaderGeneration, HeaderNode, HeaderValidationState, InsertHeaders,
-    MemHeaderStore, OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, PreparedHeader,
-    PreparedHeaderBatch, ProjectionDelta, SourceId, StateVersion, StoreError, StoreRead,
-    SuffixWork, TargetCompletion, TransientBodyFailure, TransientBodyFailureKind,
+    FinalityRecord, Frontier, FrontierSet, FullStateEvidenceAuthority, FullStateFinalized,
+    HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode, HeaderValidationState,
+    InsertHeaders, MemHeaderStore, OperatorInvalidate, OperatorInvalidationId, OperatorReconsider,
+    PreparedHeader, PreparedHeaderBatch, ProjectionDelta, SourceId, StateVersion, StoreError,
+    StoreRead, SuffixWork, TargetCompletion, TransientBodyFailure, TransientBodyFailureKind,
     TransitionContext, TransitionFailure, TransitionPlan, TransitionRequest, TrustedAnchor,
-    ValidationLease, VerifiedBodyEvidence, VerifiedGeneration, WorkOwner,
+    ValidationLease, VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause,
+    VerifiedGeneration, VerifiedHeaderRef, WorkOwner,
 };
 
 /// Deterministic summary of one bounded structured-operation replay.
@@ -252,6 +253,57 @@ impl FuzzStore {
             .unwrap_or(finalized.hash);
         Frontier::new(block::Height(height), hash)
     }
+
+    fn verify_selected_path(&self, operation: usize, branch: u8) -> TransitionRequest {
+        let target = self.retained_parent(branch);
+        let new_path = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|frontier| {
+                frontier.height > self.metadata.frontiers.finalized.height
+                    && frontier.height <= target.height
+            })
+            .map(|frontier| {
+                let node = self
+                    .graph
+                    .node(frontier.hash)
+                    .expect("selected projections contain retained nodes");
+                VerifiedHeaderRef {
+                    height: frontier.height,
+                    hash: frontier.hash,
+                    header: node.header.clone(),
+                }
+            })
+            .collect();
+        TransitionRequest {
+            expected_version: self.metadata.state_version,
+            event: crate::TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+                full_state_transition_id: evidence(operation, branch),
+                old_tip: self.metadata.frontiers.verified_best,
+                new_path,
+                cause: VerifiedChangeCause::Reset,
+            }),
+        }
+    }
+
+    fn finalize_verified(&self, operation: usize, branch: u8) -> TransitionRequest {
+        let index = usize::from(branch) % self.verified.len();
+        let new_finalized = self.verified[index];
+        TransitionRequest {
+            expected_version: self.metadata.state_version,
+            event: crate::TransitionEvent::FullStateFinalized(FullStateFinalized {
+                full_state_transition_id: evidence(operation, branch),
+                new_finalized,
+                verified_path_proof: self
+                    .verified
+                    .iter()
+                    .take(index.saturating_add(1))
+                    .map(|frontier| frontier.hash)
+                    .collect(),
+            }),
+        }
+    }
 }
 
 impl StoreRead for FuzzStore {
@@ -353,6 +405,8 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
 
     for (operation, byte) in bounded.iter().copied().enumerate() {
         let before = store.snapshot();
+        let before_selected = store.selected.clone();
+        let before_verified = store.verified.clone();
         let count = u32::from(byte & 0x07).saturating_add(1);
         let branch = byte.rotate_left(3);
         let request = match (byte >> 3) & 0x0f {
@@ -492,6 +546,8 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                 assert_exhaustive_oracle(&store);
                 continue;
             }
+            12 => store.verify_selected_path(operation, branch),
+            13 => store.finalize_verified(operation, branch),
             _ => {
                 // Explicit stale/no-op references are part of the operation language.
                 refused = refused.saturating_add(1);
@@ -510,10 +566,17 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         match apply_transition(&store, request, &context) {
             Ok(plan) => {
                 assert_eq!(plan.before(), &before);
-                assert_generation_delta(&before, &plan.change_set().metadata.snapshot());
                 let no_change = plan.is_no_change();
+                let eligibility_changed = !plan.change_set().eligibility_changes.is_empty();
                 store.commit(&plan);
                 assert_eq!(store.snapshot(), plan.change_set().metadata.snapshot());
+                assert_generation_delta(
+                    &before,
+                    &store.snapshot(),
+                    before_selected != store.selected,
+                    before_verified != store.verified,
+                    eligibility_changed,
+                );
                 if no_change {
                     refused = refused.saturating_add(1);
                 } else {
@@ -739,10 +802,16 @@ fn operation_u64(operation: usize) -> u64 {
     u64::try_from(operation).expect("the 512-operation cap fits in u64")
 }
 
-fn assert_generation_delta(before: &EngineSnapshot, after: &EngineSnapshot) {
-    let header_changed = before.frontiers.finalized != after.frontiers.finalized
-        || before.frontiers.header_best != after.frontiers.header_best;
-    let verified_changed = before.frontiers.verified_best != after.frontiers.verified_best;
+fn assert_generation_delta(
+    before: &EngineSnapshot,
+    after: &EngineSnapshot,
+    selected_path_changed: bool,
+    verified_path_changed: bool,
+    eligibility_changed: bool,
+) {
+    let finalized_changed = before.frontiers.finalized != after.frontiers.finalized;
+    let header_changed = finalized_changed || eligibility_changed || selected_path_changed;
+    let verified_changed = finalized_changed || verified_path_changed;
     assert_eq!(
         before.header_generation != after.header_generation,
         header_changed,
@@ -820,6 +889,24 @@ mod tests {
             admitted.snapshot.frontiers.header_best.height,
             block::Height(1)
         );
+
+        let verified = replay_fork_transition_bytes(&[10, 96]);
+        assert_eq!(
+            verified.snapshot.frontiers.verified_best.height,
+            block::Height(3)
+        );
+        let contradictory = replay_fork_transition_bytes(&[10, 96, 48]);
+        assert_eq!(contradictory.commits, 2);
+        assert_eq!(contradictory.refused, 1);
+        assert_eq!(
+            contradictory.snapshot.frontiers.verified_best,
+            verified.snapshot.frontiers.verified_best
+        );
+        let finalized = replay_fork_transition_bytes(&[10, 96, 104]);
+        assert_eq!(
+            finalized.snapshot.frontiers.finalized.height,
+            block::Height(3)
+        );
     }
 
     #[test]
@@ -858,6 +945,10 @@ mod tests {
                 include_bytes!(
                     "../../fuzz/header-chain/corpus/fork_transitions/deferred_reevaluation"
                 ),
+            ),
+            (
+                "verified_finality",
+                include_bytes!("../../fuzz/header-chain/corpus/fork_transitions/verified_finality"),
             ),
         ];
         for (name, bytes) in corpus {

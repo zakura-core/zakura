@@ -987,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn transition_event_surface_is_complete_and_contains_no_requested_consequences() {
+    fn all_named_inputs_use_their_single_serialized_transition_path() {
         let source = include_str!("types.rs")
             .split("#[cfg(test)]")
             .next()
@@ -1016,6 +1016,17 @@ mod tests {
             assert!(
                 !source.contains(forbidden),
                 "event inputs must contain evidence, not requested consequence {forbidden}"
+            );
+        }
+        for obsolete_facade in [
+            "AdvanceLocalCheckpoint",
+            "InternalFullState",
+            "RecoveryEvidence",
+            "TransitionEvent::Recover",
+        ] {
+            assert!(
+                !source.contains(obsolete_facade),
+                "the event surface must not duplicate a real transition path with {obsolete_facade}"
             );
         }
     }

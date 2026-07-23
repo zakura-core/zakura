@@ -81,3 +81,18 @@ pub use wire::{
     MSG_BS_BLOCKS_DONE, MSG_BS_GET_BLOCKS, MSG_BS_RANGE_UNAVAILABLE, MSG_BS_STATUS,
     ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
 };
+
+#[cfg(test)]
+fn test_work_scope() -> zakura_header_chain::WorkScope {
+    zakura_header_chain::WorkScope {
+        state_version: zakura_header_chain::StateVersion::new(1),
+        header_generation: zakura_header_chain::HeaderGeneration::new(2),
+        verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(3)),
+        branch: zakura_header_chain::BranchId::new(block::Hash([4; 32]), block::Hash([5; 32])),
+    }
+}
+
+#[cfg(test)]
+fn test_work_owner() -> zakura_header_chain::WorkOwner {
+    test_work_scope().bind(6, std::num::NonZeroU64::new(7).expect("seven is nonzero"))
+}

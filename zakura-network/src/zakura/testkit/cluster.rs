@@ -415,7 +415,7 @@ mod tests {
                             })
                             .await;
                     }
-                    BlockSyncAction::SubmitBlock { token, block } => {
+                    BlockSyncAction::SubmitBlock { token, block, .. } => {
                         let height = block.coinbase_height().expect("submitted block has height");
                         submitted
                             .lock()

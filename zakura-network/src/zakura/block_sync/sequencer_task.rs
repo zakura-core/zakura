@@ -36,6 +36,8 @@ const SUBMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// control events that release budget and drive the next scheduling reaction.
 #[derive(Debug)]
 pub(super) struct SequencedBody {
+    pub(super) owner: zakura_header_chain::WorkOwner,
+    pub(super) source: zakura_header_chain::SourceId,
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
     pub(super) previous_block_hash: block::Hash,
@@ -49,6 +51,8 @@ pub(super) struct SequencedBody {
 impl SequencedBody {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_queued(
+        owner: zakura_header_chain::WorkOwner,
+        source: zakura_header_chain::SourceId,
         height: block::Height,
         hash: block::Hash,
         previous_block_hash: block::Hash,
@@ -61,6 +65,8 @@ impl SequencedBody {
     ) -> Self {
         let decoded_attributed_memory_size_bytes = body.decoded_attributed_memory_size_bytes();
         Self {
+            owner,
+            source,
             height,
             hash,
             previous_block_hash,
@@ -413,6 +419,8 @@ impl SequencerTask {
     fn handle_accept_body(&mut self, body: SequencedBody) {
         let queued_elapsed = body.received_at.elapsed();
         let outcome = match self.sequencer.accept_buffered_body(
+            body.owner,
+            body.source,
             body.height,
             body.hash,
             body.previous_block_hash,
@@ -580,7 +588,6 @@ impl SequencerTask {
             self.sequencer.finish_submission(token, height, hash);
             return false;
         }
-
         let accepted_local_frontier = if let Some(frontiers) = local_frontier {
             // Fold the `local_frontier` advance in as a frontier advance without
             // releasing committed applying bodies (`release_applied: false`). It is
@@ -700,6 +707,8 @@ impl SequencerTask {
             let send_started = time::Instant::now();
             let sent = self
                 .send_action(BlockSyncAction::SubmitBlock {
+                    owner: item.owner,
+                    source: item.source,
                     token: item.token,
                     block: item.block,
                 })
@@ -1133,6 +1142,8 @@ mod tests {
         let block = test_block();
         let previous_block_hash = block.header.previous_block_hash;
         SequencedBody::new_queued(
+            super::super::test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
             block::Height(1),
             block.hash(),
             previous_block_hash,
@@ -1305,7 +1316,12 @@ mod tests {
             .await
             .expect("submission is retried after capacity returns")
             .expect("action channel remains live");
-        assert!(matches!(retried, BlockSyncAction::SubmitBlock { .. }));
+        assert!(matches!(
+            retried,
+            BlockSyncAction::SubmitBlock { owner, source, .. }
+                if owner == super::super::test_work_owner()
+                    && source == zakura_header_chain::SourceId::from_digest([1; 32])
+        ));
 
         task.abort();
     }

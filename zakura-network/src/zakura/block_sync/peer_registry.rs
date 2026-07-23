@@ -101,6 +101,7 @@ pub(super) struct SlotDiagnostics {
 /// Published metadata for one unreceived outstanding height.
 #[derive(Copy, Clone, Debug)]
 pub(super) struct OutstandingMeta {
+    pub(super) owner: zakura_header_chain::WorkOwner,
     pub(super) hash: block::Hash,
     pub(super) estimated_bytes: u64,
     pub(super) queued_at: Instant,
@@ -179,7 +180,12 @@ impl PeerRegistry {
     ) -> u64 {
         let generation = self
             .next_generation
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |generation| generation.checked_add(1),
+            )
+            .unwrap_or_else(|_| panic!("block-sync routine generation counter is exhausted"));
         let mut peers = self.lock();
         peers
             .entry(peer.clone())
@@ -305,6 +311,22 @@ impl PeerRegistry {
         })
     }
 
+    /// Whether the current committed scope already has this exact request.
+    pub(super) fn has_outstanding_request_in_scope(
+        &self,
+        scope: zakura_header_chain::WorkScope,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> bool {
+        let peers = self.lock();
+        peers.values().any(|entry| {
+            entry
+                .outstanding
+                .get(&height)
+                .is_some_and(|meta| meta.hash == hash && meta.owner.scope() == scope)
+        })
+    }
+
     /// Whether any connected peer has an outstanding request covering `height`
     /// (regardless of hash). Used by the routine's terminator-dedup fallthrough
     /// (`ignore_unmatched_active_terminator_response`): a `BlocksDone` for a range
@@ -334,6 +356,21 @@ impl PeerRegistry {
     pub(super) fn total_unreceived(&self) -> usize {
         let peers = self.lock();
         peers.values().map(|entry| entry.outstanding.len()).sum()
+    }
+
+    /// Total unreceived heights owned by one committed work scope.
+    pub(super) fn total_unreceived_in_scope(&self, scope: zakura_header_chain::WorkScope) -> usize {
+        let peers = self.lock();
+        peers
+            .values()
+            .map(|entry| {
+                entry
+                    .outstanding
+                    .values()
+                    .filter(|meta| meta.owner.scope() == scope)
+                    .count()
+            })
+            .sum()
     }
 
     /// Whether any peer has an outstanding request reaching height `at_or_above`
@@ -510,12 +547,22 @@ impl PeerRegistry {
             .collect()
     }
 
-    /// Remove a published outstanding claim for `height` from `peer`.
-    pub(super) fn clear_outstanding_height(&self, peer: &ZakuraPeerId, height: block::Height) {
+    /// Remove a published outstanding claim only when its exact owner still matches.
+    pub(super) fn clear_outstanding_height_for_owner(
+        &self,
+        peer: &ZakuraPeerId,
+        height: block::Height,
+        owner: zakura_header_chain::WorkOwner,
+    ) -> bool {
         let mut peers = self.lock();
-        if let Some(entry) = peers.get_mut(peer) {
-            entry.outstanding.remove(&height);
+        let Some(entry) = peers.get_mut(peer) else {
+            return false;
+        };
+        if entry.outstanding.get(&height).map(|meta| meta.owner) != Some(owner) {
+            return false;
         }
+        entry.outstanding.remove(&height);
+        true
     }
 
     /// Hard-exclude this peer from re-taking `height` until `until` after the
@@ -785,6 +832,58 @@ mod floor_bias_tests {
         );
         assert!(!reg.is_floor_height_avoided(&peer, block::Height(1), now));
         assert!(reg.is_floor_height_avoided(&peer, block::Height(2), now));
+    }
+
+    #[test]
+    fn outstanding_cleanup_requires_the_exact_request_owner() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let peer = peer(1);
+        let generation = reg.admit(&peer, ServicePeerDirection::Outbound, &config);
+        let current_owner = super::super::test_work_owner();
+        let stale_owner = zakura_header_chain::WorkOwner {
+            request_id: std::num::NonZeroU64::new(current_owner.request_id.get() + 1)
+                .expect("the incremented test request ID is nonzero"),
+            ..current_owner
+        };
+        let height = block::Height(1);
+        reg.set_outstanding(
+            &peer,
+            generation,
+            BTreeMap::from([(
+                height,
+                OutstandingMeta {
+                    owner: current_owner,
+                    hash: block::Hash([1; 32]),
+                    estimated_bytes: 100,
+                    queued_at: Instant::now(),
+                    deadline: Instant::now(),
+                },
+            )]),
+        );
+
+        let obsolete_scope = zakura_header_chain::WorkScope {
+            state_version: zakura_header_chain::StateVersion::new(
+                current_owner.state_version.get().saturating_add(1),
+            ),
+            ..current_owner.scope()
+        };
+        assert!(reg.has_outstanding_request_in_scope(
+            current_owner.scope(),
+            height,
+            block::Hash([1; 32]),
+        ));
+        assert!(!reg.has_outstanding_request_in_scope(
+            obsolete_scope,
+            height,
+            block::Hash([1; 32]),
+        ));
+        assert_eq!(reg.total_unreceived_in_scope(current_owner.scope()), 1);
+        assert_eq!(reg.total_unreceived_in_scope(obsolete_scope), 0);
+        assert!(!reg.clear_outstanding_height_for_owner(&peer, height, stale_owner));
+        assert!(reg.peer_has_outstanding_height(&peer, height));
+        assert!(reg.clear_outstanding_height_for_owner(&peer, height, current_owner));
+        assert!(!reg.peer_has_outstanding_height(&peer, height));
     }
 
     #[test]

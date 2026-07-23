@@ -1589,6 +1589,23 @@ mod zakura_header_sync_driver_tests {
         Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
     }
 
+    fn test_block_work_owner() -> zakura_header_chain::WorkOwner {
+        zakura_header_chain::WorkScope {
+            state_version: zakura_header_chain::StateVersion::new(1),
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(1)),
+            branch: zakura_header_chain::BranchId::new(block::Hash([0; 32]), block::Hash([1; 32])),
+        }
+        .bind(
+            1,
+            std::num::NonZeroU64::new(1).expect("test request ID is nonzero"),
+        )
+    }
+
+    fn test_block_source() -> zakura_header_chain::SourceId {
+        zakura_header_chain::SourceId::from_digest([2; 32])
+    }
+
     fn root_at(height: block::Height) -> BlockCommitmentRoots {
         BlockCommitmentRoots {
             height,
@@ -2434,7 +2451,12 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, mut action_rx) = mpsc::channel(8);
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         action_tx
-            .send(BlockSyncAction::SubmitBlock { token: 7, block })
+            .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
+                token: 7,
+                block,
+            })
             .await
             .expect("submit action queues");
         action_tx
@@ -2590,6 +2612,8 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 1,
                 block: block1.clone(),
             })
@@ -2732,6 +2756,8 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 2,
                 block: block2.clone(),
             })
@@ -2739,6 +2765,8 @@ mod zakura_header_sync_driver_tests {
             .expect("driver action channel stays open");
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 1,
                 block: block1.clone(),
             })
@@ -2861,6 +2889,8 @@ mod zakura_header_sync_driver_tests {
             .expect("driver action channel stays open");
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 1,
                 block: block1.clone(),
             })
@@ -2868,6 +2898,8 @@ mod zakura_header_sync_driver_tests {
             .expect("driver action channel stays open");
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 2,
                 block: block2.clone(),
             })
@@ -2962,6 +2994,8 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 1,
                 block: block1.clone(),
             })
@@ -2976,6 +3010,8 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 2,
                 block: block2.clone(),
             })
@@ -3064,6 +3100,8 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 1,
                 block: block1.clone(),
             })
@@ -3078,6 +3116,8 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 2,
                 block: block2.clone(),
             })
@@ -3167,6 +3207,8 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 1,
                 block: block1.clone(),
             })
@@ -3181,6 +3223,8 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 2,
                 block: block2.clone(),
             })
@@ -3251,6 +3295,8 @@ mod zakura_header_sync_driver_tests {
         // QueryBlocksByHeightRange should still be served, proving Zakura is still alive as a serving bridge.
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 77,
                 block: block.clone(),
             })
@@ -3343,6 +3389,8 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 1,
                 block: block1.clone(),
             })
@@ -3359,6 +3407,8 @@ mod zakura_header_sync_driver_tests {
         // Block 2 sits in the driver's apply queue due to apply limit of 1.
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 2,
                 block: block2.clone(),
             })
@@ -3533,7 +3583,12 @@ mod zakura_header_sync_driver_tests {
                 block1.clone()
             };
             action_tx
-                .send(BlockSyncAction::SubmitBlock { token, block })
+                .send(BlockSyncAction::SubmitBlock {
+                    owner: test_block_work_owner(),
+                    source: test_block_source(),
+                    token,
+                    block,
+                })
                 .await
                 .expect("driver action channel stays open during submit storm");
         }
@@ -3651,6 +3706,8 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 1,
                 block: block1.clone(),
             })
@@ -3665,6 +3722,8 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 2,
                 block: block2.clone(),
             })
@@ -4079,7 +4138,12 @@ mod zakura_header_sync_driver_tests {
         ));
 
         action_tx
-            .send(BlockSyncAction::SubmitBlock { token: 1, block })
+            .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
+                token: 1,
+                block,
+            })
             .await
             .expect("driver action channel stays open");
         action_tx
@@ -4176,6 +4240,8 @@ mod zakura_header_sync_driver_tests {
         for token in 0..=two_checkpoint_gaps {
             action_tx
                 .send(BlockSyncAction::SubmitBlock {
+                    owner: test_block_work_owner(),
+                    source: test_block_source(),
                     token: u64::try_from(token).expect("test token fits in u64"),
                     block: block.clone(),
                 })
@@ -4296,7 +4362,12 @@ mod zakura_header_sync_driver_tests {
         ));
 
         action_tx
-            .send(BlockSyncAction::SubmitBlock { token: 1, block })
+            .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
+                token: 1,
+                block,
+            })
             .await
             .expect("driver action channel stays open");
         tokio::task::yield_now().await;
@@ -4422,6 +4493,8 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 1,
                 block: block1,
             })
@@ -4429,6 +4502,8 @@ mod zakura_header_sync_driver_tests {
             .expect("driver action channel stays open");
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 2,
                 block: block2,
             })
@@ -4560,6 +4635,8 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 1,
                 block: block.clone(),
             })
@@ -4567,6 +4644,8 @@ mod zakura_header_sync_driver_tests {
             .expect("driver action channel stays open");
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: 2,
                 block: block.clone(),
             })
@@ -4711,6 +4790,8 @@ mod zakura_header_sync_driver_tests {
             }
             action_tx
                 .send(BlockSyncAction::SubmitBlock {
+                    owner: test_block_work_owner(),
+                    source: test_block_source(),
                     token: u64::from(height.0),
                     block: block.clone(),
                 })
@@ -4735,6 +4816,8 @@ mod zakura_header_sync_driver_tests {
             .expect("withheld block is part of the test chain");
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                owner: test_block_work_owner(),
+                source: test_block_source(),
                 token: u64::from(withheld_height.0),
                 block: withheld_block.clone(),
             })
@@ -4846,6 +4929,8 @@ mod zakura_header_sync_driver_tests {
         for (height, block) in &chain {
             action_tx
                 .send(BlockSyncAction::SubmitBlock {
+                    owner: test_block_work_owner(),
+                    source: test_block_source(),
                     token: u64::from(height.0),
                     block: block.clone(),
                 })

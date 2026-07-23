@@ -213,6 +213,18 @@ pub struct WorkOwner {
     pub request_id: NonZeroU64,
 }
 
+impl WorkOwner {
+    /// Return the durable coordinates shared by every item in this request.
+    pub const fn scope(self) -> WorkScope {
+        WorkScope {
+            state_version: self.state_version,
+            header_generation: self.header_generation,
+            verified_generation: self.verified_generation,
+            branch: self.branch,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -583,7 +583,7 @@ async fn drive_mock_block_sync_actions(
                         })
                         .await;
                 }
-                BlockSyncAction::SubmitBlock { token, block } => {
+                BlockSyncAction::SubmitBlock { token, block, .. } => {
                     let Some(apply) = &apply else {
                         continue;
                     };

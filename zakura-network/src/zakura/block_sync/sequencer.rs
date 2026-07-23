@@ -28,6 +28,8 @@ use super::{events::BlockApplyToken, reorder::*, state::*, *};
 /// of thousands of decoded bodies resident at once).
 #[derive(Clone, Debug)]
 pub(super) struct ApplyingBlock {
+    pub(super) owner: zakura_header_chain::WorkOwner,
+    pub(super) source: zakura_header_chain::SourceId,
     pub(super) token: BlockApplyToken,
     pub(super) hash: block::Hash,
     /// `previous_block_hash` captured at receipt, so reset-conflict checks never
@@ -58,6 +60,8 @@ pub(super) enum AcceptOutcome {
 /// dispatches the matching `SubmitBlock` action.
 #[derive(Clone, Debug)]
 pub(super) struct SubmitItem {
+    pub(super) owner: zakura_header_chain::WorkOwner,
+    pub(super) source: zakura_header_chain::SourceId,
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
     pub(super) token: BlockApplyToken,
@@ -333,6 +337,8 @@ impl Sequencer {
     ) -> AcceptOutcome {
         let previous_block_hash = block.header.previous_block_hash;
         self.accept_buffered_body(
+            super::test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
             height,
             hash,
             previous_block_hash,
@@ -342,8 +348,11 @@ impl Sequencer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn accept_buffered_body(
         &mut self,
+        owner: zakura_header_chain::WorkOwner,
+        source: zakura_header_chain::SourceId,
         height: block::Height,
         hash: block::Hash,
         previous_block_hash: block::Hash,
@@ -371,10 +380,16 @@ impl Sequencer {
             body.retain_for_backlog()
         };
 
-        match self
-            .reorder
-            .insert_body(height, hash, previous_block_hash, body, bytes, source_peer)
-        {
+        match self.reorder.insert_body(
+            owner,
+            source,
+            height,
+            hash,
+            previous_block_hash,
+            body,
+            bytes,
+            source_peer,
+        ) {
             ReorderInsertResult::Inserted => AcceptOutcome::Buffered { covered: height },
             ReorderInsertResult::Duplicate => AcceptOutcome::Redundant {
                 release_bytes: bytes,
@@ -415,6 +430,8 @@ impl Sequencer {
             self.applying.insert(
                 drained.height,
                 ApplyingBlock {
+                    owner: drained.owner,
+                    source: drained.source,
                     token: 0,
                     hash: drained.hash,
                     previous_block_hash: drained.previous_block_hash,
@@ -469,6 +486,8 @@ impl Sequencer {
         }
         let token = self.next_apply_token();
         let (
+            owner,
+            source,
             hash,
             bytes,
             block,
@@ -482,6 +501,8 @@ impl Sequencer {
             applying.token = token;
             applying.submitted = true;
             (
+                applying.owner,
+                applying.source,
                 applying.hash,
                 applying.bytes,
                 block,
@@ -506,6 +527,8 @@ impl Sequencer {
         self.in_flight_submission_count = self.in_flight_submission_count.saturating_add(1);
         self.in_flight_submission_bytes = self.in_flight_submission_bytes.saturating_add(bytes);
         Some(SubmitItem {
+            owner,
+            source,
             height,
             hash,
             token,

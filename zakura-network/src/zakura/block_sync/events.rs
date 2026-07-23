@@ -137,6 +137,10 @@ pub enum BlockSyncAction {
     },
     /// Parent-first body ready for B3's verifier/commit driver.
     SubmitBlock {
+        /// Exact network request that owns this verifier submission.
+        owner: zakura_header_chain::WorkOwner,
+        /// Authenticated peer source that supplied the body.
+        source: zakura_header_chain::SourceId,
         /// Submission token to echo in [`BlockSyncEvent::BlockApplyFinished`].
         token: BlockApplyToken,
         /// Block body that is contiguous above `verified_block_tip`.

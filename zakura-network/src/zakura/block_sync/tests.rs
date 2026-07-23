@@ -454,6 +454,7 @@ fn window_request(height: u32) -> OutstandingBlockRange {
     let now = Instant::now();
     OutstandingBlockRange {
         request: BlockRangeRequest {
+            owner: test_work_owner(),
             start_height: block::Height(height),
             count: 1,
             anchor_hash: block::Hash([byte; 32]),
@@ -477,6 +478,7 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
     let now = Instant::now();
     OutstandingBlockRange {
         request: BlockRangeRequest {
+            owner: test_work_owner(),
             start_height: block::Height(start),
             count,
             anchor_hash: block::Hash([byte; 32]),
@@ -894,7 +896,7 @@ fn work_queue_with(
 ) -> super::work_queue::WorkQueue {
     let queue = super::work_queue::WorkQueue::new(block::Height(floor));
     queue.set_estimate_floor_for_tests(1);
-    queue.extend(items);
+    queue.extend(test_work_scope(), items);
     queue
 }
 
@@ -1356,14 +1358,94 @@ fn work_queue_extend_dedups_against_pending_in_flight_and_floor() {
     // Take h6 into `in_flight`, then re-extend with h6 (in flight) and h7
     // (already pending): both are skipped, only a genuinely new height inserts.
     queue.take_in_range(block::Height(6), block::Height(6), 1);
-    let inserted = queue.extend([
-        needed(6, BlockSizeEstimate::Advertised(100)), // in flight
-        needed(7, BlockSizeEstimate::Advertised(100)), // already pending
-        needed(8, BlockSizeEstimate::Advertised(100)), // new
-    ]);
+    let inserted = queue.extend(
+        test_work_scope(),
+        [
+            needed(6, BlockSizeEstimate::Advertised(100)), // in flight
+            needed(7, BlockSizeEstimate::Advertised(100)), // already pending
+            needed(8, BlockSizeEstimate::Advertised(100)), // new
+        ],
+    );
     assert_eq!(inserted, 1, "only the genuinely new height is inserted");
     assert!(queue.pending_contains(block::Height(8)));
     assert!(!queue.pending_contains(block::Height(6)));
+}
+
+#[test]
+fn work_queue_separates_scopes_and_retires_obsolete_reservations() {
+    let obsolete = test_work_scope();
+    let current = zakura_header_chain::WorkScope {
+        state_version: zakura_header_chain::StateVersion::new(9),
+        ..obsolete
+    };
+    let queue = WorkQueue::new(block::Height(0));
+    queue.set_estimate_floor_for_tests(1);
+    assert_eq!(
+        queue.extend(obsolete, [needed(1, BlockSizeEstimate::Advertised(100))]),
+        1
+    );
+    assert_eq!(
+        queue.extend(current, [needed(2, BlockSizeEstimate::Advertised(200))]),
+        1
+    );
+
+    let taken = queue.take_in_range(block::Height(1), block::Height(2), 2);
+    assert_eq!(
+        taken.len(),
+        1,
+        "one request must never mix ownership scopes"
+    );
+    assert_eq!(taken[0].1.scope, obsolete);
+    let owner = obsolete.bind(
+        12,
+        std::num::NonZeroU64::new(13).expect("thirteen is nonzero"),
+    );
+    assert_eq!(
+        queue.mark_reserved_for_owner(owner, [block::Height(1)]),
+        100
+    );
+    assert_eq!(queue.owner_for_height(block::Height(1)), Some(owner));
+
+    assert_eq!(queue.retire_obsolete_scope(current), 100);
+    assert_eq!(queue.reserved_bytes(), 0);
+    assert!(!queue.in_flight_contains(block::Height(1)));
+    assert_eq!(
+        queue.extend(current, [needed(1, BlockSizeEstimate::Advertised(100))]),
+        1
+    );
+    let replacement = queue.take_in_range(block::Height(1), block::Height(2), 1);
+    assert_eq!(replacement.len(), 1);
+    assert_eq!(replacement[0].0, block::Height(1));
+    assert_eq!(replacement[0].1.scope, current);
+
+    let replacement_owner = current.bind(
+        12,
+        std::num::NonZeroU64::new(14).expect("fourteen is nonzero"),
+    );
+    assert_eq!(
+        queue.mark_reserved_for_owner(replacement_owner, [block::Height(1)]),
+        100
+    );
+    let stale_same_scope_owner = current.bind(
+        12,
+        std::num::NonZeroU64::new(13).expect("thirteen is nonzero"),
+    );
+    let stale_cleanup = queue.release_reserved_and_return_items_detailed_for_owner(
+        stale_same_scope_owner,
+        [block::Height(1)],
+    );
+    assert_eq!(stale_cleanup.released_bytes, 0);
+    assert_eq!(stale_cleanup.returned_count, 0);
+    assert_eq!(stale_cleanup.missing_count, 1);
+    assert_eq!(
+        queue.owner_for_height(block::Height(1)),
+        Some(replacement_owner)
+    );
+    assert_eq!(queue.reserved_bytes(), 100);
+    assert_eq!(queue.retire_all(), 100);
+    assert_eq!(queue.reserved_bytes(), 0);
+    assert_eq!(queue.pending_len(), 0);
+    assert_eq!(queue.in_flight_len(), 0);
 }
 
 #[test]
@@ -3064,13 +3146,7 @@ async fn block_liveness_disconnects_silent_peer_and_traces_reason() {
 }
 
 #[tokio::test]
-async fn block_liveness_credits_late_unmatched_body_and_keeps_peer() {
-    // Regression: a peer whose probe times out but that then delivers the body late
-    // — after its own outstanding request was already removed, so the body arrives
-    // through the unmatched-queued path — must be credited with block progress and
-    // kept. Before the fix, `accept_unmatched_queued_body` buffered the useful body
-    // without resetting the no-progress streak or proving the peer, so the peer was
-    // disconnected at the liveness deadline despite delivering the block we accepted.
+async fn block_liveness_rejects_late_unowned_body_and_expires_peer() {
     let mut config = immediate_body_download_config();
     // Short request/floor-rescue leash so the probe times out fast; the liveness
     // deadline (request_timeout * 4 = 1.2s) is what a false disconnect would trip.
@@ -3144,8 +3220,8 @@ async fn block_liveness_credits_late_unmatched_body_and_keeps_peer() {
     // queue and, being unproven, the peer is now gated at its one-probe cap.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // The body arrives late, matching no outstanding request → the unmatched-queued
-    // path buffers and forwards it.
+    // The body arrives after its request owner was retired. It must not become an
+    // unowned verifier submission or prove this peer made timely progress.
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[0].clone())
@@ -3155,27 +3231,24 @@ async fn block_liveness_credits_late_unmatched_body_and_keeps_peer() {
         .await
         .expect("late block frame queues");
 
-    // Non-vacuous: the late body was accepted (forwarded for submission).
-    let submitted = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match next_action(&mut actions).await {
-                BlockSyncAction::SubmitBlock { block, .. } => break block.coinbase_height(),
-                _ => continue,
-            }
-        }
-    })
-    .await
-    .expect("the late unmatched body is accepted and submitted");
-    assert_eq!(submitted, Some(block::Height(1)));
-
-    // The credited progress must keep the peer alive past the liveness deadline
-    // (1.2s from the probe). Before the fix the peer was disconnected here.
     assert!(
-        tokio::time::timeout(Duration::from_millis(1500), connection_cancel.cancelled())
-            .await
-            .is_err(),
-        "a peer that delivered an accepted (late) body must not be parked as silent",
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if matches!(
+                    next_action(&mut actions).await,
+                    BlockSyncAction::SubmitBlock { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_err(),
+        "a completion whose request owner retired must not reach the verifier",
     );
+    tokio::time::timeout(Duration::from_millis(1500), connection_cancel.cancelled())
+        .await
+        .expect("an unproven peer still expires at its liveness deadline");
 
     reactor_task.abort();
 }
@@ -3269,12 +3342,15 @@ fn work_queue_estimate_clamps_hint_between_floor_and_max_block_bytes() {
     // Default estimator: Unknown -> worst case; tiny hints clamp up to the floor;
     // huge hints clamp down to MAX_BLOCK_BYTES; ordinary hints pass through.
     let queue = super::work_queue::WorkQueue::new(block::Height(0));
-    queue.extend([
-        needed(1, BlockSizeEstimate::Unknown),
-        needed(2, BlockSizeEstimate::Advertised(1)), // below the floor
-        needed(3, BlockSizeEstimate::Advertised(12_345)),
-        needed(4, BlockSizeEstimate::Confirmed(u32::MAX)), // above MAX_BLOCK_BYTES
-    ]);
+    queue.extend(
+        test_work_scope(),
+        [
+            needed(1, BlockSizeEstimate::Unknown),
+            needed(2, BlockSizeEstimate::Advertised(1)), // below the floor
+            needed(3, BlockSizeEstimate::Advertised(12_345)),
+            needed(4, BlockSizeEstimate::Confirmed(u32::MAX)), // above MAX_BLOCK_BYTES
+        ],
+    );
     let item = |height| {
         queue
             .take_in_range(block::Height(height), block::Height(height), 1)
@@ -3291,10 +3367,13 @@ fn work_queue_estimate_clamps_hint_between_floor_and_max_block_bytes() {
     // The test estimator override changes the floor clamp.
     let tuned = super::work_queue::WorkQueue::new(block::Height(0));
     tuned.set_estimate_floor_for_tests(100);
-    tuned.extend([
-        needed(10, BlockSizeEstimate::Unknown),
-        needed(11, BlockSizeEstimate::Advertised(50)), // below the tuned floor
-    ]);
+    tuned.extend(
+        test_work_scope(),
+        [
+            needed(10, BlockSizeEstimate::Unknown),
+            needed(11, BlockSizeEstimate::Advertised(50)), // below the tuned floor
+        ],
+    );
     assert_eq!(
         tuned
             .take_in_range(block::Height(10), block::Height(10), 1)
@@ -3355,8 +3434,14 @@ fn work_queue_keeps_pending_ordered_by_height() {
     // A BTreeMap keeps the lowest needed height first regardless of extend order,
     // so a newly-needed lower height never sits behind later queued work.
     let queue = super::work_queue::WorkQueue::new(block::Height(0));
-    queue.extend([needed(20, BlockSizeEstimate::Advertised(100))]);
-    queue.extend([needed(10, BlockSizeEstimate::Advertised(100))]);
+    queue.extend(
+        test_work_scope(),
+        [needed(20, BlockSizeEstimate::Advertised(100))],
+    );
+    queue.extend(
+        test_work_scope(),
+        [needed(10, BlockSizeEstimate::Advertised(100))],
+    );
     assert_eq!(queue.min_pending(), Some(block::Height(10)));
     let taken = queue.take_in_range(block::Height(1), block::Height(30), 1);
     assert_eq!(
@@ -3506,6 +3591,8 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
 
     assert_eq!(
         seq.accept_buffered_body(
+            test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
             block::Height(2),
             block2.hash(),
             block2.header.previous_block_hash,
@@ -3579,6 +3666,8 @@ fn sequencer_bounds_decoded_bodies_to_submission_window() {
             BufferedBlockBody::from_decoded_block(block.clone(), Some(raw_block_payload(block)));
         assert_eq!(
             seq.accept_buffered_body(
+                test_work_owner(),
+                zakura_header_chain::SourceId::from_digest([1; 32]),
                 height,
                 block.hash(),
                 block.header.previous_block_hash,
@@ -3762,6 +3851,8 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
             block::Height(u32::try_from(index + 1).expect("403 test block indices fit in u32"));
         body_tx
             .send(SequencedBody::new_queued(
+                test_work_owner(),
+                zakura_header_chain::SourceId::from_digest([1; 32]),
                 height,
                 block.hash(),
                 block.header.previous_block_hash,
@@ -3804,7 +3895,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
             .expect("initial submission action arrives")
             .expect("sequencer action channel remains live");
         match action {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::SubmitBlock { token, block, .. } => {
                 initial_submissions.push((token, block));
             }
             action => panic!("unexpected action before initial submissions complete: {action:?}"),
@@ -3990,6 +4081,8 @@ fn sequencer_completed_duplicate_releases_attached_decode_window_slot() {
         let body =
             BufferedBlockBody::from_decoded_block(block.clone(), Some(raw_block_payload(block)));
         seq.accept_buffered_body(
+            test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
             height,
             block.hash(),
             block.header.previous_block_hash,
@@ -4383,6 +4476,8 @@ fn sequencer_keeps_whole_body_for_contiguous_height() {
     // Height 1 is the next contiguous height above the floor (0).
     assert_eq!(
         seq.accept_buffered_body(
+            test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
             block::Height(1),
             block1.hash(),
             block1.header.previous_block_hash,
@@ -4458,6 +4553,7 @@ const THREE_BLOCK_ESTIMATE: u64 = 1_000;
 
 fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRange {
     let request = BlockRangeRequest {
+        owner: test_work_owner(),
         start_height: block::Height(1),
         count: 3,
         anchor_hash: block::Hash([1; 32]),
@@ -4866,6 +4962,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     let mut reorder = ReorderBuffer::new();
 
     let request = BlockRangeRequest {
+        owner: test_work_owner(),
         start_height: block::Height(1),
         count: 1,
         anchor_hash: block::Hash([1; 32]),
@@ -5561,7 +5658,7 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
 
     let submit_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::SubmitBlock { token, block, .. } => {
                 assert_eq!(block.hash(), blocks[0].hash());
                 break token;
             }
@@ -5941,7 +6038,7 @@ async fn reactor_downloads_run_ahead_of_stalled_commit() {
         .expect("block queues");
     let _submit_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::SubmitBlock { token, block, .. } => {
                 assert_eq!(block.hash(), blocks[0].hash());
                 break token;
             }
@@ -6098,7 +6195,7 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
     send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[0].clone())).await;
     let submit_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::SubmitBlock { token, block, .. } => {
                 assert_eq!(block.hash(), blocks[0].hash());
                 break token;
             }
@@ -6393,7 +6490,7 @@ async fn reactor_ignores_unmatched_body_for_currently_needed_height() {
 }
 
 #[tokio::test]
-async fn reactor_accepts_unmatched_body_for_queued_height() {
+async fn reactor_rejects_unmatched_body_for_ownerless_queued_height() {
     let blocks = mainnet_blocks_1_to_3();
     let block1_size = block_size(&blocks[0]);
     let block2_size = block_size(&blocks[1]);
@@ -6450,9 +6547,8 @@ async fn reactor_accepts_unmatched_body_for_queued_height() {
         "the byte-capped request must cover only height 1",
     );
 
-    // Height 2's body arrives without a matching outstanding request. It is a
-    // queued (pending) height in the peer's servable range, so the routine must
-    // claim and buffer it — no request reservation is consumed for it.
+    // Height 2's body arrives without a matching outstanding request. A pending
+    // height has no request owner, so it must not enter the commit pipeline.
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[1].clone())
@@ -6462,8 +6558,7 @@ async fn reactor_accepts_unmatched_body_for_queued_height() {
         .await
         .expect("unmatched queued block queues");
 
-    // Deliver height 1 on its live request; both bodies must submit in order,
-    // proving the unmatched height-2 body was accepted and buffered.
+    // Deliver height 1 on its live request; only that owned body may submit.
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[0].clone())
@@ -6473,17 +6568,27 @@ async fn reactor_accepts_unmatched_body_for_queued_height() {
         .await
         .expect("matched block queues");
 
-    let mut submitted = Vec::new();
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while submitted.len() < 2 {
-            if let BlockSyncAction::SubmitBlock { block, .. } = next_action(&mut actions).await {
-                submitted.push(block.hash());
-            }
+    let submitted = loop {
+        if let BlockSyncAction::SubmitBlock { block, .. } = next_action(&mut actions).await {
+            break block.hash();
         }
-    })
-    .await
-    .expect("both bodies are submitted");
-    assert_eq!(submitted, vec![blocks[0].hash(), blocks[1].hash()]);
+    };
+    assert_eq!(submitted, blocks[0].hash());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if matches!(
+                    next_action(&mut actions).await,
+                    BlockSyncAction::SubmitBlock { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_err(),
+        "the ownerless height-2 body must not be submitted",
+    );
 
     reactor_task.abort();
 }
@@ -6495,9 +6600,8 @@ async fn reactor_accepts_unmatched_body_for_queued_height() {
 // that path entirely: a peer's frames are decoded by its own per-peer pipe-routine,
 // so once the peer disconnects its stream is closed and the routine has exited —
 // there is no transport over which a late body could arrive, and no reactor inbound
-// demux to accept one. The live-peer unmatched-queued-body acceptance is still
-// covered by `reactor_accepts_unmatched_body_for_queued_height` (the routine's
-// `accept_unmatched_queued_body`, driven by a real inbound frame just above).
+// demux to accept one. The live-peer case is covered above and now proves an
+// ownerless queued body is rejected before the commit pipeline.
 
 #[tokio::test]
 async fn reactor_queries_needed_blocks_above_submitted_floor() {
@@ -6591,7 +6695,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
     let mut saw_refill_query = false;
     while submitted.len() < 2 {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::SubmitBlock { token, block, .. } => {
                 submitted.push((
                     block.coinbase_height().expect("test block has height"),
                     token,
@@ -6768,6 +6872,7 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
             BlockSyncAction::SubmitBlock {
                 token,
                 block: submitted,
+                ..
             } => {
                 assert_eq!(submitted.hash(), block.hash());
                 break token;
@@ -7005,7 +7110,7 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
     // routine's fill-check and its await must not be lost).
     let token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::SubmitBlock { token, block, .. } => {
                 assert_eq!(block.coinbase_height(), Some(block::Height(1)));
                 break token;
             }
@@ -8537,7 +8642,7 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
         .expect("successor body queues");
     let successor_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::SubmitBlock { token, block, .. } => {
                 assert_eq!(block.hash(), blocks[2].hash());
                 break token;
             }
@@ -8844,7 +8949,7 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
     let mut submitted = Vec::new();
     while submitted.len() < 2 {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => submitted.push((
+            BlockSyncAction::SubmitBlock { token, block, .. } => submitted.push((
                 block.coinbase_height().expect("test block has height"),
                 token,
             )),
@@ -9049,7 +9154,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
         .expect("first body frame queues");
     let stale_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::SubmitBlock { token, block, .. } => {
                 assert_eq!(block.hash(), block_hash);
                 break token;
             }
@@ -9115,7 +9220,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
         .expect("second body frame queues");
     let current_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::SubmitBlock { token, block, .. } => {
                 assert_eq!(block.hash(), block_hash);
                 break token;
             }
@@ -10320,7 +10425,7 @@ async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
     // and submitted to consensus.
     let submit_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::SubmitBlock { token, block, .. } => {
                 assert_eq!(block.hash(), blocks[0].hash());
                 break token;
             }
@@ -12694,7 +12799,7 @@ async fn reactor_ignores_duplicate_response_at_body_download_floor() {
 
     let (token, hash) = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => break (token, block.hash()),
+            BlockSyncAction::SubmitBlock { token, block, .. } => break (token, block.hash()),
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action while waiting for submit: {action:?}"),
         }
@@ -12820,7 +12925,7 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
 
     let (token, hash) = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => break (token, block.hash()),
+            BlockSyncAction::SubmitBlock { token, block, .. } => break (token, block.hash()),
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action while waiting for submit: {action:?}"),
         }

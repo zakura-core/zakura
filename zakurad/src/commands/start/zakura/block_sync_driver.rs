@@ -481,7 +481,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     }
                 }
             }
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::SubmitBlock { token, block, .. } => {
                 let class = block_apply_class(block.as_ref(), max_checkpoint_height);
                 let height = block.coinbase_height();
                 if block_sync_handoff.is_yielded_to_legacy() {
@@ -1580,7 +1580,7 @@ fn trace_block_driver_action(trace: &ZakuraTrace, action: &BlockSyncAction) {
                 insert_cs_height(row, cs_trace::RANGE_START, *start);
                 insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(*count));
             }
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::SubmitBlock { token, block, .. } => {
                 insert_cs_str(row, cs_trace::ACTION, "submit_block");
                 insert_cs_u64(row, cs_trace::APPLY_TOKEN, *token);
                 insert_cs_hash(row, cs_trace::HASH, block.hash());

@@ -62,6 +62,8 @@ impl ReorderBuffer {
     ) -> ReorderInsertResult {
         let previous_block_hash = block.header.previous_block_hash;
         self.insert_body(
+            super::test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
             height,
             block.hash(),
             previous_block_hash,
@@ -73,8 +75,11 @@ impl ReorderBuffer {
 
     /// Buffer a received body, keeping raw block bytes when the peer routine can
     /// provide them so non-contiguous backlog does not retain decoded blocks.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn insert_body(
         &mut self,
+        owner: zakura_header_chain::WorkOwner,
+        source: zakura_header_chain::SourceId,
         height: block::Height,
         hash: block::Hash,
         previous_block_hash: block::Hash,
@@ -90,6 +95,8 @@ impl ReorderBuffer {
         self.blocks.insert(
             height,
             BufferedBlock {
+                owner,
+                source,
                 hash,
                 previous_block_hash,
                 body,
@@ -120,6 +127,8 @@ impl ReorderBuffer {
                 .decoded_attributed_memory_bytes
                 .saturating_sub(buffered.body.decoded_attributed_memory_size_bytes());
             released.push(DrainedBlock {
+                owner: buffered.owner,
+                source: buffered.source,
                 height: next,
                 hash: buffered.hash,
                 previous_block_hash: buffered.previous_block_hash,
@@ -194,6 +203,8 @@ pub(super) enum ReorderInsertResult {
 /// into `applying` never forces a decode.
 #[derive(Clone, Debug)]
 pub(super) struct DrainedBlock {
+    pub(super) owner: zakura_header_chain::WorkOwner,
+    pub(super) source: zakura_header_chain::SourceId,
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
     pub(super) previous_block_hash: block::Hash,
@@ -204,6 +215,8 @@ pub(super) struct DrainedBlock {
 
 #[derive(Clone, Debug)]
 struct BufferedBlock {
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
     hash: block::Hash,
     previous_block_hash: block::Hash,
     body: BufferedBlockBody,

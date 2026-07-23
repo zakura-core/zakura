@@ -324,9 +324,21 @@ impl BlockSyncReactor {
                     }
                 } => {
                     if changed.is_ok() {
+                        let previous_scope = self.body_work_scope();
                         self.committed_snapshot = committed_snapshots
                             .as_ref()
                             .and_then(|snapshots| snapshots.borrow().clone());
+                        let current_scope = self.body_work_scope();
+                        if current_scope != previous_scope {
+                            let released = match current_scope {
+                                Some(scope) => self.state.work_queue.retire_obsolete_scope(scope),
+                                None => self.state.work_queue.retire_all(),
+                            };
+                            self.state.budget.release(released);
+                            if current_scope.is_some() {
+                                self.query_needed_blocks_with_options(true).await;
+                            }
+                        }
                     } else {
                         committed_snapshots = None;
                     }
@@ -434,8 +446,13 @@ impl BlockSyncReactor {
                 continue;
             }
 
-            self.registry
-                .clear_outstanding_height(&claim.peer, claim.height);
+            if !self.registry.clear_outstanding_height_for_owner(
+                &claim.peer,
+                claim.height,
+                claim.meta.owner,
+            ) {
+                continue;
+            }
             if servable_peers > 2 {
                 self.registry.avoid_floor_height_until(
                     &claim.peer,
@@ -446,7 +463,10 @@ impl BlockSyncReactor {
             let released = self
                 .state
                 .work_queue
-                .release_reserved_and_return_items_detailed([claim.height]);
+                .release_reserved_and_return_items_detailed_for_owner(
+                    claim.meta.owner,
+                    [claim.height],
+                );
             self.state.budget.release(released.released_bytes);
             self.emit_trace(bs_trace::BLOCK_FLOOR_WATCHDOG_CANCELLED, |row| {
                 bs_insert_peer(row, bs_trace::PEER, &claim.peer);
@@ -506,7 +526,10 @@ impl BlockSyncReactor {
             }
             #[cfg(test)]
             BlockSyncEvent::NeededBlocks(blocks) => {
-                self.handle_needed_blocks(blocks).await;
+                let scope = self
+                    .body_work_scope()
+                    .expect("test reactors synthesize a body-work scope");
+                self.handle_needed_blocks(scope, blocks).await;
             }
             BlockSyncEvent::BlockApplyFinished {
                 token,
@@ -919,7 +942,11 @@ impl BlockSyncReactor {
         self.query_needed_blocks_with_options(reset_advanced).await;
     }
 
-    async fn handle_needed_blocks(&mut self, blocks: Vec<BlockSyncBlockMeta>) {
+    async fn handle_needed_blocks(
+        &mut self,
+        scope: zakura_header_chain::WorkScope,
+        blocks: Vec<BlockSyncBlockMeta>,
+    ) {
         self.pending_needed_query = None;
         // The state reports every header-known, body-missing height above the
         // download floor, but it has no visibility into our in-memory buffers.
@@ -957,9 +984,11 @@ impl BlockSyncReactor {
             .filter(|block| {
                 block.height > self.request_floor
                     && !self.state.work_queue.in_flight_contains(block.height)
-                    && !self
-                        .registry
-                        .has_outstanding_request(block.height, block.hash)
+                    && !self.registry.has_outstanding_request_in_scope(
+                        scope,
+                        block.height,
+                        block.hash,
+                    )
             })
             .collect();
 
@@ -983,6 +1012,7 @@ impl BlockSyncReactor {
         // the matching heights already being takeable, with no extend-vs-observe
         // race.
         let count = self.state.work_queue.extend(
+            scope,
             blocks
                 .into_iter()
                 .map(|block| (block.height, block.hash, block.size)),
@@ -1014,7 +1044,7 @@ impl BlockSyncReactor {
             self.query_needed_blocks().await;
             return;
         }
-        self.handle_needed_blocks(blocks).await;
+        self.handle_needed_blocks(scope, blocks).await;
     }
 
     /// Header tip minus verified body tip, emitted as the `body_lag` trace field
@@ -1388,7 +1418,9 @@ impl BlockSyncReactor {
         // The unreceived in-flight heights live in the routines, mirrored into the
         // registry's per-peer outstanding set (per-request granularity: each entry
         // is one still-unreceived requested height). `total_unreceived` sums them.
-        let outstanding = self.registry.total_unreceived();
+        let outstanding = self
+            .body_work_scope()
+            .map_or(0, |scope| self.registry.total_unreceived_in_scope(scope));
 
         // Count only the download pipeline (pending WorkQueue heights + the
         // unreceived heights of in-flight requests) against the refill low-water
@@ -2412,6 +2444,7 @@ impl BlockSyncReactor {
                 hash,
                 result,
                 local_frontier,
+                ..
             } => {
                 bs_insert_str(row, bs_trace::KIND, "block_apply_finished");
                 bs_insert_u64(row, bs_trace::APPLY_TOKEN, *token);
@@ -2468,7 +2501,7 @@ impl BlockSyncReactor {
                 bs_insert_height(row, bs_trace::RANGE_START, *start);
                 bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(*count));
             }
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::SubmitBlock { token, block, .. } => {
                 bs_insert_str(row, bs_trace::KIND, "submit_block");
                 bs_insert_u64(row, bs_trace::APPLY_TOKEN, *token);
                 bs_insert_hash(row, bs_trace::HASH, block.hash());

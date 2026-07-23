@@ -530,7 +530,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-INT-04"
 name = "Atomic invalidate and reconsider"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::service::write::commit_operator_change"
+tests = ["IN-01::df_01_generated_nu5_graph_matches_full_state_before_finalization", "AUD-10::aud_10_invalidation_promotes_alternate_and_aud_12_preserves_nested_reasons", "AUD-11::aud_11_invalidating_only_verified_path_keeps_independent_header_best", "AUD-12::aud_12_reconsider_restores_a_shorter_higher_work_verified_branch", "AUD-14::aud_14_operator_reason_changes_reopen_complete_before_or_after"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-BODY-01"

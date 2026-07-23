@@ -228,13 +228,26 @@ The end of support height is calculated from the current blockchain height:
 ## Create the GitHub Pre-Release
 
 - [ ] Wait for all the release PRs to be merged
-- [ ] Run the [Create release workflow](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml)
+- [ ] Run the T-0 orchestrator — its preflight checks for a competing
+      release train, then it dispatches `Create release` from `main` with
+      the exact tag, watches to the approval gate, and verifies the
+      published tag, release, and assets (resumable — re-runs skip
+      completed steps):
+
+      ```sh
+      ./scripts/release-t0.sh publish --tag v<version> --mode main \
+          --head-sha <merged-main-commit>
+      ```
+
+      Manual fallback: run the
+      [Create release workflow](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml)
       from `main`, entering the exact version tag, for example `v1.0.0-rc2`.
       The workflow verifies that the tag matches the `zakura` package version,
       then builds and verifies the assets without creating a tag.
 - [ ] Wait for the build and no-push Docker checks to pass, then approve the
-      `release` environment deployment. The workflow publishes a complete
-      pre-release and creates the protected tag as its final step.
+      `release` environment deployment when the script announces it. The
+      workflow publishes a complete pre-release and creates the protected
+      tag as its final step.
 - [ ] Review and update the new release description against the final changelog
       you created, starting just _after_ the title `## [Zakura ...` of the
       current version and ending just _before_ the title of the previous
@@ -253,10 +266,12 @@ For a release candidate, skip this section: the release stays a pre-release
 from publication until deletion.
 
 - [ ] For a stable release, after `make sign-release` has run against the tag:
-      [edit the release](https://github.com/zakura-core/zakura/releases) to
-      disable 'pre-release' **and** check "Set as the latest release"
-      (`make_latest: true`) — both steps are explicit; nothing does this
-      automatically.
+      `./scripts/release-t0.sh promote --tag v<version>` — it refuses
+      unsigned releases and release candidates, clears 'pre-release', checks
+      "Set as the latest release" (`make_latest: true`), and verifies both.
+      Manual fallback:
+      [edit the release](https://github.com/zakura-core/zakura/releases) and
+      set both flags explicitly — nothing does this automatically.
 
 ## Publish Crates
 

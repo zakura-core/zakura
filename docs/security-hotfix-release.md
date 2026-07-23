@@ -192,7 +192,7 @@ T-0 involves zero authoring — only pushing and clicking. The branch carries:
      patch de-rcs became three major bumps this way) — and normalize
      internal dependency requirements, because `dependent-version = "fix"`
      leaves stale `^X.Y.Z-rcN` requirements in place when the stable version
-     still matches them;
+     still matches them (`make pre-release` fails on any left behind);
    - the stored config snapshot
      (`zakurad/tests/common/configs/v<version>.toml` — `last_config_is_stored`
      fails without it);
@@ -259,6 +259,10 @@ never for anything public.
       in the ruleset's allowed merge methods (recommended — the merge button
       still defaults to squash) or verify the temporary-edit procedure in a
       drill. At v1.0.3 this conflict was discovered live, mid-T-0.
+- [ ] `scripts/release-t0.sh preflight` runs clean against the public repo,
+      and the script itself has been drilled: `--dry-run` publicly, and for
+      staging rehearsals
+      `--repo zakura-core/zakura-private --allow-nondefault-repo`.
 
 ### The day before
 
@@ -277,10 +281,11 @@ are what made that survivable.
       version: under embargo you are invisible to a teammate correctly
       running the regular checklist (this happened at v1.0.3's T-0).
 - [ ] Decide who executes the public T-0 triggers (branch push, PR merge,
-      workflow dispatch, promotion): the operator runs them directly by
-      default; if an agent drives the release, pre-authorize its T-0 command
-      set now — permission prompts mid-incident are unplanned friction at
-      exactly the wrong moment.
+      workflow dispatch, promotion): the operator runs
+      `scripts/release-t0.sh` directly by default; if an agent drives the
+      release, pre-authorize the script and its `gh`/`git` calls now —
+      permission prompts mid-incident are unplanned friction at exactly the
+      wrong moment.
 - [ ] Optional [pre-announcement](#pre-announcement) published.
 - [ ] Main-base only: freeze the Mergify `batched` queue.
 - [ ] Partner/upstream notifications sent per `SECURITY.md`
@@ -295,6 +300,27 @@ are what made that survivable.
 Complete, verified assets exist before the tag does. Times from recent
 `Create release` runs (~18–30 min dispatch-to-tag).
 
+The mechanical steps (merge or push → dispatch → watch → verify) are one
+resumable command — [`scripts/release-t0.sh`](../scripts/release-t0.sh):
+
+```sh
+# main base (T-0 PR merge into main):
+./scripts/release-t0.sh publish --hotfix --tag vX.Y.Z --mode main \
+    --pr <N> --head-sha <final-commit>
+# branch base (hotfix/vX.Y.Z push):
+./scripts/release-t0.sh publish --hotfix --tag vX.Y.Z --mode branch \
+    --head-sha <final-commit>
+```
+
+Its preflight re-verifies the standing preconditions and detects in-flight
+regular releases (open `A-release` PRs, `release/v*`/`bump-v*` branches,
+active `Create release` runs) before anything mutates; every step checks
+preconditions, acts, then verifies target state — a failed check prints
+observed vs expected and the exact recovery, and re-running skips completed
+steps. It stops for exactly one human action — approving the `release`
+environment — and hands off before crates, signing, and announcements. The
+clock below is what it does when:
+
 | Clock | Step |
 | --- | --- |
 | T-0 | Branch base: push `hotfix/vX.Y.Z`. Main base: open the public PR from `hotfix/vX.Y.Z` and squash-merge it into `main`. |
@@ -304,13 +330,13 @@ Complete, verified assets exist before the tag does. Times from recent
 | T+30 | Tag + complete pre-release published; tag-push run starts Docker publishing. |
 | T+30 | Start the crates publish loop (below) — it runs ~30–60 min, mostly waiting. |
 | T+35 | `make sign-release TAG=v<version>` (signs `SHA256SUMS.txt`, uploads `.minisig`). |
-| T+40 | Promote (stable only: clear pre-release **and** set latest). Publish the GHSA advisory. Announce. |
+| T+40 | Promote (stable only: `release-t0.sh promote --tag vX.Y.Z` — refuses unsigned releases, clears pre-release **and** sets latest). Publish the GHSA advisory. Announce. |
 | T+45–75 | Docker images land; confirm assets, images, and manifest per the standard checklist. |
 
 ### Mode B — source-first (active exploitation only)
 
-Dispatching `Create release` with the `source_first_release` input skips the
-staged asset build: validation only (~4–8 min), approve, and the **tag +
+Dispatching `Create release` with the `source_first_release` input
+(`release-t0.sh publish --source-first ...`) skips the staged asset build: validation only (~4–8 min), approve, and the **tag +
 source-only release publish at ~T+10**. The tag-push run of
 `release-binaries.yml` then sees an incomplete asset set and rebuilds and
 attaches assets to the existing release, so binaries land ~T+35–50, then
@@ -365,6 +391,8 @@ warrants a pre-announcement.
       `gh api --method PUT repos/zakura-core/zakura/rulesets/<id>` with the
       amended rule), merge with the dropdown set to "Create a merge commit"
       — **the button defaults to squash** — then revert the ruleset edit.
+      `./scripts/release-t0.sh forward-merge --tag vX.Y.Z --pr <N>` executes
+      and verifies all of this, including the tag-ancestry postcondition.
 - [ ] Main base: nothing to forward-merge — the fix entered `main` at T-0 as
       the squash commit the tag points to. Un-freeze Mergify.
 - [ ] Confirm installer-metadata/post-release automation completed as usual.
@@ -451,7 +479,8 @@ without full detail).
     process never touches `release/v*`), the hold-releases heads-up the day
     before, and checking for open release PRs, `release/v*`/`bump-v*`
     branches, and running `Create release` dispatches before pushing
-    anything at T-0.
+    anything at T-0 — `scripts/release-t0.sh` runs exactly these checks as
+    its preflight.
 
 ## Drills
 
@@ -464,7 +493,9 @@ pre-releases are already a normal, permanent part of the repository's
 history. Exercise Mode A once and Mode B once (separate RCs of the same
 line), including `make sign-release` against the RC tag — signing an RC is
 harmless and exercises the signing tooling; promotion stays un-exercised by
-design. Skip the crates publish: the packaging `--verify` rehearsal covers it
+design. Drive the T-0 sequence through `scripts/release-t0.sh` (against the
+staging repo with `--allow-nondefault-repo`; `--dry-run` against the public
+repo) so the tooling itself is what gets drilled. Skip the crates publish: the packaging `--verify` rehearsal covers it
 without spending permanent registry versions. Time every step; replace the
 estimates in the runbook with measured numbers.
 

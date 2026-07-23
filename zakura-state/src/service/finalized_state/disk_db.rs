@@ -113,6 +113,12 @@ pub struct DiskDb {
     db: Arc<DB>,
 }
 
+/// An immutable RocksDB view tied to a [`DiskDb`].
+pub(in crate::service::finalized_state) struct DiskDbSnapshot<'a> {
+    db: &'a DiskDb,
+    snapshot: rocksdb::SnapshotWithThreadMode<'a, DB>,
+}
+
 /// Wrapper struct to ensure low-level database writes go through the correct API.
 ///
 /// [`rocksdb::WriteBatch`] is a batched set of database updates,
@@ -434,6 +440,49 @@ impl PartialEq for DiskDb {
 
 impl Eq for DiskDb {}
 
+impl DiskDbSnapshot<'_> {
+    /// Returns the column family handle for `cf_name`.
+    pub(in crate::service::finalized_state) fn cf_handle(
+        &self,
+        cf_name: &str,
+    ) -> Option<rocksdb::ColumnFamilyRef<'_>> {
+        self.db.cf_handle(cf_name)
+    }
+
+    /// Returns the value for `key` from this snapshot, if present.
+    pub(in crate::service::finalized_state) fn zs_get<C, K, V>(&self, cf: &C, key: &K) -> Option<V>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk,
+        V: FromDisk,
+    {
+        let key_bytes = key.as_bytes();
+        let value_bytes = self
+            .snapshot
+            .get_pinned_cf(cf, key_bytes)
+            .expect("unexpected database failure");
+
+        value_bytes.map(V::from_bytes)
+    }
+
+    /// Returns the highest key and its value from this snapshot.
+    pub(in crate::service::finalized_state) fn zs_last_key_value<C, K, V>(
+        &self,
+        cf: &C,
+    ) -> Option<(K, V)>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: FromDisk,
+        V: FromDisk,
+    {
+        self.snapshot
+            .iterator_cf(cf, rocksdb::IteratorMode::End)
+            .next()
+            .map(|result| result.expect("unexpected database failure"))
+            .map(|(key, value)| (K::from_bytes(key), V::from_bytes(value)))
+    }
+}
+
 /// # Deprecation
 ///
 /// These impls should not be used in new code, use [`TypedColumnFamily`] instead.
@@ -586,6 +635,19 @@ impl DiskWriteBatch {
 }
 
 impl DiskDb {
+    /// Returns an immutable view of all column families at one RocksDB sequence.
+    ///
+    /// This pins consistency inside this database instance. A read-only secondary
+    /// does not coordinate snapshot retention with its primary, so callers must
+    /// keep secondary snapshots short-lived and treat catch-up freshness as a
+    /// separate concern.
+    pub(in crate::service::finalized_state) fn snapshot(&self) -> DiskDbSnapshot<'_> {
+        DiskDbSnapshot {
+            db: self,
+            snapshot: self.db.snapshot(),
+        }
+    }
+
     /// Prints rocksdb metrics for each column family along with total database disk size, live data disk size and database memory size.
     pub fn print_db_metrics(&self) {
         let mut total_size_on_disk = 0;

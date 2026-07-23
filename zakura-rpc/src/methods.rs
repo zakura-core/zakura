@@ -3202,32 +3202,16 @@ where
             };
         }
 
-        // TODO: Ensure that the returned tip hash is always valid for the response, i.e. that Zebra can't return a tip that
-        //       hadn't yet included the queried transaction output.
-
-        // Get the best block tip hash
-        let tip_rsp = self
-            .read_state
-            .clone()
-            .oneshot(zakura_state::ReadRequest::Tip)
-            .await
-            .map_misc_error()?;
-
-        let best_block_hash = match tip_rsp {
-            zakura_state::ReadResponse::Tip(tip) => tip.ok_or_misc_error("No blocks in state")?.1,
-            _ => unreachable!("unmatched response to a `Tip` request"),
-        };
-
-        // State path
         let rsp = self
             .read_state
             .clone()
-            .oneshot(zakura_state::ReadRequest::Transaction(txid))
+            .oneshot(zakura_state::ReadRequest::BestChainUnspentOutput(outpoint))
             .await
             .map_misc_error()?;
 
         match rsp {
-            zakura_state::ReadResponse::Transaction(Some(tx)) => {
+            zakura_state::ReadResponse::BestChainUnspentOutput(Some(output_info)) => {
+                let tx = output_info.transaction;
                 let outputs = tx.tx.outputs();
                 let index: usize = n.try_into().expect("u32 always fits in usize");
                 let output = match outputs.get(index) {
@@ -3236,33 +3220,10 @@ where
                     None => return Ok(GetTxOutResponse(None)),
                 };
 
-                // Prune state outputs that are spent
-                let is_spent = {
-                    let rsp = self
-                        .read_state
-                        .clone()
-                        .oneshot(zakura_state::ReadRequest::IsTransparentOutputSpent(
-                            outpoint,
-                        ))
-                        .await
-                        .map_misc_error()?;
-
-                    match rsp {
-                        zakura_state::ReadResponse::IsTransparentOutputSpent(spent) => spent,
-                        _ => unreachable!(
-                            "unmatched response to an `IsTransparentOutputSpent` request"
-                        ),
-                    }
-                };
-
-                if is_spent {
-                    return Ok(GetTxOutResponse(None));
-                }
-
                 Ok(GetTxOutResponse(Some(
                     types::transaction::OutputObject::from_output(
                         output,
-                        best_block_hash.to_string(),
+                        output_info.tip_hash.to_string(),
                         tx.confirmations,
                         tx.tx.version(),
                         tx.tx.is_coinbase(),
@@ -3270,8 +3231,8 @@ where
                     ),
                 )))
             }
-            zakura_state::ReadResponse::Transaction(None) => Ok(GetTxOutResponse(None)),
-            _ => unreachable!("unmatched response to a `Transaction` request"),
+            zakura_state::ReadResponse::BestChainUnspentOutput(None) => Ok(GetTxOutResponse(None)),
+            _ => unreachable!("unmatched response to a `BestChainUnspentOutput` request"),
         }
     }
 }

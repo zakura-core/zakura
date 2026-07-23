@@ -23,6 +23,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc::{self, Receiver, Sender},
+    Mutex,
+};
+
 use futures::future::FutureExt;
 use tokio::sync::oneshot;
 use tower::{util::BoxService, Service, ServiceExt};
@@ -255,9 +262,87 @@ pub struct ReadStateService {
 
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
     vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
+
     /// Compact durable header-root authentication progress.
     header_root_auth_receiver:
         tokio::sync::watch::Receiver<Option<finalized_state::HeaderRootAuthState>>,
+
+    #[cfg(test)]
+    best_chain_read_view_test_hook: Option<BestChainReadViewTestHook>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Capture points exposed only to deterministic state interleaving tests.
+pub(in crate::service) enum BestChainReadViewCapturePhase {
+    /// After the non-finalized generation is captured, before the RocksDB snapshot.
+    BeforeFinalizedSnapshot,
+    /// After the RocksDB snapshot is captured, before its first read.
+    AfterFinalizedSnapshot,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+/// A one-shot pause used to force a state transition during view capture.
+pub(in crate::service) struct BestChainReadViewTestHook {
+    phase: BestChainReadViewCapturePhase,
+    entered: Sender<()>,
+    resume: Arc<Mutex<Receiver<()>>>,
+    fired: Arc<AtomicBool>,
+    visits: Arc<AtomicUsize>,
+    pause_every_visit: bool,
+}
+
+#[cfg(test)]
+impl BestChainReadViewTestHook {
+    /// Creates a hook, bounded enter/resume channels, and a visit counter.
+    pub(in crate::service) fn new(
+        phase: BestChainReadViewCapturePhase,
+    ) -> (Self, Receiver<()>, Sender<()>, Arc<AtomicUsize>) {
+        Self::new_with_behavior(phase, false)
+    }
+
+    /// Creates a hook that pauses every capture attempt until retry exhaustion.
+    pub(in crate::service) fn every_visit(
+        phase: BestChainReadViewCapturePhase,
+    ) -> (Self, Receiver<()>, Sender<()>, Arc<AtomicUsize>) {
+        Self::new_with_behavior(phase, true)
+    }
+
+    fn new_with_behavior(
+        phase: BestChainReadViewCapturePhase,
+        pause_every_visit: bool,
+    ) -> (Self, Receiver<()>, Sender<()>, Arc<AtomicUsize>) {
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (resume_sender, resume_receiver) = mpsc::channel();
+        let visits = Arc::new(AtomicUsize::new(0));
+        let hook = Self {
+            phase,
+            entered: entered_sender,
+            resume: Arc::new(Mutex::new(resume_receiver)),
+            fired: Arc::new(AtomicBool::new(false)),
+            visits: visits.clone(),
+            pause_every_visit,
+        };
+
+        (hook, entered_receiver, resume_sender, visits)
+    }
+
+    fn run(&self, phase: BestChainReadViewCapturePhase) {
+        if self.phase != phase {
+            return;
+        }
+
+        self.visits.fetch_add(1, Ordering::SeqCst);
+        if self.pause_every_visit || !self.fired.swap(true, Ordering::SeqCst) {
+            self.entered.send(()).expect("test receiver remains open");
+            self.resume
+                .lock()
+                .expect("test hook mutex is not poisoned")
+                .recv_timeout(Duration::from_secs(10))
+                .expect("test releases the read-view capture hook");
+        }
+    }
 }
 
 impl Drop for StateService {
@@ -1105,6 +1190,9 @@ impl StateService {
 }
 
 impl ReadStateService {
+    /// Maximum attempts to capture one non-finalized generation and RocksDB sequence.
+    const BEST_CHAIN_READ_VIEW_ATTEMPTS: usize = 3;
+
     /// Creates a new read-only state service, using the provided finalized state and
     /// block write task handle.
     ///
@@ -1134,6 +1222,8 @@ impl ReadStateService {
             _highest_completed_checkpoint_sender: highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
             header_root_auth_receiver,
+            #[cfg(test)]
+            best_chain_read_view_test_hook: None,
         };
 
         tracing::debug!("created new read-only state service");
@@ -1174,6 +1264,75 @@ impl ReadStateService {
     fn latest_best_chain(&self) -> Option<Arc<Chain>> {
         self.non_finalized_state_receiver
             .borrow_mapped(|non_finalized_state| non_finalized_state.best_chain().cloned())
+    }
+
+    /// Captures one coherent view across the watched non-finalized state and RocksDB.
+    ///
+    /// The writer publishes its non-finalized chain before moving the same chain's
+    /// oldest blocks into the finalized database. This ordering guarantees overlap,
+    /// rather than a gap, between a captured chain and a later RocksDB snapshot.
+    /// Marking the watch generation as seen before capture, then checking it after
+    /// the snapshot, detects every concurrent chain publication, including ABA
+    /// changes. A changed generation retries from scratch. The RocksDB snapshot
+    /// pins every finalized column family to one sequence for the lifetime of the
+    /// returned view.
+    ///
+    /// If the watch channel closes, its final value is immutable. Re-capture that
+    /// value before taking a fresh database snapshot so an unseen final publication
+    /// cannot be combined with an older chain handle.
+    ///
+    /// The overlap guarantee applies when the primary state writer supplies the
+    /// watch channel. In a read-only service, database catch-up and a caller-managed
+    /// non-finalized sender are independent. An empty non-finalized state still gets
+    /// a coherent finalized snapshot, but a caller that publishes non-finalized
+    /// chains must preserve the same publish-before-finalize ordering.
+    fn best_chain_read_view(&self) -> Result<read::BestChainReadView<'_>, BoxError> {
+        let mut receiver = self.non_finalized_state_receiver.clone();
+
+        for _ in 0..Self::BEST_CHAIN_READ_VIEW_ATTEMPTS {
+            receiver.mark_as_seen();
+            let best_chain = receiver
+                .borrow_mapped(|non_finalized_state| non_finalized_state.best_chain().cloned());
+            #[cfg(test)]
+            if let Some(hook) = &self.best_chain_read_view_test_hook {
+                hook.run(BestChainReadViewCapturePhase::BeforeFinalizedSnapshot);
+            }
+            let finalized = self.db.snapshot();
+            #[cfg(test)]
+            if let Some(hook) = &self.best_chain_read_view_test_hook {
+                hook.run(BestChainReadViewCapturePhase::AfterFinalizedSnapshot);
+            }
+
+            match receiver.has_changed() {
+                Ok(true) => continue,
+                Ok(false) => {
+                    return Ok(read::BestChainReadView::new(best_chain, finalized));
+                }
+                Err(_) => {
+                    // A closed channel cannot change again, but its final value might
+                    // have arrived during the first capture. Re-read that final value,
+                    // then take a fresh database snapshot in that order.
+                    let best_chain = receiver.borrow_mapped(|non_finalized_state| {
+                        non_finalized_state.best_chain().cloned()
+                    });
+                    let finalized = self.db.snapshot();
+
+                    return Ok(read::BestChainReadView::new(best_chain, finalized));
+                }
+            }
+        }
+
+        Err("best chain changed while capturing a coherent read view".into())
+    }
+
+    #[cfg(test)]
+    /// Installs a one-shot deterministic capture hook on this service clone.
+    pub(in crate::service) fn with_best_chain_read_view_test_hook(
+        mut self,
+        hook: BestChainReadViewTestHook,
+    ) -> Self {
+        self.best_chain_read_view_test_hook = Some(hook);
+        self
     }
 
     /// Test-only access to the inner database.
@@ -1953,6 +2112,18 @@ impl Service<ReadRequest> for ReadStateService {
                 read::unspent_utxo(state.latest_best_chain(), &state.db, outpoint),
             )),
 
+            // Used by the gettxout RPC.
+            ReadRequest::BestChainUnspentOutput(outpoint) => {
+                let view = state.best_chain_read_view()?;
+                if view.tip().is_none() {
+                    return Err("No blocks in state".into());
+                }
+
+                Ok(ReadResponse::BestChainUnspentOutput(
+                    view.unspent_output(outpoint)?,
+                ))
+            }
+
             // Manually used by the StateService to implement part of AwaitUtxo.
             ReadRequest::AnyChainUtxo(outpoint) => Ok(ReadResponse::AnyChainUtxo(read::any_utxo(
                 state.latest_non_finalized_state(),
@@ -2368,6 +2539,12 @@ pub async fn init(
 /// Each `network` has its own separate on-disk database.
 ///
 /// To share access to the state, clone the returned [`ReadStateService`].
+///
+/// The returned non-finalized sender is caller-managed. Callers that publish
+/// non-finalized chains while the secondary database catches up must publish the
+/// chain before finalized state can advance past the shared overlap. Coherent
+/// multi-source reads rely on that publish-before-finalize ordering. Database
+/// snapshots pin one local secondary sequence; catch-up freshness is separate.
 pub fn init_read_only(
     config: Config,
     network: &Network,

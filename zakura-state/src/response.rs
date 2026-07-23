@@ -187,6 +187,16 @@ pub struct MinedTx {
     pub block_time: DateTime<Utc>,
 }
 
+/// An unspent output's transaction and tip context from one coherent best-chain view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BestChainUnspentOutput {
+    /// The best-chain tip hash used to calculate `transaction.confirmations`.
+    pub tip_hash: block::Hash,
+
+    /// The transaction that creates the unspent output.
+    pub transaction: MinedTx,
+}
+
 impl MinedTx {
     /// Creates a new [`MinedTx`]
     pub fn new(
@@ -478,6 +488,10 @@ pub enum ReadResponse {
     /// _best_ non-finalized chain, or the finalized chain.
     UnspentBestChainUtxo(Option<transparent::Utxo>),
 
+    /// An unspent output and its transaction and tip context from one coherent
+    /// best-chain view.
+    BestChainUnspentOutput(Option<BestChainUnspentOutput>),
+
     /// The response to an `AnyChainUtxo` request, from verified blocks in
     /// _any_ non-finalized chain, or the finalized chain.
     ///
@@ -665,6 +679,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::MissingBlockBodyMetadata(_)
             | ReadResponse::BlockSizeHints(_)
             | ReadResponse::Blocks(_)
+            | ReadResponse::BestChainUnspentOutput(_)
             | ReadResponse::NonFinalizedBlocksListener(_)
             | ReadResponse::IsTransparentOutputSpent(_) => {
                 Err("there is no corresponding Response for this ReadResponse")

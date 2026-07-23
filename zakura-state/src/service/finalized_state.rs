@@ -123,6 +123,7 @@ pub use zakura_db::commitment_roots_db::{
 };
 pub use zakura_db::highest_completed_checkpoint::*;
 pub use zakura_db::ZakuraDb;
+pub(super) use zakura_db::ZakuraDbSnapshot;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use disk_format::KV;

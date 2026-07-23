@@ -1318,3 +1318,93 @@ fn read_only_open_with_ephemeral_config_returns_error() {
         }
     }
 }
+
+/// A delayed read can retain a pre-reorg chain after the winning fork has finalized.
+/// Looking up the requested finalized hash by height must not return the stale fork's header.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Result<()> {
+    use crate::{
+        request::{FinalizedBlock, Treestate},
+        service::{
+            finalized_state::DiskWriteBatch, non_finalized_state::NonFinalizedState,
+            watch_receiver::WatchReceiver, ReadStateService, VctRootRepairStatus,
+        },
+    };
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let winning_block = Arc::new(network.test_block(653599, 583999).unwrap());
+    let config = Config::ephemeral();
+    let finalized_state = FinalizedState::new(
+        &config,
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    )
+    .unwrap();
+    let mut stale_block = winning_block.clone();
+    // Production inserts blocks only after semantic verification. This state-layer
+    // regression bypasses that boundary and mutates the nonce only to give the
+    // retained fork a distinct block identity.
+    Arc::make_mut(&mut Arc::make_mut(&mut stale_block).header)
+        .nonce
+        .0[0] ^= 1;
+    let stale_hash = stale_block.hash();
+    let winning_height = winning_block.coinbase_height().unwrap();
+    assert_ne!(stale_hash, winning_block.hash());
+    let mut stale_state = NonFinalizedState::new(&network);
+    stale_state
+        .commit_new_chain(stale_block.prepare(), &finalized_state)
+        .unwrap();
+    assert_eq!(
+        stale_state
+            .best_chain()
+            .and_then(|chain| chain.hash_by_height(winning_height)),
+        Some(stale_hash)
+    );
+    let (_stale_sender, stale_receiver) = tokio::sync::watch::channel(stale_state);
+    let (_checkpoint_sender, checkpoint_receiver) = tokio::sync::watch::channel(None);
+    let (_repair_sender, repair_receiver) =
+        tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let read_state = ReadStateService::new(
+        &finalized_state,
+        None,
+        WatchReceiver::new(stale_receiver),
+        checkpoint_receiver,
+        None,
+        repair_receiver,
+    );
+    let winning_finalized = FinalizedBlock::from_checkpoint_verified(
+        CheckpointVerifiedBlock::from(winning_block.clone()),
+        Treestate::default(),
+    );
+    // Use the production finalization sub-batch to stage every database row this
+    // handler reads. Ancestor and tip metadata are irrelevant to this request.
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_block_header_and_transaction_data_batch(
+            &finalized_state.db,
+            &winning_finalized,
+            false,
+            None,
+        )
+        .unwrap();
+    finalized_state.db.write_batch(batch).unwrap();
+    let response = read_state
+        .oneshot(ReadRequest::BlockHeader(winning_block.hash().into()))
+        .await
+        .unwrap();
+    let ReadResponse::BlockHeader {
+        header,
+        hash,
+        height,
+        ..
+    } = response
+    else {
+        unreachable!();
+    };
+    assert_eq!(height, winning_height);
+    assert_eq!(hash, winning_block.hash());
+    assert_eq!(block::Hash::from(header.as_ref()), winning_block.hash());
+    Ok(())
+}

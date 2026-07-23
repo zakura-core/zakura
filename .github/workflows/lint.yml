@@ -208,6 +208,9 @@ jobs:
       - name: Mempool load harness tests
         run: python3 .github/workflows/scripts/test_mempool_load.py
 
+      - name: Affected semver package tests
+        run: python3 .github/workflows/scripts/test_affected_semver_packages.py
+
       - name: Deployer tests
         run: python3 deploy/deployer/test_deploy.py
 

@@ -380,6 +380,12 @@ impl HeaderSyncCore {
         wire_request: HeaderSyncWireRequestIdentity,
         payload: HeaderRangePayload,
     ) -> bool {
+        // Retention requires live auth state: without it no consumption or pruning
+        // path runs, so admitted payloads would accumulate unboundedly, and the
+        // eventual `None -> Some` watch transition clears the retained store anyway.
+        if self.header_root_auth.is_none() {
+            return false;
+        }
         if !payload.has_tree_aux_roots() || payload.range().count() < 2 {
             return false;
         }

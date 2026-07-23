@@ -1062,7 +1062,13 @@ async fn root_auth_state_trace_records_exact_hole_height() {
 fn retained_admission_keeps_farthest_same_start_payload() {
     let network = Network::Mainnet;
     let anchor = (block::Height(0), network.genesis_hash());
-    let startup = startup_for(network, anchor, None);
+    let mut startup = startup_for(network, anchor, None);
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(0),
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(6),
+        completed_checkpoint_hash: block::Hash([6; 32]),
+    });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
     let wire_request = |request_id| HeaderSyncWireRequestIdentity {
         peer: peer(231),
@@ -1160,7 +1166,13 @@ fn retained_admission_supersedes_queued_fallback() {
 fn retained_store_does_not_pressure_evict_long_lead() {
     let network = Network::Mainnet;
     let anchor = (block::Height(0), network.genesis_hash());
-    let startup = startup_for(network, anchor, None);
+    let mut startup = startup_for(network, anchor, None);
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(0),
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(40),
+        completed_checkpoint_hash: block::Hash([40; 32]),
+    });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
 
     for index in 0..16u32 {
@@ -1191,6 +1203,50 @@ fn retained_store_does_not_pressure_evict_long_lead() {
 
     assert_eq!(state.retained_roots.len(), 16);
     assert_eq!(state.retained_heights(), 32);
+}
+
+/// Without live auth state no consumption or pruning path runs, so retention
+/// must be refused: admitted payloads would accumulate unboundedly and the
+/// eventual `None -> Some` watch transition clears the retained store anyway.
+#[test]
+fn retained_admission_requires_live_auth_state() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let startup = startup_for(network, anchor, None);
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    assert!(state.header_root_auth.is_none());
+
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(1),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+            vec![0, 0],
+            roots_from_height(block::Height(1), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    let wire_request = HeaderSyncWireRequestIdentity {
+        peer: peer(234),
+        session_id: 1,
+        request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+    };
+
+    assert!(!state.admit_retained_root_payload(wire_request.clone(), payload.clone()));
+    assert!(state.retained_roots.is_empty());
+
+    // The identical payload is admitted once auth state is live.
+    state.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(0),
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(6),
+        completed_checkpoint_hash: block::Hash([6; 32]),
+    });
+    assert!(state.admit_retained_root_payload(wire_request, payload));
+    assert_eq!(state.retained_roots.len(), 1);
 }
 
 #[test]
@@ -1375,11 +1431,17 @@ fn stale_root_auth_waits_for_watch_before_rescheduling() {
 #[test]
 fn session_retirement_cleans_auth_and_retained_payloads() {
     let network = Network::Mainnet;
-    let startup = startup_for(
+    let mut startup = startup_for(
         network.clone(),
         (block::Height(0), network.genesis_hash()),
         None,
     );
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(0),
+        authenticated_hash: network.genesis_hash(),
+        completed_checkpoint_height: block::Height(6),
+        completed_checkpoint_hash: block::Hash([6; 32]),
+    });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
     let peer = peer(212);
     let wire_request = HeaderSyncWireRequestIdentity {

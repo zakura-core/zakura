@@ -574,6 +574,36 @@ pub struct AuxEvidence {
     pub authentication: AuxAuthentication,
 }
 
+/// Dependency-neutral VCT metadata repair status published by the state writer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct VctRootRepairStatus {
+    /// Current repair need.
+    pub state: VctRootRepairState,
+    /// Monotonic replacement-attempt generation.
+    pub generation: u64,
+}
+
+impl Default for VctRootRepairStatus {
+    fn default() -> Self {
+        Self {
+            state: VctRootRepairState::Idle,
+            generation: 0,
+        }
+    }
+}
+
+/// Exact VCT metadata repair need, independent of state/network service types.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum VctRootRepairState {
+    /// No VCT metadata repair is currently required.
+    Idle,
+    /// The finalized writer needs a replacement delivery for one exact height.
+    Unavailable {
+        /// Height whose selected-header metadata is unavailable or rejected.
+        height: block::Height,
+    },
+}
+
 /// Startup-only recovery evidence.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryEvidence {

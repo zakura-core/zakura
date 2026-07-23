@@ -39,6 +39,8 @@ pub struct HeaderSyncStartup {
     pub frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
     /// Atomic snapshots from the durable header engine.
     pub committed_snapshots: Option<watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>>,
+    /// VCT metadata repair needs published by the finalized writer.
+    pub vct_root_repairs: Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
     /// Local header-sync configuration.
     pub config: ZakuraHeaderSyncConfig,
     /// Application frame cap for header-sync messages.
@@ -71,6 +73,7 @@ impl HeaderSyncStartup {
             best_header_tip,
             frontier_updates: None,
             committed_snapshots: None,
+            vct_root_repairs: None,
             config,
             max_frame_bytes,
             request_timeout: Duration::from_secs(30),

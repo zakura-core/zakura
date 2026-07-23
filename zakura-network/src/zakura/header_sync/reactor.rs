@@ -12,7 +12,7 @@ use super::{
     scheduler::{
         coverage::{BranchRange, CoverageMap},
         peer_work::{HeaderTargetPhase, PeerWorkPriority, PeerWorkQueue, QueueWorkResult},
-        repair::VctRepairQueue,
+        repair::{VctRepairQueue, VctRepairTask},
         retry::BodyRetryQueue,
         status::StatusPublisher,
     },
@@ -22,6 +22,8 @@ use crate::zakura::{
     FrontierChange, FrontierUpdate, OrderedSendError, ServicePeerDirection, ServicePeerSnapshot,
     ZakuraHeaderSyncCandidateState, ZakuraPeerId,
 };
+
+const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
 
 /// Spawn the canonical header-sync reactor.
 pub fn spawn_header_sync_reactor(
@@ -76,6 +78,10 @@ pub fn spawn_header_sync_reactor(
         .committed_snapshots
         .as_ref()
         .and_then(|snapshots| snapshots.borrow().clone());
+    let vct_repair_status = startup
+        .vct_root_repairs
+        .as_ref()
+        .map_or_else(Default::default, |repairs| *repairs.borrow());
     let handle = HeaderSyncHandle {
         events: events_tx,
         lifecycle: lifecycle_tx,
@@ -84,7 +90,7 @@ pub fn spawn_header_sync_reactor(
         candidates: candidates_rx,
         codec: codec.clone(),
     };
-    let reactor = HeaderSyncReactor {
+    let mut reactor = HeaderSyncReactor {
         startup,
         events: events_rx,
         lifecycle: lifecycle_rx,
@@ -95,6 +101,7 @@ pub fn spawn_header_sync_reactor(
         codec,
         serving_limits,
         committed_snapshot,
+        vct_repair_status,
         peer_state: HashMap::new(),
         peer_work_queue: PeerWorkQueue::default(),
         coverage: CoverageMap::default(),
@@ -103,6 +110,7 @@ pub fn spawn_header_sync_reactor(
         pending_owners: zakura_header_chain::PendingOwners::default(),
         served_paths: HashMap::new(),
     };
+    reactor.schedule_current_vct_repair();
     Ok((handle, actions_rx, tokio::spawn(reactor.run())))
 }
 
@@ -141,6 +149,7 @@ struct HeaderSyncReactor {
     codec: HeaderSyncCodec,
     serving_limits: HeaderServingLimits,
     committed_snapshot: Option<zakura_header_chain::EngineSnapshot>,
+    vct_repair_status: zakura_header_chain::VctRootRepairStatus,
     peer_state: HashMap<ZakuraPeerId, PeerState>,
     peer_work_queue: PeerWorkQueue,
     coverage: CoverageMap,
@@ -150,10 +159,30 @@ struct HeaderSyncReactor {
     served_paths: HashMap<ZakuraPeerId, ServedPathState>,
 }
 
+fn vct_repair_task(
+    snapshot: &zakura_header_chain::EngineSnapshot,
+    status: zakura_header_chain::VctRootRepairStatus,
+) -> Option<VctRepairTask> {
+    let zakura_header_chain::VctRootRepairState::Unavailable { height } = status.state else {
+        return None;
+    };
+    if height <= snapshot.frontiers.finalized.height
+        || height > snapshot.frontiers.header_best.height
+    {
+        return None;
+    }
+    let request_id = status.generation.checked_add(1).and_then(NonZeroU64::new)?;
+    let scope = zakura_header_chain::WorkScope::for_body_work(snapshot);
+    let owner = scope.bind(INTERNAL_VCT_REPAIR_SESSION_ID, request_id);
+    let range = BranchRange::new(owner.branch, height, height)?;
+    VctRepairTask::new(owner, range).ok()
+}
+
 impl HeaderSyncReactor {
     async fn run(mut self) {
         let mut frontier_updates = self.startup.frontier_updates.clone();
         let mut committed_snapshots = self.startup.committed_snapshots.clone();
+        let mut vct_root_repairs = self.startup.vct_root_repairs.clone();
         let _ = self
             .actions
             .try_send(HeaderSyncAction::QueryMissingBlockBodies {
@@ -204,6 +233,22 @@ impl HeaderSyncReactor {
                         }
                     } else {
                         frontier_updates = None;
+                    }
+                }
+                changed = async {
+                    match vct_root_repairs.as_mut() {
+                        Some(repairs) => repairs.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_ok() {
+                        if let Some(status) =
+                            vct_root_repairs.as_ref().map(|repairs| *repairs.borrow())
+                        {
+                            self.observe_vct_root_repair(status);
+                        }
+                    } else {
+                        vct_root_repairs = None;
                     }
                 }
                 _ = time::sleep_until(maintenance) => self.refresh_statuses(),
@@ -1051,6 +1096,7 @@ impl HeaderSyncReactor {
         let status = Status::from_snapshot(&snapshot, &self.serving_limits);
         let now = Instant::now();
         self.committed_snapshot = Some(snapshot);
+        self.schedule_current_vct_repair();
         for state in self.peer_state.values_mut() {
             match state.status_publisher.as_mut() {
                 Some(publisher) => publisher.observe(status.clone(), now),
@@ -1082,6 +1128,27 @@ impl HeaderSyncReactor {
             self.publish_peer_state();
         }
         self.refresh_statuses();
+    }
+
+    fn observe_vct_root_repair(&mut self, status: zakura_header_chain::VctRootRepairStatus) {
+        self.vct_repair_status = status;
+        self.schedule_current_vct_repair();
+    }
+
+    fn schedule_current_vct_repair(&mut self) {
+        self.vct_repairs.clear();
+        let Some(snapshot) = self.committed_snapshot.as_ref() else {
+            return;
+        };
+        let Some(task) = vct_repair_task(snapshot, self.vct_repair_status) else {
+            return;
+        };
+        let replaced = self.vct_repairs.insert(task);
+        debug_assert!(
+            replaced.is_none(),
+            "the queue is cleared before scheduling the current repair"
+        );
+        metrics::counter!("sync.header.vct.repair.scheduled.total").increment(1);
     }
 
     fn retire_obsolete_work(&mut self, snapshot: &zakura_header_chain::EngineSnapshot) {
@@ -1403,6 +1470,64 @@ mod tests {
             oldest_retained_height: anchor.height,
             alarms: Default::default(),
         }
+    }
+
+    #[test]
+    fn vct_repair_signal_schedules_one_exact_current_branch_range() {
+        let anchor = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([1; 32]));
+        let mut snapshot = committed_snapshot(anchor);
+        snapshot.frontiers.header_best =
+            zakura_header_chain::Frontier::new(block::Height(20), block::Hash([2; 32]));
+        let status = zakura_header_chain::VctRootRepairStatus {
+            state: zakura_header_chain::VctRootRepairState::Unavailable {
+                height: block::Height(11),
+            },
+            generation: 7,
+        };
+
+        let task = vct_repair_task(&snapshot, status)
+            .expect("an in-range repair need schedules exact work");
+        assert_eq!(task.range.start, block::Height(11));
+        assert_eq!(task.range.end, block::Height(11));
+        assert_eq!(task.owner.state_version, snapshot.state_version);
+        assert_eq!(task.owner.header_generation, snapshot.header_generation);
+        assert_eq!(
+            task.owner.verified_generation,
+            Some(snapshot.verified_generation)
+        );
+        assert_eq!(
+            task.owner.branch,
+            zakura_header_chain::BranchId::new(
+                snapshot.frontiers.finalized.hash,
+                snapshot.frontiers.header_best.hash,
+            )
+        );
+        assert_eq!(task.owner.session_id, INTERNAL_VCT_REPAIR_SESSION_ID);
+        assert_eq!(task.owner.request_id.get(), 8);
+
+        assert!(vct_repair_task(
+            &snapshot,
+            zakura_header_chain::VctRootRepairStatus::default()
+        )
+        .is_none());
+        assert!(vct_repair_task(
+            &snapshot,
+            zakura_header_chain::VctRootRepairStatus {
+                state: zakura_header_chain::VctRootRepairState::Unavailable {
+                    height: snapshot.frontiers.finalized.height,
+                },
+                generation: 0,
+            }
+        )
+        .is_none());
+        assert!(vct_repair_task(
+            &snapshot,
+            zakura_header_chain::VctRootRepairStatus {
+                state: status.state,
+                generation: u64::MAX,
+            }
+        )
+        .is_none());
     }
 
     async fn next_action(actions: &mut mpsc::Receiver<HeaderSyncAction>) -> HeaderSyncAction {

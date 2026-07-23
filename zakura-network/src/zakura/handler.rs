@@ -551,6 +551,8 @@ pub struct ZakuraHeaderSyncDriverStartup {
     pub verified_block_tip_hash: block::Hash,
     /// Durable header snapshots, absent until the semantic handoff audit succeeds.
     pub committed_snapshots: Option<watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>>,
+    /// VCT metadata repair needs published by the finalized writer.
+    pub vct_root_repairs: Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
 }
 
 impl ZakuraEndpoint {
@@ -3065,6 +3067,9 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     startup.committed_snapshots = header_sync_driver_startup
         .as_ref()
         .and_then(|driver| driver.committed_snapshots.clone());
+    startup.vct_root_repairs = header_sync_driver_startup
+        .as_ref()
+        .and_then(|driver| driver.vct_root_repairs.clone());
     let header_sync_shutdown = CancellationToken::new();
     startup.shutdown = header_sync_shutdown.clone();
     let (header_sync, header_sync_actions, header_sync_task) = spawn_header_sync_reactor(startup)?;

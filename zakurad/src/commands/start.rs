@@ -2317,6 +2317,7 @@ mod zakura_header_sync_driver_tests {
                 best_header_tip: Some((block::Height(0), genesis_hash)),
                 verified_block_tip_hash: genesis_hash,
                 committed_snapshots: None,
+                vct_root_repairs: None,
             }),
         )
         .await

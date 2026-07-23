@@ -123,6 +123,11 @@ impl VctRepairQueue {
         self.0.remove(&owner)
     }
 
+    /// Retire every repair before replacing or withdrawing the current state need.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
     /// Retire every task whose version, generation, or finalized anchor is obsolete.
     pub fn retain_current(&mut self, current: &EngineSnapshot) {
         self.0.retain(|owner, _| {

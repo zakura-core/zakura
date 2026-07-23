@@ -59,40 +59,7 @@ use crate::service::{
 mod vct_write;
 
 use vct_write::VctWriteManager;
-
-/// Status published by the finalized write loop when a VCT fast-sync height needs a
-/// replacement supplied root.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct VctRootRepairStatus {
-    /// The state of the current root repair need.
-    pub state: VctRootRepairState,
-    /// Monotonic generation for repair attempts. A new generation means the previous
-    /// replacement candidate was absent or rejected and the networking layer should try
-    /// another bounded repair candidate.
-    pub generation: u64,
-}
-
-impl Default for VctRootRepairStatus {
-    fn default() -> Self {
-        Self {
-            state: VctRootRepairState::Idle,
-            generation: 0,
-        }
-    }
-}
-
-/// Dependency-neutral VCT root repair state.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum VctRootRepairState {
-    /// No VCT root repair is currently required.
-    Idle,
-    /// The finalized writer cannot commit this height until a verifiable supplied root is
-    /// re-delivered through header sync.
-    Unavailable {
-        /// Height whose supplied roots are missing from the VCT source.
-        height: block::Height,
-    },
-}
+pub use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
 
 /// A full-state mutation staged until its matching header transition commits durably.
 #[allow(dead_code)] // Constructed when the dark header engine is attached to the writer task.

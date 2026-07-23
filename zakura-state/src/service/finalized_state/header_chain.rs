@@ -4733,6 +4733,294 @@ mod tests {
     }
 
     #[test]
+    fn aud_14_verified_grow_and_reset_reopen_complete_before_or_after() {
+        for reset in [false, true] {
+            for (index, target) in FaultPoint::ALL.into_iter().enumerate() {
+                let cache = tempfile::tempdir().expect("the test cache directory is created");
+                let db_config = Config {
+                    cache_dir: cache.path().to_owned(),
+                    ephemeral: false,
+                    debug_skip_non_finalized_state_backup_task: true,
+                    ..Config::default()
+                };
+                let (engine_config, anchor, metadata) = fixture();
+                let network = engine_config.network.clone();
+                let db = open(&db_config, &network);
+                let store = HeaderChainStore::new(db.clone());
+                store
+                    .initialize(metadata, anchor.clone())
+                    .expect("the empty schema initializes");
+                let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+                let child_height = anchor
+                    .height
+                    .next()
+                    .expect("the genesis anchor has a next height");
+                let mut incumbent_header = *anchor.header;
+                incumbent_header.previous_block_hash = anchor.hash;
+                incumbent_header.time += chrono::Duration::seconds(1);
+                incumbent_header.nonce.0[0] ^= 1;
+                let incumbent_header = Arc::new(incumbent_header);
+                let incumbent = VerifiedHeaderRef {
+                    height: child_height,
+                    hash: incumbent_header.hash(),
+                    header: incumbent_header,
+                };
+                let mut replacement_header = *anchor.header;
+                replacement_header.previous_block_hash = anchor.hash;
+                replacement_header.time += chrono::Duration::seconds(1);
+                replacement_header.nonce.0[0] ^= 2;
+                let replacement_header = Arc::new(replacement_header);
+                let replacement = VerifiedHeaderRef {
+                    height: child_height,
+                    hash: replacement_header.hash(),
+                    header: replacement_header,
+                };
+                assert_ne!(incumbent.hash, replacement.hash);
+
+                let (runtime, _) = if reset {
+                    store
+                        .startup_reconciled(
+                            &engine_config,
+                            anchor_frontier,
+                            Vec::new(),
+                            vec![incumbent.clone()],
+                        )
+                        .expect("the incumbent verified path reconciles")
+                } else {
+                    store
+                        .startup(&engine_config)
+                        .expect("the initialized store audits")
+                };
+                let before = runtime.publisher().snapshot();
+                let old_verified = before.frontiers.verified_best;
+                let event_header = if reset {
+                    replacement.clone()
+                } else {
+                    incumbent.clone()
+                };
+                let event_frontier = Frontier::new(event_header.height, event_header.hash);
+                let marker = u8::try_from(index + if reset { 0xd0 } else { 0xb0 })
+                    .expect("the fault-point list fits in u8");
+                let evidence = EvidenceId::from_digest([marker; 32]);
+                let authority = Authority(evidence);
+                let context = TransitionContext {
+                    config: &engine_config,
+                    clock: &SystemClock,
+                    full_state_authority: Some(&authority),
+                    startup_capability: None,
+                    retention_references: &[],
+                };
+                let request = TransitionRequest {
+                    expected_version: before.state_version,
+                    event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+                        full_state_transition_id: evidence,
+                        old_tip: old_verified,
+                        new_path: vec![event_header],
+                        cause: if reset {
+                            VerifiedChangeCause::Reset
+                        } else {
+                            VerifiedChangeCause::Grow
+                        },
+                    }),
+                };
+                let marker_key = [marker; 4];
+                let mut full_state_batch = DiskWriteBatch::new();
+                runtime
+                    .store
+                    .put_raw(
+                        &mut full_state_batch,
+                        ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+                        marker_key,
+                        [marker],
+                    )
+                    .expect("the paired verified-path marker can be staged");
+                let memory_swapped = Arc::new(AtomicBool::new(false));
+                let swap_probe = memory_swapped.clone();
+                let result = runtime.apply_combined_with_fault(
+                    request,
+                    &context,
+                    full_state_batch,
+                    move || swap_probe.store(true, Ordering::SeqCst),
+                    |point| {
+                        if point == target {
+                            Err(HeaderChainStoreError::InjectedCrash(point))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+                assert!(matches!(
+                    result,
+                    Err(HeaderChainStoreError::InjectedCrash(point)) if point == target
+                ));
+
+                let committed = matches!(
+                    target,
+                    FaultPoint::AfterDbCommit
+                        | FaultPoint::BeforeMemorySwap
+                        | FaultPoint::BeforePublish
+                        | FaultPoint::AfterPublish
+                        | FaultPoint::BeforeReactorObserve
+                );
+                let published = matches!(
+                    target,
+                    FaultPoint::AfterPublish | FaultPoint::BeforeReactorObserve
+                );
+                let committed_version = before
+                    .state_version
+                    .checked_next()
+                    .expect("the short fixture state version can advance");
+                let header_best_after = if reset {
+                    [incumbent.hash, replacement.hash]
+                        .into_iter()
+                        .max_by_key(|hash| hash.0)
+                        .map(|hash| Frontier::new(child_height, hash))
+                        .expect("the two-child fixture is nonempty")
+                } else {
+                    event_frontier
+                };
+                let durable = runtime
+                    .store
+                    .snapshot()
+                    .expect("the verified-path snapshot read succeeds");
+                assert_eq!(
+                    durable.state_version,
+                    if committed {
+                        committed_version
+                    } else {
+                        before.state_version
+                    },
+                    "{target:?}, reset={reset}"
+                );
+                assert_eq!(
+                    durable.frontiers.verified_best,
+                    if committed {
+                        event_frontier
+                    } else {
+                        old_verified
+                    },
+                    "{target:?}, reset={reset}"
+                );
+                assert_eq!(
+                    durable.frontiers.header_best,
+                    if committed {
+                        header_best_after
+                    } else {
+                        before.frontiers.header_best
+                    },
+                    "{target:?}, reset={reset}"
+                );
+                let event_node = runtime
+                    .store
+                    .node(event_frontier.hash)
+                    .expect("the event node read succeeds");
+                assert_eq!(event_node.is_some(), committed, "{target:?}, reset={reset}");
+                if let Some(event_node) = event_node {
+                    assert!(matches!(
+                        event_node.body,
+                        BodyValidationState::Verified {
+                            evidence: node_evidence
+                        } if node_evidence == evidence
+                    ));
+                }
+                assert_eq!(
+                    runtime
+                        .store
+                        .verified_projection()
+                        .expect("the verified projection is readable"),
+                    if committed {
+                        vec![anchor_frontier, event_frontier]
+                    } else if reset {
+                        vec![
+                            anchor_frontier,
+                            Frontier::new(incumbent.height, incumbent.hash),
+                        ]
+                    } else {
+                        vec![anchor_frontier]
+                    },
+                    "{target:?}, reset={reset}"
+                );
+                let marker_cf = runtime
+                    .store
+                    .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                    .expect("the marker column family is open");
+                assert_eq!(
+                    runtime
+                        .store
+                        .db
+                        .raw_get_cf(&marker_cf, &marker_key)
+                        .expect("the paired marker read succeeds")
+                        .is_some(),
+                    committed,
+                    "{target:?}, reset={reset}"
+                );
+                assert_eq!(
+                    memory_swapped.load(Ordering::SeqCst),
+                    matches!(
+                        target,
+                        FaultPoint::BeforePublish
+                            | FaultPoint::AfterPublish
+                            | FaultPoint::BeforeReactorObserve
+                    ),
+                    "{target:?}, reset={reset}"
+                );
+                assert_eq!(
+                    runtime.publisher().snapshot().frontiers.verified_best,
+                    if published {
+                        event_frontier
+                    } else {
+                        old_verified
+                    },
+                    "{target:?}, reset={reset}"
+                );
+                drop(runtime);
+                drop(db);
+
+                let (reopened, report) = HeaderChainStore::new(open(&db_config, &network))
+                    .startup(&engine_config)
+                    .expect("the verified-path crash boundary reopens coherently");
+                assert_eq!(
+                    reopened.publisher().snapshot(),
+                    report.current,
+                    "{target:?}, reset={reset}"
+                );
+                assert_eq!(
+                    report.current.frontiers.verified_best,
+                    if committed {
+                        event_frontier
+                    } else {
+                        old_verified
+                    },
+                    "{target:?}, reset={reset}"
+                );
+                assert_eq!(
+                    reopened
+                        .store
+                        .node(event_frontier.hash)
+                        .expect("the reopened event node read succeeds")
+                        .is_some(),
+                    committed,
+                    "{target:?}, reset={reset}"
+                );
+                let reopened_marker_cf = reopened
+                    .store
+                    .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                    .expect("the reopened marker column family is open");
+                assert_eq!(
+                    reopened
+                        .store
+                        .db
+                        .raw_get_cf(&reopened_marker_cf, &marker_key)
+                        .expect("the reopened marker read succeeds")
+                        .is_some(),
+                    committed,
+                    "{target:?}, reset={reset}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn aud_14_no_change_crash_points_preserve_the_paired_full_state_transaction() {
         for (index, target) in FaultPoint::NO_CHANGE.into_iter().enumerate() {
             let cache = tempfile::tempdir().expect("the test cache directory is created");

@@ -24,7 +24,7 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 | `lint.yml` | Clippy, rustfmt, `cargo deny`, feature checks. A nightly scheduled run adds the expensive non-gating lints (unused deps, docs build). | PR/push on Rust-relevant paths, merge queue, nightly, manual |
 | `tests-unit.yml` | Unit-test suite via `cargo nextest` on an OS matrix. Nightly run covers release mode. | PR/push on Rust-relevant paths, merge queue, nightly, manual |
 | `test-crates.yml` | Builds each workspace crate standalone under its feature combinations. | PR/push on Rust-relevant paths |
-| `test-docker.yml` | Validates `zakurad` config handling against the built Docker image. Daily run covers release mode. | PR/push on Rust/Docker paths, daily, manual |
+| `test-docker.yml` | Builds the production runtime image once, then smoke-tests its packaged binaries, privilege drop, default startup, and combined config overrides. | PR/push on Cargo, Docker, `zakurad`, or runtime-config paths; weekly; manual |
 | `zakura-e2e.yml` | The heaviest PR-path job, isolated in its own workflow: regtest docker-compose end-to-end gate, multi-node testkit test, block-sync fuzz on every push to `main`, and long four-node modes nightly. PR runs are gated by a `changes` job or the `run-zakura-e2e` label. | PR/push (self-gated), merge queue, nightly, manual |
 | `status-checks.patch.yml` | Empty jobs with the same names as required checks, so branch protection passes when path filters skip `lint.yml` / `tests-unit.yml` / `test-crates.yml`. Its `paths-ignore` list **must stay the exact inverse** of those workflows' `paths`. | PR on non-Rust paths only |
 | `docs-check.yml` | markdownlint, codespell, and lychee link checking over all Markdown. | PR/push on Markdown paths |
@@ -36,7 +36,7 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 ## Release pipeline
 
 - **`create-release.yml`** — the only supported path for creating `v*` release tags. Calls `release-binaries.yml` (as a reusable workflow) to build and verify every asset, then a protected environment lets the release GitHub App publish the draft and create the immutable tag. See the release runbook before using it.
-- **`release-binaries.yml`** — builds and publishes `zakurad` release assets and Docker images when a `v*` tag is pushed. Also callable from `create-release.yml` for pre-tag staging, and manually dispatchable to repair assets on an existing tag. Gated on the tag matching the `zakura` package version.
+- **`release-binaries.yml`** — builds and publishes `zakurad` release assets and Docker images when a `v*` tag is pushed. Also callable from `create-release.yml` for pre-tag staging, and manually dispatchable to repair assets on an existing tag. The canonical repository uses Depot builders by default; set the `RELEASE_BUILD_BACKEND` repository variable to `github` for an immediate fallback. Gated on the tag matching the `zakura` package version.
 - **`release-drafter.yml`** — manual: compiles PR titles since the last release
   into a draft GitHub release note.
 - **Changelog assembly** — `make prepare-release-changelog` consumes reviewed

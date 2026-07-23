@@ -4,7 +4,8 @@ name: PR node reaper
 # zakura-pr-node-bake.yml). Run droplets are intentionally kept alive after
 # their run for SSH inspection; this deletes them (and every other leaked
 # resource) on a TTL so nothing accrues cost indefinitely:
-#   - zakura-pr-node droplets older than max_age_hours (default 24h)
+#   - zakura-pr-node and zakura-mempool-load droplets older than
+#     max_age_hours (default 24h)
 #   - zakura-image-bake droplets older than 6h (failed bakes)
 #   - detached zakura-pr-* volumes older than 2h (run/bake leftovers)
 #   - zakura-pr-node-* images and zakura-pr-state-* volume snapshots beyond
@@ -63,6 +64,9 @@ jobs:
           }
           reap_tag zakura-pr-node    $(( MAX_AGE_HOURS * 3600 ))
           reap_tag zakura-image-bake $(( 6 * 3600 ))
+          # Mempool-load droplets normally tear themselves down at the end of
+          # the run; this is the backstop for a cancelled or crashed job.
+          reap_tag zakura-mempool-load $(( MAX_AGE_HOURS * 3600 ))
 
       - name: Reap detached state volumes
         env:

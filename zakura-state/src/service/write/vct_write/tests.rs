@@ -162,13 +162,9 @@ fn reset_clears_the_lookahead() {
 
     let network = zakura_chain::parameters::Network::Mainnet;
     let config = crate::Config::ephemeral();
-    let mut finalized_state = crate::service::finalized_state::FinalizedState::new(
-        &config,
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let mut finalized_state =
+        crate::service::finalized_state::FinalizedState::new(&config, &network)
+            .expect("opening an ephemeral database should succeed");
 
     manager.reset(&mut finalized_state);
 
@@ -337,8 +333,6 @@ fn reset_withdraws_published_root_repair_need() {
     let mut finalized_state = crate::service::finalized_state::FinalizedState::new(
         &crate::Config::ephemeral(),
         &zakura_chain::parameters::Network::Mainnet,
-        #[cfg(feature = "elasticsearch")]
-        false,
     )
     .expect("opening an ephemeral finalized state succeeds");
 

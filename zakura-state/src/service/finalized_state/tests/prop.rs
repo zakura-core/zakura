@@ -59,6 +59,30 @@ fn early_upgrade_network() -> zakura_chain::parameters::Network {
         .expect("failed to build configured network")
 }
 
+/// A testnet with room between upgrades for tests that need era-specific
+/// transactions or several consecutive blocks within one upgrade.
+fn spaced_upgrade_network() -> zakura_chain::parameters::Network {
+    ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu6_3: Some(48),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network")
+}
+
 type TestRootMap = HashMap<
     u32,
     (
@@ -89,13 +113,8 @@ fn next_vct_block(block: Arc<Block>) -> Option<NextVctBlock> {
 fn vct_successor_witness_uses_stored_header_without_body() {
     let _init_guard = zakura_test::init();
     let network = zakura_chain::parameters::Network::Mainnet;
-    let mut state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral finalized state succeeds");
+    let mut state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral finalized state succeeds");
     let genesis = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
         .expect("genesis block deserializes");
@@ -286,25 +305,7 @@ fn v4_transaction_with_interstitial_anchor(old_anchor_tree: &SproutTree) -> Arc<
 fn vct_generated_final_frontier_bytes_are_node_loader_compatible() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -316,7 +317,7 @@ fn vct_generated_final_frontier_bytes_are_node_loader_compatible() -> Result<()>
             prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
             let height = Height(last as u32);
 
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             for block in blocks.iter().take(last + 1) {
                 let cv = CheckpointVerifiedBlock::from(block.block.clone());
                 legacy
@@ -371,7 +372,7 @@ fn blocks_with_v5_transactions() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES)),
         |((chain, count, network, _history_tree) in PreparedChain::default())| {
-            let mut state = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut state = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             let mut height = Height(0);
             // use `count` to minimize test failures, so they are easier to diagnose
             for block in chain.iter().take(count) {
@@ -416,7 +417,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
         .unwrap_or(DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES)),
         |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
 
-            let mut state = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut state = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             let mut height = Height(0);
             let heartwood_height = NetworkUpgrade::Heartwood.activation_height(&network).unwrap();
             let heartwood_height_plus1 = (heartwood_height + 1).unwrap();
@@ -543,7 +544,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
 
             // Legacy pass over [0, last]: record per-block roots for the fast range as
             // the fixture, and the golden consensus state at the tip.
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             let mut fixture = std::collections::HashMap::new();
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
@@ -568,7 +569,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             // (no fixture entry); seed+1..=last verify-ahead against their buffered
             // successor. Every fast-eligible block takes the fast path, and the result
             // equals legacy.
-            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             enable_vct_test_fixture_source(&mut fast, fixture.clone());
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
@@ -586,7 +587,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
 
             // A trusted local fixture may commit its tip root without a successor: it is
             // not adversarial and the root is checked in arrears when a successor arrives.
-            let mut no_successor = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut no_successor = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             enable_vct_test_fixture_source(&mut no_successor, fixture.clone());
             for i in 0..last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
@@ -617,7 +618,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             prop_assert_ne!(bad_entry.0, Default::default(), "a V2 block must have a non-empty Sapling root");
             bad_entry.0 = Default::default();
 
-            let mut bad = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut bad = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             enable_vct_test_fixture_source(&mut bad, bad_fixture);
             let mut error_height = None;
             for i in 0..=last {
@@ -648,7 +649,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             prop_assert_eq!(bad_orchard_entry.1, empty_orchard, "a below-NU5 block has the empty Orchard root");
             bad_orchard_entry.1 = wrong_orchard;
 
-            let mut bad_orchard = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut bad_orchard = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             enable_vct_test_fixture_source(&mut bad_orchard, bad_orchard_fixture);
             let mut orchard_error_height = None;
             for i in 0..=last {
@@ -679,25 +680,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
 fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -712,7 +695,7 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
             let seed = (heartwood - 1) as usize;
 
             // Record the per-block roots for the fast range as the fixture.
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             let mut fixture = std::collections::HashMap::new();
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
@@ -739,7 +722,7 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
             prop_assert!(hole > seed && hole < last, "the hole must be inside the fast range");
             fixture.remove(&(hole as u32));
 
-            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             enable_vct_test_fixture_source(&mut fast, fixture);
 
             let mut error_height = None;
@@ -784,25 +767,7 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
 fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -816,7 +781,7 @@ fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
             prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
             let seed = (heartwood - 1) as usize;
 
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             let mut fixture = std::collections::HashMap::new();
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
@@ -838,7 +803,7 @@ fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
             let hole = (nu5 + 1) as usize;
             fixture.remove(&(hole as u32));
 
-            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             enable_vct_test_fixture_source(&mut fast, fixture);
 
             for i in 0..hole {
@@ -888,25 +853,7 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
 
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = spaced_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -942,7 +889,7 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
             );
 
             // Legacy golden pass to source the correct per-block roots for the fast range.
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             let mut peer_roots = Vec::new();
             for i in 0..=tip_target {
                 let block = if i == tip_target {
@@ -985,7 +932,7 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
             // about the missing successor, not a bad root. The roots are persisted into the
             // fast state's own database through the same header-sync write path production
             // uses, and the peer source reads them back from that database.
-            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             fast.db
                 .insert_zakura_header_commitment_roots(peer_roots)
                 .expect("writing header-sync roots to an ephemeral database succeeds");
@@ -1129,30 +1076,18 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
 
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("NU5 activation height is configured");
+    // The poisoned target is NU5 + 1, and its successor is also required.
+    let tested_block_count =
+        usize::try_from(nu5_height.0 + 3).expect("test activation height fits in usize");
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
     proptest!(ProptestConfig::with_cases(1),
-        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+        |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
 
             let blocks: Vec<_> = chain.iter().collect();
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
@@ -1164,7 +1099,7 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
             // Source the true roots from a legacy pass, then poison the target height exactly
             // as a malicious peer would. Earlier roots are correct so the frontier freezes
             // before the bad root is encountered.
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             let mut peer_roots = Vec::new();
             let mut correct_target_root = None;
             for i in 0..=target {
@@ -1200,7 +1135,7 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
             }
             let correct_target_root = correct_target_root.expect("target root was produced");
 
-            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             fast.db
                 .insert_zakura_header_commitment_roots(peer_roots)
                 .expect("writing header-sync roots to an ephemeral database succeeds");
@@ -1266,25 +1201,7 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
 fn vct_frozen_frontier_survives_reopen() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -1308,7 +1225,7 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
 
             // Legacy golden pass over [0, last]: the per-block fixture for the fast range
             // and the real final frontiers at the handoff (needed to configure fast mode).
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             let mut fixture = std::collections::HashMap::new();
             let mut handoff_trees = None;
             for i in 0..=last {
@@ -1347,7 +1264,7 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
             // the handoff. The fast commits write the fast-sync marker but no per-height
             // trees, so the on-disk frontier is frozen and the tip is below the handoff.
             {
-                let mut fast = FinalizedState::new(&config, &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+                let mut fast = FinalizedState::new(&config, &network).expect("opening an ephemeral database should succeed");
                 enable_vct_test_fixture_source_with_handoff(
                     &mut fast,
                     fixture.clone(),
@@ -1377,8 +1294,6 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
             let mut reopened = FinalizedState::new_with_debug_and_storage_validation(
                 &config,
                 &network,
-                false,
-                #[cfg(feature = "elasticsearch")]
                 false,
                 false,
                 true,
@@ -1445,25 +1360,13 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
 fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = spaced_upgrade_network();
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("NU5 activation height is configured");
+    // The handoff is NU5 + 3, so generate exactly through that height.
+    let tested_block_count =
+        usize::try_from(nu5_height.0 + 4).expect("test activation height fits in usize");
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -1471,7 +1374,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES)),
-        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+        |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
 
             let blocks: Vec<_> = chain.iter().collect();
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
@@ -1489,7 +1392,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
 
             // Legacy pass over [0, last]: the per-block fixture for the fast range, the
             // golden consensus state, and the real final frontiers at the handoff.
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             let mut fixture = std::collections::HashMap::new();
             let mut handoff_trees = None;
             let mut previous_sprout_root =
@@ -1529,7 +1432,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
 
             // Fast genesis-start pass over [0, last], supplying the verified frontiers
             // for the handoff at `last`.
-            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             enable_vct_test_fixture_source_with_handoff(
                 &mut fast,
                 fixture.clone(),
@@ -1610,7 +1513,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 .append(zakura_chain::sprout::NoteCommitment::from([99; 32]))
                 .expect("one corrupt fixture commitment fits");
             prop_assert_ne!(corrupt_sprout.root(), handoff_trees.sprout.root());
-            let mut corrupt_handoff = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut corrupt_handoff = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             enable_vct_test_fixture_source_with_handoff(
                 &mut corrupt_handoff,
                 fixture.clone(),
@@ -1682,7 +1585,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             prop_assert_ne!(bad_handoff_entry.0, Default::default(), "a post-NU5 handoff block must have a non-empty Sapling root");
             bad_handoff_entry.0 = Default::default();
 
-            let mut bad_handoff = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut bad_handoff = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             enable_vct_test_fixture_source_with_handoff(
                 &mut bad_handoff,
                 bad_handoff_fixture,
@@ -1739,7 +1642,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 "test needs an Ironwood frontier distinct from the real (empty) one"
             );
 
-            let mut bad_ironwood_handoff = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut bad_ironwood_handoff = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             enable_vct_test_fixture_source_with_handoff(
                 &mut bad_ironwood_handoff,
                 fixture.clone(),
@@ -1790,30 +1693,18 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
 fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("NU5 activation height is configured");
+    // The test consumes two blocks after its NU5 + 3 handoff.
+    let tested_block_count =
+        usize::try_from(nu5_height.0 + 6).expect("test activation height fits in usize");
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
     proptest!(ProptestConfig::with_cases(1),
-        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+        |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
             let blocks: Vec<_> = chain.iter().collect();
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
             let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
@@ -1825,7 +1716,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
 
             // Legacy golden pass over the full range: source fast roots and final frontiers, then
             // compare both switching scenarios against this byte-identical manual recompute.
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             let mut fixture = std::collections::HashMap::new();
             let mut handoff_trees = None;
             let mut post_handoff_roots = None;
@@ -1870,7 +1761,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 ..Config::default()
             };
             {
-                let mut fast = FinalizedState::new(&fast_config, &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+                let mut fast = FinalizedState::new(&fast_config, &network).expect("opening an ephemeral database should succeed");
                 enable_vct_test_fixture_source_with_handoff(
                     &mut fast,
                     fixture.clone(),
@@ -1880,12 +1771,22 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                     handoff_trees.sprout.clone(),
                     handoff_trees.ironwood.clone(),
                 );
+                // Match the writer service by carrying the frozen in-memory
+                // frontier through an uninterrupted fast-sync sequence.
+                let mut prev_note_commitment_trees = None;
                 for i in 0..=handoff_index {
                     let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                     let next = (i < handoff_index)
                         .then(|| vct_successor_header(blocks[i + 1].block.clone()));
-                    fast.commit_finalized_direct(cv.into(), None, next, "vct switch fast prefix")
+                    let (_, note_commitment_trees) = fast
+                        .commit_finalized_direct(
+                            cv.into(),
+                            prev_note_commitment_trees.take(),
+                            next,
+                            "vct switch fast prefix",
+                        )
                         .expect("verified fast prefix commits");
+                    prev_note_commitment_trees = Some(note_commitment_trees);
                 }
                 prop_assert_eq!(fast.vct_fast_synced_below(), Some(handoff), "fast sync reached the handoff before the switch");
             }
@@ -1894,7 +1795,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 vct_fast_sync: false,
                 ..fast_config
             };
-            let mut manual = FinalizedState::new(&manual_config, &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut manual = FinalizedState::new(&manual_config, &network).expect("opening an ephemeral database should succeed");
             for i in (handoff_index + 1)..=post_handoff_tip {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 manual
@@ -1918,7 +1819,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 ..Config::default()
             };
             {
-                let mut manual_prefix = FinalizedState::new(&manual_prefix_config, &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+                let mut manual_prefix = FinalizedState::new(&manual_prefix_config, &network).expect("opening an ephemeral database should succeed");
                 for i in 0..=seed {
                     let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                     manual_prefix
@@ -1931,7 +1832,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 vct_fast_sync: true,
                 ..manual_prefix_config
             };
-            let mut fast_suffix = FinalizedState::new(&fast_suffix_config, &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut fast_suffix = FinalizedState::new(&fast_suffix_config, &network).expect("opening an ephemeral database should succeed");
             let mut guarded_fixture = fixture;
             // A stale or over-eager peer cache entry above the handoff must be ignored so
             // the committer resumes legacy recompute from the real handoff frontier.
@@ -1957,13 +1858,22 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 handoff_trees.sprout.clone(),
                 handoff_trees.ironwood.clone(),
             );
+            // Match the writer service after this deliberate mode-switch
+            // restart, then carry the frontier through the fast suffix.
+            let mut prev_note_commitment_trees = None;
             for i in (seed + 1)..=post_handoff_tip {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = (i < post_handoff_tip)
                     .then(|| vct_successor_header(blocks[i + 1].block.clone()));
-                fast_suffix
-                    .commit_finalized_direct(cv.into(), None, next, "vct switch fast suffix")
+                let (_, note_commitment_trees) = fast_suffix
+                    .commit_finalized_direct(
+                        cv.into(),
+                        prev_note_commitment_trees.take(),
+                        next,
+                        "vct switch fast suffix",
+                    )
                     .expect("fast suffix commits after manual prefix");
+                prev_note_commitment_trees = Some(note_commitment_trees);
             }
             prop_assert_eq!(
                 fast_suffix.vct_fast_count(),
@@ -1995,25 +1905,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
 fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = spaced_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -2031,7 +1923,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
 
             // Legacy pass to record the correct per-block roots as the fixture.
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             let mut fixture = std::collections::HashMap::new();
             for (i, prepared) in blocks.iter().take(last + 1).enumerate() {
                 let cv = CheckpointVerifiedBlock::from(prepared.block.clone());
@@ -2050,7 +1942,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
                 }
             }
 
-            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             enable_vct_test_fixture_source(&mut fast, fixture);
 
             // Commit block `i` with its real successor as the one-block look-ahead.
@@ -2295,25 +2187,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
 fn vct_clear_prevalidation_cache_disarms_skip_then_dedup_resumes() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -2326,7 +2200,7 @@ fn vct_clear_prevalidation_cache_disarms_skip_then_dedup_resumes() -> Result<()>
             let last = seed + 5;
             prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
 
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             let mut fixture = std::collections::HashMap::new();
             for (i, prepared) in blocks.iter().take(last + 1).enumerate() {
                 let cv = CheckpointVerifiedBlock::from(prepared.block.clone());
@@ -2345,7 +2219,7 @@ fn vct_clear_prevalidation_cache_disarms_skip_then_dedup_resumes() -> Result<()>
                 }
             }
 
-            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             enable_vct_test_fixture_source(&mut fast, fixture);
 
             let commit = |fast: &mut FinalizedState, i: usize| {
@@ -2403,25 +2277,7 @@ fn vct_clear_prevalidation_cache_disarms_skip_then_dedup_resumes() -> Result<()>
 fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -2438,7 +2294,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
             let seed = (heartwood - 1) as usize;
 
             // Legacy/archive pass: a real DB with per-height trees, plus the golden state.
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             for block in blocks.iter().take(last + 1) {
                 let cv = CheckpointVerifiedBlock::from(block.block.clone());
                 legacy
@@ -2466,7 +2322,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
             prop_assert_eq!(produced_frontiers.sprout.root(), legacy.db.sprout_tree_for_tip().unwrap().root(), "produced sprout frontier matches legacy tip");
 
             // Consume the DB-produced roots in a fresh fast-sync state.
-            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             let produced_roots = produced_roots
                 .into_iter()
                 .map(|root| {
@@ -2544,25 +2400,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
 fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -2580,7 +2418,7 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
             let seed = (heartwood - 1) as usize;
 
             // Legacy/archive pass: a real DB with per-height trees, plus the golden state.
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             for block in blocks.iter().take(last + 1) {
                 let cv = CheckpointVerifiedBlock::from(block.block.clone());
                 legacy
@@ -2600,7 +2438,7 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
             // block is committed with its successor buffered, as the write loop does — the
             // untrusted source defers a tip commit with no successor (covered by
             // `vct_peer_source_defers_unverifiable_tip_root_until_successor`).
-            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
 
             // Fill the fast state's database incrementally, in two chunks, as header sync
             // would when successive root ranges arrive from a peer; the peer source reads

@@ -161,9 +161,13 @@ fn request_genesis_is_rate_limited() {
         misbehavior_tx,
     );
 
-    // run `request_genesis()` with a timeout of 13 seconds
+    // Run `request_genesis()` long enough to observe multiple retries.
     runtime.block_on(async move {
-        // allow extra wall clock time for tests on CPU-bound machines
+        // This test checks Tokio timer behavior using fully mocked services, so
+        // advance retry delays virtually instead of waiting for wall-clock time.
+        tokio::time::pause();
+
+        // Leave half a retry interval for scheduling the final request.
         let retries_timeout = (RETRIES_TO_RUN - 1) as u64 * GENESIS_TIMEOUT_RETRY.as_secs()
             + GENESIS_TIMEOUT_RETRY.as_secs() / 2;
         let _ = timeout(

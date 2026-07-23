@@ -10,7 +10,10 @@ use std::{
 
 use futures::FutureExt;
 use indexmap::IndexSet;
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::{
+    sync::{oneshot, Notify},
+    task::JoinHandle,
+};
 use tower::{
     buffer::Buffer, builder::ServiceBuilder, load_shed::LoadShed, util::BoxService, ServiceExt,
 };
@@ -46,14 +49,18 @@ use crate::{
 use InventoryResponse::*;
 
 /// An in-memory writer for assertions on test-local tracing output.
-struct TestWriter(Arc<Mutex<Vec<u8>>>);
+struct TestWriter {
+    output: Arc<Mutex<Vec<u8>>>,
+    log_written: Arc<Notify>,
+}
 
 impl io::Write for TestWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0
+        self.output
             .lock()
             .map_err(|_| io::Error::other("log buffer lock should not be poisoned"))?
             .extend_from_slice(buf);
+        self.log_written.notify_one();
         Ok(buf.len())
     }
 
@@ -1127,11 +1134,16 @@ mod submitblock_test {
     async fn submitblock_channel() -> Result<(), crate::BoxError> {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let log_sink = logs.clone();
+        let log_written = Arc::new(Notify::new());
+        let writer_log_written = log_written.clone();
 
         // Set up a tracing subscriber with a custom writer
         let subscriber = fmt()
             .with_max_level(Level::INFO)
-            .with_writer(move || TestWriter(log_sink.clone())) // Write logs to an in-memory buffer
+            .with_writer(move || TestWriter {
+                output: log_sink.clone(),
+                log_written: writer_log_written.clone(),
+            })
             .finish();
 
         let _guard = tracing::subscriber::set_default(subscriber);
@@ -1194,17 +1206,41 @@ mod submitblock_test {
             .in_current_span(),
         );
 
-        // Wait for the block gossip task to process the block
-        tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+        // Wait for the exact event under test. The timeout is only a failure
+        // deadline; the mined-block channel bypasses the periodic gossip delay.
+        tokio::time::timeout(PEER_GOSSIP_DELAY, async {
+            loop {
+                let next_log = log_written.notified();
+                let sent_mined_block = {
+                    let captured_logs = logs.lock().unwrap();
+                    String::from_utf8_lossy(&captured_logs)
+                        .contains("sending mined block broadcast")
+                };
 
-        // Check that the block was processed as a mnined block by the gossip task
-        let captured_logs = logs.lock().unwrap();
-        let log_output = String::from_utf8(captured_logs.clone()).unwrap();
+                if sent_mined_block {
+                    break;
+                }
+
+                next_log.await;
+            }
+        })
+        .await
+        .expect("block gossip task should process the submitted block");
+
+        // Check that the block was processed as a mined block by the gossip task.
+        let log_output = {
+            let captured_logs = logs.lock().unwrap();
+            String::from_utf8(captured_logs.clone()).unwrap()
+        };
 
         assert!(log_output.contains("initializing block gossip task"));
         assert!(log_output.contains("sending mined block broadcast"));
 
-        std::mem::drop(gossip_task_handle);
+        gossip_task_handle.abort();
+        let gossip_task_error = gossip_task_handle
+            .await
+            .expect_err("block gossip task should run until it is cancelled");
+        assert!(gossip_task_error.is_cancelled());
 
         Ok(())
     }

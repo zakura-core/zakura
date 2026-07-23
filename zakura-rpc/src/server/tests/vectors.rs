@@ -74,9 +74,11 @@ async fn rpc_server_spawn() {
 
     info!("spawned RPC server, checking services...");
 
-    mempool.expect_no_requests().await;
-    read_state.expect_no_requests().await;
-    block_verifier_router.expect_no_requests().await;
+    tokio::join!(
+        mempool.expect_no_requests(),
+        read_state.expect_no_requests(),
+        block_verifier_router.expect_no_requests(),
+    );
 }
 
 /// Test that the JSON-RPC server spawns on an OS-assigned unallocated port.
@@ -145,10 +147,12 @@ async fn rpc_spawn_unallocated_port(do_shutdown: bool) {
 
     info!("spawned RPC server, checking services...");
 
-    mempool.expect_no_requests().await;
-    state.expect_no_requests().await;
-    read_state.expect_no_requests().await;
-    block_verifier_router.expect_no_requests().await;
+    tokio::join!(
+        mempool.expect_no_requests(),
+        state.expect_no_requests(),
+        read_state.expect_no_requests(),
+        block_verifier_router.expect_no_requests(),
+    );
 
     if do_shutdown {
         rpc.abort();
@@ -158,7 +162,6 @@ async fn rpc_spawn_unallocated_port(do_shutdown: bool) {
 /// Test if the RPC server will panic correctly when there is a port conflict.
 #[tokio::test]
 async fn rpc_server_spawn_port_conflict() {
-    use std::time::Duration;
     let _init_guard = zakura_test::init();
 
     let port = zakura_test::net::random_known_port();
@@ -202,14 +205,14 @@ async fn rpc_server_spawn_port_conflict() {
         .await
         .expect("RPC server should start");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
     RpcServer::start(rpc_impl, conf)
         .await
         .expect_err("RPC server should not start");
 
-    mempool.expect_no_requests().await;
-    state.expect_no_requests().await;
-    read_state.expect_no_requests().await;
-    block_verifier_router.expect_no_requests().await;
+    tokio::join!(
+        mempool.expect_no_requests(),
+        state.expect_no_requests(),
+        read_state.expect_no_requests(),
+        block_verifier_router.expect_no_requests(),
+    );
 }

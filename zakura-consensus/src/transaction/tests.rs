@@ -2951,9 +2951,12 @@ async fn v4_with_joinsplit_is_rejected_for_modification(
     assert_eq!(result, expected_error);
 }
 
-/// Test if a V4 transaction with Sapling spends is accepted by the verifier.
+/// Test if V4 and V5 transactions with Sapling spends are accepted by the verifier.
+///
+/// Keeping both versions in one test amortizes Sapling verifying-key
+/// initialization under nextest's process-per-test execution model.
 #[test]
-fn v4_with_sapling_spends() {
+fn v4_and_v5_with_sapling_spends() {
     let _init_guard = zakura_test::init();
     zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
         let network = Network::Mainnet;
@@ -2992,6 +2995,46 @@ fn v4_with_sapling_spends() {
             result.expect("unexpected error response").tx_id(),
             expected_hash
         );
+
+        for net in Network::iter() {
+            let nu5_activation = NetworkUpgrade::Nu5.activation_height(&net);
+
+            let tx = v5_transactions(net.block_iter())
+                .filter(|tx| {
+                    !tx.is_coinbase()
+                        && tx.inputs().is_empty()
+                        && tx.expiry_height() >= nu5_activation
+                })
+                .find(|tx| tx.sapling_spends_per_anchor().next().is_some())
+                .expect("V5 tx with Sapling spends");
+
+            let expected_hash = tx.unmined_id();
+            let height = tx.expiry_height().expect("expiry height");
+
+            let verifier = Verifier::new_for_tests(
+                &net,
+                service_fn(|_| async { unreachable!("State service should not be called") }),
+            );
+
+            assert_eq!(
+                timeout(
+                    test_timeout(),
+                    verifier.oneshot(Request::Block {
+                        transaction_hash: tx.hash(),
+                        transaction: Arc::new(tx),
+                        known_utxos: Arc::new(HashMap::new()),
+                        known_outpoint_hashes: Arc::new(HashSet::new()),
+                        height,
+                        time: DateTime::<Utc>::MAX_UTC,
+                    })
+                )
+                .await
+                .expect("timeout expired")
+                .expect("unexpected error response")
+                .tx_id(),
+                expected_hash
+            );
+        }
     });
 }
 
@@ -3594,50 +3637,6 @@ fn modify_first_sapling_spend_proof_in_transfers<A: sapling::AnchorVariant + Clo
         sapling::TransferData::JustOutputs { .. } => {
             panic!("expected Sapling shielded data with spends")
         }
-    }
-}
-
-/// Test if a V5 transaction with Sapling spends is accepted by the verifier.
-#[tokio::test]
-async fn v5_with_sapling_spends() {
-    let _init_guard = zakura_test::init();
-
-    for net in Network::iter() {
-        let nu5_activation = NetworkUpgrade::Nu5.activation_height(&net);
-
-        let tx = v5_transactions(net.block_iter())
-            .filter(|tx| {
-                !tx.is_coinbase() && tx.inputs().is_empty() && tx.expiry_height() >= nu5_activation
-            })
-            .find(|tx| tx.sapling_spends_per_anchor().next().is_some())
-            .expect("V5 tx with Sapling spends");
-
-        let expected_hash = tx.unmined_id();
-        let height = tx.expiry_height().expect("expiry height");
-
-        let verifier = Verifier::new_for_tests(
-            &net,
-            service_fn(|_| async { unreachable!("State service should not be called") }),
-        );
-
-        assert_eq!(
-            timeout(
-                test_timeout(),
-                verifier.oneshot(Request::Block {
-                    transaction_hash: tx.hash(),
-                    transaction: Arc::new(tx),
-                    known_utxos: Arc::new(HashMap::new()),
-                    known_outpoint_hashes: Arc::new(HashSet::new()),
-                    height,
-                    time: DateTime::<Utc>::MAX_UTC,
-                })
-            )
-            .await
-            .expect("timeout expired")
-            .expect("unexpected error response")
-            .tx_id(),
-            expected_hash
-        );
     }
 }
 

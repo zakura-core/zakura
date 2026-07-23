@@ -1,18 +1,12 @@
 //! Randomised property tests for candidate peer selection.
 
-use std::{
-    env,
-    net::SocketAddr,
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{env, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use proptest::{
     collection::{hash_map, vec},
     prelude::*,
 };
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout, Instant};
 use tracing::Span;
 
 use zakura_chain::{parameters::Network::*, serialization::DateTime32};
@@ -35,10 +29,8 @@ const TEST_ADDRESSES: usize = 2 * MAX_TEST_CANDIDATES as usize;
 /// The default number of proptest cases for each test that includes sleeps.
 const DEFAULT_SLEEP_TEST_PROPTEST_CASES: u32 = 16;
 
-/// The largest extra delay we allow after every test sleep.
-///
-/// This makes the tests more reliable on machines with high CPU load.
-const MAX_SLEEP_EXTRA_DELAY: Duration = Duration::from_secs(1);
+/// The largest unexpected virtual-time delay allowed after a rate-limit sleep.
+const MAX_SLEEP_EXTRA_DELAY: Duration = Duration::from_millis(1);
 
 proptest! {
     /// Test that validated gossiped peers never have a `last_seen` time that's in the future.
@@ -65,6 +57,7 @@ proptest! {
     fn skipping_outbound_peer_connection_skips_rate_limit(next_peer_attempts in 0..TEST_ADDRESSES) {
         let (runtime, _init_guard) = zakura_test::init_async();
         let _guard = runtime.enter();
+        runtime.block_on(async { tokio::time::pause() });
 
         let peer_service = tower::service_fn(|_| async {
             unreachable!("Mock peer service is never used");
@@ -79,8 +72,7 @@ proptest! {
         for _ in 0..next_peer_attempts {
             // An empty address book immediately returns "no next peer".
             //
-            // Check that it takes less than the peer set candidate delay,
-            // and hope that is enough time for test machines with high CPU load.
+            // Check that it takes less virtual time than the peer set candidate delay.
             let less_than_min_interval = MIN_OUTBOUND_PEER_CONNECTION_INTERVAL - Duration::from_millis(1);
             assert_eq!(runtime.block_on(timeout(less_than_min_interval, candidate_set.next())), Ok(None));
         }
@@ -104,6 +96,7 @@ proptest! {
     ) {
         let (runtime, _init_guard) = zakura_test::init_async();
         let _guard = runtime.enter();
+        runtime.block_on(async { tokio::time::pause() });
 
         let peers = peers.into_iter().map(|(ip, port)| {
             MetaAddr::new_initial_peer(canonical_peer_addr(SocketAddr::new(ip, port)))
@@ -128,8 +121,7 @@ proptest! {
             check_candidates_rate_limiting(&mut candidate_set, extra_candidates).await;
         };
 
-        // Allow enough time for the maximum number of candidates,
-        // plus some extra time for test machines with high CPU load.
+        // Allow enough virtual time for the maximum number of candidates.
         // (The max delay asserts usually fail before hitting this timeout.)
         let max_rate_limit_sleep = 3 * MAX_TEST_CANDIDATES * MIN_OUTBOUND_PEER_CONNECTION_INTERVAL;
         let max_extra_delay = (2 * MAX_TEST_CANDIDATES + 1) * MAX_SLEEP_EXTRA_DELAY;
@@ -152,7 +144,7 @@ where
 {
     let mut now = Instant::now();
     let mut minimum_reconnect_instant = now;
-    // Allow extra time for test machines with high CPU load
+    // Allow a small amount of virtual-time drift between timer operations.
     let mut maximum_reconnect_instant = now + MAX_SLEEP_EXTRA_DELAY;
 
     for _ in 0..candidates {

@@ -1,5 +1,6 @@
 .PHONY: prepare-release-changelog pre-release pre-release-changelog \
-	pre-release-version pre-release-state pre-release-packaging sign-release
+	pre-release-version pre-release-requirements pre-release-state \
+	pre-release-packaging sign-release
 
 PRE_RELEASE_WARN_CRATE_VERSION_BUMPS ?= $(if $(CI),0,1)
 CRATE_PACKAGING_VERIFY ?= 0
@@ -11,13 +12,15 @@ prepare-release-changelog:
 
 pre-release:
 	@test -n "$(RELEASE_TAG)" || { echo "RELEASE_TAG is required, e.g. make pre-release RELEASE_TAG=v1.0.0" >&2; exit 1; }
-	@printf '\n==> [1/4] Checking release version\n\n'
+	@printf '\n==> [1/5] Checking release version\n\n'
 	$(MAKE) pre-release-version RELEASE_TAG="$(RELEASE_TAG)" BASE_TAG="$(BASE_TAG)" PRE_RELEASE_WARN_CRATE_VERSION_BUMPS="$(PRE_RELEASE_WARN_CRATE_VERSION_BUMPS)"
-	@printf '\n==> [2/4] Checking assembled changelog\n\n'
+	@printf '\n==> [2/5] Checking internal dependency requirements\n\n'
+	$(MAKE) pre-release-requirements RELEASE_TAG="$(RELEASE_TAG)"
+	@printf '\n==> [3/5] Checking assembled changelog\n\n'
 	$(MAKE) pre-release-changelog RELEASE_TAG="$(RELEASE_TAG)"
-	@printf '\n==> [3/4] Checking committed Mainnet release state\n\n'
+	@printf '\n==> [4/5] Checking committed Mainnet release state\n\n'
 	$(MAKE) pre-release-state
-	@printf '\n==> [4/4] Checking crate packaging\n\n'
+	@printf '\n==> [5/5] Checking crate packaging\n\n'
 	$(MAKE) pre-release-packaging CRATE_PACKAGING_VERIFY="$(CRATE_PACKAGING_VERIFY)"
 
 pre-release-changelog:
@@ -35,6 +38,10 @@ pre-release-version:
 	else \
 		BASE_TAG="$(BASE_TAG)" bash ./scripts/check-crate-version-bumps.sh; \
 	fi
+
+pre-release-requirements:
+	@test -n "$(RELEASE_TAG)" || { echo "RELEASE_TAG is required, e.g. make pre-release-requirements RELEASE_TAG=v1.0.0" >&2; exit 1; }
+	./scripts/check-release-requirements.sh "$(RELEASE_TAG)"
 
 pre-release-state:
 	./scripts/check-release-state.sh

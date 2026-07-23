@@ -9,4 +9,9 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+test = false
+
 [dependencies]

@@ -23,6 +23,7 @@ PRs are welcome. Please:
 2. **Keep PRs focused.** Prefer one logical change per PR and avoid unrelated refactors.
 3. **Test the change.** Run checks appropriate to the affected code. Explain how the tests exercise the root cause and verify the solution, rather than only listing commands.
 4. **Follow conventional commits.** PRs are squash-merged to `main`, so the PR title becomes the commit message. Follow the [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) standard.
+5. **Carry semver bumps with API changes.** The `Semver checks` CI job compares publishable crates against their latest stable crates.io releases; a PR that changes a published API must bump the affected crate's version in the same PR (see [`CHANGELOG_GUIDELINES.md`](CHANGELOG_GUIDELINES.md), "Library crates").
 
 Zakura is a validator node — it excludes features not strictly needed for block validation and chain sync. Features like wallets, block explorers, and mining pools belong in [Zaino](https://github.com/zingolabs/zaino), [Zallet](https://github.com/zcash/wallet), or [librustzcash](https://github.com/zcash/librustzcash).
 

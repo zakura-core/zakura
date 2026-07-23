@@ -1,6 +1,6 @@
 //! Fixed test vectors for zakura-network configuration.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{collections::HashSet, fs, net::SocketAddr, time::Duration};
 
 use static_assertions::const_assert;
 use zakura_chain::{
@@ -84,6 +84,40 @@ fn ensure_peer_connection_limits_consistent() {
     assert!(
         config.peerset_inbound_connection_limit() <= config.peerset_outbound_connection_limit(),
         "this fork caps inbound connections at or below the outbound limit, to prioritize sync",
+    );
+}
+
+#[tokio::test]
+async fn empty_peer_cache_update_preserves_existing_cache() {
+    let _init_guard = zakura_test::init();
+
+    let cache_dir = tempfile::tempdir().expect("temporary peer cache directory creation failed");
+    let config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        ..Config::default()
+    };
+    let peer_cache_file = config
+        .cache_dir
+        .peer_cache_file_path(&config.network)
+        .expect("test cache directory enables the peer cache");
+    let cached_peers = "127.0.0.1:8233\n";
+    fs::create_dir_all(
+        peer_cache_file
+            .parent()
+            .expect("peer cache file has a parent directory"),
+    )
+    .expect("peer cache directory should be creatable");
+    fs::write(&peer_cache_file, cached_peers).expect("pre-seeded peer cache should be writable");
+
+    config
+        .update_peer_cache(HashSet::new())
+        .await
+        .expect("an empty peer cache update should succeed");
+
+    assert_eq!(
+        fs::read_to_string(peer_cache_file).expect("pre-seeded peer cache should remain readable"),
+        cached_peers,
+        "an empty peer list must not overwrite the existing peer cache",
     );
 }
 

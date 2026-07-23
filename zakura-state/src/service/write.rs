@@ -1223,13 +1223,8 @@ mod tests {
         let network = Network::Mainnet;
         let mut config = Config::ephemeral();
         config.enable_zakura_header_seed_from_committed_blocks = true;
-        let finalized_state = FinalizedState::new(
-            &config,
-            &network,
-            #[cfg(feature = "elasticsearch")]
-            false,
-        )
-        .expect("opening an ephemeral database should succeed");
+        let finalized_state = FinalizedState::new(&config, &network)
+            .expect("opening an ephemeral database should succeed");
         finalized_state.set_finalized_value_pool(ValueBalance::fake_populated_pool());
 
         let parent = zakura_test::vectors::BLOCK_MAINNET_434873_BYTES

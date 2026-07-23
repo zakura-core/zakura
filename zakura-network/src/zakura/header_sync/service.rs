@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use iroh::NodeId;
 use tokio::{sync::mpsc, task};
 use tokio_util::sync::CancellationToken;
 
@@ -464,6 +465,29 @@ impl Service for HeaderSyncService {
 
     fn streams(&self) -> &[Stream] {
         header_sync_streams()
+    }
+
+    fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        let owns_stream = self
+            .peers
+            .lock()
+            .expect("header-sync peer map mutex is never poisoned")
+            .get(peer)
+            .is_some_and(|record| record.conn_id == conn_id);
+        if !owns_stream {
+            return false;
+        }
+
+        let Ok(bytes) = <[u8; 32]>::try_from(peer.as_bytes()) else {
+            return false;
+        };
+        let Ok(node_id) = NodeId::from_bytes(&bytes) else {
+            return false;
+        };
+        self.header_sync
+            .candidate_state()
+            .admitted_node_ids
+            .contains(&node_id)
     }
 
     fn wants_peer(

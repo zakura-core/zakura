@@ -39,13 +39,8 @@ const TEST_BLOCKS: u32 = 9;
 
 /// Opens a fresh finalized state and commits blocks `0..=TEST_BLOCKS` for `network`.
 fn new_state_with_blocks(config: &Config, network: &Network) -> FinalizedState {
-    let mut state = FinalizedState::new(
-        config,
-        network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let mut state =
+        FinalizedState::new(config, network).expect("opening an ephemeral database should succeed");
 
     let blocks = network.blockchain_map();
     for height in 0..=TEST_BLOCKS {
@@ -70,14 +65,9 @@ fn new_state_with_checkpoint_retention(
     network: &Network,
     max_checkpoint_height: Height,
 ) -> FinalizedState {
-    let mut state = FinalizedState::new(
-        config,
-        network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed")
-    .with_checkpoint_raw_tx_retention(max_checkpoint_height, config);
+    let mut state = FinalizedState::new(config, network)
+        .expect("opening an ephemeral database should succeed")
+        .with_checkpoint_raw_tx_retention(max_checkpoint_height, config);
 
     let blocks = network.blockchain_map();
     for height in 0..=TEST_BLOCKS {
@@ -105,16 +95,9 @@ fn new_unvalidated_state_with_checkpoint_retention(
     network: &Network,
     max_checkpoint_height: Height,
 ) -> FinalizedState {
-    FinalizedState::new_with_debug_without_storage_validation(
-        config,
-        network,
-        false,
-        #[cfg(feature = "elasticsearch")]
-        false,
-        false,
-    )
-    .expect("opening an ephemeral database should succeed")
-    .with_checkpoint_raw_tx_retention(max_checkpoint_height, config)
+    FinalizedState::new_with_debug_without_storage_validation(config, network, false, false)
+        .expect("opening an ephemeral database should succeed")
+        .with_checkpoint_raw_tx_retention(max_checkpoint_height, config)
 }
 
 /// Returns a pruned-mode config with a valid mainnet retention window.
@@ -663,13 +646,8 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
     };
     let blocks = network.blockchain_map();
 
-    let mut archive_state = FinalizedState::new(
-        &archive_config,
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let mut archive_state = FinalizedState::new(&archive_config, &network)
+        .expect("opening an ephemeral database should succeed");
 
     for height in 0..TEST_BLOCKS {
         let block: Arc<Block> = blocks
@@ -763,13 +741,8 @@ fn archive_backlog_flag_is_recomputed_when_reopening_a_pruned_database() {
 
     // Archive phase: store raw transactions for every block before the future
     // checkpoint retention start.
-    let mut archive_state = FinalizedState::new(
-        &archive_config,
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let mut archive_state = FinalizedState::new(&archive_config, &network)
+        .expect("opening an ephemeral database should succeed");
     for height in 0..TEST_BLOCKS {
         let block: Arc<Block> = blocks
             .get(&height)
@@ -877,14 +850,9 @@ fn contextual_commits_keep_raw_transactions_before_checkpoint_retention_start() 
     let network = Mainnet;
     let config = pruned_config();
     let max_checkpoint_height = Height(MIN_PRUNING_RETENTION + 2);
-    let mut state = FinalizedState::new(
-        &config,
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed")
-    .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
+    let mut state = FinalizedState::new(&config, &network)
+        .expect("opening an ephemeral database should succeed")
+        .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
     let blocks = network.blockchain_map();
 
     let genesis: Arc<Block> = blocks
@@ -1180,13 +1148,8 @@ fn reopening_pruned_database_in_archive_mode_panics() {
 
     // Reopening in archive mode (the default) must refuse, because pruned data
     // can't be served.
-    let _state = FinalizedState::new(
-        &config,
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let _state = FinalizedState::new(&config, &network)
+        .expect("opening an ephemeral database should succeed");
 }
 
 #[test]
@@ -1217,13 +1180,8 @@ fn reopening_fast_synced_database_in_archive_mode_succeeds() {
         vct_fast_sync: false,
         ..config
     };
-    let reopened = FinalizedState::new(
-        &config,
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let reopened = FinalizedState::new(&config, &network)
+        .expect("opening an ephemeral database should succeed");
 
     assert_eq!(
         reopened.db.vct_synced_below(),
@@ -1262,13 +1220,8 @@ fn reopening_fast_synced_database_in_pruned_mode_with_vct_disabled_succeeds() {
         vct_fast_sync: false,
         ..config
     };
-    let reopened = FinalizedState::new(
-        &config,
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let reopened = FinalizedState::new(&config, &network)
+        .expect("opening an ephemeral database should succeed");
 
     assert_eq!(
         reopened.db.vct_synced_below(),
@@ -1304,13 +1257,8 @@ fn reopening_interrupted_fast_sync_without_a_root_source_panics() {
 
     // Reopening with the fast path disabled must refuse: the on-disk frontier is stale and no
     // root source exists, so the committer would otherwise stall on every below-handoff block.
-    let _state = FinalizedState::new(
-        &config,
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let _state = FinalizedState::new(&config, &network)
+        .expect("opening an ephemeral database should succeed");
 }
 
 #[test]
@@ -1340,13 +1288,8 @@ fn reopening_interrupted_fast_sync_with_vct_disabled_panics() {
 
     // Reopening with the VCT force-disable knob must refuse: the on-disk frontier is stale and
     // no root source exists, so the committer would otherwise stall on every below-handoff block.
-    let _state = FinalizedState::new(
-        &config,
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let _state = FinalizedState::new(&config, &network)
+        .expect("opening an ephemeral database should succeed");
 }
 
 #[test]

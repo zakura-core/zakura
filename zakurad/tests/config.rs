@@ -496,17 +496,3 @@ fn config_env_unknown_sensitive_key_errors() {
     let msg = result.unwrap_err().to_string();
     assert!(msg.contains("sensitive key"), "error message: {}", msg);
 }
-
-#[test]
-fn config_env_elasticsearch_password_errors() {
-    let env = EnvGuard::new();
-
-    // This key may or may not exist depending on features. It should be filtered regardless.
-    env.set_var("ZAKURA_STATE__ELASTICSEARCH_PASSWORD", "topsecret");
-
-    let result = ZakuradConfig::load(None);
-    assert!(result.is_err(), "Sensitive env key should cause an error");
-
-    let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("sensitive key"), "error message: {}", msg);
-}

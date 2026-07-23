@@ -26,7 +26,7 @@ use zakura_chain::{
 use zcash_protocol::value::ZatBalance;
 
 use super::{
-    verifier_for, Item, VERIFIER_NU6_2, VERIFIER_NU6_3_ONWARD, VERIFIER_PRE_NU6_2,
+    lazy_verifier_for, Item, VERIFIER_NU6_2, VERIFIER_NU6_3_ONWARD, VERIFIER_PRE_NU6_2,
     VERIFYING_KEY_NU6_2, VERIFYING_KEY_PRE_NU6_2,
 };
 
@@ -89,22 +89,16 @@ fn pre_nu6_2_proof_only_verifies_under_pre_nu6_2_key() {
     );
 }
 
-/// [`verifier_for`] routes each upgrade to the service that holds the correct
+/// [`lazy_verifier_for`] routes each upgrade to the service that holds the correct
 /// circuit era's key.
 ///
-/// We compare service identity by pointer: the routing functions return borrows of global `Lazy`
-/// services, so each expected route must alias the matching service. Because the route is what
-/// binds an item to a key, routing to the wrong service is exactly routing to the wrong key.
-///
-/// This is an async test because forcing the global `Lazy` verifiers builds their `Batch` layer,
-/// which spawns a worker task and therefore needs a Tokio runtime.
-#[tokio::test(flavor = "multi_thread")]
-async fn verifier_routes_each_network_upgrade_to_the_correct_key() {
-    // Deref each `Lazy` to the inner service it guards, matching what the routing functions
-    // return, so the pointer comparisons below compare the same service type.
-    let pre: &'static super::VerifierService = &VERIFIER_PRE_NU6_2;
-    let nu6_2: &'static super::VerifierService = &VERIFIER_NU6_2;
-    let nu6_3_onward: &'static super::VerifierService = &VERIFIER_NU6_3_ONWARD;
+/// Comparing the `Lazy` handles themselves proves the routing without building
+/// any verifying key or starting a batch worker.
+#[test]
+fn verifier_routes_each_network_upgrade_to_the_correct_key() {
+    let pre = &VERIFIER_PRE_NU6_2;
+    let nu6_2 = &VERIFIER_NU6_2;
+    let nu6_3_onward = &VERIFIER_NU6_3_ONWARD;
 
     // Everything before NU6.2 (including upgrades from before Orchard existed) routes to the
     // insecure key, which is the only key any pre-NU6.2 Orchard history verifies under.
@@ -114,7 +108,7 @@ async fn verifier_routes_each_network_upgrade_to_the_correct_key() {
         NetworkUpgrade::Nu6_1,
     ] {
         assert!(
-            std::ptr::eq(verifier_for(nu), pre),
+            std::ptr::eq(lazy_verifier_for(nu), pre),
             "{nu:?} must route to the pre-NU6.2 (insecure) verifier"
         );
     }
@@ -122,7 +116,7 @@ async fn verifier_routes_each_network_upgrade_to_the_correct_key() {
     // NU6.2 is the only upgrade that uses the fixed key: it is active from the NU6.2 activation
     // height until NU6.3.
     assert!(
-        std::ptr::eq(verifier_for(NetworkUpgrade::Nu6_2), nu6_2),
+        std::ptr::eq(lazy_verifier_for(NetworkUpgrade::Nu6_2), nu6_2),
         "Nu6_2 must route to the NU6.2 (fixed) verifier"
     );
 
@@ -133,7 +127,7 @@ async fn verifier_routes_each_network_upgrade_to_the_correct_key() {
     // upgrades do not fall back to the NU6.2 fixed key.
     for nu in [NetworkUpgrade::Nu6_3, NetworkUpgrade::Nu7] {
         assert!(
-            std::ptr::eq(verifier_for(nu), nu6_3_onward),
+            std::ptr::eq(lazy_verifier_for(nu), nu6_3_onward),
             "{nu:?} must route to the NU6.3-onward verifier even for v5 Orchard bundles"
         );
     }
@@ -142,7 +136,7 @@ async fn verifier_routes_each_network_upgrade_to_the_correct_key() {
     // that very same key — selecting the verifier is what binds a bundle to a key, so this is the
     // regression guard against routing v5@NU6.3 to the fixed key.
     assert!(
-        std::ptr::eq(verifier_for(NetworkUpgrade::Nu6_3), nu6_3_onward),
+        std::ptr::eq(lazy_verifier_for(NetworkUpgrade::Nu6_3), nu6_3_onward),
         "a v5 Orchard bundle at NU6.3 must use the same key as v6 Orchard and Ironwood"
     );
 }

@@ -79,9 +79,15 @@ fastmod --fixed-strings '1.58' '1.65'
 
 ## Create the Release PR
 
-- [ ] Push the reviewed fragments and README updates into a new branch
-      for example: `bump-v1.0.0` - this needs to be different to the tag name
-- [ ] Create a release PR by adding `&template=release-checklist.md` to the comparing url ([Example](https://github.com/zakura-core/zakura/compare/bump-v1.0.0?expand=1&template=release-checklist.md)).
+- [ ] If a release-capable maintainer has asked you to hold releases, stop
+      here until they lift the hold — a security hotfix may be in flight for
+      the same version, invisible to you under embargo.
+- [ ] Push the reviewed fragments and README updates into a new branch named
+      `release/v<version>`, for example `release/v1.0.0` (CI triggers match
+      `release/**`; any name different from the tag works, but never
+      `hotfix/v*` — that namespace is reserved for the
+      [hotfix release process](https://github.com/zakura-core/zakura/blob/main/docs/security-hotfix-release.md)).
+- [ ] Create a release PR by adding `&template=release-checklist.md` to the comparing url ([Example](https://github.com/zakura-core/zakura/compare/release/v1.0.0?expand=1&template=release-checklist.md)).
 - [ ] Freeze the [`batched` queue](https://dashboard.mergify.com/github/valargroup/repo/zakura/queues) using Mergify.
 - [ ] Mark all the release PRs as `Critical` priority, so they go in the `urgent` Mergify queue.
 - [ ] Mark all non-release PRs with `do-not-merge`, because Mergify checks approved PRs against every commit, even when a queue is frozen.
@@ -139,6 +145,11 @@ snapshot the test rejects.
 
 If you're publishing crates for the first time, [log in to crates.io](https://github.com/zakura-core/zakura/dev/crate-owners.html#logging-in-to-cratesio),
 and make sure you're a member of owners group.
+
+The `Semver checks` CI job enforces bump-with-change against stable
+crates.io baselines on every Rust PR, so most bumps already exist by release
+time; the steps below review and complete them (for example, for non-API
+changes that still warrant publishing).
 
 Check that the release will work:
 
@@ -217,13 +228,26 @@ The end of support height is calculated from the current blockchain height:
 ## Create the GitHub Pre-Release
 
 - [ ] Wait for all the release PRs to be merged
-- [ ] Run the [Create release workflow](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml)
+- [ ] Run the T-0 orchestrator — its preflight checks for a competing
+      release train, then it dispatches `Create release` from `main` with
+      the exact tag, watches to the approval gate, and verifies the
+      published tag, release, and assets (resumable — re-runs skip
+      completed steps):
+
+      ```sh
+      ./scripts/release-t0.sh publish --tag v<version> --mode main \
+          --head-sha <merged-main-commit>
+      ```
+
+      Manual fallback: run the
+      [Create release workflow](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml)
       from `main`, entering the exact version tag, for example `v1.0.0-rc2`.
       The workflow verifies that the tag matches the `zakura` package version,
       then builds and verifies the assets without creating a tag.
 - [ ] Wait for the build and no-push Docker checks to pass, then approve the
-      `release` environment deployment. The workflow publishes a complete
-      pre-release and creates the protected tag as its final step.
+      `release` environment deployment when the script announces it. The
+      workflow publishes a complete pre-release and creates the protected
+      tag as its final step.
 - [ ] Review and update the new release description against the final changelog
       you created, starting just _after_ the title `## [Zakura ...` of the
       current version and ending just _before_ the title of the previous
@@ -242,10 +266,12 @@ For a release candidate, skip this section: the release stays a pre-release
 from publication until deletion.
 
 - [ ] For a stable release, after `make sign-release` has run against the tag:
-      [edit the release](https://github.com/zakura-core/zakura/releases) to
-      disable 'pre-release' **and** check "Set as the latest release"
-      (`make_latest: true`) — both steps are explicit; nothing does this
-      automatically.
+      `./scripts/release-t0.sh promote --tag v<version>` — it refuses
+      unsigned releases and release candidates, clears 'pre-release', checks
+      "Set as the latest release" (`make_latest: true`), and verifies both.
+      Manual fallback:
+      [edit the release](https://github.com/zakura-core/zakura/releases) and
+      set both flags explicitly — nothing does this automatically.
 
 ## Publish Crates
 

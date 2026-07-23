@@ -1439,13 +1439,8 @@ mod tests {
         }
         let handoff_hash = blocks[height_index(handoff)].hash();
 
-        let mut golden = FinalizedState::new(
-            &Config::ephemeral(),
-            &network,
-            #[cfg(feature = "elasticsearch")]
-            false,
-        )
-        .expect("golden state opens");
+        let mut golden =
+            FinalizedState::new(&Config::ephemeral(), &network).expect("golden state opens");
         let mut golden_trees = Vec::new();
         for block in &blocks {
             let (_, trees) = golden
@@ -1474,13 +1469,8 @@ mod tests {
         )
         .expect("fixture artifact globally replays");
 
-        let mut prefix = FinalizedState::new(
-            &config,
-            &network,
-            #[cfg(feature = "elasticsearch")]
-            false,
-        )
-        .expect("repair fixture state opens");
+        let mut prefix =
+            FinalizedState::new(&config, &network).expect("repair fixture state opens");
         for block in blocks.iter().take(height_index(tip) + 1) {
             prefix
                 .commit_finalized_direct(
@@ -1525,13 +1515,8 @@ mod tests {
             },
         );
 
-        let repaired = FinalizedState::new(
-            &config,
-            &network,
-            #[cfg(feature = "elasticsearch")]
-            false,
-        )
-        .expect("restart synchronously repairs the interrupted prefix");
+        let repaired = FinalizedState::new(&config, &network)
+            .expect("restart synchronously repairs the interrupted prefix");
         assert_eq!(repaired.db.finalized_tip_height(), Some(tip));
         assert_eq!(
             repaired
@@ -1554,13 +1539,8 @@ mod tests {
         );
         drop(repaired);
 
-        let mut state = FinalizedState::new(
-            &config,
-            &network,
-            #[cfg(feature = "elasticsearch")]
-            false,
-        )
-        .expect("the version-complete repaired state reopens");
+        let mut state = FinalizedState::new(&config, &network)
+            .expect("the version-complete repaired state reopens");
         assert_eq!(
             state
                 .db

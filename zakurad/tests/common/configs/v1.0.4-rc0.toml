@@ -149,4 +149,3 @@ shutdown_grace_period = "5m"
 startup_delay = "1s"
 zcashd_extra_args = []
 zcashd_source = "path"
-

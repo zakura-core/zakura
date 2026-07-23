@@ -383,6 +383,15 @@ impl Service for BlockSyncService {
         block_sync_streams()
     }
 
+    fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        self.inner
+            .peers
+            .lock()
+            .expect("block-sync peer map mutex is never poisoned")
+            .get(peer)
+            .is_some_and(|record| record.conn_id == conn_id)
+    }
+
     fn wants_peer(
         &self,
         peer: &ZakuraPeerId,

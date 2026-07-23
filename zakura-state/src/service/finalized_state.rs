@@ -259,52 +259,23 @@ pub struct FinalizedState {
     /// The last instance that is dropped will close the underlying database.
     pub db: ZakuraDb,
 
-    #[cfg(feature = "elasticsearch")]
-    /// The elasticsearch handle.
-    pub elastic_db: Option<elasticsearch::Elasticsearch>,
-
-    #[cfg(feature = "elasticsearch")]
-    /// A collection of blocks to be sent to elasticsearch as a bulk.
-    pub elastic_blocks: Vec<String>,
-
     /// Commit-time verified-commitment-trees state.
     vct: VctCommitState,
 }
 
 impl FinalizedState {
-    /// Returns an on-disk database instance for `config`, `network`, and `elastic_db`.
+    /// Returns an on-disk database instance for `config` and `network`.
     /// If there is no existing database, creates a new database on disk.
-    pub fn new(
-        config: &Config,
-        network: &Network,
-        #[cfg(feature = "elasticsearch")] enable_elastic_db: bool,
-    ) -> Result<Self, StateInitError> {
-        Self::new_with_debug(
-            config,
-            network,
-            false,
-            #[cfg(feature = "elasticsearch")]
-            enable_elastic_db,
-            false,
-        )
+    pub fn new(config: &Config, network: &Network) -> Result<Self, StateInitError> {
+        Self::new_with_debug(config, network, false, false)
     }
 
     /// Opens (or creates) the on-disk finalized state database read-write, for
     /// offline tooling (e.g. the replay benchmark).
     ///
-    /// Equivalent to [`FinalizedState::new`] but without the `elasticsearch`
-    /// feature's `enable_elastic_db` parameter, so callers compile unchanged
-    /// regardless of feature flags (elasticsearch is never enabled here).
+    /// Equivalent to [`FinalizedState::new`] for offline tooling.
     pub fn new_writable(config: &Config, network: &Network) -> Self {
-        Self::new_with_debug(
-            config,
-            network,
-            false,
-            #[cfg(feature = "elasticsearch")]
-            false,
-            false,
-        )
-        .expect(
+        Self::new_with_debug(config, network, false, false).expect(
             "opening the read-write finalized state database failed; check that the \
              state cache directory is writable and not locked by another Zakura instance, \
              and that there is free disk space",
@@ -320,15 +291,12 @@ impl FinalizedState {
         config: &Config,
         network: &Network,
         debug_skip_format_upgrades: bool,
-        #[cfg(feature = "elasticsearch")] enable_elastic_db: bool,
         read_only: bool,
     ) -> Result<Self, StateInitError> {
         Self::new_with_debug_and_storage_validation(
             config,
             network,
             debug_skip_format_upgrades,
-            #[cfg(feature = "elasticsearch")]
-            enable_elastic_db,
             read_only,
             true,
             true,
@@ -344,15 +312,12 @@ impl FinalizedState {
         config: &Config,
         network: &Network,
         debug_skip_format_upgrades: bool,
-        #[cfg(feature = "elasticsearch")] enable_elastic_db: bool,
         read_only: bool,
     ) -> Result<Self, StateInitError> {
         Self::new_with_debug_and_storage_validation(
             config,
             network,
             debug_skip_format_upgrades,
-            #[cfg(feature = "elasticsearch")]
-            enable_elastic_db,
             read_only,
             false,
             true,
@@ -364,7 +329,6 @@ impl FinalizedState {
         config: &Config,
         network: &Network,
         debug_skip_format_upgrades: bool,
-        #[cfg(feature = "elasticsearch")] enable_elastic_db: bool,
         read_only: bool,
         validate_storage_mode: bool,
         enforce_resume_guard: bool,
@@ -375,34 +339,6 @@ impl FinalizedState {
                 panic!("{error}");
             }
         }
-
-        #[cfg(feature = "elasticsearch")]
-        let elastic_db = if enable_elastic_db {
-            use elasticsearch::{
-                auth::Credentials::Basic,
-                cert::CertificateValidation,
-                http::transport::{SingleNodeConnectionPool, TransportBuilder},
-                http::Url,
-                Elasticsearch,
-            };
-
-            let conn_pool = SingleNodeConnectionPool::new(
-                Url::parse(config.elasticsearch_url.as_str())
-                    .expect("configured elasticsearch url is invalid"),
-            );
-            let transport = TransportBuilder::new(conn_pool)
-                .cert_validation(CertificateValidation::None)
-                .auth(Basic(
-                    config.clone().elasticsearch_username,
-                    config.clone().elasticsearch_password,
-                ))
-                .build()
-                .expect("elasticsearch transport builder should not fail");
-
-            Some(Elasticsearch::new(transport))
-        } else {
-            None
-        };
 
         let db = ZakuraDb::new(
             config,
@@ -431,18 +367,6 @@ impl FinalizedState {
             .zip(db.finalized_tip_height())
             .is_some_and(|(last_checkpoint_height, tip)| tip < last_checkpoint_height);
 
-        #[cfg(feature = "elasticsearch")]
-        let new_state = Self {
-            debug_stop_at_height: config.debug_stop_at_height.map(block::Height),
-            checkpoint_raw_tx_retention_start: None,
-            checkpoint_raw_tx_archive_backlog: Arc::new(AtomicBool::new(false)),
-            db,
-            elastic_db,
-            elastic_blocks: vec![],
-            vct: VctCommitState::new(vct, is_vct_sync_below_last_checkpoint),
-        };
-
-        #[cfg(not(feature = "elasticsearch"))]
         let new_state = Self {
             debug_stop_at_height: config.debug_stop_at_height.map(block::Height),
             checkpoint_raw_tx_retention_start: None,
@@ -1158,8 +1082,6 @@ impl FinalizedState {
             );
         }
 
-        #[cfg(feature = "elasticsearch")]
-        let finalized_inner_block = finalized.block.clone();
         let note_commitment_trees = finalized.treestate.note_commitment_trees.clone();
 
         // Run `write_block` directly on the committer thread rather than entering the
@@ -1187,10 +1109,6 @@ impl FinalizedState {
                 self.checkpoint_raw_tx_archive_backlog
                     .store(false, Ordering::Relaxed);
             }
-
-            // Save blocks to elasticsearch if the feature is enabled.
-            #[cfg(feature = "elasticsearch")]
-            self.elasticsearch(&finalized_inner_block);
 
             // TODO: move the stop height check to the syncer (#3442)
             if self.is_at_stop_height(height) {
@@ -1407,91 +1325,6 @@ impl FinalizedState {
             vct_fast_blocks = fast_count,
             "VCT-DIGEST"
         );
-    }
-
-    #[cfg(feature = "elasticsearch")]
-    /// Store finalized blocks into an elasticsearch database.
-    ///
-    /// We use the elasticsearch bulk api to index multiple blocks at a time while we are
-    /// synchronizing the chain, when we get close to tip we index blocks one by one.
-    pub fn elasticsearch(&mut self, block: &Arc<block::Block>) {
-        if let Some(client) = self.elastic_db.clone() {
-            let block_time = block.header.time.timestamp();
-            let local_time = chrono::Utc::now().timestamp();
-
-            // Bulk size is small enough to avoid the elasticsearch 100mb content length limitation.
-            // MAX_BLOCK_BYTES = 2MB but each block use around 4.1 MB of JSON.
-            // Each block count as 2 as we send them with a operation/header line. A value of 48
-            // is 24 blocks.
-            const AWAY_FROM_TIP_BULK_SIZE: usize = 48;
-
-            // The number of blocks the bulk will have when we are in sync.
-            // A value of 2 means only 1 block as we want to insert them as soon as we get
-            // them for a real time experience. This is the same for mainnet and testnet.
-            const CLOSE_TO_TIP_BULK_SIZE: usize = 2;
-
-            // We consider in sync when the local time and the blockchain time difference is
-            // less than this number of seconds.
-            const CLOSE_TO_TIP_SECONDS: i64 = 14400; // 4 hours
-
-            let mut blocks_size_to_dump = AWAY_FROM_TIP_BULK_SIZE;
-
-            // If we are close to the tip, index one block per bulk call.
-            if local_time - block_time < CLOSE_TO_TIP_SECONDS {
-                blocks_size_to_dump = CLOSE_TO_TIP_BULK_SIZE;
-            }
-
-            // Insert the operation line.
-            let height_number = block.coinbase_height().unwrap_or(block::Height(0)).0;
-            self.elastic_blocks.push(
-                serde_json::json!({
-                    "index": {
-                        "_id": height_number.to_string().as_str()
-                    }
-                })
-                .to_string(),
-            );
-
-            // Insert the block itself.
-            self.elastic_blocks
-                .push(serde_json::json!(block).to_string());
-
-            // We are in bulk time, insert to ES all we have.
-            if self.elastic_blocks.len() >= blocks_size_to_dump {
-                let rt = tokio::runtime::Runtime::new()
-                    .expect("runtime creation for elasticsearch should not fail.");
-                let blocks = self.elastic_blocks.clone();
-                let network = self.network();
-
-                rt.block_on(async move {
-                    // Send a ping to the server to check if it is available before inserting.
-                    if client.ping().send().await.is_err() {
-                        tracing::error!("Elasticsearch is not available, skipping block indexing");
-                        return;
-                    }
-
-                    let response = client
-                        .bulk(elasticsearch::BulkParts::Index(
-                            format!("zcash_{}", network.to_string().to_lowercase()).as_str(),
-                        ))
-                        .body(blocks)
-                        .send()
-                        .await
-                        .expect("ES Request should never fail");
-
-                    // Make sure no errors ever.
-                    let response_body = response
-                        .json::<serde_json::Value>()
-                        .await
-                        .expect("ES response parsing error. Maybe we are sending more than 100 mb of data (`http.max_content_length`)");
-                    let errors = response_body["errors"].as_bool().unwrap_or(true);
-                    assert!(!errors, "{}", format!("ES error: {response_body}"));
-                });
-
-                // Clean the block storage.
-                self.elastic_blocks.clear();
-            }
-        }
     }
 
     /// Stop the process if `block_height` is greater than or equal to the

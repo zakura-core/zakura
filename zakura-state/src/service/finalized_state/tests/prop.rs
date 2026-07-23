@@ -1894,12 +1894,22 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                     handoff_trees.sprout.clone(),
                     handoff_trees.ironwood.clone(),
                 );
+                // Match the writer service by carrying the frozen in-memory
+                // frontier through an uninterrupted fast-sync sequence.
+                let mut prev_note_commitment_trees = None;
                 for i in 0..=handoff_index {
                     let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                     let next = (i < handoff_index)
                         .then(|| vct_successor_header(blocks[i + 1].block.clone()));
-                    fast.commit_finalized_direct(cv.into(), None, next, "vct switch fast prefix")
+                    let (_, note_commitment_trees) = fast
+                        .commit_finalized_direct(
+                            cv.into(),
+                            prev_note_commitment_trees.take(),
+                            next,
+                            "vct switch fast prefix",
+                        )
                         .expect("verified fast prefix commits");
+                    prev_note_commitment_trees = Some(note_commitment_trees);
                 }
                 prop_assert_eq!(fast.vct_fast_synced_below(), Some(handoff), "fast sync reached the handoff before the switch");
             }
@@ -1971,13 +1981,22 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 handoff_trees.sprout.clone(),
                 handoff_trees.ironwood.clone(),
             );
+            // Match the writer service after this deliberate mode-switch
+            // restart, then carry the frontier through the fast suffix.
+            let mut prev_note_commitment_trees = None;
             for i in (seed + 1)..=post_handoff_tip {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = (i < post_handoff_tip)
                     .then(|| vct_successor_header(blocks[i + 1].block.clone()));
-                fast_suffix
-                    .commit_finalized_direct(cv.into(), None, next, "vct switch fast suffix")
+                let (_, note_commitment_trees) = fast_suffix
+                    .commit_finalized_direct(
+                        cv.into(),
+                        prev_note_commitment_trees.take(),
+                        next,
+                        "vct switch fast suffix",
+                    )
                     .expect("fast suffix commits after manual prefix");
+                prev_note_commitment_trees = Some(note_commitment_trees);
             }
             prop_assert_eq!(
                 fast_suffix.vct_fast_count(),

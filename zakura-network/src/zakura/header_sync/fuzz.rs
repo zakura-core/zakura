@@ -6,8 +6,8 @@ use tokio::time::Instant;
 use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::{
     AlarmSet, BranchId, ChainScore, CompletionDecision, CompletionGate, EngineMode, EngineSnapshot,
-    Frontier, FrontierSet, HeaderGeneration, HeaderLocator, PendingOwners, SourceId, StateVersion,
-    SuffixWork, VerifiedGeneration, WorkOwner, MAX_STAGED_TARGETS_V1,
+    Frontier, FrontierSet, HeaderGeneration, HeaderLocator, PendingOwners, RetiredWork, SourceId,
+    StateVersion, SuffixWork, VerifiedGeneration, WorkOwner, MAX_STAGED_TARGETS_V1,
 };
 
 use super::{
@@ -30,6 +30,14 @@ pub struct HeaderPursuitReplaySummary {
     pub refused_operations: usize,
     /// Number of peer punishments, which must remain zero for modeled outcomes.
     pub peer_punishments: usize,
+    /// Prepared completions retained across later operations.
+    pub held_completions: usize,
+    /// Held completions released through the centralized ownership gate.
+    pub released_completions: usize,
+    /// Released completions rejected after retirement or scope change.
+    pub stale_releases: usize,
+    /// Unauthenticated status mutations exercised without changing local authority.
+    pub advisory_mutations: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,9 +56,16 @@ enum ModelWork {
     },
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct HeldCompletion {
+    peer_key: u8,
+    owner: WorkOwner,
+}
+
 struct PursuitHarness {
     queue: PeerWorkQueue,
     model: HashMap<u8, ModelWork>,
+    held: HashMap<u8, HeldCompletion>,
     pending: PendingOwners,
     snapshot: EngineSnapshot,
     observed_at: Instant,
@@ -63,6 +78,7 @@ impl PursuitHarness {
         Self {
             queue: PeerWorkQueue::default(),
             model: HashMap::new(),
+            held: HashMap::new(),
             pending: PendingOwners::default(),
             snapshot: EngineSnapshot {
                 mode: EngineMode::Integrated,
@@ -84,7 +100,7 @@ impl PursuitHarness {
     }
 
     fn apply(&mut self, bytes: &[u8]) {
-        let opcode = bytes[0] % 8;
+        let opcode = decode_opcode(bytes[0]);
         let peer_key = bytes[1] % LOGICAL_PEERS;
         let marker = bytes[2];
         let flags = bytes[3];
@@ -97,7 +113,10 @@ impl PursuitHarness {
             5 => self.explicit_outcome(peer_key, marker, flags),
             6 => self.disconnect(peer_key),
             7 => self.advance_generation(flags),
-            _ => unreachable!("the opcode is reduced modulo eight"),
+            8 => self.hold_completion(peer_key, marker, flags),
+            9 => self.release_completion(marker),
+            10 => self.corrupt_advisory(peer_key, marker, flags),
+            _ => unreachable!("the opcode is reduced modulo eleven"),
         }
         self.assert_matches_model();
         assert_eq!(
@@ -360,7 +379,97 @@ impl PursuitHarness {
         self.model.remove(&peer_key);
     }
 
+    fn hold_completion(&mut self, peer_key: u8, marker: u8, flags: u8) {
+        let supplied_session = session(flags);
+        let supplied_target = target(marker);
+        let slot = (flags >> 2).saturating_add(32);
+        let Some(ModelWork::Active {
+            session_id,
+            target,
+            owner,
+            phase: HeaderTargetPhase::Preparing,
+            ancestor_bound: true,
+        }) = self.model.get(&peer_key).cloned()
+        else {
+            self.summary.refused_operations += 1;
+            return;
+        };
+        if session_id != supplied_session
+            || target != supplied_target
+            || self.held.contains_key(&slot)
+            || self
+                .held
+                .values()
+                .any(|completion| completion.owner == owner)
+        {
+            self.summary.refused_operations += 1;
+            return;
+        }
+        self.held.insert(slot, HeldCompletion { peer_key, owner });
+        self.summary.held_completions += 1;
+    }
+
+    fn release_completion(&mut self, marker: u8) {
+        let slot = marker % 64;
+        let Some(completion) = self.held.remove(&slot) else {
+            self.summary.refused_operations += 1;
+            return;
+        };
+        self.summary.released_completions += 1;
+        let decision = CompletionGate::check(
+            &self.snapshot,
+            &self.pending,
+            source(completion.peer_key),
+            &completion.owner,
+        );
+        if decision == CompletionDecision::Current {
+            self.summary.state_submissions += 1;
+        } else {
+            self.summary.refused_operations += 1;
+            self.summary.stale_releases += 1;
+        }
+        self.retire_if_exact(completion);
+    }
+
+    fn corrupt_advisory(&mut self, peer_key: u8, marker: u8, flags: u8) {
+        let before = self.snapshot.clone();
+        let session_id = session(flags);
+        let mut advertised = advertisement(self.observed_at, session_id, marker);
+        match (flags >> 2) % 4 {
+            0 => {
+                advertised.status.work_anchor_hash = hash(marker.wrapping_add(1));
+                advertised.status.suffix_cumulative_work = U256::MAX;
+            }
+            1 => advertised.status.selected_tip_height = block::Height(u32::MAX),
+            2 => advertised.status.oldest_retained_height = block::Height(u32::MAX),
+            3 => advertised.status.max_headers_per_response = 0,
+            _ => unreachable!("the advisory mutation is reduced modulo four"),
+        }
+        let target = advertised.status.selected_tip_hash;
+        if advertised.is_discovery_eligible(&self.snapshot) {
+            let priority =
+                PeerWorkPriority::from_work_order(advertised.claimed_work_order(&self.snapshot));
+            let actual = self.queue.stage(peer(peer_key), advertised, priority);
+            let expected = self.model_stage(peer_key, session_id, target, priority);
+            assert_eq!(
+                actual, expected,
+                "advisory mutation changed queue semantics"
+            );
+        } else {
+            self.queue.remove_unstarted(&peer(peer_key));
+            if matches!(self.model.get(&peer_key), Some(ModelWork::Awaiting { .. })) {
+                self.model.remove(&peer_key);
+            }
+        }
+        assert_eq!(
+            self.snapshot, before,
+            "unauthenticated advisory fields cannot mutate local authority"
+        );
+        self.summary.advisory_mutations += 1;
+    }
+
     fn advance_generation(&mut self, flags: u8) {
+        let previous = self.snapshot.clone();
         if flags & 1 == 0 {
             self.snapshot.state_version = self
                 .snapshot
@@ -373,6 +482,24 @@ impl PursuitHarness {
                 .header_generation
                 .checked_next()
                 .expect("at most 128 fuzz operations cannot exhaust header generations");
+        }
+        let retired = self.pending.apply_retirement(
+            &RetiredWork {
+                header_generation_changed: previous.header_generation
+                    != self.snapshot.header_generation,
+                verified_generation_changed: false,
+                owners: Vec::new(),
+            },
+            &self.snapshot,
+        );
+        for owner in retired {
+            assert!(
+                self.queue.remove_owner(owner).is_some(),
+                "retired pending owners have exact queue work"
+            );
+            self.model.retain(
+                |_, work| !matches!(work, ModelWork::Active { owner: active, .. } if *active == owner),
+            );
         }
     }
 
@@ -388,6 +515,25 @@ impl PursuitHarness {
             .expect("the queue contains the exact active owner");
         assert_eq!(retired.owner, owner);
         self.model.remove(&peer_key);
+    }
+
+    fn retire_if_exact(&mut self, completion: HeldCompletion) {
+        let Some(retired) = self.queue.remove_owner(completion.owner) else {
+            return;
+        };
+        assert_eq!(retired.owner, completion.owner);
+        assert_eq!(
+            self.pending
+                .remove(source(completion.peer_key), completion.owner.request_id),
+            Some(completion.owner),
+            "an exact held owner retires only its own pending entry"
+        );
+        if matches!(
+            self.model.get(&completion.peer_key),
+            Some(ModelWork::Active { owner, .. }) if *owner == completion.owner
+        ) {
+            self.model.remove(&completion.peer_key);
+        }
     }
 
     fn assert_matches_model(&self) {
@@ -459,6 +605,15 @@ pub fn replay_header_pursuit_bytes(data: &[u8]) -> HeaderPursuitReplaySummary {
 
 fn hash(marker: u8) -> block::Hash {
     block::Hash([marker; 32])
+}
+
+fn decode_opcode(byte: u8) -> u8 {
+    match byte {
+        0..=10 => byte,
+        56..=63 => byte - 56,
+        72..=74 => byte - 64,
+        _ => byte % 8,
+    }
 }
 
 fn frontier(marker: u8) -> Frontier {
@@ -592,6 +747,28 @@ mod tests {
             match name {
                 "exact_completion" => assert_eq!(first.state_submissions, 1),
                 "explicit_outcome" => assert_eq!(first.explicit_outcomes, 1),
+                "held_completion" => {
+                    assert_eq!(first.state_submissions, 1);
+                    assert_eq!(first.held_completions, 1);
+                    assert_eq!(first.released_completions, 1);
+                    assert_eq!(first.stale_releases, 0);
+                }
+                "stale_held_completion" => {
+                    assert_eq!(first.state_submissions, 0);
+                    assert_eq!(first.held_completions, 1);
+                    assert_eq!(first.released_completions, 1);
+                    assert_eq!(first.stale_releases, 1);
+                }
+                "disconnected_held_completion" => {
+                    assert_eq!(first.state_submissions, 0);
+                    assert_eq!(first.held_completions, 1);
+                    assert_eq!(first.released_completions, 1);
+                    assert_eq!(first.stale_releases, 1);
+                }
+                "corrupt_advisory" => {
+                    assert_eq!(first.state_submissions, 0);
+                    assert_eq!(first.advisory_mutations, 1);
+                }
                 "seventeen_pursuits" | "stale_generation" | "wrong_ancestry" | "wrong_target" => {
                     assert_eq!(first.state_submissions, 0)
                 }
@@ -639,5 +816,50 @@ mod tests {
         let replacement = replay_header_pursuit_bytes(&input);
         assert_eq!(replacement.state_submissions, 0);
         assert_eq!(replacement.peer_punishments, 0);
+    }
+
+    #[test]
+    fn held_completion_is_current_before_retirement_and_stale_after_it() {
+        let prepare_and_hold = [
+            0, 0, 42, 0, // advertise session 1, target 42
+            1, 0, 42, 0, // start exact request
+            2, 0, 42, 0, // bind authenticated ancestry
+            3, 0, 42, 0, // prepare the complete target
+            8, 0, 42, 0, // hold in slot 32
+        ];
+
+        let mut current = prepare_and_hold.to_vec();
+        current.extend([9, 0, 32, 0]);
+        let current = replay_header_pursuit_bytes(&current);
+        assert_eq!(current.state_submissions, 1);
+        assert_eq!(current.stale_releases, 0);
+
+        let mut stale = prepare_and_hold.to_vec();
+        stale.extend([7, 0, 0, 0]);
+        stale.extend([9, 0, 32, 0]);
+        let stale = replay_header_pursuit_bytes(&stale);
+        assert_eq!(stale.state_submissions, 0);
+        assert_eq!(stale.stale_releases, 1);
+        assert_eq!(stale.peer_punishments, 0);
+
+        let mut disconnected = prepare_and_hold.to_vec();
+        disconnected.extend([6, 0, 0, 0]);
+        disconnected.extend([9, 0, 32, 0]);
+        let disconnected = replay_header_pursuit_bytes(&disconnected);
+        assert_eq!(disconnected.state_submissions, 0);
+        assert_eq!(disconnected.stale_releases, 1);
+        assert_eq!(disconnected.peer_punishments, 0);
+    }
+
+    #[test]
+    fn corrupted_advisory_fields_never_change_local_authority() {
+        let mut input = Vec::new();
+        for mutation in 0..4 {
+            input.extend([10, mutation, 42 + mutation, mutation << 2]);
+        }
+        let summary = replay_header_pursuit_bytes(&input);
+        assert_eq!(summary.advisory_mutations, 4);
+        assert_eq!(summary.state_submissions, 0);
+        assert_eq!(summary.peer_punishments, 0);
     }
 }

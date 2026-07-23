@@ -115,6 +115,32 @@ impl BodyRetryEpisode {
         }
     }
 
+    /// Restore a durable episode without weakening its persisted alarm cadence.
+    pub fn restore(
+        branch: BranchId,
+        generation: HeaderGeneration,
+        header: Frontier,
+        eligible_suppliers: BTreeSet<SourceId>,
+        summary: BodyUnavailableSummary,
+    ) -> Self {
+        let tried_suppliers = if summary.alarmed {
+            eligible_suppliers.clone()
+        } else {
+            BTreeSet::new()
+        };
+        Self {
+            branch,
+            generation,
+            header,
+            started_at: summary.started_at,
+            attempts: summary.attempts,
+            tried_suppliers,
+            next_probe_at: summary.next_probe_at,
+            alarmed: summary.alarmed,
+            eligible_suppliers,
+        }
+    }
+
     /// Replace this episode when a newly eligible supplier can change availability.
     pub fn refresh_suppliers<C: Clock>(
         &mut self,
@@ -199,9 +225,14 @@ impl BodyRetryEpisode {
     /// Return the bounded durable alarm summary for state admission.
     pub fn summary(&self) -> BodyUnavailableSummary {
         BodyUnavailableSummary {
+            started_at: self.started_at,
             attempts: self.attempts,
             suppliers: u32::try_from(self.eligible_suppliers.len()).unwrap_or(u32::MAX),
+            supplier_set_digest: BodyUnavailableSummary::supplier_set_digest(
+                &self.eligible_suppliers,
+            ),
             alarmed: self.alarmed,
+            next_probe_at: self.next_probe_at,
         }
     }
 }
@@ -405,9 +436,14 @@ mod tests {
         assert_eq!(
             episode.summary(),
             BodyUnavailableSummary {
+                started_at: episode.started_at,
                 attempts: 11,
                 suppliers: 1,
-                alarmed: true
+                supplier_set_digest: BodyUnavailableSummary::supplier_set_digest(
+                    &episode.eligible_suppliers,
+                ),
+                alarmed: true,
+                next_probe_at: episode.next_probe_at,
             }
         );
     }
@@ -438,6 +474,46 @@ mod tests {
         episode.restart(&clock);
         assert_eq!(episode.attempts, 0);
         assert!(episode.is_due(&clock));
+    }
+
+    #[test]
+    fn restored_alarm_preserves_episode_age_attempts_and_probe_cadence() {
+        let clock = clock();
+        let first = source(3);
+        let second = source(4);
+        let suppliers = [first, second].into_iter().collect();
+        let started_at = clock.now() - Duration::minutes(12);
+        let next_probe_at = clock.now() + Duration::minutes(4);
+        let summary = BodyUnavailableSummary {
+            started_at,
+            attempts: 14,
+            suppliers: 2,
+            supplier_set_digest: BodyUnavailableSummary::supplier_set_digest(&suppliers),
+            alarmed: true,
+            next_probe_at,
+        };
+        let mut episode = BodyRetryEpisode::restore(
+            BranchId::new(hash(1), hash(2)),
+            HeaderGeneration::new(3),
+            Frontier::new(block::Height(20), hash(2)),
+            suppliers,
+            summary,
+        );
+
+        assert_eq!(episode.summary(), summary);
+        assert!(!episode.is_due(&clock));
+        assert_eq!(
+            episode.record_failure(first, &clock, &FixedJitter(0)),
+            RetryUpdate::TooEarly
+        );
+        clock.advance(Duration::minutes(4));
+        assert_eq!(
+            episode.record_failure(second, &clock, &FixedJitter(0)),
+            RetryUpdate::ProbeAt(clock.now() + ALARM_PROBE_INTERVAL)
+        );
+        assert_eq!(episode.started_at, started_at);
+        assert_eq!(episode.attempts, 15);
+        assert!(episode.alarmed);
     }
 
     #[test]

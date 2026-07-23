@@ -273,6 +273,13 @@ pub enum BlockSyncAction {
         /// Typed retry result with its bounded episode summary.
         failure: zakura_header_chain::TransientBodyFailure,
     },
+    /// Persist a fresh episode after discovering a changed eligible supplier set.
+    RestartBodyAvailability {
+        /// Durable version whose selected alarm is being restarted.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Authenticated supplier-set evidence and fresh summary.
+        discovery: zakura_header_chain::BodySupplierDiscovered,
+    },
     /// Report peer misbehavior to the supervisor.
     Misbehavior {
         /// Misbehaving peer.
@@ -290,6 +297,7 @@ impl BlockSyncAction {
             Self::QueryBlocksByHeightRange { .. } => "query_blocks_by_height_range",
             Self::SubmitBlock { .. } => "submit_block",
             Self::RecordBodyUnavailable { .. } => "record_body_unavailable",
+            Self::RestartBodyAvailability { .. } => "restart_body_availability",
             Self::Misbehavior { .. } => "misbehavior",
         }
     }

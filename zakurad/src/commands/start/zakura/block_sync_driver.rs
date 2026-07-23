@@ -323,6 +323,40 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     Err(_) => warn!("timed out persisting header-chain body retry evidence"),
                 }
             }
+            BlockSyncAction::RestartBodyAvailability {
+                expected_version,
+                discovery,
+            } => {
+                let Some(writer) = header_chain_write.as_ref() else {
+                    debug!(
+                        ?discovery,
+                        "header-chain body retry restart is not wired in this harness"
+                    );
+                    continue;
+                };
+                match tokio::time::timeout(
+                    ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+                    writer.clone().oneshot(
+                        zakura_state::Request::RestartHeaderChainBodyAvailability {
+                            expected_version,
+                            discovery,
+                        },
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(zakura_state::Response::HeaderChainBodyAvailabilityRestarted(_))) => {}
+                    Ok(Ok(response)) => warn!(
+                        ?response,
+                        "unexpected header-chain body retry restart response"
+                    ),
+                    Ok(Err(error)) => debug!(
+                        ?error,
+                        "header-chain body retry restart was stale or unavailable"
+                    ),
+                    Err(_) => warn!("timed out restarting header-chain body availability"),
+                }
+            }
             BlockSyncAction::Misbehavior { peer, reason } => {
                 // Record-only: peer scoring no longer drives disconnects.
                 debug!(?peer, ?reason, "recorded Zakura block-sync peer violation");
@@ -1876,6 +1910,9 @@ fn trace_block_driver_action(trace: &ZakuraTrace, action: &BlockSyncAction) {
             }
             BlockSyncAction::RecordBodyUnavailable { .. } => {
                 insert_cs_str(row, cs_trace::ACTION, "record_body_unavailable");
+            }
+            BlockSyncAction::RestartBodyAvailability { .. } => {
+                insert_cs_str(row, cs_trace::ACTION, "restart_body_availability");
             }
         },
     );

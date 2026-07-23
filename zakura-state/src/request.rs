@@ -898,6 +898,14 @@ pub enum Request {
         failure: zakura_header_chain::TransientBodyFailure,
     },
 
+    /// Persist a fresh retry episode after authenticated supplier discovery.
+    RestartHeaderChainBodyAvailability {
+        /// Durable version whose selected alarm is being restarted.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Exact supplier-set evidence and fresh episode summary.
+        discovery: zakura_header_chain::BodySupplierDiscovered,
+    },
+
     /// Performs contextual validation of the given semantically verified block,
     /// committing it to the state if successful.
     ///
@@ -1189,6 +1197,9 @@ impl Request {
             Request::ApplyHeaderChainInsert { .. } => "apply_header_chain_insert",
             Request::RecordHeaderChainBodyUnavailable { .. } => {
                 "record_header_chain_body_unavailable"
+            }
+            Request::RestartHeaderChainBodyAvailability { .. } => {
+                "restart_header_chain_body_availability"
             }
             Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
@@ -1802,6 +1813,7 @@ impl TryFrom<Request> for ReadRequest {
 
             Request::ApplyHeaderChainInsert { .. }
             | Request::RecordHeaderChainBodyUnavailable { .. }
+            | Request::RestartHeaderChainBodyAvailability { .. }
             | Request::CommitSemanticallyVerifiedBlock(_)
             | Request::CommitCheckpointVerifiedBlock(_)
             | Request::InvalidateBlock(_)

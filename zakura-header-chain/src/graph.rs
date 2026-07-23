@@ -875,6 +875,7 @@ mod tests {
                     attempts: 10,
                     suppliers: 0,
                     alarmed: true,
+                    ..Default::default()
                 }),
             )
             .expect("the unavailable tip is retained");
@@ -895,6 +896,7 @@ mod tests {
                 attempts: 10,
                 suppliers: 0,
                 alarmed: true,
+                ..Default::default()
             })
         );
     }

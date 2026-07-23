@@ -587,9 +587,12 @@ fn put_body(
         }
         HeaderBodyStateDisk::Unavailable(summary) => {
             encoder.u8(4);
+            put_time(encoder, summary.started_at);
             encoder.u32(summary.attempts);
             encoder.u32(summary.suppliers);
+            encoder.fixed(&summary.supplier_set_digest);
             encoder.bool(summary.alarmed);
+            put_time(encoder, summary.next_probe_at);
         }
     }
     Ok(())
@@ -609,9 +612,12 @@ fn get_body(decoder: &mut Decoder<'_>) -> Result<HeaderBodyStateDisk, HeaderChai
                 .to_owned(),
         }),
         4 => Ok(HeaderBodyStateDisk::Unavailable(BodyUnavailableSummary {
+            started_at: get_time(decoder)?,
             attempts: decoder.u32()?,
             suppliers: decoder.u32()?,
+            supplier_set_digest: decoder.array()?,
             alarmed: decoder.bool()?,
+            next_probe_at: get_time(decoder)?,
         })),
         value => Err(HeaderChainValueError::UnknownDiscriminant {
             field: "body_state",
@@ -905,9 +911,12 @@ impl HeaderChainValue for HeaderEngineMetadataDisk {
         encoder.bool(value.alarms.resource_stalled);
         encoder.bool(value.alarms.header_best_body_unavailable.is_some());
         if let Some(summary) = value.alarms.header_best_body_unavailable {
+            put_time(&mut encoder, summary.started_at);
             encoder.u32(summary.attempts);
             encoder.u32(summary.suppliers);
+            encoder.fixed(&summary.supplier_set_digest);
             encoder.bool(summary.alarmed);
+            put_time(&mut encoder, summary.next_probe_at);
         }
         encoder.fixed(&value.last_transition_id.digest());
         encoder.bool(value.alarms.migrated_pin_refuted.is_some());
@@ -966,9 +975,12 @@ impl HeaderChainValue for HeaderEngineMetadataDisk {
             .bool()?
             .then(|| {
                 Ok(BodyUnavailableSummary {
+                    started_at: get_time(&mut decoder)?,
                     attempts: decoder.u32()?,
                     suppliers: decoder.u32()?,
+                    supplier_set_digest: decoder.array()?,
                     alarmed: decoder.bool()?,
+                    next_probe_at: get_time(&mut decoder)?,
                 })
             })
             .transpose()?;
@@ -1039,9 +1051,18 @@ mod tests {
             ),
             inherited_from: Some(block::Hash([3; 32])),
             body: HeaderBodyStateDisk::Unavailable(BodyUnavailableSummary {
+                started_at: Utc
+                    .timestamp_opt(30, 40)
+                    .single()
+                    .expect("valid fixture time"),
                 attempts: 1,
                 suppliers: 2,
+                supplier_set_digest: [7; 32],
                 alarmed: true,
+                next_probe_at: Utc
+                    .timestamp_opt(50, 60)
+                    .single()
+                    .expect("valid fixture time"),
             }),
             aux_delivery_ids: vec![EvidenceId::from_digest([4; 32])],
         };
@@ -1091,7 +1112,7 @@ mod tests {
                 digest(&context.encode().expect("context encodes"))
             ],
             [
-                "c7e3448aa1cabc72e6ed1bff3de3a65183f4906f8fab9b052c12b0805710a266",
+                "a10768fc091c74d250189203381578212a7b3eb7ea3e759ee85584015bf04f89",
                 "095c753ad1f2a99c1a29f14db8f4e36c528c159c7e436957ac0f18a46dde7049",
                 "dcb21b5799e73e2ca54fd1448f50dd56d5d7994cb173e5279d28942350534863",
             ]
@@ -1177,9 +1198,18 @@ mod tests {
             alarms: AlarmSet {
                 resource_stalled: true,
                 header_best_body_unavailable: Some(BodyUnavailableSummary {
+                    started_at: Utc
+                        .timestamp_opt(70, 80)
+                        .single()
+                        .expect("valid fixture time"),
                     attempts: 7,
                     suppliers: 8,
+                    supplier_set_digest: [9; 32],
                     alarmed: true,
+                    next_probe_at: Utc
+                        .timestamp_opt(90, 100)
+                        .single()
+                        .expect("valid fixture time"),
                 }),
                 migrated_pin_refuted: Some(frontier(1, 2)),
             },
@@ -1213,7 +1243,7 @@ mod tests {
             [
                 "186354a36e1b19a6cead350807f3bba93f1bd723114a838f1e38c8b6a2a80696",
                 "b887bf384510dfb1a255221a8c97066617cb145eaf3e272ad70dc94cd17a3802",
-                "a07e697728327c41b90f4ff71890e737d20f32337b2ce84a059659957fa3b483",
+                "58e4aac31baa70f4a8a93bbef0ac6591b443256cdf734a4ce041f0be9139fade",
             ]
         );
     }

@@ -3,10 +3,11 @@
 use std::{cmp::Ordering, collections::BTreeSet, sync::Arc};
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zakura_chain::{block, work::difficulty::Work};
 
-use crate::{EvidenceId, Frontier, OperatorInvalidationId, WorkCoordinate};
+use crate::{EvidenceId, Frontier, OperatorInvalidationId, SourceId, WorkCoordinate};
 
 /// Stable full-state consensus rule identity attached to body evidence.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -193,12 +194,30 @@ pub enum BodyValidationState {
 /// Durable bounded summary of one body-unavailability retry episode.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct BodyUnavailableSummary {
+    /// Authoritative start of the current retry episode.
+    pub started_at: DateTime<Utc>,
     /// Failed delivery attempts in the current episode.
     pub attempts: u32,
     /// Currently known eligible suppliers.
     pub suppliers: u32,
+    /// Stable digest of the complete eligible-supplier identity set.
+    pub supplier_set_digest: [u8; 32],
     /// Whether the persistent unavailability alarm has fired.
     pub alarmed: bool,
+    /// Earliest time another repeated-supplier attempt or alarm probe is allowed.
+    pub next_probe_at: DateTime<Utc>,
+}
+
+impl BodyUnavailableSummary {
+    /// Return a stable digest of one complete sorted eligible-supplier set.
+    pub fn supplier_set_digest(suppliers: &BTreeSet<SourceId>) -> [u8; 32] {
+        let mut state = Sha256::new();
+        state.update(b"zakura-body-supplier-set-v1");
+        for supplier in suppliers {
+            state.update(supplier.digest());
+        }
+        state.finalize().into()
+    }
 }
 
 /// One retained header DAG node.

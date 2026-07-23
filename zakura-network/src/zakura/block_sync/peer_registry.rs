@@ -23,7 +23,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Mutex as StdMutex,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use zakura_chain::block;
@@ -104,6 +104,17 @@ impl BodyRetryKey {
     }
 }
 
+pub(super) fn retry_deadline_instant(deadline: chrono::DateTime<chrono::Utc>) -> Instant {
+    let monotonic_now = Instant::now();
+    let delay = deadline
+        .signed_duration_since(chrono::Utc::now())
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    monotonic_now
+        .checked_add(delay)
+        .unwrap_or_else(|| monotonic_now + Duration::from_secs(10 * 60))
+}
+
 /// Per-peer download window diagnostics published by the routine for trace
 /// summaries and cross-peer floor-bias decisions.
 #[derive(Copy, Clone, Debug, Default)]
@@ -140,6 +151,7 @@ pub(super) struct PeerRegistry {
     peers: StdMutex<HashMap<ZakuraPeerId, Entry>>,
     parked_peers: StdMutex<HashMap<ZakuraPeerId, Instant>>,
     body_retry_avoid: StdMutex<HashMap<(zakura_header_chain::SourceId, BodyRetryKey), Instant>>,
+    body_retry_all: StdMutex<HashMap<BodyRetryKey, Instant>>,
     /// Source of monotonically-increasing routine generations.
     next_generation: std::sync::atomic::AtomicU64,
 }
@@ -156,6 +168,7 @@ impl PeerRegistry {
             peers: StdMutex::new(HashMap::new()),
             parked_peers: StdMutex::new(HashMap::new()),
             body_retry_avoid: StdMutex::new(HashMap::new()),
+            body_retry_all: StdMutex::new(HashMap::new()),
             next_generation: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -192,6 +205,17 @@ impl PeerRegistry {
         }
     }
 
+    pub(super) fn set_persisted_body_alarm(
+        &self,
+        alarm: Option<(zakura_header_chain::WorkScope, block::Hash, Instant)>,
+    ) {
+        let mut retries = self.body_retry_all_lock();
+        retries.clear();
+        if let Some((scope, hash, until)) = alarm {
+            retries.insert(BodyRetryKey::new(scope, hash), until);
+        }
+    }
+
     pub(super) fn clear_body_retry(
         &self,
         scope: zakura_header_chain::WorkScope,
@@ -200,10 +224,16 @@ impl PeerRegistry {
         let key = BodyRetryKey::new(scope, hash);
         self.body_retry_lock()
             .retain(|(_, candidate), _| *candidate != key);
+        self.body_retry_all_lock().remove(&key);
     }
 
     pub(super) fn retain_body_retry_scope(&self, current: Option<zakura_header_chain::WorkScope>) {
         self.body_retry_lock().retain(|(_, key), _| {
+            current.is_some_and(|scope| {
+                key.header_generation == scope.header_generation && key.branch == scope.branch
+            })
+        });
+        self.body_retry_all_lock().retain(|key, _| {
             current.is_some_and(|scope| {
                 key.header_generation == scope.header_generation && key.branch == scope.branch
             })
@@ -222,6 +252,11 @@ impl PeerRegistry {
             return false;
         };
         let source = zakura_header_chain::SourceId::from_digest(digest);
+        let mut all_retries = self.body_retry_all_lock();
+        all_retries.retain(|_, until| *until > now);
+        if all_retries.get(&key).is_some_and(|until| *until > now) {
+            return true;
+        }
         let mut retries = self.body_retry_lock();
         retries.retain(|_, until| *until > now);
         retries
@@ -236,12 +271,18 @@ impl PeerRegistry {
     ) -> Option<Instant> {
         let digest = peer.as_bytes().try_into().ok()?;
         let source = zakura_header_chain::SourceId::from_digest(digest);
+        let all_deadline = {
+            let mut retries = self.body_retry_all_lock();
+            retries.retain(|_, until| *until > now);
+            retries.values().copied().min()
+        };
         let mut retries = self.body_retry_lock();
         retries.retain(|_, until| *until > now);
-        retries
+        let source_deadline = retries
             .iter()
             .filter_map(|((candidate, _), until)| (*candidate == source).then_some(*until))
-            .min()
+            .min();
+        all_deadline.into_iter().chain(source_deadline).min()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ZakuraPeerId, Entry>> {
@@ -257,6 +298,12 @@ impl PeerRegistry {
         self.body_retry_avoid
             .lock()
             .expect("body retry registry mutex is never poisoned")
+    }
+
+    fn body_retry_all_lock(&self) -> std::sync::MutexGuard<'_, HashMap<BodyRetryKey, Instant>> {
+        self.body_retry_all
+            .lock()
+            .expect("global body retry registry mutex is never poisoned")
     }
 
     fn lock_parked(&self) -> std::sync::MutexGuard<'_, HashMap<ZakuraPeerId, Instant>> {
@@ -861,6 +908,53 @@ mod floor_bias_tests {
             ..scope
         }));
         assert!(!reg.is_body_retry_avoided(&failed, scope, hash, now));
+    }
+
+    #[test]
+    fn persisted_body_alarm_is_exact_global_and_survives_reconnect() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (first, second) = (peer(1), peer(2));
+        register(&reg, &config, &first, 1, 1, 1);
+        register(&reg, &config, &second, 1, 1, 1);
+        let scope = zakura_header_chain::WorkScope {
+            state_version: zakura_header_chain::StateVersion::new(3),
+            header_generation: zakura_header_chain::HeaderGeneration::new(4),
+            verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(5)),
+            branch: zakura_header_chain::BranchId::new(block::Hash([6; 32]), block::Hash([7; 32])),
+        };
+        let hash = block::Hash([8; 32]);
+        let now = Instant::now();
+        let until = now + std::time::Duration::from_secs(60);
+
+        reg.set_persisted_body_alarm(Some((scope, hash, until)));
+        assert!(reg.is_body_retry_avoided(&first, scope, hash, now));
+        assert!(reg.is_body_retry_avoided(&second, scope, hash, now));
+        assert!(!reg.is_body_retry_avoided(&first, scope, block::Hash([9; 32]), now));
+        assert!(!reg.is_body_retry_avoided(
+            &first,
+            zakura_header_chain::WorkScope {
+                header_generation: zakura_header_chain::HeaderGeneration::new(10),
+                ..scope
+            },
+            hash,
+            now
+        ));
+        assert_eq!(reg.next_body_retry_deadline(&first, now), Some(until));
+
+        reg.remove(&first);
+        register(&reg, &config, &first, 1, 1, 1);
+        assert!(reg.is_body_retry_avoided(&first, scope, hash, now));
+        assert!(!reg.is_body_retry_avoided(
+            &first,
+            scope,
+            hash,
+            until + std::time::Duration::from_millis(1)
+        ));
+
+        reg.set_persisted_body_alarm(Some((scope, hash, until)));
+        reg.clear_body_retry(scope, hash);
+        assert!(!reg.is_body_retry_avoided(&first, scope, hash, now));
     }
 
     #[test]

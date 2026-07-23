@@ -2628,6 +2628,20 @@ mod tests {
 
         let evidence = EvidenceId::from_digest([7; 32]);
         let authority = Authority(evidence);
+        let availability = BodyUnavailableSummary {
+            started_at: Utc
+                .timestamp_opt(1_000, 0)
+                .single()
+                .expect("valid fixture time"),
+            attempts: 10,
+            suppliers: 2,
+            supplier_set_digest: [0x22; 32],
+            alarmed: true,
+            next_probe_at: Utc
+                .timestamp_opt(1_600, 0)
+                .single()
+                .expect("valid fixture time"),
+        };
         let context = TransitionContext {
             config: &engine_config,
             clock: &SystemClock,
@@ -2641,11 +2655,7 @@ mod tests {
                 hash: anchor.hash,
                 evidence,
                 kind: TransientBodyFailureKind::Storage,
-                availability: BodyUnavailableSummary {
-                    attempts: 10,
-                    suppliers: 2,
-                    alarmed: true,
-                },
+                availability,
             })),
         };
         let receipt = runtime
@@ -2663,20 +2673,12 @@ mod tests {
         assert_eq!(*subscriber.borrow_and_update(), receipt.current);
         assert_eq!(
             receipt.current.alarms.header_best_body_unavailable,
-            Some(BodyUnavailableSummary {
-                attempts: 10,
-                suppliers: 2,
-                alarmed: true,
-            })
+            Some(availability)
         );
         assert!(matches!(
             runtime.store.node(anchor.hash).expect("the node row decodes").expect("the anchor remains").body,
             BodyValidationState::Unavailable(summary)
-                if summary == BodyUnavailableSummary {
-                    attempts: 10,
-                    suppliers: 2,
-                    alarmed: true,
-                }
+                if summary == availability
         ));
         assert!(matches!(
             runtime.apply(request, &context).expect("idempotent replay succeeds"),
@@ -2711,11 +2713,7 @@ mod tests {
                 .expect("the reopened anchor exists")
                 .body,
             BodyValidationState::Unavailable(summary)
-                if summary == BodyUnavailableSummary {
-                    attempts: 10,
-                    suppliers: 2,
-                    alarmed: true,
-                }
+                if summary == availability
         ));
         let verified_evidence = EvidenceId::from_digest([8; 32]);
         let verified_authority = Authority(verified_evidence);
@@ -2833,6 +2831,7 @@ mod tests {
                     attempts: 1,
                     suppliers: 1,
                     alarmed: false,
+                    ..Default::default()
                 },
             })),
         };
@@ -3316,6 +3315,7 @@ mod tests {
                             attempts: 1,
                             suppliers: 1,
                             alarmed: false,
+                            ..Default::default()
                         },
                     },
                 )),

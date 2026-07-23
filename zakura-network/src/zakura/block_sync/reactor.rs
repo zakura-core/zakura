@@ -64,6 +64,26 @@ struct PendingNeededQuery {
     best_header_hash: block::Hash,
 }
 
+fn synchronize_persisted_body_alarm(
+    registry: &PeerRegistry,
+    snapshot: Option<&zakura_header_chain::EngineSnapshot>,
+) {
+    let alarm = snapshot.and_then(|snapshot| {
+        snapshot
+            .alarms
+            .header_best_body_unavailable
+            .filter(|summary| summary.alarmed)
+            .map(|summary| {
+                (
+                    zakura_header_chain::WorkScope::for_body_work(snapshot),
+                    snapshot.frontiers.header_best.hash,
+                    retry_deadline_instant(summary.next_probe_at),
+                )
+            })
+    });
+    registry.set_persisted_body_alarm(alarm);
+}
+
 /// Spawn a block-sync reactor and return its handle plus action stream.
 pub fn spawn_block_sync_reactor(
     startup: BlockSyncStartup,
@@ -128,6 +148,7 @@ pub fn spawn_block_sync_reactor(
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
     // Shared peer facts are also the exact per-supplier body-retry admission gate.
     let registry = Arc::new(PeerRegistry::new());
+    synchronize_persisted_body_alarm(&registry, committed_snapshot.as_ref());
     let mut retry_jitter_seed = [0u8; 32];
     OsRng.fill_bytes(&mut retry_jitter_seed);
 
@@ -189,10 +210,12 @@ pub fn spawn_block_sync_reactor(
         verified_block_tip: startup.frontiers.verified_block_tip,
         request_floor: startup.frontiers.verified_block_tip,
         pending_needed_query: None,
+        pending_body_supplier_restart: None,
         next_needed_query_id: NonZeroU64::new(1),
         last_reset_epoch: 0,
         last_reaction_epoch: 0,
         last_view: initial_view(startup.frontiers),
+        published_body_alarm: None,
         committed_snapshot,
         startup,
         state,
@@ -270,6 +293,9 @@ pub(super) struct BlockSyncReactor {
     /// Exact identity and scope of the dispatched state query whose response has
     /// not come back yet.
     pending_needed_query: Option<PendingNeededQuery>,
+    /// Supplier-set restart submitted against the current durable version.
+    pending_body_supplier_restart:
+        Option<(zakura_header_chain::StateVersion, block::Hash, [u8; 32])>,
     /// Next reactor-local identity assigned to a body-work state query. `None`
     /// means the identifier space is exhausted and scheduling fails closed.
     next_needed_query_id: Option<NonZeroU64>,
@@ -283,6 +309,8 @@ pub(super) struct BlockSyncReactor {
     /// Latest view snapshot, kept so the periodic trace tick can read the
     /// (remote) Sequencer's reorder/applying/throughput counters.
     last_view: SequencerView,
+    /// Last labeled persistent alarm exported to metrics, for exact clearing.
+    published_body_alarm: Option<zakura_header_chain::Frontier>,
 }
 
 impl BlockSyncReactor {
@@ -338,6 +366,11 @@ impl BlockSyncReactor {
                         self.committed_snapshot = committed_snapshots
                             .as_ref()
                             .and_then(|snapshots| snapshots.borrow().clone());
+                        self.pending_body_supplier_restart = None;
+                        synchronize_persisted_body_alarm(
+                            &self.registry,
+                            self.committed_snapshot.as_ref(),
+                        );
                         let current_scope = self.body_work_scope();
                         if current_scope != previous_scope {
                             let released = match current_scope {
@@ -1124,9 +1157,74 @@ impl BlockSyncReactor {
             return;
         }
         self.publish_candidate_state();
+        self.restart_body_alarm_for_new_supplier();
         if send_reply {
             self.send_status(&peer, "status_reply");
         }
+    }
+
+    fn restart_body_alarm_for_new_supplier(&mut self) {
+        let Some(snapshot) = self.committed_snapshot.as_ref() else {
+            return;
+        };
+        let Some(previous) = snapshot
+            .alarms
+            .header_best_body_unavailable
+            .filter(|summary| summary.alarmed)
+        else {
+            return;
+        };
+        let header = snapshot.frontiers.header_best;
+        let eligible_sources = self.registry.eligible_sources(header.height);
+        let suppliers = u32::try_from(eligible_sources.len()).unwrap_or(u32::MAX);
+        let supplier_set_digest =
+            zakura_header_chain::BodyUnavailableSummary::supplier_set_digest(&eligible_sources);
+        let has_new_supplier = suppliers > previous.suppliers
+            || (suppliers == previous.suppliers
+                && supplier_set_digest != previous.supplier_set_digest);
+        if !has_new_supplier
+            || self.pending_body_supplier_restart
+                == Some((snapshot.state_version, header.hash, supplier_set_digest))
+        {
+            return;
+        }
+
+        let now = chrono::Utc::now();
+        let availability = zakura_header_chain::BodyUnavailableSummary {
+            started_at: now,
+            attempts: 0,
+            suppliers,
+            supplier_set_digest,
+            alarmed: false,
+            next_probe_at: now,
+        };
+        let mut hasher = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(b"ZkBodyDiscover1_")
+            .to_state();
+        hasher.update(&snapshot.state_version.get().to_le_bytes());
+        hasher.update(&header.height.0.to_le_bytes());
+        hasher.update(&header.hash.0);
+        hasher.update(&supplier_set_digest);
+        let discovery = zakura_header_chain::BodySupplierDiscovered {
+            hash: header.hash,
+            evidence: zakura_header_chain::EvidenceId::from_digest(
+                hasher
+                    .finalize()
+                    .as_bytes()
+                    .try_into()
+                    .expect("the configured discovery digest is exactly 32 bytes"),
+            ),
+            availability,
+        };
+        if !self.dispatch_action(BlockSyncAction::RestartBodyAvailability {
+            expected_version: snapshot.state_version,
+            discovery,
+        }) {
+            return;
+        }
+        self.pending_body_supplier_restart =
+            Some((snapshot.state_version, header.hash, supplier_set_digest));
     }
 
     async fn handle_get_blocks(
@@ -1292,6 +1390,11 @@ impl BlockSyncReactor {
             outcome.result(),
             self.state.budget.reserved(),
         );
+        let persisted_availability = self.committed_snapshot.as_ref().and_then(|snapshot| {
+            (snapshot.frontiers.header_best.hash == hash)
+                .then_some(snapshot.alarms.header_best_body_unavailable)
+                .flatten()
+        });
         let capacity = self.sequencer_input.capacity();
         let max_capacity = self.sequencer_input.max_capacity();
         let started = Instant::now();
@@ -1305,6 +1408,7 @@ impl BlockSyncReactor {
                 hash,
                 outcome,
                 eligible_sources: self.registry.eligible_sources(height),
+                persisted_availability,
                 semantic_current,
                 local_frontier,
             });
@@ -2368,7 +2472,7 @@ impl BlockSyncReactor {
         })
     }
 
-    fn publish_metrics(&self) {
+    fn publish_metrics(&mut self) {
         // These lossy casts are metrics-only gauges; consensus and scheduling
         // continue to use the original integer values.
         let view = *self.sequencer_view.borrow();
@@ -2398,6 +2502,74 @@ impl BlockSyncReactor {
         // Outstanding (unreceived in-flight) heights summed across peers from the
         // registry (the routines own the per-peer outstanding now).
         metrics::gauge!("sync.block.outstanding").set(self.registry.total_unreceived() as f64);
+        self.publish_body_unavailable_metrics();
+    }
+
+    fn publish_body_unavailable_metrics(&mut self) {
+        let current = self.committed_snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .alarms
+                .header_best_body_unavailable
+                .filter(|summary| summary.alarmed)
+                .map(|summary| (snapshot.frontiers.header_best, summary))
+        });
+        let current_frontier = current.map(|(frontier, _)| frontier);
+        if self.published_body_alarm != current_frontier {
+            if let Some(previous) = self.published_body_alarm {
+                let hash = format!("{:?}", previous.hash);
+                let height = previous.height.0.to_string();
+                metrics::gauge!(
+                    "sync.header_chain.body_unavailable",
+                    "hash" => hash.clone(),
+                    "height" => height.clone(),
+                )
+                .set(0.0);
+                for name in [
+                    "sync.header_chain.body_unavailable.age_seconds",
+                    "sync.header_chain.body_unavailable.attempts",
+                    "sync.header_chain.body_unavailable.available_suppliers",
+                ] {
+                    metrics::gauge!(name, "hash" => hash.clone(), "height" => height.clone())
+                        .set(0.0);
+                }
+            }
+            self.published_body_alarm = current_frontier;
+        }
+        metrics::gauge!("sync.header_chain.body_unavailable.active")
+            .set(f64::from(current.is_some()));
+        if let Some((frontier, summary)) = current {
+            let hash = format!("{:?}", frontier.hash);
+            let height = frontier.height.0.to_string();
+            let age_seconds = chrono::Utc::now()
+                .signed_duration_since(summary.started_at)
+                .num_milliseconds()
+                .max(0) as f64
+                / 1_000.0;
+            metrics::gauge!(
+                "sync.header_chain.body_unavailable",
+                "hash" => hash.clone(),
+                "height" => height.clone(),
+            )
+            .set(1.0);
+            metrics::gauge!(
+                "sync.header_chain.body_unavailable.age_seconds",
+                "hash" => hash.clone(),
+                "height" => height.clone(),
+            )
+            .set(age_seconds);
+            metrics::gauge!(
+                "sync.header_chain.body_unavailable.attempts",
+                "hash" => hash.clone(),
+                "height" => height.clone(),
+            )
+            .set(f64::from(summary.attempts));
+            metrics::gauge!(
+                "sync.header_chain.body_unavailable.available_suppliers",
+                "hash" => hash,
+                "height" => height,
+            )
+            .set(f64::from(summary.suppliers));
+        }
     }
 
     fn clamp_served_block_count(&self, start_height: block::Height, count: u32) -> u32 {
@@ -2590,6 +2762,9 @@ impl BlockSyncReactor {
             }
             BlockSyncAction::RecordBodyUnavailable { .. } => {
                 bs_insert_str(row, bs_trace::KIND, "record_body_unavailable");
+            }
+            BlockSyncAction::RestartBodyAvailability { .. } => {
+                bs_insert_str(row, bs_trace::KIND, "restart_body_availability");
             }
             BlockSyncAction::Misbehavior { peer, reason } => {
                 bs_insert_str(row, bs_trace::KIND, "misbehavior");

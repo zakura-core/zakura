@@ -2580,6 +2580,7 @@ mod zakura_header_sync_driver_tests {
                 attempts: 3,
                 suppliers: 2,
                 alarmed: false,
+                ..Default::default()
             },
         };
         action_tx

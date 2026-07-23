@@ -18,7 +18,7 @@
 use super::super::trace::queue_send_trace as qs_trace;
 use super::{
     events::*,
-    peer_registry::PeerRegistry,
+    peer_registry::{retry_deadline_instant, PeerRegistry},
     reactor::{bs_insert_height, bs_insert_str, bs_insert_u64},
     reorder::BufferedBlockBody,
     sequencer::*,
@@ -177,6 +177,7 @@ pub(super) enum SequencerControlInput {
         hash: block::Hash,
         outcome: BlockApplyOutcome,
         eligible_sources: BTreeSet<zakura_header_chain::SourceId>,
+        persisted_availability: Option<zakura_header_chain::BodyUnavailableSummary>,
         semantic_current: bool,
         local_frontier: Option<BlockSyncFrontiers>,
     },
@@ -440,6 +441,7 @@ impl SequencerTask {
                 hash,
                 mut outcome,
                 eligible_sources,
+                persisted_availability,
                 semantic_current,
                 local_frontier,
             } => {
@@ -452,6 +454,7 @@ impl SequencerTask {
                         hash,
                         &mut outcome,
                         eligible_sources,
+                        persisted_availability,
                         semantic_current,
                         local_frontier,
                     )
@@ -635,6 +638,7 @@ impl SequencerTask {
         hash: block::Hash,
         outcome: &mut BlockApplyOutcome,
         mut eligible_sources: BTreeSet<zakura_header_chain::SourceId>,
+        persisted_availability: Option<zakura_header_chain::BodyUnavailableSummary>,
         semantic_current: bool,
         local_frontier: Option<BlockSyncFrontiers>,
     ) -> (bool, bool) {
@@ -669,7 +673,14 @@ impl SequencerTask {
                 .finish_submission(owner, source, token, height, hash);
             return (false, false);
         }
-        self.record_body_retry(owner, source, height, hash, outcome, &mut eligible_sources);
+        self.record_body_retry(
+            owner,
+            source,
+            zakura_header_chain::Frontier::new(height, hash),
+            outcome,
+            &mut eligible_sources,
+            persisted_availability,
+        );
         if let zakura_header_chain::BodyVerificationOutcome::Retryable(failure) =
             outcome.verification()
         {
@@ -761,11 +772,12 @@ impl SequencerTask {
         &mut self,
         owner: zakura_header_chain::WorkOwner,
         source: zakura_header_chain::SourceId,
-        height: block::Height,
-        hash: block::Hash,
+        header: zakura_header_chain::Frontier,
         outcome: &mut BlockApplyOutcome,
         eligible_sources: &mut BTreeSet<zakura_header_chain::SourceId>,
+        persisted_availability: Option<zakura_header_chain::BodyUnavailableSummary>,
     ) {
+        let hash = header.hash;
         let Some(failure) = outcome.retryable_mut() else {
             self.body_retries
                 .remove(owner.header_generation, owner.branch, hash);
@@ -773,20 +785,32 @@ impl SequencerTask {
             return;
         };
         eligible_sources.insert(source);
-        let header = zakura_header_chain::Frontier::new(height, hash);
         if self
             .body_retries
             .get_mut(owner.header_generation, owner.branch, hash)
             .is_none()
         {
-            self.body_retries
-                .insert(crate::zakura::header_sync::BodyRetryEpisode::new(
-                    owner.branch,
-                    owner.header_generation,
-                    header,
-                    eligible_sources.clone(),
-                    &zakura_header_chain::SystemClock,
-                ));
+            let episode = persisted_availability
+                .filter(|summary| summary.alarmed)
+                .map(|summary| {
+                    crate::zakura::header_sync::BodyRetryEpisode::restore(
+                        owner.branch,
+                        owner.header_generation,
+                        header,
+                        eligible_sources.clone(),
+                        summary,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    crate::zakura::header_sync::BodyRetryEpisode::new(
+                        owner.branch,
+                        owner.header_generation,
+                        header,
+                        eligible_sources.clone(),
+                        &zakura_header_chain::SystemClock,
+                    )
+                });
+            self.body_retries.insert(episode);
         }
         let episode = self
             .body_retries
@@ -811,6 +835,12 @@ impl SequencerTask {
             crate::zakura::header_sync::RetryUpdate::Alarmed { probe_at } => probe_at,
         };
         failure.availability = episode.summary();
+        if let Some(persisted) = persisted_availability.filter(|summary| summary.alarmed) {
+            if persisted.suppliers > failure.availability.suppliers {
+                failure.availability.suppliers = persisted.suppliers;
+                failure.availability.supplier_set_digest = persisted.supplier_set_digest;
+            }
+        }
         if restarted {
             self.registry.clear_body_retry(owner.scope(), hash);
         }
@@ -1173,17 +1203,6 @@ impl SequencerTask {
     }
 }
 
-fn retry_deadline_instant(deadline: chrono::DateTime<chrono::Utc>) -> Instant {
-    let monotonic_now = Instant::now();
-    let delay = deadline
-        .signed_duration_since(chrono::Utc::now())
-        .to_std()
-        .unwrap_or(Duration::ZERO);
-    monotonic_now
-        .checked_add(delay)
-        .unwrap_or_else(|| monotonic_now + Duration::from_secs(10 * 60))
-}
-
 fn add_atomic_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
     let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
     loop {
@@ -1466,6 +1485,7 @@ mod tests {
                 hash,
                 &mut outcome,
                 BTreeSet::new(),
+                None,
                 false,
                 None,
             )

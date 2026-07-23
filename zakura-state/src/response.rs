@@ -43,6 +43,9 @@ pub enum Response {
     /// Result of persisting one retryable header-chain body-availability result.
     HeaderChainBodyUnavailableRecorded(zakura_header_chain::ApplyResult),
 
+    /// Result of restarting one persistent body-unavailability episode.
+    HeaderChainBodyAvailabilityRestarted(zakura_header_chain::ApplyResult),
+
     /// Response to [`Request::CommitSemanticallyVerifiedBlock`] and [`Request::CommitCheckpointVerifiedBlock`]
     /// indicating that a block was successfully committed to the state.
     Committed(block::Hash),

@@ -326,7 +326,8 @@ fn spawn_action_driver(
                         }
                     }
                 }
-                BlockSyncAction::RecordBodyUnavailable { .. } => {}
+                BlockSyncAction::RecordBodyUnavailable { .. }
+                | BlockSyncAction::RestartBodyAvailability { .. } => {}
                 BlockSyncAction::Misbehavior { .. } => {}
             }
         }

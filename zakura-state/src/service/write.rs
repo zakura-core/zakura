@@ -357,6 +357,23 @@ impl HeaderChainWriter {
             &context,
         )
     }
+
+    fn restart_body_availability(
+        &self,
+        expected_version: StateVersion,
+        discovery: zakura_header_chain::BodySupplierDiscovered,
+    ) -> Result<ApplyResult, HeaderChainStoreError> {
+        let authority = PreparedAuthority(discovery.evidence);
+        let mut context = self.context();
+        context.full_state_authority = Some(&authority);
+        self.runtime.apply(
+            TransitionRequest {
+                expected_version,
+                event: TransitionEvent::BodySupplierDiscovered(discovery),
+            },
+            &context,
+        )
+    }
 }
 
 fn verified_path(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
@@ -799,6 +816,12 @@ pub enum NonFinalizedWriteMessage {
         failure: zakura_header_chain::TransientBodyFailure,
         rsp_tx: oneshot::Sender<Result<ApplyResult, HeaderChainStoreError>>,
     },
+    /// A changed authenticated supplier set restarts one persistent alarm.
+    RestartHeaderChainBodyAvailability {
+        expected_version: StateVersion,
+        discovery: zakura_header_chain::BodySupplierDiscovered,
+        rsp_tx: oneshot::Sender<Result<ApplyResult, HeaderChainStoreError>>,
+    },
     /// A newly downloaded and semantically verified block prepared for
     /// contextual validation and insertion into the non-finalized state.
     Commit(QueuedSemanticallyVerified),
@@ -1219,6 +1242,20 @@ impl WriteBlockWorkerTask {
                     let _ = rsp_tx.send(result);
                     None
                 }
+                NonFinalizedWriteMessage::RestartHeaderChainBodyAvailability {
+                    expected_version,
+                    discovery,
+                    rsp_tx,
+                } => {
+                    let result = header_chain
+                        .as_ref()
+                        .ok_or(HeaderChainStoreError::Uninitialized)
+                        .and_then(|writer| {
+                            writer.restart_body_availability(expected_version, discovery)
+                        });
+                    let _ = rsp_tx.send(result);
+                    None
+                }
                 NonFinalizedWriteMessage::Commit(queued_child) => Some(queued_child),
                 NonFinalizedWriteMessage::Invalidate { hash, rsp_tx } => {
                     tracing::info!(?hash, "invalidating a block in the non-finalized state");
@@ -1598,6 +1635,7 @@ mod tests {
                     attempts: 1,
                     suppliers: 1,
                     alarmed: false,
+                    ..Default::default()
                 },
             },
         );

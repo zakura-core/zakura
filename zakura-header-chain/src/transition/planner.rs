@@ -568,9 +568,12 @@ fn apply_event<S: StoreRead>(
         }
         TransitionEvent::BodyEvidence(BodyEvidence::PayloadMismatch(_)) => {}
         TransitionEvent::BodyEvidence(BodyEvidence::Transient(event)) => {
-            if event.availability.attempts == 0 {
+            if event.availability.attempts == 0
+                || event.availability.suppliers == 0
+                || event.availability.started_at > event.availability.next_probe_at
+            {
                 return Err(TransitionFailure::InvalidEvidence(
-                    "body retry evidence has no failed attempt",
+                    "body retry evidence has an invalid episode summary",
                 ));
             }
             if matches!(
@@ -579,6 +582,38 @@ fn apply_event<S: StoreRead>(
             ) {
                 return Err(TransitionFailure::InvalidEvidence(
                     "body retry evidence cannot regress an already verified body",
+                ));
+            }
+            graph.set_body_state(
+                event.hash,
+                BodyValidationState::Unavailable(event.availability),
+            )?;
+        }
+        TransitionEvent::BodySupplierDiscovered(event) => {
+            if event.hash != graph.select_header_best()?.0.hash
+                || event.availability.attempts != 0
+                || event.availability.suppliers == 0
+                || event.availability.alarmed
+                || event.availability.started_at != event.availability.next_probe_at
+            {
+                return Err(TransitionFailure::InvalidEvidence(
+                    "body supplier discovery has an invalid fresh episode",
+                ));
+            }
+            let old = match graph.node(event.hash).map(|node| &node.body) {
+                Some(BodyValidationState::Unavailable(summary)) if summary.alarmed => *summary,
+                _ => {
+                    return Err(TransitionFailure::InvalidEvidence(
+                        "body supplier discovery requires the selected persistent alarm",
+                    ));
+                }
+            };
+            let has_new_supplier = event.availability.suppliers > old.suppliers
+                || (event.availability.suppliers == old.suppliers
+                    && event.availability.supplier_set_digest != old.supplier_set_digest);
+            if !has_new_supplier {
+                return Err(TransitionFailure::InvalidEvidence(
+                    "body supplier discovery does not add an eligible supplier",
                 ));
             }
             graph.set_body_state(
@@ -2156,6 +2191,7 @@ mod tests {
                         attempts: 1,
                         suppliers: 1,
                         alarmed: false,
+                        ..Default::default()
                     },
                 },
             )),
@@ -2171,6 +2207,149 @@ mod tests {
             ),
             "unexpected transition result: {result:?}"
         );
+    }
+
+    #[test]
+    fn new_body_supplier_restarts_only_the_selected_persistent_alarm() {
+        let (mut store, config) = TestStore::new(EngineMode::Integrated);
+        let now = Utc::now();
+        let clock = ManualClock(now);
+        let selected = store.metadata.frontiers.header_best;
+        let old = crate::BodyUnavailableSummary {
+            started_at: now - chrono::Duration::minutes(12),
+            attempts: 10,
+            suppliers: 2,
+            supplier_set_digest: [0x11; 32],
+            alarmed: true,
+            next_probe_at: now + chrono::Duration::minutes(8),
+        };
+        store
+            .graph
+            .set_body_state(selected.hash, BodyValidationState::Unavailable(old))
+            .expect("the selected fixture body exists");
+        store.metadata.alarms.header_best_body_unavailable = Some(old);
+        let fresh = crate::BodyUnavailableSummary {
+            started_at: now,
+            attempts: 0,
+            suppliers: 2,
+            supplier_set_digest: [0x22; 32],
+            alarmed: false,
+            next_probe_at: now,
+        };
+        let evidence = EvidenceId::from_digest([0xc1; 32]);
+        let request = TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::BodySupplierDiscovered(crate::BodySupplierDiscovered {
+                hash: selected.hash,
+                evidence,
+                availability: fresh,
+            }),
+        };
+
+        let plan = apply_transition(
+            &store,
+            request.clone(),
+            &context(&config, &clock, Some(&Authority)),
+        )
+        .expect("a changed supplier set starts a fresh availability episode");
+        assert_eq!(plan.change_set.metadata.frontiers, store.metadata.frontiers);
+        assert_eq!(
+            plan.projected
+                .node(selected.hash)
+                .expect("the selected node remains retained")
+                .body,
+            BodyValidationState::Unavailable(fresh)
+        );
+        assert_eq!(
+            plan.change_set.metadata.alarms.header_best_body_unavailable,
+            None
+        );
+        store.commit(&plan);
+        let replay = apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: store.metadata.state_version,
+                ..request
+            },
+            &context(&config, &clock, Some(&Authority)),
+        )
+        .expect("the exact supplier-discovery evidence replays idempotently");
+        assert!(replay.is_no_change());
+    }
+
+    #[test]
+    fn body_supplier_restart_rejects_nonfresh_or_nonexpanding_evidence() {
+        let (mut store, config) = TestStore::new(EngineMode::Integrated);
+        let now = Utc::now();
+        let clock = ManualClock(now);
+        let selected = store.metadata.frontiers.header_best;
+        let old = crate::BodyUnavailableSummary {
+            started_at: now - chrono::Duration::minutes(12),
+            attempts: 10,
+            suppliers: 2,
+            supplier_set_digest: [0x11; 32],
+            alarmed: true,
+            next_probe_at: now + chrono::Duration::minutes(8),
+        };
+        store
+            .graph
+            .set_body_state(selected.hash, BodyValidationState::Unavailable(old))
+            .expect("the selected fixture body exists");
+        store.metadata.alarms.header_best_body_unavailable = Some(old);
+        let apply = |availability| {
+            apply_transition(
+                &store,
+                TransitionRequest {
+                    expected_version: store.metadata.state_version,
+                    event: TransitionEvent::BodySupplierDiscovered(crate::BodySupplierDiscovered {
+                        hash: selected.hash,
+                        evidence: EvidenceId::from_digest([0xc2; 32]),
+                        availability,
+                    }),
+                },
+                &context(&config, &clock, Some(&Authority)),
+            )
+        };
+
+        assert!(matches!(
+            apply(crate::BodyUnavailableSummary {
+                started_at: now,
+                attempts: 0,
+                suppliers: 2,
+                supplier_set_digest: old.supplier_set_digest,
+                alarmed: false,
+                next_probe_at: now,
+            }),
+            Err(TransitionFailure::InvalidEvidence(
+                "body supplier discovery does not add an eligible supplier"
+            ))
+        ));
+        assert!(matches!(
+            apply(crate::BodyUnavailableSummary {
+                started_at: now,
+                attempts: 1,
+                suppliers: 3,
+                supplier_set_digest: [0x22; 32],
+                alarmed: false,
+                next_probe_at: now,
+            }),
+            Err(TransitionFailure::InvalidEvidence(
+                "body supplier discovery has an invalid fresh episode"
+            ))
+        ));
+        assert!(matches!(
+            apply(crate::BodyUnavailableSummary {
+                started_at: now,
+                attempts: 0,
+                suppliers: 1,
+                supplier_set_digest: [0x22; 32],
+                alarmed: false,
+                next_probe_at: now,
+            }),
+            Err(TransitionFailure::InvalidEvidence(
+                "body supplier discovery does not add an eligible supplier"
+            ))
+        ));
     }
 
     #[test]

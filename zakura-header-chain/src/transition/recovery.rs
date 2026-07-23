@@ -927,6 +927,7 @@ mod tests {
             attempts: 10,
             suppliers: 2,
             alarmed: true,
+            ..Default::default()
         };
         store.nodes[1].body = crate::BodyValidationState::Unavailable(summary);
 

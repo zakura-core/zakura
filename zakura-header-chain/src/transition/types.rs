@@ -434,6 +434,17 @@ pub struct TransientBodyFailure {
     pub availability: BodyUnavailableSummary,
 }
 
+/// Authenticated discovery of a changed eligible body-supplier set.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BodySupplierDiscovered {
+    /// Exact selected header whose retry episode restarts.
+    pub hash: block::Hash,
+    /// Stable identity of the authenticated supplier-set observation.
+    pub evidence: EvidenceId,
+    /// Fresh zero-attempt episode summary.
+    pub availability: BodyUnavailableSummary,
+}
+
 /// Full-state acceptance of one exact body/header pair.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedBodyEvidence {
@@ -581,6 +592,8 @@ pub enum TransitionEvent {
     VerifiedChainChanged(VerifiedChainChanged),
     /// Body delivery/verification evidence.
     BodyEvidence(BodyEvidence),
+    /// A newly eligible supplier restarted body acquisition.
+    BodySupplierDiscovered(BodySupplierDiscovered),
     /// Reversible operator invalidation.
     OperatorInvalidate(OperatorInvalidate),
     /// Reason-scoped operator reconsideration.
@@ -621,6 +634,7 @@ impl TransitionEvent {
             }
             Self::VerifiedChainChanged(_)
             | Self::BodyEvidence(_)
+            | Self::BodySupplierDiscovered(_)
             | Self::FullStateFinalized(_)
             | Self::MigratedPinRefutation(_)
             | Self::AuxEvidence(_) => EventAdmission::IntegratedFullState,
@@ -642,6 +656,7 @@ impl TransitionEvent {
             Self::BodyEvidence(BodyEvidence::ConsensusInvalid(event)) => Some(event.evidence),
             Self::BodyEvidence(BodyEvidence::Transient(event)) => Some(event.evidence),
             Self::BodyEvidence(BodyEvidence::Verified(event)) => Some(event.evidence),
+            Self::BodySupplierDiscovered(event) => Some(event.evidence),
             Self::OperatorInvalidate(event) => Some(event.evidence),
             Self::OperatorReconsider(event) => Some(event.evidence),
             Self::FullStateFinalized(event) => Some(event.full_state_transition_id),
@@ -952,6 +967,7 @@ mod tests {
                     attempts: 1,
                     suppliers: 1,
                     alarmed: false,
+                    ..Default::default()
                 },
             })),
             BodyEvidence::Transient(TransientBodyFailure { hash: actual, .. }) if actual == hash
@@ -968,6 +984,7 @@ mod tests {
             "InsertHeaders(Box<InsertHeaders>)",
             "VerifiedChainChanged(VerifiedChainChanged)",
             "BodyEvidence(BodyEvidence)",
+            "BodySupplierDiscovered(BodySupplierDiscovered)",
             "OperatorInvalidate(OperatorInvalidate)",
             "OperatorReconsider(OperatorReconsider)",
             "FullStateFinalized(FullStateFinalized)",

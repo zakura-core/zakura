@@ -3934,6 +3934,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
             hash: block_1.hash(),
             outcome: test_block_apply_outcome(BlockApplyResult::Committed),
             eligible_sources: BTreeSet::new(),
+            persisted_availability: None,
             semantic_current: true,
             local_frontier: Some(BlockSyncFrontiers {
                 finalized_height: block::Height(0),
@@ -3966,6 +3967,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
                 hash: block.hash(),
                 outcome: test_block_apply_outcome(BlockApplyResult::Committed),
                 eligible_sources: BTreeSet::new(),
+                persisted_availability: None,
                 semantic_current: true,
                 local_frontier: Some(BlockSyncFrontiers {
                     finalized_height: block::Height(0),
@@ -8963,7 +8965,8 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             BlockSyncAction::QueryBlocksByHeightRange { .. } => {}
-            BlockSyncAction::RecordBodyUnavailable { .. } => {}
+            BlockSyncAction::RecordBodyUnavailable { .. }
+            | BlockSyncAction::RestartBodyAvailability { .. } => {}
         }
     }
 
@@ -9074,7 +9077,8 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
             }
             BlockSyncAction::QueryNeededBlocks { .. }
             | BlockSyncAction::QueryBlocksByHeightRange { .. }
-            | BlockSyncAction::RecordBodyUnavailable { .. } => {}
+            | BlockSyncAction::RecordBodyUnavailable { .. }
+            | BlockSyncAction::RestartBodyAvailability { .. } => {}
         }
     }
 

@@ -6668,6 +6668,261 @@ mod tests {
     }
 
     #[test]
+    fn aud_14_two_delivery_aux_rejection_never_partially_commits() {
+        const REJECTION_FAULT_CASES: [(FaultPoint, usize); 5] = [
+            // Candidate replacement is the first index boundary; these are the two aux rows.
+            (FaultPoint::AfterEachIndexWrite, 2),
+            (FaultPoint::AfterEachIndexWrite, 3),
+            (FaultPoint::AfterDbCommit, 1),
+            (FaultPoint::BeforePublish, 1),
+            (FaultPoint::AfterPublish, 1),
+        ];
+
+        for (index, (target, target_occurrence)) in REJECTION_FAULT_CASES.into_iter().enumerate() {
+            let cache = tempfile::tempdir().expect("the test cache directory is created");
+            let db_config = Config {
+                cache_dir: cache.path().to_owned(),
+                ephemeral: false,
+                debug_skip_non_finalized_state_backup_task: true,
+                ..Config::default()
+            };
+            let (engine_config, mut anchor, metadata) = fixture();
+            let network = engine_config.network.clone();
+            let db = open(&db_config, &network);
+            let store = HeaderChainStore::new(db.clone());
+            store
+                .initialize(metadata.clone(), anchor.clone())
+                .expect("the empty schema initializes");
+            let marker = u8::try_from(index + 0x80).expect("the rejection cases fit in u8");
+            let delivery_owner = WorkScope::for_body_work(&metadata.snapshot())
+                .bind(61, NonZeroU64::new(62).expect("sixty-two is nonzero"));
+            let first = AuxDelivery {
+                delivery_id: EvidenceId::from_digest([marker.wrapping_add(1); 32]),
+                header_hash: anchor.hash,
+                source: SourceId::from_digest([marker.wrapping_add(2); 32]),
+                owner: delivery_owner,
+                body_size: zakura_header_chain::BodySizeHint::Unknown,
+                tree_aux: None,
+                authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
+            };
+            let second = AuxDelivery {
+                delivery_id: EvidenceId::from_digest([marker.wrapping_add(3); 32]),
+                source: SourceId::from_digest([marker.wrapping_add(4); 32]),
+                ..first
+            };
+            anchor
+                .aux_delivery_ids
+                .extend([first.delivery_id, second.delivery_id]);
+            let mut seed = DiskWriteBatch::new();
+            store
+                .put_value(
+                    &mut seed,
+                    HEADER_NODE_BY_HASH,
+                    anchor.hash.0,
+                    &HeaderNodeDisk::from_domain(&anchor),
+                )
+                .expect("the two-delivery anchor node encodes");
+            for delivery in [first, second] {
+                store
+                    .put_value(
+                        &mut seed,
+                        HEADER_AUX_DELIVERY,
+                        HeaderAuxDeliveryKey {
+                            header: delivery.header_hash,
+                            delivery: delivery.delivery_id,
+                        }
+                        .as_bytes(),
+                        &HeaderAuxDeliveryDisk(delivery),
+                    )
+                    .expect("the unauthenticated auxiliary delivery encodes");
+            }
+            db.write(seed)
+                .expect("the coherent two-delivery fixture commits");
+            let (runtime, _) = store
+                .startup(&engine_config)
+                .expect("the two-delivery fixture audits");
+            let before = runtime.publisher().snapshot();
+            let evidence = EvidenceId::from_digest([marker.wrapping_add(5); 32]);
+            let authentication = zakura_header_chain::AuxAuthentication::Rejected { evidence };
+            let authority = Authority(evidence);
+            let context = TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                startup_capability: None,
+                retention_references: &[],
+            };
+            let marker_key = [marker; 4];
+            let mut full_state_batch = DiskWriteBatch::new();
+            runtime
+                .store
+                .put_raw(
+                    &mut full_state_batch,
+                    ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+                    marker_key,
+                    [marker],
+                )
+                .expect("the paired rejection marker can be staged");
+            let memory_swapped = Arc::new(AtomicBool::new(false));
+            let swap_probe = memory_swapped.clone();
+            let mut index_occurrence = 0;
+            let result = runtime.apply_combined_with_fault(
+                TransitionRequest {
+                    expected_version: before.state_version,
+                    event: TransitionEvent::AuxEvidence(Box::new(
+                        zakura_header_chain::AuxEvidence {
+                            owner: WorkScope::for_body_work(&before)
+                                .bind(delivery_owner.session_id, delivery_owner.request_id),
+                            deliveries: vec![first, second],
+                            authentication,
+                        },
+                    )),
+                },
+                &context,
+                full_state_batch,
+                move || swap_probe.store(true, Ordering::SeqCst),
+                |point| {
+                    if point == FaultPoint::AfterEachIndexWrite {
+                        index_occurrence += 1;
+                    }
+                    if point == target
+                        && (point != FaultPoint::AfterEachIndexWrite
+                            || index_occurrence == target_occurrence)
+                    {
+                        Err(HeaderChainStoreError::InjectedCrash(point))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(HeaderChainStoreError::InjectedCrash(point)) if point == target
+            ));
+
+            let committed = matches!(
+                target,
+                FaultPoint::AfterDbCommit | FaultPoint::BeforePublish | FaultPoint::AfterPublish
+            );
+            let published = target == FaultPoint::AfterPublish;
+            let committed_version = before
+                .state_version
+                .checked_next()
+                .expect("the short fixture state version can advance");
+            let durable = runtime
+                .store
+                .snapshot()
+                .expect("the rejection snapshot is readable");
+            assert_eq!(
+                durable.state_version,
+                if committed {
+                    committed_version
+                } else {
+                    before.state_version
+                },
+                "{target:?} occurrence {target_occurrence}"
+            );
+            assert_eq!(
+                durable.frontiers, before.frontiers,
+                "{target:?} occurrence {target_occurrence}"
+            );
+            let stored = runtime
+                .store
+                .aux_deliveries(anchor.hash)
+                .expect("the rejected delivery rows are readable");
+            assert_eq!(stored.len(), 2);
+            assert!(stored.iter().all(|delivery| {
+                delivery.authentication
+                    == if committed {
+                        authentication
+                    } else {
+                        zakura_header_chain::AuxAuthentication::Unauthenticated
+                    }
+            }));
+            assert_eq!(
+                runtime
+                    .store
+                    .node(anchor.hash)
+                    .expect("the rejection anchor node read succeeds")
+                    .expect("the rejection anchor remains retained")
+                    .aux_delivery_ids,
+                vec![first.delivery_id, second.delivery_id]
+            );
+            let marker_cf = runtime
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the marker column family is open");
+            assert_eq!(
+                runtime
+                    .store
+                    .db
+                    .raw_get_cf(&marker_cf, &marker_key)
+                    .expect("the paired marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?} occurrence {target_occurrence}"
+            );
+            assert_eq!(
+                memory_swapped.load(Ordering::SeqCst),
+                matches!(target, FaultPoint::BeforePublish | FaultPoint::AfterPublish),
+                "{target:?} occurrence {target_occurrence}"
+            );
+            assert_eq!(
+                runtime.publisher().snapshot().state_version,
+                if published {
+                    committed_version
+                } else {
+                    before.state_version
+                },
+                "{target:?} occurrence {target_occurrence}"
+            );
+            drop(runtime);
+            drop(db);
+
+            let (reopened, report) = HeaderChainStore::new(open(&db_config, &network))
+                .startup(&engine_config)
+                .expect("the two-delivery rejection reopens coherently");
+            assert_eq!(reopened.publisher().snapshot(), report.current);
+            assert_eq!(
+                report.current.state_version,
+                if committed {
+                    committed_version
+                } else {
+                    before.state_version
+                },
+                "{target:?} occurrence {target_occurrence}"
+            );
+            let reopened_deliveries = reopened
+                .store
+                .aux_deliveries(anchor.hash)
+                .expect("the reopened rejected delivery rows are readable");
+            assert_eq!(reopened_deliveries.len(), 2);
+            assert!(reopened_deliveries.iter().all(|delivery| {
+                delivery.authentication
+                    == if committed {
+                        authentication
+                    } else {
+                        zakura_header_chain::AuxAuthentication::Unauthenticated
+                    }
+            }));
+            let reopened_marker_cf = reopened
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the reopened marker column family is open");
+            assert_eq!(
+                reopened
+                    .store
+                    .db
+                    .raw_get_cf(&reopened_marker_cf, &marker_key)
+                    .expect("the reopened paired marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?} occurrence {target_occurrence}"
+            );
+        }
+    }
+
+    #[test]
     fn aud_14_migrated_pin_refutation_fails_closed_at_every_reachable_boundary() {
         const REFUTATION_FAULT_POINTS: [FaultPoint; 7] = [
             FaultPoint::AfterSnapshot,

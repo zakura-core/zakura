@@ -14,7 +14,7 @@ the remaining gap. Fuzzer reachability alone is not requirement coverage.
 | Equal-height permutations | Work/raw-hash comparator and retained-state oracle | LC-SELECT-02..03 | `aud_03_same_height_permutations` | Covered in the engine; DF-01 full-state comparison remains open |
 | Verified grow/reset | `TransitionEvent::VerifiedChainChanged` | LC-FRONTIER-02, LC-INT-01..02 | `verified_and_finality`, `aud_04_consecutive_resets` | Covered |
 | Body mismatch | `BodyEvidence::PayloadMismatch` | LC-BODY-02, LC-ERR-01 | `body_mismatch` | Covered |
-| Body invalid / transient / verified | Typed `BodyEvidence` variants | LC-BODY-01..04, LC-AVAIL-01 | `body_invalid`, `body_unavailable`, `verified_and_finality` | Covered for one rule/class each; the complete IN-02/DF-02 class matrix remains open |
+| Body invalid / transient / verified | Typed `BodyEvidence` variants | LC-BODY-01..04, LC-AVAIL-01 | `body_evidence_matrix`, `body_invalid`, `body_unavailable`, `verified_and_finality` | Planner coverage includes all mismatch/transient kinds, unknown-header refusal, supplier identity, and invalid-descendant propagation; end-to-end attribution classification and the DF-02 full-state differential remain open |
 | Operator invalidate / reconsider | Unified planner and exact reason IDs | LC-INT-04, LC-OP-01..02 | structured operations and AUD-10..12 | Covered |
 | Finalize verified | `TransitionEvent::FullStateFinalized` | LC-FINAL-01..02, LC-TXN-01 | `verified_and_finality`, AUD-13 | Covered |
 | Deferred header / clock / reevaluation | `DeferredUntil` and `ReevaluateDeferred` | LC-VAL-08, LC-INT-01 | `deferred_header` | Covered |

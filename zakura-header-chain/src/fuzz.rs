@@ -18,12 +18,13 @@ use zakura_chain::{
 
 use crate::{
     apply_transition, AlarmSet, AuxDelivery, AuxDelta, BodyCommitmentKind, BodyEvidence,
-    BodyPayloadMismatch, BodyRuleId, BodyUnavailableSummary, BranchId, ChainScore, CheckpointSet,
-    Clock, ConsensusBodyInvalid, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot,
-    EvidenceId, FinalityEpoch, FinalityRecord, Frontier, FrontierSet, FullStateEvidenceAuthority,
-    FullStateFinalized, HeaderBatchInput, HeaderChainDiskVersion, HeaderContextFact, HeaderFailure,
-    HeaderGeneration, HeaderNode, HeaderRule, HeaderRules, HeaderValidationState, InsertHeaders,
-    MemHeaderStore, OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, PreparedHeader,
+    BodyPayloadMismatch, BodyRuleId, BodyUnavailableSummary, BodyValidationState, BranchId,
+    ChainScore, CheckpointSet, Clock, ConsensusBodyInvalid, EligibilityReason, EngineConfig,
+    EngineMetadata, EngineMode, EngineSnapshot, EvidenceId, FinalityEpoch, FinalityRecord,
+    Frontier, FrontierSet, FullStateEvidenceAuthority, FullStateFinalized, GraphError,
+    HeaderBatchInput, HeaderChainDiskVersion, HeaderContextFact, HeaderFailure, HeaderGeneration,
+    HeaderNode, HeaderRule, HeaderRules, HeaderValidationState, InsertHeaders, MemHeaderStore,
+    OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, PreparedHeader,
     PreparedHeaderBatch, ProjectionDelta, SourceId, StateVersion, StoreError, StoreRead,
     SuffixWork, TargetCompletion, TransientBodyFailure, TransientBodyFailureKind,
     TransitionContext, TransitionFailure, TransitionPlan, TransitionRequest, TrustedAnchor,
@@ -56,6 +57,8 @@ pub struct ForkReplaySummary {
     pub validation_checks: u16,
     /// Exact selected/verified next-child assertions completed.
     pub next_child_checks: u16,
+    /// Complete typed body-evidence matrices completed.
+    pub body_evidence_checks: u16,
     /// Final authoritative snapshot.
     pub snapshot: EngineSnapshot,
     /// Stable digest of operation outcomes and snapshots.
@@ -458,6 +461,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     let mut boundary_checks = 0u16;
     let mut validation_checks = 0u16;
     let mut next_child_checks = 0u16;
+    let mut body_evidence_checks = 0u16;
     let mut transcript = Sha256::new();
     let clock = ManualClock::new();
     let authority = FuzzAuthority;
@@ -466,7 +470,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     for (operation, encoded) in bounded.iter().copied().enumerate() {
         if matches!(
             bounded.first(),
-            Some(b'A' | b'F' | b'I' | b'R' | b'T' | b'V')
+            Some(b'A' | b'F' | b'I' | b'R' | b'T' | b'V' | b'Y')
         ) && encoded == b'\n'
             && operation.saturating_add(1) == bounded.len()
         {
@@ -517,6 +521,15 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
             transcript.update(digest);
             no_effects = no_effects.saturating_add(1);
             validation_checks = validation_checks.saturating_add(1);
+            assert_exhaustive_oracle(&store);
+            continue;
+        }
+        if encoded == b'Y' {
+            let digest = assert_body_evidence_matrix();
+            transcript.update(b"body-evidence-matrix");
+            transcript.update(digest);
+            no_effects = no_effects.saturating_add(1);
+            body_evidence_checks = body_evidence_checks.saturating_add(1);
             assert_exhaustive_oracle(&store);
             continue;
         }
@@ -789,6 +802,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         boundary_checks,
         validation_checks,
         next_child_checks,
+        body_evidence_checks,
         snapshot: store.snapshot(),
         replay_digest: transcript.finalize().into(),
         retained_digest: retained_digest(&store),
@@ -1239,6 +1253,192 @@ fn assert_block_spec_mutations() -> [u8; 32] {
         ));
         hasher.update([expected_rule as u8]);
     }
+    hasher.finalize().into()
+}
+
+fn assert_body_evidence_matrix() -> [u8; 32] {
+    let mut store = FuzzStore::new(EngineMode::Integrated);
+    let clock = ManualClock::new();
+    let authority = FuzzAuthority;
+    let anchor = store.metadata.frontiers.finalized;
+    commit_fixture_insertion(&mut store, &clock, &authority, anchor, 3, 0xe000, 0xe0);
+    let parent = store.selected[1];
+    let invalid = store.selected[2];
+    let descendant = store.selected[3];
+    let before = store.snapshot();
+    let before_digest = retained_digest(&store);
+    let context = TransitionContext {
+        config: &store.config,
+        clock: &clock,
+        full_state_authority: Some(&authority),
+        startup_capability: None,
+        retention_references: &[],
+    };
+
+    let mismatch_kinds = [
+        BodyCommitmentKind::HeaderHash,
+        BodyCommitmentKind::TransactionMerkleRoot,
+        BodyCommitmentKind::AuthDataRoot,
+        BodyCommitmentKind::Other("fuzz.other_commitment"),
+    ];
+    let mut hasher = Sha256::new();
+    for (index, kind) in mismatch_kinds.into_iter().enumerate() {
+        let marker = u8::try_from(index).expect("the mismatch matrix fits in u8");
+        let source = SourceId::from_digest([marker.wrapping_add(0x10); 32]);
+        let request = TransitionRequest {
+            expected_version: before.state_version,
+            event: crate::TransitionEvent::BodyEvidence(BodyEvidence::PayloadMismatch(
+                BodyPayloadMismatch {
+                    evidence: evidence(0xe100 + index, marker),
+                    requested: invalid.hash,
+                    delivered: block::Hash([marker.wrapping_add(0x20); 32]),
+                    kind,
+                    source,
+                },
+            )),
+        };
+        assert!(matches!(
+            &request.event,
+            crate::TransitionEvent::BodyEvidence(BodyEvidence::PayloadMismatch(event))
+                if event.kind == kind && event.source == source
+        ));
+        let plan = apply_transition(&store, request, &context)
+            .expect("every typed payload mismatch is informational to the header DAG");
+        assert!(plan.is_no_change());
+        assert_eq!(plan.before(), &before);
+        assert_eq!(retained_digest(&store), before_digest);
+        hasher.update([match kind {
+            BodyCommitmentKind::HeaderHash => 0,
+            BodyCommitmentKind::TransactionMerkleRoot => 1,
+            BodyCommitmentKind::AuthDataRoot => 2,
+            BodyCommitmentKind::Other(_) => 3,
+        }]);
+        hasher.update(source.digest());
+    }
+
+    let transient_kinds = [
+        TransientBodyFailureKind::MissingContext,
+        TransientBodyFailureKind::Canceled,
+        TransientBodyFailureKind::Storage,
+        TransientBodyFailureKind::VerifierUnavailable,
+        TransientBodyFailureKind::Timeout,
+        TransientBodyFailureKind::ResourceExhausted,
+    ];
+    for (index, kind) in transient_kinds.into_iter().enumerate() {
+        let marker = u8::try_from(index).expect("the transient matrix fits in u8");
+        let availability = BodyUnavailableSummary {
+            attempts: u32::try_from(index + 1).expect("the transient matrix fits in u32"),
+            suppliers: 1,
+            supplier_set_digest: [marker.wrapping_add(0x30); 32],
+            ..Default::default()
+        };
+        let request = TransitionRequest {
+            expected_version: before.state_version,
+            event: crate::TransitionEvent::BodyEvidence(BodyEvidence::Transient(
+                TransientBodyFailure {
+                    hash: invalid.hash,
+                    evidence: evidence(0xe200 + index, marker),
+                    kind,
+                    availability,
+                },
+            )),
+        };
+        let mut trial = store.clone();
+        let plan = apply_transition(&trial, request, &context)
+            .expect("every transient body class updates availability only");
+        assert!(plan.change_set().eligibility_changes.is_empty());
+        trial.commit(&plan);
+        assert_eq!(trial.metadata.frontiers, before.frontiers);
+        let node = trial
+            .graph
+            .node(invalid.hash)
+            .expect("the transient target remains retained");
+        assert_eq!(node.body, BodyValidationState::Unavailable(availability));
+        assert!(node.eligibility.direct_reasons.is_empty());
+        assert_eq!(node.eligibility.inherited_from, None);
+        hasher.update([match kind {
+            TransientBodyFailureKind::MissingContext => 0,
+            TransientBodyFailureKind::Canceled => 1,
+            TransientBodyFailureKind::Storage => 2,
+            TransientBodyFailureKind::VerifierUnavailable => 3,
+            TransientBodyFailureKind::Timeout => 4,
+            TransientBodyFailureKind::ResourceExhausted => 5,
+        }]);
+    }
+
+    let source = SourceId::from_digest([0x51; 32]);
+    let invalid_evidence = evidence(0xe300, 0x52);
+    let rule = BodyRuleId::new("fuzz.body.commitment_matching_invalid");
+    let request = TransitionRequest {
+        expected_version: before.state_version,
+        event: crate::TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(
+            ConsensusBodyInvalid {
+                hash: invalid.hash,
+                evidence: invalid_evidence,
+                rule: rule.clone(),
+                source,
+            },
+        )),
+    };
+    assert!(matches!(
+        &request.event,
+        crate::TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(event))
+            if event.source == source && event.rule == rule
+    ));
+    let mut invalidated = store.clone();
+    let plan = apply_transition(&invalidated, request, &context)
+        .expect("commitment-matching deterministic invalidity is durable");
+    invalidated.commit(&plan);
+    let invalid_node = invalidated
+        .graph
+        .node(invalid.hash)
+        .expect("the invalid target remains retained as evidence");
+    assert_eq!(
+        invalid_node.body,
+        BodyValidationState::ConsensusInvalid {
+            evidence: invalid_evidence,
+            rule: rule.clone(),
+        }
+    );
+    assert!(invalid_node.eligibility.direct_reasons.contains(
+        &EligibilityReason::ConsensusBodyInvalid {
+            evidence: invalid_evidence,
+            rule: rule.clone(),
+        }
+    ));
+    assert_eq!(
+        invalidated
+            .graph
+            .node(descendant.hash)
+            .expect("the invalid target descendant remains retained")
+            .eligibility
+            .inherited_from,
+        Some(invalid.hash)
+    );
+    assert_eq!(invalidated.metadata.frontiers.header_best, parent);
+    assert_exhaustive_oracle(&invalidated);
+    hasher.update(source.digest());
+    hasher.update(invalid_evidence.digest());
+
+    let unknown = block::Hash([0x61; 32]);
+    let request = TransitionRequest {
+        expected_version: before.state_version,
+        event: crate::TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(
+            ConsensusBodyInvalid {
+                hash: unknown,
+                evidence: evidence(0xe400, 0x62),
+                rule: BodyRuleId::new("fuzz.body.unknown_header"),
+                source: SourceId::from_digest([0x63; 32]),
+            },
+        )),
+    };
+    assert!(matches!(
+        apply_transition(&store, request, &context),
+        Err(TransitionFailure::Graph(GraphError::UnknownNode(hash))) if hash == unknown
+    ));
+    assert_eq!(store.snapshot(), before);
+    assert_eq!(retained_digest(&store), before_digest);
+
     hasher.finalize().into()
 }
 
@@ -1779,6 +1979,15 @@ mod tests {
     }
 
     #[test]
+    fn body_evidence_matrix_preserves_typed_effect_boundaries() {
+        let first = replay_fork_transition_bytes(b"Y");
+        let second = replay_fork_transition_bytes(b"Y");
+        assert_eq!(first, second);
+        assert_eq!(first.body_evidence_checks, 1);
+        assert_eq!(first.no_effects, 1);
+    }
+
+    #[test]
     #[should_panic(expected = "selected projection must exactly match parent links")]
     fn exhaustive_oracle_rejects_a_projection_gap() {
         let mut store = FuzzStore::new(EngineMode::Integrated);
@@ -1934,6 +2143,12 @@ mod tests {
                     "../../fuzz/header-chain/corpus/fork_transitions/block_spec_mutations"
                 ),
             ),
+            (
+                "body_evidence_matrix",
+                include_bytes!(
+                    "../../fuzz/header-chain/corpus/fork_transitions/body_evidence_matrix"
+                ),
+            ),
         ];
         for (name, bytes) in corpus {
             let first = replay_fork_transition_bytes(bytes);
@@ -1965,6 +2180,9 @@ mod tests {
             }
             if *name == "block_spec_mutations" {
                 assert_eq!(first.validation_checks, 1);
+            }
+            if *name == "body_evidence_matrix" {
+                assert_eq!(first.body_evidence_checks, 1);
             }
         }
     }

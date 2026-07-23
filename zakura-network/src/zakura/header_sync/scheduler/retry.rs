@@ -260,6 +260,7 @@ fn retry_delay<J: RetryJitter>(
         .saturating_mul(1_000)
         .saturating_mul(i64::from(1_000_i16.saturating_add(offset)))
         / 1_000;
+    let milliseconds = milliseconds.min(MAX_BACKOFF_SECONDS.saturating_mul(1_000));
     Duration::milliseconds(milliseconds)
 }
 
@@ -449,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn jitter_is_clamped_and_a_new_supplier_starts_a_fresh_episode() {
+    fn jitter_and_final_delay_are_clamped_and_a_new_supplier_starts_a_fresh_episode() {
         let clock = clock();
         let first = source(3);
         let second = source(4);
@@ -464,6 +465,15 @@ mod tests {
         assert_eq!(
             episode.record_failure(first, &clock, &FixedJitter(500)),
             RetryUpdate::RetryAt(now + Duration::milliseconds(2_200))
+        );
+        assert_eq!(
+            retry_delay(episode.branch, episode.header, 7, &FixedJitter(-500)),
+            Duration::seconds(54)
+        );
+        assert_eq!(
+            retry_delay(episode.branch, episode.header, 7, &FixedJitter(500)),
+            Duration::seconds(60),
+            "the jittered delay itself must not exceed the normative cap"
         );
         assert!(episode.refresh_suppliers([first, second].into_iter().collect(), &clock));
         assert_eq!(episode.attempts, 0);

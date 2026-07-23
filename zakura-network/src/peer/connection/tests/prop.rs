@@ -60,7 +60,7 @@ proptest! {
             let (
                 connection,
                 mut client_tx,
-                mut inbound_service,
+                inbound_service,
                 mut peer_outbound_messages,
                 shared_error_slot,
             ) = new_test_connection();
@@ -119,7 +119,11 @@ proptest! {
             let error = shared_error_slot.try_get_error();
             assert!(error.is_none());
 
-            inbound_service.expect_no_requests().await?;
+            // Receiving the second response is a causal barrier: the connection
+            // has already processed both peer messages in order. Any attempt to
+            // route either response to the inbound service would poll it before
+            // this response could be returned.
+            prop_assert_eq!(inbound_service.poll_count(), 0);
 
             // Stop the connection thread
             mem::drop(peer_tx);

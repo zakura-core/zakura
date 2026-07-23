@@ -95,7 +95,7 @@ fn oversized_find_blocks_response_is_rejected() {
 /// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and blocks 3-4 using extend_tips.
 ///
 /// This test also makes sure that the syncer downloads blocks in order.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
     // Get services
     let (
@@ -594,7 +594,7 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
 /// with unrelated trailing hashes that are discarded.
 ///
 /// This test also makes sure that the syncer downloads blocks in order.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn sync_blocks_trailing_hashes_ok() -> Result<(), crate::BoxError> {
     // Get services
     let (
@@ -1085,7 +1085,7 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
 /// Test that the sync downloader rejects blocks that are too high in extend_tips.
 ///
 /// TODO: also test that it rejects blocks behind the tip limit. (Needs ~100 fake blocks.)
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
     // Get services
     let (

@@ -512,7 +512,6 @@ async fn test_rpc_response_data_for_network(network: &Network) {
     let rpc_req = rpc.get_raw_transaction(txid.clone(), Some(0u8), None);
     let (rsp, _) = futures::join!(rpc_req, mempool_req);
     settings.bind(|| insta::assert_json_snapshot!(format!("getrawtransaction_verbosity=0"), rsp));
-    mempool.expect_no_requests().await;
 
     // `getrawtransaction` verbosity=1
     let mempool_req = mempool
@@ -526,7 +525,6 @@ async fn test_rpc_response_data_for_network(network: &Network) {
     let rpc_req = rpc.get_raw_transaction(txid, Some(1u8), None);
     let (rsp, _) = futures::join!(rpc_req, mempool_req);
     settings.bind(|| insta::assert_json_snapshot!(format!("getrawtransaction_verbosity=1"), rsp));
-    mempool.expect_no_requests().await;
 
     // `getrawtransaction` with unknown txid
     let mempool_req = mempool
@@ -541,13 +539,17 @@ async fn test_rpc_response_data_for_network(network: &Network) {
         rpc.get_raw_transaction(transaction::Hash::from([0; 32]).encode_hex(), Some(1), None);
     let (rsp, _) = futures::join!(rpc_req, mempool_req);
     settings.bind(|| insta::assert_json_snapshot!(format!("getrawtransaction_unknown_txid"), rsp));
-    mempool.expect_no_requests().await;
 
     // `getrawtransaction` with an invalid TXID
     let rsp = rpc
         .get_raw_transaction("aBadC0de".to_owned(), Some(1), None)
         .await;
     settings.bind(|| insta::assert_json_snapshot!(format!("getrawtransaction_invalid_txid"), rsp));
+
+    // Each awaited RPC has finished all of its causal mempool work, and each
+    // expected request above was consumed by its paired handler. One absence
+    // window here therefore catches an extra request from any of the variants
+    // without paying the same timeout after every call.
     mempool.expect_no_requests().await;
 
     // `getaddresstxids`

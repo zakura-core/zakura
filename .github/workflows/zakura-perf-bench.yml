@@ -28,6 +28,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/zakura-perf-bench.yml"
+      - ".github/workflows/scripts/perf-bench-run.sh"
   schedule:
     # Weekly profiled baselines of main (UTC Monday, after the 04:00 pr-node
     # bake). The cron string picks the verify mode — see the plan job.
@@ -303,7 +304,9 @@ jobs:
         env:
           DROPLET_ID: ${{ steps.droplet.outputs.id }}
           VOLUME_ID: ${{ steps.droplet.outputs.volume_id }}
-          TEARDOWN: ${{ inputs.teardown_after_run == false && 'false' || 'true' }}
+          # string-compare: on schedule/pull_request the input is null, and
+          # GitHub's loose `null == false` coercion would skip teardown
+          TEARDOWN: ${{ format('{0}', inputs.teardown_after_run) == 'false' && 'false' || 'true' }}
         run: |
           set -euo pipefail
           if [ "${TEARDOWN}" != "true" ]; then

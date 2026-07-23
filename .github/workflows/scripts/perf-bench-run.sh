@@ -35,7 +35,10 @@ OUT_DIR=/root/out
 DIGEST_PY=/root/zakura-bench-digest.py
 DASHBOARD_PY=/root/zakura-metrics-dashboard.py
 PROFILE_SECONDS="${PROFILE_SECONDS:-300}"
-PROFILE_FREQ="${PROFILE_FREQ:-99}"
+# 49Hz (not 99) keeps `perf script` DWARF unwinding tractable: the A/A
+# validation run measured ~55 minutes of unwinding for a 99Hz x 300s window on
+# a c-16 droplet; halving the samples plus --no-inline brings it to minutes.
+PROFILE_FREQ="${PROFILE_FREQ:-49}"
 PROFILE_DWARF_STACK="${PROFILE_DWARF_STACK:-8192}"
 CKPT_LIMIT="${CKPT_LIMIT:-1500}"
 DL_LIMIT="${DL_LIMIT:-150}"
@@ -259,7 +262,7 @@ start_profile() {
 
 CSV="$OUT_DIR/samples.csv"
 echo "epoch,elapsed,height" > "$CSV"
-T_ESCAPE=""; END_HEIGHT="$START_HEIGHT"; CLEAN_STOP=0
+T_ESCAPE=""; END_HEIGHT="$START_HEIGHT"; CLEAN_STOP=0; LAST_BEAT=0
 while :; do
   NOW=$(date +%s); ELAPSED=$((NOW - T0))
   H="$(scrape_height)" || true
@@ -269,6 +272,11 @@ while :; do
     if [[ -z "$T_ESCAPE" && "$H" -gt "$START_HEIGHT" ]]; then
       T_ESCAPE=$NOW; log "escaped cold-start at +${ELAPSED}s, height $H"
       start_profile
+    fi
+    # liveness heartbeat for the CI log (the loop is otherwise silent)
+    if (( NOW - LAST_BEAT >= 120 )); then
+      LAST_BEAT=$NOW
+      log "height $H (+${ELAPSED}s, $(( H - START_HEIGHT )) blocks)"
     fi
   fi
   if ! kill -0 "$NODE_PID" 2>/dev/null; then
@@ -299,7 +307,12 @@ if [[ -n "$PERF_PID" ]]; then
   PERF_PID=""
 fi
 if [[ -s "$OUT_DIR/perf.data" ]]; then
-  if ! perf script -i "$OUT_DIR/perf.data" 2>>"$OUT_DIR/perf.log" \
+  # --no-inline skips per-sample inline-frame resolution, the dominant cost of
+  # dwarf perf.script (tens of minutes without it at these sample volumes);
+  # inline info is partial on line-tables-only builds anyway
+  log "folding $(du -m "$OUT_DIR/perf.data" | cut -f1)MB of perf data (dwarf unwinding) ..."
+  FOLD_START=$(date +%s)
+  if ! perf script --no-inline -i "$OUT_DIR/perf.data" 2>>"$OUT_DIR/perf.log" \
         | python3 "$DIGEST_PY" collapse > "$OUT_DIR/profile.folded" \
         || [[ ! -s "$OUT_DIR/profile.folded" ]]; then
     log "WARNING: perf script/collapse produced no stacks:" \
@@ -314,6 +327,7 @@ if [[ -s "$OUT_DIR/perf.data" ]]; then
     python3 "$DIGEST_PY" top --folded "$OUT_DIR/profile.folded" \
       --title "$LEG $SHA" --note "$PROFILE_NOTE" > "$OUT_DIR/profile.md" 2>>"$OUT_DIR/perf.log" \
       || { log "WARNING: profile digest failed"; rm -f "$OUT_DIR/profile.md"; }
+    log "profile folded + digested in $(( $(date +%s) - FOLD_START ))s"
   fi
   rm -f "$OUT_DIR/perf.data"
 elif [[ "$PROFILE" == "cpu" ]]; then
@@ -371,23 +385,26 @@ ERRS="$(grep -iE 'panic|ERROR committing|resetting state queue' "$LOGF" 2>/dev/n
 [[ -f "$OUT_DIR/latency.md" ]] && { echo ""; cat "$OUT_DIR/latency.md"; } >> "$OUT_DIR/leg-summary.md"
 [[ -f "$OUT_DIR/profile.md" ]] && { echo ""; cat "$OUT_DIR/profile.md"; } >> "$OUT_DIR/leg-summary.md"
 
-# machine-readable leg result for the compare job
-python3 - "$OUT_DIR/meta.json" <<PY
-import json, sys
-json.dump({
-    "leg": "$LEG", "sha": "$SHA", "verify_mode": "$VERIFY_MODE",
-    "start_height": $START_HEIGHT, "end_height": $END_HEIGHT,
-    "blocks": $BLOCKS, "seconds": $TOTAL, "bps": $BPS, "post_bps": $PBPS,
-    "clean_stop": bool($CLEAN_STOP), "build_secs": $BUILD_SECS,
-    "verdict": "${VERDICT}", "profiled": $( [[ -s "$OUT_DIR/profile.folded" ]] && echo true || echo false ),
-}, open(sys.argv[1], "w"), indent=2)
-PY
-
 # package traces + trim logs for scp
 ( cd "$OUT_DIR" && tar -cf - zakura-traces | zstd -T0 -q -f -o zakura-traces.tar.zst && rm -rf zakura-traces ) || true
 tail -n 2000 "$LOGF" > "$OUT_DIR/node-tail.log" 2>/dev/null || true
 zstd -T0 -q -f "$LOGF" -o "$OUT_DIR/node-full.log.zst" 2>/dev/null || true
 rm -f "$LOGF"
 rm -rf "$REC_DIR"
+
+# machine-readable leg result for the compare job (best-effort: a meta failure
+# costs the compare, never the leg — the A/A validation died here on a shell
+# true/false leaking into python)
+PROFILED=$( [[ -s "$OUT_DIR/profile.folded" ]] && echo 1 || echo 0 )
+python3 - "$OUT_DIR/meta.json" <<PY || log "WARNING: meta.json write failed"
+import json, sys
+json.dump({
+    "leg": "$LEG", "sha": "$SHA", "verify_mode": "$VERIFY_MODE",
+    "start_height": $START_HEIGHT, "end_height": $END_HEIGHT,
+    "blocks": $BLOCKS, "seconds": $TOTAL, "bps": $BPS, "post_bps": $PBPS,
+    "clean_stop": bool($CLEAN_STOP), "build_secs": $BUILD_SECS,
+    "verdict": "${VERDICT}", "profiled": bool($PROFILED),
+}, open(sys.argv[1], "w"), indent=2)
+PY
 
 log "leg $LEG done: $BLOCKS blocks in ${TOTAL}s ($BPS blk/s), verdict=${VERDICT:-n/a}"

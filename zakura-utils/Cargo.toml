@@ -45,7 +45,11 @@ zakura-checkpoints-offline = [
 ]
 
 # Preserve published feature names after removing the obsolete developer tools.
-search-issue-refs = []
+search-issue-refs = [
+    "regex",
+    "reqwest",
+    "tokio"
+]
 regex = []
 reqwest = []
 

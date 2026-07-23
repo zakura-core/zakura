@@ -220,6 +220,17 @@ fn settle_root_auth_task_join(
     }
 }
 
+/// Failure kind when a new root-auth action arrives while the driver's JoinSet
+/// slot is still occupied.
+///
+/// This is a local capacity condition: the frontier did not move and no watch
+/// publish is implied. Settling as [`HeaderRootAuthenticationFailureKind::Stale`]
+/// would park the reactor on `root_auth_waiting_for_watch` until an unrelated
+/// commit happens to publish.
+fn root_auth_slot_occupied_failure_kind() -> HeaderRootAuthenticationFailureKind {
+    HeaderRootAuthenticationFailureKind::Local
+}
+
 fn header_root_authentication_failure_kind(
     error: &(dyn std::error::Error + Send + Sync + 'static),
 ) -> HeaderRootAuthenticationFailureKind {
@@ -318,6 +329,21 @@ mod operation_identity_tests {
                 } if echoed == operation && echoed_kind == kind
             ));
         }
+    }
+
+    #[test]
+    fn root_auth_slot_occupied_settles_as_local_not_stale() {
+        // Stale parks the reactor waiting for a frontier watch update. Slot
+        // occupancy does not imply a frontier move, so the backstop must be
+        // Local (reactor retries with delay) instead.
+        assert_eq!(
+            root_auth_slot_occupied_failure_kind(),
+            HeaderRootAuthenticationFailureKind::Local
+        );
+        assert_ne!(
+            root_auth_slot_occupied_failure_kind(),
+            HeaderRootAuthenticationFailureKind::Stale
+        );
     }
 
     #[test]
@@ -1328,7 +1354,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         .header_sync
                         .send(header_root_authentication_failed(
                             operation,
-                            HeaderRootAuthenticationFailureKind::Stale,
+                            root_auth_slot_occupied_failure_kind(),
                         ))
                         .await
                         .is_err()

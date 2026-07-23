@@ -54,7 +54,7 @@ pub(super) async fn run_peer(
         }
 
         let message_type = u8::try_from(frame.message_type).ok();
-        let response_context = if matches!(
+        let expected_response = if matches!(
             message_type,
             Some(MSG_HS_HEADERS) | Some(MSG_HS_HEADERS_OUTCOME)
         ) {
@@ -63,19 +63,31 @@ pub(super) async fn run_peer(
             let response = expected
                 .remove(&request_id)
                 .ok_or_else(|| protocol_reject("unsolicited header-sync response"))?;
-            (message_type == Some(MSG_HS_HEADERS)).then_some(response.context)
+            Some(response)
         } else {
             None
         };
+        let response_context = expected_response.as_ref().and_then(|response| {
+            (message_type == Some(MSG_HS_HEADERS)).then_some(response.context)
+        });
         let msg = codec
             .decode_frame(frame, response_context)
             .map_err(protocol_reject)?;
-        handle
-            .try_send(HeaderSyncEvent::SessionWireMessage {
+        let event = match expected_response {
+            Some(response) => HeaderSyncEvent::SessionResponse {
+                peer: peer.clone(),
+                session_id,
+                scope: response.scope,
+                msg,
+            },
+            None => HeaderSyncEvent::SessionWireMessage {
                 peer: peer.clone(),
                 session_id,
                 msg,
-            })
+            },
+        };
+        handle
+            .try_send(event)
             .map_err(|error| SinkReject::local(error.to_string()))?;
     }
 }
@@ -110,6 +122,15 @@ mod tests {
 
     fn peer() -> ZakuraPeerId {
         ZakuraPeerId::new(vec![7; 32]).expect("test peer ID has the required length")
+    }
+
+    fn scope() -> zakura_header_chain::WorkScope {
+        zakura_header_chain::WorkScope {
+            state_version: zakura_header_chain::StateVersion::new(1),
+            header_generation: zakura_header_chain::HeaderGeneration::new(2),
+            verified_generation: None,
+            branch: zakura_header_chain::BranchId::new(block::Hash([0; 32]), block::Hash([3; 32])),
+        }
     }
 
     fn handle(codec: HeaderSyncCodec) -> (HeaderSyncHandle, mpsc::Receiver<HeaderSyncEvent>) {
@@ -148,6 +169,7 @@ mod tests {
         commands_tx
             .send(HeaderSyncPeerCommand::Reserve(ExpectedHeadersResponse {
                 request_id: HeaderSyncRequestId::new(1).expect("one is nonzero"),
+                scope: scope(),
                 context: HeaderSyncDecodeContext {
                     max_header_count: 1,
                     requested_tree_aux_schema: AuxSchema::None,
@@ -169,10 +191,11 @@ mod tests {
 
         assert!(matches!(
             events.recv().await,
-            Some(HeaderSyncEvent::SessionWireMessage {
+            Some(HeaderSyncEvent::SessionResponse {
+                scope: response_scope,
                 msg: HeaderSyncMessage::HeadersOutcome(_),
                 ..
-            })
+            }) if response_scope == scope()
         ));
     }
 
@@ -197,6 +220,7 @@ mod tests {
                     .send(HeaderSyncPeerCommand::Reserve(ExpectedHeadersResponse {
                         request_id: HeaderSyncRequestId::new(request_id)
                             .expect("the fixture request ID is nonzero"),
+                        scope: scope(),
                         context: HeaderSyncDecodeContext {
                             max_header_count: 1,
                             requested_tree_aux_schema: AuxSchema::None,

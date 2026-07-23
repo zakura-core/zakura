@@ -178,6 +178,17 @@ pub enum HeaderSyncEvent {
         /// Decoded message.
         msg: HeaderSyncMessage,
     },
+    /// A correlated response decoded with the exact scope reserved before its request was sent.
+    SessionResponse {
+        /// Sending peer.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation.
+        session_id: u64,
+        /// Durable generation and exact branch that owns the response reservation.
+        scope: zakura_header_chain::WorkScope,
+        /// Decoded `Headers` or `HeadersOutcome` response.
+        msg: HeaderSyncMessage,
+    },
     /// State returned the selected-path locator for an advertised target.
     HeaderLocatorReady {
         /// Peer whose target requested the locator.
@@ -290,6 +301,7 @@ impl HeaderSyncEvent {
             Self::PeerDisconnected(_) => "peer_disconnected",
             Self::AdvisoryHeaderSummary { .. } => "advisory_header_summary",
             Self::SessionWireMessage { .. } => "session_wire_message",
+            Self::SessionResponse { .. } => "session_response",
             Self::HeaderLocatorReady { .. } => "header_locator_ready",
             Self::VctRepairContextReady { .. } => "vct_repair_context_ready",
             Self::HeaderPathLeaseReady { .. } => "header_path_lease_ready",

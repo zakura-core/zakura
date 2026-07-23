@@ -218,6 +218,7 @@ impl HeaderSyncPeerSession {
     pub(super) fn try_send_get_headers(
         &self,
         codec: &HeaderSyncCodec,
+        scope: zakura_header_chain::WorkScope,
         target_tip_hash: block::Hash,
         locator: &zakura_header_chain::HeaderLocator,
         max_header_count: u32,
@@ -236,6 +237,7 @@ impl HeaderSyncPeerSession {
             .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
         let expected = ExpectedHeadersResponse {
             request_id,
+            scope,
             context: HeaderSyncDecodeContext {
                 max_header_count,
                 requested_tree_aux_schema: tree_aux_schema,
@@ -306,6 +308,7 @@ pub(super) enum HeaderSyncPeerCommand {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct ExpectedHeadersResponse {
     pub(super) request_id: HeaderSyncRequestId,
+    pub(super) scope: zakura_header_chain::WorkScope,
     pub(super) context: HeaderSyncDecodeContext,
 }
 

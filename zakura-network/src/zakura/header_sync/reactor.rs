@@ -292,6 +292,12 @@ impl HeaderSyncReactor {
                 session_id,
                 msg,
             } => self.handle_wire_message(peer, session_id, msg),
+            HeaderSyncEvent::SessionResponse {
+                peer,
+                session_id,
+                scope,
+                msg,
+            } => self.handle_wire_response(peer, session_id, scope, msg),
             HeaderSyncEvent::HeaderLocatorReady {
                 peer,
                 session_id,
@@ -444,12 +450,12 @@ impl HeaderSyncReactor {
                 self.handle_get_headers(peer, session_id, request);
                 return;
             }
-            HeaderSyncMessage::Headers(response) => {
-                self.handle_headers(peer, session_id, response);
+            HeaderSyncMessage::Headers(_) => {
+                tracing::debug!(?peer, "ignored response without an ownership reservation");
                 return;
             }
-            HeaderSyncMessage::HeadersOutcome(response) => {
-                self.handle_headers_outcome(peer, session_id, response);
+            HeaderSyncMessage::HeadersOutcome(_) => {
+                tracing::debug!(?peer, "ignored outcome without an ownership reservation");
                 return;
             }
         };
@@ -514,6 +520,32 @@ impl HeaderSyncReactor {
             }
             QueueWorkResult::AtCapacity => {
                 metrics::counter!("sync.header.target.capacity_refused").increment(1);
+            }
+        }
+    }
+
+    fn handle_wire_response(
+        &mut self,
+        peer: ZakuraPeerId,
+        session_id: u64,
+        scope: zakura_header_chain::WorkScope,
+        message: HeaderSyncMessage,
+    ) {
+        let Some(state) = self.peer_state.get(&peer) else {
+            return;
+        };
+        if state.session.session_id() != session_id {
+            return;
+        }
+        match message {
+            HeaderSyncMessage::Headers(response) => {
+                self.handle_headers(peer, session_id, scope, response)
+            }
+            HeaderSyncMessage::HeadersOutcome(response) => {
+                self.handle_headers_outcome(peer, session_id, scope, response)
+            }
+            HeaderSyncMessage::Status(_) | HeaderSyncMessage::GetHeaders(_) => {
+                tracing::debug!(?peer, "ignored non-response in an ownership reservation");
             }
         }
     }
@@ -628,12 +660,19 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn handle_headers(&mut self, peer: ZakuraPeerId, session_id: u64, response: Headers) {
+    fn handle_headers(
+        &mut self,
+        peer: ZakuraPeerId,
+        session_id: u64,
+        response_scope: zakura_header_chain::WorkScope,
+        response: Headers,
+    ) {
         let Some(request_id) = HeaderSyncRequestId::new(response.request_id) else {
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         };
-        if self.handle_vct_repair_headers(&peer, session_id, request_id, &response) {
+        if self.handle_vct_repair_headers(&peer, session_id, response_scope, request_id, &response)
+        {
             return;
         }
         let Some(active) = self.peer_work_queue.active(&peer).cloned() else {
@@ -641,6 +680,10 @@ impl HeaderSyncReactor {
             return;
         };
         if active.request_id != request_id {
+            metrics::counter!("sync.header.target.late_response.total").increment(1);
+            return;
+        }
+        if active.owner.scope() != response_scope {
             metrics::counter!("sync.header.target.late_response.total").increment(1);
             return;
         }
@@ -714,6 +757,7 @@ impl HeaderSyncReactor {
         };
         match session.try_send_get_headers(
             &self.codec,
+            active.owner.scope(),
             target_tip_hash,
             &locator,
             max_header_count,
@@ -739,6 +783,7 @@ impl HeaderSyncReactor {
         &mut self,
         peer: &ZakuraPeerId,
         session_id: u64,
+        response_scope: zakura_header_chain::WorkScope,
         request_id: HeaderSyncRequestId,
         response: &Headers,
     ) -> bool {
@@ -756,6 +801,9 @@ impl HeaderSyncReactor {
             self.retry_vct_repair(task.owner, source);
             return true;
         };
+        if task.owner.scope() != response_scope {
+            return true;
+        }
         let ancestor = zakura_header_chain::Frontier::new(
             response.common_ancestor_height,
             response.common_ancestor_hash,
@@ -835,6 +883,7 @@ impl HeaderSyncReactor {
         &mut self,
         peer: ZakuraPeerId,
         session_id: u64,
+        response_scope: zakura_header_chain::WorkScope,
         response: HeadersOutcome,
     ) {
         if let Some(request_id) = NonZeroU64::new(response.request_id) {
@@ -844,6 +893,9 @@ impl HeaderSyncReactor {
                     .on_wire(source, session_id, request_id)
                     .cloned()
                 {
+                    if task.owner.scope() != response_scope {
+                        return;
+                    }
                     let matches = task
                         .context
                         .as_ref()
@@ -871,6 +923,10 @@ impl HeaderSyncReactor {
             return;
         };
         if active.request_id != request_id {
+            metrics::counter!("sync.header.target.late_response.total").increment(1);
+            return;
+        }
+        if active.owner.scope() != response_scope {
             metrics::counter!("sync.header.target.late_response.total").increment(1);
             return;
         }
@@ -1447,6 +1503,7 @@ impl HeaderSyncReactor {
 
         match session.try_send_get_headers(
             &self.codec,
+            target.scope,
             target_tip_hash,
             &locator,
             max_header_count,
@@ -1672,6 +1729,7 @@ impl HeaderSyncReactor {
         for (peer, source, session) in candidates {
             let request_id = match session.try_send_get_headers(
                 &self.codec,
+                task.owner.scope(),
                 context.target.hash,
                 &context.locator,
                 1,
@@ -2206,7 +2264,7 @@ mod tests {
                 .is_ok(),
             "the wrong locator member is otherwise wire-valid"
         );
-        reactor.handle_headers(peer.clone(), 0, wrong_ancestor_response);
+        reactor.handle_headers(peer.clone(), 0, owner.scope(), wrong_ancestor_response);
         assert_peer_violation(&mut actions, HeaderSyncMisbehavior::MalformedMessage);
 
         let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
@@ -2223,6 +2281,7 @@ mod tests {
         reactor.handle_headers(
             peer.clone(),
             0,
+            owner.scope(),
             Headers {
                 request_id: owner.request_id.get(),
                 target_tip_hash: owner.branch.target_tip_hash,
@@ -2252,6 +2311,65 @@ mod tests {
             HeaderTargetPreparationResult::InvalidHeader,
         );
         assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+    }
+
+    #[test]
+    fn response_completion_requires_the_reserved_branch_scope() {
+        let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
+        let expected = reactor
+            .peer_work_queue
+            .active(&peer)
+            .expect("the fixture has active work")
+            .clone();
+        let mut wrong_scope = owner.scope();
+        wrong_scope.header_generation = wrong_scope
+            .header_generation
+            .checked_next()
+            .expect("the fixture generation has a successor");
+        reactor.handle_headers(
+            peer.clone(),
+            0,
+            wrong_scope,
+            Headers {
+                request_id: owner.request_id.get(),
+                target_tip_hash: owner.branch.target_tip_hash,
+                common_ancestor_height: snapshot.frontiers.finalized.height,
+                common_ancestor_hash: snapshot.frontiers.finalized.hash,
+                complete: true,
+                tree_aux_schema: AuxSchema::None,
+                entries: Vec::new(),
+            },
+        );
+        assert_eq!(reactor.peer_work_queue.active(&peer), Some(&expected));
+        assert!(
+            actions.try_recv().is_err(),
+            "a scope-mismatched page has no peer or scheduling effect"
+        );
+
+        let (mut reactor, mut actions, _snapshot, peer, _source, owner) = peer_violation_fixture();
+        let expected = reactor
+            .peer_work_queue
+            .active(&peer)
+            .expect("the fixture has active work")
+            .clone();
+        let mut wrong_scope = owner.scope();
+        wrong_scope.branch =
+            zakura_header_chain::BranchId::new(owner.branch.anchor_hash, block::Hash([0x73; 32]));
+        reactor.handle_headers_outcome(
+            peer.clone(),
+            0,
+            wrong_scope,
+            HeadersOutcome {
+                request_id: owner.request_id.get(),
+                target_tip_hash: owner.branch.target_tip_hash,
+                outcome: HeadersOutcomeCode::Busy,
+            },
+        );
+        assert_eq!(reactor.peer_work_queue.active(&peer), Some(&expected));
+        assert!(
+            actions.try_recv().is_err(),
+            "a scope-mismatched outcome has no peer or scheduling effect"
+        );
     }
 
     #[test]
@@ -2292,7 +2410,7 @@ mod tests {
             "the overflowing page is otherwise wire-valid"
         );
 
-        reactor.handle_headers(peer.clone(), 0, response);
+        reactor.handle_headers(peer.clone(), 0, owner.scope(), response);
 
         assert!(
             reactor.peer_work_queue.active(&peer).is_none(),
@@ -2539,6 +2657,7 @@ mod tests {
             tree_aux_schema: AuxSchema::None,
             entries: vec![response_entry],
         };
+        let stale_scope = old_active.owner.scope();
         drop(old_reactor);
 
         let mut fresh_startup = startup(CancellationToken::new());
@@ -2578,9 +2697,10 @@ mod tests {
         let published_tip = fresh_handle.best_header_tip();
         let published_candidates = fresh_handle.candidate_state();
 
-        fresh_reactor.handle_event(HeaderSyncEvent::SessionWireMessage {
+        fresh_reactor.handle_event(HeaderSyncEvent::SessionResponse {
             peer: peer.clone(),
             session_id: 7,
+            scope: stale_scope,
             msg: HeaderSyncMessage::Headers(stale_response),
         });
 
@@ -2843,9 +2963,10 @@ mod tests {
         assert_eq!(request.max_header_count, 1);
         assert_eq!(request.tree_aux_schema, AuxSchema::V1);
         handle
-            .send(HeaderSyncEvent::SessionWireMessage {
+            .send(HeaderSyncEvent::SessionResponse {
                 peer: peer.clone(),
                 session_id: 0,
+                scope: owner.scope(),
                 msg: HeaderSyncMessage::Headers(Headers {
                     request_id: request.request_id,
                     target_tip_hash: repair_header.hash,
@@ -3078,9 +3199,10 @@ mod tests {
             HeaderSyncAction::QueryVctRepairContext { .. }
         ));
         handle
-            .send(HeaderSyncEvent::SessionWireMessage {
+            .send(HeaderSyncEvent::SessionResponse {
                 peer,
                 session_id: 0,
+                scope: owner.scope(),
                 msg: HeaderSyncMessage::Headers(Headers {
                     request_id: request.request_id,
                     target_tip_hash: repair_header.hash,
@@ -3352,9 +3474,10 @@ mod tests {
             other => panic!("expected GetHeaders, got {other:?}"),
         };
         handle
-            .send(HeaderSyncEvent::SessionWireMessage {
+            .send(HeaderSyncEvent::SessionResponse {
                 peer: peer.clone(),
                 session_id: 0,
+                scope,
                 msg: HeaderSyncMessage::Headers(Headers {
                     request_id: first_request.request_id,
                     target_tip_hash: target.hash,
@@ -3381,9 +3504,10 @@ mod tests {
         };
         assert_eq!(continuation.locator_hashes, vec![first.hash]);
         handle
-            .send(HeaderSyncEvent::SessionWireMessage {
+            .send(HeaderSyncEvent::SessionResponse {
                 peer: peer.clone(),
                 session_id: 0,
+                scope,
                 msg: HeaderSyncMessage::Headers(Headers {
                     request_id: continuation.request_id,
                     target_tip_hash: target.hash,
@@ -3637,9 +3761,10 @@ mod tests {
                 other => panic!("expected GetHeaders, got {other:?}"),
             };
             handle
-                .send(HeaderSyncEvent::SessionWireMessage {
+                .send(HeaderSyncEvent::SessionResponse {
                     peer: peer.clone(),
                     session_id: 0,
+                    scope,
                     msg: HeaderSyncMessage::HeadersOutcome(HeadersOutcome {
                         request_id: request.request_id,
                         target_tip_hash: target,

@@ -12,7 +12,7 @@ use super::{
     scheduler::{
         coverage::{BranchRange, CoverageMap},
         peer_work::{HeaderTargetPhase, PeerWorkPriority, PeerWorkQueue, QueueWorkResult},
-        repair::{VctRepairQueue, VctRepairTask},
+        repair::{RepairPhase, VctRepairQueue, VctRepairTask},
         retry::BodyRetryQueue,
         status::StatusPublisher,
     },
@@ -119,6 +119,7 @@ struct PeerState {
     session: HeaderSyncPeerSession,
     status_publisher: Option<StatusPublisher>,
     last_received_status_at: Option<Instant>,
+    last_status: Option<Status>,
 }
 
 #[derive(Debug)]
@@ -281,6 +282,9 @@ impl HeaderSyncReactor {
                 target_tip_hash,
                 locator,
             } => self.handle_header_locator_ready(peer, session_id, target_tip_hash, locator),
+            HeaderSyncEvent::VctRepairContextReady { owner, result } => {
+                self.handle_vct_repair_context_ready(owner, result)
+            }
             HeaderSyncEvent::HeaderPathLeaseReady {
                 peer,
                 session_id,
@@ -343,6 +347,7 @@ impl HeaderSyncReactor {
                 session,
                 status_publisher,
                 last_received_status_at: None,
+                last_status: None,
             },
         ) {
             previous.session.cancel_token().cancel();
@@ -392,6 +397,12 @@ impl HeaderSyncReactor {
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         }
+        if let Some(state) = self.peer_state.get_mut(&peer) {
+            state.last_received_status_at = Some(Instant::now());
+            state.last_status = Some(status.clone());
+        }
+        self.request_vct_repair_context();
+        self.try_assign_vct_repair();
 
         let target = AdvertisedHeaderTarget {
             session_id,
@@ -403,9 +414,6 @@ impl HeaderSyncReactor {
         };
         let work_order = target.claimed_work_order(local);
         let eligible = target.is_discovery_eligible(local);
-        if let Some(state) = self.peer_state.get_mut(&peer) {
-            state.last_received_status_at = Some(Instant::now());
-        }
         if !eligible {
             self.peer_work_queue.remove_unstarted(&peer);
             return;
@@ -1131,6 +1139,9 @@ impl HeaderSyncReactor {
     }
 
     fn observe_vct_root_repair(&mut self, status: zakura_header_chain::VctRootRepairStatus) {
+        if self.vct_repair_status == status {
+            return;
+        }
         self.vct_repair_status = status;
         self.schedule_current_vct_repair();
     }
@@ -1149,6 +1160,143 @@ impl HeaderSyncReactor {
             "the queue is cleared before scheduling the current repair"
         );
         metrics::counter!("sync.header.vct.repair.scheduled.total").increment(1);
+        self.request_vct_repair_context();
+    }
+
+    fn request_vct_repair_context(&mut self) {
+        let Some(task) = self.vct_repairs.scheduled() else {
+            return;
+        };
+        if task.context.is_some() || task.context_requested {
+            return;
+        }
+        let owner = task.owner;
+        let height = task.range.start;
+        if self.dispatch_action(HeaderSyncAction::QueryVctRepairContext { owner, height }) {
+            let _ = self
+                .vct_repairs
+                .get_mut(owner)
+                .expect("the scheduled repair remains owned during synchronous dispatch")
+                .mark_context_requested();
+        }
+    }
+
+    fn handle_vct_repair_context_ready(
+        &mut self,
+        owner: zakura_header_chain::WorkOwner,
+        result: VctRepairContextResult,
+    ) {
+        if self.vct_repairs.get(owner).is_none_or(|task| {
+            task.phase != RepairPhase::Scheduled
+                || task.context.is_some()
+                || !task.context_requested
+        }) {
+            return;
+        }
+        match result {
+            VctRepairContextResult::Resolved(context) => {
+                if self
+                    .vct_repairs
+                    .get_mut(owner)
+                    .expect("the exact scheduled repair was checked above")
+                    .resolve(context)
+                    .is_err()
+                {
+                    self.vct_repairs.remove(owner);
+                    return;
+                }
+                self.try_assign_vct_repair();
+            }
+            VctRepairContextResult::Stale => {
+                self.vct_repairs.remove(owner);
+            }
+            VctRepairContextResult::Unavailable => {
+                let _ = self
+                    .vct_repairs
+                    .get_mut(owner)
+                    .expect("the exact pending context read was checked above")
+                    .context_unavailable();
+                metrics::counter!("sync.header.vct.repair.context_unavailable.total").increment(1);
+            }
+        }
+    }
+
+    fn try_assign_vct_repair(&mut self) {
+        let Some(task) = self.vct_repairs.scheduled().cloned() else {
+            return;
+        };
+        let Some(context) = task.context.as_ref() else {
+            return;
+        };
+        let Some(predecessor) = context.locator.entries().first().copied() else {
+            return;
+        };
+        let response_bytes = 1_usize
+            .saturating_add(8)
+            .saturating_add(32)
+            .saturating_add(4)
+            .saturating_add(32)
+            .saturating_add(4)
+            .saturating_add(1)
+            .saturating_add(1)
+            .saturating_add(header_sync_header_bytes_for_network(&self.startup.network))
+            .saturating_add(4)
+            .saturating_add(TREE_AUX_SCHEMA_V1_BYTES);
+        let mut candidates: Vec<_> = self
+            .peer_state
+            .iter()
+            .filter_map(|(peer, state)| {
+                let status = state.last_status.as_ref()?;
+                (status.selected_tip_hash == task.owner.branch.target_tip_hash
+                    && status.selected_tip_height >= context.target.height
+                    && status.oldest_retained_height <= predecessor.height
+                    && status.max_headers_per_response != 0
+                    && status.max_inflight_requests != 0
+                    && usize::try_from(status.max_message_bytes).unwrap_or(usize::MAX)
+                        >= response_bytes
+                    && status.tree_aux_schema_mask & AuxSchema::V1.mask_bit() != 0
+                    && self.peer_work_queue.active(peer).is_none())
+                .then(|| {
+                    source_id_from_peer(peer)
+                        .map(|source| (peer.clone(), source, state.session.clone()))
+                })
+                .flatten()
+            })
+            .collect();
+        candidates.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        for (peer, source, session) in candidates {
+            let request_id = match session.try_send_get_headers(
+                &self.codec,
+                context.target.hash,
+                &context.locator,
+                1,
+                AuxSchema::V1,
+            ) {
+                Ok(request_id) => request_id,
+                Err(_) => continue,
+            };
+            let wire_owner = task.owner.scope().bind(
+                session.session_id(),
+                NonZeroU64::new(request_id.get()).expect("header-sync request IDs are nonzero"),
+            );
+            if self
+                .vct_repairs
+                .assign(task.owner, wire_owner, source)
+                .is_err()
+            {
+                session.cancel_request(request_id);
+                return;
+            }
+            debug_assert_eq!(self.pending_owners.insert(source, wire_owner), None);
+            metrics::counter!("sync.header.vct.repair.requested.total").increment(1);
+            debug!(
+                ?peer,
+                height = context.target.height.0,
+                hash = ?context.target.hash,
+                "requested exact selected VCT metadata repair"
+            );
+            return;
+        }
     }
 
     fn retire_obsolete_work(&mut self, snapshot: &zakura_header_chain::EngineSnapshot) {
@@ -1528,6 +1676,101 @@ mod tests {
             }
         )
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn vct_repair_uses_one_exact_canonical_auxiliary_request() {
+        let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown.clone());
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let repair_header =
+            zakura_header_chain::Frontier::new(block::Height(1), block::Hash([2; 32]));
+        let selected_tip =
+            zakura_header_chain::Frontier::new(block::Height(2), block::Hash([3; 32]));
+        let mut snapshot = committed_snapshot(anchor);
+        snapshot.frontiers.header_best = selected_tip;
+        let (snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+        startup.committed_snapshots = Some(snapshots_rx);
+        let repair_status = zakura_header_chain::VctRootRepairStatus {
+            state: zakura_header_chain::VctRootRepairState::Unavailable {
+                height: repair_header.height,
+            },
+            generation: 7,
+        };
+        let (_repairs_tx, repairs_rx) = watch::channel(repair_status);
+        startup.vct_root_repairs = Some(repairs_rx);
+        let (handle, mut actions, reactor) =
+            spawn_header_sync_reactor(startup).expect("the repair fixture starts");
+        let query = next_action(&mut actions).await;
+        let HeaderSyncAction::QueryVctRepairContext { owner, height } = query else {
+            panic!("the exact repair context query precedes ordinary maintenance");
+        };
+        assert_eq!(height, repair_header.height);
+        assert_eq!(
+            owner.scope(),
+            zakura_header_chain::WorkScope::for_body_work(&snapshot)
+        );
+        assert!(matches!(
+            next_action(&mut actions).await,
+            HeaderSyncAction::QueryMissingBlockBodies { .. }
+        ));
+
+        let (send, mut outbound) = framed_channel(8);
+        let peer = peer();
+        handle
+            .send(HeaderSyncEvent::PeerConnected(
+                HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
+            ))
+            .await
+            .expect("the repair supplier connects");
+        let _status = outbound.recv().await.expect("the local status is sent");
+        handle
+            .send(HeaderSyncEvent::SessionWireMessage {
+                peer: peer.clone(),
+                session_id: 0,
+                msg: HeaderSyncMessage::Status(Status {
+                    work_anchor_height: anchor.height,
+                    work_anchor_hash: anchor.hash,
+                    selected_tip_height: selected_tip.height,
+                    selected_tip_hash: selected_tip.hash,
+                    suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+                    oldest_retained_height: anchor.height,
+                    max_headers_per_response: 1,
+                    max_inflight_requests: 1,
+                    max_message_bytes: 2_000_000,
+                    tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+                }),
+            })
+            .await
+            .expect("the repair supplier status reaches the reactor");
+        handle
+            .send(HeaderSyncEvent::VctRepairContextReady {
+                owner,
+                result: VctRepairContextResult::Resolved(zakura_header_chain::VctRepairContext {
+                    target: repair_header,
+                    locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
+                }),
+            })
+            .await
+            .expect("the exact repair context reaches the reactor");
+
+        let request = outbound.recv().await.expect("the repair request is sent");
+        let HeaderSyncMessage::GetHeaders(request) = handle
+            .codec()
+            .decode_frame(request, None)
+            .expect("the canonical repair request decodes")
+        else {
+            panic!("the repair uses the canonical GetHeaders message");
+        };
+        assert_ne!(request.request_id, 0);
+        assert_eq!(request.target_tip_hash, repair_header.hash);
+        assert_eq!(request.locator_hashes, vec![anchor.hash]);
+        assert_eq!(request.max_header_count, 1);
+        assert_eq!(request.tree_aux_schema, AuxSchema::V1);
+
+        drop(snapshots_tx);
+        shutdown.cancel();
+        reactor.await.expect("the repair reactor stops cleanly");
     }
 
     async fn next_action(actions: &mut mpsc::Receiver<HeaderSyncAction>) -> HeaderSyncAction {

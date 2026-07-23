@@ -201,6 +201,13 @@ pub enum HeaderSyncEvent {
         /// Coherent locator, absent when state is unavailable.
         locator: Option<zakura_header_chain::HeaderLocator>,
     },
+    /// State resolved one branch-owned VCT repair against the exact selected projection.
+    VctRepairContextReady {
+        /// Owner echoed from the exact state query.
+        owner: zakura_header_chain::WorkOwner,
+        /// Exact state-read outcome.
+        result: VctRepairContextResult,
+    },
     /// State finished acquiring an immutable path for one inbound request.
     HeaderPathLeaseReady {
         /// Peer that sent the request.
@@ -249,6 +256,17 @@ pub enum HeaderSyncEvent {
     },
 }
 
+/// Result of resolving one branch-owned VCT repair against durable state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VctRepairContextResult {
+    /// The owner is current and the exact selected request was resolved.
+    Resolved(zakura_header_chain::VctRepairContext),
+    /// The owner or requested selected height is no longer current.
+    Stale,
+    /// Local state or driver capacity prevented the read.
+    Unavailable,
+}
+
 impl HeaderSyncEvent {
     pub(super) fn metrics_label(&self) -> &'static str {
         match self {
@@ -259,6 +277,7 @@ impl HeaderSyncEvent {
             Self::SessionWireMessage { .. } => "session_wire_message",
             Self::StateFrontiersChanged(_) => "state_frontiers_changed",
             Self::HeaderLocatorReady { .. } => "header_locator_ready",
+            Self::VctRepairContextReady { .. } => "vct_repair_context_ready",
             Self::HeaderPathLeaseReady { .. } => "header_path_lease_ready",
             Self::HeaderPathPageReady { .. } => "header_path_page_ready",
             Self::HeaderTargetPrepared { .. } => "header_target_prepared",
@@ -348,6 +367,13 @@ pub enum HeaderSyncAction {
         session_id: u64,
         /// Exact advertised target hash.
         target_tip_hash: block::Hash,
+    },
+    /// Ask state to resolve one current branch-owned VCT repair.
+    QueryVctRepairContext {
+        /// Complete owner captured with the committed repair signal.
+        owner: zakura_header_chain::WorkOwner,
+        /// Exact unavailable selected-header height.
+        height: block::Height,
     },
     /// Acquire an immutable retained path for one inbound request.
     AcquireHeaderPath {

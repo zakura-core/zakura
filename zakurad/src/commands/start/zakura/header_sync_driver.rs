@@ -266,6 +266,32 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     })
                     .await;
             }
+            HeaderSyncAction::QueryVctRepairContext { owner, height } => {
+                let result = match read_state
+                    .clone()
+                    .oneshot(zakura_state::ReadRequest::VctRepairContext { owner, height })
+                    .await
+                {
+                    Ok(zakura_state::ReadResponse::VctRepairContext(Some(context))) => {
+                        zakura_network::zakura::VctRepairContextResult::Resolved(context)
+                    }
+                    Ok(zakura_state::ReadResponse::VctRepairContext(None)) => {
+                        zakura_network::zakura::VctRepairContextResult::Stale
+                    }
+                    Ok(response) => {
+                        warn!(?owner, ?response, "unexpected VctRepairContext response");
+                        zakura_network::zakura::VctRepairContextResult::Unavailable
+                    }
+                    Err(error) => {
+                        warn!(?owner, ?error, "failed to query exact VCT repair context");
+                        zakura_network::zakura::VctRepairContextResult::Unavailable
+                    }
+                };
+                let _ = handles
+                    .header_sync
+                    .send(HeaderSyncEvent::VctRepairContextReady { owner, result })
+                    .await;
+            }
             HeaderSyncAction::AcquireHeaderPath {
                 peer,
                 session_id,
@@ -1072,6 +1098,11 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
                 insert_cs_str(row, cs_trace::ACTION, "query_header_locator");
                 insert_cs_peer(row, cs_trace::PEER, peer);
                 insert_cs_hash(row, cs_trace::HASH, *target_tip_hash);
+            }
+            HeaderSyncAction::QueryVctRepairContext { owner, height } => {
+                insert_cs_str(row, cs_trace::ACTION, "query_vct_repair_context");
+                insert_cs_height(row, cs_trace::HEIGHT, *height);
+                insert_cs_hash(row, cs_trace::HASH, owner.branch.target_tip_hash);
             }
             HeaderSyncAction::AcquireHeaderPath { peer, request, .. } => {
                 insert_cs_str(row, cs_trace::ACTION, "acquire_header_path");

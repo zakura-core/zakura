@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use thiserror::Error;
-use zakura_header_chain::{EngineSnapshot, EvidenceId, SourceId, WorkOwner};
+use zakura_header_chain::{EngineSnapshot, EvidenceId, SourceId, VctRepairContext, WorkOwner};
 
 use super::coverage::BranchRange;
 
@@ -34,6 +34,12 @@ pub enum RepairTaskError {
     /// Range and owner name different exact branches.
     #[error("repair range and owner branch identities differ")]
     BranchMismatch,
+    /// A wire owner changed the durable repair scope.
+    #[error("wire assignment changed the VCT repair scope")]
+    ScopeMismatch,
+    /// The resolved target is outside the exact one-height repair range.
+    #[error("resolved VCT repair target is outside its exact range")]
+    TargetMismatch,
     /// The requested phase edge is not part of the repair state machine.
     #[error("illegal VCT repair phase transition")]
     IllegalPhase,
@@ -43,7 +49,7 @@ pub enum RepairTaskError {
 }
 
 /// One branch-owned auxiliary repair task.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VctRepairTask {
     /// Exact asynchronous owner fixed when work was scheduled.
     pub owner: WorkOwner,
@@ -53,6 +59,10 @@ pub struct VctRepairTask {
     pub phase: RepairPhase,
     /// Failed or abandoned on-wire attempts.
     pub attempts: u8,
+    /// State-resolved selected request context, once available.
+    pub context: Option<VctRepairContext>,
+    /// Whether the exact state context read is currently outstanding.
+    pub context_requested: bool,
 }
 
 impl VctRepairTask {
@@ -66,7 +76,54 @@ impl VctRepairTask {
             range,
             phase: RepairPhase::Scheduled,
             attempts: 0,
+            context: None,
+            context_requested: false,
         })
+    }
+
+    /// Record that one bounded state context read is outstanding.
+    pub fn mark_context_requested(&mut self) -> Result<(), RepairTaskError> {
+        if self.phase != RepairPhase::Scheduled || self.context.is_some() || self.context_requested
+        {
+            return Err(RepairTaskError::IllegalPhase);
+        }
+        self.context_requested = true;
+        Ok(())
+    }
+
+    /// Attach a still-current exact selected request context.
+    pub fn resolve(&mut self, context: VctRepairContext) -> Result<(), RepairTaskError> {
+        if self.phase != RepairPhase::Scheduled || !self.context_requested {
+            return Err(RepairTaskError::IllegalPhase);
+        }
+        if self.range.start != self.range.end || context.target.height != self.range.start {
+            return Err(RepairTaskError::TargetMismatch);
+        }
+        self.context = Some(context);
+        self.context_requested = false;
+        Ok(())
+    }
+
+    /// Release one failed local context read for a later retry.
+    pub fn context_unavailable(&mut self) -> Result<(), RepairTaskError> {
+        if self.phase != RepairPhase::Scheduled || !self.context_requested {
+            return Err(RepairTaskError::IllegalPhase);
+        }
+        self.context_requested = false;
+        Ok(())
+    }
+
+    /// Bind a resolved task to the actual canonical stream request.
+    pub fn assign(&mut self, owner: WorkOwner, peer: SourceId) -> Result<(), RepairTaskError> {
+        if self.phase != RepairPhase::Scheduled || self.context.is_none() {
+            return Err(RepairTaskError::IllegalPhase);
+        }
+        if owner.scope() != self.owner.scope() {
+            return Err(RepairTaskError::ScopeMismatch);
+        }
+        self.owner = owner;
+        self.phase = RepairPhase::OnWire { peer };
+        Ok(())
     }
 
     /// Advance along one legal monotonic repair phase edge.
@@ -99,6 +156,8 @@ impl VctRepairTask {
             .checked_add(1)
             .ok_or(RepairTaskError::AttemptsExhausted)?;
         self.phase = RepairPhase::Scheduled;
+        self.context = None;
+        self.context_requested = false;
         Ok(())
     }
 }
@@ -116,6 +175,37 @@ impl VctRepairQueue {
     /// Return one exact task for phase handling.
     pub fn get_mut(&mut self, owner: WorkOwner) -> Option<&mut VctRepairTask> {
         self.0.get_mut(&owner)
+    }
+
+    /// Return one exact task without permitting mutation.
+    pub fn get(&self, owner: WorkOwner) -> Option<&VctRepairTask> {
+        self.0.get(&owner)
+    }
+
+    /// Return the sole scheduled task, when one exists.
+    pub fn scheduled(&self) -> Option<&VctRepairTask> {
+        self.0
+            .values()
+            .find(|task| task.phase == RepairPhase::Scheduled)
+    }
+
+    /// Rekey a resolved task from its scheduling owner to its actual wire owner.
+    pub fn assign(
+        &mut self,
+        scheduled_owner: WorkOwner,
+        wire_owner: WorkOwner,
+        peer: SourceId,
+    ) -> Result<(), RepairTaskError> {
+        let mut task = self
+            .0
+            .remove(&scheduled_owner)
+            .ok_or(RepairTaskError::IllegalPhase)?;
+        if let Err(error) = task.assign(wire_owner, peer) {
+            self.0.insert(scheduled_owner, task);
+            return Err(error);
+        }
+        self.0.insert(wire_owner, task);
+        Ok(())
     }
 
     /// Retire one completed, stale, or canceled task.

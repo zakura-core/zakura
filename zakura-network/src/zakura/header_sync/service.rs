@@ -242,6 +242,12 @@ impl HeaderSyncPeerSession {
         result
     }
 
+    pub(super) fn cancel_request(&self, request_id: HeaderSyncRequestId) {
+        if let Some(commands) = &self.inner.commands {
+            let _ = commands.send(HeaderSyncPeerCommand::Cancel(request_id));
+        }
+    }
+
     pub(super) fn try_send_headers(
         &self,
         codec: &HeaderSyncCodec,
@@ -316,6 +322,14 @@ pub(crate) async fn drive_header_sync_actions(
                         session_id,
                         target_tip_hash,
                         locator: None,
+                    })
+                    .await;
+            }
+            HeaderSyncAction::QueryVctRepairContext { owner, .. } => {
+                let _ = handle
+                    .send(HeaderSyncEvent::VctRepairContextReady {
+                        owner,
+                        result: VctRepairContextResult::Unavailable,
                     })
                     .await;
             }

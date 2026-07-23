@@ -20,7 +20,7 @@ pub use events::{
     FullStateFrontiers, HeaderPathLease, HeaderPathLeaseResult, HeaderPathPage,
     HeaderPathPageResult, HeaderSyncAction, HeaderSyncEvent, HeaderSyncHandle,
     HeaderSyncMisbehavior, HeaderSyncRequestId, HeaderSyncStartup, HeaderTargetAdmissionResult,
-    HeaderTargetPreparationResult,
+    HeaderTargetPreparationResult, VctRepairContextResult,
 };
 pub use reactor::spawn_header_sync_reactor;
 pub use scheduler::coverage::BranchRange;

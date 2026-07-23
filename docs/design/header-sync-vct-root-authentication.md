@@ -12,10 +12,14 @@ commitment-root index.
 
 This design makes `zakura-state` the owner of a single, durable, ascending
 root authentication frontier. Header discovery remains responsible for
-finding and committing valid headers, while a root-authentication lane
-supplies overlapping canonical header ranges to state. State verifies each
-range against its current history-tree frontier and atomically persists
-only the confirmed root prefix.
+finding and committing valid headers. Root-carrying header responses are retained
+in reactor memory through the VCT handoff region until the state-owned
+authentication frontier can consume them. Authentication and promotion remain gated
+by completed-checkpoint coverage, so retained payloads above the current completed
+checkpoint wait until that frontier advances. A root-authentication network lane
+fetches an overlapping canonical range only when the retained responses have a gap
+or authentication rejects a payload. State verifies each range against its current
+history-tree frontier and atomically persists only the confirmed root prefix.
 
 The central invariant is:
 
@@ -44,7 +48,11 @@ header chain becomes canonical.
    without duplicating chain ownership.
 5. Keep failure behavior fail-closed: missing or invalid roots cannot influence VCT state.
 6. Reuse the existing ZIP-221 verification implementation rather than introducing new cryptography.
-7. Keep bandwidth and restart costs bounded.
+7. Avoid re-fetching roots already delivered with committed headers unless their
+   retained payload was lost, invalidated, or rejected.
+8. Retain root-carrying payloads with committed headers through the VCT handoff so
+   later checkpoint closure does not force a re-fetch; gate authentication and
+   promotion on completed-checkpoint coverage.
 
 ## 3. Non-goals
 
@@ -56,6 +64,7 @@ header chain becomes canonical.
   headers.
 - Supporting multiple durable candidate header branches.
 - Fetching headers below the verified body/history-tree authentication base.
+- Preserving unauthenticated retained roots across restart.
 
 ## 4. Cryptographic constraint
 
@@ -114,6 +123,8 @@ Responsibility is divided as follows.
 - request scheduling and response correlation;
 - frame and shape validation;
 - peer, session, and request attribution;
+- in-memory retention of root-carrying committed-header responses through the
+  VCT handoff region;
 - retries and peer policy;
 - the one-header overlap used by the root-authentication lane.
 
@@ -142,19 +153,27 @@ The header-discovery lane:
 2. validates their wire shape, proof of work, linkage, and checkpoint termination;
 3. asks state to perform contextual validation and canonical chain selection;
 4. writes headers and body-size hints;
-5. does not write peer-supplied roots.
+5. retains aligned roots and their peer attribution in reactor memory after
+   the headers commit, through the VCT handoff region even when ahead of the
+   current completed checkpoint;
+6. does not write peer-supplied roots to the authoritative index.
 
 The root-authentication lane:
 
 1. follows the state-published authenticated root frontier;
-2. requests a canonical, overlapping range from one peer;
-3. submits the complete response to state while its peer attribution is live;
-4. persists only the prefix confirmed by the successor header;
-5. advances the durable frontier after the database write succeeds.
+2. consumes the next contiguous overlapping range from retained forward responses;
+3. submits the complete single-peer response to state while its attribution is live;
+4. requests a replacement overlapping range from a peer only when retained coverage
+   is missing, invalidated, or rejected;
+5. persists only the prefix confirmed by the successor header;
+6. advances the durable frontier after the database write succeeds.
 
-The lanes can share a network response when a newly discovered header range begins
-exactly where root authentication is ready to advance. Otherwise, root
-authentication can re-request already-known canonical headers.
+Forward responses are the primary source of roots. Header discovery may run ahead
+without forcing the same roots to be downloaded again: committed root-carrying
+payloads wait in reactor memory until their predecessor becomes the durable
+authentication frontier and their successor is covered by a completed checkpoint.
+The dedicated authentication request path is recovery for gaps and invalid
+payloads, not the steady-state supply path.
 
 ### 5.3 Why state owns the frontier
 
@@ -255,10 +274,14 @@ store and configured checkpoint list before publishing it.
 complete. A short response retains no authority from that flag. Root authentication
 uses only `HighestCompletedCheckpoint` as its promotion limit.
 
-An authentication delivery may include one canonical successor header above the
-completed checkpoint snapshot to witness the root at the frontier height. State may
-promote roots only through `HighestCompletedCheckpoint.height`; the successor's root
-remains unconfirmed until a later completed bracket authorizes further promotion.
+The completed checkpoint bracket bounds the successor witness as well as the
+promoted roots. A witness header above `HighestCompletedCheckpoint.height` is not
+pinned by any configured checkpoint hash, so it authenticates nothing: a peer can
+craft a valid-PoW successor whose commitment field matches fabricated auxiliary
+inputs, and nothing below the fast-sync handoff ever semantically verifies that
+field. Every promoted root and its successor witness must therefore be at or below
+`HighestCompletedCheckpoint.height`. The root at the checkpoint height itself
+remains unconfirmed until a later completed bracket supplies a pinned successor.
 
 ## 7. State API
 
@@ -295,11 +318,12 @@ struct HeaderRootAuthState {
 }
 ```
 
-The root scheduler requests from `authenticated.confirmed_height + 1`. Both every
-promoted root and its successor witness must be at or below
-`completed_checkpoint.height`, so the highest promotable root is strictly below that
-frontier. Neither frontier is inferred from a network request flag or a successful
-response.
+The root scheduler consumes retained coverage from
+`authenticated.confirmed_height + 1` and requests fallback coverage from that height
+only on a miss. Both every promoted root and its successor witness must be at or
+below `completed_checkpoint.height`, so the highest promotable root is strictly
+below that frontier. Neither frontier is inferred from a network request flag or a
+successful response.
 
 State validates all of the following before promotion:
 
@@ -344,9 +368,8 @@ or scheduler change. Store and write errors are local faults.
 
 ## 8. Overlapping range protocol
 
-Assume the durable frontier is authenticated through height `F`.
-
-The root lane requests:
+Assume the durable frontier is authenticated through height `F`. The next complete
+single-peer delivery, retained from forward sync or fetched as fallback, covers:
 
 ```text
 [F + 1 ... E + 1]
@@ -358,8 +381,9 @@ State verifies the full delivery and persists:
 [F + 1 ... E]
 ```
 
-The root at `E + 1` is deliberately discarded because it is not confirmed by that
-delivery. The next request starts at the overlapping header:
+The root at `E + 1` is not promoted because it is not confirmed by that delivery.
+The next root-carrying forward or fallback response starts at the overlapping
+header:
 
 ```text
 [E + 1 ... N + 1]
@@ -371,7 +395,10 @@ This confirms and persists:
 [E + 1 ... N]
 ```
 
-No pending unverified root needs to survive between requests.
+The terminal root does not need a separate per-height quarantine entry: the complete
+next response repeats it together with the successor witness and remains attributable
+to one peer. Other committed forward responses may remain in the retained store while
+authentication catches up.
 
 For a range of 4,000 headers, one repeated boundary header adds approximately
 0.025% request-count overhead. This is preferable to a durable quarantine index or
@@ -385,16 +412,22 @@ successor is available.
 
 ### 9.1 Common path
 
-When the next header-discovery response starts at `confirmed_height + 1`, the same
-response can serve both lanes:
+Every valid forward response within the VCT root window carries roots with its
+headers. After state commits the independently valid headers, the reactor retains
+the aligned payload and its exact peer/session/request attribution. When a retained response starts at
+`confirmed_height + 1` and includes a checkpoint-covered successor witness, the same
+response serves both lanes:
 
 1. state commits the independently valid headers;
-2. state authenticates the roots against those now-canonical headers;
-3. state persists the confirmed prefix;
-4. the reactor advances both header scheduling and root scheduling.
+2. the reactor retains the root-carrying payload;
+3. state authenticates the roots against those now-canonical headers;
+4. state persists the confirmed prefix;
+5. the reactor advances the authentication frontier and consumes the next retained
+   response.
 
 The request's final header becomes the overlap header for the next root-carrying
-request.
+range. Retained responses are never combined across peers to manufacture an
+authentication witness range.
 
 ### 9.2 Header lead
 
@@ -402,21 +435,55 @@ Header discovery may run ahead of root authentication. Headers remain useful for
 download scheduling and checkpoint closure, so missing roots must not block their
 commit.
 
-Root authentication remains bounded by its own small number of in-flight requests.
-It does not retain an unbounded queue of unverified roots. Responses that cannot
-advance the current root frontier are either:
+The reactor stores root-carrying payloads from committed forward ranges in a map
+keyed by contiguous start height. This retained store may extend ahead of both the
+durable authentication frontier and the current completed checkpoint. Let `C` be
+the VCT fast-sync handoff and maximum configured checkpoint. Retention continues
+through header `C`, which is the final checkpoint-covered successor witness used to
+authenticate the peer-supplied root at `C - 1`. Payloads above `C` are not requested
+or retained: ordinary semantic verification rebuilds those trees from bodies.
+Completed-checkpoint coverage gates authentication and promotion only.
+There is no separate resident height or byte budget and no pressure eviction.
+Keeping the open-bracket retained lead is simpler and cheap enough for the VCT
+region, and avoids re-fetching when the next checkpoint closes. State still
+authenticates exactly one range at a time in ascending order.
 
-- used only for header discovery and their roots discarded; or
-- requested without tree-aux roots.
+On each authentication-frontier or completed-checkpoint update, the reactor first
+looks for retained contiguous coverage starting at `confirmed_height + 1` and
+ending with a successor witness at or below the completed checkpoint. A hit is
+dispatched directly to state. A miss schedules one overlapping `AuthenticateRoots`
+network request. An invalid retained response is discarded, attributed to its
+supplying peer, and replaced from another peer; stale or local state errors do not
+prove the retained roots invalid.
 
-When the root frontier catches up, it reuses the stored canonical headers as the
-expected chain and obtains a fresh overlapping root response.
+Checkpoint coverage can advance while a root request is in flight. This does not
+invalidate an unchanged authenticated height and hash: state uses the latest
+checkpoint snapshot to bound the response witness, while compare-and-swap staleness
+applies only to the durable root frontier. When `HighestCompletedCheckpoint`
+advances, previously retained open-bracket payloads become eligible without a
+network round-trip.
+
+Authentication advancement removes retained entries at or below the new frontier.
+Frontier rollback or removal, checkpoint rollback, branch replacement, peer-session
+retirement, and canonical hash mismatch drop affected retained payloads. Every
+payload is rechecked against the current canonical headers and checkpoint bound
+before persistence.
 
 ## 10. Forward-only startup
 
 The existing backward header-sync lane is removed before root authentication is
 implemented. Header discovery and root authentication schedule only ascending work
 from the durable verified body/history-tree authentication base.
+
+The base is a one-time seed and a floor, not an ongoing coupling to body sync. A
+history tree can only be extended forward from an already-trusted tree state, and
+the trusted sources are the empty tree at the activation height and the tree
+produced by verified block bodies. On a fresh fast-sync node the base is the
+activation-height tree, so root authentication starts with no body progress at all.
+On an existing database the base is the verified body tip, below which every root
+row is already authoritative. Above the base, the only forward gate on promotion is
+`HighestCompletedCheckpoint`, which canonical headers alone advance; body sync
+never bounds the root-authentication frontier from above.
 
 At startup, state publishes that base together with the canonical header frontier and
 completed-checkpoint snapshot. Header sync resumes at the first missing height above
@@ -442,7 +509,8 @@ This forward-only checkpoint gating keeps:
 - checkpoint-backed authentication immutable.
 
 If the body pipeline reaches a missing root before authentication catches up, VCT
-stays fail-closed and prioritizes the corresponding forward root request.
+stays fail-closed and prioritizes retained coverage for that range, then a fallback
+root request if the retained store has a gap.
 
 ## 11. Reorganizations
 
@@ -452,6 +520,11 @@ checkpoint bracket.
 
 Therefore ordinary unfinalized header reorganizations affect header discovery but do
 not roll back the authenticated root frontier.
+
+Explicit finalized-state rollback or startup recovery may rebase this durable
+frontier and truncate the corresponding authoritative suffix. The single ascending
+frontier invariant applies during ordinary forward operation, not across an operator-
+requested database rollback.
 
 A `NonCanonicalHeader` result means a network response raced a header-store change.
 It is dropped without peer punishment and retried against the current canonical
@@ -463,7 +536,8 @@ outside this design.
 
 ## 12. Peer attribution
 
-Each root-authentication request is supplied by one peer and contains both:
+Each root-authentication operation uses one complete response supplied by one peer
+and contains both:
 
 - roots and transaction counts for height `H`;
 - the successor header and auth-data root needed to authenticate height `H`.
@@ -508,10 +582,10 @@ enum HeaderSyncOperationKind {
 One peer response may start both operations. They share the request identity but
 have distinct operation identities.
 
-The reactor preserves this identity through the outstanding request, buffered
-payload, driver action, state await, and completion event. State does not receive
-network peer types. The driver retains the identity while awaiting the typed state
-result and attaches it to the event returned to the reactor.
+The reactor preserves this identity through the outstanding request, retained or
+buffered payload, driver action, state await, and completion event. State does not
+receive network peer types. The driver retains the identity while awaiting the typed
+state result and attaches it to the event returned to the reactor.
 
 Every completion settles exactly the pending operation with the same identity.
 Peer attribution, retries, and failure handling never infer operation identity from
@@ -551,7 +625,8 @@ Startup performs:
 3. verify that its `(height, hash)` matches the canonical header store;
 4. verify that the frontier is not behind the authoritative body history tree;
 5. if bodies advanced farther, rebase to the body-derived history tree;
-6. schedule the next overlapping request from `confirmed_height + 1`.
+6. schedule a fallback overlapping request from `confirmed_height + 1`, because the
+   pre-restart retained store is intentionally not restored.
 
 No unverified candidate roots are restored.
 
@@ -592,15 +667,17 @@ serialized, this requires no network-side lazy rebuild.
 Root authentication is required only through the last checkpoint used by VCT fast
 sync.
 
-To authenticate the last VCT checkpoint root at height `C`, state must first publish a
-later completed checkpoint bracket that canonically covers successor header `C + 1`.
-An uncheckpointed successor is insufficient: a competing valid successor can commit
-to different parent auxiliary inputs. The embedded final frontier remains an
-independent handoff check: its Sapling, Orchard, and Ironwood roots must equal the
-authenticated roots at `C` before the frontier is written.
+Let `C = network.checkpoint_list().max_height()`, which is also the height of the
+embedded final frontier. The peer-root lane promotes through `C - 1`; checkpoint
+header `C` is the final pinned successor witness. It does not attempt to authenticate
+the peer-supplied root at `C`, because no later configured checkpoint can pin a
+successor at `C + 1`. Instead, the embedded final frontier and the normal handoff-body
+checks independently establish the authoritative Sapling, Orchard, and Ironwood
+state at `C`.
 
 Above `C`, ordinary semantic verification and tree updates resume. Header sync stops
-requesting tree-aux roots unless another feature requires them.
+requesting and retaining tree-aux roots above `C` unless another feature requires
+them.
 
 ## 16. Serving policy
 
@@ -653,20 +730,29 @@ Repeated peer failures:
 
 ## 18. Bandwidth and memory
 
-The selected design spends one repeated header per root range. It does not keep an
-unbounded root candidate cache and does not persist untrusted payloads.
+The selected design retains root-carrying payloads with committed headers through
+the VCT handoff so authentication can consume them later without a steady-state
+re-download. It does not persist untrusted payloads.
 
-In the steady path, header discovery and root authentication share the same response,
-so the only repeated data is the one-header boundary overlap.
+In the steady path, header discovery supplies every root payload and authentication
+later consumes it from the retained store once completed-checkpoint coverage
+allows. The only repeated data is the one-header boundary overlap between adjacent
+forward responses.
 
 Extra bandwidth occurs when:
 
-- root authentication follows headers that were previously committed without roots;
-- a node restarts before authenticating an in-flight response;
-- an invalid response must be fetched from another peer.
+- a committed range arrived without complete roots;
+- a node restarted before authenticating retained responses;
+- a rebase or canonical mismatch invalidated retained responses;
+- authentication rejected a response and replacement data must come from another
+  peer.
 
-This cost is bounded by the root-authentication window and is preferable to making
-untrusted data durable.
+Retention is bounded by the VCT handoff region, not by the current completed
+checkpoint. Open-bracket payloads between `HighestCompletedCheckpoint` and the
+header tip remain cached until that checkpoint closes, authentication consumes
+them, or they are invalidated. The store removes consumed or invalidated entries
+promptly and does not pressure-evict under a memory budget. Refetch after restart is
+acceptable and is preferable to making untrusted data durable.
 
 A future roots-only recovery message could avoid retransmitting full headers, using
 `(height, header_hash, roots)` records. It is not required initially and adds another
@@ -719,15 +805,26 @@ Advantages:
 - untrusted roots never reach disk;
 - peer provenance is easy to retain;
 - no new persistent format.
+- roots delivered with headers are not normally downloaded again;
+- header and authentication throughput can differ without wasting forward-response
+  bandwidth.
 
 Disadvantages:
 
-- restart and eviction require re-fetching;
-- forward sync can outrun the cache;
+- restart requires re-fetching;
+- forward sync can outrun authentication and hold retained payloads until the
+  frontier catches up;
 - delayed cross-range verification complicates attribution;
-- another queue needs backpressure and reorganization cleanup.
+- another queue needs reorganization cleanup.
 
-Decision: unnecessary when overlapping requests keep verification synchronous.
+Decision: accepted in a constrained form. The reactor retains complete,
+single-peer, root-carrying forward payloads keyed by contiguous range; it does not
+cache independent per-height candidates or combine data from different peers.
+State remains the only owner of authentication and durable promotion. The cache is
+ephemeral, limited by the VCT handoff region (not the current completed checkpoint),
+and cleared or pruned on frontier and session invalidation. It does not use a
+separate memory budget or pressure eviction. Completed-checkpoint coverage gates
+only when a retained payload may be authenticated.
 
 ### 19.4 Persistent quarantine index
 
@@ -865,14 +962,32 @@ Implemented in draft
 6. Gate promotion on the state-published `HighestCompletedCheckpoint`.
 7. Require the successor witness itself to be covered by that frontier.
 
-### Phase 5: integrate VCT consumption
+### Phase 5: retain forward root payloads
+
+1. Replace the one-shot `reusable_payload` path with a reactor-owned retained
+   payload store limited by the VCT handoff region.
+2. Make adjacent root-carrying forward requests overlap by one header so every
+   retained authentication range contains its own terminal successor witness and
+   remains attributable to one peer.
+3. Insert complete root-carrying payloads only after their headers commit, including
+   payloads ahead of the current completed checkpoint.
+4. Preserve exact peer, session, and request attribution with each payload.
+5. Consume contiguous retained coverage from `confirmed_height + 1` before
+   scheduling authentication network work, but only when the successor witness is
+   covered by `HighestCompletedCheckpoint`.
+6. Make `AuthenticateRoots` requests fallback-only for missing, invalidated, or
+   rejected coverage.
+7. Prune consumed payloads and invalidate affected payloads on frontier rebase,
+   checkpoint rollback, canonical mismatch, and peer-session retirement.
+
+### Phase 6: integrate VCT consumption
 
 1. Make `PeerSource` read only authenticated roots.
 2. Retain body-time checks as defense in depth.
 3. Keep bounded repair for missing authenticated rows.
 4. Verify the embedded final frontier against the authenticated checkpoint root.
 
-### Phase 6: remove obsolete provisional behavior
+### Phase 7: remove obsolete provisional behavior
 
 1. Remove provisional-root terminology and reads.
 2. Remove body-commit invalidation of unauthenticated database rows.
@@ -916,6 +1031,10 @@ Implemented in draft
 ### Network scheduling
 
 - Consecutive root requests overlap by exactly one header.
+- Adjacent root-carrying forward responses overlap by exactly one header, so each
+  retained response independently carries its successor witness.
+- The repeated boundary header commits idempotently and does not regress or duplicate
+  canonical header progress.
 - The confirmed prefix is one shorter than the delivered headers.
 - Short responses use their actual final header as the next overlap.
 - Serving can shorten only at the authenticated frontier or available header tip,
@@ -930,6 +1049,21 @@ Implemented in draft
 - A response from an avoided peer is not immediately retried to that peer.
 - Invalid roots are attributed to the peer that supplied the complete witness range.
 - Local and stale state errors do not score peers.
+- A root-carrying forward payload remains retained after header commit even when its
+  range is ahead of the current authentication frontier or completed checkpoint.
+- Authentication consumes retained contiguous coverage before scheduling a network
+  fallback request, and only once the successor is checkpoint-covered.
+- A long header lead does not re-fetch retained roots for the same heights.
+- When `HighestCompletedCheckpoint` advances, previously retained open-bracket
+  payloads become eligible without a fallback request.
+- A retained-store miss schedules exactly one overlapping fallback request.
+- Invalid retained roots are dropped, attributed to their original peer, and
+  replaced from another peer.
+- Frontier advancement prunes consumed retained payloads.
+- Rebase, canonical mismatch, checkpoint rollback, and peer-session retirement drop
+  affected retained payloads without promoting them.
+- Retained payloads through the VCT handoff are kept until consumed or invalidated;
+  there is no pressure eviction.
 
 ### Forward-only startup
 
@@ -947,29 +1081,101 @@ Implemented in draft
 ### Restart and handoff
 
 - Restart resumes at `confirmed_height + 1`.
-- The first post-restart request overlaps the correct canonical header.
+- The first post-restart fallback starts at `confirmed_height + 1` and includes its
+  successor witness; it does not re-request `confirmed_height`.
 - No unverified tip root survives restart.
-- The last VCT checkpoint root is confirmed only after a later completed checkpoint
-  covers its successor.
+- Restart may re-fetch roots that existed only in the pre-restart retained store.
+- The final peer-promoted root is at `C - 1`, confirmed by checkpoint header `C`;
+  the embedded frontier and handoff-body checks establish the authoritative state at
+  `C`.
 - The embedded frontier must match the authenticated last-checkpoint roots.
 
 ## 22. Metrics and diagnostics
 
-Suggested metrics:
+The primary health metric is `sync.header.root_auth.lead_blocks`. It is the
+authenticated root height minus the verified body tip, saturated at zero. During
+checkpoint sync it should normally be positive and large enough to absorb temporary
+network or verification delays. A value of zero is not automatically an error at the
+chain tip or during startup, but zero combined with body-sync root retries means the
+authentication lane has failed to stay ahead.
+
+The bounded retained pipeline is exposed through these gauges:
+
+- `sync.header.root_auth.work.retained_batches`: committed forward responses held
+  for future authentication;
+- `sync.header.root_auth.work.retained_heights`: the sum of entries in retained
+  responses, including repeated overlap witnesses;
+- `sync.header.root_auth.work.pending_batches`: fallback ranges waiting for a peer;
+- `sync.header.root_auth.work.in_flight_batches`: fallback requests currently
+  assigned to peers;
+- `sync.header.root_auth.work.buffered_batches`: fallback responses waiting for the
+  durable frontier;
+- `sync.header.root_auth.work.authenticating_batches`: retained or fallback ranges
+  admitted to state authentication; this should never remain above one because
+  durable verification is serial;
+- `sync.header.root_auth.work.resident_heights`: the sum of entries in queued,
+  in-flight, buffered, retained, and authenticating root ranges. Overlap witnesses
+  are counted in adjacent ranges, so this measures retained lead size rather than
+  unique heights.
+
+The retained-store and fallback counters are:
+
+- `sync.header.root_auth.retain.admitted`: committed root-carrying forward responses
+  added to the retained store;
+- `sync.header.root_auth.retain.hit`: next-frontier authentication ranges supplied
+  from retained forward responses;
+- `sync.header.root_auth.retain.miss`: next-frontier ranges absent from retained
+  coverage;
+- `sync.header.root_auth.retain.dropped{reason=...}`: retained responses removed
+  without authentication. Expected reasons include `frontier_advanced`,
+  `frontier_rebased`, `checkpoint_rebased`, `canonical_mismatch`,
+  `invalid_roots`, and `session_retired`;
+- `sync.header.root_auth.fallback.requested{reason=...}`: overlapping network
+  recovery requested because of `missing`, `invalid_roots`, or `restart`;
+- `sync.header.root_auth.completed`: state operations that reported success. Durable
+  progress is still accepted only from the state watch, so this counter alone does not
+  prove frontier advancement.
+
+The steady path should have a high retain-hit rate and near-zero fallback requests.
+Occasional `frontier_advanced` drops are normal because a larger authenticated range
+can cover retained work. Repeated `frontier_rebased`, `checkpoint_rebased`, or
+`canonical_mismatch` drops without corresponding canonical chain changes indicate
+scheduler/state churn. Any `invalid_roots` drop identifies a peer payload that
+failed authentication.
+
+Body commit exposes the consequences of insufficient lead:
+
+- `state.vct.root.unavailable.count`: a body needed a root that was not present in the
+  authenticated index;
+- `state.vct.root.await_successor.count`: the root existed but lacked its authenticated
+  successor witness;
+- `state.vct.root.retry.count`: write-loop retry polls. One stall can increment this
+  many times, so use it as a rate rather than an incident count;
+- `state.vct.root.stalled.height`: zero normally; after a prolonged retry episode it
+  contains the blocked body height;
+- `state.vct.root.repair.requested`: bounded repair requests sent back to header sync;
+- `state.vct.fast_path.hit` and `state.vct.fast_path.miss`: whether finalized body
+  commits used the authenticated-root fast path.
+
+A healthy checkpoint-sync dashboard should show a positive
+`sync.header.root_auth.lead_blocks`, at most one authenticating batch, retained work
+within the VCT handoff region, a high retain-hit rate, near-zero fallback
+requests, and no sustained increase in either root-unavailable counter. The
+strongest correctness regression signal is:
 
 ```text
-sync.header.root_auth.frontier.height
-sync.header.root_auth.requested
-sync.header.root_auth.confirmed
-sync.header.root_auth.rejected
-sync.header.root_auth.retry
-sync.header.root_auth.stale
-sync.header.root_auth.local_error
-sync.header.root_auth.storage_error
-sync.header.root_auth.waiting_for_checkpoint
-sync.header.root_auth.waiting_for_header
-sync.header.root_auth.overlap_headers
+sync.header.root_auth.lead_blocks == 0
+and rate(state.vct.root.retry.count) > 0
 ```
+
+When diagnosing that condition, first compare retained batches, retain hits/misses,
+and fallback pending/in-flight/buffered gauges. Retained coverage with no retain hits
+points to a frontier, overlap, or checkpoint-bound mismatch. Persistent misses with
+no retained coverage point to lost or never-admitted payloads. Pending fallback work
+with no in-flight work points to peer admission or scheduling; in-flight fallback
+work without a response points to network latency or timeouts. No retained or
+fallback work despite available checkpoint coverage points to a scheduler
+regression.
 
 Logs for failures should include:
 
@@ -1001,5 +1207,12 @@ After implementation:
 11. The authoritative root index is contiguous through the authenticated frontier.
 12. Every asynchronous state result is matched to its original request and operation;
     range geometry is never used as completion identity.
-13. Body verification remains the final proof that authenticated auxiliary values
+13. Root-carrying committed-header responses are retained in reactor memory through
+    the VCT handoff region until authenticated, invalidated, or lost on restart,
+    including payloads ahead of the current completed checkpoint.
+14. Retained roots are consumed before network fallback once their successor is
+    checkpoint-covered; heights already retained are not re-fetched unless coverage
+    is missing, invalidated, or rejected.
+15. Retained roots never enter the authoritative index without state authentication.
+16. Body verification remains the final proof that authenticated auxiliary values
     match downloaded transactions.

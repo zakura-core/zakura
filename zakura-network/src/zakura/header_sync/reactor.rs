@@ -1756,6 +1756,7 @@ impl HeaderSyncReactor {
     }
 
     fn retire_obsolete_work(&mut self, snapshot: &zakura_header_chain::EngineSnapshot) {
+        self.peer_work_queue.retire_obsolete_unstarted(snapshot);
         let obsolete_served_paths: Vec<_> = self
             .served_paths
             .iter()

@@ -184,6 +184,26 @@ impl PeerWorkQueue {
         self.work_by_peer.len()
     }
 
+    /// Retire locator work captured from an obsolete committed snapshot.
+    ///
+    /// Active requests are retired through `PendingOwners`, which also owns their
+    /// completion identity. This removes only targets that have not reached that
+    /// ownership boundary yet.
+    pub(in crate::zakura::header_sync) fn retire_obsolete_unstarted(
+        &mut self,
+        current: &EngineSnapshot,
+    ) -> usize {
+        let before = self.work_by_peer.len();
+        self.work_by_peer.retain(|_, work| match work {
+            PeerWorkState::AwaitingLocator { target, .. } => {
+                target.scope
+                    == WorkScope::for_header_target(current, target.status.selected_tip_hash)
+            }
+            PeerWorkState::Active(_) => true,
+        });
+        before.saturating_sub(self.work_by_peer.len())
+    }
+
     pub(in crate::zakura::header_sync) fn stage(
         &mut self,
         peer: ZakuraPeerId,
@@ -558,6 +578,39 @@ mod tests {
         assert!(queue
             .awaiting(&peer(17), 7, hash(17), expected.scope)
             .is_some());
+    }
+
+    #[test]
+    fn generation_change_retires_unstarted_targets_before_new_scheduling() {
+        let local = snapshot();
+        let mut queue = PeerWorkQueue::default();
+        let awaiting = advertisement(1);
+        assert_eq!(
+            queue.stage(peer(1), awaiting, PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        let active = advertisement(2);
+        assert_eq!(
+            queue.stage(peer(2), active.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        assert!(queue.start(active_request(2, active, &local, Vec::new())));
+
+        let mut current = local;
+        current.state_version = current
+            .state_version
+            .checked_next()
+            .expect("the fixture state version advances");
+        current.header_generation = current
+            .header_generation
+            .checked_next()
+            .expect("the fixture generation advances");
+        assert_eq!(queue.retire_obsolete_unstarted(&current), 1);
+        assert_eq!(queue.len(), 1);
+        assert!(
+            queue.active(&peer(2)).is_some(),
+            "active requests remain owned by the pending-owner retirement path"
+        );
     }
 
     #[test]

@@ -154,6 +154,10 @@ mod ownership_tests {
         assert!(response_event.contains("scope: zakura_header_chain::WorkScope"));
 
         let reactor = include_str!("reactor.rs");
+        assert!(
+            reactor.contains("self.peer_work_queue.retire_obsolete_unstarted(snapshot);"),
+            "committed snapshots must retire staged locator targets before new scheduling"
+        );
         let served = declaration(reactor, "enum ServedPathState");
         assert_eq!(
             served

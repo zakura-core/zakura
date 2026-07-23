@@ -48,7 +48,10 @@ independently predict the lowest work/raw-hash eviction, including the case
 where the newly offered tip is discarded without a durable delete. The replay
 function also replays stable same-height branches in both insertion orders,
 requiring unequal-work and equal-work/raw-hash selection to converge to
-byte-identical retained state. It is also used by deterministic corpus tests.
+byte-identical retained state. Consecutive-reset replay builds lower,
+same-height, and forward exact-hash verified paths without intervening forward
+work, then requires the next child to anchor to the final reset hash. It is also
+used by deterministic corpus tests.
 
 `header_pursuit` consumes at most 512 bytes as four-byte operations over twenty
 logical peers. It drives the production peer work queue, response-page and

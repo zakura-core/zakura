@@ -46,6 +46,8 @@ pub struct ForkReplaySummary {
     pub pressure_checks: u16,
     /// Same-height insertion-order permutation checks completed.
     pub permutation_checks: u16,
+    /// Consecutive exact-branch reset checks completed.
+    pub reset_checks: u16,
     /// Final authoritative snapshot.
     pub snapshot: EngineSnapshot,
     /// Stable digest of operation outcomes and snapshots.
@@ -443,13 +445,14 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     let mut no_effects = 0u16;
     let mut pressure_checks = 0u16;
     let mut permutation_checks = 0u16;
+    let mut reset_checks = 0u16;
     let mut transcript = Sha256::new();
     let clock = ManualClock::new();
     let authority = FuzzAuthority;
     assert_exhaustive_oracle(&store);
 
     for (operation, encoded) in bounded.iter().copied().enumerate() {
-        if matches!(bounded.first(), Some(b'A' | b'T'))
+        if matches!(bounded.first(), Some(b'A' | b'R' | b'T'))
             && encoded == b'\n'
             && operation.saturating_add(1) == bounded.len()
         {
@@ -464,6 +467,15 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
             transcript.update(digest);
             no_effects = no_effects.saturating_add(1);
             permutation_checks = permutation_checks.saturating_add(1);
+            assert_exhaustive_oracle(&store);
+            continue;
+        }
+        if encoded == b'R' {
+            let digest = assert_consecutive_resets();
+            transcript.update(b"resets");
+            transcript.update(digest);
+            no_effects = no_effects.saturating_add(1);
+            reset_checks = reset_checks.saturating_add(1);
             assert_exhaustive_oracle(&store);
             continue;
         }
@@ -706,6 +718,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         no_effects,
         pressure_checks,
         permutation_checks,
+        reset_checks,
         snapshot: store.snapshot(),
         replay_digest: transcript.finalize().into(),
         retained_digest: retained_digest(&store),
@@ -840,6 +853,174 @@ fn assert_same_height_permutations() -> [u8; 32] {
     hasher.update(equal_forward.0);
     hasher.update(unequal_forward.0);
     hasher.finalize().into()
+}
+
+fn assert_consecutive_resets() -> [u8; 32] {
+    let mut store = FuzzStore::new(EngineMode::Integrated);
+    let clock = ManualClock::new();
+    let authority = FuzzAuthority;
+    let incumbent = insert_fixture_path(&mut store, &clock, &authority, 70, 31, 4);
+    let lower = insert_fixture_path(&mut store, &clock, &authority, 71, 32, 1);
+    let same_height = insert_fixture_path(&mut store, &clock, &authority, 72, 33, 1);
+    let forward = insert_fixture_path(&mut store, &clock, &authority, 73, 34, 5);
+
+    let reset_paths = [&incumbent, &lower, &same_height, &forward];
+    for (index, path) in reset_paths.into_iter().enumerate() {
+        let before = store.snapshot();
+        let new_tip = path.last().expect("each reset fixture path is nonempty");
+        let request = TransitionRequest {
+            expected_version: before.state_version,
+            event: crate::TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+                full_state_transition_id: evidence(80 + index, new_tip.hash.0[0]),
+                old_tip: before.frontiers.verified_best,
+                new_path: path.clone(),
+                cause: VerifiedChangeCause::Reset,
+            }),
+        };
+        let context = TransitionContext {
+            config: &store.config,
+            clock: &clock,
+            full_state_authority: Some(&authority),
+            startup_capability: None,
+            retention_references: &[],
+        };
+        let plan = apply_transition(&store, request, &context)
+            .expect("each exact retained reset path is admissible");
+        assert_eq!(
+            plan.change_set().metadata.frontiers.verified_best,
+            Frontier::new(new_tip.height, new_tip.hash),
+            "reset selects the exact hash-qualified path rather than inferring by height"
+        );
+        assert_eq!(
+            plan.change_set().metadata.verified_generation,
+            before
+                .verified_generation
+                .checked_next()
+                .expect("the bounded reset fixture cannot exhaust its generation"),
+            "every exact reset retires the previous verified-work generation"
+        );
+        assert_eq!(
+            plan.change_set().metadata.header_generation,
+            before.header_generation,
+            "verified reset shape alone does not replace independently selected header work"
+        );
+        store.commit(&plan);
+        assert_eq!(
+            store
+                .verified
+                .iter()
+                .map(|frontier| frontier.hash)
+                .collect::<Vec<_>>(),
+            std::iter::once(store.metadata.frontiers.finalized.hash)
+                .chain(path.iter().map(|header| header.hash))
+                .collect::<Vec<_>>(),
+            "the committed verified projection is the exact reset branch"
+        );
+        assert_exhaustive_oracle(&store);
+    }
+
+    assert!(
+        incumbent.last().expect("incumbent is nonempty").height
+            > lower.last().expect("lower reset is nonempty").height
+    );
+    assert_eq!(
+        lower.last().expect("lower reset is nonempty").height,
+        same_height
+            .last()
+            .expect("same-height reset is nonempty")
+            .height
+    );
+    assert_ne!(
+        lower.last().expect("lower reset is nonempty").hash,
+        same_height
+            .last()
+            .expect("same-height reset is nonempty")
+            .hash
+    );
+    assert!(
+        forward.last().expect("forward reset is nonempty").height
+            > same_height
+                .last()
+                .expect("same-height reset is nonempty")
+                .height
+    );
+
+    let final_tip = store.metadata.frontiers.verified_best;
+    let request = store.insertion(final_tip, 1, 90, 35);
+    let inserted_tip = match &request.event {
+        crate::TransitionEvent::InsertHeaders(event) => {
+            assert_eq!(event.parent_hash, final_tip.hash);
+            assert_eq!(
+                event.completion,
+                TargetCompletion::TargetComplete {
+                    common_ancestor: final_tip,
+                }
+            );
+            assert_eq!(
+                event.batch.headers()[0].header.previous_block_hash,
+                final_tip.hash,
+                "the first forward request after consecutive resets anchors to the final exact hash"
+            );
+            event.target_tip_hash
+        }
+        _ => unreachable!("the next-child fixture constructs one header insertion"),
+    };
+    let context = TransitionContext {
+        config: &store.config,
+        clock: &clock,
+        full_state_authority: Some(&authority),
+        startup_capability: None,
+        retention_references: &[],
+    };
+    let plan =
+        apply_transition(&store, request, &context).expect("the exact next child is admissible");
+    store.commit(&plan);
+    assert_eq!(
+        store
+            .graph
+            .node(inserted_tip)
+            .expect("the committed next child is retained")
+            .parent_hash,
+        final_tip.hash
+    );
+    assert_exhaustive_oracle(&store);
+    retained_digest(&store)
+}
+
+fn insert_fixture_path(
+    store: &mut FuzzStore,
+    clock: &ManualClock,
+    authority: &FuzzAuthority,
+    operation: usize,
+    branch: u8,
+    count: u32,
+) -> Vec<VerifiedHeaderRef> {
+    let request = store.insertion(store.metadata.frontiers.finalized, count, operation, branch);
+    let path = match &request.event {
+        crate::TransitionEvent::InsertHeaders(event) => event
+            .batch
+            .headers()
+            .iter()
+            .map(|header| VerifiedHeaderRef {
+                height: header.height,
+                hash: header.hash,
+                header: header.header.clone(),
+            })
+            .collect(),
+        _ => unreachable!("the reset fixture constructs only header insertions"),
+    };
+    let context = TransitionContext {
+        config: &store.config,
+        clock,
+        full_state_authority: Some(authority),
+        startup_capability: None,
+        retention_references: &[],
+    };
+    let plan =
+        apply_transition(store, request, &context).expect("the reset fixture branch is admissible");
+    store.commit(&plan);
+    assert_exhaustive_oracle(store);
+    path
 }
 
 fn permutation_fixture(
@@ -1207,6 +1388,15 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_resets_use_exact_branch_identity() {
+        let first = replay_fork_transition_bytes(b"R");
+        let second = replay_fork_transition_bytes(b"R");
+        assert_eq!(first, second);
+        assert_eq!(first.reset_checks, 1);
+        assert_eq!(first.no_effects, 1);
+    }
+
+    #[test]
     #[should_panic(expected = "selected projection must exactly match parent links")]
     fn exhaustive_oracle_rejects_a_projection_gap() {
         let mut store = FuzzStore::new(EngineMode::Integrated);
@@ -1338,6 +1528,12 @@ mod tests {
                     "../../fuzz/header-chain/corpus/fork_transitions/aud_03_same_height_permutations"
                 ),
             ),
+            (
+                "aud_04_consecutive_resets",
+                include_bytes!(
+                    "../../fuzz/header-chain/corpus/fork_transitions/aud_04_consecutive_resets"
+                ),
+            ),
         ];
         for (name, bytes) in corpus {
             let first = replay_fork_transition_bytes(bytes);
@@ -1357,6 +1553,9 @@ mod tests {
             }
             if *name == "aud_03_same_height_permutations" {
                 assert_eq!(first.permutation_checks, 1);
+            }
+            if *name == "aud_04_consecutive_resets" {
+                assert_eq!(first.reset_checks, 1);
             }
         }
     }

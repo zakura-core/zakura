@@ -10,8 +10,9 @@ Stdlib only, mirroring deploy/deployer/deploy.py.
 
 Each node binds a distinct loopback address (127.0.0.1, 127.0.0.2, ...) rather
 than a distinct port: Kresko hardcodes one p2p/RPC port per host (18233/18232),
-assuming one node per machine, so distinct IPs let its generated configs and
-peer lists be used unmodified.
+assuming one node per machine. `kresko localize-fleet` re-points each generated
+config at that node's own address and directories, and `kresko seed-local`
+loads the generated chain into it -- work this harness used to do in Python.
 
 The chain is synthetic. Funded keys spend premine on a network whose magic is
 generated per run, so they are worthless off this chain -- but they are still
@@ -24,7 +25,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -245,176 +245,31 @@ def cmd_genesis(args) -> int:
 
 
 # ---------------------------------------------------------------------------- #
-# Per-node config rewriting
+# Per-node config localization (delegated to Kresko)
 # ---------------------------------------------------------------------------- #
 
-# Kresko renders its configs one key per line with toml::to_string_pretty, so a
-# line-oriented rewrite is sound. Addressing is by "section.key" rather than by
-# bare key because the same key name recurs across sections -- `cache_dir` is
-# both the peer cache and the state DB, and `listen_addr` appears in [network],
-# [rpc], and [network.zakura]. A bare-key rewrite silently hits only the first,
-# which would leave every node sharing one RocksDB.
-def set_toml_values(text: str, updates: dict[str, str], *, insert_missing: bool = False) -> str:
-    """Set `section.key = value` entries, addressed by full dotted path.
 
-    Missing keys raise unless `insert_missing`, so Kresko template drift fails
-    loudly instead of leaving a node on a default binding.
+def localize_fleet(lab: Path, args) -> None:
+    """Render each node's localized config via `kresko localize-fleet`.
+
+    Kresko generates one-node-per-host configs (0.0.0.0 binds, a shared /root
+    state dir). `kresko localize-fleet` re-points each node's config at its own
+    127.0.0.x loopback and per-node directories, inserts the metrics endpoint
+    and internal-miner flag, empties the public seed-peer lists, and regenerates
+    the loopback peer list -- the work the harness used to do in Python. The
+    resolved lab dir is passed so the absolute node-relative paths Kresko bakes
+    in match this run's layout.
     """
-    remaining = dict(updates)
-    out: list[str] = []
-    section = ""
-    # Where each section's body ends, so a missing key can be inserted into it.
-    section_end: dict[str, int] = {}
-
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            section = stripped.strip("[]")
-        elif "=" in stripped and not stripped.startswith("#"):
-            key = stripped.split("=", 1)[0].strip()
-            path = f"{section}.{key}" if section else key
-            if path in remaining:
-                out.append(f"{key} = {remaining.pop(path)}")
-                section_end[section] = len(out)
-                continue
-        if section:
-            section_end[section] = len(out) + 1
-        out.append(line)
-
-    if remaining and not insert_missing:
-        raise KeyError(
-            "keys not found in generated config (Kresko template drift?): "
-            + ", ".join(sorted(remaining))
-        )
-    # Insert leftovers at the end of their section, or append the section.
-    for path, value in sorted(remaining.items(), reverse=True):
-        target_section, _, key = path.rpartition(".")
-        if target_section in section_end:
-            out.insert(section_end[target_section], f"{key} = {value}")
-        else:
-            out.extend(["", f"[{target_section}]", f"{key} = {value}"])
-    return "\n".join(out) + "\n"
-
-
-def prepare_node_dirs(lab: Path, node_count: int, miner_nodes: int) -> None:
-    """Rewrite each generated config to bind that node's own loopback address.
-
-    Kresko generates configs for one-node-per-host: every node would otherwise
-    bind 0.0.0.0 on the same ports and share `state.cache_dir`. We give each its
-    own 127.0.0.x bind and its own state dir so N nodes coexist on one machine.
-    """
-    payload = lab / "payload"
-    for i in range(node_count):
-        name = node_name(i)
-        ip = node_ip(i)
-        node_dir = lab / "nodes" / name
-        for sub in ("state", "identity", "cookie"):
-            (node_dir / sub).mkdir(parents=True, exist_ok=True)
-
-        for src_name, dst_name in (
-            ("zebrad.toml", "zakura.toml"),
-            ("zebrad.bootstrap.toml", "zakura.bootstrap.toml"),
-        ):
-            text = (payload / name / src_name).read_text()
-            # Kresko renders remote-deployment absolute paths (/root/payload,
-            # /root/.cache); repoint every one at this node's own directory so
-            # N nodes never share a state DB, peer cache, identity, or cookie.
-            updates = {
-                "network.cache_dir": f'"{node_dir / "peer-cache"}"',
-                "network.identity_dir": f'"{node_dir / "identity"}"',
-                "state.cache_dir": f'"{node_dir / "state"}"',
-                "rpc.cookie_dir": f'"{node_dir / "cookie"}"',
-                "rpc.listen_addr": f'"{ip}:{RPC_PORT}"',
-                "network.testnet_parameters.checkpoints": f'"{checkpoints_path(lab)}"',
-            }
-            # The bootstrap config deliberately runs P2P-disabled on an isolated
-            # RPC, so it keeps Kresko's own network.listen_addr handling.
-            if not dst_name.endswith("bootstrap.toml"):
-                updates["network.listen_addr"] = f'"{ip}:{P2P_PORT}"'
-            # The Zakura p2p stack is inactive under p2p_stack = "default", but
-            # it still binds a wildcard port that every node would contend for.
-            updates["network.zakura.listen_addr"] = f'"{ip}:{ZAKURA_P2P_PORT}"'
-            text = set_toml_values(text, updates)
-            # Inserted rather than replaced: Kresko writes neither key.
-            text = set_toml_values(
-                text,
-                {
-                    "metrics.endpoint_addr": f'"{ip}:{METRICS_PORT}"',
-                    # Only the designated miners produce blocks; the rest are
-                    # pure relay/mempool peers, which is what we measure.
-                    "mining.internal_miner": str(i < miner_nodes).lower(),
-                },
-                insert_missing=True,
-            )
-            text = clear_public_peers(text)
-            # Kresko bakes the peer list at genesis time from config.json's
-            # addresses. Regenerating it here from the live addressing keeps
-            # `up` correct even if genesis ran with a different node count or
-            # address base -- a stale list silently yields a 0-peer network.
-            if not dst_name.endswith("bootstrap.toml"):
-                text = set_peer_list(text, i, node_count)
-            (node_dir / dst_name).write_text(text)
-
-        shutil.copy(payload / name / "funded_key.json", node_dir / "funded_key.json")
-
-
-def set_peer_list(text: str, index: int, node_count: int) -> str:
-    """Point node `index` at every other node in the lab."""
-    peers = [f"{node_ip(other)}:{P2P_PORT}" for other in range(node_count) if other != index]
-    return set_toml_arrays(text, {"initial_testnet_peers": peers}, require=True)
-
-
-def checkpoints_path(lab: Path) -> Path:
-    return lab / "payload" / "local_genesis" / "checkpoints.txt"
-
-
-# Multi-line arrays of public seed nodes. The active stack is `default` with
-# network = Testnet, so none of these are dialled on this chain -- but an
-# isolated testnet should carry no route to a public network at all, so they
-# are emptied rather than left to depend on that.
-PUBLIC_PEER_KEYS = ("initial_mainnet_peers", "bootstrap_peers")
-
-
-def clear_public_peers(text: str) -> str:
-    """Empty every public seed-peer list, preserving the loopback peer list."""
-    return set_toml_arrays(text, {key: [] for key in PUBLIC_PEER_KEYS})
-
-
-def set_toml_arrays(text: str, arrays: dict[str, list[str]], *, require: bool = False) -> str:
-    """Replace whole `key = [...]` arrays, single- or multi-line.
-
-    Handles both forms Kresko emits, and raises for a missing key when
-    `require` -- a silently absent peer list yields a 0-peer network that
-    measures nothing.
-    """
-    out: list[str] = []
-    seen: set[str] = set()
-    consuming = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if consuming:
-            # Drop the old entries up to the closing bracket.
-            if stripped.startswith("]"):
-                consuming = False
-            continue
-        key = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
-        if key in arrays:
-            seen.add(key)
-            items = arrays[key]
-            if items:
-                out.append(f"{key} = [")
-                out.extend(f'    "{item}",' for item in items)
-                out.append("]")
-            else:
-                out.append(f"{key} = []")
-            # A single-line `key = [...]` is fully consumed by this line.
-            consuming = not stripped.rstrip().endswith("]")
-            continue
-        out.append(line)
-    missing = set(arrays) - seen
-    if require and missing:
-        raise KeyError(f"array key(s) not found in generated config: {sorted(missing)}")
-    return "\n".join(out) + "\n"
+    run(
+        [
+            args.kresko_binary,
+            "localize-fleet",
+            "-d",
+            str(lab),
+            "--miner-nodes",
+            str(args.miner_nodes),
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------- #
@@ -536,15 +391,16 @@ def stop_proc(proc: subprocess.Popen, name: str, timeout_secs: int = 60) -> None
 def seed_node(lab: Path, args, index: int) -> None:
     """Load the generated chain into one node via the P2P-disabled bootstrap config.
 
-    Mirrors Kresko's scripts/node_init.sh: bring the node up with P2P off so it
-    cannot gossip a partial chain, submitblock genesis then every premine block,
-    then shut down. The node is restarted on the real config by `start`.
+    Brings the node up with P2P off so it cannot gossip a partial chain, then
+    hands the genesis and premine blocks to `kresko seed-local`, which submits
+    them over RPC (with the duplicate/rejected retry and height-idempotence
+    semantics scripts/node_init.sh uses), then shuts the node down. The node is
+    restarted on the real config by `up`.
     """
     name = node_name(index)
     url = f"http://{node_ip(index)}:{RPC_PORT}"
-    genesis_hex = (lab / "payload" / "local_genesis" / "genesis.hex").read_text().strip()
+    genesis_path = lab / "payload" / "local_genesis" / "genesis.hex"
     premine_path = lab / "payload" / "local_genesis" / "premine_blocks.hex"
-    blocks = [b for b in premine_path.read_text().splitlines() if b.strip()]
 
     proc = spawn_node(lab, args, index, bootstrap=True)
     try:
@@ -554,21 +410,18 @@ def seed_node(lab: Path, args, index: int) -> None:
                 f"{name}: bootstrap RPC never came up (see {log_path})"
                 + explain_startup_failure(log_path)
             )
-        # Idempotence: a node that already holds the seed chain must not be
-        # re-seeded. Resubmitting genesis to a node whose tip has moved past it
-        # returns a bare "rejected", which reads as a chain failure rather than
-        # "this already ran".
-        height = rpc_call(url, "getblockchaininfo").get("blocks") or 0
-        if height >= len(blocks):
-            print(f"{name}: already seeded to height {height}, skipping", flush=True)
-            return
-        submit_block(url, genesis_hex, f"{name} genesis")
-        for n, block_hex in enumerate(blocks, start=1):
-            submit_block(url, block_hex, f"{name} seed block {n}/{len(blocks)}")
-            if n == 1 or n % 25 == 0 or n == len(blocks):
-                print(f"{name}: seeded {n}/{len(blocks)} blocks", flush=True)
-        height = rpc_call(url, "getblockchaininfo")["blocks"]
-        print(f"{name}: seeded to height {height}", flush=True)
+        run(
+            [
+                args.kresko_binary,
+                "seed-local",
+                "--rpc-endpoint",
+                url,
+                "--genesis",
+                str(genesis_path),
+                "--premine",
+                str(premine_path),
+            ]
+        )
     finally:
         stop_proc(proc, name)
 
@@ -597,25 +450,11 @@ def explain_startup_failure(log_path: Path) -> str:
     return ""
 
 
-def submit_block(url: str, block_hex: str, label: str, retries: int = 10) -> None:
-    """submitblock with the accept/duplicate/retry semantics node_init.sh uses."""
-    for attempt in range(1, retries + 1):
-        result = rpc_call(url, "submitblock", [block_hex])
-        # null means accepted; "duplicate*" means already present, which is fine
-        # on a re-run; "inconclusive" means accepted but not yet best chain.
-        if result is None or result == "inconclusive" or str(result).startswith("duplicate"):
-            return
-        if result == "rejected" and attempt < retries:
-            time.sleep(2)
-            continue
-        raise RuntimeError(f"{label}: submitblock returned {result!r}")
-
-
 def cmd_up(args) -> int:
     """Seed every node, start them all, and leave them running."""
     lab = Path(args.lab_dir).resolve()
     assert_ports_free(args.node_count)
-    prepare_node_dirs(lab, args.node_count, args.miner_nodes)
+    localize_fleet(lab, args)
     for i in range(args.node_count):
         seed_node(lab, args, i)
 

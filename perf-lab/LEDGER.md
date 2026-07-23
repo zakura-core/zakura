@@ -404,3 +404,16 @@ This file is the sole reporting channel (design D5). Entry template:
 - settle2 started back-to-back, same pinned SHA (binary cached, no build).
   Batch 3: settle1 = 6 of 8, settle2 will be 7, exp002-k8-c 8 — boundary
   lands exactly on the confirmation.
+
+### settle2 — plateau at a lower level; proceeding to confirmation (2026-07-23 ~05:20Z)
+
+- settle2 (k=1, c3b26d24): 91.53 / 94.79. Four k=1 legs tonight: 84.45,
+  94.86, 91.53, 94.79 — plateaued ~93-95 with ~±2% wobble, i.e. tonight's
+  steady level sits ~10% below yesterday's ~105 on the fresh s3 droplet
+  (droplet-level shift; same SHA both days, so not a code change). The
+  two-leg WIN test is relative within droplet+cadence, so this only moves
+  the bar, not the validity.
+- exp002-k8-c started in cadence (same SHA, k=8). Confirmation bar: BOTH
+  k8 legs >= 3% above the highest plateau k=1 leg (94.86) -> both >= 97.7.
+  Expected if yesterday's +9% mean effect is real: ~101-103. Batch 3:
+  settle2 = 7 of 8; k8-c collect will be 8 (boundary).

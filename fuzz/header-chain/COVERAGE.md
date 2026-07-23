@@ -20,7 +20,7 @@ the remaining gap. Fuzzer reachability alone is not requirement coverage.
 | Deferred header / clock / reevaluation | `DeferredUntil` and `ReevaluateDeferred` | LC-VAL-08, LC-INT-01 | `deferred_header` | Covered |
 | Candidate-tip pressure | Planner retention and independent eviction oracle | LC-RETAIN-01..04 | `evict_pressure` | Covered at the tip cap; 65,536 nodes remain a deterministic retention test |
 | Fixed-anchor 999/1,000/1,001 replacement | Planner in both arrival orders | LC-REORG-01 | `fixed_anchor_999_1000_1001` | Covered |
-| Logical crash/reopen | Retained digest and snapshot clone | LC-RECOVER-02, LC-FRONTIER-04 | `crash_reopen`, `aud_incident_late_a_after_b_promotion` | Partial: production disk reopen is a separate target, not periodic inside `fork_transitions` |
+| Logical and production crash/reopen | Retained digest and snapshot clone plus RocksDB writer/startup and reconstructed reactor/session harnesses | LC-RECOVER-02, LC-FRONTIER-04 | `crash_reopen`, `aud_incident_late_a_after_b_promotion`, AUD-14 | Covered: the byte target checks deterministic logical identity, while AUD-14 separately exercises every production transaction boundary, startup repair boundary, and stale completion/stream delivery after process-state loss |
 | Block specification mutations | Production `prepare_headers` plus generated planner fixtures | LC-VAL-02..08 | `block_spec_mutations`, hard-work, and deferred-time classes | Covered for the structured operation: subsequent input bytes parameterize isolated invalid parent/version/commitment/signed-target/nonmonotonic-time fields and valid future deferral |
 | Page partition equivalence | Target-bound staging/admission | LC-WIRE-03, LC-WIRE-05 | `page_partitions` plus requester reactor tests | Covered |
 

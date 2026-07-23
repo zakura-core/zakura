@@ -2029,6 +2029,155 @@ mod tests {
         HeaderChainWriter::new(runtime, config)
     }
 
+    fn commit_verified_change(
+        writer: &HeaderChainWriter,
+        live: &mut NonFinalizedState,
+        staged: NonFinalizedState,
+        accepted: Frontier,
+    ) {
+        let (evidence, event_path, request) = verified_request(writer, live, &staged, accepted)
+            .expect("the generated full-state change has exact header evidence");
+        PreparedFullStateTransition::new(
+            evidence,
+            writer
+                .runtime
+                .publisher()
+                .snapshot()
+                .frontiers
+                .verified_best,
+            event_path,
+            staged,
+            None,
+            request,
+        )
+        .expect("the generated full-state and header paths agree")
+        .commit(&writer.runtime, live, &writer.context())
+        .expect("the generated full-state and header transition commits");
+    }
+
+    fn assert_selected_header_matches_full_state(
+        writer: &HeaderChainWriter,
+        full_state: &NonFinalizedState,
+    ) {
+        let best = full_state
+            .best_chain()
+            .expect("the generated fork graph has a full-state best chain");
+        let (_, tip_hash) = best.non_finalized_tip();
+        let expected_work = best
+            .blocks
+            .values()
+            .map(|block| {
+                block
+                    .block
+                    .header
+                    .difficulty_threshold
+                    .to_work()
+                    .expect("generated block targets have exact work")
+                    .as_u256()
+            })
+            .fold(zakura_chain::work::difficulty::U256::zero(), |sum, work| {
+                sum.checked_add(work)
+                    .expect("the short generated graph cannot overflow cumulative work")
+            });
+        let snapshot = writer.runtime.publisher().snapshot();
+
+        assert_eq!(snapshot.frontiers.header_best.hash, tip_hash);
+        assert_eq!(snapshot.frontiers.verified_best.hash, tip_hash);
+        assert_eq!(snapshot.header_best_score.tip_hash, tip_hash);
+        assert_eq!(
+            snapshot.header_best_score.suffix_work.as_u256(),
+            expected_work
+        );
+    }
+
+    #[test]
+    fn df_01_body_valid_fork_graph_matches_full_state_before_finalization() {
+        let _init_guard = zakura_test::init();
+
+        for network in Network::iter() {
+            let finalized_state = FinalizedState::new(
+                &Config::ephemeral(),
+                &network,
+                #[cfg(feature = "elasticsearch")]
+                false,
+            )
+            .expect("the differential fixture finalized state opens");
+            finalized_state.set_finalized_value_pool(ValueBalance::fake_populated_pool());
+            let anchor: Arc<zakura_chain::block::Block> =
+                Arc::new(network.test_block(653599, 583999).unwrap());
+            let anchor_height = anchor
+                .coinbase_height()
+                .expect("the differential anchor has a height");
+            let writer = header_writer(&finalized_state, &network, anchor_height, &anchor);
+            let mut live = NonFinalizedState::new(&network);
+
+            let common = anchor.make_fake_child().set_work(1);
+            let first = common.make_fake_child().set_work(10);
+            let mut second = common.make_fake_child().set_work(10);
+            Arc::make_mut(&mut Arc::make_mut(&mut second).header)
+                .nonce
+                .0[0] ^= 1;
+            let (lower_hash, higher_hash) = if first.hash().0 < second.hash().0 {
+                (first, second)
+            } else {
+                (second, first)
+            };
+
+            let mut staged = live.clone();
+            staged
+                .commit_new_chain(common.clone().prepare(), &finalized_state.db)
+                .expect("the common body-valid block enters full state");
+            staged
+                .commit_block(lower_hash.clone().prepare(), &finalized_state.db)
+                .expect("the lower raw-hash competitor enters full state");
+            let lower_frontier = Frontier::new(
+                lower_hash
+                    .coinbase_height()
+                    .expect("the lower competitor has a height"),
+                lower_hash.hash(),
+            );
+            commit_verified_change(&writer, &mut live, staged, lower_frontier);
+            assert_selected_header_matches_full_state(&writer, &live);
+
+            let mut staged = live.clone();
+            staged
+                .commit_block(higher_hash.clone().prepare(), &finalized_state.db)
+                .expect("the higher raw-hash competitor enters full state");
+            let higher_frontier = Frontier::new(
+                higher_hash
+                    .coinbase_height()
+                    .expect("the higher competitor has a height"),
+                higher_hash.hash(),
+            );
+            commit_verified_change(&writer, &mut live, staged, higher_frontier);
+            assert_selected_header_matches_full_state(&writer, &live);
+            assert_eq!(
+                writer.runtime.publisher().snapshot().frontiers.header_best,
+                higher_frontier,
+                "equal work uses the same raw internal hash order in both engines"
+            );
+
+            let harder = lower_hash.make_fake_child().set_work(1);
+            let harder_frontier = Frontier::new(
+                harder
+                    .coinbase_height()
+                    .expect("the harder branch tip has a height"),
+                harder.hash(),
+            );
+            let mut staged = live.clone();
+            staged
+                .commit_block(harder.prepare(), &finalized_state.db)
+                .expect("the greater-work branch enters full state");
+            commit_verified_change(&writer, &mut live, staged, harder_frontier);
+            assert_selected_header_matches_full_state(&writer, &live);
+            assert_eq!(
+                writer.runtime.publisher().snapshot().frontiers.header_best,
+                harder_frontier,
+                "greater cumulative work wins independently of the prior tie order"
+            );
+        }
+    }
+
     #[test]
     fn production_body_unavailability_writer_authenticates_exact_evidence() {
         let _init_guard = zakura_test::init();

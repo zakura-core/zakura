@@ -3,7 +3,7 @@ use std::{cmp::Ordering, collections::HashMap};
 use tokio::time::Instant;
 
 use zakura_header_chain::{
-    EngineSnapshot, Frontier, HeaderLocator, SourceId, WorkOwner, MAX_STAGED_TARGETS_V1,
+    EngineSnapshot, Frontier, HeaderLocator, SourceId, WorkOwner, WorkScope, MAX_STAGED_TARGETS_V1,
 };
 
 use super::super::{AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId};
@@ -14,6 +14,8 @@ pub(in crate::zakura::header_sync) const MAX_STAGED_HEADERS_V1: usize = 4_096;
 /// One peer's exact, session-bound target claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdvertisedHeaderTarget {
+    /// Durable generation and exact branch captured before locator work is scheduled.
+    pub scope: WorkScope,
     /// Ordered-stream generation that supplied this status.
     pub session_id: u64,
     /// Local receipt time, used only for freshness and scheduling.
@@ -139,7 +141,7 @@ impl ActiveHeaderRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PeerWorkState {
     AwaitingLocator {
-        target: AdvertisedHeaderTarget,
+        target: Box<AdvertisedHeaderTarget>,
         priority: PeerWorkPriority,
     },
     Active(Box<ActiveHeaderRequest>),
@@ -194,7 +196,7 @@ impl PeerWorkQueue {
                     target: current,
                     priority: current_priority,
                 } => {
-                    *current = target;
+                    **current = target;
                     *current_priority = priority;
                     QueueWorkResult::NeedsLocator
                 }
@@ -222,8 +224,13 @@ impl PeerWorkQueue {
             };
             self.work_by_peer.remove(&replace);
         }
-        self.work_by_peer
-            .insert(peer, PeerWorkState::AwaitingLocator { target, priority });
+        self.work_by_peer.insert(
+            peer,
+            PeerWorkState::AwaitingLocator {
+                target: Box::new(target),
+                priority,
+            },
+        );
         QueueWorkResult::NeedsLocator
     }
 
@@ -232,13 +239,15 @@ impl PeerWorkQueue {
         peer: &ZakuraPeerId,
         session_id: u64,
         target_tip_hash: zakura_chain::block::Hash,
+        scope: WorkScope,
     ) -> Option<&AdvertisedHeaderTarget> {
         match self.work_by_peer.get(peer) {
             Some(PeerWorkState::AwaitingLocator { target, .. })
                 if target.session_id == session_id
-                    && target.status.selected_tip_hash == target_tip_hash =>
+                    && target.status.selected_tip_hash == target_tip_hash
+                    && target.scope == scope =>
             {
-                Some(target)
+                Some(target.as_ref())
             }
             _ => None,
         }
@@ -250,6 +259,7 @@ impl PeerWorkQueue {
             &peer,
             request.target.session_id,
             request.target.status.selected_tip_hash,
+            request.target.scope,
         ) == Some(&request.target);
         if matches {
             self.work_by_peer
@@ -362,7 +372,9 @@ mod tests {
     }
 
     fn advertisement(marker: u8) -> AdvertisedHeaderTarget {
+        let local = snapshot();
         AdvertisedHeaderTarget {
+            scope: WorkScope::for_header_target(&local, hash(marker)),
             session_id: 7,
             observed_at: Instant::now(),
             status: Status {
@@ -478,7 +490,10 @@ mod tests {
             queue.stage(peer(1), replacement.clone(), PeerWorkPriority::Normal),
             QueueWorkResult::NeedsLocator
         );
-        assert_eq!(queue.awaiting(&peer(1), 7, hash(42)), Some(&replacement));
+        assert_eq!(
+            queue.awaiting(&peer(1), 7, hash(42), replacement.scope),
+            Some(&replacement)
+        );
 
         let local = snapshot();
         let locator = HeaderLocator::for_selected_path(&local, |height| {
@@ -539,7 +554,10 @@ mod tests {
             ),
             QueueWorkResult::NeedsLocator
         );
-        assert!(queue.awaiting(&peer(17), 7, hash(17)).is_some());
+        let expected = advertisement(17);
+        assert!(queue
+            .awaiting(&peer(17), 7, hash(17), expected.scope)
+            .is_some());
     }
 
     #[test]

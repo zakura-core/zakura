@@ -186,6 +186,8 @@ pub enum HeaderSyncEvent {
         session_id: u64,
         /// Exact advertised target hash.
         target_tip_hash: block::Hash,
+        /// Durable generation and exact branch that scheduled the locator read.
+        scope: zakura_header_chain::WorkScope,
         /// Coherent locator, absent when state is unavailable.
         locator: Option<zakura_header_chain::HeaderLocator>,
     },
@@ -377,6 +379,8 @@ pub enum HeaderSyncAction {
         session_id: u64,
         /// Exact advertised target hash.
         target_tip_hash: block::Hash,
+        /// Durable generation and exact branch that owns the query.
+        scope: zakura_header_chain::WorkScope,
     },
     /// Ask state to resolve one current branch-owned VCT repair.
     QueryVctRepairContext {

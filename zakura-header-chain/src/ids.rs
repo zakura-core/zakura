@@ -170,6 +170,19 @@ pub struct WorkScope {
 }
 
 impl WorkScope {
+    /// Capture requester work coordinates for one exact advertised target.
+    pub fn for_header_target(
+        snapshot: &crate::EngineSnapshot,
+        target_tip_hash: block::Hash,
+    ) -> Self {
+        Self {
+            state_version: snapshot.state_version,
+            header_generation: snapshot.header_generation,
+            verified_generation: None,
+            branch: BranchId::new(snapshot.frontiers.finalized.hash, target_tip_hash),
+        }
+    }
+
     /// Capture body-affecting work coordinates from one atomic committed snapshot.
     pub fn for_body_work(snapshot: &crate::EngineSnapshot) -> Self {
         Self {

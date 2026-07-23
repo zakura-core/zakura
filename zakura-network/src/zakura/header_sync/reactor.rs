@@ -294,8 +294,11 @@ impl HeaderSyncReactor {
                 peer,
                 session_id,
                 target_tip_hash,
+                scope,
                 locator,
-            } => self.handle_header_locator_ready(peer, session_id, target_tip_hash, locator),
+            } => {
+                self.handle_header_locator_ready(peer, session_id, target_tip_hash, scope, locator)
+            }
             HeaderSyncEvent::VctRepairContextReady { owner, result } => {
                 self.handle_vct_repair_context_ready(owner, result)
             }
@@ -457,13 +460,16 @@ impl HeaderSyncReactor {
         self.request_vct_repair_context();
         self.try_assign_vct_repair();
 
+        let Some(local) = self.committed_snapshot.as_ref() else {
+            return;
+        };
+        let scope =
+            zakura_header_chain::WorkScope::for_header_target(local, status.selected_tip_hash);
         let target = AdvertisedHeaderTarget {
+            scope,
             session_id,
             observed_at: Instant::now(),
             status: status.clone(),
-        };
-        let Some(local) = self.committed_snapshot.as_ref() else {
-            return;
         };
         let work_order = target.claimed_work_order(local);
         let eligible = target.is_discovery_eligible(local);
@@ -493,6 +499,7 @@ impl HeaderSyncReactor {
                     peer: peer.clone(),
                     session_id,
                     target_tip_hash: status.selected_tip_hash,
+                    scope,
                 }) {
                     self.peer_work_queue.remove_unstarted(&peer);
                 }
@@ -1327,11 +1334,12 @@ impl HeaderSyncReactor {
         peer: ZakuraPeerId,
         session_id: u64,
         target_tip_hash: block::Hash,
+        scope: zakura_header_chain::WorkScope,
         locator: Option<zakura_header_chain::HeaderLocator>,
     ) {
         let Some(target) = self
             .peer_work_queue
-            .awaiting(&peer, session_id, target_tip_hash)
+            .awaiting(&peer, session_id, target_tip_hash, scope)
             .cloned()
         else {
             metrics::counter!("sync.header.target.stale_locator").increment(1);
@@ -1346,6 +1354,13 @@ impl HeaderSyncReactor {
             self.peer_work_queue.remove_unstarted(&peer);
             return;
         };
+        if target.scope
+            != zakura_header_chain::WorkScope::for_header_target(&local, target_tip_hash)
+        {
+            self.peer_work_queue.remove_unstarted(&peer);
+            metrics::counter!("sync.header.target.stale_locator").increment(1);
+            return;
+        }
         let Some(session) = self
             .peer_state
             .get(&peer)
@@ -1405,18 +1420,10 @@ impl HeaderSyncReactor {
             tree_aux_schema,
         ) {
             Ok(request_id) => {
-                let owner = zakura_header_chain::WorkOwner {
-                    state_version: local.state_version,
-                    header_generation: local.header_generation,
-                    verified_generation: None,
-                    branch: zakura_header_chain::BranchId::new(
-                        local.frontiers.finalized.hash,
-                        target_tip_hash,
-                    ),
+                let owner = target.scope.bind(
                     session_id,
-                    request_id: NonZeroU64::new(request_id.get())
-                        .expect("header-sync request IDs are nonzero"),
-                };
+                    NonZeroU64::new(request_id.get()).expect("header-sync request IDs are nonzero"),
+                );
                 let started = self.peer_work_queue.start(ActiveHeaderRequest {
                     peer,
                     source,
@@ -2012,6 +2019,7 @@ mod tests {
             request_id: NonZeroU64::new(request_id.get()).expect("the request ID is nonzero"),
         };
         let advertised = AdvertisedHeaderTarget {
+            scope: zakura_header_chain::WorkScope::for_header_target(snapshot, target.hash),
             session_id: owner.session_id,
             observed_at: Instant::now(),
             status: Status {
@@ -3052,6 +3060,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_locator_completion_cannot_rebase_onto_a_new_generation() {
+        let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown.clone());
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let initial = committed_snapshot(anchor);
+        let (snapshots_tx, snapshots_rx) = watch::channel(Some(initial.clone()));
+        startup.committed_snapshots = Some(snapshots_rx);
+        let (handle, mut actions, task) =
+            spawn_header_sync_reactor(startup).expect("the requester fixture starts");
+        assert!(matches!(
+            next_action(&mut actions).await,
+            HeaderSyncAction::QueryMissingBlockBodies { .. }
+        ));
+
+        let (send, mut outbound) = framed_channel(8);
+        let peer = peer();
+        handle
+            .send(HeaderSyncEvent::PeerConnected(
+                HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
+            ))
+            .await
+            .expect("the peer connects");
+        let _initial_status = outbound.recv().await.expect("initial status is sent");
+
+        let target = block::Hash([0x52; 32]);
+        let remote_status = Status {
+            work_anchor_height: anchor.height,
+            work_anchor_hash: anchor.hash,
+            selected_tip_height: block::Height(2),
+            selected_tip_hash: target,
+            suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+            oldest_retained_height: anchor.height,
+            max_headers_per_response: 1,
+            max_inflight_requests: 1,
+            max_message_bytes: 2_000_000,
+            tree_aux_schema_mask: 0,
+        };
+        handle
+            .send(HeaderSyncEvent::SessionWireMessage {
+                peer: peer.clone(),
+                session_id: 0,
+                msg: HeaderSyncMessage::Status(remote_status.clone()),
+            })
+            .await
+            .expect("the target status reaches the reactor");
+        let stale_scope = match next_action(&mut actions).await {
+            HeaderSyncAction::QueryHeaderLocator {
+                target_tip_hash,
+                scope,
+                ..
+            } if target_tip_hash == target => scope,
+            other => panic!("expected locator query for target, got {other:?}"),
+        };
+
+        let mut advanced = initial;
+        advanced.state_version = advanced
+            .state_version
+            .checked_next()
+            .expect("the fixture state version has a successor");
+        advanced.header_generation = advanced
+            .header_generation
+            .checked_next()
+            .expect("the fixture header generation has a successor");
+        snapshots_tx
+            .send(Some(advanced))
+            .expect("the snapshot receiver remains live");
+
+        let fresh_scope = loop {
+            handle
+                .send(HeaderSyncEvent::SessionWireMessage {
+                    peer: peer.clone(),
+                    session_id: 0,
+                    msg: HeaderSyncMessage::Status(remote_status.clone()),
+                })
+                .await
+                .expect("a refreshed target status reaches the reactor");
+            let observed_scope = match next_action(&mut actions).await {
+                HeaderSyncAction::QueryHeaderLocator {
+                    target_tip_hash,
+                    scope,
+                    ..
+                } if target_tip_hash == target => scope,
+                other => panic!("expected refreshed locator query for target, got {other:?}"),
+            };
+            if observed_scope != stale_scope {
+                break observed_scope;
+            }
+            tokio::task::yield_now().await;
+        };
+
+        handle
+            .send(HeaderSyncEvent::HeaderLocatorReady {
+                peer: peer.clone(),
+                session_id: 0,
+                target_tip_hash: target,
+                scope: stale_scope,
+                locator: Some(zakura_header_chain::HeaderLocator::for_continuation(anchor)),
+            })
+            .await
+            .expect("the delayed locator reaches the reactor");
+        assert!(
+            time::timeout(std::time::Duration::from_millis(20), outbound.recv())
+                .await
+                .is_err(),
+            "a stale locator cannot send GetHeaders under the new generation"
+        );
+        assert!(
+            time::timeout(std::time::Duration::from_millis(20), actions.recv())
+                .await
+                .is_err(),
+            "retiring a stale locator has no punishment or follow-on action"
+        );
+
+        assert_ne!(fresh_scope, stale_scope);
+        handle
+            .send(HeaderSyncEvent::HeaderLocatorReady {
+                peer,
+                session_id: 0,
+                target_tip_hash: target,
+                scope: fresh_scope,
+                locator: Some(zakura_header_chain::HeaderLocator::for_continuation(anchor)),
+            })
+            .await
+            .expect("the current locator reaches the reactor");
+        assert!(matches!(
+            handle
+                .codec()
+                .decode_frame(outbound.recv().await.expect("GetHeaders is sent"), None)
+                .expect("GetHeaders decodes"),
+            HeaderSyncMessage::GetHeaders(_)
+        ));
+
+        shutdown.cancel();
+        task.await.expect("the reactor exits cleanly");
+    }
+
+    #[tokio::test]
     async fn requester_stages_all_pages_before_one_exact_admission() {
         let shutdown = CancellationToken::new();
         let mut startup = startup(shutdown.clone());
@@ -3111,16 +3256,20 @@ mod tests {
             })
             .await
             .expect("the target status reaches the reactor");
-        assert!(matches!(
-            next_action(&mut actions).await,
-            HeaderSyncAction::QueryHeaderLocator { target_tip_hash, .. }
-                if target_tip_hash == target.hash
-        ));
+        let scope = match next_action(&mut actions).await {
+            HeaderSyncAction::QueryHeaderLocator {
+                target_tip_hash,
+                scope,
+                ..
+            } if target_tip_hash == target.hash => scope,
+            other => panic!("expected locator query for target, got {other:?}"),
+        };
         handle
             .send(HeaderSyncEvent::HeaderLocatorReady {
                 peer: peer.clone(),
                 session_id: 0,
                 target_tip_hash: target.hash,
+                scope,
                 locator: Some(zakura_header_chain::HeaderLocator::for_continuation(anchor)),
             })
             .await
@@ -3392,18 +3541,20 @@ mod tests {
                 })
                 .await
                 .expect("the refreshed status reaches the reactor");
-            assert!(matches!(
-                next_action(&mut actions).await,
+            let scope = match next_action(&mut actions).await {
                 HeaderSyncAction::QueryHeaderLocator {
                     target_tip_hash,
+                    scope,
                     ..
-                } if target_tip_hash == target
-            ));
+                } if target_tip_hash == target => scope,
+                other => panic!("expected locator query for target, got {other:?}"),
+            };
             handle
                 .send(HeaderSyncEvent::HeaderLocatorReady {
                     peer: peer.clone(),
                     session_id: 0,
                     target_tip_hash: target,
+                    scope,
                     locator: Some(zakura_header_chain::HeaderLocator::for_continuation(anchor)),
                 })
                 .await

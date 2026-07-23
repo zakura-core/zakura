@@ -234,6 +234,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 peer,
                 session_id,
                 target_tip_hash,
+                scope,
             } => {
                 let locator = match read_state
                     .clone()
@@ -256,6 +257,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         peer,
                         session_id,
                         target_tip_hash,
+                        scope,
                         locator,
                     })
                     .await;

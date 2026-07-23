@@ -332,12 +332,14 @@ pub(crate) async fn drive_header_sync_actions(
                 peer,
                 session_id,
                 target_tip_hash,
+                scope,
             } => {
                 let _ = handle
                     .send(HeaderSyncEvent::HeaderLocatorReady {
                         peer,
                         session_id,
                         target_tip_hash,
+                        scope,
                         locator: None,
                     })
                     .await;

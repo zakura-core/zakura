@@ -10,7 +10,7 @@ use zakura_chain::{
 use zakura_header_chain::{
     AlarmSet, BranchId, ChainScore, CompletionDecision, CompletionGate, EngineMode, EngineSnapshot,
     Frontier, FrontierSet, HeaderGeneration, HeaderLocator, PendingOwners, RetiredWork, SourceId,
-    StateVersion, SuffixWork, VerifiedGeneration, WorkOwner, MAX_STAGED_TARGETS_V1,
+    StateVersion, SuffixWork, VerifiedGeneration, WorkOwner, WorkScope, MAX_STAGED_TARGETS_V1,
 };
 
 use super::{
@@ -85,6 +85,7 @@ enum ModelWork {
     Awaiting {
         session_id: u64,
         target: block::Hash,
+        scope: WorkScope,
         priority: PeerWorkPriority,
     },
     Active {
@@ -183,12 +184,13 @@ impl PursuitHarness {
         let session_id = session(flags);
         let target = target(marker);
         let priority = priority(flags);
+        let scope = WorkScope::for_header_target(&self.snapshot, target);
         let actual = self.queue.stage(
             peer(peer_key),
-            advertisement(self.observed_at, session_id, marker),
+            advertisement(&self.snapshot, self.observed_at, session_id, marker),
             priority,
         );
-        let expected = self.model_stage(peer_key, session_id, target, priority);
+        let expected = self.model_stage(peer_key, session_id, target, scope, priority);
         assert_eq!(actual, expected, "queue admission diverged from the model");
     }
 
@@ -197,6 +199,7 @@ impl PursuitHarness {
         peer_key: u8,
         session_id: u64,
         target: block::Hash,
+        scope: WorkScope,
         priority: PeerWorkPriority,
     ) -> QueueWorkResult {
         if let Some(work) = self.model.get_mut(&peer_key) {
@@ -204,10 +207,12 @@ impl PursuitHarness {
                 ModelWork::Awaiting {
                     session_id: current_session,
                     target: current_target,
+                    scope: current_scope,
                     priority: current_priority,
                 } => {
                     *current_session = session_id;
                     *current_target = target;
+                    *current_scope = scope;
                     *current_priority = priority;
                     QueueWorkResult::NeedsLocator
                 }
@@ -240,6 +245,7 @@ impl PursuitHarness {
             ModelWork::Awaiting {
                 session_id,
                 target,
+                scope,
                 priority,
             },
         );
@@ -249,13 +255,17 @@ impl PursuitHarness {
     fn start(&mut self, peer_key: u8, marker: u8, flags: u8) {
         let supplied_session = session(flags);
         let supplied_target = target(marker);
+        let supplied_scope = WorkScope::for_header_target(&self.snapshot, supplied_target);
         let model_match = matches!(
             self.model.get(&peer_key),
             Some(ModelWork::Awaiting {
                 session_id,
                 target,
+                scope,
                 ..
-            }) if *session_id == supplied_session && *target == supplied_target
+            }) if *session_id == supplied_session
+                && *target == supplied_target
+                && *scope == supplied_scope
         );
         let request = request(
             &self.snapshot,
@@ -490,7 +500,7 @@ impl PursuitHarness {
     fn corrupt_advisory(&mut self, peer_key: u8, marker: u8, flags: u8) {
         let before = self.snapshot.clone();
         let session_id = session(flags);
-        let mut advertised = advertisement(self.observed_at, session_id, marker);
+        let mut advertised = advertisement(&self.snapshot, self.observed_at, session_id, marker);
         match (flags >> 2) % 4 {
             0 => {
                 advertised.status.work_anchor_hash = hash(marker.wrapping_add(1));
@@ -502,11 +512,12 @@ impl PursuitHarness {
             _ => unreachable!("the advisory mutation is reduced modulo four"),
         }
         let target = advertised.status.selected_tip_hash;
+        let scope = advertised.scope;
         if advertised.is_discovery_eligible(&self.snapshot) {
             let priority =
                 PeerWorkPriority::from_work_order(advertised.claimed_work_order(&self.snapshot));
             let actual = self.queue.stage(peer(peer_key), advertised, priority);
-            let expected = self.model_stage(peer_key, session_id, target, priority);
+            let expected = self.model_stage(peer_key, session_id, target, scope, priority);
             assert_eq!(
                 actual, expected,
                 "advisory mutation changed queue semantics"
@@ -844,11 +855,14 @@ impl PursuitHarness {
         for peer_key in 0..LOGICAL_PEERS {
             match self.model.get(&peer_key) {
                 Some(ModelWork::Awaiting {
-                    session_id, target, ..
+                    session_id,
+                    target,
+                    scope,
+                    ..
                 }) => {
                     assert!(
                         self.queue
-                            .awaiting(&peer(peer_key), *session_id, *target)
+                            .awaiting(&peer(peer_key), *session_id, *target, *scope)
                             .is_some(),
                         "the queue's exact awaiting target matches the model"
                     );
@@ -936,8 +950,14 @@ fn priority(flags: u8) -> PeerWorkPriority {
     }
 }
 
-fn advertisement(observed_at: Instant, session_id: u64, marker: u8) -> AdvertisedHeaderTarget {
+fn advertisement(
+    snapshot: &EngineSnapshot,
+    observed_at: Instant,
+    session_id: u64,
+    marker: u8,
+) -> AdvertisedHeaderTarget {
     AdvertisedHeaderTarget {
+        scope: WorkScope::for_header_target(snapshot, target(marker)),
         session_id,
         observed_at,
         status: Status {
@@ -965,7 +985,7 @@ fn request(
     let request_value = u64::from(peer_key) + 1;
     let request_id =
         NonZeroU64::new(request_value).expect("logical peer request identifiers are nonzero");
-    let target = advertisement(observed_at, session_id, marker);
+    let target = advertisement(snapshot, observed_at, session_id, marker);
     let owner = WorkOwner {
         state_version: snapshot.state_version,
         header_generation: snapshot.header_generation,

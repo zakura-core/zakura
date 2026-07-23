@@ -42,6 +42,7 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 - **Changelog assembly** — `make prepare-release-changelog` consumes reviewed
   PR fragments into the versioned root changelog before the release PR runs
   the protected release gate.
+- **`prepare-release-pr.yml`** — manual: mechanically prepares a release PR for a given tag (crate bumps chosen by `cargo-semver-checks` against the base tag, zakura version, lockfile, config fixture, end-of-support floor, changelog assembly via `scripts/prepare-release.sh`), verifies with `make pre-release`, and opens a draft PR through the release GitHub App. Judgment items (bump-level review, authoritative end-of-support height, changelog curation) stay with the reviewer; a `dry_run` input uploads the diff as an artifact instead of opening a PR.
 - **`update-release-state.yml`** — manual + weekly: imports the newest Mainnet checkpoint/VCT-frontier bundle from the release-state publisher (digest-verified, append-only over the committed list) and opens a draft PR for human review. Release creation itself never fetches from R2; `make pre-release` validates only the committed state.
 
 ## Fleet operations (DigitalOcean)

@@ -1,0 +1,341 @@
+# Prepare a release PR mechanically and open it as a draft for human review.
+#
+# Runs scripts/prepare-release.sh on a fresh checkout of main (crate bumps via
+# cargo-semver-checks, zakura version, lockfile, config fixture, README tag,
+# end-of-support floor, changelog assembly), verifies the result with
+# `make pre-release`, and opens or updates a draft PR through the release
+# GitHub App. Nothing merges, tags, or publishes from this workflow: the PR is
+# always a draft, judgment items (bump-level review, authoritative
+# end-of-support height, changelog curation) are listed in the PR body, and
+# create-release.yml re-validates everything after merge.
+#
+# Re-running with the same tag recreates the release/v* branch from the
+# current main HEAD, which is how the PR stays rebased.
+#
+# Unlike semver-checks.yml (crates.io baselines gating every PR), bump levels
+# here are computed against BASE_TAG as a git baseline: the version at the
+# base tag may never have been published to crates.io.
+name: Prepare release PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to prepare, e.g. v1.2.3 or v1.2.3-rc0"
+        required: true
+        type: string
+      base_tag:
+        description: "Base tag to diff against (default: most recent v* tag)"
+        required: false
+        type: string
+      publish_crates:
+        description: "Bump all changed crates (uncheck for a GitHub-only release candidate that bumps just the zakura package; ignored for stable tags)"
+        required: false
+        type: boolean
+        default: true
+      dry_run:
+        description: "Prepare and verify, upload the diff as an artifact, but do not open a PR"
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: prepare-release-pr
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release PR
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    environment: release-automation
+    permissions:
+      contents: read
+    steps:
+      # fetch-depth: 0 — tag resolution, per-crate diffs against BASE_TAG, and
+      # cargo-semver-checks --baseline-rev all need full history.
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve parameters
+        id: params
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          BASE_TAG_INPUT: ${{ inputs.base_tag }}
+          PUBLISH_CRATES: ${{ inputs.publish_crates }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
+            echo "release_tag must match vX.Y.Z or vX.Y.Z-rcN, got '$RELEASE_TAG'" >&2
+            exit 1
+          fi
+
+          BASE_TAG="$BASE_TAG_INPUT"
+          if [ -z "$BASE_TAG" ]; then
+            BASE_TAG="$(git describe --tags --match 'v*' --abbrev=0 HEAD)"
+          fi
+          git rev-parse --verify --quiet "${BASE_TAG}^{commit}" >/dev/null
+
+          IS_RC=false
+          case "$RELEASE_TAG" in
+            *-rc*) IS_RC=true ;;
+          esac
+
+          # GitHub-only release candidates bump just the zakura package;
+          # stable releases always version the full changed crate graph.
+          NO_CRATES_FLAG=""
+          if [ "$IS_RC" = "true" ] && [ "$PUBLISH_CRATES" = "false" ]; then
+            NO_CRATES_FLAG="--no-crates"
+          fi
+
+          {
+            echo "base_tag=${BASE_TAG}"
+            echo "is_rc=${IS_RC}"
+            echo "no_crates_flag=${NO_CRATES_FLAG}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Preparing ${RELEASE_TAG} from ${BASE_TAG} (rc: ${IS_RC}, flags: '${NO_CRATES_FLAG}')"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        id: toolchain
+        with:
+          toolchain: stable
+          cache-key: prepare-release
+          cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Separate cache for baseline rustdoc JSON, mirroring semver-checks.yml:
+      # rust-cache's target-dir cleaner would delete target/semver-checks
+      # before saving. Distinct key because --baseline-rev baselines differ
+      # from crates.io ones.
+      - name: Restore baseline rustdoc cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: target/semver-checks/cache
+          key: prepare-release-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ github.run_id }}
+          restore-keys: prepare-release-baselines-${{ steps.toolchain.outputs.cachekey }}-
+
+      # Deliberately unpinned (like semver-checks.yml): cargo-semver-checks
+      # must track new stable rustdoc formats.
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
+        with:
+          tool: cargo-release,cargo-semver-checks
+
+      - uses: ./.github/actions/setup-zakura-build
+
+      - name: Prepare the release
+        id: prep
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          BASE_TAG: ${{ steps.params.outputs.base_tag }}
+          NO_CRATES_FLAG: ${{ steps.params.outputs.no_crates_flag }}
+        run: |
+          # shellcheck disable=SC2086 # NO_CRATES_FLAG is deliberately unquoted
+          scripts/prepare-release.sh \
+            --release-tag "$RELEASE_TAG" \
+            --base-tag "$BASE_TAG" \
+            $NO_CRATES_FLAG \
+            --summary-json "$RUNNER_TEMP/prep-summary.json"
+
+      - name: Save baseline rustdoc cache
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: target/semver-checks/cache
+          key: prepare-release-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ github.run_id }}
+
+      # Verification is continue-on-error: the draft PR opens either way with
+      # the failure summarized in its body, and the final step fails the run.
+      - name: Verify with make pre-release
+        id: verify-prerelease
+        continue-on-error: true
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          BASE_TAG: ${{ steps.params.outputs.base_tag }}
+        run: |
+          make pre-release \
+            RELEASE_TAG="$RELEASE_TAG" \
+            BASE_TAG="$BASE_TAG" \
+            CRATE_PACKAGING_VERIFY=1
+
+      - name: Verify the stored config fixture
+        id: verify-config
+        continue-on-error: true
+        run: cargo test -p zakura --test acceptance config_tests -- --exact
+
+      - name: Verify formatting
+        id: verify-fmt
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: Write the PR body
+        id: body
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          VERIFY_PRERELEASE: ${{ steps.verify-prerelease.outcome }}
+          VERIFY_CONFIG: ${{ steps.verify-config.outcome }}
+          VERIFY_FMT: ${{ steps.verify-fmt.outcome }}
+        run: |
+          python3 - "$RUNNER_TEMP/prep-summary.json" > "$RUNNER_TEMP/pr-body.md" <<'PY'
+          import json, os, sys
+
+          summary = json.load(open(sys.argv[1], encoding="utf-8"))
+          tag = summary["release_tag"]
+          base = summary["base_tag"]
+          zakura = summary["zakura"]
+          eos = summary["eos"]
+
+          def mark(outcome):
+              return "x" if outcome == "success" else " "
+
+          lines = [
+              "## Motivation",
+              "",
+              f"Prepare `main` for the {tag} release. Generated by the "
+              f"[Prepare release PR workflow run]({os.environ['RUN_URL']}); "
+              f"base tag {base}.",
+              "",
+              "## Version changes",
+              "",
+              "| Crate | Base | New | Level | Basis |",
+              "| --- | --- | --- | --- | --- |",
+              f"| zakura | {zakura['old']} | {zakura['new']} | tag | release tag |",
+          ]
+          for c in summary["crates"]:
+              lines.append(
+                  f"| {c['name']} | {c['base'] or '—'} | {c['target'] or '—'} "
+                  f"| {c['level']} | {c['reason']} |"
+              )
+          if summary["no_crates"]:
+              lines.append("| _(GitHub-only rc: crate bumps skipped)_ | | | | |")
+
+          lines += [
+              "",
+              "Bump policy: breaking → major; any other change → minor. Patch is",
+              "never auto-selected — downgrade during review where warranted.",
+              "",
+              "## Also updated",
+              "",
+              f"- Config fixture regenerated: `{summary['fixture']}` "
+              "(stale generated fixtures removed).",
+          ]
+          if eos["floored"]:
+              lines.append(
+                  f"- `ESTIMATED_RELEASE_HEIGHT` floored: {eos['old']} → {eos['floor']} "
+                  "(committed checkpoint height + 3456)."
+              )
+          else:
+              lines.append(
+                  f"- `ESTIMATED_RELEASE_HEIGHT` kept at {eos['old']} "
+                  f"(already at or above the {eos['floor']} floor)."
+              )
+          lines.append(
+              f"- README install tag updated to {tag}." if summary["readme_updated"]
+              else "- README install tag unchanged (release candidate)."
+          )
+          lines.append(
+              f"- Changelog assembled from {summary['fragments_consumed']} fragment(s)."
+          )
+
+          checks = [
+              ("make pre-release RELEASE_TAG=%s BASE_TAG=%s CRATE_PACKAGING_VERIFY=1"
+               % (tag, base), os.environ["VERIFY_PRERELEASE"]),
+              ("cargo test -p zakura --test acceptance config_tests -- --exact",
+               os.environ["VERIFY_CONFIG"]),
+              ("cargo fmt --all -- --check", os.environ["VERIFY_FMT"]),
+          ]
+          lines += ["", "## Verification", ""]
+          lines += [f"- [{mark(o)}] `{cmd}`" for cmd, o in checks]
+          if any(o != "success" for _, o in checks):
+              lines += [
+                  "",
+                  "⚠️ **Verification failed** — inspect the "
+                  f"[workflow run]({os.environ['RUN_URL']}) and fix the branch "
+                  "before review.",
+              ]
+
+          lines += [
+              "",
+              "## Remaining manual judgment (before undrafting)",
+              "",
+              "- [ ] Set the authoritative `ESTIMATED_RELEASE_HEIGHT` from the "
+              "current Mainnet tip and expected tag date (the automated value "
+              "is only a staleness floor).",
+              "- [ ] Curate the assembled changelog (dedupe, trim trivial "
+              "entries, check categories).",
+              "- [ ] Review semver bump levels; downgrade minor → patch where "
+              "appropriate; choose initial versions for any new crates.",
+              "- [ ] Confirm no release hold is in effect (an embargoed hotfix "
+              "may be in flight for the same version).",
+              "",
+              "### AI Disclosure",
+              "",
+              "This PR was generated by the automated Prepare release PR "
+              "workflow; review the diff and verification results before "
+              "approval.",
+          ]
+          print("\n".join(lines))
+          PY
+          cat "$RUNNER_TEMP/pr-body.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the prepared diff
+        if: ${{ inputs.dry_run }}
+        run: |
+          git diff > "$RUNNER_TEMP/prepared.diff"
+          git status --porcelain > "$RUNNER_TEMP/prepared-status.txt"
+
+      - name: Upload dry-run artifact
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: prepare-release-dry-run
+          path: |
+            ${{ runner.temp }}/prepared.diff
+            ${{ runner.temp }}/prepared-status.txt
+            ${{ runner.temp }}/prep-summary.json
+            ${{ runner.temp }}/pr-body.md
+
+      - name: Create release GitHub App token
+        if: ${{ !inputs.dry_run }}
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 #v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      # Never hotfix/*: that namespace is reserved for the embargoed hotfix
+      # process (docs/security-hotfix-release.md).
+      - name: Open or update the draft pull request
+        if: ${{ !inputs.dry_run }}
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 #v8.1.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          branch: release/${{ inputs.release_tag }}
+          base: main
+          title: "chore(release): prepare ${{ inputs.release_tag }}"
+          body-path: ${{ runner.temp }}/pr-body.md
+          labels: |
+            A-release
+            C-exclude-from-changelog
+            P-Critical :ambulance:
+          commit-message: "chore(release): prepare ${{ inputs.release_tag }}"
+          sign-commits: true
+          draft: always-true
+          delete-branch: true
+
+      - name: Fail the run if verification failed
+        if: >-
+          steps.verify-prerelease.outcome == 'failure' ||
+          steps.verify-config.outcome == 'failure' ||
+          steps.verify-fmt.outcome == 'failure'
+        run: |
+          echo "Release preparation verification failed; see the step logs above." >&2
+          exit 1

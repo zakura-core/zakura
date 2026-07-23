@@ -46,7 +46,9 @@ shorter-higher-work comparisons without substituting height for work.
 Candidate-pressure operations cross the exact tip cap in a bounded fixture and
 independently predict the lowest work/raw-hash eviction, including the case
 where the newly offered tip is discarded without a durable delete. The replay
-function is also used by deterministic corpus tests.
+function also replays stable same-height branches in both insertion orders,
+requiring unequal-work and equal-work/raw-hash selection to converge to
+byte-identical retained state. It is also used by deterministic corpus tests.
 
 `header_pursuit` consumes at most 512 bytes as four-byte operations over twenty
 logical peers. It drives the production peer work queue, response-page and

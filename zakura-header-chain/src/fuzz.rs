@@ -44,6 +44,8 @@ pub struct ForkReplaySummary {
     pub no_effects: u16,
     /// Exact candidate-tip-cap pressure checks completed.
     pub pressure_checks: u16,
+    /// Same-height insertion-order permutation checks completed.
+    pub permutation_checks: u16,
     /// Final authoritative snapshot.
     pub snapshot: EngineSnapshot,
     /// Stable digest of operation outcomes and snapshots.
@@ -440,18 +442,28 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     let mut refused = 0u16;
     let mut no_effects = 0u16;
     let mut pressure_checks = 0u16;
+    let mut permutation_checks = 0u16;
     let mut transcript = Sha256::new();
     let clock = ManualClock::new();
     let authority = FuzzAuthority;
     assert_exhaustive_oracle(&store);
 
     for (operation, encoded) in bounded.iter().copied().enumerate() {
-        if bounded.first() == Some(&b'A')
+        if matches!(bounded.first(), Some(b'A' | b'T'))
             && encoded == b'\n'
             && operation.saturating_add(1) == bounded.len()
         {
             no_effects = no_effects.saturating_add(1);
             transcript.update(b"corpus-newline");
+            assert_exhaustive_oracle(&store);
+            continue;
+        }
+        if encoded == b'T' {
+            let digest = assert_same_height_permutations();
+            transcript.update(b"permutation");
+            transcript.update(digest);
+            no_effects = no_effects.saturating_add(1);
+            permutation_checks = permutation_checks.saturating_add(1);
             assert_exhaustive_oracle(&store);
             continue;
         }
@@ -693,6 +705,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         refused,
         no_effects,
         pressure_checks,
+        permutation_checks,
         snapshot: store.snapshot(),
         replay_digest: transcript.finalize().into(),
         retained_digest: retained_digest(&store),
@@ -794,6 +807,81 @@ fn assert_candidate_eviction_boundary(seed: usize) -> [u8; 32] {
         "candidate-tip retention ends exactly at the configured cap"
     );
     retained_digest(&store)
+}
+
+fn assert_same_height_permutations() -> [u8; 32] {
+    let equal_forward = permutation_fixture([(40, 11, false), (41, 12, false)]);
+    let equal_reverse = permutation_fixture([(41, 12, false), (40, 11, false)]);
+    assert_eq!(
+        equal_forward.0, equal_reverse.0,
+        "equal-work fork choice is independent of insertion order"
+    );
+    assert_eq!(
+        equal_forward.1,
+        [equal_forward.2, equal_forward.3]
+            .into_iter()
+            .max_by_key(|hash| hash.0)
+            .expect("the permutation fixture has two tips"),
+        "equal work is resolved by the greatest raw internal tip hash"
+    );
+
+    let unequal_forward = permutation_fixture([(50, 21, false), (51, 22, true)]);
+    let unequal_reverse = permutation_fixture([(51, 22, true), (50, 21, false)]);
+    assert_eq!(
+        unequal_forward.0, unequal_reverse.0,
+        "unequal-work fork choice is independent of insertion order"
+    );
+    assert_eq!(
+        unequal_forward.1, unequal_forward.3,
+        "the harder same-height branch wins independently of raw hash"
+    );
+
+    let mut hasher = Sha256::new();
+    hasher.update(equal_forward.0);
+    hasher.update(unequal_forward.0);
+    hasher.finalize().into()
+}
+
+fn permutation_fixture(
+    operations: [(usize, u8, bool); 2],
+) -> ([u8; 32], block::Hash, block::Hash, block::Hash) {
+    let mut store = FuzzStore::new(EngineMode::Integrated);
+    let clock = ManualClock::new();
+    let authority = FuzzAuthority;
+    let finalized = store.metadata.frontiers.finalized;
+    let mut tips = Vec::new();
+    for (operation, branch, hard_work) in operations {
+        let request = store.insertion_with_validation(
+            finalized,
+            2,
+            operation,
+            branch,
+            HeaderValidationState::Valid,
+            hard_work,
+        );
+        let target = match &request.event {
+            crate::TransitionEvent::InsertHeaders(event) => event.target_tip_hash,
+            _ => unreachable!("the permutation fixture constructs only header insertions"),
+        };
+        let context = TransitionContext {
+            config: &store.config,
+            clock: &clock,
+            full_state_authority: Some(&authority),
+            startup_capability: None,
+            retention_references: &[],
+        };
+        let plan = apply_transition(&store, request, &context)
+            .expect("both stable permutation branches are admissible");
+        store.commit(&plan);
+        assert_exhaustive_oracle(&store);
+        tips.push(target);
+    }
+    (
+        retained_digest(&store),
+        store.metadata.frontiers.header_best.hash,
+        tips[0],
+        tips[1],
+    )
 }
 
 fn assert_exhaustive_oracle(store: &FuzzStore) {
@@ -1110,6 +1198,15 @@ mod tests {
     }
 
     #[test]
+    fn same_height_forks_are_insertion_order_independent() {
+        let first = replay_fork_transition_bytes(b"T");
+        let second = replay_fork_transition_bytes(b"T");
+        assert_eq!(first, second);
+        assert_eq!(first.permutation_checks, 1);
+        assert_eq!(first.no_effects, 1);
+    }
+
+    #[test]
     #[should_panic(expected = "selected projection must exactly match parent links")]
     fn exhaustive_oracle_rejects_a_projection_gap() {
         let mut store = FuzzStore::new(EngineMode::Integrated);
@@ -1235,6 +1332,12 @@ mod tests {
                     "../../fuzz/header-chain/corpus/fork_transitions/aud_02_shorter_higher_work"
                 ),
             ),
+            (
+                "aud_03_same_height_permutations",
+                include_bytes!(
+                    "../../fuzz/header-chain/corpus/fork_transitions/aud_03_same_height_permutations"
+                ),
+            ),
         ];
         for (name, bytes) in corpus {
             let first = replay_fork_transition_bytes(bytes);
@@ -1251,6 +1354,9 @@ mod tests {
                     first.snapshot.frontiers.header_best.height,
                     block::Height(2)
                 );
+            }
+            if *name == "aud_03_same_height_permutations" {
+                assert_eq!(first.permutation_checks, 1);
             }
         }
     }

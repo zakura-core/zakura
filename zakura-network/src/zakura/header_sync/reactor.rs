@@ -603,30 +603,15 @@ impl HeaderSyncReactor {
             metrics::counter!("sync.header.target.late_response.total").increment(1);
             return;
         }
-        if active.phase != HeaderTargetPhase::Receiving
-            || active.target.status.selected_tip_hash != response.target_tip_hash
-        {
-            self.retire_peer_work(&peer);
-            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
-            return;
-        }
         let returned_ancestor = zakura_header_chain::Frontier::new(
             response.common_ancestor_height,
             response.common_ancestor_hash,
         );
-        let expected_ancestor = match active.common_ancestor {
-            Some(_) => active.staged_tip(),
-            None => active
-                .sent_locator
-                .entries()
-                .iter()
-                .copied()
-                .find(|entry| *entry == returned_ancestor),
-        };
-        if expected_ancestor != Some(returned_ancestor)
-            || active.entries.len().saturating_add(response.entries.len())
-                > zakura_header_chain::MAX_NON_FINALIZED_NODES_V1
-        {
+        if !active.accepts_response_page(
+            response.target_tip_hash,
+            returned_ancestor,
+            response.entries.len(),
+        ) {
             self.retire_peer_work(&peer);
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
@@ -844,8 +829,7 @@ impl HeaderSyncReactor {
             metrics::counter!("sync.header.target.late_response.total").increment(1);
             return;
         }
-        let matches = active.phase == HeaderTargetPhase::Receiving
-            && active.target.status.selected_tip_hash == response.target_tip_hash;
+        let matches = active.accepts_outcome(request_id, response.target_tip_hash);
         self.retire_peer_work(&peer);
         if matches {
             metrics::counter!(

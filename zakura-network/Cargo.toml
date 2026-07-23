@@ -38,6 +38,7 @@ progress-bar = [
 # tor = ["arti-client", "tor-rtcompat"]
 
 # Testing features that activate extra dependencies
+header-fuzz = []
 proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl"]
 zakura-testkit = []
 

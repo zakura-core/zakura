@@ -3,7 +3,8 @@ use std::{cmp::Ordering, collections::HashMap};
 use tokio::time::Instant;
 
 use zakura_header_chain::{
-    EngineSnapshot, Frontier, HeaderLocator, SourceId, WorkOwner, MAX_STAGED_TARGETS_V1,
+    EngineSnapshot, Frontier, HeaderLocator, SourceId, WorkOwner, MAX_NON_FINALIZED_NODES_V1,
+    MAX_STAGED_TARGETS_V1,
 };
 
 use super::super::{AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId};
@@ -80,6 +81,39 @@ pub enum HeaderTargetPhase {
 }
 
 impl ActiveHeaderRequest {
+    /// Whether one page preserves the active phase, target, ancestry, and staging bound.
+    pub fn accepts_response_page(
+        &self,
+        target_tip_hash: zakura_chain::block::Hash,
+        returned_ancestor: Frontier,
+        entry_count: usize,
+    ) -> bool {
+        let expected_ancestor = match self.common_ancestor {
+            Some(_) => self.staged_tip(),
+            None => self
+                .sent_locator
+                .entries()
+                .iter()
+                .copied()
+                .find(|entry| *entry == returned_ancestor),
+        };
+        self.phase == HeaderTargetPhase::Receiving
+            && self.target.status.selected_tip_hash == target_tip_hash
+            && expected_ancestor == Some(returned_ancestor)
+            && self.entries.len().saturating_add(entry_count) <= MAX_NON_FINALIZED_NODES_V1
+    }
+
+    /// Whether one explicit outcome exactly matches the active request.
+    pub fn accepts_outcome(
+        &self,
+        request_id: HeaderSyncRequestId,
+        target_tip_hash: zakura_chain::block::Hash,
+    ) -> bool {
+        self.phase == HeaderTargetPhase::Receiving
+            && self.request_id == request_id
+            && self.target.status.selected_tip_hash == target_tip_hash
+    }
+
     /// Select the continuation-only locator without changing this request's target.
     pub fn continuation_locator(
         &self,
@@ -143,6 +177,11 @@ pub(in crate::zakura::header_sync) struct PeerWorkQueue {
 }
 
 impl PeerWorkQueue {
+    #[cfg(any(test, feature = "header-fuzz"))]
+    pub(in crate::zakura::header_sync) fn len(&self) -> usize {
+        self.work_by_peer.len()
+    }
+
     pub(in crate::zakura::header_sync) fn stage(
         &mut self,
         peer: ZakuraPeerId,

@@ -8,6 +8,8 @@ use super::{Frame, ZakuraPeerId, FRAME_HEADER_BYTES};
 mod config;
 mod error;
 mod events;
+#[cfg(any(test, feature = "header-fuzz"))]
+mod fuzz;
 mod pipe;
 mod reactor;
 mod scheduler;
@@ -22,6 +24,8 @@ pub use events::{
     HeaderSyncMisbehavior, HeaderSyncRequestId, HeaderSyncStartup, HeaderTargetAdmissionResult,
     HeaderTargetPreparationResult, VctRepairContextResult,
 };
+#[cfg(any(test, feature = "header-fuzz"))]
+pub use fuzz::{replay_header_pursuit_bytes, HeaderPursuitReplaySummary};
 pub use reactor::spawn_header_sync_reactor;
 pub use scheduler::coverage::BranchRange;
 pub use scheduler::peer_work::{ActiveHeaderRequest, AdvertisedHeaderTarget};

@@ -29,7 +29,7 @@ pub use ids::{
     BranchId, CounterExhausted, EvidenceId, FinalityEpoch, HeaderGeneration, HeaderId,
     OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration, WorkOwner, WorkScope,
 };
-pub use locator::{HeaderLocator, MAX_HEADER_LOCATOR_HASHES};
+pub use locator::{HeaderLocator, VctRepairContext, MAX_HEADER_LOCATOR_HASHES};
 pub use node::{
     BodyRuleId, BodyUnavailableSummary, BodyValidationState, DurableNodeError, EligibilityReason,
     EligibilityState, HeaderNode, HeaderValidationState,

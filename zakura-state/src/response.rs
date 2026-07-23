@@ -469,6 +469,9 @@ pub enum ReadResponse {
     /// the requested parent ceased to be retained.
     HeaderValidationLease(Option<zakura_header_chain::ValidationLease>),
 
+    /// Response to [`ReadRequest::VctRepairContext`], absent when its owner is stale.
+    VctRepairContext(Option<zakura_header_chain::VctRepairContext>),
+
     /// Response to [`ReadRequest::AcquireRetainedHeaderPath`].
     RetainedHeaderPathLease(crate::RetainedPathLeaseOutcome),
 
@@ -680,6 +683,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::ChainInfo(_)
             | ReadResponse::HeaderLocator(_)
             | ReadResponse::HeaderValidationLease(_)
+            | ReadResponse::VctRepairContext(_)
             | ReadResponse::RetainedHeaderPathLease(_)
             | ReadResponse::RetainedHeaderPathPage(_)
             | ReadResponse::RetainedHeaderPathReleased(_)

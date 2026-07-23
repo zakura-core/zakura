@@ -13,6 +13,15 @@ const SELECTED_PATH_OFFSETS: [u32; 12] = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 5
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeaderLocator(Vec<Frontier>);
 
+/// Exact selected-header request context for one auxiliary VCT repair.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VctRepairContext {
+    /// Already-selected header whose auxiliary metadata must be redelivered.
+    pub target: Frontier,
+    /// Single-entry locator naming the target's direct selected predecessor.
+    pub locator: HeaderLocator,
+}
+
 impl HeaderLocator {
     /// Build the exact fresh-pursuit locator from one committed selected projection.
     pub fn for_selected_path(

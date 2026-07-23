@@ -1445,6 +1445,14 @@ pub enum ReadRequest {
         parent_hash: block::Hash,
     },
 
+    /// Resolve one current branch-owned VCT repair to its exact selected request context.
+    VctRepairContext {
+        /// Complete owner captured when the repair was scheduled.
+        owner: zakura_header_chain::WorkOwner,
+        /// Exact selected height whose auxiliary metadata is unavailable.
+        height: block::Height,
+    },
+
     /// Acquire one immutable retained path for an exact header-sync target.
     AcquireRetainedHeaderPath {
         /// Stable requesting peer identity.
@@ -1729,6 +1737,7 @@ impl ReadRequest {
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
             ReadRequest::HeaderLocator => "header_locator",
             ReadRequest::HeaderValidationLease { .. } => "header_validation_lease",
+            ReadRequest::VctRepairContext { .. } => "vct_repair_context",
             ReadRequest::AcquireRetainedHeaderPath { .. } => "acquire_retained_header_path",
             ReadRequest::ReadRetainedHeaderPath { .. } => "read_retained_header_path",
             ReadRequest::ReleaseRetainedHeaderPath { .. } => "release_retained_header_path",

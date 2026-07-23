@@ -1959,6 +1959,15 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::HeaderValidationLease(lease))
             }
 
+            ReadRequest::VctRepairContext { owner, height } => {
+                let reader = state.header_chain_reader_receiver.borrow().clone();
+                let context = reader
+                    .map(|reader| reader.vct_repair_context(owner, height))
+                    .transpose()?
+                    .flatten();
+                Ok(ReadResponse::VctRepairContext(context))
+            }
+
             ReadRequest::AcquireRetainedHeaderPath {
                 peer,
                 session_id,

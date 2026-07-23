@@ -21,7 +21,7 @@ use zakura_header_chain::{
     RecoveryFailure, RecoveryPlan, RecoveryRepair, SourceId, StaleReceipt, StoreAuditRead,
     StoreError, StoreRead, SystemClock, TransitionContext, TransitionEvent, TransitionFailure,
     TransitionRequest, ValidationContextRecord, ValidationLease, VerifiedChainChanged,
-    VerifiedChangeCause, VerifiedHeaderRef,
+    VerifiedChangeCause, VerifiedHeaderRef, WorkOwner, WorkScope,
 };
 
 use crate::{
@@ -447,6 +447,58 @@ impl HeaderChainReader {
             .map_err(HeaderChainStoreError::Store)?;
         HeaderLocator::for_selected_path(&snapshot, |height| self.store.selected_hash(height))
             .map_err(HeaderChainStoreError::Store)
+    }
+
+    /// Resolve an exact, still-current VCT repair owner to one selected header request.
+    pub(crate) fn vct_repair_context(
+        &self,
+        owner: WorkOwner,
+        height: block::Height,
+    ) -> Result<Option<zakura_header_chain::VctRepairContext>, HeaderChainStoreError> {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let snapshot = self
+            .store
+            .snapshot()
+            .map_err(HeaderChainStoreError::Store)?;
+        if owner.scope() != WorkScope::for_body_work(&snapshot)
+            || height <= snapshot.frontiers.finalized.height
+            || height > snapshot.frontiers.header_best.height
+        {
+            return Ok(None);
+        }
+        let Some(target_hash) = self.store.selected_hash(height)? else {
+            return Err(StoreError::Incoherent(
+                "VCT repair height is absent from the selected projection",
+            )
+            .into());
+        };
+        let target = self.store.node(target_hash)?.ok_or(StoreError::Incoherent(
+            "selected VCT repair header is not retained",
+        ))?;
+        if target.height != height {
+            return Err(StoreError::Incoherent(
+                "selected VCT repair header height disagrees with its index",
+            )
+            .into());
+        }
+        let parent_height = block::Height(height.0.checked_sub(1).ok_or(
+            StoreError::Incoherent("non-finalized VCT repair header has no predecessor height"),
+        )?);
+        if self.store.selected_hash(parent_height)? != Some(target.parent_hash) {
+            return Err(StoreError::Incoherent(
+                "selected VCT repair header does not extend its selected predecessor",
+            )
+            .into());
+        }
+        let parent = Frontier::new(parent_height, target.parent_hash);
+        Ok(Some(zakura_header_chain::VctRepairContext {
+            target: Frontier::new(height, target_hash),
+            locator: HeaderLocator::for_continuation(parent),
+        }))
     }
 
     pub(crate) fn acquire_retained_path(
@@ -2098,7 +2150,10 @@ fn store_error(error: HeaderChainStoreError) -> StoreError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::{
+        num::NonZeroU64,
+        sync::atomic::{AtomicBool, Ordering},
+    };
 
     use super::*;
     use crate::{
@@ -2310,6 +2365,36 @@ mod tests {
             reader
                 .selected_aux_window(child.height, block::Hash([0xfe; 32]))
                 .expect("a stale branch hash is a normal read outcome"),
+            None
+        );
+        let snapshot = runtime.publisher().snapshot();
+        let owner = WorkScope::for_body_work(&snapshot)
+            .bind(7, NonZeroU64::new(8).expect("eight is nonzero"));
+        let repair = reader
+            .vct_repair_context(owner, child.height)
+            .expect("the selected repair context is coherent")
+            .expect("the current owner resolves its selected header");
+        assert_eq!(repair.target, Frontier::new(child.height, child.hash));
+        assert_eq!(repair.locator.entries(), &[anchor_frontier]);
+
+        let mut stale_owner = owner;
+        stale_owner.state_version = StateVersion::new(
+            owner
+                .state_version
+                .get()
+                .checked_add(1)
+                .expect("the fixture state version can advance"),
+        );
+        assert_eq!(
+            reader
+                .vct_repair_context(stale_owner, child.height)
+                .expect("a stale repair owner is a normal read outcome"),
+            None
+        );
+        assert_eq!(
+            reader
+                .vct_repair_context(owner, anchor.height)
+                .expect("a finalized repair height is a normal stale outcome"),
             None
         );
         let owner = SourceId::from_digest([1; 32]);

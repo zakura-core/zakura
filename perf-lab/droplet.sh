@@ -214,6 +214,30 @@ PYBSK
   bash -n ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
     || echo "WARN: bsknob patch broke harness syntax" >&2
 fi
+# B-16: three mid-stream HTTP/2 INTERNAL_ERROR download deaths in two days;
+# force HTTP/1.1 on the snapshot curl and give the primary source two tries
+# (the pipeline streams into tar, so resume is impossible — a retry is a
+# full re-download, but a cheap one vs a dead bench).
+if ! grep -q "perf-lab B-16" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh; then
+  python3 - ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh <<'PYB16'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+old_curl = 'curl -fL --retry 3 --retry-delay 5 --connect-timeout 30'
+assert s.count(old_curl) >= 1, "curl anchor"
+s = s.replace(old_curl, 'curl -fL --http1.1 --retry 3 --retry-delay 5 --connect-timeout 30', 1)
+d = chr(36)
+old_srcs = 'for url in ' + chr(34) + d + 'SNAPSHOT_URL' + chr(34) + ' ' + chr(34) + d + 'SNAPSHOT_MIRROR' + chr(34) + '; do'
+assert old_srcs in s, "source-loop anchor"
+new_srcs = ('for url in ' + chr(34) + d + 'SNAPSHOT_URL' + chr(34) + ' ' + chr(34) + d + 'SNAPSHOT_URL' + chr(34)
+            + ' ' + chr(34) + d + 'SNAPSHOT_MIRROR' + chr(34) + '; do  # perf-lab B-16: primary gets two tries')
+s = s.replace(old_srcs, new_srcs, 1)
+open(path, "w").write(s)
+print("B-16 patch applied")
+PYB16
+  bash -n ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
+    || echo "WARN: B-16 patch broke harness syntax" >&2
+fi
 mkdir -p ${BENCH_OUT_REMOTE}
 echo "remote prep done"
 REMOTE

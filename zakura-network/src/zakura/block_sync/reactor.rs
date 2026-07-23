@@ -126,6 +126,8 @@ pub fn spawn_block_sync_reactor(
     let sequencer_input_decoded_attributed_memory_bytes =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
+    // Shared peer facts are also the exact per-supplier body-retry admission gate.
+    let registry = Arc::new(PeerRegistry::new());
     let mut retry_jitter_seed = [0u8; 32];
     OsRng.fill_bytes(&mut retry_jitter_seed);
 
@@ -133,6 +135,7 @@ pub fn spawn_block_sync_reactor(
         sequencer,
         state.budget.clone(),
         state.work_queue.clone(),
+        registry.clone(),
         actions_tx.clone(),
         committed_throughput,
         startup.frontiers,
@@ -151,7 +154,6 @@ pub fn spawn_block_sync_reactor(
     // the shared per-peer fact table read by the producer / candidate / trace
     // and written by the routines (servable/caps/outstanding) and the reactor
     // (admission/teardown entry insert/remove).
-    let registry = Arc::new(PeerRegistry::new());
     // The shared routine→reactor channel: every per-peer pipe-routine forwards its
     // serving / status-advertise / re-query / serving-misbehavior concerns here.
     let (routine_to_reactor_tx, routine_to_reactor_rx) = mpsc::channel(ROUTINE_TO_REACTOR_DEPTH);

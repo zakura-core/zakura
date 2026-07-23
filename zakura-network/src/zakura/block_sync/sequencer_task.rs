@@ -18,6 +18,7 @@
 use super::super::trace::queue_send_trace as qs_trace;
 use super::{
     events::*,
+    peer_registry::PeerRegistry,
     reactor::{bs_insert_height, bs_insert_str, bs_insert_u64},
     reorder::BufferedBlockBody,
     sequencer::*,
@@ -250,6 +251,7 @@ pub(super) struct SequencerTask {
     sequencer: Sequencer,
     budget: ByteBudget,
     work: Arc<WorkQueue>,
+    registry: Arc<PeerRegistry>,
     actions: mpsc::Sender<BlockSyncAction>,
     committed_throughput: ThroughputMeter,
     /// Tracks the finalized height so the published view carries it forward; the
@@ -293,6 +295,7 @@ impl SequencerTask {
         sequencer: Sequencer,
         budget: ByteBudget,
         work: Arc<WorkQueue>,
+        registry: Arc<PeerRegistry>,
         actions: mpsc::Sender<BlockSyncAction>,
         committed_throughput: ThroughputMeter,
         frontiers: BlockSyncFrontiers,
@@ -310,6 +313,7 @@ impl SequencerTask {
             sequencer,
             budget,
             work,
+            registry,
             actions,
             committed_throughput,
             finalized_height: frontiers.finalized_height,
@@ -394,6 +398,7 @@ impl SequencerTask {
         match input {
             SequencerControlInput::WorkScopeChanged { scope } => {
                 self.current_scope = scope;
+                self.registry.retain_body_retry_scope(scope);
                 if let Some(scope) = scope {
                     self.body_retries
                         .retain_scope(scope.header_generation, scope.branch.anchor_hash);
@@ -764,6 +769,7 @@ impl SequencerTask {
         let Some(failure) = outcome.retryable_mut() else {
             self.body_retries
                 .remove(owner.header_generation, owner.branch, hash);
+            self.registry.clear_body_retry(owner.scope(), hash);
             return;
         };
         eligible_sources.insert(source);
@@ -786,13 +792,34 @@ impl SequencerTask {
             .body_retries
             .get_mut(owner.header_generation, owner.branch, hash)
             .expect("the exact retry episode exists because it was inserted above");
-        episode.refresh_suppliers(eligible_sources.clone(), &zakura_header_chain::SystemClock);
-        let _ = episode.record_failure(
+        let restarted =
+            episode.refresh_suppliers(eligible_sources.clone(), &zakura_header_chain::SystemClock);
+        let update = episode.record_failure(
             source,
             &zakura_header_chain::SystemClock,
             &self.retry_jitter,
         );
+        let deferred_sources = if episode.alarmed {
+            eligible_sources.clone()
+        } else {
+            episode.tried_suppliers.clone()
+        };
+        let retry_at = match update {
+            crate::zakura::header_sync::RetryUpdate::TooEarly => episode.next_probe_at,
+            crate::zakura::header_sync::RetryUpdate::RetryAt(retry_at)
+            | crate::zakura::header_sync::RetryUpdate::ProbeAt(retry_at) => retry_at,
+            crate::zakura::header_sync::RetryUpdate::Alarmed { probe_at } => probe_at,
+        };
         failure.availability = episode.summary();
+        if restarted {
+            self.registry.clear_body_retry(owner.scope(), hash);
+        }
+        self.registry.defer_body_retry(
+            deferred_sources,
+            owner.scope(),
+            hash,
+            retry_deadline_instant(retry_at),
+        );
     }
 
     /// Drain the contiguous reorder prefix into applying, then submit it.
@@ -1146,6 +1173,17 @@ impl SequencerTask {
     }
 }
 
+fn retry_deadline_instant(deadline: chrono::DateTime<chrono::Utc>) -> Instant {
+    let monotonic_now = Instant::now();
+    let delay = deadline
+        .signed_duration_since(chrono::Utc::now())
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    monotonic_now
+        .checked_add(delay)
+        .unwrap_or_else(|| monotonic_now + Duration::from_secs(10 * 60))
+}
+
 fn add_atomic_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
     let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
     loop {
@@ -1387,6 +1425,7 @@ mod tests {
             Sequencer::new(block::Height(0), 1),
             ByteBudget::new(123),
             Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
@@ -1497,6 +1536,7 @@ mod tests {
             Sequencer::new(block::Height(0), 1),
             ByteBudget::new(123),
             Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
@@ -1572,6 +1612,7 @@ mod tests {
             Sequencer::new(block::Height(0), 1),
             ByteBudget::new(123),
             Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
@@ -1631,6 +1672,7 @@ mod tests {
             Sequencer::new(block::Height(0), 1),
             ByteBudget::new(1),
             Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,

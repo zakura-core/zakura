@@ -189,6 +189,7 @@ pub fn spawn_bench_sequencer(
         sequencer,
         budget,
         work,
+        Arc::new(super::peer_registry::PeerRegistry::new()),
         actions_tx,
         throughput,
         frontiers,

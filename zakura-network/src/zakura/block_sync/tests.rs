@@ -16,6 +16,7 @@ use super::{
         DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
         MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
+    peer_registry::PeerRegistry,
     reactor::node_id_from_block_peer_id,
     reorder::*,
     request::*,
@@ -3842,6 +3843,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
         Sequencer::new(block::Height(0), submission_limit),
         ByteBudget::new(1),
         Arc::new(WorkQueue::new(block::Height(0))),
+        Arc::new(PeerRegistry::new()),
         actions_tx,
         ThroughputMeter::new(Instant::now()),
         frontiers,
@@ -7011,6 +7013,50 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
         size: BlockSizeEstimate::Advertised(block_bytes),
     }];
     let mut saw_retry_persistence = false;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(700), async {
+            loop {
+                tokio::select! {
+                    frame = outbound_rx.recv() => {
+                        let frame = frame.expect("outbound channel is live");
+                        match BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes") {
+                            BlockSyncMessage::GetBlocks { .. } => {
+                                panic!("the failed supplier must respect the first retry deadline")
+                            }
+                            BlockSyncMessage::Status(_) => {}
+                            msg => panic!("unexpected outbound message during retry backoff: {msg:?}"),
+                        }
+                    }
+                    action = actions.recv() => {
+                        match action.expect("action channel is live") {
+                            BlockSyncAction::QueryNeededBlocks { .. } => {
+                                handle
+                                    .send(BlockSyncEvent::NeededBlocks(retry_meta.clone()))
+                                    .await
+                                    .expect("needed metadata queues during retry backoff");
+                            }
+                            BlockSyncAction::RecordBodyUnavailable {
+                                expected_version,
+                                failure,
+                            } => {
+                                assert_eq!(expected_version, submit_owner.state_version);
+                                assert_eq!(failure.hash, block.hash());
+                                assert_eq!(failure.availability.attempts, 1);
+                                saw_retry_persistence = true;
+                            }
+                            BlockSyncAction::Misbehavior { .. } => {
+                                panic!("a local/transient unavailable result must not score its supplier")
+                            }
+                            action => panic!("unexpected action during retry backoff: {action:?}"),
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .is_err(),
+        "first retry backoff must remain active for at least 700ms"
+    );
     loop {
         tokio::select! {
             biased;

@@ -647,11 +647,13 @@ impl PeerRoutine {
         let liveness_deadline = self.window.block_liveness_deadline;
         let local_retry_avoid = self.retry_avoid.values().min().copied();
         let floor_watchdog_avoid = self.registry.next_floor_avoid_deadline(&self.peer, now);
+        let body_retry_avoid = self.registry.next_body_retry_deadline(&self.peer, now);
         let earliest = [
             earliest_deadline,
             liveness_deadline,
             local_retry_avoid,
             floor_watchdog_avoid,
+            body_retry_avoid,
         ]
         .into_iter()
         .flatten()
@@ -851,12 +853,18 @@ impl PeerRoutine {
             // avoided, break — the routine wakes to retry when the avoid window
             // expires (see `earliest_deadline_sleep`).
             {
-                let keep_from = items.iter().position(|(height, _)| {
+                let is_allowed = |height: &block::Height, item: &WorkItem| {
                     !self.retry_avoid.contains_key(height)
                         && !self
                             .registry
                             .is_floor_height_avoided(&self.peer, *height, now)
-                });
+                        && !self
+                            .registry
+                            .is_body_retry_avoided(&self.peer, item.scope, item.hash, now)
+                };
+                let keep_from = items
+                    .iter()
+                    .position(|(height, item)| is_allowed(height, item));
                 match keep_from {
                     Some(0) => {}
                     Some(index) => {
@@ -868,6 +876,15 @@ impl PeerRoutine {
                         self.work.return_items_quiet(avoided);
                         break FillStop::RetryAvoid;
                     }
+                }
+                let keep_len = items
+                    .iter()
+                    .take_while(|(height, item)| is_allowed(height, item))
+                    .count();
+                if keep_len < items.len() {
+                    let avoided = items.split_off(keep_len);
+                    self.work
+                        .return_items_quiet(avoided.into_iter().map(|(height, _)| height));
                 }
             }
             self.trace_work_taken(servable_low, servable_high, items.len());

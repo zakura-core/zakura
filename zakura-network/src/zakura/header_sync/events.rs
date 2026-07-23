@@ -4,7 +4,10 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use zakura_chain::{block, parameters::Network};
 
-use super::{HeaderSyncCodec, HeaderSyncMessage, HeaderSyncPeerSession, ZakuraHeaderSyncConfig};
+use super::{
+    GetHeaders, HeaderEntry, HeaderSyncCodec, HeaderSyncMessage, HeaderSyncPeerSession,
+    HeadersOutcomeCode, ZakuraHeaderSyncConfig,
+};
 use crate::zakura::{
     FrontierUpdate, HeaderSyncServiceSummary, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
     ZakuraPeerId, ZakuraTrace,
@@ -195,6 +198,30 @@ pub enum HeaderSyncEvent {
         /// Coherent locator, absent when state is unavailable.
         locator: Option<zakura_header_chain::HeaderLocator>,
     },
+    /// State finished acquiring an immutable path for one inbound request.
+    HeaderPathLeaseReady {
+        /// Peer that sent the request.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation that owns the request.
+        session_id: u64,
+        /// Exact request whose state read completed.
+        request: GetHeaders,
+        /// Acquired lease or explicit wire outcome.
+        result: HeaderPathLeaseResult,
+    },
+    /// State finished reading one hash-keyed page from an immutable path.
+    HeaderPathPageReady {
+        /// Peer that owns the lease.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation that owns the lease.
+        session_id: u64,
+        /// Exact request correlation identifier.
+        request_id: HeaderSyncRequestId,
+        /// Exact snapshot-bound target.
+        target_tip_hash: block::Hash,
+        /// Page data or an unavailable-lease outcome.
+        result: HeaderPathPageResult,
+    },
 }
 
 impl HeaderSyncEvent {
@@ -207,8 +234,54 @@ impl HeaderSyncEvent {
             Self::SessionWireMessage { .. } => "session_wire_message",
             Self::StateFrontiersChanged(_) => "state_frontiers_changed",
             Self::HeaderLocatorReady { .. } => "header_locator_ready",
+            Self::HeaderPathLeaseReady { .. } => "header_path_lease_ready",
+            Self::HeaderPathPageReady { .. } => "header_path_page_ready",
         }
     }
+}
+
+/// Network-facing state result for one exact retained target lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeaderPathLeaseResult {
+    /// The immutable target path was acquired.
+    Acquired(HeaderPathLease),
+    /// State mapped the request to one explicit non-data protocol outcome.
+    Outcome(HeadersOutcomeCode),
+}
+
+/// Minimum immutable lease facts needed by the serving reactor.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderPathLease {
+    /// State-issued lease identity.
+    pub lease_id: u64,
+    /// First requester-order locator intersection.
+    pub common_ancestor: zakura_header_chain::Frontier,
+    /// Exact retained target fixed by the lease.
+    pub target: zakura_header_chain::Frontier,
+}
+
+/// Network-facing state result for one retained target page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeaderPathPageResult {
+    /// One fully assembled hash-keyed page.
+    Page(HeaderPathPage),
+    /// The lease expired or became unavailable before the read.
+    Unavailable,
+}
+
+/// One count-bounded page read from an immutable retained target path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderPathPage {
+    /// State-issued lease identity.
+    pub lease_id: u64,
+    /// Exact page ancestor: the initial intersection or previous page tip.
+    pub common_ancestor: zakura_header_chain::Frontier,
+    /// Exact retained target fixed by the lease.
+    pub target: zakura_header_chain::Frontier,
+    /// Canonical headers and parallel advisory metadata.
+    pub entries: Vec<HeaderEntry>,
+    /// Whether this page reaches the immutable target.
+    pub complete: bool,
 }
 
 /// Actions emitted by the header-sync reactor for node wiring.
@@ -222,6 +295,41 @@ pub enum HeaderSyncAction {
         session_id: u64,
         /// Exact advertised target hash.
         target_tip_hash: block::Hash,
+    },
+    /// Acquire an immutable retained path for one inbound request.
+    AcquireHeaderPath {
+        /// Peer that sent the request.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation that owns the request.
+        session_id: u64,
+        /// Exact request to snapshot in state.
+        request: GetHeaders,
+    },
+    /// Read one bounded page from an already acquired retained path.
+    ReadHeaderPath {
+        /// Peer that owns the lease.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation that owns the lease.
+        session_id: u64,
+        /// State-issued lease identity.
+        lease_id: u64,
+        /// Exact wire request identifier.
+        request_id: HeaderSyncRequestId,
+        /// Exact snapshot-bound target.
+        target_tip_hash: block::Hash,
+        /// Common ancestor or previous page tip.
+        after_hash: block::Hash,
+        /// Count cap after local, remote, and byte limits.
+        max_header_count: u32,
+    },
+    /// Release one retained path owned by an exact peer session.
+    ReleaseHeaderPath {
+        /// Peer that owns the lease.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation that owns the lease.
+        session_id: u64,
+        /// State-issued lease identity.
+        lease_id: u64,
     },
     /// Ask state for missing block-body gaps.
     QueryMissingBlockBodies {

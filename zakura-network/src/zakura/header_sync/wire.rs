@@ -27,9 +27,6 @@ pub const MAX_HS_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_HS_RANGE: u32 = 1000;
 /// Maximum number of headers accepted in one response.
 pub const MAX_HS_RANGE: u32 = 4000;
-/// Default number of in-flight header requests advertised per peer.
-pub const DEFAULT_HS_MAX_INFLIGHT: u16 = 10;
-
 /// Header-sync `Status` discriminator.
 pub const MSG_HS_STATUS: u8 = 1;
 /// Header-sync `GetHeaders` discriminator.
@@ -263,6 +260,10 @@ impl HeaderServingLimits {
 
     pub(crate) fn tree_aux_schema_mask(self) -> u32 {
         self.tree_aux_schema_mask
+    }
+
+    pub(crate) fn max_message_bytes(self) -> u32 {
+        self.max_message_bytes
     }
 }
 

@@ -50,7 +50,7 @@ pub enum RetainedPathLeaseOutcome {
 pub struct RetainedPathPage {
     /// Exact lease identity used for the read.
     pub lease_id: u64,
-    /// Common ancestor fixed when the lease was acquired.
+    /// Exact page ancestor: the initial intersection or previous page tip.
     pub common_ancestor: Frontier,
     /// Exact target fixed when the lease was acquired.
     pub target: Frontier,

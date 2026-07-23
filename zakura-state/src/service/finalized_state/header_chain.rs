@@ -438,13 +438,19 @@ impl HeaderChainReader {
         let Some(lease) = lease else {
             return Ok(RetainedPathReadOutcome::Unavailable);
         };
-        let start = if after_hash == lease.common_ancestor.hash {
-            0
+        let (start, page_ancestor) = if after_hash == lease.common_ancestor.hash {
+            (0, lease.common_ancestor)
         } else {
             let Some(index) = lease.path.iter().position(|hash| *hash == after_hash) else {
                 return Ok(RetainedPathReadOutcome::Unavailable);
             };
-            index.saturating_add(1)
+            let node = self.store.node(after_hash)?.ok_or(StoreError::Incoherent(
+                "active retained path page ancestor is absent",
+            ))?;
+            (
+                index.saturating_add(1),
+                Frontier::new(node.height, node.hash),
+            )
         };
         let count = usize::try_from(max_count).unwrap_or(usize::MAX);
         let end = start.saturating_add(count).min(lease.path.len());
@@ -461,7 +467,7 @@ impl HeaderChainReader {
         debug_assert!(renewed, "the lease registry is locked across the page read");
         Ok(RetainedPathReadOutcome::Page(RetainedPathPage {
             lease_id,
-            common_ancestor: lease.common_ancestor,
+            common_ancestor: page_ancestor,
             target: lease.target,
             nodes,
             aux_deliveries,
@@ -2147,32 +2153,43 @@ mod tests {
             hash: child_header.hash(),
             header: child_header,
         };
+        let mut grandchild_header = *anchor.header;
+        grandchild_header.previous_block_hash = child.hash;
+        let grandchild_header = Arc::new(grandchild_header);
+        let grandchild = VerifiedHeaderRef {
+            height: child.height.next().expect("the child has a successor"),
+            hash: grandchild_header.hash(),
+            header: grandchild_header,
+        };
         let (runtime, _) = store
             .startup_reconciled(
                 &engine_config,
                 anchor_frontier,
                 Vec::new(),
-                vec![child.clone()],
+                vec![child.clone(), grandchild.clone()],
             )
-            .expect("the selected child path reconciles");
+            .expect("the selected two-header path reconciles");
         let reader = runtime.reader();
         let owner = SourceId::from_digest([1; 32]);
         let acquired = reader
-            .acquire_retained_path(owner, 7, child.hash, &[anchor.hash])
+            .acquire_retained_path(owner, 7, grandchild.hash, &[anchor.hash])
             .expect("the coherent target path is readable");
         let RetainedPathLeaseOutcome::Acquired(lease) = acquired else {
             panic!("the exact retained target should acquire a lease");
         };
-        assert_eq!(lease.target, Frontier::new(child.height, child.hash));
+        assert_eq!(
+            lease.target,
+            Frontier::new(grandchild.height, grandchild.hash)
+        );
         assert_eq!(lease.common_ancestor, anchor_frontier);
-        assert_eq!(lease.path.as_ref(), &[child.hash]);
+        assert_eq!(lease.path.as_ref(), &[child.hash, grandchild.hash]);
         assert_eq!(
             lease.generation,
             runtime.publisher().snapshot().header_generation
         );
         assert_eq!(
             reader
-                .acquire_retained_path(owner, 7, child.hash, &[anchor.hash])
+                .acquire_retained_path(owner, 7, grandchild.hash, &[anchor.hash])
                 .expect("the lease bound is a normal outcome"),
             RetainedPathLeaseOutcome::Busy
         );
@@ -2190,8 +2207,21 @@ mod tests {
         };
         assert_eq!(page.nodes.len(), 1);
         assert_eq!(page.nodes[0].hash, child.hash);
+        assert_eq!(page.common_ancestor, anchor_frontier);
         assert_eq!(page.aux_deliveries, vec![Vec::new()]);
-        assert!(page.complete);
+        assert!(!page.complete);
+        let RetainedPathReadOutcome::Page(continuation) = reader
+            .read_retained_path(owner, 7, lease.lease_id, child.hash, 1)
+            .expect("the continuation page is readable")
+        else {
+            panic!("the current owner should read its continuation");
+        };
+        assert_eq!(
+            continuation.common_ancestor,
+            Frontier::new(child.height, child.hash)
+        );
+        assert_eq!(continuation.nodes[0].hash, grandchild.hash);
+        assert!(continuation.complete);
 
         let before = runtime.publisher().snapshot();
         runtime

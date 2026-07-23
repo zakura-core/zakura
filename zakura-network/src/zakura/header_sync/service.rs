@@ -242,6 +242,22 @@ impl HeaderSyncPeerSession {
         result
     }
 
+    pub(super) fn try_send_headers(
+        &self,
+        codec: &HeaderSyncCodec,
+        headers: Headers,
+    ) -> Result<(), OrderedSendError> {
+        self.try_send(codec, HeaderSyncMessage::Headers(headers))
+    }
+
+    pub(super) fn try_send_headers_outcome(
+        &self,
+        codec: &HeaderSyncCodec,
+        outcome: HeadersOutcome,
+    ) -> Result<(), OrderedSendError> {
+        self.try_send(codec, HeaderSyncMessage::HeadersOutcome(outcome))
+    }
+
     fn try_send(
         &self,
         codec: &HeaderSyncCodec,
@@ -303,7 +319,25 @@ pub(crate) async fn drive_header_sync_actions(
                     })
                     .await;
             }
+            HeaderSyncAction::AcquireHeaderPath {
+                peer,
+                session_id,
+                request,
+            } => {
+                let _ = handle
+                    .send(HeaderSyncEvent::HeaderPathLeaseReady {
+                        peer,
+                        session_id,
+                        request,
+                        result: HeaderPathLeaseResult::Outcome(
+                            HeadersOutcomeCode::TargetNotRetained,
+                        ),
+                    })
+                    .await;
+            }
             HeaderSyncAction::QueryMissingBlockBodies { .. }
+            | HeaderSyncAction::ReadHeaderPath { .. }
+            | HeaderSyncAction::ReleaseHeaderPath { .. }
             | HeaderSyncAction::BodyGaps { .. }
             | HeaderSyncAction::HeaderAdvanced { .. }
             | HeaderSyncAction::HeaderReanchored { .. } => {}

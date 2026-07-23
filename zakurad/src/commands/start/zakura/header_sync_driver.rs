@@ -12,8 +12,9 @@ use zakura_chain::{
 };
 use zakura_network::zakura::{
     commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange,
-    FullStateFrontiers, HeaderSyncAction, HeaderSyncEvent, ZakuraEndpoint,
-    ZakuraHeaderSyncDriverStartup, ZakuraTrace, DEFAULT_HS_RANGE,
+    FullStateFrontiers, HeaderEntry, HeaderPathLease, HeaderPathLeaseResult, HeaderPathPage,
+    HeaderPathPageResult, HeaderSyncAction, HeaderSyncEvent, HeadersOutcomeCode, ZakuraEndpoint,
+    ZakuraHeaderSyncDriverStartup, ZakuraPeerId, ZakuraTrace, DEFAULT_HS_RANGE,
 };
 
 #[cfg(test)]
@@ -261,6 +262,59 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     })
                     .await;
             }
+            HeaderSyncAction::AcquireHeaderPath {
+                peer,
+                session_id,
+                request,
+            } => {
+                let result =
+                    acquire_header_path(read_state.clone(), &peer, session_id, &request).await;
+                let _ = handles
+                    .header_sync
+                    .send(HeaderSyncEvent::HeaderPathLeaseReady {
+                        peer,
+                        session_id,
+                        request,
+                        result,
+                    })
+                    .await;
+            }
+            HeaderSyncAction::ReadHeaderPath {
+                peer,
+                session_id,
+                lease_id,
+                request_id,
+                target_tip_hash,
+                after_hash,
+                max_header_count,
+            } => {
+                let result = read_header_path(
+                    read_state.clone(),
+                    &peer,
+                    session_id,
+                    lease_id,
+                    after_hash,
+                    max_header_count,
+                )
+                .await;
+                let _ = handles
+                    .header_sync
+                    .send(HeaderSyncEvent::HeaderPathPageReady {
+                        peer,
+                        session_id,
+                        request_id,
+                        target_tip_hash,
+                        result,
+                    })
+                    .await;
+            }
+            HeaderSyncAction::ReleaseHeaderPath {
+                peer,
+                session_id,
+                lease_id,
+            } => {
+                release_header_path(read_state.clone(), &peer, session_id, lease_id).await;
+            }
             HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
                 log_missing_block_bodies(read_state.clone(), from, limit, &trace).await;
             }
@@ -291,6 +345,168 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
             }
         }
     }
+}
+
+async fn acquire_header_path<ReadState>(
+    read_state: ReadState,
+    peer: &ZakuraPeerId,
+    session_id: u64,
+    request: &zakura_network::zakura::GetHeaders,
+) -> HeaderPathLeaseResult
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let Some(source) = source_id(peer) else {
+        return HeaderPathLeaseResult::Outcome(HeadersOutcomeCode::Busy);
+    };
+    match read_state
+        .oneshot(zakura_state::ReadRequest::AcquireRetainedHeaderPath {
+            peer: source,
+            session_id,
+            target_tip_hash: request.target_tip_hash,
+            locator_hashes: request.locator_hashes.clone(),
+        })
+        .await
+    {
+        Ok(zakura_state::ReadResponse::RetainedHeaderPathLease(outcome)) => match outcome {
+            zakura_state::RetainedPathLeaseOutcome::Acquired(lease) => {
+                HeaderPathLeaseResult::Acquired(HeaderPathLease {
+                    lease_id: lease.lease_id,
+                    common_ancestor: lease.common_ancestor,
+                    target: lease.target,
+                })
+            }
+            zakura_state::RetainedPathLeaseOutcome::TargetNotRetained => {
+                HeaderPathLeaseResult::Outcome(HeadersOutcomeCode::TargetNotRetained)
+            }
+            zakura_state::RetainedPathLeaseOutcome::NoLocatorIntersection => {
+                HeaderPathLeaseResult::Outcome(HeadersOutcomeCode::NoLocatorIntersection)
+            }
+            zakura_state::RetainedPathLeaseOutcome::HistoryPruned => {
+                HeaderPathLeaseResult::Outcome(HeadersOutcomeCode::HistoryPruned)
+            }
+            zakura_state::RetainedPathLeaseOutcome::Busy => {
+                HeaderPathLeaseResult::Outcome(HeadersOutcomeCode::Busy)
+            }
+        },
+        Ok(response) => {
+            warn!(
+                ?peer,
+                ?response,
+                "unexpected retained header path lease response"
+            );
+            HeaderPathLeaseResult::Outcome(HeadersOutcomeCode::Busy)
+        }
+        Err(error) => {
+            warn!(?peer, ?error, "failed to acquire retained header path");
+            HeaderPathLeaseResult::Outcome(HeadersOutcomeCode::Busy)
+        }
+    }
+}
+
+async fn read_header_path<ReadState>(
+    read_state: ReadState,
+    peer: &ZakuraPeerId,
+    session_id: u64,
+    lease_id: u64,
+    after_hash: block::Hash,
+    max_header_count: u32,
+) -> HeaderPathPageResult
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let Some(source) = source_id(peer) else {
+        return HeaderPathPageResult::Unavailable;
+    };
+    match read_state
+        .oneshot(zakura_state::ReadRequest::ReadRetainedHeaderPath {
+            peer: source,
+            session_id,
+            lease_id,
+            after_hash,
+            max_count: max_header_count,
+        })
+        .await
+    {
+        Ok(zakura_state::ReadResponse::RetainedHeaderPathPage(
+            zakura_state::RetainedPathReadOutcome::Page(page),
+        )) => HeaderPathPageResult::Page(HeaderPathPage {
+            lease_id: page.lease_id,
+            common_ancestor: page.common_ancestor,
+            target: page.target,
+            entries: page
+                .nodes
+                .into_iter()
+                .map(|node| HeaderEntry {
+                    header: node.header,
+                    body_size: 0,
+                    tree_aux: None,
+                })
+                .collect(),
+            complete: page.complete,
+        }),
+        Ok(zakura_state::ReadResponse::RetainedHeaderPathPage(
+            zakura_state::RetainedPathReadOutcome::Unavailable,
+        )) => HeaderPathPageResult::Unavailable,
+        Ok(response) => {
+            warn!(
+                ?peer,
+                ?response,
+                "unexpected retained header path page response"
+            );
+            HeaderPathPageResult::Unavailable
+        }
+        Err(error) => {
+            warn!(?peer, ?error, "failed to read retained header path page");
+            HeaderPathPageResult::Unavailable
+        }
+    }
+}
+
+async fn release_header_path<ReadState>(
+    read_state: ReadState,
+    peer: &ZakuraPeerId,
+    session_id: u64,
+    lease_id: u64,
+) where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let Some(source) = source_id(peer) else {
+        return;
+    };
+    if let Err(error) = read_state
+        .oneshot(zakura_state::ReadRequest::ReleaseRetainedHeaderPath {
+            peer: source,
+            session_id,
+            lease_id,
+        })
+        .await
+    {
+        warn!(?peer, ?error, "failed to release retained header path");
+    }
+}
+
+fn source_id(peer: &ZakuraPeerId) -> Option<zakura_header_chain::SourceId> {
+    let digest = <[u8; 32]>::try_from(peer.as_bytes()).ok()?;
+    Some(zakura_header_chain::SourceId::from_digest(digest))
 }
 
 pub(crate) fn publish_header_frontier(
@@ -654,6 +870,26 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
                 insert_cs_str(row, cs_trace::ACTION, "query_header_locator");
                 insert_cs_peer(row, cs_trace::PEER, peer);
                 insert_cs_hash(row, cs_trace::HASH, *target_tip_hash);
+            }
+            HeaderSyncAction::AcquireHeaderPath { peer, request, .. } => {
+                insert_cs_str(row, cs_trace::ACTION, "acquire_header_path");
+                insert_cs_peer(row, cs_trace::PEER, peer);
+                insert_cs_hash(row, cs_trace::HASH, request.target_tip_hash);
+            }
+            HeaderSyncAction::ReadHeaderPath {
+                peer,
+                target_tip_hash,
+                max_header_count,
+                ..
+            } => {
+                insert_cs_str(row, cs_trace::ACTION, "read_header_path");
+                insert_cs_peer(row, cs_trace::PEER, peer);
+                insert_cs_hash(row, cs_trace::HASH, *target_tip_hash);
+                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(*max_header_count));
+            }
+            HeaderSyncAction::ReleaseHeaderPath { peer, .. } => {
+                insert_cs_str(row, cs_trace::ACTION, "release_header_path");
+                insert_cs_peer(row, cs_trace::PEER, peer);
             }
             HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
                 insert_cs_str(row, cs_trace::ACTION, "query_missing_block_bodies");

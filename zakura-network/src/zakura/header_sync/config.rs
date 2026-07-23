@@ -8,7 +8,7 @@ use crate::zakura::ServicePeerLimits;
 
 const COMMON_HEADER_BYTES: usize = 1_487;
 const REGTEST_HEADER_BYTES: usize = 177;
-const LOCAL_MAX_HS_INFLIGHT_PER_PEER: u16 = 16;
+const LOCAL_MAX_HS_INFLIGHT_PER_PEER: u16 = 1;
 const DEFAULT_HS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Header-sync configuration nested under the Zakura P2P-v2 config.
@@ -17,12 +17,6 @@ const DEFAULT_HS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 pub struct ZakuraHeaderSyncConfig {
     /// Maximum headers this node advertises per `GetHeaders` response.
     pub max_headers_per_response: u32,
-    /// Maximum concurrent `GetHeaders` requests per peer.
-    ///
-    /// This is both the inbound limit advertised to remote peers and the local
-    /// outbound requester ceiling. The effective requester limit is the minimum
-    /// of this value, the peer's advertisement, and the hard protocol cap of 16.
-    pub max_inflight_requests: u16,
     /// How often this node sends unsolicited status refreshes after local frontier changes.
     #[serde(with = "humantime_serde")]
     pub status_refresh_interval: Duration,
@@ -44,7 +38,6 @@ impl Default for ZakuraHeaderSyncConfig {
     fn default() -> Self {
         Self {
             max_headers_per_response: DEFAULT_HS_RANGE,
-            max_inflight_requests: DEFAULT_HS_MAX_INFLIGHT,
             status_refresh_interval: DEFAULT_HS_STATUS_REFRESH_INTERVAL,
             peer_limits: ServicePeerLimits::default(),
             anchor_height: None,
@@ -61,8 +54,7 @@ impl ZakuraHeaderSyncConfig {
 
     /// Return the locally capped in-flight advertisement for status messages.
     pub fn advertised_max_inflight_requests(&self) -> u16 {
-        self.max_inflight_requests
-            .clamp(1, LOCAL_MAX_HS_INFLIGHT_PER_PEER)
+        LOCAL_MAX_HS_INFLIGHT_PER_PEER
     }
 
     /// Return the configured trusted anchor, or genesis when no override is configured.
@@ -102,5 +94,16 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unknown field `accept_new_blocks`"));
+    }
+
+    #[test]
+    fn advertised_inflight_limit_matches_the_one_lease_per_peer_contract() {
+        let config = ZakuraHeaderSyncConfig::default();
+        assert_eq!(config.advertised_max_inflight_requests(), 1);
+        let error = toml::from_str::<ZakuraHeaderSyncConfig>("max_inflight_requests = 2")
+            .expect_err("the fixed one-request capability is not configurable");
+        assert!(error
+            .to_string()
+            .contains("unknown field `max_inflight_requests`"));
     }
 }

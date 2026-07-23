@@ -590,17 +590,26 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-WIRE-05"
 name = "Snapshot-bound path serving"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::RetainedPathLease"
+tests = ["PW-03::retained_path_leases_are_exact_bounded_session_scoped_and_expiring", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-WIRE-06"
 name = "No target substitution"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::HeaderPathLease"
+tests = ["PW-03::retained_path_leases_are_exact_bounded_session_scoped_and_expiring", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-WIRE-07"
 name = "Explicit response outcomes"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::HeaderPathLeaseResult"
+tests = ["PW-04::every_unservable_path_result_is_a_correlated_explicit_outcome"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-WIRE-08"

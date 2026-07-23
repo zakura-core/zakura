@@ -16,9 +16,8 @@ use crate::{
     config::zakura_secret_key_file_path,
     constants::{INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_MULTIPLIER},
     zakura::{
-        DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR,
-        DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
+        DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BOOTSTRAP_PEERS,
+        DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
     CacheDir, Config, P2pStack,
 };
@@ -479,10 +478,6 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
         DEFAULT_HS_RANGE
     );
     assert_eq!(
-        config.zakura.header_sync.max_inflight_requests,
-        DEFAULT_HS_MAX_INFLIGHT
-    );
-    assert_eq!(
         config.zakura.header_sync.status_refresh_interval,
         Duration::from_secs(30)
     );
@@ -557,7 +552,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
         [zakura.header_sync]
         max_headers_per_response = 333
-        max_inflight_requests = 9
         status_refresh_interval = "45s"
 
         [zakura.block_sync]
@@ -577,7 +571,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("trace_dir = \"target/zakura-test-traces\""));
     assert!(serialized.contains("[zakura.header_sync]"));
     assert!(serialized.contains("max_headers_per_response = 333"));
-    assert!(serialized.contains("max_inflight_requests = 9"));
     assert!(serialized.contains("status_refresh_interval = \"45s\""));
     assert!(serialized.contains("[zakura.block_sync]"));
     assert!(!serialized.contains("replace_legacy_syncer"));

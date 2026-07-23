@@ -363,11 +363,51 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     common_ancestor,
                     target,
                     entries,
+                    zakura_header_chain::TargetCompletion::TargetComplete { common_ancestor },
                 )
                 .await;
                 let _ = handles
                     .header_sync
                     .send(HeaderSyncEvent::HeaderTargetPrepared {
+                        peer,
+                        source,
+                        owner,
+                        result,
+                    })
+                    .await;
+            }
+            HeaderSyncAction::PrepareVctRepair {
+                peer,
+                source,
+                network,
+                owner,
+                context,
+                entry,
+            } => {
+                let common_ancestor = context.locator.entries().first().copied();
+                let result = match common_ancestor {
+                    Some(common_ancestor) if context.locator.entries().len() == 1 => {
+                        prepare_header_target(
+                            read_state.clone(),
+                            &peer,
+                            source,
+                            network,
+                            owner,
+                            common_ancestor,
+                            context.target,
+                            vec![entry],
+                            zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
+                                common_ancestor,
+                                selected_target: context.target,
+                            },
+                        )
+                        .await
+                    }
+                    _ => HeaderTargetPreparationResult::Stale,
+                };
+                let _ = handles
+                    .header_sync
+                    .send(HeaderSyncEvent::VctRepairPrepared {
                         peer,
                         source,
                         owner,
@@ -385,6 +425,23 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 let _ = handles
                     .header_sync
                     .send(HeaderSyncEvent::HeaderTargetAdmissionReady {
+                        peer,
+                        source,
+                        owner,
+                        result,
+                    })
+                    .await;
+            }
+            HeaderSyncAction::ApplyVctRepair {
+                peer,
+                source,
+                owner,
+                insert,
+            } => {
+                let result = apply_header_target(state.clone(), &peer, owner, insert).await;
+                let _ = handles
+                    .header_sync
+                    .send(HeaderSyncEvent::VctRepairAdmissionReady {
                         peer,
                         source,
                         owner,
@@ -434,6 +491,7 @@ async fn prepare_header_target<ReadState>(
     common_ancestor: zakura_header_chain::Frontier,
     target: zakura_header_chain::Frontier,
     entries: Vec<HeaderEntry>,
+    completion: zakura_header_chain::TargetCompletion,
 ) -> HeaderTargetPreparationResult
 where
     ReadState: Service<
@@ -529,7 +587,7 @@ where
         source,
         parent_hash: common_ancestor.hash,
         target_tip_hash: target.hash,
-        completion: zakura_header_chain::TargetCompletion::TargetComplete { common_ancestor },
+        completion,
         batch,
         aux,
     }))
@@ -1130,8 +1188,19 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
                 insert_cs_height(row, cs_trace::HEIGHT, target.height);
                 insert_cs_hash(row, cs_trace::HASH, target.hash);
             }
+            HeaderSyncAction::PrepareVctRepair { peer, context, .. } => {
+                insert_cs_str(row, cs_trace::ACTION, "prepare_vct_repair");
+                insert_cs_peer(row, cs_trace::PEER, peer);
+                insert_cs_height(row, cs_trace::HEIGHT, context.target.height);
+                insert_cs_hash(row, cs_trace::HASH, context.target.hash);
+            }
             HeaderSyncAction::ApplyHeaderTarget { peer, insert, .. } => {
                 insert_cs_str(row, cs_trace::ACTION, "apply_header_target");
+                insert_cs_peer(row, cs_trace::PEER, peer);
+                insert_cs_hash(row, cs_trace::HASH, insert.target_tip_hash);
+            }
+            HeaderSyncAction::ApplyVctRepair { peer, insert, .. } => {
+                insert_cs_str(row, cs_trace::ACTION, "apply_vct_repair");
                 insert_cs_peer(row, cs_trace::PEER, peer);
                 insert_cs_hash(row, cs_trace::HASH, insert.target_tip_hash);
             }

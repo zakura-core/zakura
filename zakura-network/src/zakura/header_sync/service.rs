@@ -353,7 +353,9 @@ pub(crate) async fn drive_header_sync_actions(
             | HeaderSyncAction::ReadHeaderPath { .. }
             | HeaderSyncAction::ReleaseHeaderPath { .. }
             | HeaderSyncAction::PrepareHeaderTarget { .. }
+            | HeaderSyncAction::PrepareVctRepair { .. }
             | HeaderSyncAction::ApplyHeaderTarget { .. }
+            | HeaderSyncAction::ApplyVctRepair { .. }
             | HeaderSyncAction::BodyGaps { .. }
             | HeaderSyncAction::HeaderAdvanced { .. }
             | HeaderSyncAction::HeaderReanchored { .. } => {}

@@ -243,6 +243,17 @@ pub enum HeaderSyncEvent {
         /// Sealed evidence or a typed preparation failure.
         result: HeaderTargetPreparationResult,
     },
+    /// One exact selected VCT metadata redelivery was prepared outside the reactor.
+    VctRepairPrepared {
+        /// Supplying peer.
+        peer: ZakuraPeerId,
+        /// Stable supplier identity.
+        source: zakura_header_chain::SourceId,
+        /// Exact current repair owner.
+        owner: zakura_header_chain::WorkOwner,
+        /// Sealed metadata-only insertion or typed preparation failure.
+        result: HeaderTargetPreparationResult,
+    },
     /// Atomic state admission completed.
     HeaderTargetAdmissionReady {
         /// Peer whose exact active work produced the completion.
@@ -250,6 +261,17 @@ pub enum HeaderSyncEvent {
         /// Stable source identity used by the pending-owner gate.
         source: zakura_header_chain::SourceId,
         /// Ownership token echoed by the driver.
+        owner: zakura_header_chain::WorkOwner,
+        /// Commit, stale-work, peer-invalid, or local-failure result.
+        result: HeaderTargetAdmissionResult,
+    },
+    /// Atomic selected VCT metadata admission completed.
+    VctRepairAdmissionReady {
+        /// Supplying peer.
+        peer: ZakuraPeerId,
+        /// Stable supplier identity.
+        source: zakura_header_chain::SourceId,
+        /// Exact current repair owner.
         owner: zakura_header_chain::WorkOwner,
         /// Commit, stale-work, peer-invalid, or local-failure result.
         result: HeaderTargetAdmissionResult,
@@ -281,7 +303,9 @@ impl HeaderSyncEvent {
             Self::HeaderPathLeaseReady { .. } => "header_path_lease_ready",
             Self::HeaderPathPageReady { .. } => "header_path_page_ready",
             Self::HeaderTargetPrepared { .. } => "header_target_prepared",
+            Self::VctRepairPrepared { .. } => "vct_repair_prepared",
             Self::HeaderTargetAdmissionReady { .. } => "header_target_admission_ready",
+            Self::VctRepairAdmissionReady { .. } => "vct_repair_admission_ready",
         }
     }
 }
@@ -427,6 +451,21 @@ pub enum HeaderSyncAction {
         /// All response entries in parent-first order.
         entries: Vec<HeaderEntry>,
     },
+    /// Validate one exact selected-header redelivery and seal its auxiliary provenance.
+    PrepareVctRepair {
+        /// Supplying peer.
+        peer: ZakuraPeerId,
+        /// Stable supplier identity.
+        source: zakura_header_chain::SourceId,
+        /// Authenticated network parameters.
+        network: Network,
+        /// Exact current repair owner.
+        owner: zakura_header_chain::WorkOwner,
+        /// State-resolved selected request context.
+        context: zakura_header_chain::VctRepairContext,
+        /// Exact complete one-header response.
+        entry: HeaderEntry,
+    },
     /// Submit sealed evidence only after the centralized completion gate accepts its owner.
     ApplyHeaderTarget {
         /// Supplying peer, retained for result attribution.
@@ -436,6 +475,17 @@ pub enum HeaderSyncAction {
         /// Exact current owner.
         owner: zakura_header_chain::WorkOwner,
         /// Sealed insertion produced by `prepare_headers`.
+        insert: Box<zakura_header_chain::InsertHeaders>,
+    },
+    /// Submit one sealed selected VCT metadata redelivery after the completion gate.
+    ApplyVctRepair {
+        /// Supplying peer.
+        peer: ZakuraPeerId,
+        /// Stable supplier identity.
+        source: zakura_header_chain::SourceId,
+        /// Exact current repair owner.
+        owner: zakura_header_chain::WorkOwner,
+        /// Sealed selected-auxiliary insertion.
         insert: Box<zakura_header_chain::InsertHeaders>,
     },
     /// Ask state for missing block-body gaps.

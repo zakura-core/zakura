@@ -6,6 +6,7 @@ use thiserror::Error;
 use zakura_header_chain::{EngineSnapshot, EvidenceId, SourceId, VctRepairContext, WorkOwner};
 
 use super::coverage::BranchRange;
+use crate::zakura::header_sync::HeaderEntry;
 
 /// Exact phase of one auxiliary repair task.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -63,6 +64,12 @@ pub struct VctRepairTask {
     pub context: Option<VctRepairContext>,
     /// Whether the exact state context read is currently outstanding.
     pub context_requested: bool,
+    /// Exact complete wire entry retained until off-reactor preparation succeeds.
+    pub entry: Option<HeaderEntry>,
+    /// Sealed metadata-only insertion retained while state action capacity is unavailable.
+    pub prepared: Option<Box<zakura_header_chain::InsertHeaders>>,
+    /// Authenticated supplier retained after the on-wire phase.
+    pub source: Option<SourceId>,
 }
 
 impl VctRepairTask {
@@ -78,6 +85,9 @@ impl VctRepairTask {
             attempts: 0,
             context: None,
             context_requested: false,
+            entry: None,
+            prepared: None,
+            source: None,
         })
     }
 
@@ -122,7 +132,41 @@ impl VctRepairTask {
             return Err(RepairTaskError::ScopeMismatch);
         }
         self.owner = owner;
+        self.source = Some(peer);
         self.phase = RepairPhase::OnWire { peer };
+        Ok(())
+    }
+
+    /// Retain one exact complete response before off-reactor preparation.
+    pub fn buffer(&mut self, entry: HeaderEntry) -> Result<(), RepairTaskError> {
+        let Some(context) = self.context.as_ref() else {
+            return Err(RepairTaskError::IllegalPhase);
+        };
+        if !matches!(self.phase, RepairPhase::OnWire { .. }) {
+            return Err(RepairTaskError::IllegalPhase);
+        }
+        if entry.header.hash() != context.target.hash || entry.tree_aux.is_none() {
+            return Err(RepairTaskError::TargetMismatch);
+        }
+        self.entry = Some(entry);
+        self.phase = RepairPhase::Buffered;
+        Ok(())
+    }
+
+    /// Retain a sealed selected-auxiliary insertion after preparation.
+    pub fn seal(
+        &mut self,
+        insert: Box<zakura_header_chain::InsertHeaders>,
+    ) -> Result<(), RepairTaskError> {
+        if !matches!(
+            self.phase,
+            RepairPhase::Buffered | RepairPhase::WaitingForCapacity
+        ) || self.entry.is_none()
+            || insert.owner != self.owner
+        {
+            return Err(RepairTaskError::IllegalPhase);
+        }
+        self.prepared = Some(insert);
         Ok(())
     }
 
@@ -158,6 +202,9 @@ impl VctRepairTask {
         self.phase = RepairPhase::Scheduled;
         self.context = None;
         self.context_requested = false;
+        self.entry = None;
+        self.prepared = None;
+        self.source = None;
         Ok(())
     }
 }
@@ -189,6 +236,36 @@ impl VctRepairQueue {
             .find(|task| task.phase == RepairPhase::Scheduled)
     }
 
+    /// Return the sole task waiting for bounded action capacity.
+    pub fn waiting(&self) -> Option<&VctRepairTask> {
+        self.0
+            .values()
+            .find(|task| task.phase == RepairPhase::WaitingForCapacity)
+    }
+
+    /// Return the exact on-wire task matching one authenticated stream response.
+    pub fn on_wire(
+        &self,
+        source: SourceId,
+        session_id: u64,
+        request_id: std::num::NonZeroU64,
+    ) -> Option<&VctRepairTask> {
+        self.0.values().find(|task| {
+            task.phase == RepairPhase::OnWire { peer: source }
+                && task.owner.session_id == session_id
+                && task.owner.request_id == request_id
+        })
+    }
+
+    /// Return repair work still owned by one authenticated stream session.
+    pub fn for_session(&self, source: SourceId, session_id: u64) -> Option<&VctRepairTask> {
+        self.0.values().find(|task| {
+            task.source == Some(source)
+                && task.owner.session_id == session_id
+                && !matches!(task.phase, RepairPhase::StateDispatched { .. })
+        })
+    }
+
     /// Rekey a resolved task from its scheduling owner to its actual wire owner.
     pub fn assign(
         &mut self,
@@ -214,12 +291,25 @@ impl VctRepairQueue {
     }
 
     /// Retire every repair before replacing or withdrawing the current state need.
-    pub fn clear(&mut self) {
-        self.0.clear();
+    pub fn drain(&mut self) -> Vec<VctRepairTask> {
+        self.0.drain().map(|(_, task)| task).collect()
     }
 
     /// Retire every task whose version, generation, or finalized anchor is obsolete.
-    pub fn retain_current(&mut self, current: &EngineSnapshot) {
+    pub fn retain_current(&mut self, current: &EngineSnapshot) -> Vec<VctRepairTask> {
+        let obsolete: Vec<_> = self
+            .0
+            .iter()
+            .filter_map(|(owner, task)| {
+                (owner.state_version != current.state_version
+                    || owner.header_generation != current.header_generation
+                    || owner
+                        .verified_generation
+                        .is_some_and(|generation| generation != current.verified_generation)
+                    || owner.branch.anchor_hash != current.frontiers.finalized.hash)
+                    .then_some(task.clone())
+            })
+            .collect();
         self.0.retain(|owner, _| {
             owner.state_version == current.state_version
                 && owner.header_generation == current.header_generation
@@ -228,6 +318,7 @@ impl VctRepairQueue {
                     .is_none_or(|generation| generation == current.verified_generation)
                 && owner.branch.anchor_hash == current.frontiers.finalized.hash
         });
+        obsolete
     }
 
     /// Number of exact pending repairs.
@@ -359,11 +450,11 @@ mod tests {
             let mut task = task(&snapshot);
             task.phase = phase;
             let mut queue = VctRepairQueue::default();
-            assert_eq!(queue.insert(task), None);
+            assert_eq!(queue.insert(task.clone()), None);
             let mut changed = snapshot.clone();
             changed.state_version = StateVersion::new(4);
             changed.header_generation = HeaderGeneration::new(5);
-            queue.retain_current(&changed);
+            assert_eq!(queue.retain_current(&changed), vec![task]);
             assert!(queue.is_empty(), "phase {phase:?} survived retirement");
         }
     }

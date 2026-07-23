@@ -650,22 +650,34 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-AUX-01"
 name = "Hash-scoped metadata provenance"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::AuxDelivery"
+tests = ["IN-06::auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral", "IN-06::selected_auxiliary_repair_adds_only_one_exact_provenance_record", "DG-01::aux_finality_and_metadata_values_round_trip_exactly"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-AUX-02"
 name = "Unauthenticated metadata isolation"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::apply_transition"
+tests = ["IN-06::auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral", "IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header", "PW-06::oversized_body_hint_is_malformed_metadata_not_an_invalid_header", "IN-06::vct_boundary_failure_attribution_never_weakens_authenticated_evidence"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-AUX-03"
 name = "Branch-scoped VCT repair"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::VctRepairTask"
+tests = ["AUD-09::aud_09_every_repair_phase_retires_before_new_generation_work", "IN-06::vct_repair_uses_one_exact_canonical_auxiliary_request", "IN-06::retired_vct_request_response_has_no_actions_or_peer_score", "AUD-14::aud_14_selected_auxiliary_repair_reopens_complete_before_or_after"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-AUX-04"
 name = "Cryptographic metadata authentication"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::service::write::HeaderChainWriter::vct_authentication_request"
+tests = ["IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header", "IN-06::vct_untrusted_source_defers_unverifiable_tip_root_until_successor", "IN-06::vct_untrusted_source_bad_root_replacement_commits_same_height", "IN-06::vct_boundary_failure_attribution_never_weakens_authenticated_evidence", "AUD-14::aud_14_aux_authentication_reopens_complete_before_or_after", "AUD-14::aud_14_two_delivery_aux_rejection_never_partially_commits"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-WIRE-01"

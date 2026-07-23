@@ -426,6 +426,21 @@ pub struct TreeAuxRecordV1 {
 }
 
 impl TreeAuxRecordV1 {
+    /// Return a stable digest of the exact canonical schema-1 payload.
+    pub fn payload_digest(&self) -> [u8; 32] {
+        let mut bytes = Vec::with_capacity(TREE_AUX_SCHEMA_V1_BYTES);
+        self.encode_to(&mut bytes)
+            .expect("serializing into an in-memory vector cannot fail");
+        let digest = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(b"ZHeaderAuxV1____")
+            .hash(&bytes);
+        digest
+            .as_bytes()
+            .try_into()
+            .expect("the configured digest length is exactly 32 bytes")
+    }
+
     /// Validate the inferred height and all activation-dependent canonical defaults.
     pub fn validate_for(
         &self,
@@ -538,23 +553,33 @@ pub struct HeaderSyncCodec {
 
 impl HeaderSyncCodec {
     /// Read only the correlation ID needed to select bounded response decode context.
-    pub(crate) fn peek_headers_request_id(
+    pub(crate) fn peek_response_request_id(
         frame: &Frame,
     ) -> Result<HeaderSyncRequestId, HeaderSyncWireError> {
-        if u8::try_from(frame.message_type).ok() != Some(MSG_HS_HEADERS) {
+        let message_type = u8::try_from(frame.message_type).ok();
+        if !matches!(
+            message_type,
+            Some(MSG_HS_HEADERS) | Some(MSG_HS_HEADERS_OUTCOME)
+        ) {
             return Err(HeaderSyncWireError::UnknownFrameMessageType(
                 frame.message_type,
             ));
         }
         let mut reader = io::Cursor::new(frame.payload.as_slice());
-        if reader.read_u8()? != MSG_HS_HEADERS {
+        let payload_type = reader.read_u8()?;
+        if Some(payload_type) != message_type {
             return Err(HeaderSyncWireError::MismatchedFrameMessageType {
                 frame: frame.message_type,
-                payload: frame.payload.first().copied().unwrap_or_default(),
+                payload: payload_type,
             });
         }
-        let request_id = read_request_id(&mut reader, "Headers")?;
-        HeaderSyncRequestId::new(request_id).ok_or(HeaderSyncWireError::ZeroRequestId("Headers"))
+        let label = if payload_type == MSG_HS_HEADERS {
+            "Headers"
+        } else {
+            "HeadersOutcome"
+        };
+        let request_id = read_request_id(&mut reader, label)?;
+        HeaderSyncRequestId::new(request_id).ok_or(HeaderSyncWireError::ZeroRequestId(label))
     }
 
     /// Construct a codec using negotiated caps, always narrowed by hard protocol limits.

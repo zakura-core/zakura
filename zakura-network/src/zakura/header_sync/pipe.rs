@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     events::{HeaderSyncEvent, HeaderSyncHandle, HeaderSyncRequestId},
     service::{ExpectedHeadersResponse, HeaderSyncPeerCommand},
-    HeaderSyncCodec, MSG_HS_HEADERS,
+    HeaderSyncCodec, MSG_HS_HEADERS, MSG_HS_HEADERS_OUTCOME,
 };
 use crate::zakura::{Frame, FramedRecv, SinkReject, ZakuraPeerId};
 
@@ -53,12 +53,17 @@ pub(super) async fn run_peer(
             apply_command(&mut expected, command);
         }
 
-        let response_context = if u8::try_from(frame.message_type).ok() == Some(MSG_HS_HEADERS) {
+        let message_type = u8::try_from(frame.message_type).ok();
+        let response_context = if matches!(
+            message_type,
+            Some(MSG_HS_HEADERS) | Some(MSG_HS_HEADERS_OUTCOME)
+        ) {
             let request_id =
-                HeaderSyncCodec::peek_headers_request_id(&frame).map_err(protocol_reject)?;
-            expected
+                HeaderSyncCodec::peek_response_request_id(&frame).map_err(protocol_reject)?;
+            let response = expected
                 .remove(&request_id)
-                .map(|response| response.context)
+                .ok_or_else(|| protocol_reject("unsolicited header-sync response"))?;
+            (message_type == Some(MSG_HS_HEADERS)).then_some(response.context)
         } else {
             None
         };
@@ -139,7 +144,16 @@ mod tests {
         send.send(frame).await.expect("pipe input remains open");
         drop(send);
         let (handle, mut events) = handle(codec.clone());
-        let (_commands_tx, commands) = mpsc::unbounded_channel();
+        let (commands_tx, commands) = mpsc::unbounded_channel();
+        commands_tx
+            .send(HeaderSyncPeerCommand::Reserve(ExpectedHeadersResponse {
+                request_id: HeaderSyncRequestId::new(1).expect("one is nonzero"),
+                context: HeaderSyncDecodeContext {
+                    max_header_count: 1,
+                    requested_tree_aux_schema: AuxSchema::None,
+                },
+            }))
+            .expect("the pipe command receiver is open");
 
         run_peer(
             handle,

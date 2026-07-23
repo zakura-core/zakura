@@ -19,7 +19,7 @@ pub use error::HeaderSyncStartError;
 pub use events::{
     FullStateFrontiers, HeaderPathLease, HeaderPathLeaseResult, HeaderPathPage,
     HeaderPathPageResult, HeaderSyncAction, HeaderSyncEvent, HeaderSyncHandle,
-    HeaderSyncMisbehavior, HeaderSyncRequestId, HeaderSyncStartup,
+    HeaderSyncMisbehavior, HeaderSyncRequestId, HeaderSyncStartup, HeaderTargetAdmissionResult,
 };
 pub use reactor::spawn_header_sync_reactor;
 pub use scheduler::peer_work::{ActiveHeaderRequest, AdvertisedHeaderTarget};

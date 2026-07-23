@@ -222,6 +222,15 @@ pub enum HeaderSyncEvent {
         /// Page data or an unavailable-lease outcome.
         result: HeaderPathPageResult,
     },
+    /// Requester validation and atomic state admission completed.
+    HeaderTargetAdmissionReady {
+        /// Peer whose exact active work produced the completion.
+        peer: ZakuraPeerId,
+        /// Ownership token echoed by the driver.
+        owner: zakura_header_chain::WorkOwner,
+        /// Commit, stale-work, peer-invalid, or local-failure result.
+        result: HeaderTargetAdmissionResult,
+    },
 }
 
 impl HeaderSyncEvent {
@@ -236,6 +245,7 @@ impl HeaderSyncEvent {
             Self::HeaderLocatorReady { .. } => "header_locator_ready",
             Self::HeaderPathLeaseReady { .. } => "header_path_lease_ready",
             Self::HeaderPathPageReady { .. } => "header_path_page_ready",
+            Self::HeaderTargetAdmissionReady { .. } => "header_target_admission_ready",
         }
     }
 }
@@ -284,6 +294,19 @@ pub struct HeaderPathPage {
     pub complete: bool,
 }
 
+/// Result of preparing and atomically applying one complete requester target.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HeaderTargetAdmissionResult {
+    /// State committed the insertion or recognized its idempotent replay.
+    Applied,
+    /// The durable generation or validation lease changed before admission.
+    Stale,
+    /// A deterministic peer-supplied header rule failed.
+    InvalidHeader,
+    /// Local state, configuration, or service availability prevented admission.
+    LocalFailure,
+}
+
 /// Actions emitted by the header-sync reactor for node wiring.
 #[derive(Clone, Debug)]
 pub enum HeaderSyncAction {
@@ -330,6 +353,21 @@ pub enum HeaderSyncAction {
         session_id: u64,
         /// State-issued lease identity.
         lease_id: u64,
+    },
+    /// Validate all staged pages and submit exactly one complete-target insertion.
+    AdmitHeaderTarget {
+        /// Supplying peer.
+        peer: ZakuraPeerId,
+        /// Authenticated network parameters.
+        network: Network,
+        /// Exact asynchronous ownership fixed by the initial request.
+        owner: zakura_header_chain::WorkOwner,
+        /// Exact initial locator intersection.
+        common_ancestor: zakura_header_chain::Frontier,
+        /// Exact advertised target.
+        target: zakura_header_chain::Frontier,
+        /// All response entries in parent-first order.
+        entries: Vec<HeaderEntry>,
     },
     /// Ask state for missing block-body gaps.
     QueryMissingBlockBodies {

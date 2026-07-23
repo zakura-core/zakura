@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, num::NonZeroU64};
 
 use iroh::NodeId;
 use tokio::{
@@ -244,6 +244,11 @@ impl HeaderSyncReactor {
                 target_tip_hash,
                 result,
             ),
+            HeaderSyncEvent::HeaderTargetAdmissionReady {
+                peer,
+                owner,
+                result,
+            } => self.handle_header_target_admission_ready(peer, owner, result),
         }
     }
 
@@ -304,12 +309,20 @@ impl HeaderSyncReactor {
         if state.session.session_id() != session_id {
             return;
         }
-        let HeaderSyncMessage::Status(status) = message else {
-            if let HeaderSyncMessage::GetHeaders(request) = message {
+        let status = match message {
+            HeaderSyncMessage::Status(status) => status,
+            HeaderSyncMessage::GetHeaders(request) => {
                 self.handle_get_headers(peer, session_id, request);
+                return;
             }
-            // Response admission is added in PR-11d2. No predecessor dispatcher exists.
-            return;
+            HeaderSyncMessage::Headers(response) => {
+                self.handle_headers(peer, response);
+                return;
+            }
+            HeaderSyncMessage::HeadersOutcome(response) => {
+                self.handle_headers_outcome(peer, response);
+                return;
+            }
         };
         metrics::counter!("sync.header.peer.status.received").increment(1);
         if status.work_anchor_height > status.selected_tip_height {
@@ -449,6 +462,162 @@ impl HeaderSyncReactor {
                 request.target_tip_hash,
                 HeadersOutcomeCode::Busy,
             );
+        }
+    }
+
+    fn handle_headers(&mut self, peer: ZakuraPeerId, response: Headers) {
+        let Some(request_id) = HeaderSyncRequestId::new(response.request_id) else {
+            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
+            return;
+        };
+        let Some(active) = self.peer_work_queue.active(&peer).cloned() else {
+            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
+            return;
+        };
+        if active.admission_pending
+            || active.request_id != request_id
+            || active.target.status.selected_tip_hash != response.target_tip_hash
+        {
+            self.peer_work_queue.remove(&peer);
+            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
+            return;
+        }
+        let returned_ancestor = zakura_header_chain::Frontier::new(
+            response.common_ancestor_height,
+            response.common_ancestor_hash,
+        );
+        let expected_ancestor = match active.common_ancestor {
+            Some(_) => active.staged_tip(),
+            None => active
+                .sent_locator
+                .entries()
+                .iter()
+                .copied()
+                .find(|entry| *entry == returned_ancestor),
+        };
+        if expected_ancestor != Some(returned_ancestor)
+            || active.entries.len().saturating_add(response.entries.len())
+                > zakura_header_chain::MAX_NON_FINALIZED_NODES_V1
+        {
+            self.peer_work_queue.remove(&peer);
+            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
+            return;
+        }
+
+        let response_schema = response.tree_aux_schema;
+        let complete = response.complete;
+        let active = self
+            .peer_work_queue
+            .active_mut(&peer)
+            .expect("the matching active request was just cloned");
+        active.common_ancestor.get_or_insert(returned_ancestor);
+        active.entries.extend(response.entries);
+        let Some(staged_tip) = active.staged_tip() else {
+            self.peer_work_queue.remove(&peer);
+            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
+            return;
+        };
+
+        if complete {
+            if staged_tip.hash != active.target.status.selected_tip_hash {
+                self.peer_work_queue.remove(&peer);
+                self.report_misbehavior(peer, HeaderSyncMisbehavior::InvalidHeader);
+                return;
+            }
+            active.admission_pending = true;
+            let action = HeaderSyncAction::AdmitHeaderTarget {
+                peer: peer.clone(),
+                network: self.startup.network.clone(),
+                owner: active.owner,
+                common_ancestor: active
+                    .common_ancestor
+                    .expect("a response page fixed its exact ancestor"),
+                target: staged_tip,
+                entries: active.entries.clone(),
+            };
+            if !self.dispatch_action(action) {
+                self.peer_work_queue.remove(&peer);
+            }
+            return;
+        }
+
+        let locator = active.continuation_locator(staged_tip);
+        let max_header_count = active.max_header_count;
+        let tree_aux_schema = active.tree_aux_schema;
+        let target_tip_hash = active.target.status.selected_tip_hash;
+        let Some(session) = self
+            .peer_state
+            .get(&peer)
+            .map(|state| state.session.clone())
+        else {
+            self.peer_work_queue.remove(&peer);
+            return;
+        };
+        match session.try_send_get_headers(
+            &self.codec,
+            target_tip_hash,
+            &locator,
+            max_header_count,
+            tree_aux_schema,
+        ) {
+            Ok(next_request_id) => {
+                let active = self
+                    .peer_work_queue
+                    .active_mut(&peer)
+                    .expect("the active request remains staged across continuation");
+                active.sent_locator = locator;
+                active.request_id = next_request_id;
+                debug_assert!(
+                    response_schema == AuxSchema::None || response_schema == tree_aux_schema,
+                    "the codec enforces response schema narrowing"
+                );
+            }
+            Err(_) => self.peer_work_queue.remove(&peer),
+        }
+    }
+
+    fn handle_headers_outcome(&mut self, peer: ZakuraPeerId, response: HeadersOutcome) {
+        let matches = HeaderSyncRequestId::new(response.request_id).is_some_and(|request_id| {
+            self.peer_work_queue.active(&peer).is_some_and(|active| {
+                !active.admission_pending
+                    && active.request_id == request_id
+                    && active.target.status.selected_tip_hash == response.target_tip_hash
+            })
+        });
+        self.peer_work_queue.remove(&peer);
+        if !matches {
+            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
+        } else {
+            metrics::counter!(
+                "sync.header.target.outcome",
+                "outcome" => format!("{:?}", response.outcome)
+            )
+            .increment(1);
+        }
+    }
+
+    fn handle_header_target_admission_ready(
+        &mut self,
+        peer: ZakuraPeerId,
+        owner: zakura_header_chain::WorkOwner,
+        result: HeaderTargetAdmissionResult,
+    ) {
+        let matches = self
+            .peer_work_queue
+            .active(&peer)
+            .is_some_and(|active| active.admission_pending && active.owner == owner);
+        if !matches {
+            return;
+        }
+        self.peer_work_queue.remove(&peer);
+        match result {
+            HeaderTargetAdmissionResult::Applied => {
+                metrics::counter!("sync.header.target.admitted").increment(1);
+            }
+            HeaderTargetAdmissionResult::InvalidHeader => {
+                self.report_misbehavior(peer, HeaderSyncMisbehavior::InvalidHeader);
+            }
+            HeaderTargetAdmissionResult::Stale | HeaderTargetAdmissionResult::LocalFailure => {}
         }
     }
 
@@ -669,6 +838,10 @@ impl HeaderSyncReactor {
             metrics::counter!("sync.header.target.locator_unavailable").increment(1);
             return;
         };
+        let Some(local) = self.committed_snapshot.clone() else {
+            self.peer_work_queue.remove_unstarted(&peer);
+            return;
+        };
         let Some(session) = self
             .peer_state
             .get(&peer)
@@ -729,6 +902,23 @@ impl HeaderSyncReactor {
                     target,
                     sent_locator: locator,
                     request_id,
+                    owner: zakura_header_chain::WorkOwner {
+                        state_version: local.state_version,
+                        header_generation: local.header_generation,
+                        verified_generation: None,
+                        branch: zakura_header_chain::BranchId::new(
+                            local.frontiers.finalized.hash,
+                            target_tip_hash,
+                        ),
+                        session_id,
+                        request_id: NonZeroU64::new(request_id.get())
+                            .expect("header-sync request IDs are nonzero"),
+                    },
+                    common_ancestor: None,
+                    entries: Vec::new(),
+                    admission_pending: false,
+                    max_header_count,
+                    tree_aux_schema,
                 });
                 debug_assert!(
                     started,
@@ -1030,11 +1220,190 @@ mod tests {
         startup
     }
 
+    fn committed_snapshot(
+        anchor: zakura_header_chain::Frontier,
+    ) -> zakura_header_chain::EngineSnapshot {
+        zakura_header_chain::EngineSnapshot {
+            mode: zakura_header_chain::EngineMode::Integrated,
+            state_version: zakura_header_chain::StateVersion::new(3),
+            header_generation: zakura_header_chain::HeaderGeneration::new(4),
+            verified_generation: zakura_header_chain::VerifiedGeneration::new(5),
+            frontiers: zakura_header_chain::FrontierSet {
+                finalized: anchor,
+                header_best: anchor,
+                verified_best: anchor,
+            },
+            header_best_score: zakura_header_chain::ChainScore::new(
+                zakura_header_chain::SuffixWork::zero(),
+                anchor.hash,
+            ),
+            oldest_retained_height: anchor.height,
+            alarms: Default::default(),
+        }
+    }
+
     async fn next_action(actions: &mut mpsc::Receiver<HeaderSyncAction>) -> HeaderSyncAction {
         time::timeout(std::time::Duration::from_secs(1), actions.recv())
             .await
             .expect("the reactor emits the expected action promptly")
             .expect("the reactor action channel stays open")
+    }
+
+    #[tokio::test]
+    async fn requester_stages_all_pages_before_one_exact_admission() {
+        let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown.clone());
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let (snapshots_tx, snapshots_rx) = watch::channel(Some(committed_snapshot(anchor)));
+        startup.committed_snapshots = Some(snapshots_rx);
+        let (handle, mut actions, task) =
+            spawn_header_sync_reactor(startup).expect("the requester fixture starts");
+        assert!(matches!(
+            next_action(&mut actions).await,
+            HeaderSyncAction::QueryMissingBlockBodies { .. }
+        ));
+        let (send, mut outbound) = framed_channel(8);
+        let peer = peer();
+        handle
+            .send(HeaderSyncEvent::PeerConnected(
+                HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
+            ))
+            .await
+            .expect("the peer connects");
+        let status_frame = outbound.recv().await.expect("initial status is sent");
+        assert!(matches!(
+            handle
+                .codec()
+                .decode_frame(status_frame, None)
+                .expect("status decodes"),
+            HeaderSyncMessage::Status(_)
+        ));
+
+        let mut first_header = *regtest_genesis_block().header;
+        first_header.previous_block_hash = anchor.hash;
+        let first_header = Arc::new(first_header);
+        let first = zakura_header_chain::Frontier::new(block::Height(1), first_header.hash());
+        let mut second_header = *regtest_genesis_block().header;
+        second_header.previous_block_hash = first.hash;
+        let second_header = Arc::new(second_header);
+        let target = zakura_header_chain::Frontier::new(block::Height(2), second_header.hash());
+        let remote_status = Status {
+            work_anchor_height: anchor.height,
+            work_anchor_hash: anchor.hash,
+            selected_tip_height: target.height,
+            selected_tip_hash: target.hash,
+            suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+            oldest_retained_height: anchor.height,
+            max_headers_per_response: 1,
+            max_inflight_requests: 1,
+            max_message_bytes: 2_000_000,
+            tree_aux_schema_mask: 0,
+        };
+        handle
+            .send(HeaderSyncEvent::SessionWireMessage {
+                peer: peer.clone(),
+                session_id: 0,
+                msg: HeaderSyncMessage::Status(remote_status),
+            })
+            .await
+            .expect("the target status reaches the reactor");
+        assert!(matches!(
+            next_action(&mut actions).await,
+            HeaderSyncAction::QueryHeaderLocator { target_tip_hash, .. }
+                if target_tip_hash == target.hash
+        ));
+        handle
+            .send(HeaderSyncEvent::HeaderLocatorReady {
+                peer: peer.clone(),
+                session_id: 0,
+                target_tip_hash: target.hash,
+                locator: Some(zakura_header_chain::HeaderLocator::for_continuation(anchor)),
+            })
+            .await
+            .expect("the locator reaches the reactor");
+        let first_request = match handle
+            .codec()
+            .decode_frame(outbound.recv().await.expect("first request is sent"), None)
+            .expect("first request decodes")
+        {
+            HeaderSyncMessage::GetHeaders(request) => request,
+            other => panic!("expected GetHeaders, got {other:?}"),
+        };
+        handle
+            .send(HeaderSyncEvent::SessionWireMessage {
+                peer: peer.clone(),
+                session_id: 0,
+                msg: HeaderSyncMessage::Headers(Headers {
+                    request_id: first_request.request_id,
+                    target_tip_hash: target.hash,
+                    common_ancestor_height: anchor.height,
+                    common_ancestor_hash: anchor.hash,
+                    complete: false,
+                    tree_aux_schema: AuxSchema::None,
+                    entries: vec![HeaderEntry {
+                        header: first_header.clone(),
+                        body_size: 0,
+                        tree_aux: None,
+                    }],
+                }),
+            })
+            .await
+            .expect("the first response page reaches the reactor");
+        let continuation = match handle
+            .codec()
+            .decode_frame(outbound.recv().await.expect("continuation is sent"), None)
+            .expect("continuation decodes")
+        {
+            HeaderSyncMessage::GetHeaders(request) => request,
+            other => panic!("expected continuation GetHeaders, got {other:?}"),
+        };
+        assert_eq!(continuation.locator_hashes, vec![first.hash]);
+        handle
+            .send(HeaderSyncEvent::SessionWireMessage {
+                peer: peer.clone(),
+                session_id: 0,
+                msg: HeaderSyncMessage::Headers(Headers {
+                    request_id: continuation.request_id,
+                    target_tip_hash: target.hash,
+                    common_ancestor_height: first.height,
+                    common_ancestor_hash: first.hash,
+                    complete: true,
+                    tree_aux_schema: AuxSchema::None,
+                    entries: vec![HeaderEntry {
+                        header: second_header,
+                        body_size: 0,
+                        tree_aux: None,
+                    }],
+                }),
+            })
+            .await
+            .expect("the completion page reaches the reactor");
+        let HeaderSyncAction::AdmitHeaderTarget {
+            owner,
+            common_ancestor,
+            target: admitted_target,
+            entries,
+            ..
+        } = next_action(&mut actions).await
+        else {
+            panic!("the complete target must produce one admission action");
+        };
+        assert_eq!(common_ancestor, anchor);
+        assert_eq!(admitted_target, target);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(owner.request_id.get(), first_request.request_id);
+        handle
+            .send(HeaderSyncEvent::HeaderTargetAdmissionReady {
+                peer,
+                owner,
+                result: HeaderTargetAdmissionResult::Applied,
+            })
+            .await
+            .expect("the admission result reaches the reactor");
+
+        drop(snapshots_tx);
+        shutdown.cancel();
+        task.await.expect("the reactor exits cleanly");
     }
 
     #[tokio::test]

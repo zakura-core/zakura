@@ -49,6 +49,19 @@ impl HeaderRules {
         })
     }
 
+    /// Bind authenticated network parameters to a state-issued validation lease. The state
+    /// transition independently rechecks the lease's anchor digest before any mutation.
+    pub fn for_validation_lease(
+        network: Network,
+        lease: &ValidationLease,
+    ) -> Result<Self, PowPolicyError> {
+        Ok(Self {
+            pow_policy: PowPolicy::for_network(&network)?,
+            network,
+            trust_anchor_digest: lease.trust_anchor_digest,
+        })
+    }
+
     /// Return the authenticated network parameters bound into these rules.
     pub fn network(&self) -> &Network {
         &self.network

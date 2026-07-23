@@ -2,9 +2,11 @@ use std::{cmp::Ordering, collections::HashMap};
 
 use tokio::time::Instant;
 
-use zakura_header_chain::{EngineSnapshot, HeaderLocator, MAX_STAGED_TARGETS_V1};
+use zakura_header_chain::{
+    EngineSnapshot, Frontier, HeaderLocator, WorkOwner, MAX_STAGED_TARGETS_V1,
+};
 
-use super::super::{HeaderSyncRequestId, Status, ZakuraPeerId};
+use super::super::{AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId};
 
 /// One peer's exact, session-bound target claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +52,18 @@ pub struct ActiveHeaderRequest {
     pub sent_locator: HeaderLocator,
     /// Nonzero request correlation identifier.
     pub request_id: HeaderSyncRequestId,
+    /// Durable generation and exact branch ownership fixed by the first request.
+    pub owner: WorkOwner,
+    /// Exact authenticated intersection fixed by the first response.
+    pub common_ancestor: Option<Frontier>,
+    /// Complete response pages staged without intermediate state mutation.
+    pub entries: Vec<HeaderEntry>,
+    /// True after the complete target has been handed to the admission driver.
+    pub admission_pending: bool,
+    /// Effective count bound preserved across continuation requests.
+    pub max_header_count: u32,
+    /// Requested auxiliary schema preserved across continuation requests.
+    pub tree_aux_schema: AuxSchema,
 }
 
 impl ActiveHeaderRequest {
@@ -60,6 +74,19 @@ impl ActiveHeaderRequest {
     ) -> HeaderLocator {
         HeaderLocator::for_continuation(returned_suffix_tip)
     }
+
+    /// Return the last staged frontier, inferred only from authenticated local heights.
+    pub fn staged_tip(&self) -> Option<Frontier> {
+        let ancestor = self.common_ancestor?;
+        let last = self.entries.last()?;
+        let count = u32::try_from(self.entries.len()).ok()?;
+        let height = ancestor
+            .height
+            .0
+            .checked_add(count)
+            .map(zakura_chain::block::Height)?;
+        Some(Frontier::new(height, last.header.hash()))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,7 +95,7 @@ enum PeerWorkState {
         target: AdvertisedHeaderTarget,
         priority: PeerWorkPriority,
     },
-    Active(ActiveHeaderRequest),
+    Active(Box<ActiveHeaderRequest>),
 }
 
 /// Advisory discovery priority. Incomparable claims deliberately map to normal.
@@ -174,7 +201,7 @@ impl PeerWorkQueue {
         ) == Some(&request.target);
         if matches {
             self.work_by_peer
-                .insert(peer, PeerWorkState::Active(request));
+                .insert(peer, PeerWorkState::Active(Box::new(request)));
         }
         matches
     }
@@ -192,12 +219,21 @@ impl PeerWorkQueue {
         }
     }
 
-    #[cfg(test)]
     pub(in crate::zakura::header_sync) fn active(
         &self,
         peer: &ZakuraPeerId,
     ) -> Option<&ActiveHeaderRequest> {
         match self.work_by_peer.get(peer) {
+            Some(PeerWorkState::Active(request)) => Some(request),
+            _ => None,
+        }
+    }
+
+    pub(in crate::zakura::header_sync) fn active_mut(
+        &mut self,
+        peer: &ZakuraPeerId,
+    ) -> Option<&mut ActiveHeaderRequest> {
+        match self.work_by_peer.get_mut(peer) {
             Some(PeerWorkState::Active(request)) => Some(request),
             _ => None,
         }
@@ -333,6 +369,22 @@ mod tests {
             target: replacement.clone(),
             sent_locator: locator.clone(),
             request_id: HeaderSyncRequestId::new(1).expect("one is a nonzero request ID"),
+            owner: WorkOwner {
+                state_version: local.state_version,
+                header_generation: local.header_generation,
+                verified_generation: None,
+                branch: zakura_header_chain::BranchId::new(
+                    local.frontiers.finalized.hash,
+                    replacement.status.selected_tip_hash,
+                ),
+                session_id: 7,
+                request_id: std::num::NonZeroU64::new(1).expect("one is nonzero"),
+            },
+            common_ancestor: None,
+            entries: Vec::new(),
+            admission_pending: false,
+            max_header_count: 1_000,
+            tree_aux_schema: AuxSchema::None,
         };
         assert!(queue.start(request.clone()));
         assert_eq!(queue.active(&peer(1)), Some(&request));

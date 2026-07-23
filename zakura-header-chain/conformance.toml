@@ -248,7 +248,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-VAL-08"
 name = "Future-header deferral"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::prepare_headers"
+tests = ["HV-05::future_time_accepts_two_hour_equality_and_rejects_one_second_above", "HV-05::future_time_is_deferred_but_deterministic_failures_are_rejected"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-VAL-09"
@@ -274,7 +277,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-VAL-11"
 name = "Validation before admission"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::prepare_headers + zakura_state::Request::ApplyHeaderChainInsert"
+tests = ["DG-01::requester_stages_all_pages_before_one_exact_admission", "DG-01::complete_batch_is_sealed_to_lease_and_uses_internal_context", "IN-01::stale_version_and_owner_fail_before_any_plan_effect"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-ANCHOR-01"

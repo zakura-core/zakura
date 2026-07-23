@@ -3169,6 +3169,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh() {
+        let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown.clone());
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let (_snapshots_tx, snapshots_rx) = watch::channel(Some(committed_snapshot(anchor)));
+        startup.committed_snapshots = Some(snapshots_rx);
+        let (handle, mut actions, task) =
+            spawn_header_sync_reactor(startup).expect("the requester fixture starts");
+        assert!(matches!(
+            next_action(&mut actions).await,
+            HeaderSyncAction::QueryMissingBlockBodies { .. }
+        ));
+        let (send, mut outbound) = framed_channel(16);
+        let peer = peer();
+        handle
+            .send(HeaderSyncEvent::PeerConnected(
+                HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
+            ))
+            .await
+            .expect("the peer connects");
+        let _initial_status = outbound.recv().await.expect("initial status is sent");
+
+        let target = block::Hash([0x42; 32]);
+        let remote_status = Status {
+            work_anchor_height: anchor.height,
+            work_anchor_hash: anchor.hash,
+            selected_tip_height: block::Height(2),
+            selected_tip_hash: target,
+            suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+            oldest_retained_height: anchor.height,
+            max_headers_per_response: 1,
+            max_inflight_requests: 1,
+            max_message_bytes: 2_000_000,
+            tree_aux_schema_mask: 0,
+        };
+
+        for outcome in [
+            HeadersOutcomeCode::TargetNotRetained,
+            HeadersOutcomeCode::HistoryPruned,
+            HeadersOutcomeCode::Busy,
+            HeadersOutcomeCode::NoLocatorIntersection,
+        ] {
+            handle
+                .send(HeaderSyncEvent::SessionWireMessage {
+                    peer: peer.clone(),
+                    session_id: 0,
+                    msg: HeaderSyncMessage::Status(remote_status.clone()),
+                })
+                .await
+                .expect("the refreshed status reaches the reactor");
+            assert!(matches!(
+                next_action(&mut actions).await,
+                HeaderSyncAction::QueryHeaderLocator {
+                    target_tip_hash,
+                    ..
+                } if target_tip_hash == target
+            ));
+            handle
+                .send(HeaderSyncEvent::HeaderLocatorReady {
+                    peer: peer.clone(),
+                    session_id: 0,
+                    target_tip_hash: target,
+                    locator: Some(zakura_header_chain::HeaderLocator::for_continuation(anchor)),
+                })
+                .await
+                .expect("the locator reaches the reactor");
+            let request = match handle
+                .codec()
+                .decode_frame(outbound.recv().await.expect("the request is sent"), None)
+                .expect("the request decodes")
+            {
+                HeaderSyncMessage::GetHeaders(request) => request,
+                other => panic!("expected GetHeaders, got {other:?}"),
+            };
+            handle
+                .send(HeaderSyncEvent::SessionWireMessage {
+                    peer: peer.clone(),
+                    session_id: 0,
+                    msg: HeaderSyncMessage::HeadersOutcome(HeadersOutcome {
+                        request_id: request.request_id,
+                        target_tip_hash: target,
+                        outcome,
+                    }),
+                })
+                .await
+                .expect("the explicit outcome reaches the reactor");
+        }
+
+        handle
+            .send(HeaderSyncEvent::SessionWireMessage {
+                peer,
+                session_id: 0,
+                msg: HeaderSyncMessage::Status(remote_status),
+            })
+            .await
+            .expect("the next bounded status refresh reaches the reactor");
+        assert!(matches!(
+            next_action(&mut actions).await,
+            HeaderSyncAction::QueryHeaderLocator {
+                target_tip_hash,
+                ..
+            } if target_tip_hash == target
+        ));
+
+        shutdown.cancel();
+        task.await.expect("the reactor exits cleanly");
+    }
+
+    #[tokio::test]
     async fn retained_path_pages_keep_one_target_and_release_after_completion() {
         let shutdown = CancellationToken::new();
         let (handle, mut actions, task) =

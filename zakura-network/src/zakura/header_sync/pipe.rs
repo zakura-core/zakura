@@ -175,4 +175,54 @@ mod tests {
             })
         ));
     }
+
+    #[tokio::test]
+    async fn unsolicited_and_mismatched_responses_are_protocol_rejected() {
+        for (reserved_id, response_id) in [(None, 1), (Some(1), 2)] {
+            let codec = HeaderSyncCodec::new(Network::Mainnet, 1024, 1, 0);
+            let frame = codec
+                .encode_frame(&HeaderSyncMessage::HeadersOutcome(HeadersOutcome {
+                    request_id: response_id,
+                    target_tip_hash: block::Hash([3; 32]),
+                    outcome: HeadersOutcomeCode::Busy,
+                }))
+                .expect("the response fixture encodes");
+            let (send, recv) = framed_channel(1);
+            send.send(frame).await.expect("pipe input remains open");
+            drop(send);
+            let (handle, mut events) = handle(codec.clone());
+            let (commands_tx, commands) = mpsc::unbounded_channel();
+            if let Some(request_id) = reserved_id {
+                commands_tx
+                    .send(HeaderSyncPeerCommand::Reserve(ExpectedHeadersResponse {
+                        request_id: HeaderSyncRequestId::new(request_id)
+                            .expect("the fixture request ID is nonzero"),
+                        context: HeaderSyncDecodeContext {
+                            max_header_count: 1,
+                            requested_tree_aux_schema: AuxSchema::None,
+                        },
+                    }))
+                    .expect("the pipe command receiver is open");
+            }
+
+            let result = run_peer(
+                handle,
+                codec,
+                peer(),
+                1,
+                commands,
+                recv,
+                CancellationToken::new(),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(SinkReject::Protocol(_))),
+                "an unsolicited or mismatched response is peer-attributable"
+            );
+            assert!(
+                events.try_recv().is_err(),
+                "a rejected response never reaches the reactor"
+            );
+        }
+    }
 }

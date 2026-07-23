@@ -319,7 +319,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-VAL-09"
 name = "Checkpoint ancestry"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::transition::planner::anchor_reasons"
+tests = ["HV-06::insertion_enforces_every_immutable_configured_checkpoint", "HV-06::production_settled_pins_create_exact_permanent_conflict_reasons", "HV-06::fixed_anchor_boundary_matrix_replays_through_transitions"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-VAL-10"
@@ -348,7 +351,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-ANCHOR-01"
 name = "Absolute trust anchors"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::transition::planner::anchor_reasons"
+tests = ["HV-06::engine_config_binds_and_validates_every_trust_anchor", "HV-06::insertion_enforces_every_immutable_configured_checkpoint", "HV-06::production_settled_pins_create_exact_permanent_conflict_reasons", "DG-05::dg_05_fixed_anchor_replacements_cross_999_1000_1001_in_both_orders"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-ANCHOR-02"

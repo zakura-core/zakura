@@ -1496,6 +1496,52 @@ mod tests {
         }
     }
 
+    fn assert_next_child_commits(
+        store: &TestStore,
+        config: &EngineConfig,
+        clock: &ManualClock,
+        expected_parent: Frontier,
+        evidence: u8,
+    ) {
+        assert_eq!(store.metadata.frontiers.header_best, expected_parent);
+        let mut committed = store.clone();
+        let request = insertion(&committed, 1, EvidenceId::from_digest([evidence; 32]));
+        let child = match &request.event {
+            TransitionEvent::InsertHeaders(event) => {
+                assert_eq!(event.parent_hash, expected_parent.hash);
+                assert_eq!(
+                    event.completion,
+                    TargetCompletion::TargetComplete {
+                        common_ancestor: expected_parent,
+                    }
+                );
+                event.target_tip_hash
+            }
+            _ => unreachable!("the next-child helper constructs one insertion"),
+        };
+        let plan = apply_transition(&committed, request, &context(config, clock, None))
+            .expect("the exact selected parent accepts its next child");
+        assert_eq!(
+            plan.change_set.metadata.frontiers.header_best,
+            Frontier::new(
+                expected_parent
+                    .height
+                    .next()
+                    .expect("the bounded test parent has a next height"),
+                child,
+            )
+        );
+        committed.commit(&plan);
+        assert_eq!(
+            committed
+                .graph
+                .node(child)
+                .expect("the committed next child is retained")
+                .parent_hash,
+            expected_parent.hash
+        );
+    }
+
     fn insert_verified_branch(
         graph: &mut MemHeaderStore,
         parent: Frontier,
@@ -1629,34 +1675,7 @@ mod tests {
         );
         store.commit(&first);
 
-        let mut promoted = store.clone();
-        let child_request = insertion(&promoted, 1, EvidenceId::from_digest([0x36; 32]));
-        let child = match &child_request.event {
-            TransitionEvent::InsertHeaders(event) => {
-                assert_eq!(
-                    event.parent_hash, loser.hash,
-                    "the next request anchors to the exact promoted branch"
-                );
-                event.target_tip_hash
-            }
-            _ => unreachable!("the next-child fixture constructs one insertion"),
-        };
-        let child_plan =
-            apply_transition(&promoted, child_request, &context(&config, &clock, None))
-                .expect("the promoted branch accepts its next child");
-        assert_eq!(
-            child_plan.change_set.metadata.frontiers.header_best,
-            Frontier::new(block::Height(2), child)
-        );
-        promoted.commit(&child_plan);
-        assert_eq!(
-            promoted
-                .graph
-                .node(child)
-                .expect("the promoted child is retained")
-                .parent_hash,
-            loser.hash
-        );
+        assert_next_child_commits(&store, &config, &clock, loser, 0x36);
 
         let second = apply_transition(
             &store,
@@ -1771,6 +1790,9 @@ mod tests {
             reconsider.change_set.metadata.frontiers.verified_best,
             shorter
         );
+        let mut reconsidered = store.clone();
+        reconsidered.commit(&reconsider);
+        assert_next_child_commits(&reconsidered, &config, &clock, shorter, 0x45);
     }
 
     #[test]
@@ -1823,6 +1845,9 @@ mod tests {
                 put: Vec::new(),
             }
         );
+        let mut invalidated = store.clone();
+        invalidated.commit(&plan);
+        assert_next_child_commits(&invalidated, &config, &clock, header_tip, 0x54);
     }
 
     #[test]
@@ -1989,6 +2014,20 @@ mod tests {
         assert_eq!(
             replacement_then_finality.metadata.state_version,
             StateVersion::new(base.metadata.state_version.get().saturating_add(2))
+        );
+        assert_next_child_commits(
+            &replacement_then_finality,
+            &config,
+            &clock,
+            replacement,
+            0x67,
+        );
+        assert_next_child_commits(
+            &finality_then_replacement,
+            &config,
+            &clock,
+            replacement,
+            0x67,
         );
     }
 

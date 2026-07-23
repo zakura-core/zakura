@@ -87,7 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Allow chain synchronization to immediately retry an honest block body after
   rejecting a body with the same header hash, without waiting for another state
   request to trigger cleanup
-  ([#5](https://github.com/zakura-core/zakura-private/pull/5)).
+  ([GHSA-8gxx-hc65-vv82](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-8gxx-hc65-vv82)).
 
 ## [1.0.2] - 2026-07-20
 

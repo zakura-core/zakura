@@ -14,6 +14,7 @@ use std::{
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use futures::StreamExt as _;
 use iroh::Watcher as _;
 use iroh::{
     endpoint::{
@@ -29,6 +30,7 @@ use tokio::{
     task::{AbortHandle, JoinHandle, JoinSet},
     time::{timeout, Instant},
 };
+use tokio_stream::StreamMap;
 use tokio_util::sync::CancellationToken;
 use zakura_chain::{
     block::{self, Block, CountedHeader},
@@ -1478,176 +1480,155 @@ struct OrderedSessionExit {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum OrderedSessionWakeSource {
+enum OrderedSessionWaitReason {
     Demand,
     Transport,
 }
 
-#[derive(Copy, Clone, Debug)]
-struct OrderedSessionWake {
-    stream: Stream,
-    generation: u64,
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+enum OrderedSessionReopenState {
+    #[default]
+    Idle,
+    Waiting(OrderedSessionWaitReason),
+    Retired,
 }
 
+type OrderedSessionWait = futures::stream::Once<BoxRunFuture<'static, ()>>;
+type OrderedSessionWaits = StreamMap<u16, OrderedSessionWait>;
+
+/// Connection-owned lifecycle for one negotiated ordered stream kind.
 #[derive(Debug)]
-struct PendingOrderedSessionWake {
-    generation: u64,
-    source: OrderedSessionWakeSource,
-    abort: Option<AbortHandle>,
+struct OrderedSessionState {
+    stream: Stream,
+    local_session_id: Option<u64>,
+    remote_session_id: Option<u64>,
+    // Keep cumulative transport re-offers across successful opens: a remote
+    // service can immediately park the stream again, and resetting here would
+    // turn persistent refusal into a base-delay reopen loop.
+    reopen_attempts: u32,
+    reopen_state: OrderedSessionReopenState,
 }
 
-struct OrderedSessionWakeScheduler {
-    wake_tx: mpsc::UnboundedSender<OrderedSessionWake>,
-    connection_token: CancellationToken,
-    generations: HashMap<u16, u64>,
-    pending: HashMap<u16, PendingOrderedSessionWake>,
-    retired: HashSet<u16>,
-}
-
-impl OrderedSessionWakeScheduler {
-    fn new(
-        wake_tx: mpsc::UnboundedSender<OrderedSessionWake>,
-        connection_token: CancellationToken,
-    ) -> Self {
+impl OrderedSessionState {
+    fn new(stream: Stream) -> Self {
         Self {
-            wake_tx,
-            connection_token,
-            generations: HashMap::new(),
-            pending: HashMap::new(),
-            retired: HashSet::new(),
+            stream,
+            local_session_id: None,
+            remote_session_id: None,
+            reopen_attempts: 0,
+            reopen_state: OrderedSessionReopenState::Idle,
         }
     }
 
-    fn schedule_demand(&mut self, stream: Stream, demand: OrderedSessionDemand) {
+    fn has_active_session(&self) -> bool {
+        self.local_session_id.is_some() || self.remote_session_id.is_some()
+    }
+
+    fn remove_active_session(&mut self, opened_locally: bool, session_id: u64) -> bool {
+        let active_session = if opened_locally {
+            &mut self.local_session_id
+        } else {
+            &mut self.remote_session_id
+        };
+        if *active_session != Some(session_id) {
+            return false;
+        }
+
+        *active_session = None;
+        true
+    }
+
+    fn schedule_demand(&mut self, waits: &mut OrderedSessionWaits, demand: OrderedSessionDemand) {
         match demand {
             OrderedSessionDemand::OpenNow => {
-                self.retired.remove(&stream.kind);
-                self.cancel(stream.kind);
-                self.install_immediate(stream, OrderedSessionWakeSource::Demand);
+                self.cancel_wait(waits);
+                self.install_wait(
+                    waits,
+                    OrderedSessionWaitReason::Demand,
+                    Box::pin(future::ready(())),
+                );
             }
             OrderedSessionDemand::RetryAt(at) => {
-                self.retired.remove(&stream.kind);
                 self.install_demand_wait(
-                    stream,
+                    waits,
                     Box::pin(async move {
                         tokio::time::sleep_until(at.into()).await;
                     }),
                 );
             }
             OrderedSessionDemand::WaitForChange(changed) => {
-                self.retired.remove(&stream.kind);
-                self.install_demand_wait(stream, changed);
+                self.install_demand_wait(waits, changed);
             }
             OrderedSessionDemand::Retire => {
-                self.retired.insert(stream.kind);
-                self.cancel(stream.kind);
+                waits.remove(&self.stream.kind);
+                self.reopen_state = OrderedSessionReopenState::Retired;
             }
         }
     }
 
-    fn schedule_transport_backoff(
-        &mut self,
-        attempts: &mut HashMap<u16, u32>,
-        stream: Stream,
-    ) -> Option<Duration> {
-        if self.retired.contains(&stream.kind) || self.pending.contains_key(&stream.kind) {
+    fn schedule_transport_backoff(&mut self, waits: &mut OrderedSessionWaits) -> Option<Duration> {
+        if self.reopen_state != OrderedSessionReopenState::Idle {
             return None;
         }
+        debug_assert!(
+            !waits.contains_key(&self.stream.kind),
+            "idle ordered session cannot already have a reopen wait"
+        );
 
-        let attempt = attempts.entry(stream.kind).or_insert(0);
-        let delay = ordered_session_reopen_backoff(*attempt);
-        *attempt = attempt.saturating_add(1);
+        let delay = ordered_session_reopen_backoff(self.reopen_attempts);
+        self.reopen_attempts = self.reopen_attempts.saturating_add(1);
         self.install_wait(
-            stream,
-            OrderedSessionWakeSource::Transport,
+            waits,
+            OrderedSessionWaitReason::Transport,
             Box::pin(tokio::time::sleep(delay)),
         );
         Some(delay)
     }
 
-    fn take(&mut self, wake: OrderedSessionWake) -> Option<Stream> {
-        let pending = self.pending.get(&wake.stream.kind)?;
-        if pending.generation != wake.generation {
-            return None;
-        }
-        self.pending.remove(&wake.stream.kind);
-        Some(wake.stream)
-    }
-
-    fn cancel(&mut self, kind: u16) {
-        if let Some(pending) = self.pending.remove(&kind) {
-            if let Some(abort) = pending.abort {
-                abort.abort();
-            }
+    fn finish_wait(&mut self, waits: &mut OrderedSessionWaits) {
+        let removed = waits.remove(&self.stream.kind);
+        debug_assert!(
+            removed.is_some(),
+            "yielded ordered session wait remains keyed until it is handled"
+        );
+        if matches!(self.reopen_state, OrderedSessionReopenState::Waiting(_)) {
+            self.reopen_state = OrderedSessionReopenState::Idle;
         }
     }
 
-    fn install_demand_wait(&mut self, stream: Stream, wait: BoxRunFuture<'static, ()>) {
-        if self
-            .pending
-            .get(&stream.kind)
-            .is_some_and(|pending| pending.source == OrderedSessionWakeSource::Demand)
+    fn cancel_wait(&mut self, waits: &mut OrderedSessionWaits) {
+        waits.remove(&self.stream.kind);
+        if matches!(self.reopen_state, OrderedSessionReopenState::Waiting(_)) {
+            self.reopen_state = OrderedSessionReopenState::Idle;
+        }
+    }
+
+    fn install_demand_wait(
+        &mut self,
+        waits: &mut OrderedSessionWaits,
+        wait: BoxRunFuture<'static, ()>,
+    ) {
+        if self.reopen_state == OrderedSessionReopenState::Waiting(OrderedSessionWaitReason::Demand)
         {
             return;
         }
 
-        self.cancel(stream.kind);
-        self.install_wait(stream, OrderedSessionWakeSource::Demand, wait);
-    }
-
-    fn install_immediate(&mut self, stream: Stream, source: OrderedSessionWakeSource) {
-        let generation = self.next_generation(stream.kind);
-        self.pending.insert(
-            stream.kind,
-            PendingOrderedSessionWake {
-                generation,
-                source,
-                abort: None,
-            },
-        );
-        let _ = self.wake_tx.send(OrderedSessionWake { stream, generation });
+        self.cancel_wait(waits);
+        self.install_wait(waits, OrderedSessionWaitReason::Demand, wait);
     }
 
     fn install_wait(
         &mut self,
-        stream: Stream,
-        source: OrderedSessionWakeSource,
+        waits: &mut OrderedSessionWaits,
+        reason: OrderedSessionWaitReason,
         wait: BoxRunFuture<'static, ()>,
     ) {
-        let generation = self.next_generation(stream.kind);
-        let wake_tx = self.wake_tx.clone();
-        let connection_token = self.connection_token.clone();
-        let task = tokio::spawn(async move {
-            tokio::select! {
-                _ = connection_token.cancelled() => return,
-                _ = wait => {}
-            }
-            let _ = wake_tx.send(OrderedSessionWake { stream, generation });
-        });
-        self.pending.insert(
-            stream.kind,
-            PendingOrderedSessionWake {
-                generation,
-                source,
-                abort: Some(task.abort_handle()),
-            },
+        let replaced = waits.insert(self.stream.kind, futures::stream::once(wait));
+        debug_assert!(
+            replaced.is_none(),
+            "ordered session wait is cancelled before replacement"
         );
-    }
-
-    fn next_generation(&mut self, kind: u16) -> u64 {
-        let generation = self.generations.entry(kind).or_default();
-        *generation = generation.wrapping_add(1);
-        *generation
-    }
-}
-
-impl Drop for OrderedSessionWakeScheduler {
-    fn drop(&mut self) {
-        for pending in self.pending.values() {
-            if let Some(abort) = &pending.abort {
-                abort.abort();
-            }
-        }
+        self.reopen_state = OrderedSessionReopenState::Waiting(reason);
     }
 }
 
@@ -1673,16 +1654,6 @@ fn should_reopen_ordered_session(
         && policy.reopen
         && may_open_ordered_stream(policy, is_initiator)
         && !connection_cancelled
-}
-
-/// Remove an ordered session only if the exit belongs to the tracked generation.
-fn remove_ordered_session(sessions: &mut HashMap<u16, u64>, kind: u16, session_id: u64) -> bool {
-    if sessions.get(&kind) != Some(&session_id) {
-        return false;
-    }
-
-    sessions.remove(&kind);
-    true
 }
 
 /// Exponential reopen delay for one ordered stream kind, capped so a
@@ -2165,20 +2136,18 @@ impl ZakuraProtocolHandler {
         let stream_sem = Arc::new(Semaphore::new(usize::from(limits.max_open_streams)));
         let mut workers = JoinSet::new();
         let (ordered_session_exit_tx, mut ordered_session_exit_rx) = mpsc::unbounded_channel();
-        let (ordered_session_wake_tx, mut ordered_session_wake_rx) = mpsc::unbounded_channel();
-        let mut ordered_session_wakes =
-            OrderedSessionWakeScheduler::new(ordered_session_wake_tx, connection_token.clone());
-        // Cumulative re-offer attempts per stream kind. Keep the backoff after a
-        // physical open succeeds: the remote service can immediately park that
-        // stream, and resetting here would turn a persistent remote refusal into
-        // a base-delay reopen loop.
-        let mut ordered_session_reopen_attempts: HashMap<u16, u32> = HashMap::new();
+        let mut ordered_session_waits = OrderedSessionWaits::new();
         let mut open_limiter = TokenBucket::new(limits.stream_open_rate_per_second);
         let mut message_buckets = MessageRateBuckets::new();
         let (freshness_tx, freshness_rx) = watch::channel(Instant::now());
         let negotiated_ordered_streams = self
             .registry
             .ordered_streams_for_negotiated(accepted_capabilities);
+        let mut ordered_sessions: HashMap<u16, OrderedSessionState> = negotiated_ordered_streams
+            .iter()
+            .copied()
+            .map(|stream| (stream.kind, OrderedSessionState::new(stream)))
+            .collect();
         let mut ordered_streams = Vec::new();
         let mut deferred_ordered_streams = Vec::new();
         for stream in negotiated_ordered_streams.iter().copied() {
@@ -2223,21 +2192,12 @@ impl ZakuraProtocolHandler {
             close_cause.record("resource_queue_split");
             connection_token.cancel();
         }
-        let selected_ordered_streams: HashMap<u16, Stream> = negotiated_ordered_streams
-            .iter()
-            .map(|stream| (stream.kind, *stream))
-            .collect();
-        let ordered_kinds: HashSet<u16> = selected_ordered_streams.keys().copied().collect();
         let queue_split_stream_count = negotiated_ordered_streams.len().max(ordered_streams.len());
         let per_stream_queue_depth = per_stream_inbound_queue_depth(
             limits.max_inbound_queue_depth,
             queue_split_stream_count,
         );
         let mut service_streams = HashMap::new();
-        // Ordered-stream kinds this side proactively opened, used by the accept
-        // loop to detect same-kind collisions (both sides opened the kind).
-        let mut opened_ordered_sessions: HashMap<u16, u64> = HashMap::new();
-        let mut accepted_ordered_sessions: HashMap<u16, u64> = HashMap::new();
         let run_freshness_reaper =
             should_run_freshness_reaper(queue_split_stream_count, request_response_stream_count);
 
@@ -2292,7 +2252,10 @@ impl ZakuraProtocolHandler {
                         break;
                     }
                 };
-                opened_ordered_sessions.insert(admitted.kind, admitted.session_id);
+                ordered_sessions
+                    .get_mut(&admitted.kind)
+                    .expect("opened ordered stream was selected from negotiated session state")
+                    .local_session_id = Some(admitted.session_id);
                 service_streams.insert(
                     admitted.kind,
                     ServiceStream::new(
@@ -2331,7 +2294,10 @@ impl ZakuraProtocolHandler {
                     ?demand,
                     "deferring ordered service session according to reactor demand"
                 );
-                ordered_session_wakes.schedule_demand(stream, demand);
+                ordered_sessions
+                    .get_mut(&stream.kind)
+                    .expect("deferred ordered stream has negotiated session state")
+                    .schedule_demand(&mut ordered_session_waits, demand);
             }
         }
 
@@ -2348,23 +2314,14 @@ impl ZakuraProtocolHandler {
                     // Stop tracking the dead generation, or a legitimate reopen of the
                     // same kind would look like a duplicate stream and kill the whole
                     // connection, taking block sync and gossip down with header sync.
-                    let removed_active_session = if exited.opened_locally {
-                        remove_ordered_session(
-                            &mut opened_ordered_sessions,
-                            exited.stream.kind,
-                            exited.session_id,
-                        )
-                    } else {
-                        remove_ordered_session(
-                            &mut accepted_ordered_sessions,
-                            exited.stream.kind,
-                            exited.session_id,
-                        )
+                    let Some(session) = ordered_sessions.get_mut(&exited.stream.kind) else {
+                        continue;
                     };
+                    let removed_active_session =
+                        session.remove_active_session(exited.opened_locally, exited.session_id);
                     let policy = self.registry.ordered_stream_policy(exited.stream.kind);
                     if removed_active_session
-                        && !opened_ordered_sessions.contains_key(&exited.stream.kind)
-                        && !accepted_ordered_sessions.contains_key(&exited.stream.kind)
+                        && !session.has_active_session()
                         && should_reopen_ordered_session(
                         exited,
                         policy,
@@ -2372,10 +2329,9 @@ impl ZakuraProtocolHandler {
                         connection_token.is_cancelled(),
                     )
                     {
-                        if let Some(delay) = ordered_session_wakes.schedule_transport_backoff(
-                            &mut ordered_session_reopen_attempts,
-                            exited.stream,
-                        ) {
+                        if let Some(delay) =
+                            session.schedule_transport_backoff(&mut ordered_session_waits)
+                        {
                             debug!(
                                 stream_kind = exited.stream.kind,
                                 stream_version = exited.stream.version,
@@ -2386,16 +2342,16 @@ impl ZakuraProtocolHandler {
                         }
                     }
                 }
-                Some(wake) = ordered_session_wake_rx.recv() => {
-                    let Some(stream) = ordered_session_wakes.take(wake) else {
+                Some((kind, ())) = ordered_session_waits.next(), if !ordered_session_waits.is_empty() => {
+                    let Some(session) = ordered_sessions.get_mut(&kind) else {
                         continue;
                     };
+                    session.finish_wait(&mut ordered_session_waits);
+                    let stream = session.stream;
                     let policy = self.registry.ordered_stream_policy(stream.kind);
                     if connection_token.is_cancelled()
                         || !may_open_ordered_stream(policy, context.is_initiator)
-                        || opened_ordered_sessions.contains_key(&stream.kind)
-                        || accepted_ordered_sessions.contains_key(&stream.kind)
-                        || selected_ordered_streams.get(&stream.kind) != Some(&stream)
+                        || session.has_active_session()
                     {
                         continue;
                     }
@@ -2410,7 +2366,7 @@ impl ZakuraProtocolHandler {
                     match demand {
                         OrderedSessionDemand::OpenNow => {}
                         demand => {
-                            ordered_session_wakes.schedule_demand(stream, demand);
+                            session.schedule_demand(&mut ordered_session_waits, demand);
                             continue;
                         }
                     }
@@ -2434,8 +2390,11 @@ impl ZakuraProtocolHandler {
                         .await
                     {
                         Ok(admitted) => {
-                            ordered_session_wakes.cancel(admitted.kind);
-                            opened_ordered_sessions.insert(admitted.kind, admitted.session_id);
+                            let session = ordered_sessions
+                                .get_mut(&admitted.kind)
+                                .expect("opened ordered stream has negotiated session state");
+                            session.cancel_wait(&mut ordered_session_waits);
+                            session.local_session_id = Some(admitted.session_id);
                             let service_streams = HashMap::from([(
                                 admitted.kind,
                                 ServiceStream::new(
@@ -2460,10 +2419,10 @@ impl ZakuraProtocolHandler {
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                         }
                         Err(error) => {
-                            let delay = ordered_session_wakes.schedule_transport_backoff(
-                                &mut ordered_session_reopen_attempts,
-                                stream,
-                            );
+                            let delay = ordered_sessions
+                                .get_mut(&stream.kind)
+                                .expect("failed ordered stream open has negotiated session state")
+                                .schedule_transport_backoff(&mut ordered_session_waits);
                             debug!(
                                 ?error,
                                 stream_kind = stream.kind,
@@ -2510,7 +2469,7 @@ impl ZakuraProtocolHandler {
                                 // A stream kind we never negotiated is a protocol
                                 // fault: tear the connection down (unchanged
                                 // strictness).
-                                if !ordered_kinds.contains(&kind) {
+                                if !ordered_sessions.contains_key(&kind) {
                                     debug!(
                                         stream_kind = kind,
                                         "closing peer after unexpected ordered stream"
@@ -2533,7 +2492,8 @@ impl ZakuraProtocolHandler {
                                     continue;
                                 }
 
-                                let is_collision = opened_ordered_sessions.contains_key(&kind);
+                                let is_collision =
+                                    ordered_sessions[&kind].local_session_id.is_some();
                                 // The deterministic winner keeps its own stream
                                 // and parks the peer's. The loser falls through
                                 // and adopts the peer's stream.
@@ -2549,7 +2509,7 @@ impl ZakuraProtocolHandler {
                                 // We intend to adopt the peer's stream. A second
                                 // accepted stream of the same kind is a real
                                 // duplicate and a fault.
-                                if accepted_ordered_sessions.contains_key(&kind) {
+                                if ordered_sessions[&kind].remote_session_id.is_some() {
                                     debug!(
                                         stream_kind = kind,
                                         "closing peer after duplicate ordered stream"
@@ -2558,7 +2518,10 @@ impl ZakuraProtocolHandler {
                                     connection_token.cancel();
                                     continue;
                                 }
-                                accepted_ordered_sessions.insert(kind, admitted.session_id);
+                                ordered_sessions
+                                    .get_mut(&kind)
+                                    .expect("accepted ordered stream has negotiated session state")
+                                    .remote_session_id = Some(admitted.session_id);
 
                                 // Honour the owning service's current per-peer
                                 // demand. For a collision we lost, demand is
@@ -2591,20 +2554,18 @@ impl ZakuraProtocolHandler {
                                     // We are not adopting it after all, so this kind
                                     // is free again -- both for a later re-offer by
                                     // the peer and for the demand re-check below.
-                                    remove_ordered_session(
-                                        &mut accepted_ordered_sessions,
-                                        kind,
-                                        admitted.session_id,
-                                    );
+                                    let session = ordered_sessions
+                                        .get_mut(&kind)
+                                        .expect("parked ordered stream has negotiated session state");
+                                    session.remove_active_session(false, admitted.session_id);
                                     // If this side may open the stream, re-check its
                                     // local demand. Otherwise the entitled remote
                                     // opener observes the parked stream and retries.
                                     if policy.reopen
                                         && may_open_ordered_stream(policy, context.is_initiator)
-                                        && selected_ordered_streams.contains_key(&kind)
                                     {
-                                        ordered_session_wakes.schedule_demand(
-                                            selected_ordered_streams[&kind],
+                                        session.schedule_demand(
+                                            &mut ordered_session_waits,
                                             demand.expect("non-open demand exists because this branch checked it"),
                                         );
                                     }
@@ -2612,7 +2573,10 @@ impl ZakuraProtocolHandler {
                                     continue;
                                 }
 
-                                ordered_session_wakes.cancel(kind);
+                                ordered_sessions
+                                    .get_mut(&kind)
+                                    .expect("adopted ordered stream has negotiated session state")
+                                    .cancel_wait(&mut ordered_session_waits);
                                 let service_streams = HashMap::from([(
                                     kind,
                                     ServiceStream::new(
@@ -7213,20 +7177,13 @@ mod tests {
     #[test]
     fn stale_ordered_session_exit_keeps_newer_active_generation() {
         let stream = test_ordered_stream();
-        let mut accepted_sessions = HashMap::from([(stream.kind, 2)]);
+        let mut session = OrderedSessionState::new(stream);
+        session.remote_session_id = Some(2);
 
-        assert!(!remove_ordered_session(
-            &mut accepted_sessions,
-            stream.kind,
-            1,
-        ));
-        assert_eq!(accepted_sessions.get(&stream.kind), Some(&2));
-        assert!(remove_ordered_session(
-            &mut accepted_sessions,
-            stream.kind,
-            2,
-        ));
-        assert!(!accepted_sessions.contains_key(&stream.kind));
+        assert!(!session.remove_active_session(false, 1));
+        assert_eq!(session.remote_session_id, Some(2));
+        assert!(session.remove_active_session(false, 2));
+        assert_eq!(session.remote_session_id, None);
     }
 
     #[test]
@@ -7260,192 +7217,178 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn ordered_session_wake_scheduler_deduplicates_demand() {
-        let (wake_tx, _wake_rx) = mpsc::unbounded_channel();
-        let mut scheduler = OrderedSessionWakeScheduler::new(wake_tx, CancellationToken::new());
+    async fn ordered_session_waits_deduplicate_demand() {
         let stream = test_ordered_stream();
-        let (_change_tx, change_rx) = watch::channel(());
+        let mut session = OrderedSessionState::new(stream);
+        let mut waits = OrderedSessionWaits::new();
+        let (change_tx, change_rx) = watch::channel(());
 
-        scheduler.schedule_demand(
-            stream,
+        session.schedule_demand(
+            &mut waits,
             OrderedSessionDemand::WaitForChange(Box::pin(async move {
                 let mut change_rx = change_rx;
                 let _ = change_rx.changed().await;
             })),
         );
-        let generation = scheduler.pending[&stream.kind].generation;
-        scheduler.schedule_demand(
-            stream,
+        session.schedule_demand(
+            &mut waits,
             OrderedSessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
         );
 
-        assert_eq!(scheduler.pending.len(), 1);
-        assert_eq!(scheduler.pending[&stream.kind].generation, generation);
+        assert_eq!(waits.len(), 1);
         assert_eq!(
-            scheduler.pending[&stream.kind].source,
-            OrderedSessionWakeSource::Demand
+            session.reopen_state,
+            OrderedSessionReopenState::Waiting(OrderedSessionWaitReason::Demand)
+        );
+        assert_eq!(
+            change_tx.receiver_count(),
+            1,
+            "repeated demand must retain the original reactor wait"
         );
     }
 
     #[tokio::test(start_paused = true)]
     async fn ordered_session_demand_replaces_transport_backoff() {
-        let (wake_tx, _wake_rx) = mpsc::unbounded_channel();
-        let mut scheduler = OrderedSessionWakeScheduler::new(wake_tx, CancellationToken::new());
-        let mut attempts = HashMap::new();
         let stream = test_ordered_stream();
+        let mut session = OrderedSessionState::new(stream);
+        let mut waits = OrderedSessionWaits::new();
 
         assert_eq!(
-            scheduler.schedule_transport_backoff(&mut attempts, stream),
+            session.schedule_transport_backoff(&mut waits),
             Some(ORDERED_STREAM_REOPEN_BACKOFF)
         );
-        let transport_generation = scheduler.pending[&stream.kind].generation;
-        scheduler.schedule_demand(
-            stream,
+        session.schedule_demand(
+            &mut waits,
             OrderedSessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
         );
 
-        assert_eq!(attempts[&stream.kind], 1);
-        assert_eq!(scheduler.pending.len(), 1);
-        assert_ne!(
-            scheduler.pending[&stream.kind].generation,
-            transport_generation
-        );
+        assert_eq!(session.reopen_attempts, 1);
+        assert_eq!(waits.len(), 1);
         assert_eq!(
-            scheduler.pending[&stream.kind].source,
-            OrderedSessionWakeSource::Demand
+            session.reopen_state,
+            OrderedSessionReopenState::Waiting(OrderedSessionWaitReason::Demand)
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn ordered_session_exit_keeps_existing_demand_wake() {
-        let (wake_tx, _wake_rx) = mpsc::unbounded_channel();
-        let mut scheduler = OrderedSessionWakeScheduler::new(wake_tx, CancellationToken::new());
-        let mut attempts = HashMap::new();
+    async fn ordered_session_exit_keeps_existing_demand_wait() {
         let stream = test_ordered_stream();
+        let mut session = OrderedSessionState::new(stream);
+        let mut waits = OrderedSessionWaits::new();
 
-        scheduler.schedule_demand(
-            stream,
+        session.schedule_demand(
+            &mut waits,
             OrderedSessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
         );
-        let generation = scheduler.pending[&stream.kind].generation;
 
+        assert_eq!(session.schedule_transport_backoff(&mut waits), None);
+        assert_eq!(session.reopen_attempts, 0);
+        assert_eq!(waits.len(), 1);
         assert_eq!(
-            scheduler.schedule_transport_backoff(&mut attempts, stream),
-            None
+            session.reopen_state,
+            OrderedSessionReopenState::Waiting(OrderedSessionWaitReason::Demand)
         );
-        assert!(attempts.is_empty());
-        assert_eq!(scheduler.pending[&stream.kind].generation, generation);
     }
 
     #[tokio::test]
-    async fn ordered_session_retirement_cancels_and_blocks_transport_wakes() {
-        let (wake_tx, _wake_rx) = mpsc::unbounded_channel();
-        let mut scheduler = OrderedSessionWakeScheduler::new(wake_tx, CancellationToken::new());
-        let mut attempts = HashMap::new();
+    async fn ordered_session_retirement_cancels_and_blocks_transport_waits() {
         let stream = test_ordered_stream();
+        let mut session = OrderedSessionState::new(stream);
+        let mut waits = OrderedSessionWaits::new();
 
-        scheduler.schedule_demand(
-            stream,
+        session.schedule_demand(
+            &mut waits,
             OrderedSessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
         );
-        scheduler.schedule_demand(stream, OrderedSessionDemand::Retire);
+        session.schedule_demand(&mut waits, OrderedSessionDemand::Retire);
 
-        assert!(scheduler.pending.is_empty());
-        assert_eq!(
-            scheduler.schedule_transport_backoff(&mut attempts, stream),
-            None
-        );
-        assert!(attempts.is_empty());
+        assert!(waits.is_empty());
+        assert_eq!(session.reopen_state, OrderedSessionReopenState::Retired);
+        assert_eq!(session.schedule_transport_backoff(&mut waits), None);
+        assert_eq!(session.reopen_attempts, 0);
     }
 
     #[tokio::test]
-    async fn ordered_session_adoption_cancels_and_ignores_queued_wake() {
-        let (wake_tx, mut wake_rx) = mpsc::unbounded_channel();
-        let mut scheduler = OrderedSessionWakeScheduler::new(wake_tx, CancellationToken::new());
+    async fn ordered_session_adoption_drops_pending_wait() {
         let stream = test_ordered_stream();
+        let mut session = OrderedSessionState::new(stream);
+        let mut waits = OrderedSessionWaits::new();
 
-        scheduler.schedule_demand(stream, OrderedSessionDemand::OpenNow);
-        let queued = wake_rx
-            .recv()
-            .await
-            .expect("immediate demand queues one reopen wake");
-        scheduler.cancel(stream.kind);
+        session.schedule_demand(&mut waits, OrderedSessionDemand::OpenNow);
+        session.cancel_wait(&mut waits);
 
-        assert!(scheduler.pending.is_empty());
-        assert!(scheduler.take(queued).is_none());
+        assert!(waits.is_empty());
+        assert_eq!(session.reopen_state, OrderedSessionReopenState::Idle);
     }
 
     #[tokio::test]
-    async fn ordered_session_demand_change_emits_exactly_one_wake() {
-        let (wake_tx, mut wake_rx) = mpsc::unbounded_channel();
-        let mut scheduler = OrderedSessionWakeScheduler::new(wake_tx, CancellationToken::new());
+    async fn ordered_session_demand_change_yields_exactly_one_reopen() {
         let stream = test_ordered_stream();
+        let mut session = OrderedSessionState::new(stream);
+        let mut waits = OrderedSessionWaits::new();
         let (change_tx, mut change_rx) = watch::channel(());
 
-        scheduler.schedule_demand(
-            stream,
+        session.schedule_demand(
+            &mut waits,
             OrderedSessionDemand::WaitForChange(Box::pin(async move {
                 let _ = change_rx.changed().await;
             })),
         );
         change_tx.send_replace(());
-        let wake = timeout(Duration::from_secs(1), wake_rx.recv())
+        let (kind, ()) = timeout(Duration::from_secs(1), waits.next())
             .await
-            .expect("reactor change wakes before timeout")
-            .expect("scheduler remains connected");
+            .expect("reactor change is observed before timeout")
+            .expect("connection still owns a pending session wait");
 
-        assert_eq!(scheduler.take(wake), Some(stream));
+        assert_eq!(kind, stream.kind);
+        session.finish_wait(&mut waits);
         assert!(
-            timeout(Duration::from_millis(20), wake_rx.recv())
-                .await
-                .is_err(),
-            "one reactor state change emits only one reopen attempt"
+            waits.is_empty(),
+            "one state change yields one reopen attempt"
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn ordered_session_demand_deadline_emits_exactly_one_wake() {
-        let (wake_tx, mut wake_rx) = mpsc::unbounded_channel();
-        let mut scheduler = OrderedSessionWakeScheduler::new(wake_tx, CancellationToken::new());
+    async fn ordered_session_demand_deadline_yields_exactly_one_reopen() {
         let stream = test_ordered_stream();
+        let mut session = OrderedSessionState::new(stream);
+        let mut waits = OrderedSessionWaits::new();
 
-        scheduler.schedule_demand(
-            stream,
+        session.schedule_demand(
+            &mut waits,
             OrderedSessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
         );
         tokio::time::advance(Duration::from_secs(60)).await;
-        let wake = wake_rx
-            .recv()
+        let (kind, ()) = waits
+            .next()
             .await
-            .expect("reactor deadline emits a reopen wake");
+            .expect("reactor deadline keeps a pending session wait");
 
-        assert_eq!(scheduler.take(wake), Some(stream));
-        assert!(
-            wake_rx.try_recv().is_err(),
-            "one reactor deadline emits only one reopen attempt"
-        );
+        assert_eq!(kind, stream.kind);
+        session.finish_wait(&mut waits);
+        assert!(waits.is_empty(), "one deadline yields one reopen attempt");
     }
 
-    #[tokio::test]
-    async fn ordered_session_connection_cancellation_drops_pending_waits() {
-        let (wake_tx, mut wake_rx) = mpsc::unbounded_channel();
-        let connection_token = CancellationToken::new();
-        let mut scheduler = OrderedSessionWakeScheduler::new(wake_tx, connection_token.clone());
+    #[test]
+    fn ordered_session_connection_teardown_drops_pending_waits() {
         let stream = test_ordered_stream();
-        let (_change_tx, mut change_rx) = watch::channel(());
+        let mut session = OrderedSessionState::new(stream);
+        let mut waits = OrderedSessionWaits::new();
+        let (change_tx, mut change_rx) = watch::channel(());
 
-        scheduler.schedule_demand(
-            stream,
+        session.schedule_demand(
+            &mut waits,
             OrderedSessionDemand::WaitForChange(Box::pin(async move {
                 let _ = change_rx.changed().await;
             })),
         );
-        connection_token.cancel();
-        drop(scheduler);
+        assert_eq!(change_tx.receiver_count(), 1);
+        drop(waits);
 
-        assert!(
-            wake_rx.recv().await.is_none(),
-            "connection cancellation must not leave a wake task that can reopen a stream"
+        assert_eq!(
+            change_tx.receiver_count(),
+            0,
+            "dropping the connection-owned wait map must drop every pending wait"
         );
     }
 

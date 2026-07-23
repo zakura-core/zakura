@@ -41,7 +41,7 @@ use super::protocol::{
 };
 
 /// Maximum time discovery waits for first-party exchange responses before releasing the session.
-const DISCOVERY_EXCHANGE_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+const DISCOVERY_INITIAL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const DISCOVERY_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_DISCOVERY,
@@ -858,12 +858,16 @@ impl DiscoverySource {
             return false;
         }
         let cancel = self.session.cancel_token();
-        tokio::select! {
+        let completed = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return false,
-            _ = self.progress.wait_complete() => {}
-            _ = tokio::time::sleep(DISCOVERY_EXCHANGE_SETTLE_TIMEOUT) => {}
+            _ = cancel.cancelled() => false,
+            _ = self.progress.wait_complete() => true,
+            _ = tokio::time::sleep(DISCOVERY_INITIAL_EXCHANGE_TIMEOUT) => false,
+        };
+        if !completed {
+            return false;
         }
+
         self.handle
             .is_current_session(self.session.peer_id(), self.conn_id, self.session_id)
             .await
@@ -1956,6 +1960,54 @@ mod tests {
         progress.mark_services();
 
         assert!(!source_task.await?);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_discovery_source_does_not_complete_exchange() -> Result<(), crate::BoxError> {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: SecretKey::from_bytes(&[50u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let peer_node_id = SecretKey::from_bytes(&[51u8; 32]).public();
+        let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
+        assert_eq!(
+            handle
+                .admit_peer_session(2, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+
+        let (send, _recv) = framed_channel(4);
+        let source = DiscoverySource {
+            handle,
+            session: DiscoveryPeerSession {
+                peer_id,
+                direction: ServicePeerDirection::Inbound,
+                send,
+                cancel: CancellationToken::new(),
+            },
+            conn_id: 2,
+            session_id: 1,
+            progress: Arc::new(DiscoveryExchangeProgress::default()),
+        };
+
+        assert!(
+            !source.run_initial_exchange().await,
+            "a peer that sends no discovery responses must fail the initial exchange"
+        );
         Ok(())
     }
 

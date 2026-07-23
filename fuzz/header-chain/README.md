@@ -2,6 +2,9 @@
 
 This isolated `cargo-fuzz` package is intentionally not a workspace member.
 
+[`COVERAGE.md`](COVERAGE.md) maps executable domains to transition/event and
+specification rule IDs, including explicit partial and open gaps.
+
 Run a target from this directory with a pinned nightly toolchain:
 
 ```console

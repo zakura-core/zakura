@@ -1552,7 +1552,7 @@ mod zakura_header_sync_driver_tests {
     use super::zakura::{
         abandoned_block_apply_finished_event, apply_block_sync_body, block_apply_class,
         block_roots_cover_range, block_sync_chain_tip_event, block_sync_missing_body_window,
-        block_sync_needed_blocks_from_state, block_verify_error_is_duplicate,
+        block_sync_needed_blocks_from_state, block_verify_error_class,
         chain_tip_mirror_frontier_change, coalesce_ready_needed_block_queries,
         coalesce_stale_needed_block_queries, commit_block_sync_body, drive_block_sync_actions,
         drive_zakura_header_sync_actions, notify_block_sync_header_tip, query_block_sync_frontiers,
@@ -1805,7 +1805,9 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[test]
-    fn block_verify_error_duplicate_classifier_detects_router_and_block_errors() {
+    fn block_verify_error_classifier_detects_router_and_block_errors() {
+        use zakura_header_chain::{BodyRuleId, BodyVerificationClass};
+
         let hash = block::Hash([1; 32]);
         let duplicate_block_error = zakura_consensus::VerifyBlockError::Block {
             source: zakura_consensus::BlockError::AlreadyInChain(
@@ -1813,7 +1815,10 @@ mod zakura_header_sync_driver_tests {
                 zakura_state::KnownBlock::BestChain,
             ),
         };
-        assert!(block_verify_error_is_duplicate(&duplicate_block_error));
+        assert_eq!(
+            block_verify_error_class(&duplicate_block_error),
+            BodyVerificationClass::Duplicate
+        );
 
         let duplicate_router_error = zakura_consensus::RouterError::Block {
             source: Box::new(zakura_consensus::VerifyBlockError::Block {
@@ -1823,12 +1828,54 @@ mod zakura_header_sync_driver_tests {
                 ),
             }),
         };
-        assert!(block_verify_error_is_duplicate(&duplicate_router_error));
+        assert_eq!(
+            block_verify_error_class(&duplicate_router_error),
+            BodyVerificationClass::Duplicate
+        );
 
         let invalid_block_error = zakura_consensus::VerifyBlockError::Block {
             source: zakura_consensus::BlockError::NoTransactions,
         };
-        assert!(!block_verify_error_is_duplicate(&invalid_block_error));
+        assert_eq!(
+            block_verify_error_class(&invalid_block_error),
+            BodyVerificationClass::ConsensusInvalid(BodyRuleId::new("block.no_transactions"))
+        );
+    }
+
+    #[tokio::test]
+    async fn block_commit_maps_unknown_local_errors_to_unavailable() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let unavailable = service_fn(|request: zakura_consensus::Request| async move {
+            match request {
+                zakura_consensus::Request::Commit(_) => {
+                    Err::<block::Hash, zakura_consensus::BoxError>(
+                        "local verifier unavailable".into(),
+                    )
+                }
+                request => panic!("unexpected consensus request: {request:?}"),
+            }
+        });
+        assert_eq!(
+            commit_block_sync_body(unavailable, block.clone(), BlockApplyClass::Full).await,
+            BlockApplyResult::Unavailable
+        );
+
+        let invalid = service_fn(|request: zakura_consensus::Request| async move {
+            match request {
+                zakura_consensus::Request::Commit(_) => {
+                    Err::<block::Hash, zakura_consensus::VerifyBlockError>(
+                        zakura_consensus::VerifyBlockError::Block {
+                            source: zakura_consensus::BlockError::NoTransactions,
+                        },
+                    )
+                }
+                request => panic!("unexpected consensus request: {request:?}"),
+            }
+        });
+        assert_eq!(
+            commit_block_sync_body(invalid, block, BlockApplyClass::Full).await,
+            BlockApplyResult::Rejected
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ use zakura_network::zakura::{
 use crate::components::sync;
 
 use super::{
-    block_apply_result_label, block_verify_error_is_duplicate, emit_commit_state, insert_cs_bool,
+    block_apply_result_label, block_verify_error_class, emit_commit_state, insert_cs_bool,
     insert_cs_frontiers, insert_cs_hash, insert_cs_height, insert_cs_peer, insert_cs_str,
     insert_cs_u64, query_block_sync_frontiers, BlocksyncThroughputProbe,
     ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
@@ -1315,22 +1315,21 @@ where
             BlockApplyResult::Rejected
         }
         Err(error) => {
-            if block_verify_error_is_duplicate(&error) {
-                debug!(
-                    ?height,
-                    ?expected_hash,
-                    ?error,
-                    "Zakura block-sync body was already known by the block verifier"
-                );
-                BlockApplyResult::Duplicate
-            } else {
-                debug!(
-                    ?height,
-                    ?expected_hash,
-                    ?error,
-                    "Zakura block-sync body rejected by block verifier"
-                );
-                BlockApplyResult::Rejected
+            use zakura_header_chain::BodyVerificationClass;
+
+            let class = block_verify_error_class(&error);
+            debug!(
+                ?height,
+                ?expected_hash,
+                ?class,
+                ?error,
+                "Zakura block-sync verifier classified a body result"
+            );
+            match class {
+                BodyVerificationClass::Duplicate => BlockApplyResult::Duplicate,
+                BodyVerificationClass::PayloadMismatch(_)
+                | BodyVerificationClass::ConsensusInvalid(_) => BlockApplyResult::Rejected,
+                BodyVerificationClass::Retryable(_) => BlockApplyResult::Unavailable,
             }
         }
     }

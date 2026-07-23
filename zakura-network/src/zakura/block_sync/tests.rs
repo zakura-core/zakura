@@ -6687,7 +6687,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
 }
 
 #[tokio::test]
-async fn reactor_retries_submitted_body_after_apply_rejection() {
+async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let block_bytes = block_size(&block);
     let mut config = immediate_body_download_config();
@@ -6782,12 +6782,12 @@ async fn reactor_retries_submitted_body_after_apply_rejection() {
             token: submit_token,
             height: block::Height(1),
             hash: block.hash(),
-            result: BlockApplyResult::Rejected,
+            result: BlockApplyResult::Unavailable,
             local_frontier: None,
         })
         .await
         .expect("apply-finished event queues");
-    // the rejection rollback (`reset_above` + floor reset) runs on the
+    // the unavailable-result rollback (`reset_above` + floor reset) runs on the
     // Sequencer task while routines independently re-query, so re-supply the needed
     // metadata on every `QueryNeededBlocks` (idempotent — filtered while the height
     // is still in flight, re-extended once the rollback clears it) and wait for the
@@ -6809,7 +6809,7 @@ async fn reactor_retries_submitted_body_after_apply_rejection() {
                     } => {
                         assert_eq!(
                             count, 1,
-                            "apply rejection must release capacity and clear submitted coverage"
+                            "unavailable apply must release capacity and clear submitted coverage"
                         );
                         break;
                     }
@@ -6823,9 +6823,11 @@ async fn reactor_retries_submitted_body_after_apply_rejection() {
                         handle
                             .send(BlockSyncEvent::NeededBlocks(retry_meta.clone()))
                             .await
-                            .expect("needed metadata queues after rejection");
+                            .expect("needed metadata queues after unavailable result");
                     }
-                    BlockSyncAction::Misbehavior { .. } => {}
+                    BlockSyncAction::Misbehavior { .. } => {
+                        panic!("a local/transient unavailable result must not score its supplier")
+                    }
                     action => panic!("unexpected action before retry request: {action:?}"),
                 }
             }

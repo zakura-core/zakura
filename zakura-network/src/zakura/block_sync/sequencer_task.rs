@@ -618,10 +618,12 @@ impl SequencerTask {
         self.sequencer.finish_submission(token, height, hash);
         match result {
             BlockApplyResult::Committed | BlockApplyResult::Duplicate => {}
-            BlockApplyResult::Rejected | BlockApplyResult::TimedOut
+            BlockApplyResult::Rejected
+            | BlockApplyResult::Unavailable
+            | BlockApplyResult::TimedOut
                 if height > self.sequencer.verified_tip() =>
             {
-                // Drop the rejected body and every successor (in applying and
+                // Drop the failed body and every successor (in applying and
                 // reorder), roll the floor back below it, and drop the WorkQueue
                 // entries above the rolled-back floor so the heights are
                 // re-requestable (the reactor's `query_needed_blocks` re-fills).
@@ -632,8 +634,8 @@ impl SequencerTask {
                 let _ = self.sequencer.drop_reorder_from(height);
                 // A `Rejected` result means consensus found the body invalid.
                 // Attribute it to the delivering peer so repeat offenders are
-                // scored and eventually disconnected. `TimedOut` is a local apply
-                // timeout, not a peer fault, so it is not scored.
+                // scored and eventually disconnected. `Unavailable` and
+                // `TimedOut` are local/transient failures, so they are not scored.
                 if matches!(result, BlockApplyResult::Rejected) {
                     self.send_action(BlockSyncAction::Misbehavior {
                         peer: applying.source_peer.clone(),
@@ -642,7 +644,9 @@ impl SequencerTask {
                     .await;
                 }
             }
-            BlockApplyResult::Rejected | BlockApplyResult::TimedOut => {}
+            BlockApplyResult::Rejected
+            | BlockApplyResult::Unavailable
+            | BlockApplyResult::TimedOut => {}
         }
         if let Some(frontiers) = accepted_local_frontier {
             let _ = self

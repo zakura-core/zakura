@@ -84,8 +84,10 @@ pub enum BlockApplyResult {
     Committed,
     /// The verifier reported the block was already committed.
     Duplicate,
-    /// The verifier rejected the block.
+    /// The verifier produced a deterministic peer-attributable rejection.
     Rejected,
+    /// Verification failed without a durable peer-attributable conclusion.
+    Unavailable,
     /// The verifier did not answer before the driver timeout.
     TimedOut,
 }

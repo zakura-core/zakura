@@ -2375,6 +2375,7 @@ fn block_apply_result_label(result: BlockApplyResult) -> &'static str {
         BlockApplyResult::Committed => "committed",
         BlockApplyResult::Duplicate => "duplicate",
         BlockApplyResult::Rejected => "rejected",
+        BlockApplyResult::Unavailable => "unavailable",
         BlockApplyResult::TimedOut => "timed_out",
     }
 }

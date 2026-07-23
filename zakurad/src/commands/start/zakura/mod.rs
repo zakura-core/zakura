@@ -213,30 +213,59 @@ pub(crate) fn block_apply_result_label(result: BlockApplyResult) -> &'static str
         BlockApplyResult::Committed => "committed",
         BlockApplyResult::Duplicate => "duplicate",
         BlockApplyResult::Rejected => "rejected",
+        BlockApplyResult::Unavailable => "unavailable",
         BlockApplyResult::TimedOut => "timed_out",
     }
 }
 
-pub(crate) fn block_verify_error_is_duplicate<Error>(error: &Error) -> bool
+pub(crate) fn block_verify_error_class<Error>(
+    error: &Error,
+) -> zakura_header_chain::BodyVerificationClass
 where
     Error: std::fmt::Debug + Send + Sync + 'static,
 {
-    let error = error as &dyn std::any::Any;
+    use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
 
-    error
-        .downcast_ref::<zakura_consensus::RouterError>()
-        .is_some_and(zakura_consensus::RouterError::is_duplicate_request)
-        || error
-            .downcast_ref::<zakura_consensus::VerifyBlockError>()
-            .is_some_and(zakura_consensus::VerifyBlockError::is_duplicate_request)
-        || error
-            .downcast_ref::<zakura_consensus::BoxError>()
-            .is_some_and(|error| {
+    fn classify(error: &(dyn std::any::Any + Send + Sync)) -> Option<BodyVerificationClass> {
+        error
+            .downcast_ref::<zakura_consensus::RouterError>()
+            .map(zakura_consensus::RouterError::body_verification_class)
+            .or_else(|| {
                 error
-                    .downcast_ref::<zakura_consensus::RouterError>()
-                    .is_some_and(zakura_consensus::RouterError::is_duplicate_request)
-                    || error
-                        .downcast_ref::<zakura_consensus::VerifyBlockError>()
-                        .is_some_and(zakura_consensus::VerifyBlockError::is_duplicate_request)
+                    .downcast_ref::<zakura_consensus::VerifyBlockError>()
+                    .map(zakura_consensus::VerifyBlockError::body_verification_class)
             })
+            .or_else(|| {
+                error
+                    .downcast_ref::<zakura_consensus::VerifyCheckpointError>()
+                    .map(zakura_consensus::VerifyCheckpointError::body_verification_class)
+            })
+    }
+
+    fn classify_box(error: &zakura_consensus::BoxError) -> Option<BodyVerificationClass> {
+        error
+            .downcast_ref::<zakura_consensus::RouterError>()
+            .map(zakura_consensus::RouterError::body_verification_class)
+            .or_else(|| {
+                error
+                    .downcast_ref::<zakura_consensus::VerifyBlockError>()
+                    .map(zakura_consensus::VerifyBlockError::body_verification_class)
+            })
+            .or_else(|| {
+                error
+                    .downcast_ref::<zakura_consensus::VerifyCheckpointError>()
+                    .map(zakura_consensus::VerifyCheckpointError::body_verification_class)
+            })
+    }
+
+    let error = error as &(dyn std::any::Any + Send + Sync);
+    classify(error)
+        .or_else(|| {
+            error
+                .downcast_ref::<zakura_consensus::BoxError>()
+                .and_then(classify_box)
+        })
+        .unwrap_or(BodyVerificationClass::Retryable(
+            TransientBodyFailureKind::VerifierUnavailable,
+        ))
 }

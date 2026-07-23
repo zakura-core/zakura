@@ -1,6 +1,6 @@
 //! Feature-gated entry points shared by libFuzzer and deterministic corpus tests.
 
-use std::{num::NonZeroU64, sync::Arc};
+use std::{collections::HashMap, num::NonZeroU64, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -16,8 +16,8 @@ use crate::{
     HeaderGeneration, HeaderNode, HeaderValidationState, InsertHeaders, MemHeaderStore,
     OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, PreparedHeader,
     PreparedHeaderBatch, ProjectionDelta, SourceId, StateVersion, StoreError, StoreRead,
-    TargetCompletion, TransitionContext, TransitionFailure, TransitionPlan, TransitionRequest,
-    TrustedAnchor, ValidationLease, VerifiedGeneration, WorkOwner,
+    SuffixWork, TargetCompletion, TransitionContext, TransitionFailure, TransitionPlan,
+    TransitionRequest, TrustedAnchor, ValidationLease, VerifiedGeneration, WorkOwner,
 };
 
 /// Deterministic summary of one bounded structured-operation replay.
@@ -33,6 +33,8 @@ pub struct ForkReplaySummary {
     pub snapshot: EngineSnapshot,
     /// Stable digest of operation outcomes and snapshots.
     pub replay_digest: [u8; 32],
+    /// Stable digest of every retained node and projection after the final operation.
+    pub retained_digest: [u8; 32],
 }
 
 #[derive(Clone)]
@@ -299,6 +301,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     let mut commits = 0u16;
     let mut refused = 0u16;
     let mut transcript = Sha256::new();
+    assert_exhaustive_oracle(&store);
 
     for (operation, byte) in bounded.iter().copied().enumerate() {
         let before = store.snapshot();
@@ -331,6 +334,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                 if target == store.metadata.frontiers.finalized {
                     refused = refused.saturating_add(1);
                     transcript.update([byte, 0]);
+                    assert_exhaustive_oracle(&store);
                     continue;
                 }
                 TransitionRequest {
@@ -348,6 +352,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                 if target == store.metadata.frontiers.finalized {
                     refused = refused.saturating_add(1);
                     transcript.update([byte, 0]);
+                    assert_exhaustive_oracle(&store);
                     continue;
                 }
                 TransitionRequest {
@@ -363,13 +368,16 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                 // Crash/reopen oracle: cloning the coherent logical rows must preserve publication.
                 let reopened = store.clone();
                 assert_eq!(reopened.snapshot(), store.snapshot());
+                assert_eq!(retained_digest(&reopened), retained_digest(&store));
                 transcript.update(b"reopen");
+                assert_exhaustive_oracle(&store);
                 continue;
             }
             _ => {
                 // Explicit stale/no-op references are part of the operation language.
                 refused = refused.saturating_add(1);
                 transcript.update([byte, 0]);
+                assert_exhaustive_oracle(&store);
                 continue;
             }
         };
@@ -405,6 +413,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                 "structured operation {operation} ({byte:#04x}) produced unexpected local failure: {error}"
             ),
         }
+        assert_exhaustive_oracle(&store);
         append_snapshot(&mut transcript, &store.snapshot());
     }
 
@@ -414,7 +423,172 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         refused,
         snapshot: store.snapshot(),
         replay_digest: transcript.finalize().into(),
+        retained_digest: retained_digest(&store),
     }
+}
+
+fn assert_exhaustive_oracle(store: &FuzzStore) {
+    let finalized = store.metadata.frontiers.finalized;
+    let mut nodes: Vec<_> = store.graph.nodes().collect();
+    nodes.sort_unstable_by_key(|node| (node.height, node.hash.0));
+    assert!(!nodes.is_empty(), "the finalized anchor must be retained");
+
+    let mut independently_eligible: HashMap<block::Hash, bool> = HashMap::new();
+    let mut suffix_work = HashMap::new();
+    let mut indexed_children: HashMap<block::Hash, Vec<block::Hash>> = HashMap::new();
+    for node in &nodes {
+        assert_eq!(
+            store.graph.node(node.hash),
+            Some(*node),
+            "the primary hash index must return every retained node"
+        );
+        assert!(
+            store
+                .graph
+                .hashes_at_height(node.height)
+                .contains(&node.hash),
+            "the height index must contain every retained node"
+        );
+
+        if node.hash == finalized.hash {
+            assert_eq!(node.height, finalized.height);
+            assert_eq!(node.eligibility.inherited_from, None);
+            suffix_work.insert(node.hash, SuffixWork::zero());
+        } else {
+            let parent = store
+                .graph
+                .node(node.parent_hash)
+                .expect("every non-finalized retained node has a retained parent");
+            assert_eq!(
+                node.height,
+                block::Height(parent.height.0.saturating_add(1)),
+                "retained height is exactly parent height plus one"
+            );
+            let parent_eligible = *independently_eligible
+                .get(&parent.hash)
+                .expect("parents sort before children by height");
+            assert_eq!(
+                node.eligibility.inherited_from,
+                (!parent_eligible).then_some(parent.hash),
+                "inherited eligibility is recomputed from the parent"
+            );
+            let parent_work = *suffix_work
+                .get(&parent.hash)
+                .expect("parents sort before children by height");
+            suffix_work.insert(
+                node.hash,
+                parent_work
+                    .checked_add(node.block_work)
+                    .expect("the production transition already rejected work overflow"),
+            );
+            indexed_children
+                .entry(parent.hash)
+                .or_default()
+                .push(node.hash);
+        }
+
+        let eligible = node.validation == HeaderValidationState::Valid
+            && node.eligibility.direct_reasons.is_empty()
+            && node.eligibility.inherited_from.is_none();
+        assert_eq!(
+            node.is_eligible(),
+            eligible,
+            "node eligibility must equal its independently recomputed facts"
+        );
+        independently_eligible.insert(node.hash, eligible);
+    }
+
+    for node in &nodes {
+        let mut expected_children = indexed_children.remove(&node.hash).unwrap_or_default();
+        expected_children.sort_unstable_by_key(|hash| hash.0);
+        assert_eq!(
+            store.graph.children(node.hash),
+            expected_children,
+            "the child index must exactly match retained parent links"
+        );
+    }
+
+    let expected_header_best = nodes
+        .iter()
+        .filter(|node| independently_eligible[&node.hash])
+        .map(|node| {
+            (
+                ChainScore::new(suffix_work[&node.hash], node.hash),
+                Frontier::new(node.height, node.hash),
+            )
+        })
+        .max_by_key(|(score, _)| *score)
+        .expect("the finalized anchor is independently eligible");
+    assert_eq!(
+        store.metadata.frontiers.header_best, expected_header_best.1,
+        "fork choice must equal independent work/hash ordering"
+    );
+    assert_eq!(
+        store.metadata.header_best_score, expected_header_best.0,
+        "published work must equal the independently accumulated score"
+    );
+    assert_eq!(
+        store.selected,
+        independent_path(store, expected_header_best.1),
+        "the selected projection must exactly match parent links"
+    );
+    assert_eq!(
+        store.verified,
+        independent_path(store, store.metadata.frontiers.verified_best),
+        "the verified projection must exactly match parent links"
+    );
+}
+
+fn independent_path(store: &FuzzStore, tip: Frontier) -> Vec<Frontier> {
+    let finalized = store.metadata.frontiers.finalized;
+    let mut current = tip;
+    let mut reversed = Vec::new();
+    loop {
+        reversed.push(current);
+        if current == finalized {
+            break;
+        }
+        let node = store
+            .graph
+            .node(current.hash)
+            .expect("published projection members are retained");
+        current = Frontier::new(
+            block::Height(current.height.0.saturating_sub(1)),
+            node.parent_hash,
+        );
+    }
+    reversed.reverse();
+    reversed
+}
+
+fn retained_digest(store: &FuzzStore) -> [u8; 32] {
+    let mut nodes: Vec<_> = store.graph.nodes().collect();
+    nodes.sort_unstable_by_key(|node| (node.height, node.hash.0));
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-header-chain-fuzz-retained-v1");
+    for node in nodes {
+        hasher.update(node.height.0.to_le_bytes());
+        hasher.update(node.hash.0);
+        hasher.update(node.parent_hash.0);
+        hasher.update(node.work_coordinate().cumulative_work().to_big_endian());
+        hasher.update(format!("{:?}", node.validation));
+        hasher.update(format!("{:?}", node.eligibility));
+        hasher.update(format!("{:?}", node.body));
+        for delivery in &node.aux_delivery_ids {
+            hasher.update(delivery.digest());
+        }
+    }
+    for frontier in &store.selected {
+        hasher.update(b"selected");
+        hasher.update(frontier.height.0.to_le_bytes());
+        hasher.update(frontier.hash.0);
+    }
+    for frontier in &store.verified {
+        hasher.update(b"verified");
+        hasher.update(frontier.height.0.to_le_bytes());
+        hasher.update(frontier.hash.0);
+    }
+    hasher.finalize().into()
 }
 
 fn apply_projection(path: &mut Vec<Frontier>, delta: &ProjectionDelta) {
@@ -489,6 +663,15 @@ mod tests {
         assert_eq!(first.operations, 512);
         assert!(first.commits > 0);
         assert!(first.refused > 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "selected projection must exactly match parent links")]
+    fn exhaustive_oracle_rejects_a_projection_gap() {
+        let mut store = FuzzStore::new(EngineMode::Integrated);
+        store.selected.clear();
+
+        assert_exhaustive_oracle(&store);
     }
 
     #[test]

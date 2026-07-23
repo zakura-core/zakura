@@ -510,6 +510,13 @@ fn check_authoritative_rows<S: StoreAuditRead>(
 
     let mut contexts = store.validation_context_records()?;
     contexts.sort_unstable_by_key(|record| record.height);
+    let required_contexts = usize::try_from(metadata.frontiers.finalized.height.0.min(27))
+        .map_err(|_| StoreError::Incoherent("validation context bound does not fit in usize"))?;
+    if contexts.len() != required_contexts {
+        violations.push(AuditViolation::ValidationContext(
+            metadata.frontiers.finalized.hash,
+        ));
+    }
     for pair in contexts.windows(2) {
         if pair[0].height.next().ok() != Some(pair[1].height)
             || pair[1].header.previous_block_hash != pair[0].header.hash()
@@ -1059,6 +1066,13 @@ mod tests {
             header: regtest_genesis_block().header.clone(),
             height: block::Height(7),
         });
+        assert!(violations(&store, &config)
+            .iter()
+            .any(|violation| matches!(violation, AuditViolation::ValidationContext(_))));
+
+        let mut store = base.clone();
+        store.metadata.frontiers.finalized = Frontier::new(block::Height(1), child_hash);
+        store.snapshot = store.metadata.snapshot();
         assert!(violations(&store, &config)
             .iter()
             .any(|violation| matches!(violation, AuditViolation::ValidationContext(_))));

@@ -256,7 +256,17 @@ fn finalized_anchor(
 fn validation_context(
     source: &ZakuraDb,
     anchor: Frontier,
+    expected_hash: block::Hash,
+) -> Result<Vec<HeaderValidationContextDisk>, HeaderChainInitializationError> {
+    linked_validation_context(anchor, expected_hash, |height| {
+        source.header_by_height(height)
+    })
+}
+
+fn linked_validation_context(
+    anchor: Frontier,
     mut expected_hash: block::Hash,
+    mut header_by_height: impl FnMut(block::Height) -> Option<(block::Hash, Arc<block::Header>)>,
 ) -> Result<Vec<HeaderValidationContextDisk>, HeaderChainInitializationError> {
     let mut contexts = Vec::new();
     let mut height = anchor.height;
@@ -264,12 +274,9 @@ fn validation_context(
         let Ok(previous) = height.previous() else {
             break;
         };
-        let (hash, header) =
-            source
-                .header_by_height(previous)
-                .ok_or(HeaderChainInitializationError::FullState(
-                    "validation context has a gap",
-                ))?;
+        let (hash, header) = header_by_height(previous).ok_or(
+            HeaderChainInitializationError::FullState("validation context has a gap"),
+        )?;
         if header.hash() != hash || hash != expected_hash {
             return Err(HeaderChainInitializationError::FullState(
                 "validation context linkage differs",
@@ -292,4 +299,121 @@ fn initialization_evidence(anchor: Frontier) -> EvidenceId {
     hasher.update(anchor.height.0.to_be_bytes());
     hasher.update(anchor.hash.0);
     EvidenceId::from_digest(hasher.finalize().into())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration;
+    use zakura_chain::block::genesis::regtest_genesis_block;
+
+    use super::*;
+
+    fn linked_headers(count: u32) -> Vec<Arc<block::Header>> {
+        let mut headers = vec![regtest_genesis_block().header.clone()];
+        for height in 1..count {
+            let previous = headers
+                .last()
+                .expect("the generated chain always starts at genesis");
+            let mut header = **previous;
+            header.previous_block_hash = previous.hash();
+            header.time += Duration::seconds(1);
+            header.nonce.0[0] = u8::try_from(height).expect("the test chain is shorter than 256");
+            headers.push(Arc::new(header));
+        }
+        headers
+    }
+
+    #[test]
+    fn later_anchor_predecessor_context_has_exact_one_to_twenty_eight_boundary() {
+        let headers = linked_headers(30);
+
+        for anchor_height in 0..=29 {
+            let anchor_index = usize::try_from(anchor_height).expect("the test height fits");
+            let anchor_header = &headers[anchor_index];
+            let anchor = Frontier::new(block::Height(anchor_height), anchor_header.hash());
+            let contexts =
+                linked_validation_context(anchor, anchor_header.previous_block_hash, |height| {
+                    let header =
+                        headers[usize::try_from(height.0).expect("the test height fits")].clone();
+                    Some((header.hash(), header))
+                })
+                .expect("the exact backward-linked context is authenticated");
+
+            let expected_predecessors =
+                usize::try_from(anchor_height.min(27)).expect("the bound fits in usize");
+            assert_eq!(contexts.len(), expected_predecessors);
+            assert_eq!(
+                contexts.len() + 1,
+                usize::try_from((anchor_height + 1).min(28)).expect("the bound fits in usize"),
+                "the anchor plus predecessor facts has the exact one-to-28-header boundary"
+            );
+            if contexts.is_empty() {
+                continue;
+            }
+            assert_eq!(
+                contexts.last().map(|context| context.height),
+                Some(block::Height(anchor_height - 1))
+            );
+            assert_eq!(
+                contexts.first().map(|context| context.height),
+                Some(block::Height(
+                    anchor_height
+                        - u32::try_from(expected_predecessors)
+                            .expect("the fixed predecessor bound fits in u32")
+                ))
+            );
+            for pair in contexts.windows(2) {
+                assert_eq!(pair[1].header.previous_block_hash, pair[0].header.hash());
+            }
+            assert_eq!(
+                anchor_header.previous_block_hash,
+                contexts
+                    .last()
+                    .expect("a non-genesis anchor has context")
+                    .header
+                    .hash()
+            );
+        }
+    }
+
+    #[test]
+    fn later_anchor_predecessor_context_rejects_gap_hash_and_link_corruption() {
+        let headers = linked_headers(30);
+        let anchor_header = headers.last().expect("the generated chain is nonempty");
+        let anchor = Frontier::new(block::Height(29), anchor_header.hash());
+
+        assert!(matches!(
+            linked_validation_context(anchor, anchor_header.previous_block_hash, |_| None),
+            Err(HeaderChainInitializationError::FullState(
+                "validation context has a gap"
+            ))
+        ));
+        assert!(matches!(
+            linked_validation_context(anchor, block::Hash([0xff; 32]), |height| {
+                let header = headers
+                    [usize::try_from(height.0).expect("the generated test height fits in usize")]
+                .clone();
+                Some((header.hash(), header))
+            },),
+            Err(HeaderChainInitializationError::FullState(
+                "validation context linkage differs"
+            ))
+        ));
+        assert!(matches!(
+            linked_validation_context(anchor, anchor_header.previous_block_hash, |height| {
+                let header = headers
+                    [usize::try_from(height.0).expect("the generated test height fits in usize")]
+                .clone();
+                let hash = if height == block::Height(27) {
+                    block::Hash([0xee; 32])
+                } else {
+                    header.hash()
+                };
+                Some((hash, header))
+            },),
+            Err(HeaderChainInitializationError::FullState(
+                "validation context linkage differs"
+            ))
+        ));
+    }
 }

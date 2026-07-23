@@ -1426,6 +1426,32 @@ impl HeaderChainStore {
     where
         F: FnMut(FaultPoint) -> Result<(), HeaderChainStoreError>,
     {
+        if self.metadata_row()?.is_some_and(|metadata| {
+            metadata.frontiers.finalized != changes.metadata.frontiers.finalized
+        }) {
+            let staged_nodes: HashMap<_, _> = changes
+                .put_nodes
+                .iter()
+                .map(|node| (node.hash, node))
+                .collect();
+            let contexts = authenticated_context_headers(
+                self,
+                changes.metadata.frontiers.finalized.hash,
+                Some(&staged_nodes),
+            )?;
+            for (key, _) in self.scan_raw(HEADER_VALIDATION_CONTEXT)? {
+                self.delete_raw(&mut batch, HEADER_VALIDATION_CONTEXT, key)?;
+            }
+            for context in contexts {
+                self.put_value(
+                    &mut batch,
+                    HEADER_VALIDATION_CONTEXT,
+                    context.header.hash().0,
+                    &context,
+                )?;
+            }
+        }
+
         for hash in &changes.delete_nodes {
             if let Some(node) = self.node(*hash).map_err(|_| {
                 HeaderChainStoreError::Incoherent("deleted node could not be decoded")
@@ -2000,41 +2026,17 @@ impl StoreRead for HeaderChainStore {
             .node(parent)?
             .ok_or(StoreError::Incoherent("validation parent is not retained"))?;
         let parent_frontier = Frontier::new(parent_node.height, parent);
-        let mut predecessors = Vec::new();
-        let mut current_hash = parent;
-        let mut expected_height = parent_node.height;
-        for _ in 0..28 {
-            if let Some(node) = self.node(current_hash)? {
-                if node.height != expected_height {
-                    return Err(StoreError::Incoherent("validation context height mismatch"));
-                }
-                predecessors.push(zakura_header_chain::HeaderContextFact {
-                    frontier: Frontier::new(node.height, node.hash),
-                    difficulty_threshold: node.header.difficulty_threshold,
-                    time: node.header.time,
-                });
-                current_hash = node.parent_hash;
-            } else {
-                let context = self
-                    .get_value::<HeaderValidationContextDisk>(
-                        HEADER_VALIDATION_CONTEXT,
-                        current_hash.0,
-                    )
-                    .map_err(store_error)?;
-                let Some(context) = context else { break };
-                if context.header.hash() != current_hash || context.height != expected_height {
-                    return Err(StoreError::Incoherent(
-                        "invalid immutable validation context",
-                    ));
-                }
-                predecessors.push(context.fact());
-                current_hash = context.header.previous_block_hash;
-            }
-            let Ok(previous_height) = expected_height.previous() else {
-                break;
-            };
-            expected_height = previous_height;
-        }
+        let mut predecessors = vec![zakura_header_chain::HeaderContextFact {
+            frontier: parent_frontier,
+            difficulty_threshold: parent_node.header.difficulty_threshold,
+            time: parent_node.header.time,
+        }];
+        predecessors.extend(
+            authenticated_context_headers(self, parent, None)?
+                .into_iter()
+                .rev()
+                .map(|context| context.fact()),
+        );
         Ok(ValidationLease::new(
             parent_frontier,
             predecessors,
@@ -2224,6 +2226,58 @@ impl StoreAuditRead for HeaderChainStore {
         }
         Ok(records)
     }
+}
+
+fn authenticated_context_headers(
+    store: &HeaderChainStore,
+    parent: block::Hash,
+    staged_nodes: Option<&HashMap<block::Hash, &HeaderNode>>,
+) -> Result<Vec<HeaderValidationContextDisk>, StoreError> {
+    let staged_parent = staged_nodes.and_then(|nodes| nodes.get(&parent).copied());
+    let stored_parent = if staged_parent.is_none() {
+        store.node(parent)?
+    } else {
+        None
+    };
+    let parent_node = staged_parent
+        .or(stored_parent.as_ref())
+        .ok_or(StoreError::Incoherent("validation parent is not retained"))?;
+    let required = usize::try_from(parent_node.height.0.min(27))
+        .map_err(|_| StoreError::Incoherent("validation context bound does not fit in usize"))?;
+    let mut contexts = Vec::with_capacity(required);
+    let mut current_hash = parent_node.parent_hash;
+    let mut expected_height = parent_node.height;
+    for _ in 0..required {
+        expected_height = expected_height
+            .previous()
+            .map_err(|_| StoreError::Incoherent("validation context height underflow"))?;
+        let staged_node = staged_nodes.and_then(|nodes| nodes.get(&current_hash).copied());
+        let stored_node = if staged_node.is_none() {
+            store.node(current_hash)?
+        } else {
+            None
+        };
+        let context = if let Some(node) = staged_node.or(stored_node.as_ref()) {
+            HeaderValidationContextDisk {
+                header: node.header.clone(),
+                height: node.height,
+            }
+        } else {
+            store
+                .get_value::<HeaderValidationContextDisk>(HEADER_VALIDATION_CONTEXT, current_hash.0)
+                .map_err(store_error)?
+                .ok_or(StoreError::Incoherent("validation context has a gap"))?
+        };
+        if context.header.hash() != current_hash || context.height != expected_height {
+            return Err(StoreError::Incoherent(
+                "invalid immutable validation context",
+            ));
+        }
+        current_hash = context.header.previous_block_hash;
+        contexts.push(context);
+    }
+    contexts.reverse();
+    Ok(contexts)
 }
 
 impl HeaderChainStore {
@@ -2461,6 +2515,66 @@ mod tests {
             last_transition_id: EvidenceId::from_digest([0; 32]),
         };
         (config, node, metadata)
+    }
+
+    #[test]
+    fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
+        let db_config = Config::ephemeral();
+        let (engine_config, anchor, metadata) = fixture();
+        let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+        store
+            .initialize(metadata, anchor.clone())
+            .expect("the empty schema initializes");
+
+        let mut nodes = Vec::new();
+        let mut parent = anchor;
+        for height in 1..=28 {
+            let mut header = *parent.header;
+            header.previous_block_hash = parent.hash;
+            header.time += chrono::Duration::seconds(1);
+            header.nonce.0[0] =
+                u8::try_from(height).expect("the staged test path is shorter than 256");
+            let header = Arc::new(header);
+            let hash = header.hash();
+            let node = HeaderNode::from_durable_parts(
+                header,
+                hash,
+                parent.hash,
+                block::Height(height),
+                parent.block_work,
+                parent
+                    .work_coordinate()
+                    .checked_add(parent.block_work)
+                    .expect("the short staged path cannot exhaust cumulative work"),
+                HeaderValidationState::Valid,
+                Default::default(),
+                BodyValidationState::Unknown,
+                Vec::new(),
+            )
+            .expect("the staged node fields are coherent");
+            parent = node.clone();
+            nodes.push(node);
+        }
+        let staged: HashMap<_, _> = nodes.iter().map(|node| (node.hash, node)).collect();
+        let contexts = authenticated_context_headers(&store, parent.hash, Some(&staged))
+            .expect("the atomic batch can authenticate context from its staged node overlay");
+        assert_eq!(contexts.len(), 27);
+        assert_eq!(
+            contexts.first().map(|context| context.height),
+            Some(block::Height(1))
+        );
+        assert_eq!(
+            contexts.last().map(|context| context.height),
+            Some(block::Height(27))
+        );
+        assert_eq!(
+            parent.header.previous_block_hash,
+            contexts
+                .last()
+                .expect("the context is nonempty")
+                .header
+                .hash()
+        );
     }
 
     #[test]
@@ -4527,6 +4641,36 @@ mod tests {
                 committed,
                 "{target:?}"
             );
+            let reopened_anchor = if committed {
+                new_finalized
+            } else {
+                anchor_frontier
+            };
+            let lease = reopened
+                .reader()
+                .validation_context(reopened_anchor.hash)
+                .expect("the reopened anchor context read succeeds")
+                .expect("the reopened anchor is retained");
+            assert_eq!(
+                lease.predecessors.len(),
+                if committed { 2 } else { 1 },
+                "{target:?}"
+            );
+            let (next_header, expected_height) = if committed {
+                (grandchild.header.clone(), grandchild.height)
+            } else {
+                (child.header.clone(), child.height)
+            };
+            let rules = HeaderRules::for_validation_lease(engine_config.network.clone(), &lease)
+                .expect("the authenticated custom-network policy is valid");
+            let prepared = zakura_header_chain::prepare_headers(
+                HeaderBatchInput::new(std::slice::from_ref(&next_header)),
+                &lease,
+                &rules,
+                &SystemClock,
+            )
+            .expect("the first post-anchor child validates after reopen");
+            assert_eq!(prepared.headers()[0].height, expected_height, "{target:?}");
         }
     }
 

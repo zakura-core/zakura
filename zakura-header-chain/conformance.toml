@@ -506,7 +506,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-INT-01"
 name = "Unified transition events"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::HeaderChainRuntime"
+tests = ["IN-01::all_named_inputs_use_their_single_serialized_transition_path", "IN-01::insertion_enforces_every_immutable_configured_checkpoint", "AUD-14::aud_14_requester_insertion_reopens_complete_before_or_after", "AUD-14::aud_14_verified_grow_and_reset_reopen_complete_before_or_after", "AUD-14::aud_14_body_conclusions_reopen_complete_before_or_after", "AUD-14::aud_14_operator_reason_changes_reopen_complete_before_or_after", "AUD-14::aud_14_finality_advance_reopens_complete_before_or_after", "AUD-14::aud_14_selected_auxiliary_repair_reopens_complete_before_or_after", "AUD-14::aud_14_startup_recovery_reopens_complete_before_or_after_without_publication"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-INT-02"

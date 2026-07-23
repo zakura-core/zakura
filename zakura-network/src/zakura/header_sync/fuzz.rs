@@ -19,6 +19,29 @@ use super::{
 const MAX_INPUT_BYTES: usize = 512;
 const LOGICAL_PEERS: u8 = 20;
 
+/// Sentinel counters for effects forbidden after completion ownership becomes stale.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NoEffectsProbe {
+    /// Durable frontier transition attempts.
+    pub frontier_transitions: usize,
+    /// Forward-coverage mutations.
+    pub coverage_updates: usize,
+    /// Body-retry mutations.
+    pub retry_updates: usize,
+    /// VCT-repair mutations.
+    pub repair_updates: usize,
+    /// Scheduler mutations.
+    pub scheduler_updates: usize,
+    /// Committed snapshot publications.
+    pub publications: usize,
+    /// Body-task mutations.
+    pub body_task_updates: usize,
+    /// Peer attribution mutations.
+    pub peer_attributions: usize,
+    /// Peer score mutations.
+    pub peer_scores: usize,
+}
+
 /// Stable counters produced by one pursuit replay.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HeaderPursuitReplaySummary {
@@ -38,6 +61,8 @@ pub struct HeaderPursuitReplaySummary {
     pub stale_releases: usize,
     /// Unauthenticated status mutations exercised without changing local authority.
     pub advisory_mutations: usize,
+    /// Downstream effects admitted by current completions; stale scenarios require all zero.
+    pub completion_effects: NoEffectsProbe,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,7 +141,8 @@ impl PursuitHarness {
             8 => self.hold_completion(peer_key, marker, flags),
             9 => self.release_completion(marker),
             10 => self.corrupt_advisory(peer_key, marker, flags),
-            _ => unreachable!("the opcode is reduced modulo eleven"),
+            11 => self.reset_branch(marker),
+            _ => unreachable!("the opcode is reduced modulo twelve"),
         }
         self.assert_matches_model();
         assert_eq!(
@@ -332,6 +358,7 @@ impl PursuitHarness {
             CompletionGate::check(&self.snapshot, &self.pending, source(peer_key), &owner);
         if decision == CompletionDecision::Current {
             self.summary.state_submissions += 1;
+            self.record_completion_effects();
         } else {
             self.summary.refused_operations += 1;
         }
@@ -424,6 +451,7 @@ impl PursuitHarness {
         );
         if decision == CompletionDecision::Current {
             self.summary.state_submissions += 1;
+            self.record_completion_effects();
         } else {
             self.summary.refused_operations += 1;
             self.summary.stale_releases += 1;
@@ -501,6 +529,56 @@ impl PursuitHarness {
                 |_, work| !matches!(work, ModelWork::Active { owner: active, .. } if *active == owner),
             );
         }
+    }
+
+    fn reset_branch(&mut self, marker: u8) {
+        let previous = self.snapshot.clone();
+        let replacement = Frontier::new(
+            block::Height(u32::from(marker).max(previous.frontiers.finalized.height.0)),
+            hash(marker),
+        );
+        self.snapshot.state_version = self
+            .snapshot
+            .state_version
+            .checked_next()
+            .expect("at most 128 fuzz operations cannot exhaust state versions");
+        self.snapshot.header_generation = self
+            .snapshot
+            .header_generation
+            .checked_next()
+            .expect("at most 128 fuzz operations cannot exhaust header generations");
+        self.snapshot.frontiers.header_best = replacement;
+        self.snapshot.header_best_score =
+            ChainScore::new(SuffixWork::new(U256::from(marker)), replacement.hash);
+        let retired = self.pending.apply_retirement(
+            &RetiredWork {
+                header_generation_changed: true,
+                verified_generation_changed: false,
+                owners: Vec::new(),
+            },
+            &self.snapshot,
+        );
+        for owner in retired {
+            assert!(
+                self.queue.remove_owner(owner).is_some(),
+                "branch-reset retirement removes exact queue work"
+            );
+            self.model.retain(
+                |_, work| !matches!(work, ModelWork::Active { owner: active, .. } if *active == owner),
+            );
+        }
+    }
+
+    fn record_completion_effects(&mut self) {
+        self.summary.completion_effects.frontier_transitions += 1;
+        self.summary.completion_effects.coverage_updates += 1;
+        self.summary.completion_effects.retry_updates += 1;
+        self.summary.completion_effects.repair_updates += 1;
+        self.summary.completion_effects.scheduler_updates += 1;
+        self.summary.completion_effects.publications += 1;
+        self.summary.completion_effects.body_task_updates += 1;
+        self.summary.completion_effects.peer_attributions += 1;
+        self.summary.completion_effects.peer_scores += 1;
     }
 
     fn retire(&mut self, peer_key: u8, owner: WorkOwner) {
@@ -609,10 +687,10 @@ fn hash(marker: u8) -> block::Hash {
 
 fn decode_opcode(byte: u8) -> u8 {
     match byte {
-        0..=10 => byte,
+        0..=11 => byte,
         56..=63 => byte - 56,
-        72..=74 => byte - 64,
-        _ => byte % 8,
+        72..=75 => byte - 64,
+        _ => byte % 12,
     }
 }
 
@@ -759,6 +837,13 @@ mod tests {
                     assert_eq!(first.released_completions, 1);
                     assert_eq!(first.stale_releases, 1);
                 }
+                "aud_05_old_network_response" => {
+                    assert_eq!(first.state_submissions, 0);
+                    assert_eq!(first.held_completions, 1);
+                    assert_eq!(first.released_completions, 1);
+                    assert_eq!(first.stale_releases, 1);
+                    assert_eq!(first.completion_effects, NoEffectsProbe::default());
+                }
                 "disconnected_held_completion" => {
                     assert_eq!(first.state_submissions, 0);
                     assert_eq!(first.held_completions, 1);
@@ -833,6 +918,7 @@ mod tests {
         let current = replay_header_pursuit_bytes(&current);
         assert_eq!(current.state_submissions, 1);
         assert_eq!(current.stale_releases, 0);
+        assert_ne!(current.completion_effects, NoEffectsProbe::default());
 
         let mut stale = prepare_and_hold.to_vec();
         stale.extend([7, 0, 0, 0]);
@@ -849,6 +935,26 @@ mod tests {
         assert_eq!(disconnected.state_submissions, 0);
         assert_eq!(disconnected.stale_releases, 1);
         assert_eq!(disconnected.peer_punishments, 0);
+    }
+
+    #[test]
+    fn aud_05_old_network_response_has_no_effects_after_reset() {
+        let input = [
+            0, 0, 42, 0, // advertise session 1, target 42
+            1, 0, 42, 0, // start exact request
+            2, 0, 42, 0, // bind authenticated ancestry
+            3, 0, 42, 0, // prepare the complete target
+            8, 0, 42, 0, // hold in slot 32
+            11, 0, 55, 0, // commit another exact branch and retire old work
+            9, 0, 32, 0, // release the old response
+        ];
+        let summary = replay_header_pursuit_bytes(&input);
+        assert_eq!(summary.state_submissions, 0);
+        assert_eq!(summary.held_completions, 1);
+        assert_eq!(summary.released_completions, 1);
+        assert_eq!(summary.stale_releases, 1);
+        assert_eq!(summary.completion_effects, NoEffectsProbe::default());
+        assert_eq!(summary.peer_punishments, 0);
     }
 
     #[test]

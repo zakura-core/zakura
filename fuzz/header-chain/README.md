@@ -60,9 +60,11 @@ bounded model. Checked-in seeds cover exact completion, wrong targets, wrong
 ancestry, explicit outcomes, stale generations, and the 17th-pursuit capacity
 boundary. Explicit hold/release slots retain prepared completions across
 generation retirement or disconnect and require stale releases to have no
-state submission or peer punishment. Advisory mutations exercise incomparable
-work, extreme height/retention claims, and pure-requester caps without changing
-local authority.
+state submission or peer punishment. A named old-response scenario commits a
+different exact branch before release and requires all nine downstream-effect
+sentinels to remain zero. Advisory mutations exercise incomparable work,
+extreme height/retention claims, and pure-requester caps without changing local
+authority.
 
 `recovery_rows` snapshots all twelve header-engine column families as a raw
 logical dump, applies at most 64 bounded row/key/value mutations, and installs

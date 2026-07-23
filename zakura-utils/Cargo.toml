@@ -44,6 +44,11 @@ zakura-checkpoints-offline = [
     "zakura-state"
 ]
 
+# Preserve published feature names after removing the obsolete developer tools.
+search-issue-refs = []
+regex = []
+reqwest = []
+
 [dependencies]
 color-eyre = { workspace = true }
 

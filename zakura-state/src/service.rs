@@ -1614,11 +1614,10 @@ where
     C: AsRef<Chain> + Clone,
 {
     let verified_block_tip = read::tip_height(chain.clone(), db);
-    let best_header_tip = header_chain
-        .map(|reader| reader.selected_tip())
-        .transpose()?
-        .map(|tip| tip.height)
-        .max(verified_block_tip);
+    let best_header_tip = match header_chain {
+        Some(reader) => Some(reader.selected_tip()?.height),
+        None => verified_block_tip,
+    };
     let Some(best_header_tip) = best_header_tip else {
         return Ok(Vec::new());
     };
@@ -2093,24 +2092,14 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::BestHeaderTip => {
-                let best_disk_header_tip = state
-                    .header_chain_reader_receiver
-                    .borrow()
-                    .clone()
-                    .map(|reader| reader.selected_tip())
-                    .transpose()?
-                    .map(|tip| (tip.height, tip.hash));
-                let verified_block_tip = read::tip(state.latest_best_chain(), &state.db);
-
-                Ok(ReadResponse::BestHeaderTip(
-                    match (best_disk_header_tip, verified_block_tip) {
-                        (Some(header_tip), Some(block_tip)) if block_tip.0 > header_tip.0 => {
-                            Some(block_tip)
-                        }
-                        (Some(header_tip), _) => Some(header_tip),
-                        (None, block_tip) => block_tip,
-                    },
-                ))
+                let header_chain_reader = state.header_chain_reader_receiver.borrow().clone();
+                let tip = match header_chain_reader {
+                    Some(reader) => reader
+                        .selected_tip()
+                        .map(|tip| Some((tip.height, tip.hash)))?,
+                    None => read::tip(state.latest_best_chain(), &state.db),
+                };
+                Ok(ReadResponse::BestHeaderTip(tip))
             }
 
             ReadRequest::HeaderChainSnapshot => Ok(ReadResponse::HeaderChainSnapshot(
@@ -2119,14 +2108,11 @@ impl Service<ReadRequest> for ReadStateService {
 
             ReadRequest::MissingBlockBodies { from, limit } => {
                 let verified_block_tip = read::tip_height(state.latest_best_chain(), &state.db);
-                let best_header_tip = state
-                    .header_chain_reader_receiver
-                    .borrow()
-                    .clone()
-                    .map(|reader| reader.selected_tip())
-                    .transpose()?
-                    .map(|tip| tip.height)
-                    .max(verified_block_tip);
+                let header_chain_reader = state.header_chain_reader_receiver.borrow().clone();
+                let best_header_tip = match header_chain_reader {
+                    Some(reader) => Some(reader.selected_tip()?.height),
+                    None => verified_block_tip,
+                };
 
                 Ok(ReadResponse::MissingBlockBodies(
                     state

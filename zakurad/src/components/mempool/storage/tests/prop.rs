@@ -47,6 +47,69 @@ const EVICTION_MEMORY_TIME: Duration = Duration::from_secs(60 * 60);
 /// Transaction count used in some tests to derive the mempool test size.
 const MEMPOOL_TX_COUNT: usize = 4;
 
+/// Rejection-list capacity used for randomized behavior tests.
+///
+/// A separate deterministic test checks the real production boundary.
+const TEST_REJECTION_LIST_CAPACITY: usize = 16;
+
+fn rejection_id_with_index(mut template: UnminedTxId, index: u32) -> UnminedTxId {
+    let index = index.to_le_bytes();
+    template.mined_id_mut().0[0..4].copy_from_slice(&index);
+    if let Some(auth_digest) = template.auth_digest_mut() {
+        auth_digest.0[0..4].copy_from_slice(&index);
+    }
+
+    template
+}
+
+fn cheap_rejection_id(index: u32) -> UnminedTxId {
+    let mut hash = [0; 32];
+    hash[..4].copy_from_slice(&index.to_le_bytes());
+    UnminedTxId::Legacy(transaction::Hash(hash))
+}
+
+/// Check the real ZIP-401 boundary once using cheap deterministic IDs.
+#[test]
+fn reject_lists_enforce_production_capacity() {
+    let config = Config {
+        tx_cost_limit: 160_000_000,
+        eviction_memory_time: EVICTION_MEMORY_TIME,
+        ..Default::default()
+    };
+    let mut tip_rejected = Storage::new(&config);
+    let mut chain_rejected = Storage::new(&config);
+    let production_capacity: u32 = MAX_EVICTION_MEMORY_ENTRIES
+        .try_into()
+        .expect("production rejection-list capacity fits in u32");
+
+    for index in 0..=production_capacity {
+        let id = cheap_rejection_id(index);
+        tip_rejected.reject(id, SameEffectsTipRejectionError::SpendConflict.into());
+        chain_rejected.reject(id, SameEffectsChainRejectionError::RandomlyEvicted.into());
+
+        if index == production_capacity - 1 {
+            assert_eq!(
+                tip_rejected.rejected_transaction_count(),
+                MAX_EVICTION_MEMORY_ENTRIES
+            );
+            assert_eq!(
+                chain_rejected.rejected_transaction_count(),
+                MAX_EVICTION_MEMORY_ENTRIES
+            );
+        }
+    }
+
+    let oldest = cheap_rejection_id(0);
+    let newest = cheap_rejection_id(production_capacity);
+    assert_eq!(tip_rejected.rejected_transaction_count(), 0);
+    assert_eq!(
+        chain_rejected.rejected_transaction_count(),
+        MAX_EVICTION_MEMORY_ENTRIES
+    );
+    assert!(!chain_rejected.contains_rejected(&oldest));
+    assert!(chain_rejected.contains_rejected(&newest));
+}
+
 proptest! {
     #![proptest_config(
         proptest::test_runner::Config::with_cases(env::var("PROPTEST_CASES")
@@ -59,14 +122,16 @@ proptest! {
     #[test]
     fn reject_lists_are_limited_insert_conflict(
         input in any::<SpendConflictTestInput>(),
-        mut rejection_template in any::<UnminedTxId>()
+        rejection_template in any::<UnminedTxId>()
     ) {
-        let mut storage = Storage::new(
+        let mut storage = Storage::new_with_rejection_list_capacity(
             &Config {
                 tx_cost_limit: 160_000_000,
                 eviction_memory_time: EVICTION_MEMORY_TIME,
                 ..Default::default()
-            });
+            },
+            TEST_REJECTION_LIST_CAPACITY,
+        );
 
         let (first_transaction, second_transaction) = input.conflicting_transactions();
         let input_permutations = vec![
@@ -79,23 +144,21 @@ proptest! {
 
             prop_assert_eq!(storage.insert(transaction_to_accept, Vec::new(), None), Ok(id_to_accept));
 
-            // Make unique IDs by converting the index to bytes, and writing it to each ID
-            let unique_ids = (0..MAX_EVICTION_MEMORY_ENTRIES as u32).map(move |index| {
-                let index = index.to_le_bytes();
-                rejection_template.mined_id_mut().0[0..4].copy_from_slice(&index);
-                if let Some(auth_digest) = rejection_template.auth_digest_mut() {
-                    auth_digest.0[0..4].copy_from_slice(&index);
-                }
-
-                rejection_template
-            });
+            let test_capacity: u32 = TEST_REJECTION_LIST_CAPACITY
+                .try_into()
+                .expect("test rejection-list capacity fits in u32");
+            let unique_ids = (0..test_capacity)
+                .map(|index| rejection_id_with_index(rejection_template, index));
 
             for rejection in unique_ids {
                 storage.reject(rejection, SameEffectsTipRejectionError::SpendConflict.into());
             }
 
             // Make sure there were no duplicates
-            prop_assert_eq!(storage.rejected_transaction_count(), MAX_EVICTION_MEMORY_ENTRIES);
+            prop_assert_eq!(
+                storage.rejected_transaction_count(),
+                TEST_REJECTION_LIST_CAPACITY
+            );
 
             // The transaction_to_reject will conflict with at least one of:
             // - transaction_to_accept, or
@@ -105,7 +168,7 @@ proptest! {
                 Err(MempoolError::StorageEffectsTip(SameEffectsTipRejectionError::SpendConflict))
             );
 
-            // Since we inserted more than MAX_EVICTION_MEMORY_ENTRIES,
+            // Since we inserted more than the configured capacity,
             // the storage should have cleared the reject list
             prop_assert_eq!(storage.rejected_transaction_count(), 0);
 
@@ -118,34 +181,35 @@ proptest! {
     fn reject_lists_are_limited_insert_eviction(
         transactions in vec(standard_verified_unmined_tx_strategy(), MEMPOOL_TX_COUNT + 1)
             .prop_map(SummaryDebug),
-        mut rejection_template in any::<UnminedTxId>()
+        rejection_template in any::<UnminedTxId>()
     ) {
         // Use as cost limit the costs of all transactions except one
         let cost_limit = transactions.iter().take(MEMPOOL_TX_COUNT).map(|tx| tx.cost()).sum();
 
-        let mut storage: Storage = Storage::new(&Config {
-            tx_cost_limit: cost_limit,
-            eviction_memory_time: EVICTION_MEMORY_TIME,
-            ..Default::default()
-        });
+        let mut storage = Storage::new_with_rejection_list_capacity(
+            &Config {
+                tx_cost_limit: cost_limit,
+                eviction_memory_time: EVICTION_MEMORY_TIME,
+                ..Default::default()
+            },
+            TEST_REJECTION_LIST_CAPACITY,
+        );
 
-        // Make unique IDs by converting the index to bytes, and writing it to each ID
-        let unique_ids = (0..MAX_EVICTION_MEMORY_ENTRIES as u32).map(move |index| {
-            let index = index.to_le_bytes();
-            rejection_template.mined_id_mut().0[0..4].copy_from_slice(&index);
-            if let Some(auth_digest) = rejection_template.auth_digest_mut() {
-                auth_digest.0[0..4].copy_from_slice(&index);
-            }
-
-            rejection_template
-        });
+        let test_capacity: u32 = TEST_REJECTION_LIST_CAPACITY
+            .try_into()
+            .expect("test rejection-list capacity fits in u32");
+        let unique_ids =
+            (0..test_capacity).map(|index| rejection_id_with_index(rejection_template, index));
 
         for rejection in unique_ids {
             storage.reject(rejection, SameEffectsChainRejectionError::RandomlyEvicted.into());
         }
 
         // Make sure there were no duplicates
-        prop_assert_eq!(storage.rejected_transaction_count(), MAX_EVICTION_MEMORY_ENTRIES);
+        prop_assert_eq!(
+            storage.rejected_transaction_count(),
+            TEST_REJECTION_LIST_CAPACITY
+        );
 
         for (i, transaction) in transactions.iter().enumerate() {
             let tx_id = transaction.transaction.id;
@@ -179,42 +243,46 @@ proptest! {
         // (More than one an be evicted to meet the limit.)
         prop_assert!(storage.transaction_count() <= MEMPOOL_TX_COUNT);
 
-        // Since we inserted more than MAX_EVICTION_MEMORY_ENTRIES,
+        // Since we inserted more than the configured capacity,
         // the storage should have removed the older entries and kept its size
-        prop_assert_eq!(storage.rejected_transaction_count(), MAX_EVICTION_MEMORY_ENTRIES);
+        prop_assert_eq!(
+            storage.rejected_transaction_count(),
+            TEST_REJECTION_LIST_CAPACITY
+        );
     }
 
     /// Test that the reject list length limits are applied when directly rejecting transactions.
     #[test]
     fn reject_lists_are_limited_reject(
         rejection_error in any::<RejectionError>(),
-        mut rejection_template in any::<UnminedTxId>()
+        rejection_template in any::<UnminedTxId>()
     ) {
-        let mut storage: Storage = Storage::new(&Config {
-            tx_cost_limit: 160_000_000,
-            eviction_memory_time: EVICTION_MEMORY_TIME,
-            ..Default::default()
-        });
+        let mut storage = Storage::new_with_rejection_list_capacity(
+            &Config {
+                tx_cost_limit: 160_000_000,
+                eviction_memory_time: EVICTION_MEMORY_TIME,
+                ..Default::default()
+            },
+            TEST_REJECTION_LIST_CAPACITY,
+        );
 
-        // Make unique IDs by converting the index to bytes, and writing it to each ID
-        let unique_ids = (0..(MAX_EVICTION_MEMORY_ENTRIES + 1) as u32).map(move |index| {
-            let index = index.to_le_bytes();
-            rejection_template.mined_id_mut().0[0..4].copy_from_slice(&index);
-            if let Some(auth_digest) = rejection_template.auth_digest_mut() {
-                auth_digest.0[0..4].copy_from_slice(&index);
-            }
-
-            rejection_template
-        });
+        let test_capacity: u32 = TEST_REJECTION_LIST_CAPACITY
+            .try_into()
+            .expect("test rejection-list capacity fits in u32");
+        let unique_ids = (0..=test_capacity)
+            .map(|index| rejection_id_with_index(rejection_template, index));
 
         for (index, rejection) in unique_ids.enumerate() {
             storage.reject(rejection, rejection_error.clone());
 
-            if index == MAX_EVICTION_MEMORY_ENTRIES - 1 {
+            if index == TEST_REJECTION_LIST_CAPACITY - 1 {
                 // Make sure there were no duplicates
-                prop_assert_eq!(storage.rejected_transaction_count(), MAX_EVICTION_MEMORY_ENTRIES);
-            } else if index == MAX_EVICTION_MEMORY_ENTRIES {
-                // Since we inserted more than MAX_EVICTION_MEMORY_ENTRIES,
+                prop_assert_eq!(
+                    storage.rejected_transaction_count(),
+                    TEST_REJECTION_LIST_CAPACITY
+                );
+            } else if index == TEST_REJECTION_LIST_CAPACITY {
+                // Since we inserted more than the configured capacity,
                 // all with the same error,
                 // the storage should have either cleared the reject list
                 // or removed the oldest ones, depending on the structure
@@ -226,7 +294,10 @@ proptest! {
                         prop_assert_eq!(storage.rejected_transaction_count(), 0);
                     },
                     RejectionError::SameEffectsChain(_) => {
-                        prop_assert_eq!(storage.rejected_transaction_count(), MAX_EVICTION_MEMORY_ENTRIES);
+                        prop_assert_eq!(
+                            storage.rejected_transaction_count(),
+                            TEST_REJECTION_LIST_CAPACITY
+                        );
                     },
                 }
             }

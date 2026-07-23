@@ -918,6 +918,48 @@ async fn body_target_waits_for_authenticated_lead() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn verified_full_block_advances_header_tip_without_auth_lead() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let best = (block::Height(800), block::Hash([8; 32]));
+    let mined = (block::Height(3), block::Hash([3; 32]));
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: best.0,
+        completed_checkpoint_hash: best.1,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+
+    // Drain startup queries / any initial actions.
+    while tokio::time::timeout(std::time::Duration::from_millis(20), fixture.actions.recv())
+        .await
+        .is_ok()
+    {}
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::FullBlockCommitted {
+            height: mined.0,
+            hash: mined.1,
+        })
+        .await
+        .unwrap();
+
+    loop {
+        if let HeaderSyncAction::HeaderAdvanced { height, hash } =
+            next_action(&mut fixture.actions).await
+        {
+            assert_eq!(height, mined.0);
+            assert_eq!(hash, mined.1);
+            break;
+        }
+    }
+    assert_eq!(fixture.handle.best_header_tip(), mined);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn root_auth_state_trace_records_exact_hole_height() {
     let network = Network::Mainnet;
     let anchor = (block::Height(0), network.genesis_hash());

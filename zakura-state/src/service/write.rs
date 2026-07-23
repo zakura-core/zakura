@@ -651,32 +651,28 @@ impl WriteBlockWorkerTask {
                     // the stalled-height gauge if it had been raised.
                     vct_write_manager.on_commit_success();
 
-                    // Publish the tip before checkpoint rebind. `commit_finalized`
-                    // already answered the oneshot, so tip waiters can race this
-                    // path; rebind must not delay chain-tip notification.
+                    // `commit_finalized` already answered the oneshot, so tip waiters
+                    // can race this path. Publish header-root auth before the tip so
+                    // tip observers always see a current authentication frontier.
                     let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
-                    chain_tip_sender.set_finalized_tip(tip_block);
 
-                    let checkpoint_rebound = match highest_completed_checkpoint
-                        .rebind_from_db(&finalized_state.db)
-                    {
-                        Ok(()) => true,
+                    match highest_completed_checkpoint.rebind_from_db(&finalized_state.db) {
+                        Ok(()) => {
+                            publish_header_root_auth_state(
+                                finalized_state,
+                                highest_completed_checkpoint,
+                                header_root_auth_sender,
+                            );
+                        }
                         Err(error) => {
                             tracing::warn!(
                                 ?error,
                                 "failed to refresh highest completed checkpoint after finalized block commit"
                             );
-                            false
                         }
-                    };
-                    if checkpoint_rebound {
-                        publish_header_root_auth_state(
-                            finalized_state,
-                            highest_completed_checkpoint,
-                            header_root_auth_sender,
-                        );
                     }
+                    chain_tip_sender.set_finalized_tip(tip_block);
                 }
                 Err((ordered_block, error)) => {
                     // Retryable VCT root stalls (an absent/evicted root, or one not yet

@@ -3190,6 +3190,14 @@ impl HeaderSyncReactor {
                 old,
                 new: (height, hash),
             });
+        } else if height <= self.state.verified_block_tip {
+            // Tips already covered by verified bodies (local mining / gossiped
+            // full blocks) are proven without waiting for root-auth lead.
+            // Always advertise them; auth gating only applies to header-only tips.
+            if height > self.state.body_sync_target.0 {
+                self.state.body_sync_target = (height, hash);
+            }
+            let _ = self.dispatch_action(HeaderSyncAction::HeaderAdvanced { height, hash });
         } else {
             self.refresh_body_sync_target();
         }

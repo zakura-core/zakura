@@ -562,7 +562,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-BODY-04"
 name = "Evidence-bound peer scoring"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::Attribution"
+tests = ["IN-02::supplier_evidence_attribution_matrix_distinguishes_header_body_and_advertiser", "IN-02::in_02_each_commitment_mismatch_scores_body_delivery_only_and_keeps_header", "IN-02::in_02_consensus_invalid_persists_and_scores_only_its_exact_supplier", "IN-02::reactor_scores_exact_supplier_for_commitment_matching_consensus_invalidity", "PW-04::wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable", "IN-02::unexpected_verifier_hash_is_retryable_without_supplier_blame"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-OP-01"

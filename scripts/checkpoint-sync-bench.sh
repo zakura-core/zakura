@@ -139,11 +139,15 @@ fi
 
 # Always tear down a launched node + its fork, even on FATAL/interrupt, so a failed
 # run never leaves an orphan zakurad thrashing the box or a fork eating disk.
+# Every line is failure-proofed: with `set -e` active inside the EXIT trap, a
+# failing command (e.g. kill on an already-reaped node pid) aborts the trap,
+# skips the fork removal, and overrides a successful script exit with 1 —
+# bench run 30025780553 failed exactly that way and leaked its fork.
 CUR_PID=""; CUR_FORK=""; CUR_REC=""
 cleanup() {
-  [[ -n "$CUR_REC" ]] && kill "$CUR_REC" 2>/dev/null
-  [[ -n "$CUR_PID" ]] && kill -9 "$CUR_PID" 2>/dev/null
-  [[ -n "$CUR_FORK" ]] && rm -rf "$CUR_FORK" 2>/dev/null
+  { [[ -n "$CUR_REC" ]] && kill "$CUR_REC"; } 2>/dev/null || true
+  { [[ -n "$CUR_PID" ]] && kill -9 "$CUR_PID"; } 2>/dev/null || true
+  { [[ -n "$CUR_FORK" ]] && rm -rf "$CUR_FORK"; } 2>/dev/null || true
   return 0
 }
 trap cleanup EXIT INT TERM
@@ -184,6 +188,9 @@ ensure_bench_home() {
   fi
   [[ -w "$BENCH_HOME" ]] || die "$BENCH_HOME not writable"
   mkdir -p "$BENCH_HOME/snapshots" "$BENCH_HOME/bins" "$BENCH_HOME/forks"
+  # sweep forks leaked by crashed runs (the concurrency group serializes CI
+  # benches, but only age-gate the sweep so a live hand-run's fork survives)
+  find "$BENCH_HOME/forks" -mindepth 1 -maxdepth 1 -mmin +360 -exec rm -rf {} + 2>/dev/null || true
   local avail_gib
   avail_gib=$(df -B1G --output=avail "$BENCH_HOME" | tail -1 | tr -dc '0-9')
   log "free space at $BENCH_HOME: ${avail_gib}GiB"
@@ -195,6 +202,51 @@ ensure_bench_home() {
 # Streams the .tar.zst straight through zstd|tar so the compressed tarball is never
 # stored on disk (the box has only ~one disk and can't hold tarball + extracted state).
 # sha256 is computed over the compressed stream via tee and checked after extraction.
+
+# Probe the artifact size with a ranged 0-0 request. A server that answers with
+# Content-Range supports resumable ranged fetches; empty output means fall back
+# to a single plain stream.
+snapshot_total_bytes() {
+  curl -fsSL -r 0-0 -o /dev/null -D - --connect-timeout 30 "$1" 2>/dev/null \
+    | awk 'tolower($1)=="content-range:"{sub(/.*\//,""); gsub(/[^0-9]/,""); print; exit}'
+}
+
+# Emit the snapshot tarball to stdout as a sequence of resumable range chunks.
+# The CDN kills ~10-minute streams mid-body (curl error 92, seen in bench run
+# 30024608628), which is fatal for a pipe extract; per-chunk ranged requests
+# finish in seconds and resume at byte granularity across retries, while costing
+# only one chunk of disk instead of tarball + extracted state. stdout is the tar
+# stream — all logging goes to stderr via log().
+SNAPSHOT_CHUNK_BYTES="${SNAPSHOT_CHUNK_BYTES:-$((1024 * 1024 * 1024))}"
+stream_snapshot_chunks() {
+  local url="$1" total="$2" offset=0 end have want cf try
+  rm -f "$BENCH_HOME/snapshots/.chunk."* 2>/dev/null || true
+  while (( offset < total )); do
+    end=$(( offset + SNAPSHOT_CHUNK_BYTES - 1 ))
+    if (( end >= total )); then end=$(( total - 1 )); fi
+    want=$(( end - offset + 1 ))
+    cf="$BENCH_HOME/snapshots/.chunk.$offset"
+    for (( try = 1; try <= 8; try++ )); do
+      have=$(stat -c%s "$cf" 2>/dev/null || echo 0)
+      if (( have >= want )); then break; fi
+      curl -fsSL --connect-timeout 30 -r "$(( offset + have ))-$end" "$url" >> "$cf" \
+        || { log "chunk fetch attempt $try failed at offset $(( offset + have )); retrying"; sleep 3; }
+    done
+    have=$(stat -c%s "$cf" 2>/dev/null || echo 0)
+    if (( have != want )); then
+      # != also catches a server that ignored the Range header and sent the
+      # whole body — emitting that would corrupt the stream, so fail the source
+      log "chunk $offset-$end incomplete after retries (have $have, want $want)"
+      rm -f "$cf"
+      return 1
+    fi
+    cat "$cf" || return 1
+    rm -f "$cf"
+    offset=$(( end + 1 ))
+    log "snapshot fetch: $(( offset / 1024 / 1024 ))MiB / $(( total / 1024 / 1024 ))MiB"
+  done
+}
+
 ensure_snapshot() {
   local version_file
   version_file="$(find "$MASTER/state" -mindepth 3 -maxdepth 3 -type f -path '*/mainnet/version' -print -quit 2>/dev/null || true)"
@@ -205,11 +257,20 @@ ensure_snapshot() {
   local tmp="$MASTER.tmp.$$" sumf; sumf="$BENCH_HOME/snapshots/.sha.$$"
   rm -rf "$tmp"; mkdir -p "$tmp"
   log "streaming snapshot download+extract (~30GiB compressed, no tarball kept) ..."
-  local ok=0 url
+  local ok=0 url total
   for url in "$SNAPSHOT_URL" "$SNAPSHOT_MIRROR"; do
     [[ -n "$url" ]] || continue
     log "source: $url"
-    if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 "$url" \
+    total="$(snapshot_total_bytes "$url" || true)"
+    local fetch_cmd
+    if [[ -n "$total" && "$total" -gt 0 ]]; then
+      log "ranged fetch: $(( total / 1024 / 1024 ))MiB in $(( SNAPSHOT_CHUNK_BYTES / 1024 / 1024 ))MiB resumable chunks"
+      fetch_cmd=(stream_snapshot_chunks "$url" "$total")
+    else
+      log "no range support detected; single-stream fetch"
+      fetch_cmd=(curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 "$url")
+    fi
+    if "${fetch_cmd[@]}" \
          | tee >(sha256sum | awk '{print $1}' > "$sumf") \
          | zstd -dc --long=31 | tar -x -C "$tmp"; then
       ok=1; break
@@ -562,6 +623,9 @@ run_one() {
     fi
     sleep "$SAMPLE_INTERVAL"
   done
+  # the node is dead (or being killed) past this point; a stale pid in the EXIT
+  # trap must not be treated as a live node
+  CUR_PID=""
   local t_end; t_end=$(date +%s)
 
   # stop the recorder (node is gone / about to be); give it a moment to flush jsonl

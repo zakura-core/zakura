@@ -55,7 +55,7 @@ pub struct ForkReplaySummary {
     pub boundary_checks: u16,
     /// Production preparation mutation matrices completed.
     pub validation_checks: u16,
-    /// Exact selected/verified next-child assertions completed.
+    /// Exact next-child assertions after frontier changes and at final frontiers.
     pub next_child_checks: u16,
     /// Complete typed body-evidence matrices completed.
     pub body_evidence_checks: u16,
@@ -738,13 +738,24 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                 if let Some(target) = inserted_target {
                     store.record_branch_tip(branch_key, target);
                 }
-                assert_eq!(store.snapshot(), plan.change_set().metadata.snapshot());
+                let after = store.snapshot();
+                assert_eq!(after, plan.change_set().metadata.snapshot());
                 assert_generation_delta(
                     &before,
-                    &store.snapshot(),
+                    &after,
                     before_selected != store.selected,
                     before_verified != store.verified,
                     eligibility_changed,
+                );
+                next_child_checks = next_child_checks.saturating_add(
+                    assert_changed_frontiers_accept_next_children(
+                        &store,
+                        &clock,
+                        &authority,
+                        &before,
+                        &after,
+                        operation,
+                    ),
                 );
                 if no_change {
                     no_effects = no_effects.saturating_add(1);
@@ -971,8 +982,9 @@ fn assert_consecutive_resets() -> [u8; 32] {
         };
         let plan = apply_transition(&store, request, &context)
             .expect("each exact retained reset path is admissible");
+        let after = plan.change_set().metadata.snapshot();
         assert_eq!(
-            plan.change_set().metadata.frontiers.verified_best,
+            after.frontiers.verified_best,
             Frontier::new(new_tip.height, new_tip.hash),
             "reset selects the exact hash-qualified path rather than inferring by height"
         );
@@ -990,6 +1002,18 @@ fn assert_consecutive_resets() -> [u8; 32] {
             "verified reset shape alone does not replace independently selected header work"
         );
         store.commit(&plan);
+        assert_ne!(
+            assert_changed_frontiers_accept_next_children(
+                &store,
+                &clock,
+                &authority,
+                &before,
+                &after,
+                0xd000 + index,
+            ),
+            0,
+            "each exact reset frontier accepts its next child"
+        );
         assert_eq!(
             store
                 .verified
@@ -1505,6 +1529,45 @@ fn commit_fixture_insertion(
     target
 }
 
+fn assert_changed_frontiers_accept_next_children(
+    store: &FuzzStore,
+    clock: &ManualClock,
+    authority: &FuzzAuthority,
+    before: &EngineSnapshot,
+    after: &EngineSnapshot,
+    operation: usize,
+) -> u16 {
+    let mut checks = 0u16;
+    let header_changed = before.frontiers.header_best != after.frontiers.header_best;
+    if header_changed {
+        let mut next_child_store = store.clone();
+        commit_next_child_exactly(
+            &mut next_child_store,
+            clock,
+            authority,
+            after.frontiers.header_best,
+            operation.saturating_mul(2).saturating_add(0xa000),
+            0xe0,
+        );
+        checks = checks.saturating_add(1);
+    }
+    if before.frontiers.verified_best != after.frontiers.verified_best
+        && (!header_changed || after.frontiers.verified_best != after.frontiers.header_best)
+    {
+        let mut next_child_store = store.clone();
+        commit_next_child_exactly(
+            &mut next_child_store,
+            clock,
+            authority,
+            after.frontiers.verified_best,
+            operation.saturating_mul(2).saturating_add(0xa001),
+            0xe1,
+        );
+        checks = checks.saturating_add(1);
+    }
+    checks
+}
+
 fn commit_next_child_exactly(
     store: &mut FuzzStore,
     clock: &ManualClock,
@@ -1611,6 +1674,7 @@ fn permutation_fixture(
     let finalized = store.metadata.frontiers.finalized;
     let mut tips = Vec::new();
     for (operation, branch, hard_work) in operations {
+        let before = store.snapshot();
         let request = store.insertion_with_validation(
             finalized,
             2,
@@ -1631,7 +1695,11 @@ fn permutation_fixture(
         };
         let plan = apply_transition(&store, request, &context)
             .expect("both stable permutation branches are admissible");
+        let after = plan.change_set().metadata.snapshot();
         store.commit(&plan);
+        let _ = assert_changed_frontiers_accept_next_children(
+            &store, &clock, &authority, &before, &after, operation,
+        );
         assert_exhaustive_oracle(&store);
         tips.push(target);
     }
@@ -1935,7 +2003,27 @@ mod tests {
             promoted.snapshot.frontiers.header_best.hash,
             incumbent.snapshot.frontiers.header_best.hash
         );
-        assert_eq!(promoted.next_child_checks, 2);
+        assert!(
+            promoted.next_child_checks > 2,
+            "the replay checks changed frontiers as well as its final frontiers"
+        );
+    }
+
+    #[test]
+    fn every_changed_frontier_accepts_an_exact_parent_next_child() {
+        let header_change = replay_fork_transition_bytes(&[0]);
+        assert_eq!(header_change.next_child_checks, 3);
+        assert_ne!(
+            header_change.snapshot.frontiers.header_best,
+            header_change.snapshot.frontiers.verified_best
+        );
+
+        let header_then_verified_change = replay_fork_transition_bytes(&[0, 0x60]);
+        assert_eq!(header_then_verified_change.next_child_checks, 3);
+        assert_eq!(
+            header_then_verified_change.snapshot.frontiers.header_best,
+            header_then_verified_change.snapshot.frontiers.verified_best
+        );
     }
 
     #[test]
@@ -1955,7 +2043,10 @@ mod tests {
             replacement.snapshot.frontiers.header_best.hash,
             incumbent.snapshot.frontiers.header_best.hash
         );
-        assert_eq!(replacement.next_child_checks, 2);
+        assert!(
+            replacement.next_child_checks > 2,
+            "the replay checks changed frontiers as well as its final frontiers"
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::{
     io::{self, Cursor, Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -952,6 +952,9 @@ pub struct ZakuraHeaderSyncCandidateState {
     pub admitted_node_ids: Vec<NodeId>,
     /// Peers in local, non-punitive advisory backoff after failing to confirm usefulness.
     pub backed_off_node_ids: Vec<NodeId>,
+    /// Real backoff expiry per backed-off peer, so reopen waits target the reactor's
+    /// deadline instead of inventing a fresh one at sampling time.
+    pub backed_off_until: Vec<(NodeId, Instant)>,
 }
 
 impl Default for ZakuraHeaderSyncCandidateState {
@@ -960,6 +963,7 @@ impl Default for ZakuraHeaderSyncCandidateState {
             target_height: block::Height::MIN,
             admitted_node_ids: Vec::new(),
             backed_off_node_ids: Vec::new(),
+            backed_off_until: Vec::new(),
         }
     }
 }

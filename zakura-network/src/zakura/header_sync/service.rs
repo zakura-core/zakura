@@ -502,13 +502,26 @@ impl Service for HeaderSyncService {
         let Some(node_id) = header_peer_node_id(peer) else {
             return OrderedSessionDemand::Retire;
         };
-        if self
-            .header_sync
-            .candidate_state()
-            .backed_off_node_ids
-            .contains(&node_id)
-        {
-            return OrderedSessionDemand::RetryAt(Instant::now() + HEADER_SYNC_ADVISORY_BACKOFF);
+        let candidate_state = self.header_sync.candidate_state();
+        if candidate_state.backed_off_node_ids.contains(&node_id) {
+            let deadline = candidate_state
+                .backed_off_until
+                .iter()
+                .find(|(backed_off, _)| *backed_off == node_id)
+                .map(|(_, until)| *until);
+            let now = Instant::now();
+            match deadline {
+                // Wake at the reactor's real backoff expiry: `install_demand_wait`
+                // never shortens a pending demand wait, so a deadline invented at
+                // sampling time would overshoot by up to a full backoff period.
+                Some(deadline) if deadline > now => return OrderedSessionDemand::RetryAt(deadline),
+                // The published deadline has passed; time is authoritative even if
+                // the reactor has not republished the cleared backoff yet.
+                Some(_) => {}
+                // No deadline published for this node (stale or hand-built state):
+                // fall back to a conservative full backoff window.
+                None => return OrderedSessionDemand::RetryAt(now + HEADER_SYNC_ADVISORY_BACKOFF),
+            }
         }
 
         OrderedSessionDemand::OpenNow

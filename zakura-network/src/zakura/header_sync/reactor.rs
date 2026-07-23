@@ -42,6 +42,7 @@ pub fn spawn_header_sync_reactor(
         target_height: header_sync_candidate_target(state.best_header_tip),
         admitted_node_ids: Vec::new(),
         backed_off_node_ids: Vec::new(),
+        backed_off_until: Vec::new(),
     });
     let handle = HeaderSyncHandle {
         events: events_tx,
@@ -594,24 +595,30 @@ impl HeaderSyncReactor {
         admitted_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         admitted_node_ids.dedup();
 
-        let mut backed_off_node_ids: Vec<_> = self
+        let mut backed_off_until: Vec<_> = self
             .state
             .advisory
             .iter()
             .filter_map(|(peer, advisory)| {
-                advisory
-                    .is_backed_off(now)
-                    .then(|| node_id_from_header_peer_id(peer))
-                    .flatten()
+                if !advisory.is_backed_off(now) {
+                    return None;
+                }
+                let until = advisory.backoff_until?;
+                Some((node_id_from_header_peer_id(peer)?, until.into_std()))
             })
             .collect();
-        backed_off_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-        backed_off_node_ids.dedup();
+        backed_off_until.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        backed_off_until.dedup_by_key(|(node_id, _)| *node_id);
+        let backed_off_node_ids: Vec<_> = backed_off_until
+            .iter()
+            .map(|(node_id, _)| *node_id)
+            .collect();
 
         let candidate_state = ZakuraHeaderSyncCandidateState {
             target_height: header_sync_candidate_target(self.state.best_header_tip),
             admitted_node_ids,
             backed_off_node_ids,
+            backed_off_until,
         };
         self.candidates.send_if_modified(|current| {
             if *current == candidate_state {

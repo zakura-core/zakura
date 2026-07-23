@@ -1301,6 +1301,86 @@ fn ordered_session_demand_bounds_advisory_backoff_and_waits_for_slots() {
     ));
 }
 
+#[test]
+fn advisory_backoff_retry_targets_the_real_deadline() {
+    // The reactor owns the real `backoff_until`, and the transport never
+    // shortens a pending demand wait; a deadline invented at sampling time
+    // would overshoot by up to a full backoff period.
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer, node_id) = node_peer();
+
+    let before = std::time::Instant::now();
+    let deadline = before + std::time::Duration::from_secs(10);
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        backed_off_node_ids: vec![node_id],
+        backed_off_until: vec![(node_id, deadline)],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+
+    let demand = service.ordered_session_demand(
+        1,
+        &peer,
+        ZAKURA_CAP_HEADER_SYNC,
+        ServicePeerDirection::Outbound,
+    );
+    let OrderedSessionDemand::RetryAt(retry_at) = demand else {
+        panic!("an advisory-backed-off candidate must use a bounded retry");
+    };
+    assert_eq!(
+        retry_at, deadline,
+        "the retry must target the reactor's published backoff expiry"
+    );
+}
+
+#[test]
+fn expired_advisory_backoff_opens_even_with_stale_candidate_state() {
+    // The reactor clears an expired backoff only on its next republish; time
+    // is authoritative, so a passed deadline must not keep gating reopens.
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer, node_id) = node_peer();
+
+    let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        backed_off_node_ids: vec![node_id],
+        backed_off_until: vec![(node_id, expired)],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::OpenNow
+    ));
+}
+
 #[tokio::test]
 async fn transient_session_exit_keeps_connection_ownership_across_reopen_gap() {
     // Discovery samples `owns_connection_for_peer` to decide whether a finished

@@ -53,7 +53,9 @@ same-height, and forward exact-hash verified paths without intervening forward
 work, then requires the next child to anchor to the final reset hash. It is also
 used by deterministic corpus tests. The historical incident seed retains A,
 promotes B, rejects a held A insertion without effects, commits B's next child,
-and reopens with the exact B tip still usable as an ancestry lease.
+and reopens with the exact B tip still usable as an ancestry lease. A bounded
+fixed-anchor seed also runs 999, 1,000, and 1,001-descendant replacement
+fixtures in both arrival orders through the transition planner.
 
 `header_pursuit` consumes at most 512 bytes as four-byte operations over twenty
 logical peers. It drives the production peer work queue, response-page and

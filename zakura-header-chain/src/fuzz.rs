@@ -50,6 +50,8 @@ pub struct ForkReplaySummary {
     pub reset_checks: u16,
     /// Historical late-A-after-B-promotion incident checks completed.
     pub incident_checks: u16,
+    /// Fixed-anchor 999/1,000/1,001 replacement matrix checks completed.
+    pub boundary_checks: u16,
     /// Final authoritative snapshot.
     pub snapshot: EngineSnapshot,
     /// Stable digest of operation outcomes and snapshots.
@@ -449,13 +451,14 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     let mut permutation_checks = 0u16;
     let mut reset_checks = 0u16;
     let mut incident_checks = 0u16;
+    let mut boundary_checks = 0u16;
     let mut transcript = Sha256::new();
     let clock = ManualClock::new();
     let authority = FuzzAuthority;
     assert_exhaustive_oracle(&store);
 
     for (operation, encoded) in bounded.iter().copied().enumerate() {
-        if matches!(bounded.first(), Some(b'A' | b'I' | b'R' | b'T'))
+        if matches!(bounded.first(), Some(b'A' | b'F' | b'I' | b'R' | b'T'))
             && encoded == b'\n'
             && operation.saturating_add(1) == bounded.len()
         {
@@ -488,6 +491,15 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
             transcript.update(digest);
             no_effects = no_effects.saturating_add(1);
             incident_checks = incident_checks.saturating_add(1);
+            assert_exhaustive_oracle(&store);
+            continue;
+        }
+        if encoded == b'F' {
+            let digest = assert_fixed_anchor_boundaries();
+            transcript.update(b"fixed-anchor-boundaries");
+            transcript.update(digest);
+            no_effects = no_effects.saturating_add(1);
+            boundary_checks = boundary_checks.saturating_add(1);
             assert_exhaustive_oracle(&store);
             continue;
         }
@@ -732,6 +744,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         permutation_checks,
         reset_checks,
         incident_checks,
+        boundary_checks,
         snapshot: store.snapshot(),
         replay_digest: transcript.finalize().into(),
         retained_digest: retained_digest(&store),
@@ -1070,6 +1083,71 @@ fn assert_incident_recovery() -> [u8; 32] {
     );
     assert_exhaustive_oracle(&reopened);
     retained_digest(&reopened)
+}
+
+fn assert_fixed_anchor_boundaries() -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for (fixture, incumbent_depth) in [999, 1_000, 1_001].into_iter().enumerate() {
+        for competitor_first in [false, true] {
+            let mut store = FuzzStore::new(EngineMode::Integrated);
+            let clock = ManualClock::new();
+            let authority = FuzzAuthority;
+            let anchor = store.metadata.frontiers.finalized;
+            let incumbent_operation = 200 + fixture.saturating_mul(2);
+            let competitor_operation = incumbent_operation.saturating_add(1);
+            let (incumbent, competitor) = if competitor_first {
+                let competitor = commit_fixture_insertion(
+                    &mut store,
+                    &clock,
+                    &authority,
+                    anchor,
+                    incumbent_depth + 1,
+                    competitor_operation,
+                    0xd2,
+                );
+                let incumbent = commit_fixture_insertion(
+                    &mut store,
+                    &clock,
+                    &authority,
+                    anchor,
+                    incumbent_depth,
+                    incumbent_operation,
+                    0xd1,
+                );
+                (incumbent, competitor)
+            } else {
+                let incumbent = commit_fixture_insertion(
+                    &mut store,
+                    &clock,
+                    &authority,
+                    anchor,
+                    incumbent_depth,
+                    incumbent_operation,
+                    0xd1,
+                );
+                assert_eq!(store.metadata.frontiers.header_best, incumbent);
+                let competitor = commit_fixture_insertion(
+                    &mut store,
+                    &clock,
+                    &authority,
+                    anchor,
+                    incumbent_depth + 1,
+                    competitor_operation,
+                    0xd2,
+                );
+                (incumbent, competitor)
+            };
+            assert_ne!(incumbent.hash, competitor.hash);
+            assert_eq!(
+                store.metadata.frontiers.header_best, competitor,
+                "fixed-anchor selection ignores replacement depth and arrival order"
+            );
+            hasher.update(incumbent_depth.to_le_bytes());
+            hasher.update([u8::from(competitor_first)]);
+            hasher.update(competitor.hash.0);
+        }
+    }
+    hasher.finalize().into()
 }
 
 fn commit_fixture_insertion(
@@ -1526,6 +1604,15 @@ mod tests {
     }
 
     #[test]
+    fn fixed_anchor_boundary_matrix_replays_through_transitions() {
+        let first = replay_fork_transition_bytes(b"F");
+        let second = replay_fork_transition_bytes(b"F");
+        assert_eq!(first, second);
+        assert_eq!(first.boundary_checks, 1);
+        assert_eq!(first.no_effects, 1);
+    }
+
+    #[test]
     #[should_panic(expected = "selected projection must exactly match parent links")]
     fn exhaustive_oracle_rejects_a_projection_gap() {
         let mut store = FuzzStore::new(EngineMode::Integrated);
@@ -1669,6 +1756,12 @@ mod tests {
                     "../../fuzz/header-chain/corpus/fork_transitions/aud_incident_late_a_after_b_promotion"
                 ),
             ),
+            (
+                "fixed_anchor_999_1000_1001",
+                include_bytes!(
+                    "../../fuzz/header-chain/corpus/fork_transitions/fixed_anchor_999_1000_1001"
+                ),
+            ),
         ];
         for (name, bytes) in corpus {
             let first = replay_fork_transition_bytes(bytes);
@@ -1694,6 +1787,9 @@ mod tests {
             }
             if *name == "aud_incident_late_a_after_b_promotion" {
                 assert_eq!(first.incident_checks, 1);
+            }
+            if *name == "fixed_anchor_999_1000_1001" {
+                assert_eq!(first.boundary_checks, 1);
             }
         }
     }

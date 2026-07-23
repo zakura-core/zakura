@@ -2303,10 +2303,10 @@ mod tests {
         let _guard = zakura_test::init();
         // Advertise dialable (non-loopback) addresses so the gossiped records are
         // kept in the dialable book rather than dropped as locally non-dialable.
-        let addr_a = "203.0.113.10:9"
+        let addr_a = "45.33.30.10:9"
             .parse::<std::net::SocketAddr>()
             .expect("valid test addr");
-        let addr_b = "203.0.113.11:9"
+        let addr_b = "45.33.30.11:9"
             .parse::<std::net::SocketAddr>()
             .expect("valid test addr");
         let a = ZakuraTestNode::builder(52)

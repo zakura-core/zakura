@@ -9,17 +9,20 @@
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
+    panic::AssertUnwindSafe,
     time::Duration,
 };
 
+use futures::FutureExt;
 use iroh::{NodeAddr, NodeId};
-use tokio::task::JoinSet;
+use tokio::{task::JoinSet, time::Instant};
 use tracing::debug;
 
 use super::dialer::native_bootstrap_dial;
 use super::protocol::{ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
 use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
 use crate::zakura::{
+    canonical_ip,
     trace::{discovery_trace as d_trace, peer_label, DISCOVERY_TABLE},
     ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId,
 };
@@ -53,6 +56,21 @@ struct DiscoveryDialWorkerResult {
     node_id: NodeId,
     reserved_ips: Vec<IpAddr>,
     result: DiscoveryDialResult,
+}
+
+/// Exponential dial backoff for a single `(node_id, ip)` pair.
+///
+/// Backoff is keyed by `(NodeId, IpAddr)`, not `IpAddr` alone: a signature on a
+/// gossip record proves control of the node key, not ownership of the addresses
+/// it advertises. Keying failure backoff by IP alone would let an attacker sign
+/// throwaway node ids that all advertise an honest peer's IP and, by failing
+/// those dials, back that IP off for every legitimate candidate that shares it.
+/// The in-flight reservation cap (`in_flight_by_ip`) stays IP-scoped because it
+/// bounds a real local resource (concurrent dials to one address).
+#[derive(Copy, Clone, Debug)]
+struct DiscoveryIpBackoff {
+    failure_count: u32,
+    retry_at: Instant,
 }
 
 /// Spawn the long-lived discovery candidate dialer for `endpoint`.
@@ -98,12 +116,15 @@ pub(crate) async fn run_native_discovery_dialer(
     let mut registered = endpoint.supervisor().subscribe();
     let mut in_flight = HashSet::new();
     let mut in_flight_by_ip = HashMap::new();
+    let mut dial_backoff_by_node_ip = HashMap::new();
+    let dial_backoff = discovery.dial_backoff().await;
     let mut workers = JoinSet::new();
 
     loop {
         if shutdown.is_cancelled() {
             return;
         }
+        prune_discovery_ip_backoff(&mut dial_backoff_by_node_ip, dial_backoff.1, Instant::now());
 
         spawn_discovery_dial_candidates(
             &endpoint,
@@ -111,6 +132,7 @@ pub(crate) async fn run_native_discovery_dialer(
             &limits,
             &mut in_flight,
             &mut in_flight_by_ip,
+            &dial_backoff_by_node_ip,
             &mut workers,
         )
         .await;
@@ -128,6 +150,14 @@ pub(crate) async fn run_native_discovery_dialer(
                         release_discovery_in_flight_ips(
                             &mut in_flight_by_ip,
                             &worker_result.reserved_ips,
+                        );
+                        apply_discovery_ip_dial_result(
+                            &mut dial_backoff_by_node_ip,
+                            worker_result.node_id,
+                            &worker_result.reserved_ips,
+                            worker_result.result,
+                            dial_backoff,
+                            Instant::now(),
                         );
                         apply_discovery_dial_result(
                             &discovery,
@@ -159,6 +189,7 @@ async fn spawn_discovery_dial_candidates(
     limits: &ZakuraLocalLimits,
     in_flight: &mut HashSet<NodeId>,
     in_flight_by_ip: &mut HashMap<IpAddr, usize>,
+    dial_backoff_by_node_ip: &HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
     workers: &mut JoinSet<DiscoveryDialWorkerResult>,
 ) {
     if !endpoint.has_native_admission_capacity() {
@@ -170,9 +201,14 @@ async fn spawn_discovery_dial_candidates(
         if !endpoint.has_native_admission_capacity() {
             return;
         }
-        let Some((node_addr, reserved_ips)) =
-            discovery_node_addr_with_reserved_ip_capacity(endpoint, &candidate, in_flight_by_ip)
-                .await
+        let Some((node_addr, reserved_ips)) = discovery_node_addr_with_reserved_ip_capacity(
+            endpoint,
+            &candidate,
+            in_flight_by_ip,
+            dial_backoff_by_node_ip,
+            Instant::now(),
+        )
+        .await
         else {
             continue;
         };
@@ -184,27 +220,55 @@ async fn spawn_discovery_dial_candidates(
 
         discovery.mark_dial_attempt(&node_id).await;
         metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
-        workers.spawn(run_discovery_dial_once(
-            endpoint.clone(),
-            node_addr,
-            limits.clone(),
+        workers.spawn({
+            let reserved_ips_on_panic = reserved_ips.clone();
+            AssertUnwindSafe(run_discovery_dial_once(
+                endpoint.clone(),
+                node_addr,
+                limits.clone(),
+                node_id,
+                reserved_ips,
+            ))
+            .catch_unwind()
+            .map(move |result| {
+                recover_discovery_dial_worker_panic(node_id, reserved_ips_on_panic, result)
+            })
+        });
+    }
+}
+
+fn recover_discovery_dial_worker_panic(
+    node_id: NodeId,
+    reserved_ips: Vec<IpAddr>,
+    result: std::thread::Result<DiscoveryDialWorkerResult>,
+) -> DiscoveryDialWorkerResult {
+    result.unwrap_or_else(|_| {
+        metrics::counter!("zakura.p2p.discovery.dial.worker_panicked").increment(1);
+        tracing::error!(?node_id, "Zakura discovery dial worker panicked");
+        DiscoveryDialWorkerResult {
             node_id,
             reserved_ips,
-        ));
-    }
+            result: DiscoveryDialResult::Failed,
+        }
+    })
 }
 
 async fn discovery_node_addr_with_reserved_ip_capacity(
     endpoint: &ZakuraEndpoint,
     candidate: &ZakuraDiscoveryDialCandidate,
     in_flight_by_ip: &HashMap<IpAddr, usize>,
+    dial_backoff_by_node_ip: &HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
+    now: Instant,
 ) -> Option<(NodeAddr, Vec<IpAddr>)> {
     let mut direct_addrs = Vec::new();
     let mut reserved_ips = Vec::new();
     for addr in &candidate.direct_addrs {
-        if can_accept_discovery_dial_ip(endpoint, addr.ip(), in_flight_by_ip).await {
-            if !reserved_ips.contains(&addr.ip()) {
-                reserved_ips.push(addr.ip());
+        let dial_ip = canonical_ip(addr.ip());
+        if !discovery_ip_is_in_backoff(dial_backoff_by_node_ip, candidate.node_id, dial_ip, now)
+            && can_accept_discovery_dial_ip(endpoint, dial_ip, in_flight_by_ip).await
+        {
+            if !reserved_ips.contains(&dial_ip) {
+                reserved_ips.push(dial_ip);
             }
             direct_addrs.push(*addr);
         }
@@ -246,6 +310,76 @@ fn release_discovery_in_flight_ips(in_flight_by_ip: &mut HashMap<IpAddr, usize>,
             in_flight_by_ip.remove(ip);
         }
     }
+}
+
+fn discovery_ip_is_in_backoff(
+    dial_backoff_by_node_ip: &HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
+    node_id: NodeId,
+    ip: IpAddr,
+    now: Instant,
+) -> bool {
+    dial_backoff_by_node_ip
+        .get(&(node_id, ip))
+        .is_some_and(|backoff| now < backoff.retry_at)
+}
+
+fn prune_discovery_ip_backoff(
+    dial_backoff_by_node_ip: &mut HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
+    retention: Duration,
+    now: Instant,
+) {
+    dial_backoff_by_node_ip
+        .retain(|_, backoff| now.saturating_duration_since(backoff.retry_at) <= retention);
+}
+
+fn apply_discovery_ip_dial_result(
+    dial_backoff_by_node_ip: &mut HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
+    node_id: NodeId,
+    ips: &[IpAddr],
+    result: DiscoveryDialResult,
+    dial_backoff: (Duration, Duration),
+    now: Instant,
+) {
+    match result {
+        DiscoveryDialResult::Registered
+        | DiscoveryDialResult::ConnectedElsewhere
+        | DiscoveryDialResult::ShortLivedRegistered => {
+            for ip in ips {
+                dial_backoff_by_node_ip.remove(&(node_id, *ip));
+            }
+        }
+        DiscoveryDialResult::Failed => {
+            for ip in ips {
+                let failure_count = dial_backoff_by_node_ip
+                    .get(&(node_id, *ip))
+                    .map_or(1, |backoff| backoff.failure_count.saturating_add(1));
+                dial_backoff_by_node_ip.insert(
+                    (node_id, *ip),
+                    DiscoveryIpBackoff {
+                        failure_count,
+                        retry_at: now
+                            + discovery_ip_dial_backoff(
+                                failure_count,
+                                dial_backoff.0,
+                                dial_backoff.1,
+                            ),
+                    },
+                );
+            }
+        }
+        DiscoveryDialResult::LocalResourceLimit => {}
+    }
+}
+
+fn discovery_ip_dial_backoff(
+    failure_count: u32,
+    dial_backoff_base: Duration,
+    dial_backoff_max: Duration,
+) -> Duration {
+    let shift = failure_count.saturating_sub(1).min(10);
+    dial_backoff_base
+        .saturating_mul(1u32 << shift)
+        .min(dial_backoff_max)
 }
 
 async fn run_discovery_dial_once(
@@ -425,6 +559,124 @@ mod tests {
 
     fn peer_id(byte: u8) -> ZakuraPeerId {
         ZakuraPeerId::new(vec![byte; 32]).expect("32-byte test peer id is valid")
+    }
+
+    fn node_id(byte: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[byte; 32]).public()
+    }
+
+    #[test]
+    fn panicked_worker_returns_metadata_needed_to_release_reservations() {
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let ip = IpAddr::from([93, 184, 216, 34]);
+        let mut in_flight = HashSet::from([node_id]);
+        let mut in_flight_by_ip = HashMap::new();
+        reserve_discovery_in_flight_ips(&mut in_flight_by_ip, &[ip]);
+
+        let worker_result = recover_discovery_dial_worker_panic(
+            node_id,
+            vec![ip],
+            Err(Box::new("test worker panic")),
+        );
+        assert_eq!(worker_result.node_id, node_id);
+        assert_eq!(worker_result.reserved_ips, vec![ip]);
+        assert_eq!(worker_result.result, DiscoveryDialResult::Failed);
+
+        in_flight.remove(&worker_result.node_id);
+        release_discovery_in_flight_ips(&mut in_flight_by_ip, &worker_result.reserved_ips);
+        assert!(in_flight.is_empty());
+        assert!(in_flight_by_ip.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_dials_back_off_only_the_failing_node_for_that_ip() {
+        let failing_node = node_id(1);
+        let honest_node = node_id(2);
+        let ip = IpAddr::from([93, 184, 216, 34]);
+        let mapped_ip: IpAddr = "::ffff:93.184.216.34"
+            .parse()
+            .expect("mapped test address parses");
+        let six_to_four_ip: IpAddr = "2002:5db8:d822::"
+            .parse()
+            .expect("6to4 test address parses");
+        let teredo_ip: IpAddr = "2001:0:c000:22d::a247:27dd"
+            .parse()
+            .expect("Teredo test address parses");
+        assert_eq!(canonical_ip(mapped_ip), ip);
+        assert_eq!(canonical_ip(six_to_four_ip), ip);
+        assert_eq!(canonical_ip(teredo_ip), ip);
+        let now = Instant::now();
+        let dial_backoff = (Duration::from_secs(60), Duration::from_secs(3_600));
+        let mut backoff_by_node_ip = HashMap::new();
+
+        apply_discovery_ip_dial_result(
+            &mut backoff_by_node_ip,
+            failing_node,
+            &[ip],
+            DiscoveryDialResult::Failed,
+            dial_backoff,
+            now,
+        );
+        // The failing node is backed off for this IP, canonicalised so v4/v6
+        // variants of the same address share the entry.
+        assert!(discovery_ip_is_in_backoff(
+            &backoff_by_node_ip,
+            failing_node,
+            ip,
+            now
+        ));
+        assert!(discovery_ip_is_in_backoff(
+            &backoff_by_node_ip,
+            failing_node,
+            canonical_ip(mapped_ip),
+            now
+        ));
+        // A different node advertising the same IP is NOT poisoned: a signature
+        // proves node-key control, not IP ownership.
+        assert!(!discovery_ip_is_in_backoff(
+            &backoff_by_node_ip,
+            honest_node,
+            ip,
+            now
+        ));
+        assert!(!discovery_ip_is_in_backoff(
+            &backoff_by_node_ip,
+            failing_node,
+            ip,
+            now + Duration::from_secs(60)
+        ));
+
+        let second_attempt = now + Duration::from_secs(60);
+        apply_discovery_ip_dial_result(
+            &mut backoff_by_node_ip,
+            failing_node,
+            &[ip],
+            DiscoveryDialResult::Failed,
+            dial_backoff,
+            second_attempt,
+        );
+        assert!(discovery_ip_is_in_backoff(
+            &backoff_by_node_ip,
+            failing_node,
+            ip,
+            second_attempt + Duration::from_secs(119)
+        ));
+        assert!(!discovery_ip_is_in_backoff(
+            &backoff_by_node_ip,
+            failing_node,
+            ip,
+            second_attempt + Duration::from_secs(120)
+        ));
+
+        apply_discovery_ip_dial_result(
+            &mut backoff_by_node_ip,
+            failing_node,
+            &[ip],
+            DiscoveryDialResult::Registered,
+            dial_backoff,
+            second_attempt,
+        );
+        assert!(!backoff_by_node_ip.contains_key(&(failing_node, ip)));
     }
 
     #[tokio::test(start_paused = true)]

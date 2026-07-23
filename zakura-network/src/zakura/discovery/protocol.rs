@@ -21,9 +21,9 @@ use zakura_chain::{
 };
 
 use crate::zakura::{
-    BlockSyncStatus, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerLimits,
-    ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId, MAX_BS_BLOCKS_PER_REQUEST,
-    MAX_BS_RESPONSE_BYTES,
+    canonical_ip, BlockSyncStatus, ServiceAdmissionDecision, ServicePeerDirection,
+    ServicePeerLimits, ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId,
+    MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES,
 };
 
 /// Native discovery stream kind.
@@ -912,9 +912,9 @@ pub struct ZakuraDiscoveryPersistedEntry {
 
 /// A locally dialable discovery candidate.
 ///
-/// Candidates may come from first-party confirmed signed discovery records or from trusted static
-/// bootstrap configuration. Only signed records are eligible for peer samples; unsigned static
-/// candidates are local dial hints.
+/// Candidates may come from signed discovery records or from trusted static bootstrap
+/// configuration. Only signed records are eligible for peer samples; unsigned static candidates
+/// are local dial hints.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZakuraDiscoveryDialCandidate {
     /// Candidate iroh node id.
@@ -1952,6 +1952,14 @@ impl ZakuraDiscoveryHandle {
         )
     }
 
+    pub(crate) async fn dial_backoff(&self) -> (Duration, Duration) {
+        let inner = self.inner.lock().await;
+        (
+            inner.config.dial_backoff_base,
+            inner.config.dial_backoff_max,
+        )
+    }
+
     /// Returns service-aware candidates, using fallback to general peers only when requested.
     pub async fn service_candidates(
         &self,
@@ -2551,7 +2559,9 @@ impl ZakuraDiscoveryBook {
                 last_short_lived_exchange: None,
                 failure_count: 0,
             });
-        candidate.direct_addrs = direct_addrs;
+        candidate.direct_addrs.extend(direct_addrs);
+        candidate.direct_addrs.sort_unstable();
+        candidate.direct_addrs.dedup();
         candidate.last_seen = now;
         Ok(())
     }
@@ -2691,7 +2701,6 @@ impl ZakuraDiscoveryBook {
                         dial_backoff.0,
                         dial_backoff.1,
                     )
-                    && entry_has_confirmed_dial_authority(entry)
                     && has_wanted_services(&entry.record, wanted_services)
                     && has_discovery_usable_direct_addrs(entry)
             })
@@ -3405,10 +3414,6 @@ fn has_discovery_usable_direct_addrs(entry: &ZakuraDiscoveryEntry) -> bool {
         })
 }
 
-fn entry_has_confirmed_dial_authority(entry: &ZakuraDiscoveryEntry) -> bool {
-    entry.is_static || entry.source == Some(entry.record.body.node_id)
-}
-
 /// Returns true only for addresses that are safe to dial from untrusted discovery gossip.
 ///
 /// A signed `ZakuraNodeRecord` proves control of the node key, not ownership of the advertised
@@ -3422,24 +3427,34 @@ fn is_discovery_dialable_addr(addr: &SocketAddr) -> bool {
         return false;
     }
 
-    match addr.ip() {
-        IpAddr::V4(ip) => {
-            !ip.is_unspecified()
-                && !ip.is_loopback()
-                && !ip.is_multicast()
-                && !ip.is_broadcast()
-                && !ip.is_link_local()
-                && !ip.is_private()
-                && !is_ipv4_shared(&ip)
-        }
+    match canonical_ip(addr.ip()) {
+        IpAddr::V4(ip) => is_discovery_dialable_ipv4(&ip),
         IpAddr::V6(ip) => {
             !ip.is_unspecified()
                 && !ip.is_loopback()
                 && !ip.is_multicast()
                 && !is_ipv6_unicast_link_local(&ip)
                 && !is_ipv6_unique_local(&ip)
+                && !is_ipv6_site_local(&ip)
+                && !is_ipv6_nat64_translation(&ip)
+                && !is_ipv6_documentation(&ip)
         }
     }
+}
+
+fn is_discovery_dialable_ipv4(ip: &Ipv4Addr) -> bool {
+    !ip.is_unspecified()
+        && ip.octets()[0] != 0
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && !ip.is_broadcast()
+        && !ip.is_link_local()
+        && !ip.is_private()
+        && !is_ipv4_shared(ip)
+        && !is_ipv4_protocol_assignment(ip)
+        && !is_ipv4_documentation(ip)
+        && !is_ipv4_benchmarking(ip)
+        && !is_ipv4_reserved(ip)
 }
 
 fn is_static_discovery_configured_addr_usable(addr: &SocketAddr) -> bool {
@@ -3447,7 +3462,7 @@ fn is_static_discovery_configured_addr_usable(addr: &SocketAddr) -> bool {
         return false;
     }
 
-    match addr.ip() {
+    match canonical_ip(addr.ip()) {
         IpAddr::V4(ip) => !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast(),
         IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_multicast(),
     }
@@ -3455,6 +3470,40 @@ fn is_static_discovery_configured_addr_usable(addr: &SocketAddr) -> bool {
 
 fn is_ipv6_unicast_link_local(ip: &Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+fn is_ipv4_protocol_assignment(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 192 && octets[1] == 0 && octets[2] == 0
+}
+
+fn is_ipv4_benchmarking(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 198 && matches!(octets[1], 18 | 19)
+}
+
+fn is_ipv4_reserved(ip: &Ipv4Addr) -> bool {
+    ip.octets()[0] >= 240
+}
+
+// `Ipv4Addr::is_documentation` is still unstable, so match the three RFC 5737
+// documentation ranges (TEST-NET-1/2/3) directly. These are reserved for docs
+// and examples, never globally routable, so an advertised documentation address
+// can only be an attempt to steer a dial at an internal or bogus target.
+fn is_ipv4_documentation(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    matches!(
+        (octets[0], octets[1], octets[2]),
+        (192, 0, 2) | (198, 51, 100) | (203, 0, 113)
+    )
+}
+
+// `Ipv6Addr::is_documentation` is still unstable, so match the RFC 3849
+// 2001:db8::/32 documentation range directly (IPv6 counterpart of the RFC 5737
+// TEST-NET ranges).
+fn is_ipv6_documentation(ip: &Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x2001 && segments[1] == 0x0db8
 }
 
 // `Ipv4Addr::is_shared` is still unstable, so match the RFC 6598 100.64.0.0/10 range directly,
@@ -3467,6 +3516,17 @@ fn is_ipv4_shared(ip: &Ipv4Addr) -> bool {
 // `Ipv6Addr::is_unique_local` is still unstable, so match the RFC 4193 fc00::/7 range directly.
 fn is_ipv6_unique_local(ip: &Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xfe00) == 0xfc00
+}
+
+// Deprecated RFC 3879 site-local addresses remain internal targets even though they are outside
+// the modern RFC 4193 unique-local range.
+fn is_ipv6_site_local(ip: &Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfec0
+}
+
+fn is_ipv6_nat64_translation(ip: &Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x0064 && segments[1] == 0xff9b && (segments[2..6] == [0; 4] || segments[2] == 1)
 }
 
 // Import accepts records inside the clock-skew window, but runtime liveness is strict.
@@ -4428,9 +4488,9 @@ mod tests {
         ZakuraNodeRecordBody {
             node_id: secret_key.public(),
             direct_addrs: vec![
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 8233),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 33, 30, 10)), 8233),
                 SocketAddr::new(
-                    IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 10)),
+                    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x10)),
                     18233,
                 ),
             ],
@@ -4504,7 +4564,7 @@ mod tests {
     }
 
     fn test_addr(index: u8) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, index)), 8233)
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 33, 30, index)), 8233)
     }
 
     fn candidate_for(record: &ZakuraNodeRecord, is_static: bool) -> ZakuraDiscoveryDialCandidate {
@@ -4991,7 +5051,7 @@ mod tests {
                 record
                     .body
                     .direct_addrs
-                    .push("198.51.100.1:8233".parse().unwrap())
+                    .push("45.33.30.1:8233".parse().unwrap())
             }),
             Box::new(|record, _context| record.body.services.push(service(9))),
             Box::new(|record, _context| record.body.zakura_protocol_min = 0),
@@ -5109,7 +5169,7 @@ mod tests {
         let secret_key = secret_key();
         let mut too_many_addrs = body(&secret_key);
         too_many_addrs.direct_addrs =
-            vec!["192.0.2.1:8233".parse().unwrap(); MAX_DIRECT_ADDRS_PER_RECORD + 1];
+            vec!["45.33.30.1:8233".parse().unwrap(); MAX_DIRECT_ADDRS_PER_RECORD + 1];
         assert!(ZakuraNodeRecord::sign(too_many_addrs, &secret_key).is_err());
 
         let mut too_many_services = body(&secret_key);
@@ -5657,7 +5717,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 8233),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)), 8233),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 8233),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20)), 0),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 33, 30, 20)), 0),
         ];
 
         for (index, bad_addr) in bad_addrs.into_iter().enumerate() {
@@ -5682,18 +5742,62 @@ mod tests {
         // direct addresses. Untrusted gossip must therefore be restricted to globally routable
         // targets; otherwise an authenticated discovery peer could seed signed records pointing at
         // the honest node's private/internal network and turn the candidate dialer into an internal
-        // SSRF/scanner. RFC 1918 private, RFC 6598 shared (CGNAT), and RFC 4193 unique-local ranges
-        // are neither loopback nor link-local, so the original filter let them through.
+        // SSRF/scanner. Private, shared, special-purpose, IPv4-embedded, NAT64 translation, and
+        // unique/site-local ranges are not all covered by the standard loopback/link-local checks.
         let bad_addrs = [
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 8233),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 5, 5)), 8233),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8233),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 1, 2, 3)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1)), 8233),
+            // RFC 5737 documentation ranges (TEST-NET-1/2/3) are reserved for
+            // docs, never globally routable.
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)), 8233),
+            // RFC 3849 IPv6 documentation range 2001:db8::/32.
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 5)),
+                8233,
+            ),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)), 8233),
             SocketAddr::new(
                 IpAddr::V6(Ipv6Addr::new(0xfd12, 0x3456, 0, 0, 0, 0, 0, 1)),
                 8233,
             ),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 1)),
+                8233,
+            ),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 1)),
+                8233,
+            ),
+            // 6to4 embeds 10.0.0.1 in bits 16..48.
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2002, 0x0a00, 1, 0, 0, 0, 0, 0)),
+                8233,
+            ),
+            // Teredo stores the client IPv4 address bitwise-inverted in the final 32 bits.
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0, 0xc000, 0x022d, 0, 0, 0xf5ff, 0xfffe,
+                )),
+                8233,
+            ),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0a00, 1)), 8233),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x0a00, 1)),
+                8233,
+            ),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0x0a00, 1)),
+                8233,
+            ),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1)), 8233),
         ];
 
         for (index, bad_addr) in bad_addrs.into_iter().enumerate() {
@@ -5745,7 +5849,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_book_gossiped_public_third_party_record_is_not_dialable() {
+    fn discovery_book_gossiped_public_third_party_record_is_dialable() {
         let mut book = ZakuraDiscoveryBook::default();
         let gossip_source = secret_key().public();
         let public_target = signed_record_with_addrs(
@@ -5768,7 +5872,7 @@ mod tests {
             &public_target
         );
 
-        assert!(
+        assert_eq!(
             book.dial_candidates(
                 10,
                 &[service(1)],
@@ -5782,11 +5886,13 @@ mod tests {
                     DEFAULT_DISCOVERY_DIAL_BACKOFF_MAX,
                 ),
                 &mut StdRng::seed_from_u64(7),
-            )
-            .is_empty(),
-            "unconfirmed third-party public gossip must not drive native dials"
+            ),
+            vec![candidate_for(&public_target, false)],
+            "valid public gossip must expand discovery beyond directly connected peers"
         );
 
+        // A later first-party exchange still updates the record's source metadata without changing
+        // its dialability.
         assert_eq!(
             book.import_record(public_target.clone(), Some(target_id), NOW + 1, &context())
                 .expect("first-party self-record confirmation imports"),
@@ -5876,10 +5982,16 @@ mod tests {
         let mut book = ZakuraDiscoveryBook::default();
         let node_id = secret_key().public();
         let loopback_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233);
+        let second_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8234);
         let node_addr = NodeAddr::new(node_id).with_direct_addresses([loopback_addr]);
 
         book.insert_static_candidate(node_addr, NOW)
             .expect("configured static loopback candidate imports");
+        book.insert_static_candidate(
+            NodeAddr::new(node_id).with_direct_addresses([second_addr]),
+            NOW + 1,
+        )
+        .expect("additional address for the same static identity imports");
 
         let mut rng = StdRng::seed_from_u64(7);
         assert!(book.sample_peers(10, &[], &[], NOW, &mut rng).is_empty());
@@ -5900,7 +6012,7 @@ mod tests {
             ),
             vec![ZakuraDiscoveryDialCandidate {
                 node_id,
-                direct_addrs: vec![loopback_addr],
+                direct_addrs: vec![loopback_addr, second_addr],
                 is_static: true,
             }]
         );

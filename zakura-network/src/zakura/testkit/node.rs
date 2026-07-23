@@ -132,6 +132,17 @@ impl ZakuraTestNode {
         timeout: Duration,
     ) -> Result<(), BoxError> {
         let peer_addr = peer.node_addr().await;
+        self.connect_native_to_addr(peer_addr, timeout).await
+    }
+
+    /// Start a native dial to an explicit [`NodeAddr`] and wait until this node
+    /// registers it. Lets tests advertise a specific direct-address list (for
+    /// example a decoy address ahead of the reachable one).
+    pub async fn connect_native_to_addr(
+        &self,
+        peer_addr: NodeAddr,
+        timeout: Duration,
+    ) -> Result<(), BoxError> {
         self.endpoint.add_node_addr(peer_addr.clone())?;
         let mut handle = self.endpoint.spawn_native_dial(peer_addr.clone());
         let peer_id = peer_addr.node_id.as_bytes().to_vec();
@@ -655,6 +666,79 @@ mod tests {
         node.connect_native(&peer2, TEST_NET_TIMEOUT)
             .await
             .expect("second same-IP peer registers with raised per-IP cap");
+
+        node.shutdown().await;
+        peer1.shutdown().await;
+        peer2.shutdown().await;
+    }
+
+    // Pin a peer's advertised addresses to its IPv4 loopback path so same-host
+    // dials share one source IP (test nodes also bind an IPv6 loopback socket).
+    fn ipv4_loopback_addr(peer_addr: &NodeAddr) -> NodeAddr {
+        let addr = NodeAddr::new(peer_addr.node_id).with_direct_addresses(
+            peer_addr
+                .direct_addresses()
+                .copied()
+                .filter(|addr| addr.is_ipv4() && addr.ip().is_loopback()),
+        );
+        assert!(
+            addr.direct_addresses().next().is_some(),
+            "test peer must advertise an IPv4 loopback direct address",
+        );
+        addr
+    }
+
+    #[tokio::test]
+    async fn outbound_dial_charges_confirmed_path_not_advertised_decoy() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // Regression for the per-IP cap bypass in `serve_native_dial_connection`:
+        // it used to charge the connection to the first *advertised* direct
+        // address instead of the path iroh actually confirmed. A record could
+        // then list an unreachable decoy first and escape the per-IP cap while
+        // being served over a different (shared) address.
+        let peer1 = ZakuraTestNode::builder(9201)
+            .spawn()
+            .await
+            .expect("peer1 spawns");
+        let peer2 = ZakuraTestNode::builder(9202)
+            .spawn()
+            .await
+            .expect("peer2 spawns");
+        let node = ZakuraTestNode::builder(9203)
+            .max_connections_per_ip(1)
+            .spawn()
+            .await
+            .expect("dialer spawns");
+
+        // Advertise peer1 with an unreachable decoy (RFC 5737 TEST-NET-1,
+        // guaranteed non-routable) ahead of its real loopback address. The dial
+        // is served over loopback, so the connection must be charged to
+        // 127.0.0.1, not the decoy.
+        let peer1_loopback = ipv4_loopback_addr(&peer1.node_addr().await);
+        let decoy = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 1);
+        let decoy_first = NodeAddr::new(peer1_loopback.node_id).with_direct_addresses(
+            std::iter::once(decoy).chain(peer1_loopback.direct_addresses().copied()),
+        );
+        node.connect_native_to_addr(decoy_first, TEST_NET_TIMEOUT)
+            .await
+            .expect("peer1 registers over its reachable loopback path despite the decoy");
+
+        // With the connection correctly charged to the confirmed loopback IP,
+        // the per-IP cap of 1 must turn away a second distinct identity from
+        // 127.0.0.1. Before the fix, peer1 was charged to the decoy IP, leaving
+        // the loopback bucket empty and wrongly admitting peer2.
+        let excess = node
+            .connect_native_to_addr(
+                ipv4_loopback_addr(&peer2.node_addr().await),
+                TEST_NET_TIMEOUT,
+            )
+            .await;
+        assert!(
+            excess.is_err(),
+            "second same-loopback identity must be rejected by the per-IP cap, proving the \
+             first dial was charged to the confirmed path and not the advertised decoy",
+        );
 
         node.shutdown().await;
         peer1.shutdown().await;

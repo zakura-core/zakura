@@ -674,7 +674,7 @@ fn write_block_replaces_matching_provisional_zakura_roots_with_verified_row() {
 /// A header range re-delivered over a height whose body is already committed (a
 /// header store behind the body store, or a late range response racing body sync)
 /// must not overwrite the verified serving-index row with peer-supplied roots:
-/// committed roots win on any overlap (design §9).
+/// committed roots win on any overlap (design §13.1).
 #[test]
 fn header_range_roots_do_not_overwrite_committed_serving_index_rows() {
     let _init_guard = zakura_test::init();

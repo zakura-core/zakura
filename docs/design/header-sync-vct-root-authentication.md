@@ -32,8 +32,8 @@ atomically persists only the confirmed root prefix.
 The design retains the strongest parts of the earlier
 [PR #62](https://github.com/zakura-core/zakura/pull/62): a sealed
 `VerifiedHeaderCommitmentRoots` type, one-header overlap between root-carrying
-ranges, a persisted confirmed-prefix invariant, reconstruction from durable
-authenticated state, and protection for authoritative roots produced by
+ranges, a persisted confirmed-prefix invariant, restart restoration from
+durable authenticated state, and protection for authoritative roots produced by
 committed block bodies. It deliberately does not retain PR #62's network-owned
 history tree, lazy rebuild, or reanchor machinery: state already owns canonical
 chain selection, durable writes, and block-commit history trees, so it also
@@ -358,8 +358,8 @@ provenance.
 
 State may persist the frontier as a single history-tree snapshot. This avoids
 replaying a long header lead on every restart. The authenticated root rows
-remain a durable audit trail and can be used for defensive reconstruction
-(Section 11.5).
+remain a durable audit trail; recovery from a missing or incoherent snapshot
+is fail-closed (Section 11.5).
 
 ### 7.1 Existing database upgrade
 
@@ -719,10 +719,13 @@ Startup performs:
 2. load the durable `HeaderRootAuthFrontier`;
 3. verify that its `(height, hash)` matches the canonical header store;
 4. verify that the frontier is not behind the authoritative body history tree;
-5. if bodies advanced farther, rebase to the body-derived history tree;
-6. load the durable best-header tip independently from the root-covered body
+   a frontier behind the body tree fails the coherence check and is handled
+   fail-closed (Section 11.5). This state has no ordinary crash window: the
+   body-overtake rebase happens inside the body-commit transaction itself
+   (Section 13.1), not as a startup step;
+5. load the durable best-header tip independently from the root-covered body
    target;
-7. resume retained-first authentication from `confirmed_height + 1`; the
+6. resume retained-first authentication from `confirmed_height + 1`; the
    pre-restart retained store is intentionally not restored.
 
 No unverified candidate roots are restored.
@@ -745,19 +748,35 @@ not merely the durable header tip, and header sync publishes a higher
 authenticated body target only after the authentication frontier has built at
 least a 400-block lead over the current target. This cushion lets bodies
 continue through short authentication delays and repeated early restarts.
-Every published target remains authenticated, so body sync cannot enter an
-unauthenticated gap. VCT remains fail-closed as a final safety check.
 
-### 11.5 Defensive reconstruction
+Tips at or below the verified body tip are the one exception to the lead
+gate: they are advertised immediately (for example after a locally mined or
+gossiped full block commits). Bodies through that height are fully
+semantically verified, which strictly dominates header-root authentication,
+so the target still cannot enter an unauthenticated gap. Every published
+target is therefore either root-authenticated or body-verified. VCT remains
+fail-closed as a final safety check.
 
-If the frontier snapshot is missing or fails coherence checks, state can
-defensively reconstruct it from:
+### 11.5 Fail-closed frontier recovery
 
-1. the authoritative history tree at the verified body tip;
-2. contiguous authenticated root rows and canonical headers above that tip.
+Frontier reconstruction from authenticated root rows is not implemented. If
+the frontier snapshot is missing, fails coherence checks, or disagrees with
+the root index (a missing frontier on a non-empty database, a root row above
+the frontier, a frontier behind the body history tree, or a missing root row
+between the body tip and the frontier), startup validation fails closed:
+state refuses to open and instructs the operator to delete and re-sync.
 
-A reconstruction gap is not filled with guessed data. Root authentication
-resumes from the last coherent frontier and re-fetches the missing range.
+The one automated repair is the opt-in startup audit
+(`repair_zakura_header_store_on_startup`, default off). It does not
+reconstruct from root rows above the body tip: it truncates every commitment
+root above the durable verified body tip and rebuilds the frontier from the
+body-derived history tree, after which the root-authentication lane
+re-fetches and re-authenticates the deleted suffix. No gap is ever filled
+with guessed data.
+
+Reconstructing a lost frontier forward from contiguous authenticated root
+rows is possible in principle — the rows are a durable audit trail — but it
+is future work, not a behavior operators can rely on today.
 
 ## 12. Reorganizations
 
@@ -839,10 +858,14 @@ canonical header tip. Every returned header has its corresponding
 authoritative root row.
 
 A missing root at or below the advertised authenticated frontier is state
-incoherence, not a short response. Serving fails closed without returning a
-partial payload from before the gap. Startup recovery truncates to the last
-coherent prefix and re-authenticates the suffix before that frontier is
-advertised or served.
+incoherence, not a short response, and can only arise from local corruption:
+promotion and body commit write atomically and cannot create an interior gap
+(I-11). The serving path itself does not detect this case — it returns the
+contiguous prefix collected before the gap and lets the client retry the
+remainder. The fail-closed protection sits at startup instead: validation
+walks the index from the body tip to the frontier, and a database with an
+interior gap refuses to open (Section 11.5), so an incoherent index is never
+advertised or served across a restart.
 
 ### 14.2 Failure policy
 
@@ -972,9 +995,11 @@ The retained-store and fallback counters are:
 - `sync.header.root_auth.retain.miss`: next-frontier ranges absent from
   retained coverage;
 - `sync.header.root_auth.retain.dropped{reason=...}`: retained responses
-  removed without authentication. Expected reasons include
-  `frontier_advanced`, `frontier_rebased`, `checkpoint_rebased`,
-  `canonical_mismatch`, `invalid_roots`, and `session_retired`;
+  removed without authentication. The emitted reasons are
+  `frontier_advanced`, `frontier_rebased`, `verified_tip_reanchor`,
+  `canonical_mismatch`, `invalid_roots`, `local_retry_exhausted`,
+  `session_retired`, and `same_start_replaced` (a longer committed payload
+  superseded a retained entry at the same start height);
 - `sync.header.root_auth.fallback.requested{reason=...}`: overlapping network
   recovery requested because of `missing` or `invalid_roots`;
 - `sync.header.root_auth.fallback.prefetched`: fallback batches added to the
@@ -984,11 +1009,14 @@ The retained-store and fallback counters are:
   counter alone does not prove frontier advancement.
 
 The steady path should have a high retain-hit rate and near-zero fallback
-requests. Occasional `frontier_advanced` drops are normal because a larger
-authenticated range can cover retained work. Repeated `frontier_rebased`,
-`checkpoint_rebased`, or `canonical_mismatch` drops without corresponding
-canonical chain changes indicate scheduler/state churn. Any `invalid_roots`
-drop identifies a peer payload that failed authentication.
+requests. Occasional `frontier_advanced` and `same_start_replaced` drops are
+normal because a larger authenticated or committed range can cover retained
+work. Repeated `frontier_rebased`, `verified_tip_reanchor`, or
+`canonical_mismatch` drops without corresponding canonical chain changes
+indicate scheduler/state churn. Any `invalid_roots` drop identifies a peer
+payload that failed authentication, and `local_retry_exhausted` means a
+retained payload was abandoned after repeated local state errors, not peer
+misbehavior.
 
 Body commit exposes the consequences of insufficient lead:
 
@@ -1120,19 +1148,24 @@ which supersedes closed draft
 
 `HighestCompletedCheckpointTracker` landed on `main` in
 [PR #351](https://github.com/zakura-core/zakura/pull/351). Snapshot
-publication, restart reconstruction, and defensive recovery are implemented in
-[PR #352](https://github.com/zakura-core/zakura/pull/352). The dedicated
-durable completed-checkpoint row from PR #323 and
-[PR #348](https://github.com/zakura-core/zakura/pull/348) was dropped in favor
-of the in-memory tracker.
+publication and restart reconstruction of the completed-checkpoint tracker
+are implemented in
+[PR #352](https://github.com/zakura-core/zakura/pull/352); recovery of the
+durable authentication frontier is fail-closed rather than reconstructive
+(Section 11.5). The dedicated durable completed-checkpoint row from PR #323
+and [PR #348](https://github.com/zakura-core/zakura/pull/348) was dropped in
+favor of the in-memory tracker.
 
 1. Reuse the in-memory `HighestCompletedCheckpointTracker`.
 2. Advance the completed-checkpoint snapshot only after a durable
    bracket-closing header commit.
 3. Reconstruct the completed-checkpoint snapshot from the canonical header
-   store.
-4. Add defensive reconstruction for the durable authentication frontier and
-   the in-memory checkpoint tracker.
+   store; reconstruction failure clears the published snapshot and is
+   retried after later successful commits, while authentication requests
+   fail locally in the interim.
+4. Keep durable-frontier recovery fail-closed: startup validation plus the
+   opt-in header-store audit (Section 11.5); no frontier reconstruction from
+   root rows.
 5. Publish both snapshots to header sync using a watch or existing frontier
    event.
 
@@ -1235,7 +1268,10 @@ Not yet implemented; planned as a follow-up to
   completed checkpoint frontier.
 - Restart reconstructs the same completed checkpoint snapshot from durable
   headers.
-- Defensive reconstruction stops at the first gap.
+- Completed-checkpoint reconstruction stops at the first canonical header
+  gap.
+- Startup validation rejects a database with a missing frontier, a root row
+  above the frontier, or a missing root row at or below it.
 - A body-tip advance safely rebases an older header-root frontier.
 - Promotion and body-derived replacement preserve a contiguous authoritative
   index through the authenticated frontier.
@@ -1249,10 +1285,10 @@ Not yet implemented; planned as a follow-up to
   duplicate canonical header progress.
 - The confirmed prefix is one shorter than the delivered headers.
 - Short responses use their actual final header as the next overlap.
-- Serving can shorten only at the authenticated frontier or available header
-  tip, never at an interior root gap.
-- A missing row at or below the advertised authenticated frontier is reported
-  as local state incoherence and returns no partial payload.
+- Serving shortens at the authenticated frontier or available header tip; at
+  an interior root gap (corruption only) it returns the contiguous prefix
+  before the gap and nothing after it, and startup validation refuses to
+  open the database across a restart.
 - Two peers requesting the same range complete independently.
 - Header commit and root authentication from one response have distinct
   completions.

@@ -57,11 +57,27 @@ jobs:
           persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        id: toolchain
         with:
           toolchain: stable
           cache-key: semver-checks
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # cargo-semver-checks reuses generated baseline rustdoc JSON from
+      # target/semver-checks/cache (~1-2 MB per crate baseline; a hit skips
+      # that baseline's download and rustdoc build entirely). rust-cache's
+      # target-dir cleaner deletes unrecognized target/ entries before
+      # saving, so this cache needs its own steps. Keyed on the rustc
+      # version: the rustdoc JSON format (and the tool's own invalidation)
+      # rotates with the toolchain. The run_id suffix makes every main run
+      # save a fresh entry; restores prefix-match the newest one.
+      - name: Restore baseline rustdoc cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: target/semver-checks/cache
+          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ github.run_id }}
+          restore-keys: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
 
       # Deliberately unpinned (like cargo-hack): cargo-semver-checks must
       # track new stable rustdoc formats; pin only if a regression forces it.
@@ -73,6 +89,13 @@ jobs:
 
       - name: Check workspace crates against stable crates.io baselines
         run: cargo semver-checks --workspace --default-features
+
+      - name: Save baseline rustdoc cache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: target/semver-checks/cache
+          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ github.run_id }}
 
       - name: Explain the failure
         if: failure()

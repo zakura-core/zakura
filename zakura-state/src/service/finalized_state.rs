@@ -684,24 +684,29 @@ impl FinalizedState {
         )
     }
 
-    /// Commit a checkpoint-verified block using one exact selected auxiliary window.
-    pub(in crate::service) fn commit_finalized_with_aux(
+    /// Commit a checkpoint block and delegate its exact full-state batch to `commit`.
+    pub(in crate::service) fn commit_finalized_with_aux_and<C>(
         &mut self,
         ordered_block: QueuedCheckpointVerified,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         vct_aux_window: Option<VctAuxWindow>,
+        commit: C,
     ) -> Result<
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
-    > {
+    >
+    where
+        C: FnOnce(&mut ZakuraDb, DiskWriteBatch) -> Result<(), CommitCheckpointVerifiedError>,
+    {
         let next_vct_block = vct_aux_window
             .as_ref()
             .and_then(|window| window.successor.clone());
-        self.commit_finalized_inner(
+        self.commit_finalized_inner_with(
             ordered_block,
             prev_note_commitment_trees,
             next_vct_block,
             vct_aux_window,
+            commit,
         )
     }
 
@@ -715,6 +720,34 @@ impl FinalizedState {
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
     > {
+        self.commit_finalized_inner_with(
+            ordered_block,
+            prev_note_commitment_trees,
+            next_vct_block,
+            vct_aux_window,
+            |db, batch| {
+                db.header_chain_disk_db()
+                    .write(batch)
+                    .expect("unexpected rocksdb error while writing block");
+                Ok(())
+            },
+        )
+    }
+
+    fn commit_finalized_inner_with<C>(
+        &mut self,
+        ordered_block: QueuedCheckpointVerified,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        next_vct_block: Option<NextVctBlock>,
+        vct_aux_window: Option<VctAuxWindow>,
+        commit: C,
+    ) -> Result<
+        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
+    >
+    where
+        C: FnOnce(&mut ZakuraDb, DiskWriteBatch) -> Result<(), CommitCheckpointVerifiedError>,
+    {
         let (checkpoint_verified, rsp_tx) = ordered_block;
         let result = self.commit_finalized_direct_with_aux(
             checkpoint_verified.clone().into(),
@@ -722,12 +755,7 @@ impl FinalizedState {
             next_vct_block,
             vct_aux_window,
             "commit checkpoint-verified request",
-            |db, batch| {
-                db.header_chain_disk_db()
-                    .write(batch)
-                    .expect("unexpected rocksdb error while writing block");
-                Ok(())
-            },
+            commit,
         );
 
         if result.is_ok() {

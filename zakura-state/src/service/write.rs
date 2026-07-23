@@ -441,6 +441,43 @@ impl HeaderChainWriter {
             )
             .map(Some)
     }
+
+    fn vct_authentication_request(
+        window: &VctAuxWindow,
+    ) -> Option<(EvidenceId, TransitionRequest)> {
+        if window.current.authentication != AuxAuthentication::Unauthenticated {
+            return None;
+        }
+        let successor = window.successor.as_ref()?;
+        let auth_data_root = successor.auth_data_root?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura.vct.aux.authentication.v1");
+        hasher.update(window.current.delivery_id.digest());
+        hasher.update(window.current.header_hash.0);
+        hasher.update(successor.hash.0);
+        hasher.update(<[u8; 32]>::from(auth_data_root));
+        let evidence = EvidenceId::from_digest(hasher.finalize().into());
+        let owner = WorkScope::for_body_work(&window.snapshot).bind(
+            window.current.owner.session_id,
+            window.current.owner.request_id,
+        );
+
+        Some((
+            evidence,
+            TransitionRequest {
+                expected_version: window.snapshot.state_version,
+                event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence {
+                    owner,
+                    deliveries: vec![window.current],
+                    authentication: AuxAuthentication::Authenticated {
+                        evidence,
+                        boundary_hash: successor.hash,
+                    },
+                })),
+            },
+        ))
+    }
 }
 
 fn select_vct_aux_delivery(
@@ -1189,12 +1226,50 @@ impl WriteBlockWorkerTask {
             let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
             let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
             let vct_aux_for_outcome = vct_aux_window.clone();
+            let vct_authentication = header_chain.as_ref().and_then(|writer| {
+                vct_aux_window
+                    .as_ref()
+                    .and_then(HeaderChainWriter::vct_authentication_request)
+                    .map(|(evidence, request)| (writer.clone(), evidence, request))
+            });
+            let commit_height = ordered_block.0.height;
 
             // Try committing the block
-            match finalized_state.commit_finalized_with_aux(
+            match finalized_state.commit_finalized_with_aux_and(
                 ordered_block,
                 prev_note_commitment_trees,
                 vct_aux_window,
+                |db, batch| {
+                    let Some((writer, evidence, request)) = vct_authentication else {
+                        db.header_chain_disk_db()
+                            .write(batch)
+                            .expect("unexpected rocksdb error while writing block");
+                        return Ok(());
+                    };
+                    let authority = PreparedAuthority(evidence);
+                    let mut context = writer.context();
+                    context.full_state_authority = Some(&authority);
+                    match writer
+                        .runtime
+                        .apply_combined(request, &context, batch, || {})
+                    {
+                        Ok(ApplyResult::Committed(_) | ApplyResult::NoChange(_)) => Ok(()),
+                        Ok(ApplyResult::Stale(receipt)) => {
+                            tracing::debug!(
+                                ?receipt,
+                                "VCT: exact auxiliary authentication became stale before commit"
+                            );
+                            Err(ValidateContextError::VctSuppliedRootAwaitingSuccessor {
+                                height: commit_height,
+                            }
+                            .into())
+                        }
+                        Err(error) => Err(CommitBlockError::HeaderChainError {
+                            error: error.to_string(),
+                        }
+                        .into()),
+                    }
+                },
             ) {
                 Ok((finalized, note_commitment_trees)) => {
                     // Whether this successful commit consumed header-carried
@@ -1661,7 +1736,7 @@ mod tests {
         service::{
             finalized_state::{
                 header_chain::{HeaderChainStore, HeaderChainStoreError},
-                FinalizedState, VctAuxRejection, VctAuxWindow,
+                FinalizedState, NextVctBlock, VctAuxRejection, VctAuxWindow,
             },
             non_finalized_state::NonFinalizedState,
             write::{
@@ -1677,8 +1752,8 @@ mod tests {
         ChainScore, CheckpointSet, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot,
         EvidenceId, FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderGeneration,
         HeaderNode, HeaderValidationState, StateVersion, SuffixWork, TransientBodyFailure,
-        TransientBodyFailureKind, TransitionFailure, TrustedAnchor, VerifiedGeneration,
-        WorkCoordinate, WorkScope,
+        TransientBodyFailureKind, TransitionEvent, TransitionFailure, TrustedAnchor,
+        VerifiedGeneration, WorkCoordinate, WorkScope,
     };
 
     #[test]
@@ -1791,6 +1866,52 @@ mod tests {
             window.current_roots(block::Height(1), block::Hash([2; 32])),
             None,
             "hash-mismatched provenance fails closed"
+        );
+        assert!(
+            HeaderChainWriter::vct_authentication_request(&window).is_none(),
+            "already authenticated metadata needs no new transition"
+        );
+
+        let successor_block = zakura_test::vectors::BLOCK_MAINNET_434873_BYTES
+            .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
+            .expect("the successor fixture deserializes");
+        let successor_height = successor_block
+            .coinbase_height()
+            .expect("the successor fixture has a height");
+        let successor_delivery = zakura_header_chain::AuxDelivery {
+            header_hash: successor_block.hash(),
+            tree_aux: Some(zakura_header_chain::TreeAuxRecordV1 {
+                height: successor_height,
+                auth_data_root: successor_block.auth_data_root(),
+                ..unauthenticated
+                    .tree_aux
+                    .expect("the unauthenticated fixture contains tree auxiliary data")
+            }),
+            ..unauthenticated
+        };
+        let successor = NextVctBlock::from_delivery(
+            successor_block.header.clone(),
+            successor_height,
+            successor_delivery,
+        )
+        .expect("the exact successor delivery constructs a witness");
+        let auth_window = VctAuxWindow {
+            snapshot: window.snapshot,
+            current: unauthenticated,
+            successor: Some(successor.clone()),
+        };
+        let (evidence, request) = HeaderChainWriter::vct_authentication_request(&auth_window)
+            .expect("an unauthenticated current delivery and successor produce evidence");
+        let TransitionEvent::AuxEvidence(event) = request.event else {
+            panic!("VCT authentication uses the sole auxiliary evidence transition");
+        };
+        assert_eq!(event.deliveries, vec![unauthenticated]);
+        assert_eq!(
+            event.authentication,
+            AuxAuthentication::Authenticated {
+                evidence,
+                boundary_hash: successor.hash,
+            }
         );
     }
 

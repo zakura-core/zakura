@@ -172,8 +172,8 @@ queue–reject–await regression.
 
 ### F-05 — Low: v6 wire validation happens at different stages
 
-Zebra round-trips parsed v5/v6 transactions through librustzcash before
-returning them:
+At the audited revisions, Zebra round-trips parsed v5/v6 transactions through
+librustzcash before returning them:
 
 - `zebra-chain/src/transaction/serialize.rs:1123-1140,1187-1218`
 

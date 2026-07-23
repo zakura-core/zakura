@@ -442,7 +442,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-FINAL-01"
 name = "Atomic finalization transition"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::HeaderChainRuntime::apply_combined"
+tests = ["DG-05::finality_atomic_prune_rebase_projection_generation", "AUD-14::aud_14_finality_advance_reopens_complete_before_or_after"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-FINAL-02"

@@ -2,9 +2,9 @@
 
 use std::time::Duration;
 
-use tokio_test::{assert_pending, assert_ready, assert_ready_err, task};
+use tokio_test::{assert_pending, assert_ready, assert_ready_err, assert_ready_ok, task};
 use tower::{Service, ServiceExt};
-use tower_batch_control::{error, Batch};
+use tower_batch_control::{error, Batch, BatchControl, RequestWeight};
 use tower_test::mock;
 
 #[tokio::test]
@@ -118,4 +118,96 @@ async fn wakes_pending_waiters_on_failure() {
         err.is::<error::ServiceError>(),
         "ready 2 should fail with a ServiceError, got: {err:?}"
     );
+}
+
+#[tokio::test]
+async fn explicit_flush_waits_for_queue_capacity() {
+    let _init_guard = zakura_test::init();
+
+    let (service, mut handle) = mock::pair::<_, ()>();
+    let (mut service, worker) = Batch::pair(service, 1, 1, Duration::from_secs(1000));
+    let mut worker = task::spawn(worker.run());
+
+    service.ready().await.unwrap();
+    let _response = service.call(());
+
+    let mut flush_service = service.clone();
+    let mut flush = task::spawn(async move { flush_service.flush().await });
+    assert_pending!(flush.poll(), "the queued item holds the only permit");
+
+    handle.allow(2);
+    assert_pending!(worker.poll());
+    assert_ready_ok!(flush.poll());
+}
+
+#[tokio::test]
+async fn try_flush_skips_when_queue_saturated() {
+    let _init_guard = zakura_test::init();
+
+    let (service, mut handle) = mock::pair::<_, ()>();
+    let (mut service, worker) = Batch::pair(service, 1, 1, Duration::from_secs(1000));
+    let mut worker = task::spawn(worker.run());
+
+    handle.allow(2);
+    service.ready().await.unwrap();
+    let _response = service.call(());
+
+    // The queued item holds the only permit, so a non-blocking flush is skipped.
+    let mut flush_service = service.clone();
+    assert!(matches!(flush_service.try_flush(), Ok(false)));
+
+    // Once the worker drains the queue, the permit frees and try_flush queues.
+    assert_pending!(worker.poll());
+    assert!(matches!(flush_service.try_flush(), Ok(true)));
+}
+
+#[tokio::test]
+async fn explicit_flush_completes_zero_weight_items() {
+    use tokio::time::timeout;
+    let _init_guard = zakura_test::init();
+
+    #[derive(Debug)]
+    struct ZeroWeight;
+    impl RequestWeight for ZeroWeight {
+        fn request_weight(&self) -> usize {
+            0
+        }
+    }
+
+    let (service, mut handle) = mock::pair::<BatchControl<ZeroWeight>, ()>();
+    // High max weight and latency: only the explicit flush can flush this batch.
+    let (mut service, worker) = Batch::pair(service, 100, 1, Duration::from_secs(1000));
+    tokio::spawn(worker.run());
+
+    handle.allow(2);
+    service.ready().await.unwrap();
+    let response = service.call(ZeroWeight);
+
+    let mut flush_service = service.clone();
+    timeout(Duration::from_secs(5), flush_service.flush())
+        .await
+        .expect("flush should not time out")
+        .expect("flush should queue");
+
+    // The worker must forward the zero-weight item and then the flush command:
+    // without the weight floor, the empty-batch guard skips this flush and the
+    // item's response future never completes.
+    let (request, send_item) = timeout(Duration::from_secs(5), handle.next_request())
+        .await
+        .expect("item should reach the inner service")
+        .expect("inner service should stay open");
+    assert!(matches!(request, BatchControl::Item(ZeroWeight)));
+    send_item.send_response(());
+
+    let (request, send_flush) = timeout(Duration::from_secs(5), handle.next_request())
+        .await
+        .expect("flush should reach the inner service")
+        .expect("inner service should stay open");
+    assert!(matches!(request, BatchControl::Flush));
+    send_flush.send_response(());
+
+    timeout(Duration::from_secs(5), response)
+        .await
+        .expect("item response should complete")
+        .expect("zero-weight item should verify");
 }

@@ -31,7 +31,7 @@ use zakura_chain::{
 };
 use zakura_state as zs;
 
-use crate::{error::*, transaction as tx, BoxError};
+use crate::{error::*, primitives, transaction as tx, BoxError};
 
 pub mod check;
 pub mod request;
@@ -295,6 +295,12 @@ where
 
             let known_outpoint_hashes: Arc<HashSet<transaction::Hash>> =
                 Arc::new(known_utxos.keys().map(|outpoint| outpoint.hash).collect());
+            // Keep this guard after `known_outpoint_hashes` so its `Drop` removes the
+            // pointer-keyed registration before the `Arc` address can be reused.
+            let _block_batch_flush = primitives::register_block_verifier_batch_flush(
+                &known_outpoint_hashes,
+                block.transactions.len(),
+            );
 
             for (&transaction_hash, transaction) in
                 transaction_hashes.iter().zip(block.transactions.iter())

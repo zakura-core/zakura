@@ -4,13 +4,22 @@ use tokio::sync::{oneshot, OwnedSemaphorePermit};
 
 use super::error::ServiceError;
 
-/// Message sent to the batch worker
+/// Message sent to the batch worker.
 #[derive(Debug)]
-pub(crate) struct Message<Request, Fut> {
-    pub(crate) request: Request,
-    pub(crate) tx: Tx<Fut>,
-    pub(crate) span: tracing::Span,
-    pub(super) _permit: OwnedSemaphorePermit,
+pub(crate) enum Message<Request, Fut> {
+    /// A batch item request.
+    Item {
+        request: Request,
+        tx: Tx<Fut>,
+        span: tracing::Span,
+        _permit: OwnedSemaphorePermit,
+    },
+
+    /// An explicit request to flush the pending batch.
+    Flush {
+        span: tracing::Span,
+        _permit: OwnedSemaphorePermit,
+    },
 }
 
 /// Response sender

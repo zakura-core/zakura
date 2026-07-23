@@ -877,6 +877,15 @@ impl MappedRequest for ReconsiderBlockRequest {
 /// A query about or modification to the chain state, via the
 /// [`StateService`](crate::service::StateService).
 pub enum Request {
+    /// Atomically admit one complete, already prepared header target through the serialized
+    /// fork-aware header-chain writer.
+    ApplyHeaderChainInsert {
+        /// Durable version observed while acquiring the validation context.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Sealed complete-target insertion; other transition authorities are unrepresentable.
+        insert: Box<zakura_header_chain::InsertHeaders>,
+    },
+
     /// Performs contextual validation of the given semantically verified block,
     /// committing it to the state if successful.
     ///
@@ -1165,6 +1174,7 @@ impl Request {
     /// Returns a [`&'static str`](str) name of the variant representing this value.
     pub fn variant_name(&self) -> &'static str {
         match self {
+            Request::ApplyHeaderChainInsert { .. } => "apply_header_chain_insert",
             Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::AwaitUtxo(_) => "await_utxo",
@@ -1402,6 +1412,12 @@ pub enum ReadRequest {
 
     /// Returns the exact committed selected-header locator after semantic handoff.
     HeaderLocator,
+
+    /// Return the exact immutable branch context for preparing children of `parent_hash`.
+    HeaderValidationLease {
+        /// Retained parent fixed by the requester's initial locator intersection.
+        parent_hash: block::Hash,
+    },
 
     /// Acquire one immutable retained path for an exact header-sync target.
     AcquireRetainedHeaderPath {
@@ -1686,6 +1702,7 @@ impl ReadRequest {
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
             ReadRequest::HeaderLocator => "header_locator",
+            ReadRequest::HeaderValidationLease { .. } => "header_validation_lease",
             ReadRequest::AcquireRetainedHeaderPath { .. } => "acquire_retained_header_path",
             ReadRequest::ReadRetainedHeaderPath { .. } => "read_retained_header_path",
             ReadRequest::ReleaseRetainedHeaderPath { .. } => "release_retained_header_path",
@@ -1768,7 +1785,8 @@ impl TryFrom<Request> for ReadRequest {
                 Ok(ReadRequest::CheckBestChainTipNullifiersAndAnchors(tx))
             }
 
-            Request::CommitSemanticallyVerifiedBlock(_)
+            Request::ApplyHeaderChainInsert { .. }
+            | Request::CommitSemanticallyVerifiedBlock(_)
             | Request::CommitCheckpointVerifiedBlock(_)
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),

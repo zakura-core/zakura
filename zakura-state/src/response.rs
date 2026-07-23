@@ -37,6 +37,9 @@ mod tests;
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].
 pub enum Response {
+    /// Response to [`Request::ApplyHeaderChainInsert`].
+    HeaderChainInsertApplied(zakura_header_chain::ApplyResult),
+
     /// Response to [`Request::CommitSemanticallyVerifiedBlock`] and [`Request::CommitCheckpointVerifiedBlock`]
     /// indicating that a block was successfully committed to the state.
     Committed(block::Hash),
@@ -456,6 +459,10 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::HeaderLocator`], absent before semantic handoff.
     HeaderLocator(Option<zakura_header_chain::HeaderLocator>),
 
+    /// Response to [`ReadRequest::HeaderValidationLease`], absent before attachment or after
+    /// the requested parent ceased to be retained.
+    HeaderValidationLease(Option<zakura_header_chain::ValidationLease>),
+
     /// Response to [`ReadRequest::AcquireRetainedHeaderPath`].
     RetainedHeaderPathLease(crate::RetainedPathLeaseOutcome),
 
@@ -666,6 +673,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::AddressUtxos(_)
             | ReadResponse::ChainInfo(_)
             | ReadResponse::HeaderLocator(_)
+            | ReadResponse::HeaderValidationLease(_)
             | ReadResponse::RetainedHeaderPathLease(_)
             | ReadResponse::RetainedHeaderPathPage(_)
             | ReadResponse::RetainedHeaderPathReleased(_)

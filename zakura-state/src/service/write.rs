@@ -769,6 +769,13 @@ impl HeaderChainObservers {
 
 /// The message type for the non-finalized block write task channel.
 pub enum NonFinalizedWriteMessage {
+    /// One complete peer target prepared outside the writer and admitted through the sole
+    /// transition algorithm.
+    ApplyHeaderChainInsert {
+        expected_version: StateVersion,
+        insert: Box<zakura_header_chain::InsertHeaders>,
+        rsp_tx: oneshot::Sender<Result<ApplyResult, HeaderChainStoreError>>,
+    },
     /// A newly downloaded and semantically verified block prepared for
     /// contextual validation and insertion into the non-finalized state.
     Commit(QueuedSemanticallyVerified),
@@ -1155,6 +1162,26 @@ impl WriteBlockWorkerTask {
             .or_else(|| non_finalized_block_write_receiver.blocking_recv())
         {
             let queued_child_and_rsp_tx = match msg {
+                NonFinalizedWriteMessage::ApplyHeaderChainInsert {
+                    expected_version,
+                    insert,
+                    rsp_tx,
+                } => {
+                    let result = header_chain
+                        .as_ref()
+                        .ok_or(HeaderChainStoreError::Uninitialized)
+                        .and_then(|writer| {
+                            writer.runtime.apply(
+                                TransitionRequest {
+                                    expected_version,
+                                    event: TransitionEvent::InsertHeaders(*insert),
+                                },
+                                &writer.context(),
+                            )
+                        });
+                    let _ = rsp_tx.send(result);
+                    None
+                }
                 NonFinalizedWriteMessage::Commit(queued_child) => Some(queued_child),
                 NonFinalizedWriteMessage::Invalidate { hash, rsp_tx } => {
                     tracing::info!(?hash, "invalidating a block in the non-finalized state");

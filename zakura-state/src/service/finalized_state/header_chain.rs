@@ -284,6 +284,24 @@ impl RetainedPathLeaseRegistry {
 }
 
 impl HeaderChainReader {
+    pub(crate) fn validation_context(
+        &self,
+        parent_hash: block::Hash,
+    ) -> Result<Option<ValidationLease>, HeaderChainStoreError> {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        if self.store.node(parent_hash)?.is_none() {
+            return Ok(None);
+        }
+        self.store
+            .validation_context(parent_hash)
+            .map(Some)
+            .map_err(HeaderChainStoreError::Store)
+    }
+
     pub(crate) fn selected_tip(&self) -> Result<Frontier, HeaderChainStoreError> {
         let _writer = self
             .store
@@ -2170,6 +2188,21 @@ mod tests {
             )
             .expect("the selected two-header path reconciles");
         let reader = runtime.reader();
+        let validation_lease = reader
+            .validation_context(anchor.hash)
+            .expect("the retained parent context is coherent")
+            .expect("the retained anchor has validation context");
+        assert_eq!(validation_lease.parent, anchor_frontier);
+        assert_eq!(
+            validation_lease.trust_anchor_digest,
+            engine_config.trust_anchor_digest()
+        );
+        assert_eq!(
+            reader
+                .validation_context(block::Hash([0xff; 32]))
+                .expect("an absent parent is a normal stale read"),
+            None
+        );
         let owner = SourceId::from_digest([1; 32]);
         let acquired = reader
             .acquire_retained_path(owner, 7, grandchild.hash, &[anchor.hash])

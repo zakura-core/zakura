@@ -52,7 +52,7 @@ use crate::{
     service::{
         block_iter::any_ancestor_blocks,
         chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip},
-        finalized_state::{FinalizedState, ZakuraDb},
+        finalized_state::{header_chain::HeaderChainStoreError, FinalizedState, ZakuraDb},
         non_finalized_state::{Chain, NonFinalizedState},
         pending_utxos::PendingUtxos,
         queued_blocks::QueuedBlocks,
@@ -1014,6 +1014,31 @@ impl StateService {
         rsp_rx
     }
 
+    fn send_header_chain_insert(
+        &self,
+        expected_version: zakura_header_chain::StateVersion,
+        insert: Box<zakura_header_chain::InsertHeaders>,
+    ) -> oneshot::Receiver<Result<zakura_header_chain::ApplyResult, HeaderChainStoreError>> {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        let Some(sender) = &self.block_write_sender.non_finalized else {
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+            return rsp_rx;
+        };
+        if let Err(tokio::sync::mpsc::error::SendError(message)) =
+            sender.send(NonFinalizedWriteMessage::ApplyHeaderChainInsert {
+                expected_version,
+                insert,
+                rsp_tx,
+            })
+        {
+            let NonFinalizedWriteMessage::ApplyHeaderChainInsert { rsp_tx, .. } = message else {
+                unreachable!("the failed send returns the same header insertion message");
+            };
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+        }
+        rsp_rx
+    }
+
     /// Assert some assumptions about the semantically verified `block` before it is queued.
     fn assert_block_can_be_validated(&self, block: &SemanticallyVerifiedBlock) {
         // required by `Request::CommitSemanticallyVerifiedBlock` call
@@ -1156,6 +1181,20 @@ impl Service<Request> for StateService {
         let span = Span::current();
 
         match req {
+            Request::ApplyHeaderChainInsert {
+                expected_version,
+                insert,
+            } => {
+                let rsp_rx = self.send_header_chain_insert(expected_version, insert);
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| BoxError::from("header-chain writer exited"))?
+                        .map(Response::HeaderChainInsertApplied)
+                        .map_err(BoxError::from)
+                }
+                .boxed()
+            }
             // Uses non_finalized_state_queued_blocks and pending_utxos in the StateService
             // Accesses shared writeable state in the StateService, NonFinalizedState, and ZakuraDb.
             //
@@ -1827,6 +1866,15 @@ impl Service<ReadRequest> for ReadStateService {
                 let reader = state.header_chain_reader_receiver.borrow().clone();
                 let locator = reader.map(|reader| reader.selected_locator()).transpose()?;
                 Ok(ReadResponse::HeaderLocator(locator))
+            }
+
+            ReadRequest::HeaderValidationLease { parent_hash } => {
+                let reader = state.header_chain_reader_receiver.borrow().clone();
+                let lease = reader
+                    .map(|reader| reader.validation_context(parent_hash))
+                    .transpose()?
+                    .flatten();
+                Ok(ReadResponse::HeaderValidationLease(lease))
             }
 
             ReadRequest::AcquireRetainedHeaderPath {

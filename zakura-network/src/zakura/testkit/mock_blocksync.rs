@@ -608,7 +608,9 @@ async fn drive_mock_block_sync_actions(
                             token,
                             height,
                             hash: block.hash(),
-                            result: outcome.result,
+                            outcome: crate::zakura::block_sync::test_block_apply_outcome(
+                                outcome.result,
+                            ),
                             local_frontier: Some(outcome.frontiers),
                         })
                         .await;

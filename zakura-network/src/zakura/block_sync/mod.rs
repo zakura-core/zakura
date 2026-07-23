@@ -66,8 +66,8 @@ pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
 pub use config::{BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
 pub use error::BlockSyncWireError;
 pub use events::{
-    BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
-    BlockSyncMisbehavior,
+    BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta,
+    BlockSyncEvent, BlockSyncMisbehavior,
 };
 pub use reactor::spawn_block_sync_reactor;
 pub use request::BlockSizeEstimate;
@@ -95,4 +95,48 @@ fn test_work_scope() -> zakura_header_chain::WorkScope {
 #[cfg(test)]
 fn test_work_owner() -> zakura_header_chain::WorkOwner {
     test_work_scope().bind(6, std::num::NonZeroU64::new(7).expect("seven is nonzero"))
+}
+
+#[cfg(test)]
+pub(crate) fn test_block_apply_outcome(result: BlockApplyResult) -> BlockApplyOutcome {
+    let evidence = zakura_header_chain::EvidenceId::from_digest([0xa5; 32]);
+    let hash = zakura_chain::block::Hash([0x5a; 32]);
+    match result {
+        BlockApplyResult::Committed => {
+            BlockApplyOutcome::committed(zakura_header_chain::VerifiedBodyEvidence {
+                hash,
+                evidence,
+            })
+        }
+        BlockApplyResult::Duplicate => {
+            BlockApplyOutcome::duplicate(zakura_header_chain::VerifiedBodyEvidence {
+                hash,
+                evidence,
+            })
+        }
+        BlockApplyResult::Rejected => {
+            BlockApplyOutcome::consensus_invalid(zakura_header_chain::ConsensusBodyInvalid {
+                hash,
+                evidence,
+                rule: zakura_header_chain::BodyRuleId::new("test.consensus_invalid"),
+                source: zakura_header_chain::SourceId::from_digest([0x3c; 32]),
+            })
+        }
+        BlockApplyResult::Unavailable => {
+            BlockApplyOutcome::retryable(zakura_header_chain::TransientBodyFailure {
+                hash,
+                evidence,
+                kind: zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable,
+                availability: zakura_header_chain::BodyUnavailableSummary::default(),
+            })
+        }
+        BlockApplyResult::TimedOut => {
+            BlockApplyOutcome::retryable(zakura_header_chain::TransientBodyFailure {
+                hash,
+                evidence,
+                kind: zakura_header_chain::TransientBodyFailureKind::Timeout,
+                availability: zakura_header_chain::BodyUnavailableSummary::default(),
+            })
+        }
+    }
 }

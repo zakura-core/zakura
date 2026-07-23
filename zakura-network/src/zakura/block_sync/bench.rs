@@ -41,7 +41,7 @@ use crate::zakura::{
 };
 
 use super::{
-    events::{BlockApplyResult, BlockApplyToken, BlockSyncAction},
+    events::{BlockApplyOutcome, BlockApplyToken, BlockSyncAction},
     reactor::{bs_insert_height, bs_insert_u64},
     reorder::BufferedBlockBody,
     sequencer::Sequencer,
@@ -95,6 +95,8 @@ pub struct BenchBodyFeeder {
     body_input_bytes: Arc<AtomicU64>,
     body_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     bench_peer: ZakuraPeerId,
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
 }
 
 /// Drains the ordered `SubmitBlock`s the sequencer emits (the `&mut` side).
@@ -114,6 +116,8 @@ pub struct BenchCommitter {
     // (the rows the zakura-trace-plots skill consumes).
     trace: ZakuraTrace,
     finalized_height: block::Height,
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
     // The JSONL trace writer guard (when `trace_dir` was supplied). Flushed via
     // [`BenchCommitter::flush_trace`] so the trace tables are complete for review.
     trace_guard: Option<JsonlTraceGuard>,
@@ -145,6 +149,17 @@ pub fn spawn_bench_sequencer(
         verified_block_tip,
         verified_block_hash,
     };
+    let owner = zakura_header_chain::WorkScope {
+        state_version: zakura_header_chain::StateVersion::new(1),
+        header_generation: zakura_header_chain::HeaderGeneration::new(1),
+        verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(1)),
+        branch: zakura_header_chain::BranchId::new(verified_block_hash, block::Hash([0xb1; 32])),
+    }
+    .bind(
+        1,
+        std::num::NonZeroU64::new(1).expect("bench request ID is nonzero"),
+    );
+    let source = zakura_header_chain::SourceId::from_digest([0xb2; 32]);
     let limit = submit_in_flight_limit.max(1);
 
     // Real JSONL trace (same path as production) when a directory is supplied; the
@@ -194,6 +209,8 @@ pub fn spawn_bench_sequencer(
             body_input_decoded_attributed_memory_bytes: body_input_decoded_attributed_memory_bytes
                 .clone(),
             bench_peer: ZakuraPeerId::new(vec![0xB1; 32]).expect("32-byte bench peer id is valid"),
+            owner,
+            source,
         },
         submissions: BenchSubmissions {
             actions: actions_rx,
@@ -205,6 +222,8 @@ pub fn spawn_bench_sequencer(
             body_input_decoded_attributed_memory_bytes,
             trace,
             finalized_height,
+            owner,
+            source,
             trace_guard,
             _join: join,
         },
@@ -232,6 +251,8 @@ impl BenchBodyFeeder {
         let previous_block_hash = block.header.previous_block_hash;
         let body = BufferedBlockBody::from_decoded_block(block, None);
         let body = SequencedBody::new_queued(
+            self.owner,
+            self.source,
             height,
             hash,
             previous_block_hash,
@@ -252,7 +273,7 @@ impl BenchSubmissions {
     /// `None` once the action channel closes.
     pub async fn next_submit(&mut self) -> Option<BenchSubmit> {
         while let Some(action) = self.actions.recv().await {
-            if let BlockSyncAction::SubmitBlock { token, block } = action {
+            if let BlockSyncAction::SubmitBlock { token, block, .. } = action {
                 return Some(BenchSubmit { token, block });
             }
         }
@@ -275,10 +296,15 @@ impl BenchCommitter {
             verified_block_hash: hash,
         };
         let _ = self.control.send(SequencerControlInput::ApplyFinished {
+            owner: Box::new(self.owner),
+            source: self.source,
             token,
             height,
             hash,
-            result: BlockApplyResult::Committed,
+            outcome: BlockApplyOutcome::committed(zakura_header_chain::VerifiedBodyEvidence {
+                hash,
+                evidence: zakura_header_chain::EvidenceId::from_digest([0xb5; 32]),
+            }),
             local_frontier: Some(local_frontier),
         });
     }

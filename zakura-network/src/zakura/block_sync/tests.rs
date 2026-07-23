@@ -3920,12 +3920,12 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     let (token_1, block_1) = &initial_submissions[0];
     control_tx
         .send(SequencerControlInput::ApplyFinished {
-            owner: test_work_owner(),
+            owner: Box::new(test_work_owner()),
             source: zakura_header_chain::SourceId::from_digest([1; 32]),
             token: *token_1,
             height: block::Height(1),
             hash: block_1.hash(),
-            result: BlockApplyResult::Committed,
+            outcome: test_block_apply_outcome(BlockApplyResult::Committed),
             local_frontier: Some(BlockSyncFrontiers {
                 finalized_height: block::Height(0),
                 verified_block_tip: block::Height(3),
@@ -3950,12 +3950,12 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     ] {
         control_tx
             .send(SequencerControlInput::ApplyFinished {
-                owner: test_work_owner(),
+                owner: Box::new(test_work_owner()),
                 source: zakura_header_chain::SourceId::from_digest([1; 32]),
                 token: *token,
                 height,
                 hash: block.hash(),
-                result: BlockApplyResult::Committed,
+                outcome: test_block_apply_outcome(BlockApplyResult::Committed),
                 local_frontier: Some(BlockSyncFrontiers {
                     finalized_height: block::Height(0),
                     verified_block_tip: block::Height(3),
@@ -5755,7 +5755,7 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
             token: submit_token,
             height: block::Height(1),
             hash: blocks[0].hash(),
-            result: BlockApplyResult::Committed,
+            outcome: test_block_apply_outcome(BlockApplyResult::Committed),
             local_frontier: Some(BlockSyncFrontiers {
                 finalized_height: block::Height(0),
                 verified_block_tip: block::Height(1),
@@ -6289,7 +6289,7 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
             token: submit_token,
             height: block::Height(1),
             hash: blocks[0].hash(),
-            result: BlockApplyResult::Duplicate,
+            outcome: test_block_apply_outcome(BlockApplyResult::Duplicate),
             local_frontier: Some(BlockSyncFrontiers {
                 finalized_height: block::Height(0),
                 verified_block_tip: block::Height(0),
@@ -6821,7 +6821,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
             token: submitted[0].3,
             height: block::Height(1),
             hash: blocks[0].hash(),
-            result: BlockApplyResult::Committed,
+            outcome: test_block_apply_outcome(BlockApplyResult::Committed),
             local_frontier: Some(BlockSyncFrontiers {
                 finalized_height: block::Height(0),
                 verified_block_tip: block::Height(1),
@@ -6838,7 +6838,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
             token: submitted[1].3,
             height: block::Height(2),
             hash: blocks[1].hash(),
-            result: BlockApplyResult::Committed,
+            outcome: test_block_apply_outcome(BlockApplyResult::Committed),
             local_frontier: Some(BlockSyncFrontiers {
                 finalized_height: block::Height(0),
                 verified_block_tip: block::Height(2),
@@ -6981,7 +6981,7 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
             token: submit_token,
             height: block::Height(1),
             hash: block.hash(),
-            result: BlockApplyResult::Unavailable,
+            outcome: test_block_apply_outcome(BlockApplyResult::Unavailable),
             local_frontier: None,
         })
         .await
@@ -7224,7 +7224,7 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
             token,
             height: block::Height(1),
             hash: blocks[0].hash(),
-            result: BlockApplyResult::Committed,
+            outcome: test_block_apply_outcome(BlockApplyResult::Committed),
             local_frontier: None,
         })
         .await
@@ -8779,7 +8779,7 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
             token: successor_token,
             height: block::Height(3),
             hash: blocks[2].hash(),
-            result: BlockApplyResult::Committed,
+            outcome: test_block_apply_outcome(BlockApplyResult::Committed),
             local_frontier: None,
         })
         .await
@@ -9355,7 +9355,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
             token: stale_token,
             height: block::Height(1),
             hash: block_hash,
-            result: BlockApplyResult::Duplicate,
+            outcome: test_block_apply_outcome(BlockApplyResult::Duplicate),
             local_frontier: None,
         })
         .await
@@ -9381,7 +9381,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
             token: current_token,
             height: block::Height(1),
             hash: block_hash,
-            result: BlockApplyResult::Duplicate,
+            outcome: test_block_apply_outcome(BlockApplyResult::Duplicate),
             local_frontier: None,
         })
         .await
@@ -9393,7 +9393,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
             token: current_token,
             height: block::Height(1),
             hash: block_hash,
-            result: BlockApplyResult::Duplicate,
+            outcome: test_block_apply_outcome(BlockApplyResult::Duplicate),
             local_frontier: None,
         })
         .await
@@ -9413,7 +9413,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
             token: current_token,
             height: block::Height(1),
             hash: block_hash,
-            result: BlockApplyResult::Committed,
+            outcome: test_block_apply_outcome(BlockApplyResult::Committed),
             local_frontier: None,
         })
         .await
@@ -10604,7 +10604,7 @@ async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
             token: submit_token,
             height: block::Height(1),
             hash: blocks[0].hash(),
-            result: BlockApplyResult::Rejected,
+            outcome: test_block_apply_outcome(BlockApplyResult::Rejected),
             local_frontier: None,
         })
         .await
@@ -12981,7 +12981,7 @@ async fn reactor_ignores_duplicate_response_at_body_download_floor() {
             token,
             height: block::Height(2),
             hash,
-            result: BlockApplyResult::Committed,
+            outcome: test_block_apply_outcome(BlockApplyResult::Committed),
             local_frontier: None,
         })
         .await
@@ -13110,7 +13110,7 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
             token,
             height: block::Height(2),
             hash,
-            result: BlockApplyResult::Committed,
+            outcome: test_block_apply_outcome(BlockApplyResult::Committed),
             local_frontier: None,
         })
         .await

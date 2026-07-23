@@ -164,12 +164,12 @@ pub(super) enum SequencerControlInput {
     },
     /// A verifier apply completion.
     ApplyFinished {
-        owner: zakura_header_chain::WorkOwner,
+        owner: Box<zakura_header_chain::WorkOwner>,
         source: zakura_header_chain::SourceId,
         token: BlockApplyToken,
         height: block::Height,
         hash: block::Hash,
-        result: BlockApplyResult,
+        outcome: BlockApplyOutcome,
         local_frontier: Option<BlockSyncFrontiers>,
     },
 }
@@ -406,17 +406,17 @@ impl SequencerTask {
                 token,
                 height,
                 hash,
-                result,
+                outcome,
                 local_frontier,
             } => {
                 let needs_reaction = self
                     .handle_apply_finished(
-                        owner,
+                        *owner,
                         source,
                         token,
                         height,
                         hash,
-                        result,
+                        outcome,
                         local_frontier,
                     )
                     .await;
@@ -588,9 +588,10 @@ impl SequencerTask {
         token: BlockApplyToken,
         height: block::Height,
         hash: block::Hash,
-        result: BlockApplyResult,
+        outcome: BlockApplyOutcome,
         local_frontier: Option<BlockSyncFrontiers>,
     ) -> bool {
+        let result = outcome.result();
         // A stale completion (no live applying entry, or token/hash mismatch)
         // releases only its exact token-aware in-flight-submission charge and
         // returns; there is no query/schedule tail here, so it needs no reaction.

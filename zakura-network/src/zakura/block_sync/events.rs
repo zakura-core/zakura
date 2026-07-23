@@ -63,8 +63,8 @@ pub enum BlockSyncEvent {
         height: block::Height,
         /// Submitted block hash.
         hash: block::Hash,
-        /// Apply result from the verifier driver.
-        result: BlockApplyResult,
+        /// Typed, evidence-bearing verifier outcome.
+        outcome: BlockApplyOutcome,
         /// Locally observed chain frontier after the apply attempt completed.
         local_frontier: Option<BlockSyncFrontiers>,
     },
@@ -105,6 +105,113 @@ pub enum BlockApplyResult {
     Unavailable,
     /// The verifier did not answer before the driver timeout.
     TimedOut,
+}
+
+/// Typed body-verification outcome retained across the driver boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockApplyOutcome {
+    verification: Box<zakura_header_chain::BodyVerificationOutcome>,
+    duplicate: bool,
+}
+
+impl BlockApplyOutcome {
+    /// A body newly accepted by full state.
+    pub fn committed(evidence: zakura_header_chain::VerifiedBodyEvidence) -> Self {
+        Self {
+            verification: Box::new(zakura_header_chain::BodyVerificationOutcome::Verified(
+                evidence,
+            )),
+            duplicate: false,
+        }
+    }
+
+    /// A body already accepted by full state.
+    pub fn duplicate(evidence: zakura_header_chain::VerifiedBodyEvidence) -> Self {
+        Self {
+            verification: Box::new(zakura_header_chain::BodyVerificationOutcome::Verified(
+                evidence,
+            )),
+            duplicate: true,
+        }
+    }
+
+    /// A supplier-attributed body/header commitment mismatch.
+    pub fn payload_mismatch(evidence: zakura_header_chain::BodyPayloadMismatch) -> Self {
+        Self {
+            verification: Box::new(
+                zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(evidence),
+            ),
+            duplicate: false,
+        }
+    }
+
+    /// A commitment-matching deterministic consensus failure.
+    pub fn consensus_invalid(evidence: zakura_header_chain::ConsensusBodyInvalid) -> Self {
+        Self {
+            verification: Box::new(
+                zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(evidence),
+            ),
+            duplicate: false,
+        }
+    }
+
+    /// A verification attempt that did not reach a durable conclusion.
+    pub fn retryable(evidence: zakura_header_chain::TransientBodyFailure) -> Self {
+        Self {
+            verification: Box::new(zakura_header_chain::BodyVerificationOutcome::Retryable(
+                evidence,
+            )),
+            duplicate: false,
+        }
+    }
+
+    /// Canonical typed verification evidence.
+    pub fn verification(&self) -> &zakura_header_chain::BodyVerificationOutcome {
+        self.verification.as_ref()
+    }
+
+    /// Consume this wrapper and return canonical typed verification evidence.
+    pub fn into_verification(self) -> zakura_header_chain::BodyVerificationOutcome {
+        *self.verification
+    }
+
+    /// Stable evidence identity for this exact outcome.
+    pub fn evidence(&self) -> zakura_header_chain::EvidenceId {
+        match self.verification.as_ref() {
+            zakura_header_chain::BodyVerificationOutcome::Verified(evidence) => evidence.evidence,
+            zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(evidence) => {
+                evidence.evidence
+            }
+            zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(evidence) => {
+                evidence.evidence
+            }
+            zakura_header_chain::BodyVerificationOutcome::Retryable(evidence) => evidence.evidence,
+        }
+    }
+
+    /// Coarse scheduling disposition derived without losing the typed outcome.
+    pub fn result(&self) -> BlockApplyResult {
+        match self.verification.as_ref() {
+            zakura_header_chain::BodyVerificationOutcome::Verified(_) if self.duplicate => {
+                BlockApplyResult::Duplicate
+            }
+            zakura_header_chain::BodyVerificationOutcome::Verified(_) => {
+                BlockApplyResult::Committed
+            }
+            zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(_)
+            | zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(_) => {
+                BlockApplyResult::Rejected
+            }
+            zakura_header_chain::BodyVerificationOutcome::Retryable(evidence)
+                if evidence.kind == zakura_header_chain::TransientBodyFailureKind::Timeout =>
+            {
+                BlockApplyResult::TimedOut
+            }
+            zakura_header_chain::BodyVerificationOutcome::Retryable(_) => {
+                BlockApplyResult::Unavailable
+            }
+        }
+    }
 }
 
 /// Monotonic token assigned by the reactor to each verifier submission.

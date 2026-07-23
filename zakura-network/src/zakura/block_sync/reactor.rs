@@ -537,7 +537,7 @@ impl BlockSyncReactor {
                 token,
                 height,
                 hash,
-                result,
+                outcome,
                 local_frontier,
             } => {
                 self.handle_block_apply_finished(
@@ -546,7 +546,7 @@ impl BlockSyncReactor {
                     token,
                     height,
                     hash,
-                    result,
+                    outcome,
                     local_frontier,
                 )
                 .await
@@ -1257,7 +1257,7 @@ impl BlockSyncReactor {
         token: BlockApplyToken,
         height: block::Height,
         hash: block::Hash,
-        result: BlockApplyResult,
+        outcome: BlockApplyOutcome,
         local_frontier: Option<BlockSyncFrontiers>,
     ) {
         // The whole commit-pipeline body (token validate, embedded local-frontier
@@ -1265,19 +1265,24 @@ impl BlockSyncReactor {
         // drain + submit) runs on the Sequencer task. The reactor
         // forwards the completion and reacts to the resulting progress view
         // (serving/status/query/schedule) on the `view` arm.
-        self.trace_apply_finished(height, token, result, self.state.budget.reserved());
+        self.trace_apply_finished(
+            height,
+            token,
+            outcome.result(),
+            self.state.budget.reserved(),
+        );
         let capacity = self.sequencer_input.capacity();
         let max_capacity = self.sequencer_input.max_capacity();
         let started = Instant::now();
         let send_result = self
             .sequencer_control
             .send(SequencerControlInput::ApplyFinished {
-                owner,
+                owner: Box::new(owner),
                 source,
                 token,
                 height,
                 hash,
-                result,
+                outcome,
                 local_frontier,
             });
         self.trace_sequencer_control_send(
@@ -2457,7 +2462,7 @@ impl BlockSyncReactor {
                 token,
                 height,
                 hash,
-                result,
+                outcome,
                 local_frontier,
                 ..
             } => {
@@ -2465,7 +2470,11 @@ impl BlockSyncReactor {
                 bs_insert_u64(row, bs_trace::APPLY_TOKEN, *token);
                 bs_insert_height(row, bs_trace::HEIGHT, *height);
                 bs_insert_hash(row, bs_trace::HASH, *hash);
-                bs_insert_str(row, bs_trace::RESULT, block_apply_result_label(*result));
+                bs_insert_str(
+                    row,
+                    bs_trace::RESULT,
+                    block_apply_result_label(outcome.result()),
+                );
                 if let Some(frontiers) = local_frontier {
                     bs_insert_frontiers(row, frontiers);
                 }

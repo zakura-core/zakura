@@ -433,7 +433,9 @@ mod tests {
                                 token,
                                 height,
                                 hash: block.hash(),
-                                result: BlockApplyResult::Committed,
+                                outcome: crate::zakura::block_sync::test_block_apply_outcome(
+                                    BlockApplyResult::Committed,
+                                ),
                                 local_frontier: Some(BlockSyncFrontiers {
                                     finalized_height: height,
                                     verified_block_tip: height,

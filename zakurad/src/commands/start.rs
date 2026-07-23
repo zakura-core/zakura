@@ -1826,7 +1826,7 @@ mod zakura_header_sync_driver_tests {
                         && row
                             .get(cs_trace::RESULT)
                             .and_then(serde_json::Value::as_str)
-                            == Some("timed_out")
+                            == Some("unavailable")
                         && row
                             .get(cs_trace::LOCAL_FRONTIER)
                             .and_then(serde_json::Value::as_bool)
@@ -1936,6 +1936,8 @@ mod zakura_header_sync_driver_tests {
     #[tokio::test]
     async fn block_commit_maps_unknown_local_errors_to_unavailable() {
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let owner = test_block_work_owner();
+        let source = test_block_source();
         let unavailable = service_fn(|request: zakura_consensus::Request| async move {
             match request {
                 zakura_consensus::Request::Commit(_) => {
@@ -1946,10 +1948,23 @@ mod zakura_header_sync_driver_tests {
                 request => panic!("unexpected consensus request: {request:?}"),
             }
         });
-        assert_eq!(
-            commit_block_sync_body(unavailable, block.clone(), BlockApplyClass::Full).await,
-            BlockApplyResult::Unavailable
-        );
+        let unavailable_outcome = commit_block_sync_body(
+            unavailable,
+            owner,
+            source,
+            block.clone(),
+            BlockApplyClass::Full,
+        )
+        .await;
+        assert!(matches!(
+            unavailable_outcome.verification(),
+            zakura_header_chain::BodyVerificationOutcome::Retryable(
+                zakura_header_chain::TransientBodyFailure {
+                    kind: zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable,
+                    ..
+                }
+            )
+        ));
 
         let invalid = service_fn(|request: zakura_consensus::Request| async move {
             match request {
@@ -1963,10 +1978,15 @@ mod zakura_header_sync_driver_tests {
                 request => panic!("unexpected consensus request: {request:?}"),
             }
         });
-        assert_eq!(
-            commit_block_sync_body(invalid, block, BlockApplyClass::Full).await,
-            BlockApplyResult::Rejected
-        );
+        let invalid_outcome =
+            commit_block_sync_body(invalid, owner, source, block, BlockApplyClass::Full).await;
+        assert!(matches!(
+            invalid_outcome.verification(),
+            zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(
+                zakura_header_chain::ConsensusBodyInvalid { rule, .. }
+            )
+                if rule == &zakura_header_chain::BodyRuleId::new("block.no_transactions")
+        ));
     }
 
     #[test]
@@ -3763,7 +3783,7 @@ mod zakura_header_sync_driver_tests {
 
         assert_eq!(height, block_height);
         assert_eq!(hash, block_hash);
-        assert_eq!(result, BlockApplyResult::TimedOut);
+        assert_eq!(result, BlockApplyResult::Unavailable);
         assert!(matches!(
             event,
             BlockSyncEvent::BlockApplyFinished {
@@ -3772,12 +3792,21 @@ mod zakura_header_sync_driver_tests {
                 token: 99,
                 height,
                 hash,
-                result: BlockApplyResult::TimedOut,
+                outcome: event_outcome,
                 local_frontier: None,
             } if event_owner == owner
                 && event_source == source
                 && height == block_height
                 && hash == block_hash
+                && matches!(
+                    event_outcome.verification(),
+                    zakura_header_chain::BodyVerificationOutcome::Retryable(
+                        zakura_header_chain::TransientBodyFailure {
+                            kind: zakura_header_chain::TransientBodyFailureKind::Canceled,
+                            ..
+                        }
+                    )
+                )
         ));
     }
 
@@ -3808,7 +3837,15 @@ mod zakura_header_sync_driver_tests {
         // A full-class commit gives up after the driver timeout. (`verifier` is
         // a capture-free `service_fn`, so it is `Copy` and reused below as-is.)
         assert_eq!(
-            commit_block_sync_body(verifier, block.clone(), BlockApplyClass::Full).await,
+            commit_block_sync_body(
+                verifier,
+                test_block_work_owner(),
+                test_block_source(),
+                block.clone(),
+                BlockApplyClass::Full,
+            )
+            .await
+            .result(),
             BlockApplyResult::TimedOut,
             "full commit should time out when the verifier never answers"
         );
@@ -3820,7 +3857,13 @@ mod zakura_header_sync_driver_tests {
         // timeout fired.
         let waited = tokio::time::timeout(
             ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT * 4,
-            commit_block_sync_body(verifier, block, BlockApplyClass::Checkpoint),
+            commit_block_sync_body(
+                verifier,
+                test_block_work_owner(),
+                test_block_source(),
+                block,
+                BlockApplyClass::Checkpoint,
+            ),
         )
         .await;
         assert!(

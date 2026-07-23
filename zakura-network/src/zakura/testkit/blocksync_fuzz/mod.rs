@@ -305,7 +305,9 @@ fn spawn_action_driver(
                             token,
                             height,
                             hash: block.hash(),
-                            result: outcome.result,
+                            outcome: crate::zakura::block_sync::test_block_apply_outcome(
+                                outcome.result,
+                            ),
                             local_frontier: Some(outcome.frontiers),
                         })
                         .await

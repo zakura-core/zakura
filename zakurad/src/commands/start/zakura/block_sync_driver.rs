@@ -10,6 +10,7 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
     FutureExt,
 };
+use sha2::{Digest, Sha256};
 use tokio::time::Instant as TokioInstant;
 use tokio::{pin, select, sync::mpsc};
 use tower::{Service, ServiceExt};
@@ -17,9 +18,9 @@ use tracing::{debug, warn};
 
 use zakura_chain::{block, chain_tip::ChainTip};
 use zakura_network::zakura::{
-    commit_state_trace as cs_trace, BlockApplyResult, BlockApplyToken, BlockSizeEstimate,
-    BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncHandle, BlockSyncMisbehavior,
-    Frontier, FrontierChange, ZakuraEndpoint, ZakuraTrace,
+    commit_state_trace as cs_trace, BlockApplyOutcome, BlockApplyResult, BlockApplyToken,
+    BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncHandle,
+    BlockSyncMisbehavior, Frontier, FrontierChange, ZakuraEndpoint, ZakuraTrace,
 };
 
 use crate::components::sync;
@@ -628,7 +629,13 @@ pub(crate) fn abandoned_block_apply_finished_event(
 ) -> Option<(block::Height, block::Hash, BlockApplyResult, BlockSyncEvent)> {
     let height = block.coinbase_height()?;
     let hash = block.hash();
-    let result = BlockApplyResult::TimedOut;
+    let outcome = retryable_body_outcome(
+        owner,
+        source,
+        hash,
+        zakura_header_chain::TransientBodyFailureKind::Canceled,
+    );
+    let result = outcome.result();
 
     Some((
         height,
@@ -640,7 +647,7 @@ pub(crate) fn abandoned_block_apply_finished_event(
             token,
             height,
             hash,
-            result,
+            outcome,
             local_frontier: None,
         },
     ))
@@ -1152,14 +1159,22 @@ where
     // Throughput-probe mode (debug only): skip consensus verify+commit and
     // advance an in-memory synthetic frontier instead, discarding the body. In
     // normal mode the frontier comes from re-reading committed state below.
-    let (result, probe_frontier) = match throughput_probe.as_ref() {
-        Some(probe) => probe.apply_block(block.as_ref()),
+    let (outcome, probe_frontier) = match throughput_probe.as_ref() {
+        Some(probe) => {
+            let (result, frontier) = probe.apply_block(block.as_ref());
+            (
+                probe_body_outcome(owner, source, expected_hash, result),
+                frontier,
+            )
+        }
         None => (
             commit_block_sync_body_with_stall_trace(
                 block_verifier.clone(),
                 block,
                 class,
                 &trace,
+                owner,
+                source,
                 token,
                 height,
                 expected_hash,
@@ -1168,6 +1183,7 @@ where
             None,
         ),
     };
+    let result = outcome.result();
     emit_commit_state(
         &trace,
         cs_trace::COMMIT_FINISH,
@@ -1227,7 +1243,7 @@ where
         token,
         height,
         hash: expected_hash,
-        result,
+        outcome,
         local_frontier,
     });
     emit_commit_state(
@@ -1262,9 +1278,11 @@ where
 #[cfg(test)]
 pub(crate) async fn commit_block_sync_body<BlockVerifier>(
     block_verifier: BlockVerifier,
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
     block: Arc<block::Block>,
     class: BlockApplyClass,
-) -> BlockApplyResult
+) -> BlockApplyOutcome
 where
     BlockVerifier:
         Service<zakura_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
@@ -1277,11 +1295,13 @@ where
         .clone()
         .oneshot(zakura_consensus::Request::Commit(block));
     match class {
-        BlockApplyClass::Checkpoint => block_commit_result(height, expected_hash, commit.await),
+        BlockApplyClass::Checkpoint => {
+            block_commit_outcome(owner, source, height, expected_hash, commit.await)
+        }
         BlockApplyClass::Full => {
             match tokio::time::timeout(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, commit).await {
-                Ok(outcome) => block_commit_result(height, expected_hash, outcome),
-                Err(_elapsed) => block_commit_timed_out(height, expected_hash),
+                Ok(outcome) => block_commit_outcome(owner, source, height, expected_hash, outcome),
+                Err(_elapsed) => block_commit_timed_out(owner, source, height, expected_hash),
             }
         }
     }
@@ -1293,10 +1313,12 @@ async fn commit_block_sync_body_with_stall_trace<BlockVerifier>(
     block: Arc<block::Block>,
     class: BlockApplyClass,
     trace: &ZakuraTrace,
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
     height: block::Height,
     expected_hash: block::Hash,
-) -> BlockApplyResult
+) -> BlockApplyOutcome
 where
     BlockVerifier:
         Service<zakura_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
@@ -1311,7 +1333,7 @@ where
         BlockApplyClass::Checkpoint => {
             tokio::pin!(commit);
             tokio::select! {
-                outcome = &mut commit => block_commit_result(Some(height), expected_hash, outcome),
+                outcome = &mut commit => block_commit_outcome(owner, source, Some(height), expected_hash, outcome),
                 _ = tokio::time::sleep(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT) => {
                     emit_commit_state(
                         trace,
@@ -1329,24 +1351,28 @@ where
                             );
                         },
                     );
-                    block_commit_result(Some(height), expected_hash, commit.await)
+                    block_commit_outcome(owner, source, Some(height), expected_hash, commit.await)
                 }
             }
         }
         BlockApplyClass::Full => {
             match tokio::time::timeout(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, commit).await {
-                Ok(outcome) => block_commit_result(Some(height), expected_hash, outcome),
-                Err(_elapsed) => block_commit_timed_out(Some(height), expected_hash),
+                Ok(outcome) => {
+                    block_commit_outcome(owner, source, Some(height), expected_hash, outcome)
+                }
+                Err(_elapsed) => block_commit_timed_out(owner, source, Some(height), expected_hash),
             }
         }
     }
 }
 
-fn block_commit_result<E>(
+fn block_commit_outcome<E>(
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
     height: Option<block::Height>,
     expected_hash: block::Hash,
     outcome: Result<block::Hash, E>,
-) -> BlockApplyResult
+) -> BlockApplyOutcome
 where
     E: std::fmt::Debug + Send + Sync + 'static,
 {
@@ -1357,7 +1383,10 @@ where
                 ?committed_hash,
                 "Zakura block sync committed block body through verifier"
             );
-            BlockApplyResult::Committed
+            BlockApplyOutcome::committed(zakura_header_chain::VerifiedBodyEvidence {
+                hash: expected_hash,
+                evidence: body_outcome_evidence(b"committed", owner, source, expected_hash, &[]),
+            })
         }
         Ok(committed_hash) => {
             warn!(
@@ -1366,7 +1395,18 @@ where
                 ?committed_hash,
                 "Zakura block-sync verifier returned an unexpected hash"
             );
-            BlockApplyResult::Rejected
+            BlockApplyOutcome::retryable(zakura_header_chain::TransientBodyFailure {
+                hash: expected_hash,
+                evidence: body_outcome_evidence(
+                    b"verifier-unexpected-hash",
+                    owner,
+                    source,
+                    expected_hash,
+                    &committed_hash.0,
+                ),
+                kind: zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable,
+                availability: zakura_header_chain::BodyUnavailableSummary::default(),
+            })
         }
         Err(error) => {
             use zakura_header_chain::BodyVerificationClass;
@@ -1380,25 +1420,199 @@ where
                 "Zakura block-sync verifier classified a body result"
             );
             match class {
-                BodyVerificationClass::Duplicate => BlockApplyResult::Duplicate,
-                BodyVerificationClass::PayloadMismatch(_)
-                | BodyVerificationClass::ConsensusInvalid(_) => BlockApplyResult::Rejected,
-                BodyVerificationClass::Retryable(_) => BlockApplyResult::Unavailable,
+                BodyVerificationClass::Duplicate => {
+                    BlockApplyOutcome::duplicate(zakura_header_chain::VerifiedBodyEvidence {
+                        hash: expected_hash,
+                        evidence: body_outcome_evidence(
+                            b"duplicate",
+                            owner,
+                            source,
+                            expected_hash,
+                            &[],
+                        ),
+                    })
+                }
+                BodyVerificationClass::PayloadMismatch(kind) => {
+                    BlockApplyOutcome::payload_mismatch(zakura_header_chain::BodyPayloadMismatch {
+                        evidence: body_outcome_evidence(
+                            b"payload-mismatch",
+                            owner,
+                            source,
+                            expected_hash,
+                            body_commitment_kind_label(kind).as_bytes(),
+                        ),
+                        requested: expected_hash,
+                        delivered: expected_hash,
+                        kind,
+                        source,
+                    })
+                }
+                BodyVerificationClass::ConsensusInvalid(rule) => {
+                    BlockApplyOutcome::consensus_invalid(
+                        zakura_header_chain::ConsensusBodyInvalid {
+                            hash: expected_hash,
+                            evidence: intrinsic_body_invalid_evidence(expected_hash, &rule),
+                            rule,
+                            source,
+                        },
+                    )
+                }
+                BodyVerificationClass::Retryable(kind) => {
+                    retryable_body_outcome(owner, source, expected_hash, kind)
+                }
             }
         }
     }
 }
 
 fn block_commit_timed_out(
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
     height: Option<block::Height>,
     expected_hash: block::Hash,
-) -> BlockApplyResult {
+) -> BlockApplyOutcome {
     warn!(
         ?height,
         ?expected_hash,
         "timed out committing Zakura block-sync body"
     );
-    BlockApplyResult::TimedOut
+    retryable_body_outcome(
+        owner,
+        source,
+        expected_hash,
+        zakura_header_chain::TransientBodyFailureKind::Timeout,
+    )
+}
+
+fn retryable_body_outcome(
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
+    hash: block::Hash,
+    kind: zakura_header_chain::TransientBodyFailureKind,
+) -> BlockApplyOutcome {
+    BlockApplyOutcome::retryable(zakura_header_chain::TransientBodyFailure {
+        hash,
+        evidence: body_outcome_evidence(
+            b"retryable",
+            owner,
+            source,
+            hash,
+            transient_failure_kind_label(kind).as_bytes(),
+        ),
+        kind,
+        availability: zakura_header_chain::BodyUnavailableSummary::default(),
+    })
+}
+
+fn probe_body_outcome(
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
+    hash: block::Hash,
+    result: BlockApplyResult,
+) -> BlockApplyOutcome {
+    match result {
+        BlockApplyResult::Committed => {
+            BlockApplyOutcome::committed(zakura_header_chain::VerifiedBodyEvidence {
+                hash,
+                evidence: body_outcome_evidence(b"probe-committed", owner, source, hash, &[]),
+            })
+        }
+        BlockApplyResult::Duplicate => {
+            BlockApplyOutcome::duplicate(zakura_header_chain::VerifiedBodyEvidence {
+                hash,
+                evidence: body_outcome_evidence(b"probe-duplicate", owner, source, hash, &[]),
+            })
+        }
+        BlockApplyResult::Rejected => retryable_body_outcome(
+            owner,
+            source,
+            hash,
+            zakura_header_chain::TransientBodyFailureKind::MissingContext,
+        ),
+        BlockApplyResult::Unavailable => retryable_body_outcome(
+            owner,
+            source,
+            hash,
+            zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable,
+        ),
+        BlockApplyResult::TimedOut => retryable_body_outcome(
+            owner,
+            source,
+            hash,
+            zakura_header_chain::TransientBodyFailureKind::Timeout,
+        ),
+    }
+}
+
+fn body_outcome_evidence(
+    kind: &[u8],
+    owner: zakura_header_chain::WorkOwner,
+    source: zakura_header_chain::SourceId,
+    hash: block::Hash,
+    detail: &[u8],
+) -> zakura_header_chain::EvidenceId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-body-apply-outcome-v1");
+    hash_bytes(&mut hasher, kind);
+    hasher.update(owner.state_version.get().to_le_bytes());
+    hasher.update(owner.header_generation.get().to_le_bytes());
+    match owner.verified_generation {
+        Some(generation) => {
+            hasher.update([1]);
+            hasher.update(generation.get().to_le_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update(owner.branch.anchor_hash.0);
+    hasher.update(owner.branch.target_tip_hash.0);
+    hasher.update(owner.session_id.to_le_bytes());
+    hasher.update(owner.request_id.get().to_le_bytes());
+    hasher.update(source.digest());
+    hasher.update(hash.0);
+    hash_bytes(&mut hasher, detail);
+    zakura_header_chain::EvidenceId::from_digest(hasher.finalize().into())
+}
+
+fn intrinsic_body_invalid_evidence(
+    hash: block::Hash,
+    rule: &zakura_header_chain::BodyRuleId,
+) -> zakura_header_chain::EvidenceId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-consensus-body-invalid-v1");
+    hasher.update(hash.0);
+    hash_bytes(&mut hasher, rule.as_str().as_bytes());
+    zakura_header_chain::EvidenceId::from_digest(hasher.finalize().into())
+}
+
+fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    let length = u64::try_from(bytes.len())
+        .expect("slice length fits in u64 on every supported Zakura target");
+    hasher.update(length.to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn body_commitment_kind_label(kind: zakura_header_chain::BodyCommitmentKind) -> &'static str {
+    match kind {
+        zakura_header_chain::BodyCommitmentKind::HeaderHash => "header_hash",
+        zakura_header_chain::BodyCommitmentKind::TransactionMerkleRoot => "transaction_merkle_root",
+        zakura_header_chain::BodyCommitmentKind::AuthDataRoot => "auth_data_root",
+        zakura_header_chain::BodyCommitmentKind::Other(label) => label,
+    }
+}
+
+fn transient_failure_kind_label(
+    kind: zakura_header_chain::TransientBodyFailureKind,
+) -> &'static str {
+    match kind {
+        zakura_header_chain::TransientBodyFailureKind::MissingContext => "missing_context",
+        zakura_header_chain::TransientBodyFailureKind::Canceled => "canceled",
+        zakura_header_chain::TransientBodyFailureKind::Storage => "storage",
+        zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable => {
+            "verifier_unavailable"
+        }
+        zakura_header_chain::TransientBodyFailureKind::Timeout => "timeout",
+        zakura_header_chain::TransientBodyFailureKind::ResourceExhausted => "resource_exhausted",
+    }
 }
 
 async fn refresh_block_sync_frontiers_for_checkpoint_window<ReadState>(
@@ -1727,6 +1941,108 @@ mod tests {
     }
 
     #[test]
+    fn body_apply_evidence_is_canonical_or_attempt_scoped_by_outcome_kind() {
+        let owner = test_owner();
+        let source = test_source();
+        let hash = block::Hash([3; 32]);
+        let detail = b"storage";
+
+        let attempt = body_outcome_evidence(b"retryable", owner, source, hash, detail);
+        assert_eq!(
+            attempt,
+            body_outcome_evidence(b"retryable", owner, source, hash, detail),
+            "the same attempt and result must produce stable evidence"
+        );
+
+        let mut other_owner = owner;
+        other_owner.request_id = std::num::NonZeroU64::new(2).expect("test request ID is nonzero");
+        assert_ne!(
+            attempt,
+            body_outcome_evidence(b"retryable", other_owner, source, hash, detail),
+            "different requests must not share transient-attempt evidence"
+        );
+        assert_ne!(
+            attempt,
+            body_outcome_evidence(
+                b"retryable",
+                owner,
+                zakura_header_chain::SourceId::from_digest([4; 32]),
+                hash,
+                detail,
+            ),
+            "different suppliers must not share transient-attempt evidence"
+        );
+
+        let rule = zakura_header_chain::BodyRuleId::new("block.no_transactions");
+        assert_eq!(
+            intrinsic_body_invalid_evidence(hash, &rule),
+            intrinsic_body_invalid_evidence(hash, &rule),
+            "intrinsic invalidity must be independent of delivery order and supplier"
+        );
+        assert_ne!(
+            intrinsic_body_invalid_evidence(hash, &rule),
+            intrinsic_body_invalid_evidence(
+                hash,
+                &zakura_header_chain::BodyRuleId::new("block.bad_coinbase"),
+            ),
+            "different consensus rules must not share evidence"
+        );
+
+        let invalid = || zakura_consensus::VerifyBlockError::Block {
+            source: zakura_consensus::BlockError::NoTransactions,
+        };
+        let first_invalid =
+            block_commit_outcome(owner, source, None, hash, Err::<block::Hash, _>(invalid()));
+        let second_source = zakura_header_chain::SourceId::from_digest([4; 32]);
+        let second_invalid = block_commit_outcome(
+            other_owner,
+            second_source,
+            None,
+            hash,
+            Err::<block::Hash, _>(invalid()),
+        );
+        assert_eq!(
+            first_invalid.evidence(),
+            second_invalid.evidence(),
+            "intrinsic consensus evidence must not depend on request or supplier"
+        );
+        assert!(matches!(
+            second_invalid.verification(),
+            zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(
+                zakura_header_chain::ConsensusBodyInvalid {
+                    source: actual_source,
+                    ..
+                }
+            ) if *actual_source == second_source
+        ));
+    }
+
+    #[test]
+    fn unexpected_verifier_hash_is_retryable_without_supplier_blame() {
+        let expected_hash = block::Hash([5; 32]);
+        let delivered_hash = block::Hash([6; 32]);
+        let outcome = block_commit_outcome::<std::convert::Infallible>(
+            test_owner(),
+            test_source(),
+            None,
+            expected_hash,
+            Ok(delivered_hash),
+        );
+
+        assert!(matches!(
+            outcome.verification(),
+            zakura_header_chain::BodyVerificationOutcome::Retryable(
+                zakura_header_chain::TransientBodyFailure {
+                    hash,
+                    kind: zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable,
+                    ..
+                }
+            ) if *hash == expected_hash
+        ));
+        assert_eq!(outcome.result(), BlockApplyResult::Unavailable);
+    }
+
+    #[test]
     fn abandoned_pending_apply_events_drain_queued_blocks() {
         let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
@@ -1759,42 +2075,60 @@ mod tests {
         );
         assert_eq!(events.len(), 2);
         assert!(matches!(
-            events[0],
+            &events[0],
             (
                 height,
                 hash,
-                BlockApplyResult::TimedOut,
+                BlockApplyResult::Unavailable,
                 BlockSyncEvent::BlockApplyFinished {
                     token: 11,
                     height: event_height,
                     hash: event_hash,
-                    result: BlockApplyResult::TimedOut,
+                    outcome,
                     local_frontier: None,
                     ..
                 },
-            ) if height == block1_height
-                && hash == block1_hash
-                && event_height == block1_height
-                && event_hash == block1_hash
+            ) if *height == block1_height
+                && *hash == block1_hash
+                && *event_height == block1_height
+                && *event_hash == block1_hash
+                && matches!(
+                    outcome.verification(),
+                    zakura_header_chain::BodyVerificationOutcome::Retryable(
+                        zakura_header_chain::TransientBodyFailure {
+                            kind: zakura_header_chain::TransientBodyFailureKind::Canceled,
+                            ..
+                        }
+                    )
+                )
         ));
         assert!(matches!(
-            events[1],
+            &events[1],
             (
                 height,
                 hash,
-                BlockApplyResult::TimedOut,
+                BlockApplyResult::Unavailable,
                 BlockSyncEvent::BlockApplyFinished {
                     token: 12,
                     height: event_height,
                     hash: event_hash,
-                    result: BlockApplyResult::TimedOut,
+                    outcome,
                     local_frontier: None,
                     ..
                 },
-            ) if height == block2_height
-                && hash == block2_hash
-                && event_height == block2_height
-                && event_hash == block2_hash
+            ) if *height == block2_height
+                && *hash == block2_hash
+                && *event_height == block2_height
+                && *event_hash == block2_hash
+                && matches!(
+                    outcome.verification(),
+                    zakura_header_chain::BodyVerificationOutcome::Retryable(
+                        zakura_header_chain::TransientBodyFailure {
+                            kind: zakura_header_chain::TransientBodyFailureKind::Canceled,
+                            ..
+                        }
+                    )
+                )
         ));
     }
 }

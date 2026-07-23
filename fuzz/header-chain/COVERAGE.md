@@ -31,7 +31,7 @@ the remaining gap. Fuzzer reachability alone is not requirement coverage.
 | Advertise / start / page / prepare / complete | `PeerWorkQueue`, response predicates, `CompletionGate` | LC-WIRE-03..05, LC-WORK-01..03 | exact/wrong-target/wrong-ancestry corpus | Covered |
 | Disconnect | Exact source/owner retirement | LC-WORK-02..03 | `disconnected_held_completion` | Covered |
 | Hold/release network completion | Pending-owner retirement and gate | LC-WORK-02, LC-GEN-03 | held/stale corpus and AUD-05 | Covered |
-| Hold/release state success/failure | Applying phase and gate | LC-TXN-01, LC-GEN-03 | AUD-06, AUD-07 | Covered at the queue/gate boundary; direct reactor assertions remain open |
+| Hold/release state success/failure | Applying phase, gate, and live reactor snapshot retirement | LC-TXN-01, LC-GEN-03 | AUD-06, AUD-07 | Covered: modeled probes and the actual reactor both reject delayed success/failure after the committed replacement snapshot with no action or publication |
 | Corrupt advisory | Discovery/removal without local authority mutation | LC-WIRE-04, LC-ERR-02 | `corrupt_advisory` | Covered |
 | Seventeen pursuits | Staged-target cap and priority replacement | LC-RETAIN-04, LC-WIRE-04 | `seventeen_pursuits` | Covered |
 | Coverage after reset | Production `CoverageMap` | LC-GEN-03, LC-WORK-03 | AUD-08 | Covered outside the byte target |

@@ -27,12 +27,26 @@ const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
 
 /// Spawn the canonical header-sync reactor.
 pub fn spawn_header_sync_reactor(
-    mut startup: HeaderSyncStartup,
+    startup: HeaderSyncStartup,
 ) -> Result<
     (
         HeaderSyncHandle,
         mpsc::Receiver<HeaderSyncAction>,
         JoinHandle<()>,
+    ),
+    HeaderSyncStartError,
+> {
+    let (handle, actions, reactor) = build_header_sync_reactor(startup)?;
+    Ok((handle, actions, tokio::spawn(reactor.run())))
+}
+
+fn build_header_sync_reactor(
+    mut startup: HeaderSyncStartup,
+) -> Result<
+    (
+        HeaderSyncHandle,
+        mpsc::Receiver<HeaderSyncAction>,
+        HeaderSyncReactor,
     ),
     HeaderSyncStartError,
 > {
@@ -124,7 +138,7 @@ pub fn spawn_header_sync_reactor(
         served_paths: HashMap::new(),
     };
     reactor.schedule_current_vct_repair();
-    Ok((handle, actions_rx, tokio::spawn(reactor.run())))
+    Ok((handle, actions_rx, reactor))
 }
 
 #[derive(Debug)]
@@ -1958,6 +1972,178 @@ mod tests {
             ),
             oldest_retained_height: anchor.height,
             alarms: Default::default(),
+        }
+    }
+
+    fn seed_applying_request(
+        reactor: &mut HeaderSyncReactor,
+        snapshot: &zakura_header_chain::EngineSnapshot,
+        peer: ZakuraPeerId,
+    ) -> (
+        zakura_header_chain::SourceId,
+        zakura_header_chain::WorkOwner,
+        BranchRange,
+    ) {
+        let source = source_id_from_peer(&peer).expect("the fixed peer has a source identity");
+        let anchor = snapshot.frontiers.finalized;
+        let mut header = *regtest_genesis_block().header;
+        header.previous_block_hash = anchor.hash;
+        header.time += chrono::Duration::seconds(1);
+        let header = Arc::new(header);
+        let target = zakura_header_chain::Frontier::new(
+            anchor
+                .height
+                .next()
+                .expect("the genesis fixture has a next height"),
+            header.hash(),
+        );
+        let request_id = HeaderSyncRequestId::new(9).expect("nine is nonzero");
+        let owner = zakura_header_chain::WorkOwner {
+            state_version: snapshot.state_version,
+            header_generation: snapshot.header_generation,
+            verified_generation: None,
+            branch: zakura_header_chain::BranchId::new(anchor.hash, target.hash),
+            session_id: 7,
+            request_id: NonZeroU64::new(request_id.get()).expect("the request ID is nonzero"),
+        };
+        let advertised = AdvertisedHeaderTarget {
+            session_id: owner.session_id,
+            observed_at: Instant::now(),
+            status: Status {
+                work_anchor_height: anchor.height,
+                work_anchor_hash: anchor.hash,
+                selected_tip_height: target.height,
+                selected_tip_hash: target.hash,
+                suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(1_u8),
+                oldest_retained_height: anchor.height,
+                max_headers_per_response: 1,
+                max_inflight_requests: 1,
+                max_message_bytes: 1_000,
+                tree_aux_schema_mask: 0,
+            },
+        };
+        assert_eq!(
+            reactor.peer_work_queue.stage(
+                peer.clone(),
+                advertised.clone(),
+                PeerWorkPriority::Normal,
+            ),
+            QueueWorkResult::NeedsLocator
+        );
+        assert!(reactor.peer_work_queue.start(ActiveHeaderRequest {
+            peer,
+            source,
+            target: advertised,
+            sent_locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
+            request_id,
+            owner,
+            common_ancestor: Some(anchor),
+            entries: vec![HeaderEntry {
+                header,
+                body_size: 0,
+                tree_aux: None,
+            }],
+            phase: HeaderTargetPhase::Applying,
+            max_header_count: 1,
+            tree_aux_schema: AuxSchema::None,
+        }));
+        assert_eq!(reactor.pending_owners.insert(source, owner), None);
+        let range = BranchRange::new(owner.branch, target.height, target.height)
+            .expect("the one-header applying range is ordered");
+        (source, owner, range)
+    }
+
+    #[test]
+    fn aud_06_07_live_reactor_ignores_results_retired_by_a_committed_snapshot() {
+        {
+            let mut startup = startup(CancellationToken::new());
+            let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+            let initial = committed_snapshot(anchor);
+            let (_snapshots_tx, snapshots_rx) = watch::channel(Some(initial.clone()));
+            startup.committed_snapshots = Some(snapshots_rx);
+            let (_handle, _actions, mut reactor) =
+                build_header_sync_reactor(startup).expect("the current-result control builds");
+            let peer = peer();
+            let (source, owner, range) =
+                seed_applying_request(&mut reactor, &initial, peer.clone());
+            reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
+                peer,
+                source,
+                owner,
+                result: HeaderTargetAdmissionResult::Applied,
+            });
+            assert!(
+                reactor
+                    .coverage
+                    .covers_tip(owner.header_generation, range.branch, range.end),
+                "the current-result control proves the live handler can mark coverage"
+            );
+        }
+
+        for result in [
+            HeaderTargetAdmissionResult::Applied,
+            HeaderTargetAdmissionResult::LocalFailure,
+        ] {
+            let shutdown = CancellationToken::new();
+            let mut startup = startup(shutdown);
+            let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+            let initial = committed_snapshot(anchor);
+            let (_snapshots_tx, snapshots_rx) = watch::channel(Some(initial.clone()));
+            startup.committed_snapshots = Some(snapshots_rx);
+            let (handle, mut actions, mut reactor) =
+                build_header_sync_reactor(startup).expect("the live reactor fixture builds");
+            let peer = peer();
+            let (source, owner, old_range) =
+                seed_applying_request(&mut reactor, &initial, peer.clone());
+
+            let replacement =
+                zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0xb2; 32]));
+            let mut committed = initial.clone();
+            committed.state_version = zakura_header_chain::StateVersion::new(
+                initial.state_version.get().saturating_add(1),
+            );
+            committed.header_generation = initial
+                .header_generation
+                .checked_next()
+                .expect("the bounded fixture generation advances");
+            committed.frontiers.header_best = replacement;
+            committed.header_best_score = zakura_header_chain::ChainScore::new(
+                zakura_header_chain::SuffixWork::zero(),
+                replacement.hash,
+            );
+            reactor.observe_latest_committed_snapshot(committed.clone());
+
+            assert!(reactor.peer_work_queue.active(&peer).is_none());
+            assert!(reactor.pending_owners.is_empty());
+            assert!(!reactor.coverage.covers_tip(
+                owner.header_generation,
+                old_range.branch,
+                old_range.end
+            ));
+            let published_tip = handle.best_header_tip();
+            let published_candidates = handle.candidate_state();
+            assert_eq!(published_tip, (replacement.height, replacement.hash));
+
+            reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
+                peer,
+                source,
+                owner,
+                result,
+            });
+
+            assert_eq!(reactor.committed_snapshot, Some(committed));
+            assert_eq!(handle.best_header_tip(), published_tip);
+            assert_eq!(handle.candidate_state(), published_candidates);
+            assert!(reactor.pending_owners.is_empty());
+            assert!(!reactor.coverage.covers_tip(
+                owner.header_generation,
+                old_range.branch,
+                old_range.end
+            ));
+            assert!(matches!(
+                actions.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
         }
     }
 

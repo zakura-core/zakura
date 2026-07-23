@@ -431,6 +431,12 @@ pub(crate) async fn drive_header_sync_actions(
 pub(crate) struct HeaderSyncService {
     header_sync: HeaderSyncHandle,
     peers: Arc<StdMutex<HashMap<ZakuraPeerId, HeaderSyncPeerRecord>>>,
+    /// Connections whose header-sync session exited while the connection stayed
+    /// up. A claim bridges the transport's reopen backoff so a discovery
+    /// ownership sample cannot close a healthy connection mid-gap; it is only
+    /// honored while this service would re-admit the peer immediately (see
+    /// `owns_connection_for_peer`).
+    session_gap_claims: Arc<StdMutex<HashMap<ZakuraPeerId, HeaderSyncSessionGapClaim>>>,
 }
 
 #[derive(Debug)]
@@ -440,11 +446,18 @@ struct HeaderSyncPeerRecord {
     cancel_token: CancellationToken,
 }
 
+#[derive(Debug)]
+struct HeaderSyncSessionGapClaim {
+    conn_id: ZakuraConnId,
+    direction: ServicePeerDirection,
+}
+
 impl HeaderSyncService {
     pub(crate) fn new(header_sync: HeaderSyncHandle) -> Self {
         Self {
             header_sync,
             peers: Arc::new(StdMutex::new(HashMap::new())),
+            session_gap_claims: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 }
@@ -508,20 +521,38 @@ impl Service for HeaderSyncService {
             .expect("header-sync peer map mutex is never poisoned")
             .get(peer)
             .is_some_and(|record| record.conn_id == conn_id);
-        if !owns_stream {
-            return false;
+        if owns_stream {
+            let Ok(bytes) = <[u8; 32]>::try_from(peer.as_bytes()) else {
+                return false;
+            };
+            let Ok(node_id) = NodeId::from_bytes(&bytes) else {
+                return false;
+            };
+            return self
+                .header_sync
+                .candidate_state()
+                .admitted_node_ids
+                .contains(&node_id);
         }
 
-        let Ok(bytes) = <[u8; 32]>::try_from(peer.as_bytes()) else {
+        // A transiently exited session leaves a gap claim while the transport
+        // backs off before reopening the stream. Honor it only while this
+        // service would re-admit the peer right now: an advisory backoff or
+        // full slots releases the connection exactly like a rejected stream,
+        // preserving the discovery-only close semantics.
+        let Some(direction) = self
+            .session_gap_claims
+            .lock()
+            .expect("header-sync gap-claim mutex is never poisoned")
+            .get(peer)
+            .and_then(|claim| (claim.conn_id == conn_id).then_some(claim.direction))
+        else {
             return false;
         };
-        let Ok(node_id) = NodeId::from_bytes(&bytes) else {
-            return false;
-        };
-        self.header_sync
-            .candidate_state()
-            .admitted_node_ids
-            .contains(&node_id)
+        matches!(
+            self.ordered_session_demand(conn_id, peer, ZAKURA_CAP_HEADER_SYNC, direction),
+            OrderedSessionDemand::OpenNow
+        )
     }
 
     fn wants_peer(
@@ -594,6 +625,11 @@ impl Service for HeaderSyncService {
                 old_record.cancel_token.cancel();
             }
         }
+        // The admitted session supersedes any gap claim left by its predecessor.
+        self.session_gap_claims
+            .lock()
+            .expect("header-sync gap-claim mutex is never poisoned")
+            .remove(&peer_id);
 
         let _ = self
             .header_sync
@@ -638,6 +674,8 @@ impl Service for HeaderSyncService {
         // panicking task leaked the peer's reactor state.
         let teardown_handle = self.header_sync.clone();
         let teardown_peers = self.peers.clone();
+        let teardown_claims = self.session_gap_claims.clone();
+        let teardown_direction = peer.direction;
         let teardown_peer = peer_id.clone();
         let on_teardown = move || {
             let should_notify = {
@@ -648,6 +686,23 @@ impl Service for HeaderSyncService {
                     record.conn_id == conn_id && record.session_id == session_id
                 }) {
                     peers.remove(&teardown_peer);
+                    // The connection may outlive this session while the
+                    // transport backs off before reopening the stream; remember
+                    // the claim so ownership checks bridge the gap. The claim
+                    // is written while still holding the peer-map lock so a
+                    // concurrent `remove_peer` for the closing connection
+                    // cannot clear claims between the removal above and this
+                    // insert, which would leak a claim for a dead connection.
+                    teardown_claims
+                        .lock()
+                        .expect("header-sync gap-claim mutex is never poisoned")
+                        .insert(
+                            teardown_peer.clone(),
+                            HeaderSyncSessionGapClaim {
+                                conn_id,
+                                direction: teardown_direction,
+                            },
+                        );
                     true
                 } else {
                     false
@@ -676,14 +731,29 @@ impl Service for HeaderSyncService {
                 .peers
                 .lock()
                 .expect("header-sync peer map mutex is never poisoned");
-            if peers
+            let removed = if peers
                 .get(peer)
                 .is_some_and(|record| record.conn_id == conn_id)
             {
                 peers.remove(peer)
             } else {
                 None
+            };
+            // The claim is cleared while still holding the peer-map lock so it
+            // stays ordered with the teardown's remove-then-claim sequence for
+            // the same connection; clearing outside the lock could leave a late
+            // claim behind for this closed connection.
+            let mut claims = self
+                .session_gap_claims
+                .lock()
+                .expect("header-sync gap-claim mutex is never poisoned");
+            if claims
+                .get(peer)
+                .is_some_and(|claim| claim.conn_id == conn_id)
+            {
+                claims.remove(peer);
             }
+            removed
         };
         if let Some(record) = removed {
             record.cancel_token.cancel();

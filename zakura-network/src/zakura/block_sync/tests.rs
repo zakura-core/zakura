@@ -7281,6 +7281,85 @@ async fn routine_disconnect_returns_outstanding_and_releases_budget() {
 }
 
 #[tokio::test]
+async fn transient_session_exit_keeps_connection_ownership_across_reopen_gap() {
+    // Discovery samples `owns_connection_for_peer` to decide whether a finished
+    // exchange may close the connection. A block-sync stream that exits while
+    // the connection stays up leaves a reopen-backoff gap with no active
+    // session; the connection must stay owned across that gap, and the claim
+    // must release as soon as this service would no longer re-admit the peer.
+    let mut config = immediate_body_download_config();
+    config.peer_limits.max_outbound_peers = 1;
+    let blocks = mainnet_blocks_1_to_3();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    let (peer_a, a_in, _a_out) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        0x81,
+        block::Height(1),
+        blocks[0].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+    assert!(service.owns_connection_for_peer(&peer_a, 0));
+
+    // The peer's inbound stream ends while the connection stays up; the routine
+    // exits and the transport backs off before offering a replacement stream.
+    drop(a_in);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while service.peer_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the exited routine releases the active block-sync session");
+    assert!(
+        service.owns_connection_for_peer(&peer_a, 0),
+        "the reopen gap must keep the connection owned while the peer would be re-admitted"
+    );
+
+    // Another peer fills the only outbound slot, so peer A would no longer be
+    // re-admitted; the gap claim stops holding A's connection open.
+    let (peer_b, _b_in, _b_out) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        0x82,
+        block::Height(1),
+        blocks[0].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+    assert!(
+        !service.owns_connection_for_peer(&peer_a, 0),
+        "a claim for a peer that would not be re-admitted must not own the connection"
+    );
+
+    // Freeing the slot makes peer A re-admittable again, reviving the claim.
+    service.remove_peer(&peer_b, 0);
+    assert!(service.owns_connection_for_peer(&peer_a, 0));
+
+    // Closing peer A's own connection releases the claim for good.
+    service.remove_peer(&peer_a, 0);
+    assert!(!service.owns_connection_for_peer(&peer_a, 0));
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
 async fn reactor_reserves_size_hint_per_block_not_worst_case() {
     // The issuance path (`try_fill`) reserves the advertised size hint per block,
     // NOT `BS_PER_BLOCK_WORST_CASE_BYTES`. The global byte budget = 3 worst-case

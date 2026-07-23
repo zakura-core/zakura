@@ -221,6 +221,12 @@ struct BlockSyncServiceInner {
     candidates: watch::Receiver<ZakuraBlockSyncCandidateState>,
     /// Authoritative active session for each peer's current transport connection.
     active_peers: StdMutex<HashMap<ZakuraPeerId, BlockSyncPeerRecord>>,
+    /// Connections whose block-sync session exited while the connection stayed
+    /// up. A claim bridges the transport's reopen backoff so a discovery
+    /// ownership sample cannot close a healthy connection mid-gap; it is only
+    /// honored while this service would re-admit the peer immediately (see
+    /// `owns_connection_for_peer`).
+    session_gap_claims: StdMutex<HashMap<ZakuraPeerId, SessionGapClaim>>,
     next_session_id: AtomicU64,
 }
 
@@ -230,6 +236,12 @@ struct BlockSyncPeerRecord {
     session_id: u64,
     direction: ServicePeerDirection,
     cancel_token: CancellationToken,
+}
+
+#[derive(Debug)]
+struct SessionGapClaim {
+    conn_id: ZakuraConnId,
+    direction: ServicePeerDirection,
 }
 
 impl BlockSyncServiceInner {
@@ -244,7 +256,25 @@ impl BlockSyncServiceInner {
             return false;
         }
 
-        active_peers.remove(peer);
+        let removed = active_peers
+            .remove(peer)
+            .expect("record exists because the ownership check just matched it");
+
+        // The connection may outlive this session while the transport backs off
+        // before reopening the stream; remember the claim so ownership checks
+        // bridge the gap. The claim is written while still holding the peer-map
+        // lock so a concurrent `remove_peer` for the closing connection cannot
+        // clear claims between the removal above and this insert, which would
+        // leak a claim for a dead connection.
+        if let Ok(mut claims) = self.session_gap_claims.lock() {
+            claims.insert(
+                peer.clone(),
+                SessionGapClaim {
+                    conn_id,
+                    direction: removed.direction,
+                },
+            );
+        }
         true
     }
 }
@@ -263,6 +293,7 @@ impl BlockSyncService {
                 peer_snapshot: handle.subscribe_peer_snapshot(),
                 candidates: handle.subscribe_candidate_state(),
                 active_peers: StdMutex::new(HashMap::new()),
+                session_gap_claims: StdMutex::new(HashMap::new()),
                 next_session_id: AtomicU64::new(1),
             }),
             _held_events: None,
@@ -299,6 +330,7 @@ impl BlockSyncService {
                 peer_snapshot: handle.subscribe_peer_snapshot(),
                 candidates: handle.subscribe_candidate_state(),
                 active_peers: StdMutex::new(HashMap::new()),
+                session_gap_claims: StdMutex::new(HashMap::new()),
                 next_session_id: AtomicU64::new(1),
             }),
             _held_events: None,
@@ -330,6 +362,7 @@ impl BlockSyncService {
                     peer_snapshot,
                     candidates,
                     active_peers: StdMutex::new(HashMap::new()),
+                    session_gap_claims: StdMutex::new(HashMap::new()),
                     next_session_id: AtomicU64::new(1),
                 }),
                 _held_events: None,
@@ -457,12 +490,36 @@ impl Service for BlockSyncService {
     }
 
     fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
-        self.inner
+        let session_is_active = self
+            .inner
             .active_peers
             .lock()
             .expect("block-sync peer map mutex is never poisoned")
             .get(peer)
-            .is_some_and(|record| record.conn_id == conn_id)
+            .is_some_and(|record| record.conn_id == conn_id);
+        if session_is_active {
+            return true;
+        }
+
+        // A transiently exited session leaves a gap claim while the transport
+        // backs off before reopening the stream. Honor it only while this
+        // service would re-admit the peer right now: a park, full slots, or the
+        // useless-work gate releases the connection exactly like a rejected
+        // stream, preserving the discovery-only close semantics.
+        let Some(direction) = self
+            .inner
+            .session_gap_claims
+            .lock()
+            .expect("block-sync gap-claim mutex is never poisoned")
+            .get(peer)
+            .and_then(|claim| (claim.conn_id == conn_id).then_some(claim.direction))
+        else {
+            return false;
+        };
+        matches!(
+            self.ordered_session_demand(conn_id, peer, ZAKURA_CAP_BLOCK_SYNC, direction),
+            OrderedSessionDemand::OpenNow
+        )
     }
 
     fn wants_peer(
@@ -576,6 +633,12 @@ impl Service for BlockSyncService {
         if let Some(old_record) = old_record {
             old_record.cancel_token.cancel();
         }
+        // The admitted session supersedes any gap claim left by its predecessor.
+        self.inner
+            .session_gap_claims
+            .lock()
+            .expect("block-sync gap-claim mutex is never poisoned")
+            .remove(&peer_id);
 
         let run_cancel = service_cancel_token.clone();
         let on_teardown = {
@@ -669,10 +732,26 @@ impl Service for BlockSyncService {
                 .active_peers
                 .lock()
                 .expect("block-sync peer-state mutex is never poisoned");
-            match active_peers.get(peer) {
+            let removed = match active_peers.get(peer) {
                 Some(record) if record.conn_id == conn_id => active_peers.remove(peer),
                 Some(_) | None => None,
+            };
+            // The claim is cleared while still holding the peer-map lock so it
+            // stays ordered with `finish_session`'s remove-then-claim sequence
+            // for the same connection; clearing outside the lock could leave a
+            // late claim behind for this closed connection.
+            let mut claims = self
+                .inner
+                .session_gap_claims
+                .lock()
+                .expect("block-sync gap-claim mutex is never poisoned");
+            if claims
+                .get(peer)
+                .is_some_and(|claim| claim.conn_id == conn_id)
+            {
+                claims.remove(peer);
             }
+            removed
         };
         if let Some(wiring) = &self.inner.routine_wiring {
             wiring

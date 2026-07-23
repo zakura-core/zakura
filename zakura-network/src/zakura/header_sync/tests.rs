@@ -1301,6 +1301,74 @@ fn ordered_session_demand_bounds_advisory_backoff_and_waits_for_slots() {
     ));
 }
 
+#[tokio::test]
+async fn transient_session_exit_keeps_connection_ownership_across_reopen_gap() {
+    // Discovery samples `owns_connection_for_peer` to decide whether a finished
+    // exchange may close the connection. A header-sync stream that exits while
+    // the connection stays up leaves a reopen-backoff gap with no active
+    // session; the connection must stay owned across that gap, and the claim
+    // must release as soon as this service would no longer re-admit the peer.
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer_id, node_id) = node_peer();
+    let conn_id = 3;
+    let (peer, peer_send) =
+        header_sync_peer_with_conn(peer_id.clone(), conn_id, CancellationToken::new());
+
+    service.add_peer(peer);
+    match lifecycle_rx.recv().await {
+        Some(HeaderSyncEvent::PeerConnected(session)) if session.peer_id() == &peer_id => {}
+        event => panic!("expected header-sync peer connection, got {event:?}"),
+    }
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        admitted_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+    assert!(service.owns_connection_for_peer(&peer_id, conn_id));
+
+    // The peer's inbound stream ends while the connection stays up; the pipe
+    // exits, the reactor drops the peer from its admitted set, and the
+    // transport backs off before offering a replacement stream.
+    drop(peer_send);
+    match tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle_rx.recv()).await {
+        Ok(Some(HeaderSyncEvent::PeerDisconnected(disconnected))) if disconnected == peer_id => {}
+        event => panic!("expected header-sync peer disconnection, got {event:?}"),
+    }
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState::default());
+    assert!(
+        service.owns_connection_for_peer(&peer_id, conn_id),
+        "the reopen gap must keep the connection owned while the peer would be re-admitted"
+    );
+
+    // An advisory backoff means the peer would not be re-admitted, so the gap
+    // claim stops holding the connection open — and revives when it clears.
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        backed_off_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+    assert!(
+        !service.owns_connection_for_peer(&peer_id, conn_id),
+        "a claim for a peer that would not be re-admitted must not own the connection"
+    );
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState::default());
+    assert!(service.owns_connection_for_peer(&peer_id, conn_id));
+
+    // Closing the peer's own connection releases the claim for good.
+    service.remove_peer(&peer_id, conn_id);
+    assert!(!service.owns_connection_for_peer(&peer_id, conn_id));
+}
+
 fn header_sync_peer_with_conn(
     peer_id: ZakuraPeerId,
     conn_id: ZakuraConnId,

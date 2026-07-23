@@ -911,6 +911,85 @@ mod tests {
     }
 
     #[test]
+    fn df_02_contextual_body_failures_have_exact_intentional_difference_types() {
+        use zakura_chain::value_balance::ValueBalanceError;
+        use zakura_header_chain::{BodyRuleId, BodyVerificationClass};
+
+        let outpoint = transparent::OutPoint {
+            hash: [3; 32].into(),
+            index: 0,
+        };
+        let transaction_hash = transaction::Hash::from([4; 32]);
+        let now = Utc::now();
+        let cases = [
+            (
+                ValidateContextError::DuplicateTransparentSpend {
+                    outpoint,
+                    location: "test chain",
+                }
+                .body_verification_class(),
+                BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(
+                    "context.duplicate_transparent_spend",
+                )),
+            ),
+            (
+                ValidateContextError::DuplicateSproutNullifier {
+                    nullifier: sprout::Nullifier::from([6; 32]),
+                    in_finalized_state: false,
+                }
+                .body_verification_class(),
+                BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(
+                    "context.duplicate_sprout_nullifier",
+                )),
+            ),
+            (
+                ValidateContextError::UnknownSproutAnchor {
+                    anchor: sprout::tree::Root::default(),
+                    height: Some(Height(7)),
+                    tx_index_in_block: Some(0),
+                    transaction_hash,
+                }
+                .body_verification_class(),
+                BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(
+                    "context.unknown_sprout_anchor",
+                )),
+            ),
+            (
+                ValidateContextError::CalculateBlockChainValueChange {
+                    value_balance_error: ValueBalanceError::Unparsable,
+                    height: Height(7),
+                    block_hash: block::Hash([5; 32]),
+                    transaction_count: 1,
+                    spent_utxo_count: 1,
+                }
+                .body_verification_class(),
+                BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(
+                    "context.calculate_block_chain_value_change",
+                )),
+            ),
+            (
+                ValidateContextError::TimeTooLate {
+                    candidate_time: now,
+                    block_time_max: now - chrono::Duration::seconds(1),
+                }
+                .body_verification_class(),
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable),
+            ),
+            (
+                CommitBlockError::HeaderChainError {
+                    error: "local transition failure".to_owned(),
+                }
+                .body_verification_class(),
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage),
+            ),
+        ];
+
+        for (actual, expected) in cases {
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
     fn commit_block_error_misbehavior_scores() {
         let context_err = CommitBlockError::ValidateContextError(Box::new(
             ValidateContextError::NonSequentialBlock {

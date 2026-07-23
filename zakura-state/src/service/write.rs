@@ -2257,7 +2257,7 @@ mod tests {
     }
 
     #[test]
-    fn production_invalid_body_writer_reselects_after_exact_authenticated_evidence() {
+    fn in_02_header_valid_body_invalid_reselects_after_exact_authenticated_evidence() {
         let _init_guard = zakura_test::init();
         let network = Network::new_regtest(Default::default());
         let finalized_state = FinalizedState::new(

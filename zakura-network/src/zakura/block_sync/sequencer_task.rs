@@ -1519,7 +1519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consensus_invalid_persists_and_scores_only_its_exact_supplier() {
+    async fn in_02_consensus_invalid_persists_and_scores_only_its_exact_supplier() {
         for attribution_matches in [true, false] {
             let frontiers = BlockSyncFrontiers {
                 finalized_height: block::Height(0),

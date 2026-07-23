@@ -64,7 +64,7 @@ jobs:
   # Building once removes two of the three compile passes while preserving
   # parallel test execution across the shard jobs.
   build-tests:
-    name: build test binaries (${{ github.event_name == 'pull_request' && 'debug' || 'release' }})
+    name: build test binaries (${{ github.event_name == 'pull_request' && 'debug' || 'ci-tests' }})
     permissions:
       contents: read
       id-token: write
@@ -79,8 +79,9 @@ jobs:
         with:
           toolchain: stable
           # PR debug builds restore the cache populated by the main-branch
-          # config job. Full-coverage runs keep a separate release cache.
-          cache-shared-key: ${{ github.event_name == 'pull_request' && 'zakura-drb-debug' || 'unit-tests-release' }}
+          # config job. Full-coverage runs use the release-derived `ci-tests`
+          # profile, with a separate cache from production release builds.
+          cache-shared-key: ${{ github.event_name == 'pull_request' && 'zakura-drb-debug' || 'unit-tests-ci-tests' }}
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
@@ -94,7 +95,7 @@ jobs:
           # mode the shards run. The run-time-only filters (`--profile`,
           # `--partition`, `--run-ignored`) are applied by the shard jobs, not here.
           if [[ "${FULL_COVERAGE}" == "true" ]]; then
-            cargo nextest archive --locked --release --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --cargo-profile ci-tests --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           else
             cargo nextest archive --locked --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           fi

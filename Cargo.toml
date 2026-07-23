@@ -341,6 +341,12 @@ debug = "line-tables-only"
 # Disable debug info for dependencies to reduce binary size.
 debug = false
 
+[profile.ci-tests]
+inherits = "release"
+# Unit tests need release-mode execution speed, but do not benefit from
+# optimizing across crate boundaries.
+lto = "off"
+
 [workspace.lints.rust]
 # The linter should ignore these expected config flags/values
 unexpected_cfgs = { level = "warn", check-cfg = [

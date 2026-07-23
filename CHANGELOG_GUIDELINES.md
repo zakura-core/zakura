@@ -88,10 +88,19 @@ is in
 
 ## Library crates
 
-The repository does not maintain per-crate changelogs. Release preparation
-uses `cargo semver-checks`, `cargo public-api diff`, and the code diff to choose
-version bumps for changed publishable crates. Those checks are release inputs,
-not permanent changelog entries.
+The repository does not maintain per-crate changelogs. Version bumps for
+published-API changes land **in the PR that makes the change**: the
+`Semver checks` CI job compares every publishable crate against its latest
+stable crates.io release, and a PR that changes a published API must carry
+the version bump that covers it —
+
+```sh
+cargo release version --verbose --execute --allow-branch '*' -p <crate> major # [ minor ]
+```
+
+(which also rewrites workspace-internal dependency requirements). Release
+preparation reviews the accumulated bumps — with `cargo public-api diff` and
+the code diff where useful — rather than originating them on release day.
 
 ## Release assembly
 

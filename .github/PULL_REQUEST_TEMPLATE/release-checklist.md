@@ -146,6 +146,11 @@ snapshot the test rejects.
 If you're publishing crates for the first time, [log in to crates.io](https://github.com/zakura-core/zakura/dev/crate-owners.html#logging-in-to-cratesio),
 and make sure you're a member of owners group.
 
+The `Semver checks` CI job enforces bump-with-change against stable
+crates.io baselines on every Rust PR, so most bumps already exist by release
+time; the steps below review and complete them (for example, for non-API
+changes that still warrant publishing).
+
 Check that the release will work:
 
 - [ ] Review the changed-crate version advisory from `make pre-release`. It

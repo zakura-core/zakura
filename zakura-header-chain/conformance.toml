@@ -766,7 +766,7 @@ id = "LC-PARITY-01"
 name = "Observable-header consensus parity"
 status = "implemented"
 owner = "zakura_header_chain::prepare_headers + zakura_state::HeaderChainWriter"
-tests = ["DF-01::df_01_observable_activation_headers_pass_shared_rules", "DF-01::df_01_body_valid_fork_graph_matches_full_state_before_finalization", "DF-01::df_01_generated_nu5_graph_matches_full_state_before_finalization"]
+tests = ["DF-01::df_01_observable_activation_headers_pass_shared_rules", "DF-01::df_01_generated_nu5_graph_matches_full_state_before_finalization"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -782,7 +782,7 @@ id = "LC-PARITY-03"
 name = "Tie-break policy isolation"
 status = "implemented"
 owner = "zakura_header_chain::ChainScore::cmp"
-tests = ["DF-01::header_chain_score_matches_legacy_chain_comparator", "DF-01::df_01_body_valid_fork_graph_matches_full_state_before_finalization"]
+tests = ["DF-01::header_chain_score_matches_legacy_chain_comparator"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

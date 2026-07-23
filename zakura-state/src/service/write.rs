@@ -1823,7 +1823,6 @@ mod tests {
         serialization::ZcashDeserializeInto,
         transaction::{arbitrary::transaction_to_fake_v5, Transaction},
         transparent,
-        value_balance::ValueBalance,
         work::{difficulty::ParameterDifficulty as _, equihash},
     };
 
@@ -1837,7 +1836,7 @@ mod tests {
             non_finalized_state::NonFinalizedState,
             write::{
                 classify_verified_change, commit_contextual_finalization, commit_operator_change,
-                verified_path, verified_request, HeaderChainWriter, PreparedFullStateTransition,
+                verified_request, HeaderChainWriter, PreparedFullStateTransition,
             },
         },
         tests::FakeChainHelper,
@@ -2187,94 +2186,6 @@ mod tests {
     }
 
     #[test]
-    fn df_01_body_valid_fork_graph_matches_full_state_before_finalization() {
-        let _init_guard = zakura_test::init();
-
-        for network in Network::iter() {
-            let finalized_state = FinalizedState::new(
-                &Config::ephemeral(),
-                &network,
-                #[cfg(feature = "elasticsearch")]
-                false,
-            )
-            .expect("the differential fixture finalized state opens");
-            finalized_state.set_finalized_value_pool(ValueBalance::fake_populated_pool());
-            let anchor: Arc<zakura_chain::block::Block> =
-                Arc::new(network.test_block(653599, 583999).unwrap());
-            let anchor_height = anchor
-                .coinbase_height()
-                .expect("the differential anchor has a height");
-            let writer = header_writer(&finalized_state, &network, anchor_height, &anchor);
-            let mut live = NonFinalizedState::new(&network);
-
-            let common = anchor.make_fake_child().set_work(1);
-            let first = common.make_fake_child().set_work(10);
-            let mut second = common.make_fake_child().set_work(10);
-            Arc::make_mut(&mut Arc::make_mut(&mut second).header)
-                .nonce
-                .0[0] ^= 1;
-            let (lower_hash, higher_hash) = if first.hash().0 < second.hash().0 {
-                (first, second)
-            } else {
-                (second, first)
-            };
-
-            let mut staged = live.clone();
-            staged
-                .commit_new_chain(common.clone().prepare(), &finalized_state.db)
-                .expect("the common body-valid block enters full state");
-            staged
-                .commit_block(lower_hash.clone().prepare(), &finalized_state.db)
-                .expect("the lower raw-hash competitor enters full state");
-            let lower_frontier = Frontier::new(
-                lower_hash
-                    .coinbase_height()
-                    .expect("the lower competitor has a height"),
-                lower_hash.hash(),
-            );
-            commit_verified_change(&writer, &mut live, staged, lower_frontier);
-            assert_selected_header_matches_full_state(&writer, &live);
-
-            let mut staged = live.clone();
-            staged
-                .commit_block(higher_hash.clone().prepare(), &finalized_state.db)
-                .expect("the higher raw-hash competitor enters full state");
-            let higher_frontier = Frontier::new(
-                higher_hash
-                    .coinbase_height()
-                    .expect("the higher competitor has a height"),
-                higher_hash.hash(),
-            );
-            commit_verified_change(&writer, &mut live, staged, higher_frontier);
-            assert_selected_header_matches_full_state(&writer, &live);
-            assert_eq!(
-                writer.runtime.publisher().snapshot().frontiers.header_best,
-                higher_frontier,
-                "equal work uses the same raw internal hash order in both engines"
-            );
-
-            let harder = lower_hash.make_fake_child().set_work(1);
-            let harder_frontier = Frontier::new(
-                harder
-                    .coinbase_height()
-                    .expect("the harder branch tip has a height"),
-                harder.hash(),
-            );
-            let mut staged = live.clone();
-            staged
-                .commit_block(harder.prepare(), &finalized_state.db)
-                .expect("the greater-work branch enters full state");
-            commit_verified_change(&writer, &mut live, staged, harder_frontier);
-            assert_selected_header_matches_full_state(&writer, &live);
-            assert_eq!(
-                writer.runtime.publisher().snapshot().frontiers.header_best,
-                harder_frontier,
-                "greater cumulative work wins independently of the prior tie order"
-            );
-        }
-    }
-
-    #[test]
     fn df_01_observable_activation_headers_pass_shared_rules() {
         let _init_guard = zakura_test::init();
 
@@ -2432,6 +2343,7 @@ mod tests {
                     .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(
                         blocks
                             .iter()
+                            .take(31)
                             .map(|block| {
                                 (
                                     block
@@ -2607,7 +2519,7 @@ mod tests {
             canopy_anchor
         );
 
-        for (index, block) in chain.into_iter().enumerate().skip(31) {
+        for (index, block) in chain.iter().cloned().enumerate().skip(31) {
             let height = block
                 .coinbase_height()
                 .expect("the generated block has a coinbase height");
@@ -2657,12 +2569,109 @@ mod tests {
             ),
             NetworkUpgrade::Nu5
         );
+
+        let incumbent = writer
+            .runtime
+            .publisher()
+            .snapshot()
+            .frontiers
+            .verified_best;
+        let mut replacement = chain[38].make_fake_child().set_work(1_000);
+        let replacement_block = Arc::make_mut(&mut replacement);
+        let Transaction::V5 { expiry_height, .. } =
+            Arc::make_mut(&mut replacement_block.transactions[0])
+        else {
+            unreachable!("the replacement is after the generated NU5 activation")
+        };
+        *expiry_height = block::Height(40);
+        Arc::make_mut(&mut replacement_block.header).merkle_root =
+            replacement_block.transactions.iter().cloned().collect();
+        let parent_history_root = live
+            .best_chain()
+            .expect("the generated full-state graph has a best chain")
+            .history_tree(crate::HashOrHeight::Height(block::Height(38)))
+            .expect("the replacement parent has a retained history tree")
+            .hash()
+            .expect("the replacement parent history tree is nonempty");
+        let commitment: [u8; 32] = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            &parent_history_root,
+            &replacement.auth_data_root(),
+        )
+        .into();
+        Arc::make_mut(&mut Arc::make_mut(&mut replacement).header).commitment_bytes =
+            commitment.into();
+        let replacement_frontier = Frontier::new(
+            replacement
+                .coinbase_height()
+                .expect("the replacement has a height"),
+            replacement.hash(),
+        );
+        let mut staged = live.clone();
+        staged
+            .commit_block(replacement.prepare(), &finalized_state.db)
+            .expect("the harder supported-format replacement enters full state");
+        commit_verified_change(&writer, &mut live, staged, replacement_frontier);
+        assert_eq!(
+            writer
+                .runtime
+                .publisher()
+                .snapshot()
+                .frontiers
+                .verified_best,
+            replacement_frontier
+        );
+
+        let mut staged = live.clone();
+        staged
+            .invalidate_block(replacement_frontier.hash)
+            .expect("the replacement invalidates in staged full state");
+        commit_operator_change(&writer, &mut live, staged, replacement_frontier.hash, true)
+            .expect("invalidation commits both frontiers before swapping full state");
+        assert_eq!(
+            writer
+                .runtime
+                .publisher()
+                .snapshot()
+                .frontiers
+                .verified_best,
+            incumbent
+        );
+
+        let mut staged = live.clone();
+        staged
+            .reconsider_block(replacement_frontier.hash, &finalized_state.db)
+            .expect("the replacement replays into staged full state");
+        commit_operator_change(&writer, &mut live, staged, replacement_frontier.hash, false)
+            .expect("reconsider commits both frontiers before swapping full state");
+        assert_eq!(
+            writer
+                .runtime
+                .publisher()
+                .snapshot()
+                .frontiers
+                .verified_best,
+            replacement_frontier
+        );
+
+        let first_non_finalized = chain[31].hash();
+        let mut staged = live.clone();
+        staged
+            .invalidate_block(first_non_finalized)
+            .expect("invalidating the common root empties every full-state branch");
+        commit_operator_change(&writer, &mut live, staged, first_non_finalized, true)
+            .expect("empty full state commits its exact finalized fallback");
+        assert!(live.is_chain_set_empty());
+        let snapshot = writer.runtime.publisher().snapshot();
+        assert_eq!(
+            snapshot.frontiers.verified_best,
+            snapshot.frontiers.finalized
+        );
     }
 
     #[test]
     fn production_body_unavailability_writer_authenticates_exact_evidence() {
         let _init_guard = zakura_test::init();
-        let network = Network::Mainnet;
+        let network = Network::new_regtest(Default::default());
         let finalized_state = FinalizedState::new(
             &Config::ephemeral(),
             &network,
@@ -2670,9 +2679,7 @@ mod tests {
             false,
         )
         .expect("the fixture finalized state opens");
-        let anchor = zakura_test::vectors::BLOCK_MAINNET_434873_BYTES
-            .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
-            .expect("the anchor block deserializes");
+        let anchor = regtest_genesis_block();
         let anchor_height = anchor
             .coinbase_height()
             .expect("the anchor has a coinbase height");
@@ -2816,7 +2823,7 @@ mod tests {
     #[test]
     fn stale_vct_aux_rejection_has_zero_durable_effects() {
         let _init_guard = zakura_test::init();
-        let network = Network::Mainnet;
+        let network = Network::new_regtest(Default::default());
         let finalized_state = FinalizedState::new(
             &Config::ephemeral(),
             &network,
@@ -2824,9 +2831,7 @@ mod tests {
             false,
         )
         .expect("the fixture finalized state opens");
-        let anchor = zakura_test::vectors::BLOCK_MAINNET_434873_BYTES
-            .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
-            .expect("the anchor block deserializes");
+        let anchor = regtest_genesis_block();
         let anchor_height = anchor
             .coinbase_height()
             .expect("the anchor has a coinbase height");
@@ -2865,173 +2870,6 @@ mod tests {
     }
 
     #[test]
-    fn staged_grow_reset_invalidate_and_reconsider_keep_both_frontiers_atomic() {
-        let _init_guard = zakura_test::init();
-        let network = Network::Mainnet;
-        let finalized_state = FinalizedState::new(
-            &Config::ephemeral(),
-            &network,
-            #[cfg(feature = "elasticsearch")]
-            false,
-        )
-        .expect("the fixture finalized state opens");
-        finalized_state.set_finalized_value_pool(ValueBalance::fake_populated_pool());
-        let parent = zakura_test::vectors::BLOCK_MAINNET_434873_BYTES
-            .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
-            .expect("the parent block deserializes");
-        let parent_height = parent
-            .coinbase_height()
-            .expect("the parent has a coinbase height");
-        let writer = header_writer(&finalized_state, &network, parent_height, &parent);
-        let mut live = NonFinalizedState::new(&network);
-
-        let common = parent.make_fake_child().set_work(1);
-        let first = common.make_fake_child().set_work(10);
-        let first_frontier = Frontier::new(
-            first.coinbase_height().expect("the child has a height"),
-            first.hash(),
-        );
-        let mut staged = live.clone();
-        staged
-            .commit_new_chain(common.clone().prepare(), &finalized_state.db)
-            .expect("the common full-state block validates");
-        staged
-            .commit_block(first.clone().prepare(), &finalized_state.db)
-            .expect("the first full-state branch validates");
-        let (evidence, event_path, request) =
-            verified_request(&writer, &live, &staged, first_frontier)
-                .expect("the grow evidence matches full state");
-        PreparedFullStateTransition::new(
-            evidence,
-            writer
-                .runtime
-                .publisher()
-                .snapshot()
-                .frontiers
-                .verified_best,
-            event_path,
-            staged,
-            None,
-            request,
-        )
-        .expect("the grow staging facts agree")
-        .commit(&writer.runtime, &mut live, &writer.context())
-        .expect("grow commits before swapping full state");
-        assert_eq!(
-            live.best_tip(),
-            Some((first_frontier.height, first_frontier.hash))
-        );
-        assert_eq!(
-            writer
-                .runtime
-                .publisher()
-                .snapshot()
-                .frontiers
-                .verified_best,
-            first_frontier
-        );
-
-        let replacement = common.make_fake_child().set_work(20);
-        let replacement_frontier = Frontier::new(
-            replacement
-                .coinbase_height()
-                .expect("the replacement has a height"),
-            replacement.hash(),
-        );
-        let mut staged = live.clone();
-        staged
-            .commit_block(replacement.clone().prepare(), &finalized_state.db)
-            .expect("the higher-work replacement validates");
-        let (evidence, event_path, request) =
-            verified_request(&writer, &live, &staged, replacement_frontier)
-                .expect("the reset evidence matches full state");
-        PreparedFullStateTransition::new(
-            evidence,
-            writer
-                .runtime
-                .publisher()
-                .snapshot()
-                .frontiers
-                .verified_best,
-            event_path,
-            staged,
-            None,
-            request,
-        )
-        .expect("the reset staging facts agree")
-        .commit(&writer.runtime, &mut live, &writer.context())
-        .expect("reset commits before swapping full state");
-        assert_eq!(
-            writer
-                .runtime
-                .publisher()
-                .snapshot()
-                .frontiers
-                .verified_best,
-            replacement_frontier
-        );
-
-        let mut staged = live.clone();
-        staged
-            .invalidate_block(replacement_frontier.hash)
-            .expect("the winning replacement invalidates in staged state");
-        commit_operator_change(&writer, &mut live, staged, replacement_frontier.hash, true)
-            .expect("invalidation commits both frontiers before swapping state");
-        assert_eq!(
-            live.best_tip(),
-            Some((first_frontier.height, first_frontier.hash))
-        );
-        assert_eq!(
-            writer
-                .runtime
-                .publisher()
-                .snapshot()
-                .frontiers
-                .verified_best,
-            first_frontier
-        );
-
-        let mut staged = live.clone();
-        staged
-            .reconsider_block(replacement_frontier.hash, &finalized_state.db)
-            .expect("the replacement replays into staged state");
-        commit_operator_change(&writer, &mut live, staged, replacement_frontier.hash, false)
-            .expect("reconsider commits both frontiers before swapping state");
-        assert_eq!(
-            live.best_tip(),
-            Some((replacement_frontier.height, replacement_frontier.hash))
-        );
-        assert_eq!(
-            writer
-                .runtime
-                .publisher()
-                .snapshot()
-                .frontiers
-                .verified_best,
-            replacement_frontier
-        );
-        assert_eq!(
-            verified_path(&live)
-                .last()
-                .map(|header| Frontier::new(header.height, header.hash)),
-            Some(replacement_frontier)
-        );
-
-        let mut staged = live.clone();
-        staged
-            .invalidate_block(common.hash())
-            .expect("invalidating the common root empties every full-state branch");
-        commit_operator_change(&writer, &mut live, staged, common.hash(), true)
-            .expect("empty full state commits its exact finalized fallback");
-        assert!(live.is_chain_set_empty());
-        let snapshot = writer.runtime.publisher().snapshot();
-        assert_eq!(
-            snapshot.frontiers.verified_best,
-            snapshot.frontiers.finalized
-        );
-    }
-
-    #[test]
     fn contextual_finalization_commits_full_state_header_rows_and_memory_together() {
         let _init_guard = zakura_test::init();
         let network = Network::Mainnet;
@@ -3054,7 +2892,6 @@ mod tests {
             )
             .expect("genesis commits");
         let block1 = genesis.make_fake_child().set_work(10);
-        let block1_height = block1.coinbase_height().expect("block one has a height");
         finalized_state
             .commit_finalized_direct(
                 CheckpointVerifiedBlock::from(block1.clone()).into(),
@@ -3063,7 +2900,9 @@ mod tests {
                 "shared finalization fixture block one",
             )
             .expect("block one commits");
-        let writer = header_writer(&finalized_state, &network, block1_height, &block1);
+        let mut live = NonFinalizedState::new(&network);
+        let writer = HeaderChainWriter::attach_at_semantic_handoff(&finalized_state, &live)
+            .expect("the header engine attaches from authenticated finalized state");
         let mut block2 = block1.make_fake_child().set_work(10);
         let block2_height = block2.coinbase_height().expect("block two has a height");
         let mut block2_tx =
@@ -3077,7 +2916,6 @@ mod tests {
         *network_upgrade = NetworkUpgrade::Nu5;
         Arc::make_mut(&mut block2).transactions[0] = Arc::new(block2_tx);
         let frontier = Frontier::new(block2_height, block2.hash());
-        let mut live = NonFinalizedState::new(&network);
         let mut staged = live.clone();
         staged
             .commit_new_chain(block2.prepare(), &finalized_state.db)

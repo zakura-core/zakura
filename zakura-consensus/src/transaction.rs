@@ -461,9 +461,10 @@ where
             // This is a constricting rule, so it is gated on that network upgrade:
             // Orchard actions mined before it, under earlier rules that did not enforce
             // the proof size, must remain valid so that nodes can sync and reindex the
-            // chain before the soft fork that temporarily disabled Orchard. Orchard
-            // bundles are deserialized leniently, so the size is checked here, where the
-            // block height is available, rather than during parsing.
+            // chain before the soft fork that temporarily disabled Orchard. Whole-
+            // transaction parsing applies a stricter canonical-size policy to every V5
+            // and V6 transaction; repeat the consensus rule here using the block height
+            // for defense-in-depth and in-memory transactions.
             //
             // The gate activates at the NU6.2 activation height committed in
             // MAINNET/TESTNET_ACTIVATION_HEIGHTS. See

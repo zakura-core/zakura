@@ -1,0 +1,22 @@
+[package]
+name = "zakura-header-chain-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zakura-chain = { path = "../../zakura-chain" }
+zakura-network = { path = "../../zakura-network" }
+
+[[bin]]
+name = "header_codec"
+path = "fuzz_targets/header_codec.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

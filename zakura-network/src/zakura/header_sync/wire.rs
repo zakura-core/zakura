@@ -1100,6 +1100,53 @@ mod tests {
         )
     }
 
+    #[test]
+    fn header_codec_regression_corpus_replays_green() {
+        let codec = codec();
+        let context = HeaderSyncDecodeContext {
+            max_header_count: MAX_HS_RANGE,
+            requested_tree_aux_schema: AuxSchema::V1,
+        };
+        let corpus: &[(&str, &[u8])] = &[
+            (
+                "discriminator_status",
+                include_bytes!(
+                    "../../../../fuzz/header-chain/corpus/header_codec/discriminator_status"
+                ),
+            ),
+            (
+                "discriminator_get_headers",
+                include_bytes!(
+                    "../../../../fuzz/header-chain/corpus/header_codec/discriminator_get_headers"
+                ),
+            ),
+            (
+                "discriminator_headers",
+                include_bytes!(
+                    "../../../../fuzz/header-chain/corpus/header_codec/discriminator_headers"
+                ),
+            ),
+            (
+                "discriminator_headers_outcome",
+                include_bytes!(
+                    "../../../../fuzz/header-chain/corpus/header_codec/discriminator_headers_outcome"
+                ),
+            ),
+        ];
+
+        for (name, bytes) in corpus {
+            if let Ok(message) = codec.decode(bytes, Some(context)) {
+                let canonical = codec
+                    .encode(&message)
+                    .unwrap_or_else(|error| panic!("{name} failed to re-encode: {error}"));
+                let replayed = codec
+                    .decode(&canonical, Some(context))
+                    .unwrap_or_else(|error| panic!("{name} failed canonical replay: {error}"));
+                assert_eq!(replayed, message, "{name} changed after canonical replay");
+            }
+        }
+    }
+
     fn hash(byte: u8) -> block::Hash {
         block::Hash([byte; 32])
     }

@@ -1,4 +1,6 @@
-use super::{request::*, state::*, *};
+#[cfg(any(test, feature = "proptest-impl"))]
+use super::state::BlockSyncFrontiers;
+use super::{request::*, *};
 use std::num::NonZeroU64;
 
 /// Committed header metadata used by block sync to schedule and validate a body.

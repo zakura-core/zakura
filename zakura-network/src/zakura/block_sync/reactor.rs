@@ -2916,6 +2916,7 @@ fn bs_insert_duration_ms(
     );
 }
 
+#[cfg(any(test, feature = "proptest-impl"))]
 fn bs_insert_frontiers(
     row: &mut serde_json::Map<String, serde_json::Value>,
     frontiers: &BlockSyncFrontiers,

@@ -113,6 +113,11 @@ slow-timeout = { period = "15m", terminate-after = 1 }
 failure-output = "immediate"
 default-filter = 'package(zakura-network) and test(~zakura::testkit::blocksync_fuzz)'
 
+[profile.zakura-header-fuzz-regressions]
+fail-fast = true
+failure-output = "immediate"
+default-filter = '(package(zakura-network) and test(~header_codec_regression_corpus_replays_green)) or (package(zakura-header-chain) and test(~checked_in_transition_seed_corpus_replays_green))'
+
 
 [profile.sync-checkpoints-local]
 test-threads = 1

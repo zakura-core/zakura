@@ -185,6 +185,14 @@ pub(crate) struct HeaderChainReader {
     leases: Arc<Mutex<RetainedPathLeaseRegistry>>,
 }
 
+/// One atomically read selected-path window with exact auxiliary provenance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedAuxWindow {
+    pub(crate) current: HeaderNode,
+    pub(crate) current_deliveries: Vec<AuxDelivery>,
+    pub(crate) successor: Option<(HeaderNode, Vec<AuxDelivery>)>,
+}
+
 #[derive(Debug, Default)]
 struct RetainedPathLeaseRegistry {
     next_lease_id: u64,
@@ -284,6 +292,27 @@ impl RetainedPathLeaseRegistry {
 }
 
 impl HeaderChainReader {
+    fn coherent_aux_deliveries(
+        &self,
+        node: &HeaderNode,
+    ) -> Result<Vec<AuxDelivery>, HeaderChainStoreError> {
+        let deliveries = self.store.aux_deliveries(node.hash)?;
+        let indexed: BTreeSet<_> = node.aux_delivery_ids.iter().copied().collect();
+        let stored: BTreeSet<_> = deliveries
+            .iter()
+            .map(|delivery| delivery.delivery_id)
+            .collect();
+        if indexed.len() != node.aux_delivery_ids.len()
+            || stored.len() != deliveries.len()
+            || indexed != stored
+        {
+            return Err(HeaderChainStoreError::Store(StoreError::Incoherent(
+                "retained node and auxiliary delivery index disagree",
+            )));
+        }
+        Ok(deliveries)
+    }
+
     pub(crate) fn validation_context(
         &self,
         parent_hash: block::Hash,
@@ -345,6 +374,60 @@ impl HeaderChainReader {
             return Ok(None);
         };
         Ok((successor.parent_hash == hash).then_some(successor))
+    }
+
+    /// Read one exact selected header and its optional direct successor without
+    /// allowing a concurrent transition to mix branches or auxiliary records.
+    pub(crate) fn selected_aux_window(
+        &self,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> Result<Option<SelectedAuxWindow>, HeaderChainStoreError> {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        if self.store.selected_hash(height)? != Some(hash) {
+            return Ok(None);
+        }
+        let current = self.store.node(hash)?.ok_or(StoreError::Incoherent(
+            "selected auxiliary header is not retained",
+        ))?;
+        if current.height != height {
+            return Err(StoreError::Incoherent(
+                "selected auxiliary header height disagrees with its index",
+            )
+            .into());
+        }
+        let current_deliveries = self.coherent_aux_deliveries(&current)?;
+        let successor = match height.next() {
+            Ok(successor_height) => match self.store.selected_hash(successor_height)? {
+                Some(successor_hash) => {
+                    let successor =
+                        self.store
+                            .node(successor_hash)?
+                            .ok_or(StoreError::Incoherent(
+                                "selected auxiliary successor is not retained",
+                            ))?;
+                    if successor.height != successor_height || successor.parent_hash != hash {
+                        return Err(StoreError::Incoherent(
+                            "selected auxiliary successor does not extend the requested header",
+                        )
+                        .into());
+                    }
+                    let deliveries = self.coherent_aux_deliveries(&successor)?;
+                    Some((successor, deliveries))
+                }
+                None => None,
+            },
+            Err(_) => None,
+        };
+        Ok(Some(SelectedAuxWindow {
+            current,
+            current_deliveries,
+            successor,
+        }))
     }
 
     pub(crate) fn selected_locator(&self) -> Result<HeaderLocator, HeaderChainStoreError> {
@@ -478,8 +561,8 @@ impl HeaderChainReader {
             let node = self.store.node(*hash)?.ok_or(StoreError::Incoherent(
                 "active retained path node is absent",
             ))?;
+            aux_deliveries.push(self.coherent_aux_deliveries(&node)?);
             nodes.push(node);
-            aux_deliveries.push(self.store.aux_deliveries(*hash)?);
         }
         let renewed = leases.renew(peer, session_id, lease_id, Instant::now());
         debug_assert!(renewed, "the lease registry is locked across the page read");
@@ -2203,6 +2286,22 @@ mod tests {
                 .expect("an absent parent is a normal stale read"),
             None
         );
+        let window = reader
+            .selected_aux_window(child.height, child.hash)
+            .expect("the exact selected auxiliary window is coherent")
+            .expect("the selected child is retained");
+        assert_eq!(window.current.hash, child.hash);
+        assert!(window.current_deliveries.is_empty());
+        let (window_successor, successor_deliveries) =
+            window.successor.expect("the selected grandchild follows");
+        assert_eq!(window_successor.hash, grandchild.hash);
+        assert!(successor_deliveries.is_empty());
+        assert_eq!(
+            reader
+                .selected_aux_window(child.height, block::Hash([0xfe; 32]))
+                .expect("a stale branch hash is a normal read outcome"),
+            None
+        );
         let owner = SourceId::from_digest([1; 32]);
         let acquired = reader
             .acquire_retained_path(owner, 7, grandchild.hash, &[anchor.hash])
@@ -2387,6 +2486,49 @@ mod tests {
                 )
                 .expect("expired slots are reclaimed"),
             RetainedPathLeaseOutcome::Acquired(_)
+        ));
+
+        let snapshot = runtime.publisher().snapshot();
+        let delivery = AuxDelivery {
+            delivery_id: EvidenceId::from_digest([0xa1; 32]),
+            header_hash: anchor.hash,
+            source: SourceId::from_digest([0xa2; 32]),
+            owner: zakura_header_chain::WorkOwner {
+                state_version: snapshot.state_version,
+                header_generation: snapshot.header_generation,
+                verified_generation: Some(snapshot.verified_generation),
+                branch: zakura_header_chain::BranchId::new(anchor.hash, anchor.hash),
+                session_id: 11,
+                request_id: std::num::NonZeroU64::new(12).expect("twelve is nonzero"),
+            },
+            body_size: zakura_header_chain::BodySizeHint::Unknown,
+            tree_aux: None,
+            authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
+        };
+        let mut corrupt = DiskWriteBatch::new();
+        runtime
+            .store
+            .put_value(
+                &mut corrupt,
+                HEADER_AUX_DELIVERY,
+                HeaderAuxDeliveryKey {
+                    header: anchor.hash,
+                    delivery: delivery.delivery_id,
+                }
+                .as_bytes(),
+                &HeaderAuxDeliveryDisk(delivery),
+            )
+            .expect("the contradictory auxiliary row encodes");
+        runtime
+            .store
+            .db
+            .write(corrupt)
+            .expect("the contradictory auxiliary row commits");
+        assert!(matches!(
+            reader.selected_aux_window(anchor.height, anchor.hash),
+            Err(HeaderChainStoreError::Store(StoreError::Incoherent(
+                "retained node and auxiliary delivery index disagree"
+            )))
         ));
     }
 

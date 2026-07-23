@@ -411,9 +411,11 @@ impl PeerRoutine {
                         // the supervised pipe cancels the connection; the `Drop`
                         // guard returns unreceived work on the way out.
                         Some(frame) => self.handle_frame(&mut guard, frame).await?,
-                        // Stream closed (peer gone): exit cleanly. `Drop` returns
+                        // Stream closed by the peer. With no outstanding work this
+                        // is a clean exit; with unanswered requests it is a
+                        // no-progress stall (park or disconnect). `Drop` returns
                         // unreceived outstanding heights and releases their budget.
-                        None => return Ok(()),
+                        None => return self.handle_remote_stream_closed(Instant::now()),
                     }
                 }
                 changed = self.sequencer_view.changed() => {
@@ -1174,34 +1176,57 @@ impl PeerRoutine {
                     .extend_liveness_deadline(now, self.config.request_timeout);
                 Ok(())
             }
-            LivenessOutcome::Park => {
-                let error =
-                    "block-sync peer made no accepted block progress before liveness deadline";
-                if no_progress_response(self.allow_no_progress_park)
-                    == NoProgressResponse::Disconnect
-                {
-                    tracing::debug!(
-                        peer = ?self.peer,
-                        outstanding = self.window.outstanding.len(),
-                        "disconnecting Zakura block-sync peer after repeated no-progress stall"
-                    );
-                    return Err(SinkReject::protocol(error));
-                }
-                self.registry.park_session(
-                    &self.peer,
-                    self.conn_id,
-                    self.generation,
-                    now + self.config.effective_no_progress_peer_cooldown(),
-                );
-                self.trace_liveness_park(error);
-                tracing::debug!(
-                    peer = ?self.peer,
-                    outstanding = self.window.outstanding.len(),
-                    "parking Zakura block-sync session after no accepted block progress"
-                );
-                Err(SinkReject::local(error))
-            }
+            LivenessOutcome::Park => self.no_progress_stall(
+                now,
+                "block-sync peer made no accepted block progress before liveness deadline",
+            ),
         }
+    }
+
+    /// Apply the no-progress stall protocol: disconnect on a repeated stall,
+    /// otherwise park the session for the cooldown and exit locally (the
+    /// connection survives).
+    fn no_progress_stall(&mut self, now: Instant, error: &'static str) -> Result<(), SinkReject> {
+        if no_progress_response(self.allow_no_progress_park) == NoProgressResponse::Disconnect {
+            tracing::debug!(
+                peer = ?self.peer,
+                outstanding = self.window.outstanding.len(),
+                "disconnecting Zakura block-sync peer after repeated no-progress stall"
+            );
+            return Err(SinkReject::protocol(error));
+        }
+        self.registry.park_session(
+            &self.peer,
+            self.conn_id,
+            self.generation,
+            now + self.config.effective_no_progress_peer_cooldown(),
+        );
+        self.trace_liveness_park(error);
+        tracing::debug!(
+            peer = ?self.peer,
+            outstanding = self.window.outstanding.len(),
+            "parking Zakura block-sync session after no accepted block progress"
+        );
+        Err(SinkReject::local(error))
+    }
+
+    /// Handle the peer closing its send side of the stream. Honest peers close
+    /// *connections*, not lone streams; a stream-only EOF while we still hold
+    /// unanswered requests is the same signal as the liveness stall and must not
+    /// reset the park/second-stall state machine — otherwise a peer could take
+    /// work, deliver nothing, EOF before the liveness deadline, and be readmitted
+    /// fresh forever. Frames are processed in-order in this task, so at EOF
+    /// everything the peer sent has already been counted. The liveness grace does
+    /// not apply: it waits for in-flight frames stuck behind our full outbound
+    /// queue, and a closed stream has none.
+    fn handle_remote_stream_closed(&mut self, now: Instant) -> Result<(), SinkReject> {
+        if self.window.outstanding.is_empty() {
+            return Ok(());
+        }
+        self.no_progress_stall(
+            now,
+            "block-sync peer closed the stream with outstanding requests unanswered",
+        )
     }
 
     /// Drop this routine's outstanding requests whose whole range is at or below

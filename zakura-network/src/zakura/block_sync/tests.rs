@@ -3070,6 +3070,161 @@ async fn block_liveness_parks_silent_session_without_disconnect() {
 }
 
 #[tokio::test]
+async fn remote_stream_eof_with_outstanding_work_parks_session() {
+    // A peer that takes work and then closes just the stream (connection stays
+    // up) before the liveness deadline must hit the same no-progress park as a
+    // silent peer — otherwise EOF-cycling resets the park/second-stall state
+    // machine and the peer is readmitted fresh forever.
+    let mut config = immediate_body_download_config();
+    // Long request timeout so the liveness deadline (request_timeout * 4) cannot
+    // fire inside this test's window: a park can only come from the EOF path.
+    config.request_timeout = Duration::from_secs(10);
+    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    let peer = peer(0x52);
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    let connection_cancel = CancellationToken::new();
+    service.add_peer(Peer::new_with_direction(
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        connection_cancel.clone(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                tip_hash: block::Hash([1; 32]),
+                max_blocks_per_response: 1,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+
+    tip_tx
+        .send((block::Height(1), block::Hash([1; 32])))
+        .expect("tip watch is live");
+    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+            height: block::Height(1),
+            hash: block::Hash([1; 32]),
+            size: BlockSizeEstimate::Advertised(1_000),
+        }]))
+        .await
+        .expect("needed metadata queues");
+
+    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(count, 1);
+
+    // The peer holds one unanswered GetBlocks; close its send side of the
+    // stream without delivering anything.
+    drop(inbound_tx);
+
+    await_until(
+        "EOF'd block-sync session is locally parked",
+        Duration::from_secs(3),
+        || handle.peer_snapshot().outbound_peers == 0,
+    )
+    .await
+    .expect("stream EOF with outstanding work must park the session");
+    assert!(
+        !connection_cancel.is_cancelled(),
+        "a first stream-EOF stall must preserve the shared transport connection",
+    );
+    assert!(
+        !service.wants_peer(&peer, ZAKURA_CAP_BLOCK_SYNC, ServicePeerDirection::Outbound,),
+        "the parked peer must be withheld during its block-sync cooldown",
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn remote_stream_eof_without_outstanding_work_stays_clean() {
+    // A stream EOF with nothing outstanding is a clean exit: no park, and the
+    // peer stays eligible for re-admission.
+    let mut config = immediate_body_download_config();
+    config.request_timeout = Duration::from_secs(10);
+
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    let peer = peer(0x53);
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    let connection_cancel = CancellationToken::new();
+    service.add_peer(Peer::new_with_direction(
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        connection_cancel.clone(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
+
+    drop(inbound_tx);
+
+    await_until(
+        "idle block-sync session exits on stream EOF",
+        Duration::from_secs(3),
+        || handle.peer_snapshot().outbound_peers == 0,
+    )
+    .await
+    .expect("stream EOF without outstanding work exits cleanly");
+    assert!(
+        !connection_cancel.is_cancelled(),
+        "a clean stream EOF must preserve the shared transport connection",
+    );
+    assert!(
+        service.wants_peer(&peer, ZAKURA_CAP_BLOCK_SYNC, ServicePeerDirection::Outbound,),
+        "a clean stream EOF must leave the peer eligible for re-admission",
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
 async fn block_liveness_credits_late_unmatched_body_and_keeps_peer() {
     // Regression: a peer whose probe times out but that then delivers the body late
     // — after its own outstanding request was already removed, so the body arrives

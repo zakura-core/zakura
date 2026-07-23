@@ -41,10 +41,11 @@ use crate::{
 
 use super::{
     spawn_supervised_peer_task, trace::peer_label as trace_peer_label, BoxRunFuture, Frame,
-    FramedSend, OrderedSendError, OrderedStreamOpening, OrderedStreamPolicy, Peer,
-    RequestResponseService, Service as ZakuraService, SinkReject, Stream, StreamMode, ZakuraConnId,
-    ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
-    LEGACY_REQUEST_TABLE, LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
+    FramedSend, OrderedSendError, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy,
+    Peer, RequestResponseService, Service as ZakuraService, ServicePeerDirection, SinkReject,
+    Stream, StreamMode, ZakuraConnId, ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle,
+    ZakuraTrace, FRAME_HEADER_BYTES, LEGACY_REQUEST_TABLE, LOCAL_MAX_CONTROL_FRAME_BYTES,
+    ZAKURA_CAP_LEGACY_GOSSIP,
 };
 
 /// Zakura stream kind reserved for legacy gossip compatibility.
@@ -1289,12 +1290,29 @@ struct GossipGapClaim {
     conn_id: ZakuraConnId,
 }
 
+/// Consecutive gossip sessions on one connection that ended without delivering a
+/// single frame before the service retires the peer's gossip stream. Generous:
+/// honest peers send frames, and transient stream errors do not repeat eight
+/// times in a row on a healthy connection.
+const MAX_GOSSIP_NO_FRAME_SESSIONS: u32 = 8;
+
+/// Per-connection counter of consecutive zero-frame session exits, so a peer
+/// cycling stream EOFs cannot convert endless reopen churn into a permanently
+/// claim-pinned connection.
+#[derive(Clone, Copy, Debug)]
+struct GossipSessionChurn {
+    conn_id: ZakuraConnId,
+    no_frame_exits: u32,
+    retired: bool,
+}
+
 /// Session and reopen-gap claim state, kept under one lock so a session removal
 /// and its gap claim are always observed together.
 #[derive(Debug, Default)]
 struct LegacyGossipOutboundState {
     sessions: HashMap<ZakuraPeerId, LegacyGossipPeerSession>,
     gap_claims: HashMap<ZakuraPeerId, GossipGapClaim>,
+    churn: HashMap<ZakuraPeerId, GossipSessionChurn>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1316,6 +1334,16 @@ impl LegacyGossipOutbound {
         }) {
             return false;
         }
+        // A retired connection must not be resurrected by a new stream — the
+        // remote initiates streams on inbound connections and could otherwise
+        // churn sessions at its own pace.
+        if state
+            .churn
+            .get(session.peer_id())
+            .is_some_and(|churn| churn.conn_id == session.conn_id() && churn.retired)
+        {
+            return false;
+        }
         state.gap_claims.remove(session.peer_id());
         state.sessions.insert(session.peer_id().clone(), session);
         true
@@ -1328,7 +1356,17 @@ impl LegacyGossipOutbound {
     /// teardown from an earlier stream session must not retire a reopened
     /// session: removal requires an exact `(conn_id, session_id)` match, and the
     /// gap claim is inserted only when that removal happened.
-    fn finish_session(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId, session_id: u64) {
+    ///
+    /// `no_frame_exit` marks a session that ended without delivering a single
+    /// frame; enough of those in a row retires the peer's gossip stream on this
+    /// connection instead of claiming another reopen gap.
+    fn finish_session(
+        &self,
+        peer: &ZakuraPeerId,
+        conn_id: ZakuraConnId,
+        session_id: u64,
+        no_frame_exit: bool,
+    ) {
         let mut state = self
             .state
             .lock()
@@ -1336,12 +1374,63 @@ impl LegacyGossipOutbound {
         let matches_exact = state.sessions.get(peer).is_some_and(|session| {
             session.conn_id() == conn_id && session.session_id() == session_id
         });
-        if matches_exact {
-            state.sessions.remove(peer);
+        if !matches_exact {
+            return;
+        }
+        state.sessions.remove(peer);
+
+        let churn = state
+            .churn
+            .entry(peer.clone())
+            .and_modify(|churn| {
+                // A newer connection starts a fresh churn record.
+                if churn.conn_id != conn_id {
+                    *churn = GossipSessionChurn {
+                        conn_id,
+                        no_frame_exits: 0,
+                        retired: false,
+                    };
+                }
+            })
+            .or_insert(GossipSessionChurn {
+                conn_id,
+                no_frame_exits: 0,
+                retired: false,
+            });
+        if no_frame_exit {
+            churn.no_frame_exits = churn.no_frame_exits.saturating_add(1);
+            if churn.no_frame_exits >= MAX_GOSSIP_NO_FRAME_SESSIONS {
+                churn.retired = true;
+            }
+        } else {
+            churn.no_frame_exits = 0;
+        }
+
+        if churn.retired {
+            // No gap claim: the retired stream will not be reopened, so holding
+            // connection ownership across a gap would pin the connection open
+            // for a service that has given up on it.
+            debug!(
+                ?peer,
+                conn_id, "retiring Zakura legacy-gossip stream after repeated zero-frame sessions"
+            );
+            state.gap_claims.remove(peer);
+        } else {
             state
                 .gap_claims
                 .insert(peer.clone(), GossipGapClaim { conn_id });
         }
+    }
+
+    /// Whether the peer's gossip stream on this connection has been retired
+    /// after repeated zero-frame sessions.
+    fn is_retired(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        self.state
+            .lock()
+            .expect("legacy gossip outbound mutex is never poisoned")
+            .churn
+            .get(peer)
+            .is_some_and(|churn| churn.conn_id == conn_id && churn.retired)
     }
 
     /// Release all state for a closed connection: the active session (whatever
@@ -1364,6 +1453,13 @@ impl LegacyGossipOutbound {
             .is_some_and(|claim| claim.conn_id == conn_id)
         {
             state.gap_claims.remove(peer);
+        }
+        if state
+            .churn
+            .get(peer)
+            .is_some_and(|churn| churn.conn_id == conn_id)
+        {
+            state.churn.remove(peer);
         }
     }
 
@@ -2427,11 +2523,25 @@ impl ZakuraService for LegacyGossipSink {
     }
 
     fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
-        // A reopen-gap claim counts as ownership without any demand gating:
-        // gossip has no `ordered_session_demand`/`wants_peer` override, so its
-        // demand for a connected peer is unconditionally `OpenNow` and the
-        // transport re-admits as soon as the reopen backoff elapses.
+        // A reopen-gap claim counts as ownership without any demand gating: for
+        // a non-retired peer the demand below is unconditionally `OpenNow` and
+        // the transport re-admits as soon as the reopen backoff elapses. A
+        // retired peer holds no session and no claim, so ownership correctly
+        // reads false.
         self.outbound.owns_connection(peer, conn_id)
+    }
+
+    fn ordered_session_demand(
+        &self,
+        conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        _negotiated: u64,
+        _direction: ServicePeerDirection,
+    ) -> OrderedSessionDemand {
+        if self.outbound.is_retired(peer, conn_id) {
+            return OrderedSessionDemand::Retire;
+        }
+        OrderedSessionDemand::OpenNow
     }
 
     fn add_peer(&self, mut peer: Peer) {
@@ -2459,7 +2569,12 @@ impl ZakuraService for LegacyGossipSink {
             || {},
             move || {
                 replay_panic_cancel.cancel();
-                replay_panic_outbound.finish_session(&replay_panic_peer_id, conn_id, session_id);
+                replay_panic_outbound.finish_session(
+                    &replay_panic_peer_id,
+                    conn_id,
+                    session_id,
+                    false,
+                );
             },
             {
                 let outbound = outbound.clone();
@@ -2479,23 +2594,37 @@ impl ZakuraService for LegacyGossipSink {
         spawn_supervised_peer_task(
             recv_task_peer_id,
             move || {
-                recv_teardown_outbound.finish_session(&recv_teardown_peer_id, conn_id, session_id)
+                recv_teardown_outbound.finish_session(
+                    &recv_teardown_peer_id,
+                    conn_id,
+                    session_id,
+                    false,
+                )
             },
             move || {
                 recv_panic_cancel.cancel();
             },
             async move {
+                let mut received_frame = false;
                 loop {
                     let frame = tokio::select! {
                         _ = cancel_token.cancelled() => {
-                            outbound.finish_session(&peer_id, conn_id, session_id);
+                            outbound.finish_session(&peer_id, conn_id, session_id, false);
                             return;
                         }
                         frame = recv.recv() => {
                             let Some(frame) = frame else {
-                                outbound.finish_session(&peer_id, conn_id, session_id);
+                                // A stream-only EOF without a single delivered
+                                // frame counts toward the reopen-churn bound.
+                                outbound.finish_session(
+                                    &peer_id,
+                                    conn_id,
+                                    session_id,
+                                    !received_frame,
+                                );
                                 return;
                             };
+                            received_frame = true;
                             frame
                         }
                     };
@@ -2514,7 +2643,7 @@ impl ZakuraService for LegacyGossipSink {
                                 "legacy gossip stream rejected protocol-invalid frame"
                             );
                             cancel_token.cancel();
-                            outbound.finish_session(&peer_id, conn_id, session_id);
+                            outbound.finish_session(&peer_id, conn_id, session_id, false);
                             return;
                         }
                         Err(SinkReject::Local(error)) => {
@@ -4473,7 +4602,7 @@ mod tests {
 
         // A delayed teardown from the first stream session must not retire the
         // reopened session.
-        outbound.finish_session(&peer_id, conn_id, 1);
+        outbound.finish_session(&peer_id, conn_id, 1, false);
         assert!(
             outbound.contains(&peer_id),
             "stale teardown must not retire the reopened gossip session",
@@ -4490,12 +4619,111 @@ mod tests {
         )));
 
         // The owning session's teardown retires it and claims the reopen gap.
-        outbound.finish_session(&peer_id, conn_id, 2);
+        outbound.finish_session(&peer_id, conn_id, 2, false);
         assert!(!outbound.contains(&peer_id));
         assert!(
             outbound.owns_connection(&peer_id, conn_id),
             "reopen gap keeps the connection owned",
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_no_frame_gossip_sessions_retire_the_service() {
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let outbound = LegacyGossipOutbound::default();
+        let sink = LegacyGossipSink {
+            inbound_tx,
+            outbound: outbound.clone(),
+            trace: ZakuraTrace::noop(),
+        };
+        let peer_id = ZakuraPeerId::new(vec![98; 32]).expect("test peer id is within bounds");
+        let conn_id = 7;
+
+        for session_id in 1..=u64::from(MAX_GOSSIP_NO_FRAME_SESSIONS) {
+            let (send, _rx) = framed_channel(1);
+            assert!(
+                outbound.insert(LegacyGossipPeerSession::new(
+                    peer_id.clone(),
+                    conn_id,
+                    session_id,
+                    send
+                )),
+                "session {session_id} is admitted before the churn bound"
+            );
+            outbound.finish_session(&peer_id, conn_id, session_id, true);
+        }
+
+        assert!(
+            !outbound.owns_connection(&peer_id, conn_id),
+            "a retired gossip stream must not hold a reopen-gap claim"
+        );
+        assert!(matches!(
+            sink.ordered_session_demand(conn_id, &peer_id, 0, ServicePeerDirection::Outbound),
+            OrderedSessionDemand::Retire,
+        ));
+        let (send, _rx) = framed_channel(1);
+        assert!(
+            !outbound.insert(LegacyGossipPeerSession::new(
+                peer_id.clone(),
+                conn_id,
+                u64::from(MAX_GOSSIP_NO_FRAME_SESSIONS) + 1,
+                send
+            )),
+            "a retired connection must refuse new gossip sessions"
+        );
+
+        // A fresh connection starts a fresh churn record.
+        let new_conn_id = conn_id + 1;
+        let (send, _rx) = framed_channel(1);
+        assert!(outbound.insert(LegacyGossipPeerSession::new(
+            peer_id.clone(),
+            new_conn_id,
+            1,
+            send
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_received_frame_resets_gossip_churn() {
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let sink = LegacyGossipSink {
+            inbound_tx,
+            outbound: LegacyGossipOutbound::default(),
+            trace: ZakuraTrace::noop(),
+        };
+        let outbound = sink.outbound.clone();
+        let peer_id = ZakuraPeerId::new(vec![99; 32]).expect("test peer id is within bounds");
+        let conn_id = 7;
+        let mut session_id = 0;
+        let mut run_session = |no_frame_exit: bool| {
+            session_id += 1;
+            let (send, _rx) = framed_channel(1);
+            assert!(outbound.insert(LegacyGossipPeerSession::new(
+                peer_id.clone(),
+                conn_id,
+                session_id,
+                send
+            )));
+            outbound.finish_session(&peer_id, conn_id, session_id, no_frame_exit);
+        };
+
+        for _ in 1..MAX_GOSSIP_NO_FRAME_SESSIONS {
+            run_session(true);
+        }
+        // A session that delivered a frame resets the churn counter.
+        run_session(false);
+        for _ in 1..MAX_GOSSIP_NO_FRAME_SESSIONS {
+            run_session(true);
+        }
+
+        assert!(
+            outbound.owns_connection(&peer_id, conn_id),
+            "a reset churn counter must keep the reopen-gap claim"
+        );
+        assert!(matches!(
+            sink.ordered_session_demand(conn_id, &peer_id, 0, ServicePeerDirection::Outbound),
+            OrderedSessionDemand::OpenNow,
+        ));
     }
 
     #[tokio::test]

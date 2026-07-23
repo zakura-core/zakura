@@ -1,4 +1,4 @@
-use std::{future::Future, time::Instant};
+use std::future::Future;
 
 use color_eyre::eyre::{eyre, Report};
 use sha2::{Digest, Sha256};
@@ -14,7 +14,7 @@ use zakura_network::zakura::{
     commit_state_trace as cs_trace, FullStateFrontiers, HeaderEntry, HeaderPathLease,
     HeaderPathLeaseResult, HeaderPathPage, HeaderPathPageResult, HeaderSyncAction, HeaderSyncEvent,
     HeaderTargetAdmissionResult, HeaderTargetPreparationResult, HeadersOutcomeCode,
-    ZakuraHeaderSyncDriverStartup, ZakuraPeerId, ZakuraTrace, DEFAULT_HS_RANGE,
+    ZakuraHeaderSyncDriverStartup, ZakuraPeerId, ZakuraTrace,
 };
 
 use super::{
@@ -452,16 +452,6 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     })
                     .await;
             }
-            HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
-                log_missing_block_bodies(read_state.clone(), from, limit, &trace).await;
-            }
-            HeaderSyncAction::BodyGaps { from, to } => {
-                let limit =
-                    to.0.saturating_sub(from.0)
-                        .saturating_add(1)
-                        .min(DEFAULT_HS_RANGE);
-                log_missing_block_bodies(read_state.clone(), from, limit, &trace).await;
-            }
         }
     }
 }
@@ -788,77 +778,6 @@ fn source_id(peer: &ZakuraPeerId) -> Option<zakura_header_chain::SourceId> {
     Some(zakura_header_chain::SourceId::from_digest(digest))
 }
 
-async fn log_missing_block_bodies<ReadState>(
-    read_state: ReadState,
-    from: block::Height,
-    limit: u32,
-    trace: &ZakuraTrace,
-) where
-    ReadState: Service<
-            zakura_state::ReadRequest,
-            Response = zakura_state::ReadResponse,
-            Error = zakura_state::BoxError,
-        > + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
-{
-    trace_state_read_start(trace, "missing_block_bodies", None, from, limit);
-    let started = Instant::now();
-    match read_state
-        .oneshot(zakura_state::ReadRequest::MissingBlockBodies { from, limit })
-        .await
-    {
-        Ok(zakura_state::ReadResponse::MissingBlockBodies(heights)) => {
-            emit_commit_state(
-                trace,
-                cs_trace::STATE_READ_SUCCESS,
-                "header_sync_driver",
-                |row| {
-                    insert_cs_str(row, cs_trace::ACTION, "missing_block_bodies");
-                    insert_cs_height(row, cs_trace::RANGE_START, from);
-                    insert_cs_u64(row, cs_trace::RANGE_COUNT, heights.len() as u64);
-                    insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-                },
-            );
-            let first = heights.first().copied();
-            let last = heights.last().copied();
-            let count = heights.len();
-            debug!(
-                ?from,
-                ?limit,
-                ?count,
-                ?first,
-                ?last,
-                "Zakura header-known body gaps from state"
-            );
-        }
-        Ok(response) => {
-            trace_state_read_error(
-                trace,
-                "missing_block_bodies",
-                None,
-                from,
-                limit,
-                "unexpected_response",
-                started,
-            );
-            warn!(?response, "unexpected MissingBlockBodies response")
-        }
-        Err(error) => {
-            trace_state_read_error(
-                trace,
-                "missing_block_bodies",
-                None,
-                from,
-                limit,
-                &format!("{error}"),
-                started,
-            );
-            warn!(?error, "failed to query Zakura missing block bodies")
-        }
-    }
-}
-
 fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
     emit_commit_state(
         trace,
@@ -921,73 +840,11 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
                 insert_cs_peer(row, cs_trace::PEER, peer);
                 insert_cs_hash(row, cs_trace::HASH, insert.target_tip_hash);
             }
-            HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
-                insert_cs_str(row, cs_trace::ACTION, "query_missing_block_bodies");
-                insert_cs_height(row, cs_trace::RANGE_START, *from);
-                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(*limit));
-            }
             HeaderSyncAction::Misbehavior { peer, reason } => {
                 insert_cs_str(row, cs_trace::ACTION, "misbehavior");
                 insert_cs_peer(row, cs_trace::PEER, peer);
                 insert_cs_str(row, cs_trace::REASON, header_misbehavior_label(*reason));
             }
-            HeaderSyncAction::BodyGaps { from, to } => {
-                insert_cs_str(row, cs_trace::ACTION, "body_gaps");
-                insert_cs_height(row, cs_trace::RANGE_START, *from);
-                insert_cs_u64(
-                    row,
-                    cs_trace::RANGE_COUNT,
-                    u64::from(to.0.saturating_sub(from.0).saturating_add(1)),
-                );
-            }
-        },
-    );
-}
-
-fn trace_state_read_start(
-    trace: &ZakuraTrace,
-    action: &'static str,
-    peer: Option<&zakura_network::zakura::ZakuraPeerId>,
-    start: block::Height,
-    count: u32,
-) {
-    emit_commit_state(
-        trace,
-        cs_trace::STATE_READ_START,
-        "header_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, action);
-            if let Some(peer) = peer {
-                insert_cs_peer(row, cs_trace::PEER, peer);
-            }
-            insert_cs_height(row, cs_trace::RANGE_START, start);
-            insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-        },
-    );
-}
-
-fn trace_state_read_error(
-    trace: &ZakuraTrace,
-    action: &'static str,
-    peer: Option<&zakura_network::zakura::ZakuraPeerId>,
-    start: block::Height,
-    count: u32,
-    reason: &str,
-    started: Instant,
-) {
-    emit_commit_state(
-        trace,
-        cs_trace::STATE_READ_ERROR,
-        "header_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, action);
-            if let Some(peer) = peer {
-                insert_cs_peer(row, cs_trace::PEER, peer);
-            }
-            insert_cs_height(row, cs_trace::RANGE_START, start);
-            insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-            insert_cs_str(row, cs_trace::REASON, reason);
-            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
         },
     );
 }
@@ -997,8 +854,4 @@ fn header_misbehavior_label(reason: zakura_network::zakura::HeaderSyncMisbehavio
         zakura_network::zakura::HeaderSyncMisbehavior::MalformedMessage => "malformed_message",
         zakura_network::zakura::HeaderSyncMisbehavior::InvalidHeader => "invalid_header",
     }
-}
-
-fn elapsed_ms(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }

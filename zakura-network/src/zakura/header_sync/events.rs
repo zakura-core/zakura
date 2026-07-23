@@ -504,26 +504,12 @@ pub enum HeaderSyncAction {
         /// Sealed selected-auxiliary insertion.
         insert: Box<zakura_header_chain::InsertHeaders>,
     },
-    /// Ask state for missing block-body gaps.
-    QueryMissingBlockBodies {
-        /// First height to consider.
-        from: block::Height,
-        /// Maximum number of heights.
-        limit: u32,
-    },
     /// Record peer protocol misbehavior.
     Misbehavior {
         /// Misbehaving peer.
         peer: ZakuraPeerId,
         /// Classification.
         reason: HeaderSyncMisbehavior,
-    },
-    /// Notify body download wiring about a missing interval.
-    BodyGaps {
-        /// First missing height.
-        from: block::Height,
-        /// Last missing height.
-        to: block::Height,
     },
 }
 

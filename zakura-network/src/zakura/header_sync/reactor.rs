@@ -218,13 +218,6 @@ impl HeaderSyncReactor {
     async fn run(mut self) {
         let mut committed_snapshots = self.startup.committed_snapshots.clone();
         let mut vct_root_repairs = self.startup.vct_root_repairs.clone();
-        let _ = self
-            .actions
-            .try_send(HeaderSyncAction::QueryMissingBlockBodies {
-                from: next_height(self.startup.frontiers.verified_block_tip),
-                limit: DEFAULT_HS_RANGE,
-            });
-
         loop {
             let maintenance = self.next_maintenance_deadline();
             metrics::counter!("sync.header.reactor.iterations").increment(1);
@@ -2747,19 +2740,12 @@ mod tests {
         let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot));
         startup.committed_snapshots = Some(snapshots_rx);
 
-        let (handle, mut actions, reactor) =
+        let (handle, _actions, reactor) =
             spawn_header_sync_reactor(startup).expect("the snapshot-authoritative reactor starts");
         assert_eq!(
             handle.best_header_tip(),
             (header_best.height, header_best.hash)
         );
-        assert!(matches!(
-            next_action(&mut actions).await,
-            HeaderSyncAction::QueryMissingBlockBodies {
-                from: block::Height(1),
-                ..
-            }
-        ));
 
         reactor.abort();
     }
@@ -2905,10 +2891,6 @@ mod tests {
             owner.scope(),
             zakura_header_chain::WorkScope::for_body_work(&snapshot)
         );
-        assert!(matches!(
-            next_action(&mut actions).await,
-            HeaderSyncAction::QueryMissingBlockBodies { .. }
-        ));
 
         let (send, mut outbound) = framed_channel(8);
         let peer = peer();
@@ -3135,10 +3117,6 @@ mod tests {
         else {
             panic!("the repair context is queried");
         };
-        assert!(matches!(
-            next_action(&mut actions).await,
-            HeaderSyncAction::QueryMissingBlockBodies { .. }
-        ));
 
         let (send, mut outbound) = framed_channel(8);
         let peer = peer();
@@ -3260,10 +3238,6 @@ mod tests {
         startup.committed_snapshots = Some(snapshots_rx);
         let (handle, mut actions, task) =
             spawn_header_sync_reactor(startup).expect("the requester fixture starts");
-        assert!(matches!(
-            next_action(&mut actions).await,
-            HeaderSyncAction::QueryMissingBlockBodies { .. }
-        ));
 
         let (send, mut outbound) = framed_channel(8);
         let peer = peer();
@@ -3396,10 +3370,6 @@ mod tests {
         startup.committed_snapshots = Some(snapshots_rx);
         let (handle, mut actions, task) =
             spawn_header_sync_reactor(startup).expect("the requester fixture starts");
-        assert!(matches!(
-            next_action(&mut actions).await,
-            HeaderSyncAction::QueryMissingBlockBodies { .. }
-        ));
         let (send, mut outbound) = framed_channel(8);
         let peer = peer();
         handle
@@ -3692,10 +3662,6 @@ mod tests {
         startup.committed_snapshots = Some(snapshots_rx);
         let (handle, mut actions, task) =
             spawn_header_sync_reactor(startup).expect("the requester fixture starts");
-        assert!(matches!(
-            next_action(&mut actions).await,
-            HeaderSyncAction::QueryMissingBlockBodies { .. }
-        ));
         let (send, mut outbound) = framed_channel(16);
         let peer = peer();
         handle
@@ -3804,10 +3770,6 @@ mod tests {
         startup.committed_snapshots = Some(snapshots_rx);
         let (handle, mut actions, task) =
             spawn_header_sync_reactor(startup).expect("the fixture starts");
-        assert!(matches!(
-            next_action(&mut actions).await,
-            HeaderSyncAction::QueryMissingBlockBodies { .. }
-        ));
         let (send, mut outbound) = framed_channel(8);
         let peer = peer();
         handle
@@ -4033,10 +3995,6 @@ mod tests {
         startup.committed_snapshots = Some(snapshots_rx);
         let (handle, mut actions, task) =
             spawn_header_sync_reactor(startup).expect("the serving fixture starts");
-        assert!(matches!(
-            next_action(&mut actions).await,
-            HeaderSyncAction::QueryMissingBlockBodies { .. }
-        ));
 
         let (send, mut outbound) = framed_channel(8);
         let peer = peer();
@@ -4155,10 +4113,6 @@ mod tests {
         startup.committed_snapshots = Some(snapshots_rx);
         let (handle, mut actions, task) =
             spawn_header_sync_reactor(startup).expect("the fixture starts");
-        assert!(matches!(
-            next_action(&mut actions).await,
-            HeaderSyncAction::QueryMissingBlockBodies { .. }
-        ));
         let (send, mut outbound) = framed_channel(8);
         let peer = peer();
         handle

@@ -343,3 +343,11 @@ This file is the sole reporting channel (design D5). Entry template:
   main) → exp002-k8-c confirmation back-to-back → formal WIN if the two-leg
   test passes again → then B-04 (collision-check PR 390 first) or B-06/B-07.
 - PRs 166/217 still open: batching default stays PROPOSAL.
+
+### settle1 incident + B-16 applied (2026-07-23)
+
+- first settle1 attempt died at ~50 min on the third HTTP/2 mid-stream
+  download failure in two days; two-strikes escalation: B-16 patch built
+  (curl --http1.1 + primary-source double-try, baked into prepare_remote as
+  the fourth marker-guarded patch) and applied live to s3; settle1 restarted
+  under it.

@@ -1224,6 +1224,7 @@ struct ZakuraDiscoveryInner {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct ZakuraDiscoveryAdmittedPeer {
     conn_id: ZakuraConnId,
+    session_id: u64,
     direction: ServicePeerDirection,
 }
 
@@ -1576,13 +1577,28 @@ impl ZakuraDiscoveryHandle {
         peer_id: ZakuraPeerId,
         direction: ServicePeerDirection,
     ) -> ServiceAdmissionDecision {
+        self.admit_peer_session(conn_id, 0, peer_id, direction)
+            .await
+    }
+
+    pub(crate) async fn admit_peer_session(
+        &self,
+        conn_id: ZakuraConnId,
+        session_id: u64,
+        peer_id: ZakuraPeerId,
+        direction: ServicePeerDirection,
+    ) -> ServiceAdmissionDecision {
         let mut inner = self.inner.lock().await;
         if let Some(peer) = inner.admitted_peers.get_mut(&peer_id) {
-            if conn_id < peer.conn_id {
+            if (conn_id, session_id) <= (peer.conn_id, peer.session_id) {
                 return ServiceAdmissionDecision::RejectNotUseful;
             }
 
-            *peer = ZakuraDiscoveryAdmittedPeer { conn_id, direction };
+            *peer = ZakuraDiscoveryAdmittedPeer {
+                conn_id,
+                session_id,
+                direction,
+            };
             self.publish_peer_snapshot_locked(&inner);
             return ServiceAdmissionDecision::Admit;
         }
@@ -1600,9 +1616,14 @@ impl ZakuraDiscoveryHandle {
         if admitted >= cap {
             ServiceAdmissionDecision::RejectFull
         } else {
-            inner
-                .admitted_peers
-                .insert(peer_id, ZakuraDiscoveryAdmittedPeer { conn_id, direction });
+            inner.admitted_peers.insert(
+                peer_id,
+                ZakuraDiscoveryAdmittedPeer {
+                    conn_id,
+                    session_id,
+                    direction,
+                },
+            );
             self.publish_peer_snapshot_locked(&inner);
             ServiceAdmissionDecision::Admit
         }
@@ -1619,6 +1640,38 @@ impl ZakuraDiscoveryHandle {
             inner.admitted_peers.remove(peer_id);
         }
         self.publish_peer_snapshot_locked(&inner);
+    }
+
+    /// Remove one exact ordered discovery stream generation.
+    pub(crate) async fn remove_session(
+        &self,
+        peer_id: &ZakuraPeerId,
+        conn_id: ZakuraConnId,
+        session_id: u64,
+    ) {
+        let mut inner = self.inner.lock().await;
+        if inner
+            .admitted_peers
+            .get(peer_id)
+            .is_some_and(|peer| (peer.conn_id, peer.session_id) == (conn_id, session_id))
+        {
+            inner.admitted_peers.remove(peer_id);
+        }
+        self.publish_peer_snapshot_locked(&inner);
+    }
+
+    /// Returns whether an ordered discovery stream is the currently admitted generation.
+    pub(crate) async fn is_current_session(
+        &self,
+        peer_id: &ZakuraPeerId,
+        conn_id: ZakuraConnId,
+        session_id: u64,
+    ) -> bool {
+        let inner = self.inner.lock().await;
+        inner
+            .admitted_peers
+            .get(peer_id)
+            .is_some_and(|peer| (peer.conn_id, peer.session_id) == (conn_id, session_id))
     }
 
     fn publish_peer_snapshot_locked(&self, inner: &ZakuraDiscoveryInner) {
@@ -7929,6 +7982,38 @@ mod tests {
         );
 
         handle.remove_peer(&peer, 2).await;
+        assert_eq!(handle.peer_snapshot().inbound_peers, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_discovery_stream_cleanup_cannot_remove_newer_stream_on_same_connection() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let peer = peer_id_for(secret_key().public());
+
+        assert_eq!(
+            handle
+                .admit_peer_session(2, 1, peer.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+        assert_eq!(
+            handle
+                .admit_peer_session(2, 2, peer.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+        assert_eq!(
+            handle
+                .admit_peer_session(2, 2, peer.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::RejectNotUseful
+        );
+
+        handle.remove_session(&peer, 2, 1).await;
+        assert_eq!(handle.peer_snapshot().inbound_peers, 1);
+
+        handle.remove_session(&peer, 2, 2).await;
         assert_eq!(handle.peer_snapshot().inbound_peers, 0);
     }
 

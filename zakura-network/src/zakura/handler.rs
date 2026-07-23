@@ -1566,15 +1566,15 @@ pub(crate) fn service_registry(
     block_sync: Option<BlockSyncHandle>,
     block_sync_config: ZakuraBlockSyncConfig,
     legacy_service: Arc<dyn Service>,
-    discovery_service: Arc<dyn Service>,
+    discovery_service: Arc<super::DiscoveryService>,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
-    let mut services = vec![legacy_service.clone(), discovery_service];
-    if let Some(header_sync) = &header_sync {
-        services.push(Arc::new(HeaderSyncService::new(header_sync.clone())) as Arc<dyn Service>);
+    let mut services = vec![legacy_service.clone()];
+    let header_sync_service = if let Some(header_sync) = &header_sync {
+        Arc::new(HeaderSyncService::new(header_sync.clone())) as Arc<dyn Service>
     } else {
-        services
-            .push(Arc::new(HeaderSyncPassthroughService::new(legacy_service)) as Arc<dyn Service>);
-    }
+        Arc::new(HeaderSyncPassthroughService::new(legacy_service.clone())) as Arc<dyn Service>
+    };
+    services.push(header_sync_service.clone());
     let block_sync = match block_sync {
         Some(block_sync) => BlockSyncService::new_with_handle(block_sync_config, block_sync),
         None => match header_sync.as_ref() {
@@ -1585,7 +1585,14 @@ pub(crate) fn service_registry(
             None => BlockSyncService::new(block_sync_config),
         },
     };
-    services.push(Arc::new(block_sync) as Arc<dyn Service>);
+    let block_sync = Arc::new(block_sync) as Arc<dyn Service>;
+    discovery_service.set_connection_owners(vec![
+        legacy_service,
+        header_sync_service,
+        block_sync.clone(),
+    ]);
+    services.push(discovery_service as Arc<dyn Service>);
+    services.push(block_sync);
 
     Ok(Arc::new(
         ServiceRegistry::new(services).map_err(|error| -> BoxError { Box::new(error) })?,
@@ -3088,7 +3095,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         discovery.clone(),
         header_sync.clone(),
         block_sync.clone(),
-    )) as Arc<dyn Service>;
+    ));
     let legacy_service = sink_factory(supervisor.clone(), trace.clone());
     let registry = service_registry(
         &supervisor,
@@ -5660,7 +5667,9 @@ mod tests {
         )
     }
 
-    fn test_discovery_service(supervisor: &ZakuraSupervisorHandle) -> Arc<dyn Service> {
+    fn test_discovery_service(
+        supervisor: &ZakuraSupervisorHandle,
+    ) -> Arc<crate::zakura::DiscoveryService> {
         let (_handle, service) =
             test_discovery_service_with_peer_limits(supervisor, ServicePeerLimits::default());
         service
@@ -5669,7 +5678,7 @@ mod tests {
     fn test_discovery_service_with_peer_limits(
         supervisor: &ZakuraSupervisorHandle,
         peer_limits: ServicePeerLimits,
-    ) -> (ZakuraDiscoveryHandle, Arc<dyn Service>) {
+    ) -> (ZakuraDiscoveryHandle, Arc<crate::zakura::DiscoveryService>) {
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         let handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
@@ -5689,8 +5698,7 @@ mod tests {
             supervisor.subscribe(),
         )
         .expect("test discovery handle builds");
-        let service =
-            Arc::new(crate::zakura::DiscoveryService::new(handle.clone())) as Arc<dyn Service>;
+        let service = Arc::new(crate::zakura::DiscoveryService::new(handle.clone()));
         (handle, service)
     }
 

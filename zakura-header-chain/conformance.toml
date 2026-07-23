@@ -570,12 +570,18 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-OP-01"
 name = "Durable operator invalidation"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::service::write::commit_operator_change"
+tests = ["IN-04::df_01_generated_nu5_graph_matches_full_state_before_finalization", "AUD-10::aud_10_invalidation_promotes_alternate_and_aud_12_preserves_nested_reasons", "AUD-11::aud_11_invalidating_only_verified_path_keeps_independent_header_best", "AUD-14::aud_14_operator_reason_changes_reopen_complete_before_or_after"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-OP-02"
 name = "Reason-scoped reconsideration"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::MemHeaderStore::remove_operator_invalidation"
+tests = ["IN-04::operator_reconsider_preserves_every_unnamed_reason", "IN-04::insertion_enforces_every_immutable_configured_checkpoint", "AUD-10::aud_10_invalidation_promotes_alternate_and_aud_12_preserves_nested_reasons", "AUD-12::aud_12_reconsider_restores_a_shorter_higher_work_verified_branch", "AUD-14::aud_14_operator_reason_changes_reopen_complete_before_or_after"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-AVAIL-01"

@@ -660,17 +660,26 @@ status = "unimplemented"
 [[rule]]
 id = "LC-PARITY-01"
 name = "Observable-header consensus parity"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::prepare_headers + zakura_state::HeaderChainWriter"
+tests = ["DF-01::df_01_observable_activation_headers_pass_shared_rules", "DF-01::df_01_body_valid_fork_graph_matches_full_state_before_finalization", "DF-01::df_01_generated_nu5_graph_matches_full_state_before_finalization"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-PARITY-02"
 name = "Typed intentional differences"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::BodyVerificationClass + zakura_header_chain::BodyEvidence"
+tests = ["DF-02::df_02_full_state_failures_have_exact_intentional_difference_types", "DF-02::df_02_contextual_body_failures_have_exact_intentional_difference_types", "IN-02::in_02_header_valid_body_invalid_reselects_after_exact_authenticated_evidence"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-PARITY-03"
 name = "Tie-break policy isolation"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::ChainScore::cmp"
+tests = ["DF-01::header_chain_score_matches_legacy_chain_comparator", "DF-01::df_01_body_valid_fork_graph_matches_full_state_before_finalization"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-TEST-01"

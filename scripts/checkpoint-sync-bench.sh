@@ -24,6 +24,11 @@
 #   FEED_PEER             single pinned peer ip:port           (default 167.99.162.47:8233)
 #   CKPT_LIMIT            checkpoint_verify_concurrency_limit  (default 1500)
 #   DL_LIMIT              download_concurrency_limit           (default 150)
+#   VERIFY_MODE           checkpoint | semantic                (default checkpoint)
+#                         semantic sets consensus.checkpoint_sync = false, so every
+#                         block past the mandatory checkpoints gets full script and
+#                         proof verification (the snapshot tip is past them)
+#   FULL_VERIFY_LIMIT     full_verify_concurrency_limit        (default 20)
 #   TARGET_P2P_STACK            legacy | zakura | dual
 #                               default: zakura
 #   BASELINE_P2P_STACK          same as TARGET_P2P_STACK for the baseline run (default: legacy)
@@ -63,6 +68,8 @@ WALL_CAP="${WALL_CAP:-2000}"
 FEED_PEER="${FEED_PEER-167.99.162.47:8233}"
 CKPT_LIMIT="${CKPT_LIMIT:-1500}"
 DL_LIMIT="${DL_LIMIT:-150}"
+VERIFY_MODE="${VERIFY_MODE:-checkpoint}"
+FULL_VERIFY_LIMIT="${FULL_VERIFY_LIMIT:-20}"
 PEERSET_SIZE="${PEERSET_SIZE:-1}"   # 1 = strict single pinned peer; raise to allow DNS-seeder fallback
 TARGET_P2P_STACK="${TARGET_P2P_STACK:-}"
 BASELINE_P2P_STACK="${BASELINE_P2P_STACK:-}"
@@ -103,6 +110,14 @@ die()  { log "FATAL: $*"; exit 1; }
 
 if ! [[ "$WALL_CAP" =~ ^[0-9]+$ ]]; then
   die "WALL_CAP must be a non-negative integer number of seconds, got '$WALL_CAP'"
+fi
+
+case "$VERIFY_MODE" in
+  checkpoint|semantic) ;;
+  *) die "invalid VERIFY_MODE '$VERIFY_MODE' (use checkpoint or semantic)" ;;
+esac
+if ! [[ "$FULL_VERIFY_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+  die "FULL_VERIFY_LIMIT must be a positive integer, got '$FULL_VERIFY_LIMIT'"
 fi
 
 normalize_bool() {
@@ -480,18 +495,29 @@ run_one() {
       echo '[sync]'
       echo "checkpoint_verify_concurrency_limit = $CKPT_LIMIT"
       echo "download_concurrency_limit = $DL_LIMIT"
-      echo 'full_verify_concurrency_limit = 20'
+      echo "full_verify_concurrency_limit = $FULL_VERIFY_LIMIT"
       echo ''
+      if [[ "$VERIFY_MODE" == "semantic" ]]; then
+        echo '[consensus]'
+        echo 'checkpoint_sync = false'
+        echo ''
+      fi
       echo '[metrics]'
       echo "endpoint_addr = \"127.0.0.1:$METRICS_PORT\""
       echo ''
       echo '[tracing]'
-      echo 'filter = "info"'
+      if [[ "$VERIFY_MODE" == "semantic" ]]; then
+        # trace the batch worker so explicit block-boundary flushes are countable
+        # in the node log; applied to every leg equally so A/B stays fair
+        echo 'filter = "info,tower_batch_control=trace"'
+      else
+        echo 'filter = "info"'
+      fi
     } > "$cfg"
   }
 
   local pid t0 mode="p2p_stack"
-  log "starting zakurad ($tag), p2p_stack=$p2p_stack, stop_height=$STOP_HEIGHT, peer=${FEED_PEER:-DNS-seeders}, peerset=$PEERSET_SIZE, cap=${WALL_CAP}s, metrics=:$METRICS_PORT, listen=:$LISTEN_PORT"
+  log "starting zakurad ($tag), p2p_stack=$p2p_stack, verify=$VERIFY_MODE, stop_height=$STOP_HEIGHT, peer=${FEED_PEER:-DNS-seeders}, peerset=$PEERSET_SIZE, cap=${WALL_CAP}s, metrics=:$METRICS_PORT, listen=:$LISTEN_PORT"
   write_config "$mode"
   "$zakurad" -c "$cfg" start >"$logf" 2>&1 &
   pid=$!; CUR_PID="$pid"; t0=$(date +%s); sleep 3
@@ -581,6 +607,13 @@ run_one() {
   local errs
   errs="$(grep -iE 'panic|ERROR committing|resetting state queue' "$logf" 2>/dev/null \
             | grep -viE 'zakura_network|peer' | head -3 || true)"
+  # semantic mode: count block-boundary batch flushes from the trace-level log,
+  # as direct evidence the explicit-flush path ran (0 on refs without it)
+  RESULT_FLUSHES=""
+  if [[ "$VERIFY_MODE" == "semantic" ]]; then
+    RESULT_FLUSHES="$(grep -ac 'explicit batch flush received' "$logf" 2>/dev/null || true)"
+    RESULT_FLUSHES="${RESULT_FLUSHES:-0}"
+  fi
   cp "$logf" "$OUT_DIR/node-$prefix.log" 2>/dev/null || true
   [[ "$runs_zakura" == "1" ]] && zip_trace_dir "$trace_dir" "$OUT_DIR/zakura-traces-$prefix.zip"
 
@@ -633,6 +666,9 @@ blocks/s:       $RESULT_BPS        (post-first-commit: $RESULT_PBPS blocks/s ove
 reached stop:   $( [[ "$RESULT_STALLED" == no ]] && echo yes || echo "$RESULT_STALLED" )
 bottleneck:     ${RESULT_VERDICT:-n/a (no recorded series)}
 EOF
+  if [[ "$VERIFY_MODE" == "semantic" ]]; then
+    echo "explicit batch flushes: ${RESULT_FLUSHES:-0}"
+  fi
   if [[ -n "$RESULT_ERRS" ]]; then printf 'WARNING — log errors:\n%s\n' "$RESULT_ERRS"; fi
 }
 
@@ -671,7 +707,12 @@ SUMMARY="${GITHUB_STEP_SUMMARY:-$OUT_DIR/summary.md}"
   echo ""
   echo "- binary source: $MODE \`$PRIMARY_SPEC\`"
   echo "- snapshot start height: **$START_HEIGHT**, stop height: **$STOP_HEIGHT**, feed: \`${FEED_PEER:-DNS seeders}\` (peerset=$PEERSET_SIZE)"
-  echo "- sync knobs: checkpoint_verify=$CKPT_LIMIT, download=$DL_LIMIT"
+  echo "- sync knobs: checkpoint_verify=$CKPT_LIMIT, download=$DL_LIMIT, full_verify=$FULL_VERIFY_LIMIT"
+  if [[ "$VERIFY_MODE" == "semantic" ]]; then
+    echo "- verify mode: **semantic** (consensus.checkpoint_sync = false; full script+proof verification past the mandatory checkpoints)"
+  else
+    echo "- verify mode: checkpoint"
+  fi
   if [[ -n "$GITHUB_RUN_URL" ]]; then
     echo "- GitHub run: [${GITHUB_RUN_ID:-open}]($GITHUB_RUN_URL)"
   fi
@@ -691,15 +732,21 @@ append_verdict() { [[ -n "$1" && -f "$1" ]] && { echo ""; cat "$1"; } >> "$SUMMA
 if [[ -n "$BASELINE_SPEC" ]]; then
   log "A/B mode: baseline='$BASELINE_SPEC' vs primary='$PRIMARY_SPEC'"
   run_one "$BASELINE_SPEC" "baseline" "$BASELINE_P2P_STACK"; print_one "(baseline)"; summary_row "$BASELINE_SPEC (baseline)" >> "$SUMMARY"
-  B_BPS="$RESULT_BPS"; B_VERDICT_MD="$RESULT_VERDICT_MD"
+  B_BPS="$RESULT_BPS"; B_VERDICT_MD="$RESULT_VERDICT_MD"; B_FLUSHES="${RESULT_FLUSHES:-}"
   run_one "$PRIMARY_SPEC" "primary" "$TARGET_P2P_STACK";  print_one "(primary)";  summary_row "$PRIMARY_SPEC (primary)"  >> "$SUMMARY"
-  R_BPS="$RESULT_BPS"; R_VERDICT_MD="$RESULT_VERDICT_MD"
+  R_BPS="$RESULT_BPS"; R_VERDICT_MD="$RESULT_VERDICT_MD"; R_FLUSHES="${RESULT_FLUSHES:-}"
   SPEEDUP="$(awk -v r="$R_BPS" -v b="$B_BPS" 'BEGIN{ if (b>0) printf "%.2f", r/b; else print "n/a" }')"
   { echo ""; echo "**Speedup:** ${B_BPS} → ${R_BPS} blocks/s = **${SPEEDUP}×**"; } >> "$SUMMARY"
+  if [[ "$VERIFY_MODE" == "semantic" ]]; then
+    { echo ""; echo "**Explicit batch flushes** (from trace-level node logs): baseline ${B_FLUSHES:-0}, primary ${R_FLUSHES:-0}"; } >> "$SUMMARY"
+  fi
   printf '\n=== A/B: %s -> %s = %s× faster ===\n' "$B_BPS" "$R_BPS" "$SPEEDUP"
   append_verdict "$B_VERDICT_MD"; append_verdict "$R_VERDICT_MD"
 else
   run_one "$PRIMARY_SPEC" "primary" "$TARGET_P2P_STACK"; print_one ""; summary_row "$PRIMARY_SPEC" >> "$SUMMARY"
+  if [[ "$VERIFY_MODE" == "semantic" ]]; then
+    { echo ""; echo "**Explicit batch flushes** (from trace-level node logs): ${RESULT_FLUSHES:-0}"; } >> "$SUMMARY"
+  fi
   append_verdict "$RESULT_VERDICT_MD"
 fi
 

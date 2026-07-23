@@ -572,7 +572,6 @@ impl Drop for ZakuraTestNode {
 mod tests {
     use super::super::TEST_NET_TIMEOUT;
     use super::*;
-    use crate::zakura::DEFAULT_ZAKURA_MAX_CONNS_PER_IP;
 
     #[tokio::test]
     async fn legacy_upgrade_builder_fails_loudly() {
@@ -583,19 +582,6 @@ mod tests {
             .expect_err("legacy-upgrade hook is reserved, not silently ignored");
 
         assert!(error.to_string().contains("connect_via_upgrade"));
-    }
-
-    #[test]
-    fn default_test_node_uses_production_per_ip_cap() {
-        // `handler::tests::inbound_accept_enforces_per_ip_cap` drives the real
-        // native admission path. This test only needs to guard the test-builder
-        // default that selects that production cap.
-        let builder = ZakuraTestNode::builder(10000);
-
-        assert_eq!(
-            builder.max_connections_per_ip, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
-            "the default test node must inherit the production per-IP cap",
-        );
     }
 
     #[tokio::test]

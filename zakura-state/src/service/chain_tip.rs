@@ -141,8 +141,8 @@ impl From<CheckpointVerifiedBlock> for ChainTipBlock {
 pub struct ChainTipSender {
     /// Have we got any chain tips from the non-finalized state?
     ///
-    /// Once this flag is set, we ignore the finalized state.
-    /// `None` tips don't set this flag.
+    /// While this flag is set, we ignore finalized state updates.
+    /// Root invalidation can clear the non-finalized state and reset this flag.
     use_non_finalized_tip: bool,
 
     /// The sender channel for chain tip data.
@@ -214,11 +214,32 @@ impl ChainTipSender {
         let new_tip = new_tip.into();
         self.record_fields(&new_tip);
 
-        // once the non-finalized state becomes active, it is always populated
-        // but ignoring `None`s makes the tests easier
+        // Clearing requires the finalized fallback supplied to
+        // `reset_to_finalized_tip`; ignore bare `None` updates.
         if new_tip.is_some() {
             self.use_non_finalized_tip = true;
             self.update(new_tip)
+        }
+    }
+
+    /// Clear the best non-finalized tip and publish the finalized tip instead.
+    #[instrument(
+        skip(self, finalized_tip),
+        fields(old_use_non_finalized_tip, old_height, old_hash, new_height, new_hash)
+    )]
+    pub(crate) fn reset_to_finalized_tip(&mut self, finalized_tip: Option<ChainTipBlock>) {
+        self.record_fields(&finalized_tip);
+        self.use_non_finalized_tip = false;
+
+        let active_hash = self
+            .sender
+            .borrow()
+            .as_ref()
+            .map(|active_value| active_value.hash);
+        let finalized_hash = finalized_tip.as_ref().map(|tip| tip.hash);
+
+        if finalized_hash != active_hash {
+            let _ = self.sender.send(finalized_tip);
         }
     }
 

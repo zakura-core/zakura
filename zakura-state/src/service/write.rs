@@ -31,7 +31,7 @@ use crate::{
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
-    SemanticallyVerifiedBlock, ValidateContextError,
+    CheckpointVerifiedBlock, SemanticallyVerifiedBlock, ValidateContextError,
 };
 
 // These types are used in doc links
@@ -162,6 +162,43 @@ fn update_latest_chain_channels(
     chain_tip_sender.set_best_non_finalized_tip(tip_block);
 
     tip_block_height
+}
+
+/// Update the latest-chain channels after an invalidate or reconsider request.
+///
+/// Root invalidation can legitimately leave the non-finalized state empty. In
+/// that case, publish the empty state and switch the shared tip back to the
+/// finalized database tip.
+fn update_latest_chain_channels_after_invalidate_or_reconsider(
+    finalized_state: &FinalizedState,
+    non_finalized_state: &NonFinalizedState,
+    chain_tip_sender: &mut ChainTipSender,
+    non_finalized_state_sender: &watch::Sender<NonFinalizedState>,
+    backup_dir_path: Option<&Path>,
+) {
+    if !non_finalized_state.is_chain_set_empty() {
+        update_latest_chain_channels(
+            non_finalized_state,
+            chain_tip_sender,
+            non_finalized_state_sender,
+            backup_dir_path,
+        );
+        return;
+    }
+
+    if let Some(backup_dir_path) = backup_dir_path {
+        non_finalized_state.write_to_backup(backup_dir_path);
+    }
+
+    // If the final receiver was just dropped, ignore the error.
+    let _ = non_finalized_state_sender.send(non_finalized_state.clone());
+
+    let finalized_tip = finalized_state
+        .db
+        .tip_block()
+        .map(CheckpointVerifiedBlock::from)
+        .map(ChainTipBlock::from);
+    chain_tip_sender.reset_to_finalized_tip(finalized_tip);
 }
 
 fn commit_header_range(
@@ -650,7 +687,8 @@ impl WriteBlockWorkerTask {
             };
 
             let Some((queued_child, rsp_tx)) = queued_child_and_rsp_tx else {
-                update_latest_chain_channels(
+                update_latest_chain_channels_after_invalidate_or_reconsider(
+                    finalized_state,
                     non_finalized_state,
                     chain_tip_sender,
                     non_finalized_state_sender,
@@ -840,7 +878,8 @@ mod tests {
     use std::sync::Arc;
 
     use zakura_chain::{
-        parameters::Network, serialization::ZcashDeserializeInto, value_balance::ValueBalance,
+        chain_tip::ChainTip, parameters::Network, serialization::ZcashDeserializeInto,
+        value_balance::ValueBalance,
     };
 
     use crate::{
@@ -853,11 +892,57 @@ mod tests {
             write::{
                 seed_zakura_header_from_committed_block,
                 should_seed_zakura_header_from_non_finalized_commit,
+                update_latest_chain_channels_after_invalidate_or_reconsider,
             },
+            ChainTipBlock, ChainTipSender,
         },
-        tests::FakeChainHelper,
+        tests::{setup::new_state_with_mainnet_genesis, FakeChainHelper},
         Config,
     };
+
+    #[test]
+    fn empty_non_finalized_state_updates_channels_with_finalized_tip() {
+        let _init_guard = zakura_test::init();
+
+        let network = Network::Mainnet;
+        let (finalized_state, non_finalized_state, finalized_tip) =
+            new_state_with_mainnet_genesis();
+        let finalized_tip = ChainTipBlock::from(finalized_tip);
+        let non_finalized_tip = ChainTipBlock::from(
+            finalized_state
+                .db
+                .tip_block()
+                .expect("finalized genesis block should exist")
+                .make_fake_child()
+                .prepare(),
+        );
+        let (mut chain_tip_sender, latest_chain_tip, _chain_tip_change) =
+            ChainTipSender::new(finalized_tip.clone(), &network);
+        chain_tip_sender.set_best_non_finalized_tip(non_finalized_tip.clone());
+        assert_eq!(
+            latest_chain_tip.best_tip_height_and_hash(),
+            Some((non_finalized_tip.height, non_finalized_tip.hash)),
+        );
+
+        let (non_finalized_state_sender, non_finalized_state_receiver) =
+            tokio::sync::watch::channel(non_finalized_state.clone());
+        assert!(!non_finalized_state_receiver.has_changed().unwrap());
+
+        update_latest_chain_channels_after_invalidate_or_reconsider(
+            &finalized_state,
+            &non_finalized_state,
+            &mut chain_tip_sender,
+            &non_finalized_state_sender,
+            None,
+        );
+
+        assert!(non_finalized_state_receiver.has_changed().unwrap());
+        assert!(non_finalized_state_receiver.borrow().is_chain_set_empty());
+        assert_eq!(
+            latest_chain_tip.best_tip_height_and_hash(),
+            Some((finalized_tip.height, finalized_tip.hash)),
+        );
+    }
 
     #[test]
     fn side_chain_commit_does_not_seed_zakura_headers() {

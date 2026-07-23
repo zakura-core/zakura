@@ -21,14 +21,14 @@ use crate::{
     BodyPayloadMismatch, BodyRuleId, BodyUnavailableSummary, BranchId, ChainScore, CheckpointSet,
     Clock, ConsensusBodyInvalid, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot,
     EvidenceId, FinalityEpoch, FinalityRecord, Frontier, FrontierSet, FullStateEvidenceAuthority,
-    FullStateFinalized, HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode,
-    HeaderValidationState, InsertHeaders, MemHeaderStore, OperatorInvalidate,
-    OperatorInvalidationId, OperatorReconsider, PreparedHeader, PreparedHeaderBatch,
-    ProjectionDelta, SourceId, StateVersion, StoreError, StoreRead, SuffixWork, TargetCompletion,
-    TransientBodyFailure, TransientBodyFailureKind, TransitionContext, TransitionFailure,
-    TransitionPlan, TransitionRequest, TrustedAnchor, ValidationLease, VerifiedBodyEvidence,
-    VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef, WorkOwner,
-    MAX_CANDIDATE_TIPS_V1,
+    FullStateFinalized, HeaderBatchInput, HeaderChainDiskVersion, HeaderContextFact, HeaderFailure,
+    HeaderGeneration, HeaderNode, HeaderRule, HeaderRules, HeaderValidationState, InsertHeaders,
+    MemHeaderStore, OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, PreparedHeader,
+    PreparedHeaderBatch, ProjectionDelta, SourceId, StateVersion, StoreError, StoreRead,
+    SuffixWork, TargetCompletion, TransientBodyFailure, TransientBodyFailureKind,
+    TransitionContext, TransitionFailure, TransitionPlan, TransitionRequest, TrustedAnchor,
+    ValidationLease, VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause,
+    VerifiedGeneration, VerifiedHeaderRef, WorkOwner, MAX_CANDIDATE_TIPS_V1,
 };
 
 /// Deterministic summary of one bounded structured-operation replay.
@@ -52,6 +52,8 @@ pub struct ForkReplaySummary {
     pub incident_checks: u16,
     /// Fixed-anchor 999/1,000/1,001 replacement matrix checks completed.
     pub boundary_checks: u16,
+    /// Production preparation mutation matrices completed.
+    pub validation_checks: u16,
     /// Final authoritative snapshot.
     pub snapshot: EngineSnapshot,
     /// Stable digest of operation outcomes and snapshots.
@@ -452,14 +454,17 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     let mut reset_checks = 0u16;
     let mut incident_checks = 0u16;
     let mut boundary_checks = 0u16;
+    let mut validation_checks = 0u16;
     let mut transcript = Sha256::new();
     let clock = ManualClock::new();
     let authority = FuzzAuthority;
     assert_exhaustive_oracle(&store);
 
     for (operation, encoded) in bounded.iter().copied().enumerate() {
-        if matches!(bounded.first(), Some(b'A' | b'F' | b'I' | b'R' | b'T'))
-            && encoded == b'\n'
+        if matches!(
+            bounded.first(),
+            Some(b'A' | b'F' | b'I' | b'R' | b'T' | b'V')
+        ) && encoded == b'\n'
             && operation.saturating_add(1) == bounded.len()
         {
             no_effects = no_effects.saturating_add(1);
@@ -500,6 +505,15 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
             transcript.update(digest);
             no_effects = no_effects.saturating_add(1);
             boundary_checks = boundary_checks.saturating_add(1);
+            assert_exhaustive_oracle(&store);
+            continue;
+        }
+        if encoded == b'V' {
+            let digest = assert_block_spec_mutations();
+            transcript.update(b"block-spec-mutations");
+            transcript.update(digest);
+            no_effects = no_effects.saturating_add(1);
+            validation_checks = validation_checks.saturating_add(1);
             assert_exhaustive_oracle(&store);
             continue;
         }
@@ -745,6 +759,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         reset_checks,
         incident_checks,
         boundary_checks,
+        validation_checks,
         snapshot: store.snapshot(),
         replay_digest: transcript.finalize().into(),
         retained_digest: retained_digest(&store),
@@ -1146,6 +1161,99 @@ fn assert_fixed_anchor_boundaries() -> [u8; 32] {
             hasher.update([u8::from(competitor_first)]);
             hasher.update(competitor.hash.0);
         }
+    }
+    hasher.finalize().into()
+}
+
+fn assert_block_spec_mutations() -> [u8; 32] {
+    let store = FuzzStore::new(EngineMode::Integrated);
+    let anchor = store.metadata.frontiers.finalized;
+    let anchor_node = store
+        .graph
+        .node(anchor.hash)
+        .expect("the fixed anchor is retained");
+    let anchor_header = anchor_node.header.clone();
+    let lease = ValidationLease::new(
+        anchor,
+        vec![HeaderContextFact {
+            frontier: anchor,
+            difficulty_threshold: anchor_node.header.difficulty_threshold,
+            time: anchor_node.header.time,
+        }],
+        store.config.trust_anchor_digest(),
+    );
+    let rules = HeaderRules::from_engine_config(&store.config)
+        .expect("the authenticated fuzz network defines header rules");
+    let clock = ManualClock::new();
+    clock.advance(
+        u32::try_from(anchor_header.time.timestamp())
+            .expect("the regtest genesis timestamp fits in u32"),
+    );
+
+    let child = |seconds: i64| {
+        let mut header = *anchor_header;
+        header.previous_block_hash = anchor.hash;
+        header.time = anchor_header.time + Duration::seconds(seconds);
+        header.nonce.0[0] = u8::try_from(seconds).unwrap_or(u8::MAX);
+        Arc::new(header)
+    };
+
+    let valid = child(1);
+    let prepared = crate::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&valid)),
+        &lease,
+        &rules,
+        &clock,
+    )
+    .expect("a one-second child passes the production preparation pipeline");
+    assert_eq!(
+        prepared.headers()[0].validation,
+        HeaderValidationState::Valid
+    );
+
+    let future = child(3 * 60 * 60);
+    let prepared = crate::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&future)),
+        &lease,
+        &rules,
+        &clock,
+    )
+    .expect("a locally future child is admitted only as deferred");
+    assert_eq!(
+        prepared.headers()[0].validation,
+        HeaderValidationState::DeferredUntil(future.time - Duration::hours(2))
+    );
+
+    let mut cases = Vec::new();
+    let mut wrong_parent = *valid;
+    wrong_parent.previous_block_hash = block::Hash([0x41; 32]);
+    cases.push((Arc::new(wrong_parent), HeaderRule::ParentLink));
+    let mut bad_version = *valid;
+    bad_version.version = 3;
+    cases.push((Arc::new(bad_version), HeaderRule::EncodingVersionHash));
+    let mut bad_commitment = *valid;
+    bad_commitment.commitment_bytes = [0x42; 32].into();
+    cases.push((Arc::new(bad_commitment), HeaderRule::CommitmentStructure));
+    let mut bad_target = *valid;
+    bad_target.difficulty_threshold =
+        zakura_chain::work::difficulty::CompactDifficulty::from_le_bytes([0; 4]);
+    cases.push((Arc::new(bad_target), HeaderRule::CompactTarget));
+    cases.push((child(0), HeaderRule::ContextualDifficultyAndTime));
+
+    let mut hasher = Sha256::new();
+    for (header, expected_rule) in cases {
+        let failure = crate::prepare_headers(
+            HeaderBatchInput::new(std::slice::from_ref(&header)),
+            &lease,
+            &rules,
+            &clock,
+        )
+        .expect_err("each one-field mutation is rejected");
+        assert!(matches!(
+            failure,
+            HeaderFailure::Invalid { rule, .. } if rule == expected_rule
+        ));
+        hasher.update([expected_rule as u8]);
     }
     hasher.finalize().into()
 }
@@ -1613,6 +1721,15 @@ mod tests {
     }
 
     #[test]
+    fn block_spec_mutations_use_the_production_preparation_pipeline() {
+        let first = replay_fork_transition_bytes(b"V");
+        let second = replay_fork_transition_bytes(b"V");
+        assert_eq!(first, second);
+        assert_eq!(first.validation_checks, 1);
+        assert_eq!(first.no_effects, 1);
+    }
+
+    #[test]
     #[should_panic(expected = "selected projection must exactly match parent links")]
     fn exhaustive_oracle_rejects_a_projection_gap() {
         let mut store = FuzzStore::new(EngineMode::Integrated);
@@ -1762,6 +1879,12 @@ mod tests {
                     "../../fuzz/header-chain/corpus/fork_transitions/fixed_anchor_999_1000_1001"
                 ),
             ),
+            (
+                "block_spec_mutations",
+                include_bytes!(
+                    "../../fuzz/header-chain/corpus/fork_transitions/block_spec_mutations"
+                ),
+            ),
         ];
         for (name, bytes) in corpus {
             let first = replay_fork_transition_bytes(bytes);
@@ -1790,6 +1913,9 @@ mod tests {
             }
             if *name == "fixed_anchor_999_1000_1001" {
                 assert_eq!(first.boundary_checks, 1);
+            }
+            if *name == "block_spec_mutations" {
+                assert_eq!(first.validation_checks, 1);
             }
         }
     }

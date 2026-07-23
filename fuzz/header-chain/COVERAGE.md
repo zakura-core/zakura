@@ -21,7 +21,7 @@ the remaining gap. Fuzzer reachability alone is not requirement coverage.
 | Candidate-tip pressure | Planner retention and independent eviction oracle | LC-RETAIN-01..04 | `evict_pressure` | Covered at the tip cap; 65,536 nodes remain a deterministic retention test |
 | Fixed-anchor 999/1,000/1,001 replacement | Planner in both arrival orders | LC-REORG-01 | `fixed_anchor_999_1000_1001` | Covered |
 | Logical crash/reopen | Retained digest and snapshot clone | LC-RECOVER-02, LC-FRONTIER-04 | `crash_reopen`, `aud_incident_late_a_after_b_promotion` | Partial: production disk reopen is a separate target, not periodic inside `fork_transitions` |
-| Block specification mutations | Generated header builder | LC-VAL-02..08 | hard-work and deferred-time classes | Partial: general `time_delta`, commitment cases, and one-invalid-field generation remain open |
+| Block specification mutations | Production `prepare_headers` plus generated planner fixtures | LC-VAL-02..08 | `block_spec_mutations`, hard-work, and deferred-time classes | Partial: valid/future/nonmonotonic time plus parent/version/commitment/target single-field cases are covered; byte-parameterized mutation combinations remain open |
 | Page partition equivalence | Target-bound staging/admission | LC-WIRE-03, LC-WIRE-05 | `page_partitions` plus requester reactor tests | Covered |
 
 ## Pursuit and ownership domain

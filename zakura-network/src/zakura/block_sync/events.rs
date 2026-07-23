@@ -341,7 +341,7 @@ impl BlockSyncAction {
 }
 
 /// Block-sync peer-accounting violations.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlockSyncMisbehavior {
     /// A stream-6 payload was malformed before semantic handling.
     MalformedMessage,
@@ -353,6 +353,8 @@ pub enum BlockSyncMisbehavior {
     GetBlocksSpam,
     /// A peer supplied a body whose payload does not match its requested header.
     BodyPayloadMismatch(zakura_header_chain::BodyPayloadMismatch),
+    /// A commitment-matching body deterministically failed consensus.
+    ConsensusBodyInvalid(zakura_header_chain::ConsensusBodyInvalid),
     /// A peer supplied another invalid block payload.
     InvalidBlock,
     /// A peer supplied a body outside the tolerated scheduling-size deviation.

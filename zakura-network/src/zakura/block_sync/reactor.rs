@@ -2848,7 +2848,7 @@ impl BlockSyncReactor {
             BlockSyncAction::Misbehavior { peer, reason } => {
                 bs_insert_str(row, bs_trace::KIND, "misbehavior");
                 bs_insert_peer(row, bs_trace::PEER, peer);
-                bs_insert_str(row, bs_trace::REASON, block_misbehavior_label(*reason));
+                bs_insert_str(row, bs_trace::REASON, block_misbehavior_label(reason));
             }
         });
     }
@@ -2978,13 +2978,14 @@ pub(super) fn block_sync_message_label(msg: &BlockSyncMessage) -> &'static str {
     }
 }
 
-fn block_misbehavior_label(reason: BlockSyncMisbehavior) -> &'static str {
+fn block_misbehavior_label(reason: &BlockSyncMisbehavior) -> &'static str {
     match reason {
         BlockSyncMisbehavior::MalformedMessage => "malformed_message",
         BlockSyncMisbehavior::UnsolicitedBlock => "unsolicited_block",
         BlockSyncMisbehavior::GetBlocksTooLong => "get_blocks_too_long",
         BlockSyncMisbehavior::GetBlocksSpam => "get_blocks_spam",
         BlockSyncMisbehavior::BodyPayloadMismatch(_) => "body_payload_mismatch",
+        BlockSyncMisbehavior::ConsensusBodyInvalid(_) => "consensus_body_invalid",
         BlockSyncMisbehavior::InvalidBlock => "invalid_block",
         BlockSyncMisbehavior::SizeMismatch => "size_mismatch",
         BlockSyncMisbehavior::InvalidStatus => "invalid_status",

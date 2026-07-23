@@ -1727,7 +1727,7 @@ fn trace_block_driver_action(trace: &ZakuraTrace, action: &BlockSyncAction) {
             BlockSyncAction::Misbehavior { peer, reason } => {
                 insert_cs_str(row, cs_trace::ACTION, "misbehavior");
                 insert_cs_peer(row, cs_trace::PEER, peer);
-                insert_cs_str(row, cs_trace::REASON, block_sync_misbehavior_label(*reason));
+                insert_cs_str(row, cs_trace::REASON, block_sync_misbehavior_label(reason));
             }
             BlockSyncAction::QueryNeededBlocks {
                 from,
@@ -1822,13 +1822,14 @@ fn block_apply_class_label(class: BlockApplyClass) -> &'static str {
     }
 }
 
-fn block_sync_misbehavior_label(reason: BlockSyncMisbehavior) -> &'static str {
+fn block_sync_misbehavior_label(reason: &BlockSyncMisbehavior) -> &'static str {
     match reason {
         BlockSyncMisbehavior::MalformedMessage => "malformed_message",
         BlockSyncMisbehavior::UnsolicitedBlock => "unsolicited_block",
         BlockSyncMisbehavior::GetBlocksTooLong => "get_blocks_too_long",
         BlockSyncMisbehavior::GetBlocksSpam => "get_blocks_spam",
         BlockSyncMisbehavior::BodyPayloadMismatch(_) => "body_payload_mismatch",
+        BlockSyncMisbehavior::ConsensusBodyInvalid(_) => "consensus_body_invalid",
         BlockSyncMisbehavior::InvalidBlock => "invalid_block",
         BlockSyncMisbehavior::SizeMismatch => "size_mismatch",
         BlockSyncMisbehavior::InvalidStatus => "invalid_status",

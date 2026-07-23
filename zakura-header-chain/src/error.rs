@@ -4,7 +4,7 @@ use std::{error::Error as StdError, fmt, num::NonZeroU64};
 
 use zakura_chain::BoxError;
 
-use crate::{BranchId, EvidenceId, HeaderId, SourceId};
+use crate::{BodyPayloadMismatch, BranchId, ConsensusBodyInvalid, EvidenceId, HeaderId, SourceId};
 
 /// Stable normative rule identifier attached to a failure.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
@@ -149,6 +149,30 @@ impl HeaderChainError {
         )
     }
 
+    /// Construct mismatched-body evidence attributed only to its body supplier.
+    pub fn body_payload_mismatch(evidence: BodyPayloadMismatch) -> Self {
+        Self::new(
+            ErrorCategory::BodyPayloadMismatch,
+            ErrorSubject::Header(HeaderId::new(evidence.requested)),
+            None,
+            Some(evidence.evidence),
+            Attribution::BodyPeer(evidence.source),
+            None,
+        )
+    }
+
+    /// Construct deterministic invalid-body evidence attributed only to its body supplier.
+    pub fn consensus_body_invalid(evidence: &ConsensusBodyInvalid) -> Self {
+        Self::new(
+            ErrorCategory::ConsensusBodyInvalid,
+            ErrorSubject::Header(HeaderId::new(evidence.hash)),
+            None,
+            Some(evidence.evidence),
+            Attribution::BodyPeer(evidence.source),
+            None,
+        )
+    }
+
     /// Construct a local unknown-anchor or retained-path incoherence.
     pub fn unknown_anchor(subject: ErrorSubject, source: Option<BoxError>) -> Self {
         Self::new(
@@ -170,6 +194,18 @@ impl HeaderChainError {
                 Attribution::HeaderPeer(_)
             )
         )
+    }
+
+    /// Return true only for evidence-bearing body failures attributed to their supplier.
+    pub fn is_automatic_body_peer_fault(&self) -> bool {
+        self.evidence.is_some()
+            && matches!(
+                (&self.category, &self.attribution),
+                (
+                    ErrorCategory::BodyPayloadMismatch | ErrorCategory::ConsensusBodyInvalid,
+                    Attribution::BodyPeer(_)
+                )
+            )
     }
 }
 
@@ -224,5 +260,58 @@ mod tests {
         assert!(invalid.is_automatic_header_peer_fault());
         assert!(!unknown.is_automatic_header_peer_fault());
         assert_eq!(unknown.attribution, Attribution::None);
+    }
+
+    #[test]
+    fn supplier_evidence_attribution_matrix_distinguishes_header_body_and_advertiser() {
+        let header_source = SourceId::from_digest([1; 32]);
+        let body_source = SourceId::from_digest([2; 32]);
+        let advertiser = SourceId::from_digest([3; 32]);
+        let hash = block::Hash([4; 32]);
+        let subject = ErrorSubject::Header(HeaderId::new(hash));
+        let header = HeaderChainError::invalid_header(
+            subject,
+            RuleId::new("LC-VAL-01"),
+            EvidenceId::from_digest([5; 32]),
+            header_source,
+            None,
+        );
+        let mismatch = HeaderChainError::body_payload_mismatch(BodyPayloadMismatch {
+            evidence: EvidenceId::from_digest([6; 32]),
+            requested: hash,
+            delivered: block::Hash([7; 32]),
+            kind: crate::BodyCommitmentKind::HeaderHash,
+            source: body_source,
+        });
+        let invalid_evidence = ConsensusBodyInvalid {
+            hash,
+            evidence: EvidenceId::from_digest([8; 32]),
+            rule: crate::BodyRuleId::new("test.consensus_invalid"),
+            source: body_source,
+        };
+        let invalid = HeaderChainError::consensus_body_invalid(&invalid_evidence);
+        let advertised = HeaderChainError::new(
+            ErrorCategory::ValidLosingFork,
+            subject,
+            None,
+            None,
+            Attribution::None,
+            None,
+        );
+
+        assert_eq!(header.attribution, Attribution::HeaderPeer(header_source));
+        assert!(header.is_automatic_header_peer_fault());
+        for body_error in [&mismatch, &invalid] {
+            assert_eq!(body_error.attribution, Attribution::BodyPeer(body_source));
+            assert!(body_error.is_automatic_body_peer_fault());
+            assert_ne!(
+                body_error.attribution,
+                Attribution::HeaderPeer(header_source)
+            );
+            assert_ne!(body_error.attribution, Attribution::HeaderPeer(advertiser));
+        }
+        assert_eq!(advertised.attribution, Attribution::None);
+        assert!(!advertised.is_automatic_header_peer_fault());
+        assert!(!advertised.is_automatic_body_peer_fault());
     }
 }

@@ -10956,7 +10956,7 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
             token: submit_token,
             height: block::Height(1),
             hash: blocks[0].hash(),
-            outcome: BlockApplyOutcome::consensus_invalid(invalid),
+            outcome: BlockApplyOutcome::consensus_invalid(invalid.clone()),
         })
         .await
         .expect("apply-finished event queues");
@@ -10969,7 +10969,10 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
     let scored = loop {
         if let BlockSyncAction::Misbehavior { peer, reason } = next_action(&mut actions).await {
             assert_eq!(peer, bad_peer);
-            assert_eq!(reason, BlockSyncMisbehavior::InvalidBlock);
+            assert_eq!(
+                reason,
+                BlockSyncMisbehavior::ConsensusBodyInvalid(invalid.clone())
+            );
             break true;
         }
     };

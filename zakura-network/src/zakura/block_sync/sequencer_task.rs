@@ -754,8 +754,8 @@ impl SequencerTask {
                         zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(mismatch) => {
                             BlockSyncMisbehavior::BodyPayloadMismatch(*mismatch)
                         }
-                        zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(_) => {
-                            BlockSyncMisbehavior::InvalidBlock
+                        zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(invalid) => {
+                            BlockSyncMisbehavior::ConsensusBodyInvalid(invalid.clone())
                         }
                         zakura_header_chain::BodyVerificationOutcome::Verified(_)
                         | zakura_header_chain::BodyVerificationOutcome::Retryable(_) => {
@@ -1730,8 +1730,9 @@ mod tests {
                     actions_rx.recv().await,
                     Some(BlockSyncAction::Misbehavior {
                         peer,
-                        reason: BlockSyncMisbehavior::InvalidBlock,
+                        reason: BlockSyncMisbehavior::ConsensusBodyInvalid(actual),
                     }) if peer == ZakuraPeerId::new(vec![1; 32]).expect("test peer ID is valid")
+                        && actual == invalid
                 ));
             } else {
                 assert!(

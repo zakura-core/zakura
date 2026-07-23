@@ -61,28 +61,13 @@ env:
 
 jobs:
   clippy:
-    name: clippy ${{ matrix.rust-version }} / ${{ matrix.type }}
+    name: clippy stable
     permissions:
       contents: read
       id-token: write
       statuses: write
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        # `beta` was dropped from the PR path: it doubled the clippy compile
-        # cost for marginal early-warning value. Re-add it on the nightly
-        # schedule if upcoming-toolchain regressions need tracking.
-        rust-version: [stable]
-        type: [release, tests]
-        include:
-          - type: release
-            args: --workspace --all-targets
-            features: default-release-binaries
-          - type: tests
-            args: --workspace --all-targets
-            features: default-release-binaries proptest-impl lightwalletd-grpc-tests zakura-checkpoints
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -91,12 +76,15 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
           components: clippy
-          toolchain: ${{ matrix.rust-version }}
+          toolchain: stable
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/setup-zakura-build
-      - name: Run clippy
-        run: cargo clippy ${{ matrix.args }} --features "${{ matrix.features }}"
+      - name: Run clippy with release features
+        run: cargo clippy --workspace --all-targets --features default-release-binaries
+      - name: Run clippy with test features
+        if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets --features "default-release-binaries proptest-impl lightwalletd-grpc-tests zakura-checkpoints"
 
   # NOTE: per-crate default / no-default-features checks moved to
   # `test-crates.yml`, which runs `cargo hack check --workspace` (and again with

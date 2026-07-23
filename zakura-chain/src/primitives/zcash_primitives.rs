@@ -157,7 +157,7 @@ impl TryFrom<&transparent::Output> for zcash_transparent::bundle::TxOut {
     fn try_from(output: &transparent::Output) -> Result<Self, Self::Error> {
         let serialized_output_bytes = output
             .zcash_serialize_to_vec()
-            .expect("zcash_primitives and Zebra transparent output formats must be compatible");
+            .expect("zcash_primitives and Zakura transparent output formats must be compatible");
 
         zcash_transparent::bundle::TxOut::read(&mut serialized_output_bytes.as_slice())
     }

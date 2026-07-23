@@ -1,13 +1,6 @@
-<p align="center">
-  <img src="book/theme/zakura-flower-v1.svg" alt="Zakura logo" width="160">
-</p>
-
----
-
 [![Unit Tests](https://github.com/zakura-core/zakura/actions/workflows/tests-unit.yml/badge.svg)](https://github.com/zakura-core/zakura/actions/workflows/tests-unit.yml)
 [![Lint](https://github.com/zakura-core/zakura/actions/workflows/lint.yml/badge.svg)](https://github.com/zakura-core/zakura/actions/workflows/lint.yml)
 [![codecov](https://codecov.io/gh/zakura-core/zakura/branch/main/graph/badge.svg)](https://codecov.io/gh/zakura-core/zakura)
-[![Build docs](https://github.com/zakura-core/zakura/actions/workflows/book.yml/badge.svg)](https://github.com/zakura-core/zakura/actions/workflows/book.yml)
 ![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)
 
 - [Getting Started](#getting-started)
@@ -28,7 +21,7 @@ Zakura is forked from [Zebra](https://github.com/ZcashFoundation/zebra). This fi
 - [zcashd compatibility](book/src/user/zcashd-compat.md): A compatibility mode
   reproduces the legacy zcashd RPC interface, so existing wallets and
   integrations keep working.
-- Experimental P2P v2: We are building a new P2P transport layer for Zakura nodes, currently off by default on Mainnet. The goals are sub-500ms worst-case block propagation, mempool aggregation (used in Tachyon), sync at the speed of your bandwidth, and a future-proofed gossip protocol. The v2 stack has known DoS risks and is not yet production-hardened; see its [current tradeoffs and production readiness criteria](book/src/user/p2p.md).
+- Experimental P2P v2: We are building a new P2P transport layer for Zakura nodes, currently off by default on Mainnet. The goals are sub-500ms worst-case block propagation, mempool aggregation (used in Tachyon), sync at the speed of your bandwidth, and a future-proofed gossip protocol. The v2 stack has known DoS risks and is not yet production-hardened.
 
 ## Getting Started
 
@@ -64,8 +57,8 @@ docker run -d \
 
 The `-p 8233:8233` flag exposes the P2P port so other Zcash nodes can connect to
 yours, and `-v` persists the chain state across restarts (use port `18233` for
-Testnet). For more information, read our [Docker
-documentation](book/src/user/docker.md).
+Testnet). For more information, see the image's
+[Docker Hub page](https://hub.docker.com/r/zakuracore/zakura).
 
 ### Manual Install
 
@@ -121,7 +114,7 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.0.2 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.0.3 zakura
 ```
 
 You can start Zakura by running
@@ -130,14 +123,13 @@ You can start Zakura by running
 zakurad start
 ```
 
-Refer to the [Building and Installing
-Zakura](book/src/user/install.md) and [Running
-Zakura](book/src/user/run.md) sections in the book for enabling
-optional features, detailed configuration, and further details.
+Run `zakurad start --help` for optional features and configuration details.
 
 ## Documentation
 
 The Zakura maintainers provide the following resources:
+
+- The [Zakura website](https://zakura.com/) for user guides and announcements.
 
 - The [documentation of the public
   APIs](https://docs.rs/zakura/latest/zakurad/#zakura-crates) for the latest
@@ -150,9 +142,7 @@ The Zakura maintainers provide the following resources:
 
 If Zakura doesn't behave the way you expected, [open an
 issue](https://github.com/zakura-core/zakura/issues/new/choose). We regularly
-triage new issues and we will respond. We maintain a list of known issues in the
-[Troubleshooting](book/src/user/troubleshooting.md) section of
-the book.
+triage new issues and we will respond.
 
 If you want to chat with us, use the GitHub issues for now.
 

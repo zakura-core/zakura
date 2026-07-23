@@ -27,7 +27,7 @@ Here's how we make sure we got everything:
 
 - [ ] Run `cargo update` on the latest `main` branch, and keep the output
 - [ ] Until we bump the workspace MSRV to 1.88 or higher, `home` must be downgraded manually: `cargo update home@0.5.12 --precise 0.5.11`
-- [ ] If needed, [add duplicate dependency exceptions to deny.toml](https://github.com/zakura-core/zakura/blob/main/book/src/dev/continuous-integration.md#fixing-duplicate-dependencies-in-check-denytoml-bans)
+- [ ] If needed, add duplicate dependency exceptions to `deny.toml`.
 - [ ] If needed, remove resolved duplicate dependencies from `deny.toml`
 - [ ] Open a separate PR with the changes
 - [ ] Add the output of `cargo update` to that PR as a comment
@@ -42,25 +42,23 @@ Changelog policy lives in
 [`CHANGELOG_GUIDELINES.md`](https://github.com/zakura-core/zakura/blob/main/CHANGELOG_GUIDELINES.md) —
 follow it if it and these steps ever disagree. In particular, `v1.0.0` and its
 release candidates take a single "Initial release" entry (already in place)
-and **skip** the draft-changelog steps below; they apply to releases after
+and **skip** the fragment-assembly steps below; they apply to releases after
 `v1.0.0`.
 
-**Important**: Any merge into `main` deletes any edits to the draft changelog.
-Once you are ready to tag a release, copy the draft changelog into `CHANGELOG.md`.
+Unreleased notes live in one `changelog-unreleased/<PR-number>.md` fragment per
+PR. To prepare them for assembly:
 
-We use [the Release Drafter workflow](https://github.com/marketplace/actions/release-drafter) to automatically create a [draft changelog](https://github.com/zakura-core/zakura/releases). We follow the [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) format.
+- [ ] Run `./scripts/changelog.py check`.
+- [ ] Review every pending fragment for concrete operator-visible effects.
+- [ ] Remove trivial entries by changing their fragment to an explicit
+      no-changelog fragment with a reason.
+- [ ] Combine duplicate descriptions by editing the relevant fragments.
+- [ ] Check each category. Prefer `Fixed` if you're not sure.
+- [ ] Confirm every item contains its PR link.
 
-To create the final change log:
-
-- [ ] Copy the [**latest** draft
-      changelog](https://github.com/zakura-core/zakura/releases) into
-      `CHANGELOG.md` (there can be multiple draft releases)
-- [ ] Delete any trivial changes
-  - [ ] Put the list of deleted changelog entries in a PR comment to make reviewing easier
-- [ ] Combine duplicate changes
-- [ ] Edit change descriptions so they will make sense to Zakura users
-- [ ] Check the category for each change
-  - Prefer the "Fix" category if you're not sure
+Do not copy GitHub draft release notes or edit the shared `[Unreleased]`
+section. The version-aware assembly runs after all package version bumps below.
+Release Drafter remains responsible for the separate GitHub release-note draft.
 
 ## README
 
@@ -81,9 +79,15 @@ fastmod --fixed-strings '1.58' '1.65'
 
 ## Create the Release PR
 
-- [ ] Push the updated changelog and README into a new branch
-      for example: `bump-v1.0.0` - this needs to be different to the tag name
-- [ ] Create a release PR by adding `&template=release-checklist.md` to the comparing url ([Example](https://github.com/zakura-core/zakura/compare/bump-v1.0.0?expand=1&template=release-checklist.md)).
+- [ ] If a release-capable maintainer has asked you to hold releases, stop
+      here until they lift the hold — a security hotfix may be in flight for
+      the same version, invisible to you under embargo.
+- [ ] Push the reviewed fragments and README updates into a new branch named
+      `release/v<version>`, for example `release/v1.0.0` (CI triggers match
+      `release/**`; any name different from the tag works, but never
+      `hotfix/v*` — that namespace is reserved for the
+      [hotfix release process](https://github.com/zakura-core/zakura/blob/main/docs/security-hotfix-release.md)).
+- [ ] Create a release PR by adding `&template=release-checklist.md` to the comparing url ([Example](https://github.com/zakura-core/zakura/compare/release/v1.0.0?expand=1&template=release-checklist.md)).
 - [ ] Freeze the [`batched` queue](https://dashboard.mergify.com/github/valargroup/repo/zakura/queues) using Mergify.
 - [ ] Mark all the release PRs as `Critical` priority, so they go in the `urgent` Mergify queue.
 - [ ] Mark all non-release PRs with `do-not-merge`, because Mergify checks approved PRs against every commit, even when a queue is frozen.
@@ -137,15 +141,15 @@ The replacements are global path-string substitutions, mirroring
 than `cache_dir` (for example `cookie_dir`), so per-field rewrites produce a
 snapshot the test rejects.
 
-- [ ] On the release commit, run the pre-release checks for the tag you are
-      about to create, using the previous release tag as the base:
-      `make pre-release RELEASE_TAG=v<version> BASE_TAG=v<previous-release-tag>`
-      For example: `make pre-release RELEASE_TAG=v1.0.0 BASE_TAG=v1.0.0-rc5`
-
 ## Update Crate Versions
 
 If you're publishing crates for the first time, [log in to crates.io](https://github.com/zakura-core/zakura/dev/crate-owners.html#logging-in-to-cratesio),
 and make sure you're a member of owners group.
+
+The `Semver checks` CI job enforces bump-with-change against stable
+crates.io baselines on every Rust PR, so most bumps already exist by release
+time; the steps below review and complete them (for example, for non-API
+changes that still warrant publishing).
 
 Check that the release will work:
 
@@ -176,6 +180,28 @@ cargo release replace --verbose --execute --allow-branch '*' -p zakura
 
 - [ ] Commit and push the above version changes to the release branch.
 
+## Assemble and Verify the Change Log
+
+- [ ] Assemble the fragments after the `zakura` package version bump is final:
+
+```sh
+make prepare-release-changelog RELEASE_TAG=v<version>
+```
+
+- [ ] Confirm the `make/release.mk` target consumed every numbered
+      `changelog-unreleased/<PR-number>.md` file, including no-changelog
+      fragments. Keep `changelog-unreleased/README.md`; it documents the
+      fragment format.
+- [ ] Review the generated root changelog.
+- [ ] For a stable release, confirm the generated section combines and replaces
+      every matching `v<version>-rc*` changelog section.
+- [ ] Commit the generated changelog and fragment deletions.
+- [ ] On that release commit, run the complete pre-release gate with the
+      previous release tag as the base:
+      `make pre-release RELEASE_TAG=v<version> BASE_TAG=v<previous-release-tag>`.
+      For example:
+      `make pre-release RELEASE_TAG=v1.0.3 BASE_TAG=v1.0.2`.
+
 ## Update End of Support
 
 The end of support height is calculated from the current blockchain height:
@@ -202,13 +228,26 @@ The end of support height is calculated from the current blockchain height:
 ## Create the GitHub Pre-Release
 
 - [ ] Wait for all the release PRs to be merged
-- [ ] Run the [Create release workflow](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml)
+- [ ] Run the T-0 orchestrator — its preflight checks for a competing
+      release train, then it dispatches `Create release` from `main` with
+      the exact tag, watches to the approval gate, and verifies the
+      published tag, release, and assets (resumable — re-runs skip
+      completed steps):
+
+      ```sh
+      ./scripts/release-t0.sh publish --tag v<version> --mode main \
+          --head-sha <merged-main-commit>
+      ```
+
+      Manual fallback: run the
+      [Create release workflow](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml)
       from `main`, entering the exact version tag, for example `v1.0.0-rc2`.
       The workflow verifies that the tag matches the `zakura` package version,
       then builds and verifies the assets without creating a tag.
 - [ ] Wait for the build and no-push Docker checks to pass, then approve the
-      `release` environment deployment. The workflow publishes a complete
-      pre-release and creates the protected tag as its final step.
+      `release` environment deployment when the script announces it. The
+      workflow publishes a complete pre-release and creates the protected
+      tag as its final step.
 - [ ] Review and update the new release description against the final changelog
       you created, starting just _after_ the title `## [Zakura ...` of the
       current version and ending just _before_ the title of the previous
@@ -227,10 +266,12 @@ For a release candidate, skip this section: the release stays a pre-release
 from publication until deletion.
 
 - [ ] For a stable release, after `make sign-release` has run against the tag:
-      [edit the release](https://github.com/zakura-core/zakura/releases) to
-      disable 'pre-release' **and** check "Set as the latest release"
-      (`make_latest: true`) — both steps are explicit; nothing does this
-      automatically.
+      `./scripts/release-t0.sh promote --tag v<version>` — it refuses
+      unsigned releases and release candidates, clears 'pre-release', checks
+      "Set as the latest release" (`make_latest: true`), and verifies both.
+      Manual fallback:
+      [edit the release](https://github.com/zakura-core/zakura/releases) and
+      set both flags explicitly — nothing does this automatically.
 
 ## Publish Crates
 

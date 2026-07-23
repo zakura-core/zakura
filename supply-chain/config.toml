@@ -627,10 +627,6 @@ criteria = "safe-to-deploy"
 version = "4.2.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.elasticsearch]]
-version = "8.17.0-alpha.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.encode_unicode]]
 version = "0.3.6"
 criteria = "safe-to-deploy"

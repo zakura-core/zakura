@@ -1,4 +1,4 @@
-//! The Zebra mempool.
+//! The Zakura mempool.
 //!
 //! A service that manages known unmined Zcash transactions.
 
@@ -25,17 +25,30 @@ pub use self::{
     transaction_dependencies::TransactionDependencies,
 };
 
-/// The mempool is disabled until Zebra is close to the chain tip.
+/// The mempool is disabled until Zakura is close to the chain tip.
 #[derive(Debug)]
 pub struct MempoolDisabledError;
 
 impl fmt::Display for MempoolDisabledError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("mempool is not active: wait for Zebra to sync to the tip")
+        f.write_str("mempool is not active: wait for Zakura to sync to the tip")
     }
 }
 
 impl std::error::Error for MempoolDisabledError {}
+
+#[cfg(test)]
+mod tests {
+    use super::MempoolDisabledError;
+
+    #[test]
+    fn mempool_disabled_error_uses_zakura_branding() {
+        assert_eq!(
+            MempoolDisabledError.to_string(),
+            "mempool is not active: wait for Zakura to sync to the tip"
+        );
+    }
+}
 
 /// A peer source for per-peer mempool download accounting.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -68,6 +81,16 @@ impl From<SocketAddr> for QueueSource {
 pub enum Request {
     /// Query all [`UnminedTxId`]s in the mempool.
     TransactionIds,
+
+    /// Return and clear up to `limit` transaction IDs awaiting proactive
+    /// advertisement through the peer set.
+    ///
+    /// This pending set is separate from the full mempool inventory returned
+    /// by [`Request::TransactionIds`] in response to peer `mempool` requests.
+    TakePendingGossipTransactionIds {
+        /// Maximum number of transaction IDs to return.
+        limit: usize,
+    },
 
     /// Query matching [`UnminedTx`] in the mempool,
     /// using a unique set of [`UnminedTxId`]s.

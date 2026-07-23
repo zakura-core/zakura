@@ -1,6 +1,6 @@
 [package]
 name = "zakura-state"
-version = "3.0.0"
+version = "4.0.0"
 authors.workspace = true
 description = "State contextual verification and storage code for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -42,13 +42,6 @@ proptest-impl = [
     "zakura-chain/proptest-impl"
 ]
 
-# Experimental elasticsearch support
-elasticsearch = [
-    "dep:elasticsearch",
-    "dep:serde_json",
-    "zakura-chain/elasticsearch",
-]
-
 [dependencies]
 bincode = { workspace = true }
 chrono = { workspace = true, features = ["clock", "std"] }
@@ -82,19 +75,14 @@ tracing = { workspace = true }
 sapling-crypto = { workspace = true }
 zakura-vct-sprout-history = { workspace = true }
 
-# elasticsearch specific dependencies.
-# Security: avoid default dependency on openssl
-elasticsearch = { workspace = true, features = ["rustls-tls"], optional = true }
-serde_json = { workspace = true, optional = true }
-
-zakura-node-services = { path = "../zakura-node-services", version = "1.0.1" }
-zakura-chain = { path = "../zakura-chain", version = "1.2.0", features = ["async-error"] }
+zakura-node-services = { path = "../zakura-node-services", version = "2.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "2.0.0", features = ["async-error"] }
 
 # prod feature progress-bar
 howudoin = { workspace = true, optional = true }
 
 # test feature proptest-impl
-zakura-test = { path = "../zakura-test/", version = "1.0.0", optional = true }
+zakura-test = { path = "../zakura-test/", version = "2.0.0", optional = true }
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 derive-getters.workspace = true
@@ -120,11 +108,17 @@ jubjub = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
-zakura-chain = { path = "../zakura-chain", version = "1.2.0", features = ["proptest-impl"] }
-zakura-test = { path = "../zakura-test/", version = "1.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "2.0.0", features = ["proptest-impl"] }
+zakura-test = { path = "../zakura-test/", version = "2.0.0" }
 
 [lints]
 workspace = true
+
+# Removing the experimental `elasticsearch` feature is intentional. It never
+# provided a supported downstream library API, so do not require a major
+# version solely to remove its Cargo feature name.
+[package.metadata.cargo-semver-checks.lints]
+feature_missing = "warn"
 
 [[bench]]
 name = "transparent_spend_worst_case"

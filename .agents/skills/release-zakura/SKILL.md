@@ -26,6 +26,9 @@ defining it, and adds the Zakura-specific checks that are easy to miss.
 - Do not promote a release candidate from pre-release to Latest. Published
   release candidates stay up as pre-releases; removing one is an owner-level
   decision, never part of a release flow.
+- If a release-capable maintainer has announced a release hold, stop: do not
+  prepare or publish until it is lifted. A security hotfix may be in flight
+  for the same version, invisible under embargo.
 
 ## Gather release context
 
@@ -52,6 +55,11 @@ git diff --stat <previous-tag>
 
 ## Prepare the release branch
 
+Name the branch `release/v<version>`. Never use `hotfix/v*` — that namespace
+is reserved for the hotfix release process
+(`docs/security-hotfix-release.md`), and keeping the namespaces disjoint is
+what prevents collisions with an embargoed hotfix.
+
 ### Package versions
 
 Always update the `zakura` package version in `zakurad/Cargo.toml`; release
@@ -77,15 +85,44 @@ assume every publishable crate has the `zakura` package version.
 
 Update:
 
-- the README `cargo install --git ... --tag` example
-- `zakurad/tests/common/configs/<version>.toml`
+- the README `cargo install --git ... --tag` example for stable releases only;
+  while preparing a release candidate, keep the general install example on the
+  latest stable tag
+- `zakurad/tests/common/configs/<version>.toml`, then remove stale generated
+  release fixtures so the directory retains only the current release fixture
+  and custom test configurations
 - `ESTIMATED_RELEASE_HEIGHT` from the current chain tip and expected tag date
-- the root changelog according to project policy
+- pending `changelog-unreleased/<PR-number>.md` fragments according to project
+  policy
+- the root changelog by running the fragment assembler after the `zakura`
+  package version bump is final
 - examples in release documentation only when they are intended to track the
   current release
 
 Generate the stored config from the release branch; do not copy it blindly when
-config defaults or fields changed.
+config defaults or fields changed. Run the exact acceptance config test to
+verify both the generated fixture and the retained fixture set:
+
+```bash
+cargo test -p zakura --test acceptance config_tests -- --exact
+```
+
+After the `zakura` package version bump is final, run:
+
+```bash
+make prepare-release-changelog RELEASE_TAG=<tag>
+```
+
+This target is defined in `make/release.mk`. It must consume every numbered
+`changelog-unreleased/<PR-number>.md` fragment into the root changelog,
+including explicit no-changelog fragments. Keep
+`changelog-unreleased/README.md`; it documents the fragment format and is not a
+pending fragment.
+
+Review and commit the generated root changelog and numbered fragment deletions.
+For a stable release, confirm the generated section combines and replaces all
+matching release-candidate sections; no `X.Y.Z-rc*` section for that stable
+version should remain in the root changelog.
 
 ## Verify before opening or approving the PR
 
@@ -93,7 +130,7 @@ Run:
 
 ```bash
 cargo metadata --no-deps --format-version 1 --locked
-./scripts/check-release-version.sh <tag>
+make pre-release RELEASE_TAG=<tag> BASE_TAG=<previous-tag>
 ./scripts/check-crate-packaging.sh --verify
 ```
 
@@ -121,18 +158,29 @@ checks and why.
   a skipped result usually means the label is missing.
 - Include motivation, solution, test evidence, issue/reference links, risk
   classification, follow-up work, and AI disclosure.
+- Confirm all `changelog-unreleased/<PR-number>.md` files were consumed and the
+  generated root changelog was committed.
 - Verify the release graph independently; a green ordinary PR build does not
   prove crates.io packaging.
-- Post-1.0.0 releases only: confirm the root changelog or a separate draft
-  contains concrete release notes for every user-visible change since the
-  previous release. Through 1.0.0 the changelog is frozen — 1.0.0 ships
-  "Initial release" only in the root changelog.
+- Post-1.0.0 releases only: confirm the assembled root changelog contains
+  concrete release notes for every user-visible change since the previous
+  release. Through 1.0.0 the changelog is frozen — 1.0.0 ships "Initial
+  release" only in the root changelog.
 - Audit the checklist against `docs/release-tag-protection.md`.
 - Wait for required human approval and all enabled CI checks.
 
 ## Publish
 
-After the release PR is merged and explicit confirmation is given:
+After the release PR is merged and explicit confirmation is given, run the
+T-0 orchestrator — it preflights competing release trains, dispatches,
+watches to the approval gate, and verifies the published release; it is
+resumable and re-runs skip completed steps:
+
+```bash
+./scripts/release-t0.sh publish --tag <tag> --mode main --head-sha <merged-commit>
+```
+
+Raw dispatch fallback:
 
 ```bash
 gh workflow run create-release.yml \
@@ -164,6 +212,8 @@ still has the previous package version.
 - Install the exact version from crates.io and run `zakurad --version`.
 - Replace the boilerplate GitHub release body with concrete notes from the final
   changelog or approved release-note draft.
+- Promote stable releases with `./scripts/release-t0.sh promote --tag <tag>`
+  after signing; it refuses unsigned releases and release candidates.
 - Keep release candidates marked as pre-releases.
 
 ## Review output

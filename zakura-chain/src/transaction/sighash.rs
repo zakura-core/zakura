@@ -194,15 +194,15 @@ impl SigHasher {
     /// transactions ignore it because ZIP-244 commits to the spent output's
     /// `scriptPubKey` instead.
     ///
-    /// This method only calculates a digest. For V5 and later transactions,
-    /// callers must separately reject `SIGHASH_SINGLE` when the transparent
-    /// input does not have a corresponding output. Callers that need raw
-    /// pre-V5 hash type bytes must use [`SigHasher::sighash_v4_raw`].
+    /// Callers that need raw pre-V5 hash type bytes must use
+    /// [`SigHasher::sighash_v4_raw`].
     ///
     /// # Panics
     ///
     /// - If `hash_type` is not one of the six canonical signature hash types.
     /// - If the input index is out of bounds for the transaction inputs.
+    /// - If a V5 or later `SIGHASH_SINGLE` transparent input does not have a
+    ///   corresponding output.
     pub fn sighash(
         &self,
         hash_type: HashType,
@@ -212,6 +212,15 @@ impl SigHasher {
             CanonicalHashType::try_from(hash_type).expect("hash type should be canonical");
 
         if let Some(zip244) = &self.zip244 {
+            if let Some((input_index, _)) = &input_index_script_code {
+                assert!(
+                    !canonical_hash_type.is_single()
+                        || zip244.has_corresponding_output(*input_index),
+                    "sighash precondition violated: V5+ SIGHASH_SINGLE requires a corresponding \
+                     transparent output",
+                );
+            }
+
             return zip244.sighash(
                 canonical_hash_type,
                 input_index_script_code.as_ref().map(|(index, _)| *index),

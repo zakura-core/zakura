@@ -1221,7 +1221,7 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     global COLLECTOR
 
-    parser = argparse.ArgumentParser(description="Serve a Zebra fleet status dashboard.")
+    parser = argparse.ArgumentParser(description="Serve a Zakura fleet status dashboard.")
     parser.add_argument("--config", required=True, help="path to deploy/deployer nodes TOML")
     parser.add_argument("--host", default="0.0.0.0", help="dashboard bind host")
     parser.add_argument("--port", type=int, default=8090, help="dashboard bind port")

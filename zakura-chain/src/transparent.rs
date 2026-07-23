@@ -64,10 +64,7 @@ pub const ONE_THIRD_DUST_THRESHOLD_RATE: u32 = 100;
 /// A particular transaction output reference.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-#[cfg_attr(
-    any(test, feature = "proptest-impl", feature = "elasticsearch"),
-    derive(Serialize)
-)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Serialize))]
 pub struct OutPoint {
     /// References the transaction that contains the UTXO being spent.
     ///
@@ -102,10 +99,7 @@ impl OutPoint {
 
 /// A transparent input to a transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    any(test, feature = "proptest-impl", feature = "elasticsearch"),
-    derive(Serialize)
-)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Serialize))]
 pub enum Input {
     /// A reference to an output of a previous transaction.
     PrevOut {
@@ -290,33 +284,6 @@ impl Input {
             self.value_from_outputs(&HashMap::new())
         }
     }
-
-    /// Get the value spent by this input, by looking up its [`OutPoint`] in
-    /// [`OrderedUtxo`]s.
-    ///
-    /// See [`Self::value`] for details.
-    ///
-    /// # Panics
-    ///
-    /// If the provided [`OrderedUtxo`]s don't have this input's [`OutPoint`].
-    pub fn value_from_ordered_utxos(
-        &self,
-        ordered_utxos: &HashMap<OutPoint, utxo::OrderedUtxo>,
-    ) -> Amount<NonNegative> {
-        if let Some(outpoint) = self.outpoint() {
-            // look up the specific Output and convert it to the expected format
-            let output = ordered_utxos
-                .get(&outpoint)
-                .expect("provided Utxos don't have spent OutPoint")
-                .utxo
-                .output
-                .clone();
-            self.value_from_outputs(&iter::once((outpoint, output)).collect())
-        } else {
-            // coinbase inputs don't need any UTXOs
-            self.value_from_outputs(&HashMap::new())
-        }
-    }
 }
 
 /// A transparent output from a transaction.
@@ -333,10 +300,7 @@ impl Input {
 /// (just like receiving change).
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary, Deserialize))]
-#[cfg_attr(
-    any(test, feature = "proptest-impl", feature = "elasticsearch"),
-    derive(Serialize)
-)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Serialize))]
 pub struct Output {
     /// Transaction value.
     // At https://en.bitcoin.it/wiki/Protocol_documentation#tx, this is an i64.

@@ -1,5 +1,3 @@
-//! ![Zakura logotype](https://raw.githubusercontent.com/zakura-core/zakura/main/book/theme/favicon.png)
-//!
 //! Zakura is a Zcash full node written in Rust. Follow the [introductory
 //! page](https://github.com/zakura-core/zakura#documentation) in the Zakura documentation to learn more.
 //!
@@ -68,9 +66,6 @@
 //!   (The `progress-bar` feature is activated by default.)
 //! * `prometheus`: export metrics to prometheus.
 //!
-//! Read the [metrics](../../../book/src/user/metrics.md) section of the book
-//! for more details.
-//!
 //! ### Tracing
 //!
 //! Sending traces to different subscribers:
@@ -86,11 +81,8 @@
 //! * A set of features that [skip verbose tracing].
 //!   The default features ignore `debug` and `trace` logs in release builds.
 //!
-//! Read the [tracing](../../../book/src/user/tracing.md) section of the book
-//! for more details.
-//!
 //! [skip verbose tracing]: https://docs.rs/tracing/0.1.35/tracing/level_filters/index.html#compile-time-filters
-//! [specific compiler flags]: ../../../book/src/dev/tokio-console.md#setup
+//! [specific compiler flags]: https://docs.rs/console-subscriber/latest/console_subscriber/#enabling-tokio-instrumentation
 //!
 //! ### Testing
 //!
@@ -99,8 +91,6 @@
 //!
 //! ### Experimental
 //!
-//! * `elasticsearch`: save block data into elasticsearch database. Read the [elasticsearch](../../../book/src/user/elasticsearch.md)
-//!   section of the book for more details.
 //! * `internal-miner`: enable experimental support for mining inside Zakura, without an external
 //!   mining pool. This feature is only supported on testnet. Use a GPU or ASIC on mainnet for
 //!   efficient mining.
@@ -127,12 +117,6 @@
 //! the documentation of the internal APIs, follow <https://zakura-core.github.io/zakura/internal> that lists
 //! all Zakura crates as well in the left sidebar.
 
-#![doc(
-    html_favicon_url = "https://raw.githubusercontent.com/zakura-core/zakura/main/book/theme/favicon.png"
-)]
-#![doc(
-    html_logo_url = "https://raw.githubusercontent.com/zakura-core/zakura/main/book/theme/favicon.png"
-)]
 #![doc(html_root_url = "https://docs.rs/zakura")]
 // Tracing causes false positives on this lint:
 // https://github.com/tokio-rs/tracing/issues/553

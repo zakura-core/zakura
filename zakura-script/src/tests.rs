@@ -447,7 +447,7 @@ fn sighash_divergence_v5_p2pkh_malformed_0x84_wrong_canonical_type_rejected() {
     assert!(
         result.is_err(),
         "Malformed hash_type 0x84 signed with wrong canonical type should be rejected \
-         by both Zebra and zcashd (sighash mismatch)"
+         by both Zakura and zcashd (sighash mismatch)"
     );
 }
 
@@ -540,12 +540,26 @@ fn build_and_verify_v5_p2pkh_single_with_missing_output(
         all_previous_outputs.clone(),
     )
     .expect("sighasher creation should succeed");
-    let sighash = sighasher.sighash(
-        canonical_hash_type,
-        Some((signed_input_index, lock_script_bytes.clone())),
-    );
+    let sighash = if signed_input_index >= placeholder_tx.outputs().len() {
+        // The chain sighash API now rejects this invalid request, so preserve
+        // the old digest only to construct a regression transaction that
+        // reaches the script layer's defense in depth check.
+        <[u8; 32]>::from_hex(if anyone_can_pay {
+            "217872a1e1ce0b5738454081962541b094bdddf8ad4bec7a8894df7904bd679e"
+        } else {
+            "2820a4ba1ac63e86c2ed01941a837197f65e0be2a2fed06c73938e60daed8320"
+        })
+        .expect("fixed missing-output sighash is valid hex")
+    } else {
+        sighasher
+            .sighash(
+                canonical_hash_type,
+                Some((signed_input_index, lock_script_bytes.clone())),
+            )
+            .into()
+    };
 
-    let msg = Message::from_digest(*sighash.as_ref());
+    let msg = Message::from_digest(sighash);
     let signature = secp.sign_ecdsa(&msg, &secret_key);
     let der_sig = signature.serialize_der();
 
@@ -1733,12 +1747,12 @@ fn poc_p2sh_1001_accurate_multisigs_should_stay_below_block_sigop_limit() -> Res
 
     assert_eq!(
         zebra_count, zcashd_accurate_count,
-        "Zebra should count each accurate 1-of-1 P2SH multisig spend as 1 sigop, not 20"
+        "Zakura should count each accurate 1-of-1 P2SH multisig spend as 1 sigop, not 20"
     );
 
     assert!(
         zebra_count <= 20_000,
-        "A zcashd-valid block-level sigop total should not cross Zebra's MAX_BLOCK_SIGOPS"
+        "A zcashd-valid block-level sigop total should not cross Zakura's MAX_BLOCK_SIGOPS"
     );
 
     Ok(())

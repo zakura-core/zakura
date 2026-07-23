@@ -399,6 +399,14 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
         true
     }
 
+    /// Return whether this service has actually admitted `peer` and still owns its connection.
+    ///
+    /// Discovery uses this after its initial exchange so a merely negotiated capability cannot
+    /// keep a connection alive when the owning service rejected or parked its stream.
+    fn owns_connection_for_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) -> bool {
+        false
+    }
+
     /// Add a connected peer and spawn any per-stream work owned by this service.
     fn add_peer(&self, peer: Peer);
 

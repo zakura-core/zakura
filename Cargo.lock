@@ -227,18 +227,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-compression"
-version = "0.4.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e79b3f8a79cccc2898f31920fc69f304859b3bd567490f75ebf51ae1c792a9ac"
-dependencies = [
- "compression-codecs",
- "compression-core",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1026,23 +1014,6 @@ dependencies = [
  "bytes",
  "memchr",
 ]
-
-[[package]]
-name = "compression-codecs"
-version = "0.4.38"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
-dependencies = [
- "compression-core",
- "flate2",
- "memchr",
-]
-
-[[package]]
-name = "compression-core"
-version = "0.4.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc14f565cf027a105f7a44ccf9e5b424348421a1d8952a8fc9d499d313107789"
 
 [[package]]
 name = "config"
@@ -1860,28 +1831,6 @@ name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
-
-[[package]]
-name = "elasticsearch"
-version = "8.17.0-alpha.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52be486463ef0b89e45191803db146387d5f594c26a0c8790807bb3e988ec5f6"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "dyn-clone",
- "flate2",
- "lazy_static",
- "percent-encoding",
- "reqwest 0.12.28",
- "rustc_version",
- "serde",
- "serde_json",
- "serde_with",
- "tokio",
- "url",
- "void",
-]
 
 [[package]]
 name = "embedded-io"
@@ -7557,17 +7506,12 @@ version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
- "async-compression",
  "bitflags 2.13.0",
  "bytes",
- "futures-core",
  "futures-util",
  "http",
  "http-body",
- "http-body-util",
  "pin-project-lite",
- "tokio",
- "tokio-util",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
@@ -8044,12 +7988,6 @@ dependencies = [
  "quote",
  "syn 2.0.118",
 ]
-
-[[package]]
-name = "void"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
 
 [[package]]
 name = "wagyu-zcash-parameters"
@@ -8765,7 +8703,7 @@ checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 
 [[package]]
 name = "zakura"
-version = "1.0.2"
+version = "1.0.4-rc0"
 dependencies = [
  "abscissa_core",
  "anyhow",
@@ -8855,7 +8793,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "1.2.0"
+version = "2.0.0"
 dependencies = [
  "bech32",
  "bitflags 2.13.0",
@@ -8925,7 +8863,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -8978,7 +8916,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-jsonl-trace"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "tempfile",
  "tokio",
@@ -8988,7 +8926,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -9036,7 +8974,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "1.0.1"
+version = "2.0.0"
 dependencies = [
  "color-eyre",
  "jsonrpsee-types",
@@ -9050,7 +8988,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9120,7 +9058,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "1.0.1"
+version = "2.0.0"
 dependencies = [
  "hex",
  "lazy_static",
@@ -9138,7 +9076,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "bincode",
  "chrono",
@@ -9147,7 +9085,6 @@ dependencies = [
  "derive-getters",
  "derive-new",
  "dirs",
- "elasticsearch",
  "futures",
  "halo2_proofs",
  "hex",
@@ -9191,7 +9128,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-test"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "color-eyre",
  "futures",
@@ -9218,7 +9155,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-tower-batch-control"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "color-eyre",
  "ed25519-zebra",
@@ -9240,7 +9177,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-tower-fallback"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "futures-core",
  "pin-project",
@@ -9252,13 +9189,11 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "1.0.2"
+version = "2.0.0"
 dependencies = [
  "color-eyre",
  "hex",
  "itertools 0.14.0",
- "regex",
- "reqwest 0.12.28",
  "serde_json",
  "structopt",
  "thiserror 2.0.18",
@@ -9267,7 +9202,6 @@ dependencies = [
  "tracing-subscriber",
  "zakura-chain",
  "zakura-node-services",
- "zakura-rpc",
  "zakura-state",
  "zcash_primitives",
  "zcash_protocol",

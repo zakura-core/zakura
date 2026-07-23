@@ -2,14 +2,22 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::{iter, net::SocketAddr};
+use std::{
+    io, iter,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use futures::FutureExt;
 use indexmap::IndexSet;
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::{
+    sync::{oneshot, Notify},
+    task::JoinHandle,
+};
 use tower::{
     buffer::Buffer, builder::ServiceBuilder, load_shed::LoadShed, util::BoxService, ServiceExt,
 };
+use tracing::instrument::WithSubscriber;
 
 use zakura_chain::{
     block::{self, Height},
@@ -32,13 +40,34 @@ use zakura_test::mock_service::{MockService, PanicAssertion};
 use crate::{
     components::{
         inbound::{downloads::MAX_INBOUND_CONCURRENCY, Inbound, InboundSetupData},
-        mempool::{gossip_mempool_transaction_id, Config as MempoolConfig, Mempool},
+        mempool::{run_mempool_transaction_id_gossip, Config as MempoolConfig, Mempool},
         sync::{self, BlockGossipError, SyncStatus},
     },
     BoxError,
 };
 
 use InventoryResponse::*;
+
+/// An in-memory writer for assertions on test-local tracing output.
+struct TestWriter {
+    output: Arc<Mutex<Vec<u8>>>,
+    log_written: Arc<Notify>,
+}
+
+impl io::Write for TestWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.output
+            .lock()
+            .map_err(|_| io::Error::other("log buffer lock should not be poisoned"))?
+            .extend_from_slice(buf);
+        self.log_written.notify_one();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Check that a network stack with an empty address book only contains the local listener port,
 /// by querying the inbound service via a local TCP connection.
@@ -288,9 +317,15 @@ async fn inbound_block_empty_state_notfound() -> Result<(), crate::BoxError> {
 ///
 /// Uses a real Zebra network stack, with an isolated Zebra inbound TCP connection.
 #[tokio::test(flavor = "multi_thread")]
-#[tracing_test::traced_test]
 async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
 ) -> Result<(), crate::BoxError> {
+    // `tracing_test::traced_test` can't be used here: it sets a second process-wide
+    // subscriber, which races with the one set by `zakura_test::init()` in the other
+    // tests in this binary. Capture logs from the `zakura_test` subscriber instead.
+    // Only this test configures zcashd-compat pruning retention, so no other test in
+    // this binary can log the pruned block error message.
+    let captured_logs = zakura_test::log_capture::LogCapture::new();
+
     // `setup` configures checkpoint retention against `Height::MAX`, so block 1 is committed
     // to the retained chain indexes without storing its transaction bytes. Genesis is retained.
     let state_config = StateConfig {
@@ -381,7 +416,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         "an unknown hash maps to missing inventory"
     );
     assert!(
-        !logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        !captured_logs.contains(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
         "an unknown hash must not log a pruning error"
     );
 
@@ -395,7 +430,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         "inbound maps the unavailable block body to missing inventory"
     );
     assert!(
-        !logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        !captured_logs.contains(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
         "an ordinary peer must not log a zcashd-compat pruning error"
     );
 
@@ -416,7 +451,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         "an unconfigured legacy peer still receives missing inventory"
     );
     assert!(
-        !logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        !captured_logs.contains(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
         "an unconfigured legacy peer must not log a zcashd-compat pruning error"
     );
 
@@ -438,7 +473,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         )
     }
     assert!(
-        logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        captured_logs.contains(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
         "the configured zcashd-compat peer must log the pruning error"
     );
 
@@ -911,6 +946,14 @@ async fn setup(
         protected_peer_ips.clone(),
         setup_rx,
     );
+    let test_dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let inbound_service = ServiceBuilder::new()
+        .map_future(
+            move |future: <Inbound as tower::Service<Request>>::Future| {
+                future.with_subscriber(test_dispatch.clone())
+            },
+        )
+        .service(inbound_service);
     // TODO: add a timeout just above the service, if needed
     let inbound_service = ServiceBuilder::new()
         .load_shed()
@@ -943,7 +986,7 @@ async fn setup(
         network_config,
         inbound_service.clone(),
         latest_chain_tip.clone(),
-        "Zebra user agent".to_string(),
+        "Zakura user agent".to_string(),
         PeerServices::NODE_NETWORK,
         protected_peer_ips,
         None,
@@ -1025,9 +1068,10 @@ async fn setup(
         Some(submitblock_channel.receiver()),
     ));
 
-    let tx_gossip_task_handle = tokio::spawn(gossip_mempool_transaction_id(
+    let tx_gossip_task_handle = tokio::spawn(run_mempool_transaction_id_gossip(
         transaction_subscriber.subscribe(),
         peer_set.clone(),
+        mempool_service.clone(),
     ));
 
     // Set up the inbound service response for the isolated peer
@@ -1078,8 +1122,6 @@ async fn setup(
 }
 
 mod submitblock_test {
-    use std::io;
-    use std::sync::{Arc, Mutex};
     use tracing::{Instrument, Level};
     use tracing_subscriber::fmt;
     use zakura_rpc::SubmitBlockChannel;
@@ -1088,31 +1130,20 @@ mod submitblock_test {
 
     use crate::components::sync::PEER_GOSSIP_DELAY;
 
-    // Custom in-memory writer to capture logs
-    struct TestWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for TestWriter {
-        #[allow(clippy::unwrap_in_result)]
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            let mut logs = self.0.lock().unwrap();
-            logs.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
     #[tokio::test]
     async fn submitblock_channel() -> Result<(), crate::BoxError> {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let log_sink = logs.clone();
+        let log_written = Arc::new(Notify::new());
+        let writer_log_written = log_written.clone();
 
         // Set up a tracing subscriber with a custom writer
         let subscriber = fmt()
             .with_max_level(Level::INFO)
-            .with_writer(move || TestWriter(log_sink.clone())) // Write logs to an in-memory buffer
+            .with_writer(move || TestWriter {
+                output: log_sink.clone(),
+                log_written: writer_log_written.clone(),
+            })
             .finish();
 
         let _guard = tracing::subscriber::set_default(subscriber);
@@ -1152,7 +1183,7 @@ mod submitblock_test {
             network_config,
             inbound_service.clone(),
             latest_chain_tip.clone(),
-            "Zebra user agent".to_string(),
+            "Zakura user agent".to_string(),
             PeerServices::NODE_NETWORK,
         )
         .await;
@@ -1175,17 +1206,41 @@ mod submitblock_test {
             .in_current_span(),
         );
 
-        // Wait for the block gossip task to process the block
-        tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+        // Wait for the exact event under test. The timeout is only a failure
+        // deadline; the mined-block channel bypasses the periodic gossip delay.
+        tokio::time::timeout(PEER_GOSSIP_DELAY, async {
+            loop {
+                let next_log = log_written.notified();
+                let sent_mined_block = {
+                    let captured_logs = logs.lock().unwrap();
+                    String::from_utf8_lossy(&captured_logs)
+                        .contains("sending mined block broadcast")
+                };
 
-        // Check that the block was processed as a mnined block by the gossip task
-        let captured_logs = logs.lock().unwrap();
-        let log_output = String::from_utf8(captured_logs.clone()).unwrap();
+                if sent_mined_block {
+                    break;
+                }
+
+                next_log.await;
+            }
+        })
+        .await
+        .expect("block gossip task should process the submitted block");
+
+        // Check that the block was processed as a mined block by the gossip task.
+        let log_output = {
+            let captured_logs = logs.lock().unwrap();
+            String::from_utf8(captured_logs.clone()).unwrap()
+        };
 
         assert!(log_output.contains("initializing block gossip task"));
         assert!(log_output.contains("sending mined block broadcast"));
 
-        std::mem::drop(gossip_task_handle);
+        gossip_task_handle.abort();
+        let gossip_task_error = gossip_task_handle
+            .await
+            .expect_err("block gossip task should run until it is cancelled");
+        assert!(gossip_task_error.is_cancelled());
 
         Ok(())
     }

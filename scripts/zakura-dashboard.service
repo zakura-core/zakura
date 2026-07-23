@@ -25,7 +25,7 @@
 # followed by `sudo systemctl restart zakura-dashboard`.
 
 [Unit]
-Description=Zebra sync observability dashboard (live + recorded-run archive)
+Description=Zakura sync observability dashboard (live + recorded-run archive)
 After=network-online.target
 Wants=network-online.target
 

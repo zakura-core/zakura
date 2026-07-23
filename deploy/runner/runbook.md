@@ -4,10 +4,9 @@ Measure/debug local sync performance from the 1.8M snapshot, reproducibly. The
 bench node syncs a fixed range (≈1.80M→1.83M) peering **only** with two frozen
 serving nodes we control, over a private Zakura cohort (the `dev_network`
 feature, PR #262), so other engineers churning the public fleet can't perturb a
-run. Background: `book/src/dev/private-zakura-network.md`.
+run.
 
-This benchmark intentionally exercises the [experimental Zakura P2P v2
-stack](../../book/src/user/p2p.md).
+This benchmark intentionally exercises the experimental Zakura P2P v2 stack.
 
 Everything lives in `/root/zakura/deploy/runner/` (untracked local tooling).
 `perf.sh` is the entry point — it wraps the deployer and the run/analyze scripts.

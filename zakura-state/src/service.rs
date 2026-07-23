@@ -245,6 +245,14 @@ pub struct ReadStateService {
     /// Used to check for panics when writing blocks.
     block_write_task: Option<Arc<std::thread::JoinHandle<()>>>,
 
+    /// Watch channel publishing durable completed-checkpoint advances.
+    highest_completed_checkpoint_receiver:
+        tokio::sync::watch::Receiver<Option<finalized_state::HighestCompletedCheckpoint>>,
+
+    /// Keeps the completed-checkpoint watch open in read-only services.
+    _highest_completed_checkpoint_sender:
+        Option<tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>>,
+
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
     vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
 }
@@ -335,18 +343,13 @@ impl StateService {
             let network = network.clone();
             tokio::task::spawn_blocking(move || {
                 let timer = CodeTimer::start();
-                let finalized_state = FinalizedState::new(
-                    &config,
-                    &network,
-                    #[cfg(feature = "elasticsearch")]
-                    true,
-                )
-                .expect(
-                    "opening the read-write finalized state database failed; check that the \
+                let finalized_state = FinalizedState::new(&config, &network)
+                    .expect(
+                        "opening the read-write finalized state database failed; check that the \
                      state cache directory is writable and not locked by another Zakura instance, \
                      and that there is free disk space",
-                )
-                .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
+                    )
+                    .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
                 timer.finish_desc("opening finalized state database");
 
                 let timer = CodeTimer::start();
@@ -394,7 +397,7 @@ impl StateService {
             .map(CheckpointVerifiedBlock::from)
             .map(ChainTipBlock::from);
 
-        tracing::info!(chain_tip = ?initial_tip.as_ref().map(|tip| (tip.hash, tip.height)), "loaded Zebra state cache");
+        tracing::info!(chain_tip = ?initial_tip.as_ref().map(|tip| (tip.hash, tip.height)), "loaded Zakura state cache");
 
         let (chain_tip_sender, latest_chain_tip, chain_tip_change) =
             ChainTipSender::new(initial_tip, network);
@@ -406,6 +409,7 @@ impl StateService {
             block_write_sender,
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
+            highest_completed_checkpoint_receiver,
             vct_root_repair_receiver,
             block_write_task,
         ) = write::BlockWriteSender::spawn(
@@ -421,6 +425,8 @@ impl StateService {
             &finalized_state,
             block_write_task,
             non_finalized_state_receiver,
+            highest_completed_checkpoint_receiver,
+            None,
             vct_root_repair_receiver,
         );
 
@@ -607,7 +613,7 @@ impl StateService {
         match self.invalid_block_write_reset_receiver.try_recv() {
             Ok(reset_tip_hash) => self.finalized_block_write_last_sent_hash = reset_tip_hash,
             Err(TryRecvError::Disconnected) => {
-                info!("Block commit task closed the block reset channel. Is Zebra shutting down?");
+                info!("Block commit task closed the block reset channel. Is Zakura shutting down?");
                 return;
             }
             // There are no errors, so we can just use the last block hash we sent
@@ -668,7 +674,7 @@ impl StateService {
                 Err(TryRecvError::Disconnected) => {
                     info!(
                         "Block commit task closed the non-finalized rejected hash channel. \
-                         Is Zebra shutting down?"
+                         Is Zakura shutting down?"
                     );
                     break;
                 }
@@ -1058,6 +1064,12 @@ impl ReadStateService {
         finalized_state: &FinalizedState,
         block_write_task: Option<Arc<std::thread::JoinHandle<()>>>,
         non_finalized_state_receiver: WatchReceiver<NonFinalizedState>,
+        highest_completed_checkpoint_receiver: tokio::sync::watch::Receiver<
+            Option<finalized_state::HighestCompletedCheckpoint>,
+        >,
+        highest_completed_checkpoint_sender: Option<
+            tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>,
+        >,
         vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
     ) -> Self {
         let read_service = Self {
@@ -1065,6 +1077,8 @@ impl ReadStateService {
             db: finalized_state.db.clone(),
             non_finalized_state_receiver,
             block_write_task,
+            highest_completed_checkpoint_receiver,
+            _highest_completed_checkpoint_sender: highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
         };
 
@@ -1081,6 +1095,13 @@ impl ReadStateService {
     /// Subscribe to VCT supplied-root repair needs discovered by the finalized writer.
     pub fn subscribe_vct_root_repairs(&self) -> tokio::sync::watch::Receiver<VctRootRepairStatus> {
         self.vct_root_repair_receiver.clone()
+    }
+
+    /// Subscribe to durable completed-checkpoint advances.
+    pub fn subscribe_highest_completed_checkpoint(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<finalized_state::HighestCompletedCheckpoint>> {
+        self.highest_completed_checkpoint_receiver.clone()
     }
 
     /// Gets a clone of the latest non-finalized state from the `non_finalized_state_receiver`
@@ -1361,6 +1382,8 @@ impl Service<Request> for StateService {
             // Used by sync, inbound, and block verifier to check if a block is already in the state
             // before downloading or validating it.
             Request::KnownBlock(hash) => {
+                self.drain_non_finalized_rejected_hashes();
+
                 let timer = CodeTimer::start();
                 let sent_hash_response = self.known_sent_hash(&hash);
                 let read_service = self.read_service.clone();
@@ -2137,7 +2160,7 @@ impl Service<ReadRequest> for ReadStateService {
                     read::best_tip(&latest_non_finalized_state, &state.db)
                 else {
                     return Err(
-                        "state is empty: wait for Zebra to sync before submitting a proposal"
+                        "state is empty: wait for Zakura to sync before submitting a proposal"
                             .into(),
                     );
                 };
@@ -2259,24 +2282,22 @@ pub fn init_read_only(
     ),
     StateInitError,
 > {
-    let finalized_state = FinalizedState::new_with_debug(
-        &config,
-        network,
-        true,
-        #[cfg(feature = "elasticsearch")]
-        false,
-        true,
-    )?;
+    let finalized_state = FinalizedState::new_with_debug(&config, network, true, true)?;
     let (non_finalized_state_sender, non_finalized_state_receiver) =
         tokio::sync::watch::channel(NonFinalizedState::new(network));
     let (_vct_root_repair_sender, vct_root_repair_receiver) =
         tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let (highest_completed_checkpoint, highest_completed_checkpoint_receiver) =
+        finalized_state::HighestCompletedCheckpointTracker::open(&finalized_state.db);
+    let highest_completed_checkpoint_sender = Some(highest_completed_checkpoint.keepalive_sender());
 
     Ok((
         ReadStateService::new(
             &finalized_state,
             None,
             WatchReceiver::new(non_finalized_state_receiver),
+            highest_completed_checkpoint_receiver,
+            highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
         ),
         finalized_state.db.clone(),

@@ -113,7 +113,7 @@ pub fn z_validate_address(
         tracing::info!(
             ?network,
             address_network = ?address.network(),
-            "invalid address network in z_validateaddress RPC: address is for {:?} but Zebra is on {:?}",
+            "invalid address network in z_validateaddress RPC: address is for {:?} but Zakura is on {:?}",
             address.network(),
             network
         );

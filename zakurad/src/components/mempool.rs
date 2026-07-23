@@ -1,4 +1,4 @@
-//! Zebra mempool.
+//! Zakura mempool.
 //!
 //! A zakurad application component that manages the active collection, reception,
 //! gossip, verification, in-memory storage, eviction, and rejection of unmined Zcash
@@ -14,7 +14,7 @@
 //!    * runs in the background to periodically poll peers for fresh unmined transactions
 //!  * [Queue Checker][`queue_checker::QueueChecker`]
 //!    * runs in the background, polling the mempool to store newly verified transactions
-//!  * [Transaction Gossip Task][`gossip::gossip_mempool_transaction_id`]
+//!  * [Transaction Gossip Task][`gossip::run_mempool_transaction_id_gossip`]
 //!    * runs in the background and gossips newly added mempool transactions
 //!      to peers
 
@@ -64,7 +64,7 @@ pub use crate::BoxError;
 pub use config::Config;
 pub use crawler::Crawler;
 pub use error::MempoolError;
-pub use gossip::gossip_mempool_transaction_id;
+pub(crate) use gossip::run_mempool_transaction_id_gossip;
 pub use queue_checker::QueueChecker;
 pub use storage::{
     ExactTipRejectionError, SameEffectsChainRejectionError, SameEffectsTipRejectionError, Storage,
@@ -136,7 +136,7 @@ fn transaction_misbehavior(
 /// Indicates whether it is enabled or disabled and, if enabled, contains
 /// the necessary data to run it.
 //
-// Zebra only has one mempool, so the enum variant size difference doesn't matter.
+// Zakura only has one mempool, so the enum variant size difference doesn't matter.
 #[allow(clippy::large_enum_variant)]
 #[derive(Default)]
 enum ActiveState {
@@ -156,6 +156,13 @@ enum ActiveState {
 
         /// The transaction download and verify stream.
         tx_downloads: Pin<Box<InboundTxDownloads>>,
+
+        /// Verified transaction IDs awaiting proactive advertisement through
+        /// the peer set.
+        ///
+        /// This pending set is separate from the full mempool inventory served
+        /// by [`Request::TransactionIds`] when a peer requests it.
+        pending_gossip_tx_ids: HashSet<UnminedTxId>,
 
         /// Last seen chain tip hash that mempool transactions have been verified against.
         ///
@@ -331,7 +338,7 @@ impl Mempool {
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
     ) -> (Self, MempoolTxSubscriber) {
         let (transaction_sender, _) =
-            tokio::sync::broadcast::channel(gossip::MAX_CHANGES_BEFORE_SEND * 2);
+            tokio::sync::broadcast::channel(gossip::MEMPOOL_CHANGE_CHANNEL_CAPACITY);
         let transaction_subscriber = MempoolTxSubscriber::new(transaction_sender.clone());
 
         let mut service = Mempool {
@@ -392,7 +399,7 @@ impl Mempool {
         is_debug_enabled
     }
 
-    /// Returns `true` if Zebra is caught up enough to start the mempool.
+    /// Returns `true` if Zakura is caught up enough to start the mempool.
     ///
     /// During Zakura sync, [`SyncStatus`] is updated from state's effective
     /// best-header frontier. That frontier uses the verified block tip when it
@@ -408,7 +415,10 @@ impl Mempool {
     fn enable_at_tip(&mut self, tip_action: &TipAction) {
         let (last_seen_tip_hash, tip_height) = tip_action.best_tip_hash_and_height();
 
-        info!(?tip_height, "activating mempool: Zebra is close to the tip");
+        info!(
+            ?tip_height,
+            "activating mempool: Zakura is close to the tip"
+        );
 
         let tx_downloads = Box::pin(TxDownloads::new(
             Timeout::new(self.outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
@@ -420,6 +430,7 @@ impl Mempool {
         self.active_state = ActiveState::Enabled {
             storage: storage::Storage::new(&self.config),
             tx_downloads,
+            pending_gossip_tx_ids: HashSet::new(),
             last_seen_tip_hash,
         };
     }
@@ -435,16 +446,17 @@ impl Mempool {
         let is_caught_up_to_start = self.is_caught_up_to_start();
 
         // TODO: revisit these state transitions after header sync can prove
-        // whether Zebra is behind the network tip.
+        // whether Zakura is behind the network tip.
         match (is_caught_up_to_start, self.is_enabled(), tip_action) {
             // the active state is up to date, or there is no tip action to activate the mempool
             (false, false, _) | (true, true, _) | (true, false, None) => return false,
 
-            // Enable state - there should be a chain tip when Zebra is close to the network tip
+            // Enable state - there should be a chain tip when Zakura is close
+            // to the network tip.
             (true, false, Some(tip_action)) => self.enable_at_tip(tip_action),
 
             // TODO: only disable an already-active mempool when a validated
-            // Zakura header/block-sync frontier proves Zebra is behind a
+            // Zakura header/block-sync frontier proves Zakura is behind a
             // higher-work chain that follows this node's consensus rules.
             //
             // The legacy sync status can be triggered by lower-work forks,
@@ -465,18 +477,6 @@ impl Mempool {
             ActiveState::Disabled => false,
             ActiveState::Enabled { .. } => true,
         }
-    }
-
-    /// Remove expired transaction ids from a given list of inserted ones.
-    fn remove_expired_from_peer_list(
-        send_to_peers_ids: &HashSet<UnminedTxId>,
-        expired_transactions: &HashSet<UnminedTxId>,
-    ) -> HashSet<UnminedTxId> {
-        send_to_peers_ids
-            .iter()
-            .filter(|id| !expired_transactions.contains(id))
-            .copied()
-            .collect()
     }
 
     /// Update metrics for the mempool.
@@ -671,6 +671,7 @@ impl Service<Request> for Mempool {
         if let ActiveState::Enabled {
             storage,
             tx_downloads,
+            pending_gossip_tx_ids,
             last_seen_tip_hash,
         } = &mut self.active_state
         {
@@ -693,11 +694,15 @@ impl Service<Request> for Mempool {
                         // mempool re-verifies all pending tx_downloads when there's a `TipAction::Reset`.
                         if best_tip_height == expected_tip_height {
                             let tx_id = tx.transaction.id;
-                            let insert_result =
-                                storage.insert(tx, spent_mempool_outpoints, best_tip_height);
+                            let (insert_result, evicted_ids) = storage.insert_with_evicted_ids(
+                                tx,
+                                spent_mempool_outpoints,
+                                best_tip_height,
+                            );
 
                             tracing::trace!(
                                 ?insert_result,
+                                ?evicted_ids,
                                 "got Ok(_) transaction verify, tried to store",
                             );
 
@@ -706,6 +711,13 @@ impl Service<Request> for Mempool {
                                 send_to_peers_ids.insert(inserted_id);
                             } else {
                                 invalidated_ids.insert(tx_id);
+                            }
+
+                            if !evicted_ids.is_empty() {
+                                // A later insertion can evict a transaction accepted earlier in
+                                // this `poll_ready` pass, so do not advertise it.
+                                send_to_peers_ids.retain(|id| !evicted_ids.contains(id));
+                                invalidated_ids.extend(evicted_ids);
                             }
 
                             // Send the result to responder channel if one was provided.
@@ -802,8 +814,7 @@ impl Service<Request> for Mempool {
             if let Some(tip_height) = best_tip_height {
                 let expired_transactions = storage.remove_expired_transactions(tip_height);
                 // Remove transactions that are expired from the peers list
-                send_to_peers_ids =
-                    Self::remove_expired_from_peer_list(&send_to_peers_ids, &expired_transactions);
+                send_to_peers_ids.retain(|id| !expired_transactions.contains(id));
 
                 if !expired_transactions.is_empty() {
                     tracing::debug!(
@@ -822,8 +833,21 @@ impl Service<Request> for Mempool {
                     "sending new transactions to peers and RPC listeners"
                 );
 
+                pending_gossip_tx_ids.extend(send_to_peers_ids.iter().copied());
+
                 self.transaction_sender
                     .send(MempoolChange::added(send_to_peers_ids))?;
+            }
+
+            // Prune transaction IDs that no longer need gossip from the pending set.
+            //
+            // This runs after the pending set is extended, so it also covers
+            // transactions that were inserted and then invalidated or mined
+            // within this same `poll_ready` call.
+            if !invalidated_ids.is_empty() || !mined_mempool_ids.is_empty() {
+                pending_gossip_tx_ids.retain(|tx_id| {
+                    !invalidated_ids.contains(tx_id) && !mined_mempool_ids.contains(tx_id)
+                });
             }
 
             // Send transactions that were rejected to RPC listeners.
@@ -864,6 +888,7 @@ impl Service<Request> for Mempool {
             ActiveState::Enabled {
                 storage,
                 tx_downloads,
+                pending_gossip_tx_ids,
                 last_seen_tip_hash,
             } => match req {
                 // Queries
@@ -871,6 +896,27 @@ impl Service<Request> for Mempool {
                     trace!(?req, "got mempool request");
 
                     let res: HashSet<_> = storage.tx_ids().collect();
+
+                    trace!(?req, res_count = ?res.len(), "answered mempool request");
+
+                    async move { Ok(Response::TransactionIds(res)) }.boxed()
+                }
+
+                Request::TakePendingGossipTransactionIds { limit } => {
+                    trace!(?req, "got mempool request");
+
+                    let res = if pending_gossip_tx_ids.len() <= limit {
+                        std::mem::take(pending_gossip_tx_ids)
+                    } else {
+                        let res: HashSet<_> =
+                            pending_gossip_tx_ids.iter().copied().take(limit).collect();
+
+                        for tx_id in &res {
+                            pending_gossip_tx_ids.remove(tx_id);
+                        }
+
+                        res
+                    };
 
                     trace!(?req, res_count = ?res.len(), "answered mempool request");
 
@@ -1122,7 +1168,9 @@ impl Service<Request> for Mempool {
 
                 let resp = match req {
                     // Return empty responses for queries.
-                    Request::TransactionIds => Response::TransactionIds(Default::default()),
+                    Request::TransactionIds | Request::TakePendingGossipTransactionIds { .. } => {
+                        Response::TransactionIds(Default::default())
+                    }
 
                     Request::TransactionsById(_) => Response::Transactions(Default::default()),
                     Request::TransactionsByMinedId(_) => Response::Transactions(Default::default()),

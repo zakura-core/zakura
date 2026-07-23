@@ -22,6 +22,7 @@ use crate::{
 
 mod common;
 mod header_store_coherence;
+mod highest_completed_checkpoint;
 mod prune;
 mod snapshot;
 mod vectors;

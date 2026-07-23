@@ -22,7 +22,15 @@ The Zakura team is committed to working with researchers who submit security vul
 
 Please submit issues privately through GitHub's security advisory reporting for this repository: <https://github.com/zakura-core/zakura/security/advisories/new>.
 
-If an issue also affects upstream [Zebra](https://github.com/ZcashFoundation/zebra), please also report it to the Zcash Foundation by following [upstream's security policy](https://github.com/ZcashFoundation/zebra/blob/main/SECURITY.md). Issues in Zakura's own additions (for example the [experimental Zakura P2P v2 stack](book/src/user/p2p.md)) should be reported only to us.
+If an issue also affects upstream [Zebra](https://github.com/ZcashFoundation/zebra), please also report it to the Zcash Foundation by following [upstream's security policy](https://github.com/ZcashFoundation/zebra/blob/main/SECURITY.md). Issues in Zakura's own additions (for example the experimental Zakura P2P v2 stack) should be reported only to us.
+
+## Coordinated Security Releases
+
+For significant vulnerabilities, the fix is developed and validated under
+embargo and shipped as a coordinated hotfix release; the process — private
+staging and rehearsal, canary soak, the release-day runbook, and how the
+advisory is published — is documented in
+[`docs/security-hotfix-release.md`](docs/security-hotfix-release.md).
 
 ## Sending Disclosures
 

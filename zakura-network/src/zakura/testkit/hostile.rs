@@ -284,6 +284,28 @@ impl HostilePeer {
         Ok(())
     }
 
+    /// Open a request stream, send one frame, and read its first response frame.
+    pub async fn request_frame(
+        &self,
+        stream_kind: u16,
+        request_id: u64,
+        frame: Frame,
+    ) -> Result<Frame, BoxError> {
+        let (mut send, mut recv) = self.connection.open_bi().await?;
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind,
+            stream_version: 1,
+            request_id: Some(request_id),
+            max_frame_bytes: self.limits.max_frame_bytes,
+        };
+        send.write_all(&prelude.encode()?).await?;
+        send.write_all(&frame.encode(self.limits.max_frame_bytes)?)
+            .await?;
+        send.finish()?;
+        Self::read_frame(&mut recv, self.limits.max_frame_bytes).await
+    }
+
     /// Accept the next bidi stream opened by the victim and respond with raw frames.
     pub async fn respond_to_next_request(&self, frames: Vec<Frame>) -> Result<(), BoxError> {
         let (mut send, _recv) = self.connection.accept_bi().await?;

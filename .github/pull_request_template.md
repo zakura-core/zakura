@@ -22,6 +22,14 @@
 - If testing was not needed, explain why.
 -->
 
+## Changelog
+
+<!--
+- For Rust or Cargo.toml changes, add changelog-unreleased/<PR-number>.md after
+  opening the draft PR.
+- Use the explicit no-changelog marker for internal-only changes.
+-->
+
 ### Specifications & References
 
 <!-- Provide any relevant references. -->

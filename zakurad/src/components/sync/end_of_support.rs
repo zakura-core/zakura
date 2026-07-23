@@ -13,7 +13,7 @@ use zakura_chain::{
 use crate::application::release_version;
 
 /// The estimated height that this release will be published.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_421_862;
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_420_400;
 
 /// The maximum number of days after `ESTIMATED_RELEASE_HEIGHT` where a Zebra server will run
 /// without halting.
@@ -24,8 +24,8 @@ pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_421_862;
 ///   `ESTIMATED_RELEASE_HEIGHT` plus this number of days.
 /// - Currently set to 18 days
 ///
-/// Note: v1.0.2 spans the expected Ironwood activation (height 3,428,143,
-/// ~2026-07-28) and halts about ten days after it (~2026-08-07, height 3,440,236),
+/// Note: v1.0.3 spans the expected Ironwood activation (height 3,428,143,
+/// ~2026-07-28) and halts about eleven days after it (~2026-08-08, height 3,441,136),
 /// forcing migration to the post-Ironwood release.
 pub const EOS_PANIC_AFTER: u32 = 18;
 

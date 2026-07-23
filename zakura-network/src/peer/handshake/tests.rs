@@ -411,6 +411,7 @@ async fn responder_upgrade_keeps_legacy_when_native_dial_never_registers() {
         nonces,
         local_node_id,
         local_direct_addresses,
+        ResponderRegistrationWait::TestTimeout(std::time::Duration::from_millis(50)),
     );
 
     let (outcome, _held_peer_conn) = tokio::join!(
@@ -483,6 +484,7 @@ async fn responder_upgrade_disconnects_on_malformed_prelude() {
         nonces,
         vec![1u8; 32],
         vec![b"127.0.0.1:1".to_vec()],
+        ResponderRegistrationWait::Production,
     );
 
     let (outcome, _held_peer_conn) = tokio::join!(

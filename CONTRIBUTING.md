@@ -8,8 +8,8 @@
 
 ## Running and Debugging
 
-See the [user documentation](book/src/user.md) for details on
-how to build, run, and instrument Zakura.
+See the [getting started guide](README.md#getting-started) for details on how to
+build and run Zakura.
 
 ## Bug Reports
 
@@ -23,6 +23,7 @@ PRs are welcome. Please:
 2. **Keep PRs focused.** Prefer one logical change per PR and avoid unrelated refactors.
 3. **Test the change.** Run checks appropriate to the affected code. Explain how the tests exercise the root cause and verify the solution, rather than only listing commands.
 4. **Follow conventional commits.** PRs are squash-merged to `main`, so the PR title becomes the commit message. Follow the [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) standard.
+5. **Carry semver bumps with API changes.** The `Semver checks` CI job compares publishable crates against their latest stable crates.io releases; a PR that changes a published API must bump the affected crate's version in the same PR (see [`CHANGELOG_GUIDELINES.md`](CHANGELOG_GUIDELINES.md), "Library crates").
 
 Zakura is a validator node — it excludes features not strictly needed for block validation and chain sync. Features like wallets, block explorers, and mining pools belong in [Zaino](https://github.com/zingolabs/zaino), [Zallet](https://github.com/zcash/wallet), or [librustzcash](https://github.com/zcash/librustzcash).
 
@@ -40,4 +41,7 @@ Zakura enforces code quality through review. For the full list of architecture r
 - **Error handling**: Use `thiserror`; `expect()` messages explain why the invariant holds
 - **Async**: CPU-heavy work in `spawn_blocking`; all waits need timeouts
 - **Security**: Bound allocations from untrusted data; validate at system boundaries
-- **Changelog**: Update `CHANGELOG.md` for user-visible changes (see [`CHANGELOG_GUIDELINES.md`](CHANGELOG_GUIDELINES.md))
+- **Changelog**: After opening a draft PR, add one
+  `changelog-unreleased/<PR-number>.md` fragment. Internal-only PRs use an
+  explicit no-changelog marker (see
+  [`CHANGELOG_GUIDELINES.md`](CHANGELOG_GUIDELINES.md)).

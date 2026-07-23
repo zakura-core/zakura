@@ -329,11 +329,6 @@ impl NetworkUpgrade {
         Self::iter().skip_while(|&nu| self != nu).nth(1)
     }
 
-    /// Returns the previous network upgrade before this network upgrade.
-    pub fn previous_upgrade(self) -> Option<Self> {
-        Self::iter().rev().skip_while(|&nu| self != nu).nth(1)
-    }
-
     /// Returns the next network upgrade for `network` and `height`.
     ///
     /// Returns None if the next upgrade has not been implemented in Zebra

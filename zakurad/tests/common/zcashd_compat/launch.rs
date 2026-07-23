@@ -21,7 +21,7 @@ use super::{
 };
 use crate::common::{
     config::{read_listen_addr_from_logs, testdir},
-    launch::{ZakuradTestDirExt, LAUNCH_DELAY},
+    launch::ZakuradTestDirExt,
 };
 
 /// How long to poll zcashd's own RPC before giving up.
@@ -155,9 +155,6 @@ pub async fn spawn_zakurad_with_zcashd_compat_config(
     ])?;
 
     let _ = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
-
-    // Extra stability margin before poking zcashd
-    sleep(LAUNCH_DELAY).await;
 
     let zakura_client = RpcRequestClient::new(zakura_rpc_addr);
     let zcashd_client = ZcashdRpcClient::new(

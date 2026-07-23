@@ -15,6 +15,10 @@ on:
         description: "Bake droplet size (its disk becomes the image's minimum disk)"
         required: false
         default: c-8
+      kresko_ref:
+        description: "Kresko ref to prebake (keep in step with zakura-mempool-load.yml)"
+        required: false
+        default: main
       region:
         description: "DO region (must host the run droplets too)"
         required: false
@@ -35,7 +39,7 @@ jobs:
     # Cold cargo build + three snapshot downloads + a ~50GB image snapshot.
     timeout-minutes: 210
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -107,6 +111,10 @@ jobs:
         env:
           IP: ${{ steps.droplet.outputs.ip }}
           GH_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Keep in step with zakura-mempool-load.yml's kresko_ref default: a
+          # mismatch just means that workflow rebuilds kresko instead of using
+          # the baked binary, costing ~20 minutes rather than breaking.
+          KRESKO_BAKE_REF: ${{ inputs.kresko_ref || vars.KRESKO_BAKE_REF || 'main' }}
           MAINNET_VOLUME_NAME: ${{ steps.droplet.outputs.mainnet_vol }}
           TESTNET_VOLUME_NAME: ${{ steps.droplet.outputs.testnet_vol }}
           TIP_MAINNET_LATEST_JSON: ${{ vars.ZAKURA_PR_NODE_TIP_LATEST_JSON || 'https://zakura.valargroup.dev/mainnet-pruned/latest.json' }}
@@ -126,6 +134,7 @@ jobs:
             printf 'SANDBLAST_URL=%q\n'           "${SANDBLAST_URL}"
             printf 'SANDBLAST_SHA256=%q\n'        "${SANDBLAST_SHA256}"
             printf 'TESTNET_SNAPSHOTS_BASE=%q\n'  "${TESTNET_SNAPSHOTS_BASE}"
+            printf 'KRESKO_BAKE_REF=%q\n'          "${KRESKO_BAKE_REF}"
           } > /tmp/bake.env
           scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
             /tmp/bake.env .github/workflows/scripts/pr-node-bake.sh "root@${IP}:/root/"

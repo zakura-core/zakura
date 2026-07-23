@@ -1,6 +1,6 @@
 [package]
 name = "zakura-test"
-version = "1.0.0"
+version = "2.0.0"
 authors.workspace = true
 description = "Test harnesses and test vectors for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -48,3 +48,11 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+# `MockService` deliberately has two same-named inherent methods per
+# assertion type (`expect_no_requests` on the panic impl returns `()`, on
+# the proptest impl returns `Result`). cargo-semver-checks pairs inherent
+# methods by name across impl blocks, so this lint false-positives at
+# version parity — verified against the byte-identical published 2.0.0.
+[package.metadata.cargo-semver-checks.lints]
+inherent_method_now_returns_unit = "allow"

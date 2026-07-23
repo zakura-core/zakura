@@ -48,7 +48,7 @@ use super::{
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        direct_endpoint_builder, drive_header_sync_actions, spawn_block_sync_reactor,
+        canonical_ip, direct_endpoint_builder, drive_header_sync_actions, spawn_block_sync_reactor,
         spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
         BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FramedRecv,
         FramedSend, Frontier, FrontierChange, FrontierUpdate, HeaderSyncAction,
@@ -553,6 +553,11 @@ pub struct ZakuraHeaderSyncDriverStartup {
 }
 
 impl ZakuraEndpoint {
+    /// Returns the local iroh identity used to authenticate native connections.
+    pub(crate) fn local_node_id(&self) -> NodeId {
+        self.router.endpoint().node_id()
+    }
+
     /// Returns the connector injected into the legacy handshake path.
     pub fn connector(&self) -> super::ZakuraHandshakeConnector {
         super::ZakuraHandshakeConnector::new_with_endpoint(self.clone())
@@ -1099,6 +1104,7 @@ impl ZakuraSupervisorHandle {
         disconnect_token: CancellationToken,
         _accepted_capabilities: u64,
     ) -> ZakuraRegistration {
+        let remote_ip = remote_ip.map(canonical_ip);
         let mut state = self.inner.lock().await;
         // A re-registration for a peer id that is already active from the same
         // IP is a duplicate redial, not a new per-IP allocation: the incumbent
@@ -1238,6 +1244,7 @@ impl ZakuraSupervisorHandle {
         remote_ip: IpAddr,
         in_flight_count: usize,
     ) -> bool {
+        let remote_ip = canonical_ip(remote_ip);
         let state = self.inner.lock().await;
         let active_count = state
             .active_by_ip
@@ -1411,8 +1418,8 @@ struct ConnectionServeContext {
     /// Whether this node wins same-kind ordered-stream collisions on this
     /// connection. Block sync can be opened by either peer, so it can arrive
     /// twice; the winner keeps its own stream and the loser adopts the peer's.
-    /// Computed from the node ids so the two ends always agree:
-    /// `local_node_id < remote_node_id`.
+    /// Computed from the connection role so the two ends always agree: the
+    /// dialing side wins.
     i_open_collision_winner: bool,
     conn: ZakuraConnTrace,
 }
@@ -1747,15 +1754,15 @@ pub(crate) fn service_registry(
     block_sync: Option<BlockSyncHandle>,
     block_sync_config: ZakuraBlockSyncConfig,
     legacy_service: Arc<dyn Service>,
-    discovery_service: Arc<dyn Service>,
+    discovery_service: Arc<super::DiscoveryService>,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
-    let mut services = vec![legacy_service.clone(), discovery_service];
-    if let Some(header_sync) = &header_sync {
-        services.push(Arc::new(HeaderSyncService::new(header_sync.clone())) as Arc<dyn Service>);
+    let mut services = vec![legacy_service.clone()];
+    let header_sync_service = if let Some(header_sync) = &header_sync {
+        Arc::new(HeaderSyncService::new(header_sync.clone())) as Arc<dyn Service>
     } else {
-        services
-            .push(Arc::new(HeaderSyncPassthroughService::new(legacy_service)) as Arc<dyn Service>);
-    }
+        Arc::new(HeaderSyncPassthroughService::new(legacy_service.clone())) as Arc<dyn Service>
+    };
+    services.push(header_sync_service.clone());
     let block_sync = match block_sync {
         Some(block_sync) => BlockSyncService::new_with_handle(block_sync_config, block_sync),
         None => match header_sync.as_ref() {
@@ -1766,7 +1773,14 @@ pub(crate) fn service_registry(
             None => BlockSyncService::new(block_sync_config),
         },
     };
-    services.push(Arc::new(block_sync) as Arc<dyn Service>);
+    let block_sync = Arc::new(block_sync) as Arc<dyn Service>;
+    discovery_service.set_connection_owners(vec![
+        legacy_service,
+        header_sync_service,
+        block_sync.clone(),
+    ]);
+    services.push(discovery_service as Arc<dyn Service>);
+    services.push(block_sync);
 
     Ok(Arc::new(
         ServiceRegistry::new(services).map_err(|error| -> BoxError { Box::new(error) })?,
@@ -1806,18 +1820,22 @@ fn random_stream_session_seed() -> u64 {
     }
 }
 
-/// Resolve the inbound peer's UDP source IP from the endpoint's node map so the
-/// per-IP connection cap can be enforced for Router-accepted connections.
+/// Resolve a connected peer's confirmed UDP source IP from the endpoint's node
+/// map so the per-IP connection cap can be enforced against the path that
+/// actually carries the connection.
 ///
-/// Iroh exposes the peer address on `Incoming`, which the Router consumes before
-/// `ProtocolHandler::accept`. After the native control handshake the connection
-/// has exchanged real QUIC payload over its direct path, so the endpoint's node
-/// map knows the peer's UDP address: prefer the connection's confirmed current
-/// path (`conn_type`), then fall back to the direct address that most recently
-/// delivered payload from this peer. Relay-only paths have no single
-/// attributable source IP, so they correctly yield `None` (the global
-/// connection cap still bounds them).
-fn inbound_remote_ip(endpoint: &Endpoint, node_id: NodeId) -> Option<IpAddr> {
+/// Used for both directions. Inbound: iroh exposes the peer address on
+/// `Incoming`, which the Router consumes before `ProtocolHandler::accept`.
+/// Outbound: a dialed peer may advertise several addresses, but only one path
+/// ends up carrying the connection — charging the first *advertised* address
+/// lets a record list a decoy address to escape the cap. In both cases, after
+/// the native control handshake the connection has exchanged real QUIC payload
+/// over its direct path, so the endpoint's node map knows the peer's UDP
+/// address: prefer the connection's confirmed current path (`conn_type`), then
+/// fall back to the direct address that most recently delivered payload from
+/// this peer. Relay-only paths have no single attributable source IP, so they
+/// correctly yield `None` (the global connection cap still bounds them).
+fn confirmed_remote_ip(endpoint: &Endpoint, node_id: NodeId) -> Option<IpAddr> {
     if let Some(mut conn_type) = endpoint.conn_type(node_id) {
         match conn_type.get() {
             ConnectionType::Direct(addr) | ConnectionType::Mixed(addr, _) => {
@@ -1850,13 +1868,14 @@ fn native_connection_transcript_hash(
 }
 
 /// Whether the local node wins same-kind ordered-stream collisions against
-/// `remote_node_id`. Both sides open their demanded ordered streams, so a kind
-/// both sides open arrives twice; the lexicographically smaller node id wins and
-/// keeps its own stream while the other adopts the peer's. The two ends always
-/// compute complementary answers from the same (distinct) node ids, so they
-/// converge on a single surviving stream without any extra round trip.
-fn i_open_collision_winner(local_node_id: &NodeId, remote_node_id: &NodeId) -> bool {
-    local_node_id.as_bytes() < remote_node_id.as_bytes()
+/// Both sides open their demanded ordered streams, so a kind both sides open
+/// arrives twice; the dialing side wins and keeps its own stream while the
+/// accepting side adopts the peer's. Both ends always know who initiated the
+/// connection, so they converge on a single surviving stream without any extra
+/// round trip — and without needing the local node id, which responder-side
+/// contexts may not have (no bound endpoint).
+fn i_open_collision_winner(is_initiator: bool) -> bool {
+    is_initiator
 }
 
 impl ZakuraProtocolHandler {
@@ -1985,7 +2004,7 @@ impl ZakuraProtocolHandler {
         let remote_ip = self
             .endpoint
             .as_ref()
-            .and_then(|endpoint| inbound_remote_ip(endpoint, remote_node_id));
+            .and_then(|endpoint| confirmed_remote_ip(endpoint, remote_node_id));
         let local_node_id = self
             .endpoint
             .as_ref()
@@ -2006,7 +2025,7 @@ impl ZakuraProtocolHandler {
                     &local_node_id,
                     &remote_node_id,
                 ),
-                i_open_collision_winner: i_open_collision_winner(&local_node_id, &remote_node_id),
+                i_open_collision_winner: i_open_collision_winner(false),
                 conn,
             },
         )
@@ -3160,6 +3179,42 @@ fn bind_native_endpoint(
     }
 }
 
+fn discovery_direct_addrs(config: &Config, local_node_id: NodeId) -> Vec<SocketAddr> {
+    let Some(listen_addr) = config.zakura.listen_addr else {
+        return Vec::new();
+    };
+    let mut direct_addrs = Vec::new();
+
+    if !listen_addr.ip().is_unspecified() {
+        direct_addrs.push(listen_addr);
+    }
+    if let Some(external_addr) = config.external_addr {
+        direct_addrs.push(SocketAddr::new(external_addr.ip(), listen_addr.port()));
+    }
+    for entry in &config.zakura.bootstrap_peers {
+        let Ok(node_addr) = super::discovery::parse_bootstrap_peer(entry) else {
+            continue;
+        };
+        if node_addr.node_id == local_node_id {
+            direct_addrs.extend(node_addr.direct_addresses().copied());
+        }
+    }
+
+    direct_addrs.sort_unstable();
+    direct_addrs.dedup();
+    direct_addrs
+}
+
+fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: NodeId) -> usize {
+    bootstrap_peers
+        .iter()
+        .filter_map(|entry| super::discovery::parse_bootstrap_peer(entry).ok())
+        .filter(|node_addr| node_addr.node_id != local_node_id)
+        .map(|node_addr| node_addr.node_id)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
 /// Start a Zakura endpoint and router when P2P v2 is enabled.
 pub async fn spawn_zakura_endpoint(
     config: &Config,
@@ -3181,6 +3236,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     let limits = ZakuraLocalLimits::from_config(config);
     validate_idle_invariant(&limits)?;
     let secret_key = zakura_secret_key(config)?;
+    let local_node_id = secret_key.public();
     let discovery_secret_key = secret_key.clone();
     let builder = direct_endpoint_builder(secret_key).transport_config(limits.transport_config());
     // Bind a fixed address when configured so this node has a stable, advertisable
@@ -3202,11 +3258,11 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     );
     let discovery = super::discovery::build_discovery_handle(
         discovery_secret_key,
-        config.zakura.listen_addr.into_iter().collect(),
+        discovery_direct_addrs(config, local_node_id),
         super::discovery::default_advertised_services(),
         &handshake_config,
         config.zakura.max_connections,
-        config.zakura.bootstrap_peers.len(),
+        remote_bootstrap_peer_count(&config.zakura.bootstrap_peers, local_node_id),
         supervisor.subscribe(),
     )?;
     let anchor = config.zakura.header_sync.anchor(&config.network)?;
@@ -3284,7 +3340,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         discovery.clone(),
         header_sync.clone(),
         block_sync.clone(),
-    )) as Arc<dyn Service>;
+    ));
     let legacy_service = sink_factory(supervisor.clone(), trace.clone());
     let registry = service_registry(
         &supervisor,
@@ -3409,7 +3465,6 @@ pub(crate) async fn serve_native_dial_connection(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ZakuraHandlerError::ResourceLimit("admission"))?;
-    let remote_ip = node_addr.direct_addresses().next().map(|addr| addr.ip());
     let connection = timeout(
         limits.control_timeout,
         endpoint.router.endpoint().connect(node_addr, P2P_V2_ALPN),
@@ -3439,6 +3494,12 @@ pub(crate) async fn serve_native_dial_connection(
         .await?
     };
     let conn_limits = limits.clamp(&negotiated.limits);
+    // Charge the connection to the path iroh actually confirmed, not the first
+    // address the record advertised: a record can list an unreachable decoy as
+    // its first direct address to escape the per-IP cap while the connection is
+    // served over a different (shared) address. The handshake above exchanged
+    // QUIC payload, so the node map now knows the confirmed path.
+    let remote_ip = confirmed_remote_ip(endpoint.router.endpoint(), remote_node_id);
     let direction = ServicePeerDirection::Outbound;
     endpoint
         .handler
@@ -3456,7 +3517,7 @@ pub(crate) async fn serve_native_dial_connection(
                     &local_node_id,
                     &remote_node_id,
                 ),
-                i_open_collision_winner: i_open_collision_winner(&local_node_id, &remote_node_id),
+                i_open_collision_winner: i_open_collision_winner(true),
                 conn,
             },
         )
@@ -5081,6 +5142,48 @@ mod tests {
         endpoint.close().await;
     }
 
+    #[test]
+    fn discovery_uses_external_ip_with_the_native_listen_port() {
+        let secret_key = SecretKey::generate(OsRng);
+        let mut config = Config::default();
+        config.zakura.listen_addr = Some("0.0.0.0:8234".parse().expect("test address parses"));
+        config.external_addr = Some("203.0.113.42:8233".parse().expect("test address parses"));
+        config.zakura.bootstrap_peers.clear();
+
+        assert_eq!(
+            discovery_direct_addrs(&config, secret_key.public()),
+            vec!["203.0.113.42:8234".parse().expect("test address parses")]
+        );
+    }
+
+    #[test]
+    fn discovery_uses_matching_local_bootstrap_address_and_counts_only_remote_peers() {
+        let local_secret_key = SecretKey::generate(OsRng);
+        let remote_secret_key = SecretKey::generate(OsRng);
+        let local_node_id = local_secret_key.public();
+        let remote_node_id = remote_secret_key.public();
+        let local_entry = format!("{local_node_id}@198.51.100.7:8234");
+        let remote_entry = format!("{remote_node_id}@198.51.100.8:8234");
+        let mut config = Config::default();
+        config.zakura.listen_addr = Some("0.0.0.0:8234".parse().expect("test address parses"));
+        config.external_addr = None;
+        config.zakura.bootstrap_peers = vec![
+            local_entry,
+            remote_entry.clone(),
+            remote_entry,
+            "malformed".to_string(),
+        ];
+
+        assert_eq!(
+            discovery_direct_addrs(&config, local_node_id),
+            vec!["198.51.100.7:8234".parse().expect("test address parses")]
+        );
+        assert_eq!(
+            remote_bootstrap_peer_count(&config.zakura.bootstrap_peers, local_node_id),
+            1
+        );
+    }
+
     #[derive(Debug, Clone)]
     struct CaptureConnection {
         connection_tx: mpsc::Sender<Connection>,
@@ -5788,20 +5891,16 @@ mod tests {
 
     #[test]
     fn ordered_stream_collision_winner_is_mirror_stable() {
-        // Both ends compute the collision winner from the same pair of node ids
-        // and must reach complementary answers, so exactly one side keeps its
-        // own opened stream while the other adopts the peer's.
-        let node_a = LocalEndpointFactory::secret_key(1).public();
-        let node_b = LocalEndpointFactory::secret_key(2).public();
-        assert_ne!(node_a, node_b);
+        // The two ends of one connection hold complementary roles and must
+        // reach complementary answers, so exactly one side keeps its own
+        // opened stream while the other adopts the peer's.
         assert_ne!(
-            i_open_collision_winner(&node_a, &node_b),
-            i_open_collision_winner(&node_b, &node_a),
+            i_open_collision_winner(true),
+            i_open_collision_winner(false),
             "exactly one side must win a same-kind ordered-stream collision",
         );
-        // The winner is deterministic: the lexicographically smaller node id.
-        let a_wins = node_a.as_bytes() < node_b.as_bytes();
-        assert_eq!(i_open_collision_winner(&node_a, &node_b), a_wins);
+        // The winner is deterministic: the dialing side.
+        assert!(i_open_collision_winner(true));
     }
 
     fn header_sync_test_session(
@@ -5814,7 +5913,9 @@ mod tests {
         )
     }
 
-    fn test_discovery_service(supervisor: &ZakuraSupervisorHandle) -> Arc<dyn Service> {
+    fn test_discovery_service(
+        supervisor: &ZakuraSupervisorHandle,
+    ) -> Arc<crate::zakura::DiscoveryService> {
         let (_handle, service) =
             test_discovery_service_with_peer_limits(supervisor, ServicePeerLimits::default());
         service
@@ -5823,7 +5924,7 @@ mod tests {
     fn test_discovery_service_with_peer_limits(
         supervisor: &ZakuraSupervisorHandle,
         peer_limits: ServicePeerLimits,
-    ) -> (ZakuraDiscoveryHandle, Arc<dyn Service>) {
+    ) -> (ZakuraDiscoveryHandle, Arc<crate::zakura::DiscoveryService>) {
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         let handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
@@ -5843,8 +5944,7 @@ mod tests {
             supervisor.subscribe(),
         )
         .expect("test discovery handle builds");
-        let service =
-            Arc::new(crate::zakura::DiscoveryService::new(handle.clone())) as Arc<dyn Service>;
+        let service = Arc::new(crate::zakura::DiscoveryService::new(handle.clone()));
         (handle, service)
     }
 
@@ -6795,6 +6895,66 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipv4_embedded_ipv6_addresses_share_the_supervisor_ip_bucket() {
+        async fn register_from_ip(
+            supervisor: &ZakuraSupervisorHandle,
+            peer: ZakuraPeerId,
+            ip: IpAddr,
+        ) -> ZakuraRegistration {
+            let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+            let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
+            supervisor
+                .register(
+                    test_conn_id(),
+                    peer.clone(),
+                    Some(ip),
+                    [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
+                    outbound_handle,
+                    CancellationToken::new(),
+                    ZAKURA_CAP_DISCOVERY,
+                )
+                .await
+        }
+
+        let ipv4: IpAddr = "93.184.216.34".parse().expect("IPv4 test address parses");
+        let mapped: IpAddr = "::ffff:93.184.216.34"
+            .parse()
+            .expect("mapped test address parses");
+        let compatible: IpAddr = "::93.184.216.34"
+            .parse()
+            .expect("compatible test address parses");
+        let six_to_four: IpAddr = "2002:5db8:d822::"
+            .parse()
+            .expect("6to4 test address parses");
+        let teredo: IpAddr = "2001:0:c000:22d::a247:27dd"
+            .parse()
+            .expect("Teredo test address parses");
+        let nat64: IpAddr = "64:ff9b::5db8:d822"
+            .parse()
+            .expect("NAT64 test address parses");
+        let supervisor = ZakuraSupervisorHandle::new(1);
+
+        assert!(matches!(
+            register_from_ip(&supervisor, test_peer(60), six_to_four).await,
+            ZakuraRegistration::Registered { .. }
+        ));
+
+        for alias in [ipv4, mapped, compatible, six_to_four, teredo, nat64] {
+            assert!(
+                !supervisor
+                    .can_accept_remote_ip_with_in_flight(alias, 0)
+                    .await,
+                "{alias} must share the occupied IPv4 identity bucket"
+            );
+        }
+
+        assert!(matches!(
+            register_from_ip(&supervisor, test_peer(61), ipv4).await,
+            ZakuraRegistration::Rejected(ZakuraRejectReason::ResourceLimit)
+        ));
     }
 
     // A restarted or resyncing peer redials from its stable IP while its previous

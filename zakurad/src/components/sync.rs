@@ -1324,8 +1324,9 @@ where
                 );
 
                 let tip_network = self.tip_network.clone();
+                let state = self.state.clone();
                 let tips = std::mem::take(&mut self.prospective_tips);
-                extend = Some(Box::pin(Self::build_extend(tip_network, tips)));
+                extend = Some(Box::pin(Self::build_extend(tip_network, state, tips)));
             }
 
             // Dispatch from the reserve while we're below the lookahead limit.
@@ -1520,6 +1521,120 @@ where
         Ok(())
     }
 
+    async fn first_unknown_in_find_blocks_response(
+        &mut self,
+        hashes: &[block::Hash],
+    ) -> Result<Option<usize>, Report> {
+        let mut seen = HashSet::new();
+        let mut first_unknown = None;
+
+        for (index, &hash) in hashes.iter().enumerate() {
+            if !seen.insert(hash) {
+                debug!(?hash, "discarding FindBlocks response with duplicate hash");
+                return Ok(None);
+            }
+
+            if first_unknown.is_none() {
+                if !self.state_contains(hash).await? {
+                    first_unknown = Some(index);
+                }
+                continue;
+            }
+
+            if self.state_contains(hash).await? {
+                debug!(
+                    ?hash,
+                    "discarding FindBlocks response with known hash in advertised suffix"
+                );
+                return Ok(None);
+            }
+        }
+
+        Ok(first_unknown)
+    }
+
+    async fn validate_extend_find_blocks_response<'a>(
+        state: &mut ZS,
+        hashes: &'a [block::Hash],
+        locator: block::Hash,
+        expected_next: block::Hash,
+    ) -> Result<Option<&'a [block::Hash]>, Report> {
+        let matched_hashes = match hashes {
+            [expected_hash, _rest @ ..] if *expected_hash == expected_next => hashes,
+            [first_hash, expected_hash, _rest @ ..] if *expected_hash == expected_next => {
+                debug!(?first_hash, ?expected_next, ?locator, "unexpected first hash, but the second matches: using the hashes after the match");
+                &hashes[1..]
+            }
+            [] => return Ok(None),
+            [single_hash] => {
+                debug!(
+                    ?single_hash,
+                    ?expected_next,
+                    ?locator,
+                    "discarding response containing a single unexpected hash"
+                );
+                return Ok(None);
+            }
+            [first_hash, second_hash, rest @ ..] => {
+                debug!(?first_hash, ?second_hash, rest_len = ?rest.len(), ?expected_next, ?locator, "discarding response that starts with two unexpected hashes");
+                return Ok(None);
+            }
+        };
+
+        // We use the last hash for the tip, and we want to avoid bad tips.
+        // So we discard the last hash before checking duplicates or known hashes.
+        let matched_hashes = match matched_hashes {
+            [] => unreachable!("matched FindBlocks response contains the expected hash"),
+            [rest @ .., _last] => rest,
+        };
+
+        let unknown_hashes = match matched_hashes {
+            [expected_hash, rest @ ..] if *expected_hash == expected_next => rest,
+            [] => return Ok(Some(&[])),
+            _ => unreachable!("matched FindBlocks response starts with the expected hash"),
+        };
+
+        // Apply the count guard before scanning peer-controlled hashes or
+        // querying state, so oversized responses cannot amplify state work.
+        if !has_valid_tips_response_hash_count(unknown_hashes) {
+            debug!(
+                hashes.len = unknown_hashes.len(),
+                max_hashes = MAX_TIPS_RESPONSE_HASH_COUNT,
+                "discarding oversized FindBlocks response"
+            );
+            return Ok(None);
+        }
+
+        let mut seen = HashSet::new();
+        if matched_hashes.iter().any(|hash| !seen.insert(*hash)) {
+            debug!(
+                ?matched_hashes,
+                "discarding FindBlocks extension response with duplicate hash"
+            );
+            return Ok(None);
+        }
+
+        if unknown_hashes.contains(&locator) {
+            debug!(
+                ?locator,
+                "discarding FindBlocks extension response with locator hash in advertised suffix"
+            );
+            return Ok(None);
+        }
+
+        for &hash in unknown_hashes {
+            if Self::state_contains_service(state, hash).await? {
+                debug!(
+                    ?hash,
+                    "discarding FindBlocks extension response with known hash in advertised suffix"
+                );
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(unknown_hashes))
+    }
+
     /// Given a block_locator list fan out request for subsequent hashes to
     /// multiple peers
     #[instrument(skip(self))]
@@ -1574,7 +1689,7 @@ where
                     } else {
                         info!(
                             "task error during obtain tips task: {e:?},\
-                     is Zebra shutting down?"
+                     is Zakura shutting down?"
                         );
                         Err(e.into())
                     }
@@ -1627,13 +1742,7 @@ where
                         continue;
                     }
 
-                    let mut first_unknown = None;
-                    for (i, &hash) in hashes.iter().enumerate() {
-                        if !self.state_contains(hash).await? {
-                            first_unknown = Some(i);
-                            break;
-                        }
-                    }
+                    let first_unknown = self.first_unknown_in_find_blocks_response(hashes).await?;
 
                     debug!(hashes.len = ?hashes.len(), ?first_unknown);
 
@@ -1724,6 +1833,7 @@ where
     #[instrument(skip_all)]
     async fn build_extend(
         mut tip_network: Timeout<ZN>,
+        mut state: ZS,
         tips: HashSet<CheckedTip>,
     ) -> Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report> {
         let stage_start = std::time::Instant::now();
@@ -1762,60 +1872,16 @@ where
                         // zcashd sometimes appends an unrelated hash at the
                         // start or end of its response. Check the first hash
                         // against the previous response, and discard mismatches.
-                        let unknown_hashes = match hashes.as_slice() {
-                            [expected_hash, rest @ ..] if expected_hash == &tip.expected_next => {
-                                rest
-                            }
-                            // If the first hash doesn't match, retry with the second.
-                            [first_hash, expected_hash, rest @ ..]
-                                if expected_hash == &tip.expected_next =>
-                            {
-                                debug!(?first_hash,
-                                                ?tip.expected_next,
-                                                ?tip.tip,
-                                                "unexpected first hash, but the second matches: using the hashes after the match");
-                                rest
-                            }
-                            // We ignore these responses
-                            [] => continue,
-                            [single_hash] => {
-                                debug!(?single_hash,
-                                                ?tip.expected_next,
-                                                ?tip.tip,
-                                                "discarding response containing a single unexpected hash");
-                                continue;
-                            }
-                            [first_hash, second_hash, rest @ ..] => {
-                                debug!(?first_hash,
-                                                ?second_hash,
-                                                rest_len = ?rest.len(),
-                                                ?tip.expected_next,
-                                                ?tip.tip,
-                                                "discarding response that starts with two unexpected hashes");
-                                continue;
-                            }
-                        };
-
-                        // We use the last hash for the tip, and we want to avoid
-                        // bad tips. So we discard the last hash. (We don't need
-                        // to worry about missed downloads, because we will pick
-                        // them up again in the next ExtendTips.)
-                        let unknown_hashes = match unknown_hashes {
-                            [] => continue,
-                            [rest @ .., _last] => rest,
-                        };
-
-                        // Apply the count guard after stripping the trailing
-                        // hash so a full 500-hash chain plus one appended hash
-                        // is still usable.
-                        if !has_valid_tips_response_hash_count(unknown_hashes) {
-                            debug!(
-                                hashes.len = unknown_hashes.len(),
-                                max_hashes = MAX_TIPS_RESPONSE_HASH_COUNT,
-                                "discarding oversized FindBlocks response"
-                            );
+                        let Some(unknown_hashes) = Self::validate_extend_find_blocks_response(
+                            &mut state,
+                            hashes.as_slice(),
+                            tip.tip,
+                            tip.expected_next,
+                        )
+                        .await?
+                        else {
                             continue;
-                        }
+                        };
 
                         let new_tip = if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
                             CheckedTip {
@@ -2249,8 +2315,11 @@ where
     /// Returns `true` if the hash is present in the state, and `false`
     /// if the hash is not present in the state.
     pub(crate) async fn state_contains(&mut self, hash: block::Hash) -> Result<bool, Report> {
-        match self
-            .state
+        Self::state_contains_service(&mut self.state, hash).await
+    }
+
+    async fn state_contains_service(state: &mut ZS, hash: block::Hash) -> Result<bool, Report> {
+        match state
             .ready()
             .await
             .map_err(|e| eyre!(e))?

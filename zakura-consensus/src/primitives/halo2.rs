@@ -271,6 +271,42 @@ pub static VERIFIER_NU6_2: Lazy<VerifierService> =
 pub static VERIFIER_NU6_3_ONWARD: Lazy<VerifierService> =
     Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_3_ONWARD));
 
+/// Selects the lazily initialized Halo2 verifier for `network_upgrade`.
+///
+/// Keeping selection separate from initialization lets tests verify every
+/// routing branch without building the expensive Orchard verifying keys.
+fn lazy_verifier_for(network_upgrade: NetworkUpgrade) -> &'static Lazy<VerifierService> {
+    use NetworkUpgrade::*;
+
+    match network_upgrade {
+        // Orchard did not exist before NU5, so these upgrades never carry
+        // Orchard bundles. They are bound to the pre-NU6.2 (insecure)
+        // verifier because that is the only key under which any Orchard
+        // history before NU6.2 verifies; routing them anywhere else cannot be
+        // correct.
+        Genesis | BeforeOverwinter | Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5
+        | Nu6 | Nu6_1 => &VERIFIER_PRE_NU6_2,
+
+        // NU6.2 ships the fixed circuit and is the only upgrade that uses it:
+        // it is active from the NU6.2 activation height until NU6.3.
+        Nu6_2 => &VERIFIER_NU6_2,
+
+        // NU6.3 adds the `disableCrossAddress` constraint to the Orchard
+        // Action circuit. Every Orchard Action from NU6.3 onward, including
+        // those in V5 transactions, commits to this circuit. Per ZIP 229, the
+        // restriction applies regardless of transaction version, so it cannot
+        // be bypassed with a V5 transaction. The NU6.2 fixed key would both
+        // reject honest NU6.3 proofs and fail to enforce this constraint.
+        Nu6_3 | Nu7 => &VERIFIER_NU6_3_ONWARD,
+
+        // `ZFuture` is post-NU6.3 and inherits the NU6.3 circuit. Keep the
+        // cfg-gated arm explicit so a future upgrade cannot silently fall back
+        // to an older or insecure verifier.
+        #[cfg(zcash_unstable = "zfuture")]
+        ZFuture => &VERIFIER_NU6_3_ONWARD,
+    }
+}
+
 /// Returns the global Halo2 verifier for the Orchard Action circuit active at
 /// `network_upgrade`.
 ///
@@ -292,34 +328,7 @@ pub static VERIFIER_NU6_3_ONWARD: Lazy<VerifierService> =
 /// no version-comparison fallthrough and no default-to-insecure arm, so adding a future upgrade
 /// is a compile error here until it is bound to a key on purpose.
 pub fn verifier_for(network_upgrade: NetworkUpgrade) -> &'static VerifierService {
-    use NetworkUpgrade::*;
-
-    match network_upgrade {
-        // Orchard did not exist before NU5, so these upgrades never carry Orchard bundles. They
-        // are bound to the pre-NU6.2 (insecure) verifier because that is the only key under which
-        // any Orchard history before NU6.2 verifies; routing them anywhere else cannot be correct.
-        Genesis | BeforeOverwinter | Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5
-        | Nu6 | Nu6_1 => &VERIFIER_PRE_NU6_2,
-
-        // NU6.2 ships the fixed circuit and is the only upgrade that uses it: it is active from the
-        // NU6.2 activation height until NU6.3.
-        Nu6_2 => &VERIFIER_NU6_2,
-
-        // NU6.3 adds the `disableCrossAddress` constraint to the Orchard Action circuit. Every
-        // Orchard Action from NU6.3 onward — including those in V5 transactions — commits to this
-        // circuit, so NU6.3 and later route to the NU6.3-onward key. Per ZIP 229 the cross-address
-        // restriction applies "regardless of transaction version ... so that it cannot be bypassed
-        // by using a version 5 transaction". Verifying these under the NU6.2 fixed key would both
-        // reject honest proofs (different key) and fail to enforce the restriction.
-        Nu6_3 | Nu7 => &VERIFIER_NU6_3_ONWARD,
-
-        // `ZFuture` only exists under the `zcash_unstable = "zfuture"` cfg. It is a post-NU6.3
-        // upgrade, so it inherits the NU6.3 circuit and is bound to the NU6.3-onward key here on
-        // purpose (rather than via a wildcard) to keep this match exhaustive and fail-closed under
-        // every build configuration.
-        #[cfg(zcash_unstable = "zfuture")]
-        ZFuture => &VERIFIER_NU6_3_ONWARD,
-    }
+    lazy_verifier_for(network_upgrade)
 }
 
 /// Halo2 proof verifier implementation
@@ -453,7 +462,7 @@ impl Service<BatchControl<Item>> for Verifier {
                             let is_valid = *rx
                                 .borrow()
                                 .as_ref()
-                                .ok_or("threadpool unexpectedly dropped response channel sender. Is Zebra shutting down?")?;
+                                .ok_or("threadpool unexpectedly dropped response channel sender. Is Zakura shutting down?")?;
 
                             if is_valid {
                                 tracing::trace!(?is_valid, "verified halo2 proof");

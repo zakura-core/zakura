@@ -1,7 +1,7 @@
 # zcashd-compat Mode (`zakurad start --zcashd-compat`)
 
 zcashd-compat mode is for operators — typically exchanges and custodial
-services whi want to migrate to Zakura while keeping the `zcashd` wallet and
+services who want to migrate to Zakura while keeping the `zcashd` wallet and
 RPC surface their integration already depends on. Zakura faces the Zcash P2P
 network and is the consensus node; `zcashd` runs as a **P2P sidecar** that
 makes a single outbound peer connection to the local Zakura node and listens
@@ -215,11 +215,29 @@ block_gossip_peer_ips = ["127.0.0.1"]
 zcashd only connects to Zakura using the legacy Zcash P2P protocol. The fronting
 Zakura must therefore use `network.p2p_stack = "legacy"` or `"dual"`; Zakura
 refuses to start zcashd-compat mode with the `"zakura"`-only setting. The
-`"dual"` setting also enables the [experimental Zakura P2P v2 stack](./p2p.md),
-but the zcashd sidecar still connects over Zakura's legacy listener.
+`"dual"` setting also enables the experimental Zakura P2P v2 stack, but the
+zcashd sidecar still connects over Zakura's legacy listener.
 
-Do not enable state pruning on the fronting Zakura — a pruned node does not
-advertise `NODE_NETWORK` and zcashd will not sync from it.
+Pruned storage is supported for the fronting Zakura. When zcashd-compat is
+enabled, Zakura advertises `NODE_NETWORK` even in pruned mode so that the
+sidecar can sync. Pruning still limits which block bodies Zakura can serve:
+zcashd's current chainstate must be recent enough that every block it still
+needs is inside Zakura's configured retention window. The default and minimum
+retention on Mainnet and Testnet is 10,000 blocks, and operators can configure
+a larger `state.storage_mode.pruned.tx_retention`.
+
+A sidecar starting from genesis, restored from a stale snapshot, or returning
+after a long outage cannot sync from a pruned front if Zakura has already
+deleted a required block body. Restore zcashd from a newer snapshot that puts
+its tip inside the current retention window, or sync it against an archive
+Zakura node. When a configured sidecar address requests a known block whose
+body has been pruned, Zakura logs the block height, hash, and configured
+retention, rate limited to once per minute.
+
+For production deployments, archive storage remains recommended so that a
+sidecar can recover after an extended outage or resync from genesis. Changing
+an already-pruned Zakura database back to archive mode requires resyncing
+Zakura from genesis.
 
 > [!WARNING]
 > When the fronting Zakura runs in Docker with a published P2P port, all
@@ -274,8 +292,8 @@ miner_address = "t1YourTransparentOrShieldedAddress"
 ```
 
 Zakura's `getblocktemplate` and `submitblock` are always compiled in; no
-special build is needed. See [Mining](mining.md) for details. The sidecar
-zcashd returns `Method not found` for all template and submission RPCs, so a
+special build is needed. The sidecar zcashd returns `Method not found` for all
+template and submission RPCs, so a
 misconfigured miner fails loudly instead of building on a lagging view.
 
 ## Wallet shielded-pool support (Orchard & Ironwood)
@@ -329,15 +347,19 @@ end-of-support halt.
 
 ## Initial sync and existing datadirs
 
-The sidecar syncs the whole chain through its single Zakura peer. That works,
-but initial block download through one peer is slow — for production
-migrations, **bring your existing synced zcashd datadir** and let the sidecar
-continue from its current height. The chainstate and block files are the
-stock zcashd format; no conversion is needed. The installer searches mounted
-filesystems for existing Zakura state directories and zcashd datadirs and
-offers them as defaults; snapshots for both nodes are available from the
-locations it prints (currently <https://zcashd.valargroup.dev/> and
-<https://zakura.com/snapshots>).
+The sidecar syncs through its single Zakura peer. An archive front can serve
+the whole chain, but initial block download through one peer is slow. A pruned
+front can serve only the block bodies in its retention window, so it cannot
+bootstrap a sidecar from genesis. For production migrations, **bring your
+existing synced zcashd datadir** and let the sidecar continue from its current
+height. If the front is pruned, verify that the datadir or snapshot is recent
+enough that every block zcashd still needs remains inside the front's current
+retention window.
+
+The chainstate and block files are the stock zcashd format; no conversion is
+needed. The installer searches mounted filesystems for existing Zakura state
+directories and zcashd datadirs and offers them as defaults; snapshots for
+both nodes are available from <https://zakura.com/snapshots>.
 
 zcashd still performs its own full validation of every block Zakura relays —
 the sidecar removes zcashd's _network exposure_, not its consensus checks.

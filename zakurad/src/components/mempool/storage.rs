@@ -217,6 +217,9 @@ pub struct Storage {
     /// Same as [`config::Config::eviction_memory_time`].
     eviction_memory_time: Duration,
 
+    /// Maximum entries retained in each rejection list.
+    rejection_list_capacity: usize,
+
     /// Max total cost of the verified mempool set, beyond which transactions
     /// are evicted to make room.
     tx_cost_limit: u64,
@@ -234,9 +237,27 @@ impl Drop for Storage {
 impl Storage {
     #[allow(clippy::field_reassign_with_default)]
     pub(crate) fn new(config: &config::Config) -> Self {
+        Self::new_with_rejection_list_capacity(config, MAX_EVICTION_MEMORY_ENTRIES)
+    }
+
+    /// Constructs storage with a configurable rejection-list capacity.
+    ///
+    /// Production always uses [`MAX_EVICTION_MEMORY_ENTRIES`]. Unit tests use
+    /// smaller capacities to exercise boundary behavior without tens of
+    /// thousands of insertions per property-test case.
+    fn new_with_rejection_list_capacity(
+        config: &config::Config,
+        rejection_list_capacity: usize,
+    ) -> Self {
+        assert!(
+            rejection_list_capacity > 0,
+            "rejection lists must retain at least one entry"
+        );
+
         Self {
             tx_cost_limit: config.tx_cost_limit,
             eviction_memory_time: config.eviction_memory_time,
+            rejection_list_capacity,
             max_datacarrier_bytes: config
                 .max_datacarrier_bytes
                 .unwrap_or(config::DEFAULT_MAX_DATACARRIER_BYTES),
@@ -403,8 +424,9 @@ impl Storage {
     /// prevent this transaction from being inserted.
     /// These errors should not be propagated to peers, because the transactions are valid.
     ///
-    /// If inserting this transaction evicts other transactions, they will be tracked
-    /// as [`SameEffectsChainRejectionError::RandomlyEvicted`].
+    /// If inserting this transaction evicts other transactions, the selected
+    /// ZIP-401 victims will be tracked as
+    /// [`SameEffectsChainRejectionError::RandomlyEvicted`].
     #[allow(clippy::unwrap_in_result)]
     pub fn insert(
         &mut self,
@@ -412,6 +434,21 @@ impl Storage {
         spent_mempool_outpoints: Vec<transparent::OutPoint>,
         height: Option<Height>,
     ) -> Result<UnminedTxId, MempoolError> {
+        self.insert_with_evicted_ids(tx, spent_mempool_outpoints, height)
+            .0
+    }
+
+    /// Insert a transaction and return all IDs removed by ZIP-401 eviction.
+    ///
+    /// The returned IDs include dependents of the selected eviction victim and
+    /// the inserted transaction if it is selected for eviction.
+    #[allow(clippy::unwrap_in_result)]
+    pub(super) fn insert_with_evicted_ids(
+        &mut self,
+        tx: VerifiedUnminedTx,
+        spent_mempool_outpoints: Vec<transparent::OutPoint>,
+        height: Option<Height>,
+    ) -> (Result<UnminedTxId, MempoolError>, HashSet<UnminedTxId>) {
         // # Security
         //
         // This method must call `reject`, rather than modifying the rejection lists directly.
@@ -427,7 +464,7 @@ impl Storage {
                 "returning cached error for transaction",
             );
 
-            return Err(error);
+            return (Err(error), HashSet::new());
         }
 
         // If `tx` is already in the mempool, we don't change anything.
@@ -441,14 +478,17 @@ impl Storage {
                 "returning InMempool error for transaction that is already in the mempool",
             );
 
-            return Err(MempoolError::InMempool);
+            return (Err(MempoolError::InMempool), HashSet::new());
         }
 
         // Check that the transaction is standard.
-        self.reject_if_non_standard_tx(&tx)?;
+        if let Err(error) = self.reject_if_non_standard_tx(&tx) {
+            return (Err(error), HashSet::new());
+        }
 
         // Then, we try to insert into the pool. If this fails the transaction is rejected.
         let mut result = Ok(unmined_tx_id);
+        let mut evicted_ids = HashSet::new();
         if let Err(rejection_error) = self.verified.insert(
             tx,
             spent_mempool_outpoints,
@@ -483,25 +523,34 @@ impl Storage {
             // > EvictTransaction MUST do the following:
             // > Select a random transaction to evict, with probability in direct proportion to
             // > eviction weight. (...) Remove it from the mempool.
-            let victim_tx = self
+            // > Add the txid and the current time to RecentlyEvicted, dropping
+            // > the oldest entry in RecentlyEvicted if necessary to keep it to
+            // > at most `eviction_memory_entries entries`.
+            let victim_txs = self
                 .verified
                 .evict_one()
                 .expect("mempool is empty, but was expected to be full");
 
-            // > Add the txid and the current time to RecentlyEvicted, dropping the oldest entry in
-            // > RecentlyEvicted if necessary to keep it to at most `eviction_memory_entries entries`.
+            let victim_tx_id = victim_txs
+                .last()
+                .expect("eviction removes at least the selected transaction")
+                .transaction
+                .id;
+
             self.reject(
-                victim_tx.transaction.id,
+                victim_tx_id,
                 SameEffectsChainRejectionError::RandomlyEvicted.into(),
             );
 
             // If this transaction gets evicted, set its result to the same error
-            if victim_tx.transaction.id == unmined_tx_id {
+            if victim_tx_id == unmined_tx_id {
                 result = Err(SameEffectsChainRejectionError::RandomlyEvicted.into());
             }
+
+            evicted_ids.extend(victim_txs.into_iter().map(|tx| tx.transaction.id));
         }
 
-        result
+        (result, evicted_ids)
     }
 
     /// Remove transactions from the mempool via exact [`UnminedTxId`].
@@ -652,10 +701,10 @@ impl Storage {
     /// Otherwise, peers could make our reject lists use a lot of RAM.
     fn limit_rejection_list_memory(&mut self) {
         // These lists are an optimisation - it's ok to totally clear them as needed.
-        if self.tip_rejected_exact.len() > MAX_EVICTION_MEMORY_ENTRIES {
+        if self.tip_rejected_exact.len() > self.rejection_list_capacity {
             self.tip_rejected_exact.clear();
         }
-        if self.tip_rejected_same_effects.len() > MAX_EVICTION_MEMORY_ENTRIES {
+        if self.tip_rejected_same_effects.len() > self.rejection_list_capacity {
             self.tip_rejected_same_effects.clear();
         }
         // `chain_rejected_same_effects` limits its size by itself
@@ -793,10 +842,11 @@ impl Storage {
             }
             RejectionError::SameEffectsChain(e) => {
                 let eviction_memory_time = self.eviction_memory_time;
+                let rejection_list_capacity = self.rejection_list_capacity;
                 self.chain_rejected_same_effects
                     .entry(e)
                     .or_insert_with(|| {
-                        EvictionList::new(MAX_EVICTION_MEMORY_ENTRIES, eviction_memory_time)
+                        EvictionList::new(rejection_list_capacity, eviction_memory_time)
                     })
                     .insert(tx_id.mined_id());
             }
@@ -903,19 +953,18 @@ impl Storage {
         tip_height: zakura_chain::block::Height,
     ) -> HashSet<UnminedTxId> {
         let mut tx_ids = HashSet::new();
-        let mut unmined_tx_ids = HashSet::new();
 
         for (&tx_id, tx) in self.transactions() {
             if let Some(expiry_height) = tx.transaction.transaction.expiry_height() {
                 if tip_height >= expiry_height {
                     tx_ids.insert(tx_id);
-                    unmined_tx_ids.insert(tx.transaction.id);
                 }
             }
         }
 
         // expiry height is effecting data, so we match by non-malleable TXID
-        self.verified
+        let removed_tx_ids = self
+            .verified
             .remove_all_that(|tx| tx_ids.contains(&tx.transaction.id.mined_id()));
 
         // also reject it
@@ -928,7 +977,7 @@ impl Storage {
             );
         }
 
-        unmined_tx_ids
+        removed_tx_ids
     }
 
     /// Check if transaction should be downloaded and/or verified.

@@ -17,7 +17,7 @@ Zakura is a Rust workspace. Main crates include:
 - core libraries like `zakura-chain/`, `zakura-consensus/`, `zakura-network/`, `zakura-state/`, `zakura-rpc/`,
 - support crates like `zakura-node-services/`, `zakura-test/`, `zakura-utils/`, `tower-batch-control/`, and `tower-fallback/`.
 
-Code is primarily in each crate's `src/`; integration tests are in `*/tests/`; many unit/property tests are colocated in `src/**/tests/` (for example `prop.rs`, `vectors.rs`, `preallocate.rs`). Documentation is in `book/` and `docs/decisions/`. CI and policy automation live in `.github/workflows/`.
+Code is primarily in each crate's `src/`; integration tests are in `*/tests/`; many unit/property tests are colocated in `src/**/tests/` (for example `prop.rs`, `vectors.rs`, `preallocate.rs`). Documentation is in `docs/`, crate READMEs, and `book/src/user/zcashd-compat.md`. CI and policy automation live in `.github/workflows/`.
 
 ## Build, Test, and Development Commands
 
@@ -50,7 +50,10 @@ cargo nextest run --profile sync-large-checkpoints-empty
 
 - PR titles must follow [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) (PRs are squash-merged — the PR title becomes the commit message)
 - Use `.github/pull_request_template.md`. For fixes, connect the root cause to both the solution and the test coverage.
-- For user-visible changes, update `CHANGELOG.md` per `CHANGELOG_GUIDELINES.md`.
+- Every PR that changes a Rust source file or any `Cargo.toml` adds one
+  `changelog-unreleased/<PR-number>.md` fragment, including an explicit
+  no-changelog fragment for internal-only work. Do not edit the shared
+  changelog in ordinary PRs. See `CHANGELOG_GUIDELINES.md`.
 
 ## Project Overview
 
@@ -173,9 +176,17 @@ cargo nextest run --profile sync-large-checkpoints-empty
 
 ## Changelog
 
-- Update `CHANGELOG.md` under `[Unreleased]` for user-visible changes
+- After opening a draft PR that changes a Rust source file or any `Cargo.toml`,
+  add exactly one `changelog-unreleased/<PR-number>.md` file for that PR.
+- Put user-visible `zakurad` entries under the appropriate Keep a Changelog
+  category heading.
+- For internal-only work, use `<!-- changelog: none -->` and explain why.
+- Do not directly edit `[Unreleased]` in ordinary PRs; the release flow
+  assembles fragments into the root changelog.
 - Apply the appropriate PR label (`C-feature`, `C-bug`, `C-security`, etc.)
-- See `CHANGELOG_GUIDELINES.md` for detailed formatting rules
+- Run `./scripts/changelog.py check` and see
+  `changelog-unreleased/README.md` and
+  `CHANGELOG_GUIDELINES.md` for the exact format.
 
 ## Configuration
 

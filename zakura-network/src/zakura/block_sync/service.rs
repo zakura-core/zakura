@@ -456,6 +456,15 @@ impl Service for BlockSyncService {
         OrderedSessionDemand::OpenNow
     }
 
+    fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        self.inner
+            .active_peers
+            .lock()
+            .expect("block-sync peer map mutex is never poisoned")
+            .get(peer)
+            .is_some_and(|record| record.conn_id == conn_id)
+    }
+
     fn wants_peer(
         &self,
         peer: &ZakuraPeerId,

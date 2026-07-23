@@ -15,7 +15,7 @@ use zakura_chain::{
 
 use zakura_chain::transparent;
 
-use crate::components::mempool::{storage::*, Mempool};
+use crate::components::mempool::storage::*;
 
 /// Eviction memory time used for tests. Most tests won't care about this
 /// so we use a large enough value that will never be reached in the tests.
@@ -467,9 +467,54 @@ fn mempool_expired_basic_for_network(network: Network) -> Result<()> {
     let everything_in_mempool: HashSet<UnminedTxId> = storage.tx_ids().collect();
     assert_eq!(everything_in_mempool.len(), 0);
 
-    // No transaction will be sent to peers
-    let send_to_peers = Mempool::remove_expired_from_peer_list(&everything_in_mempool, &expired);
-    assert_eq!(send_to_peers.len(), 0);
+    Ok(())
+}
+
+#[test]
+fn mempool_expiration_reports_removed_dependent_transactions() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let mut storage = Storage::new(&config::Config {
+        tx_cost_limit: 160_000_000,
+        eviction_memory_time: EVICTION_MEMORY_TIME,
+        ..Default::default()
+    });
+    let block: Block = Network::Mainnet.test_block(982681, 925483).unwrap();
+
+    let mut parent = block.transactions[1].as_ref().clone();
+    *parent.expiry_height_mut() = Height(1);
+    let parent_id = parent.unmined_id();
+    let parent_mined_id = parent_id.mined_id();
+    assert!(
+        !parent.outputs().is_empty(),
+        "test parent transaction should have an output"
+    );
+
+    let mut dependent = block.transactions[2].as_ref().clone();
+    *dependent.expiry_height_mut() = Height(2);
+    let dependent_id = dependent.unmined_id();
+
+    let verified = |tx| {
+        VerifiedUnminedTx::new(
+            tx,
+            Amount::try_from(1_000_000).expect("valid amount"),
+            0,
+            0,
+            std::sync::Arc::new(vec![]),
+        )
+        .expect("verification should pass")
+    };
+
+    storage.insert(verified(parent.into()), Vec::new(), None)?;
+    storage.insert(
+        verified(dependent.into()),
+        vec![OutPoint::from_usize(parent_mined_id, 0)],
+        None,
+    )?;
+
+    let removed = storage.remove_expired_transactions(Height(1));
+
+    assert_eq!(removed, HashSet::from([parent_id, dependent_id]));
+    assert_eq!(storage.transaction_count(), 0);
 
     Ok(())
 }

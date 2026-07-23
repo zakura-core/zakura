@@ -7,23 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-07-22
+
 ### Added
 
 - Add an offline Mainnet checkpoint and VCT frontier export mode to
   `zakura-checkpoints`, and a committed provenance record
   (`vct/mainnet-frontier.json`) that CI verifies against the embedded
   checkpoint list and frontier on every PR. Groundwork for automated
-  release-state updates.
+  release-state updates
+  ([#261](https://github.com/zakura-core/zakura/pull/261)).
 - Automate Mainnet checkpoint and VCT frontier refreshes: the
   `update-release-state.yml` workflow imports digest-verified publisher bundles
   from R2 into reviewable draft PRs, and `make pre-release` now verifies the
   committed checkpoint/frontier/provenance coupling (rejecting pre-pipeline
-  bootstrap state unless explicitly overridden).
+  bootstrap state unless explicitly overridden)
+  ([#262](https://github.com/zakura-core/zakura/pull/262)).
+- Add `mempool::Request::TakePendingGossipTransactionIds` for bounded,
+  atomic draining of transaction IDs awaiting peer advertisement
+  ([#64](https://github.com/zakura-core/zakura/pull/64)).
 
 ### Changed
 
 - Update the embedded zcashd-compat binary and default split-container image to
-  valargroup/zcashd v1.1.0.
+  valargroup/zcashd v1.1.0
+  ([#319](https://github.com/zakura-core/zakura/pull/319)).
+- Hardened the hotfix release checklist and process documentation from the
+  first hotfix-path release's findings
+  (see [docs/security-hotfix-release.md](docs/security-hotfix-release.md)).
+
+### Removed
+
+- Removed unused public `zakura-chain` errors, constants, and helper methods
+  ([#361](https://github.com/zakura-core/zakura/pull/361)).
 
 ### Fixed
 
@@ -33,9 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   bounded, and negotiated streams respect aggregate inbound queue limits
   ([#166](https://github.com/zakura-core/zakura/pull/166)).
 - Treat IPv4 and IPv4-mapped IPv6 peer addresses as the same address when
-  enforcing bans, preventing banned peers from reconnecting through the
-  alternate representation
-  ([#314](https://github.com/zakura-core/zakura/pull/314)).
+  enforcing bans, inbound rate limits, and per-IP connection limits, preventing
+  peers from bypassing them through the alternate representation
+  ([#238](https://github.com/zakura-core/zakura/pull/238),
+  [#314](https://github.com/zakura-core/zakura/pull/314)).
 - Prevent RPC read-secondary synchronization races, stale stream retries, and
   finalized-state gaps from interrupting RPC and indexer availability
   ([#118](https://github.com/zakura-core/zakura/pull/118)).
@@ -47,15 +64,35 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Make retained peer-ban insertion and eviction O(1) rather than O(N),
   preventing ban-list maintenance from slowing as the 20,000-IP bound fills
   ([#286](https://github.com/zakura-core/zakura/pull/286)).
-- Canonicalize IPv4-mapped IPv6 inbound peer addresses on dual-stack listeners so
-  bans, the recent-inbound rate limiter, and `max_connections_per_ip` can no longer
-  be evaded. On a dual-stack bind (`[::]` with `IPV6_V6ONLY=false`), Linux reports an
-  inbound IPv4 peer as `::ffff:A.B.C.D`, but the ban map and address book are keyed on
-  the canonical `A.B.C.D`. The inbound accept path and the peer set compared the raw
-  mapped address, so a banned or rate-limited peer could bypass enforcement by
-  reconnecting in the other address form. The accept path now canonicalizes at the
-  boundary, and the peer-set ban re-checks and per-IP accounting canonicalize before
-  comparing. Nodes that bind `0.0.0.0` are unaffected.
+- Stop the experimental dummy CPU miner from continuing to use a stale block
+  template after template generation fails
+  ([#333](https://github.com/zakura-core/zakura/pull/333)).
+- Replace outdated Zebra branding in Zakura logs, errors, RPC responses, CLI
+  help, and operator tooling
+  ([#335](https://github.com/zakura-core/zakura/pull/335)).
+- Stop advertising dependent transactions after their expired parent is removed
+  from the mempool
+  ([#342](https://github.com/zakura-core/zakura/pull/342)).
+- Fixed test log capture racing the process-wide tracing subscriber, which
+  could corrupt span bookkeeping in `zakurad` test binaries; `zakura-test` now
+  provides a `log_capture` module that captures messages from its shared
+  subscriber ([#332](https://github.com/zakura-core/zakura/pull/332)).
+- Kept verbose block-header metadata bound to the resolved block across chain
+  reorganizations
+  ([#328](https://github.com/zakura-core/zakura/pull/328)).
+- Preserve transaction advertisements when the mempool gossip task lags its
+  notification channel
+  ([#64](https://github.com/zakura-core/zakura/pull/64)).
+
+### Security
+
+- Reject malformed legacy block-discovery responses instead of allowing them
+  to disrupt the active sync attempt
+  ([#355](https://github.com/zakura-core/zakura/pull/355)).
+- Allow chain synchronization to immediately retry an honest block body after
+  rejecting a body with the same header hash, without waiting for another state
+  request to trigger cleanup
+  ([GHSA-8gxx-hc65-vv82](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-8gxx-hc65-vv82)).
 
 ## [1.0.2] - 2026-07-20
 

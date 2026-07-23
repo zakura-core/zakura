@@ -219,7 +219,7 @@ fn render_command_line(program: &OsStr, args: &[OsString]) -> String {
 }
 
 fn print_help() {
-    println!("Workspace automation for Zebra.");
+    println!("Workspace automation for Zakura.");
     println!();
     let mut help = String::new();
     print_usage(&mut help).expect("writing help to a string should succeed");
@@ -231,7 +231,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output)?;
     writeln!(
         output,
-        "Builds a Zebra release binary on {DEFAULT_UBUNTU_IMAGE} using Docker,"
+        "Builds a Zakura release binary on {DEFAULT_UBUNTU_IMAGE} using Docker,"
     )?;
     writeln!(
         output,

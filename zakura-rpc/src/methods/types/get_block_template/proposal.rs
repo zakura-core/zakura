@@ -219,7 +219,7 @@ pub fn proposal_block_from_template(
         | NetworkUpgrade::Nu6_3
         | NetworkUpgrade::Nu7 => block_commitments_hash.bytes_in_serialized_order(),
         _ => Err(SerializationError::Parse(
-            "Zebra does not support generating pre-Canopy block templates",
+            "Zakura does not support generating pre-Canopy block templates",
         ))?,
     }
     .into();

@@ -314,7 +314,7 @@ where
                 match checkpoint_state_service.oneshot(request).await {
                     Ok(zakura_state::Response::BlockHash(Some(state_hash))) => assert_eq!(
                         *checkpoint_hash, state_hash,
-                        "invalid block in state: a previous Zebra instance followed an \
+                        "invalid block in state: a previous Zakura instance followed an \
                          incorrect chain. Delete and re-sync your state to use the best chain"
                     ),
 
@@ -327,7 +327,7 @@ where
                         } else {
                             tracing::warn!(
                                 "state is not fully synced yet, remaining checkpoints will be \
-                                 verified next time Zebra starts up. Zebra will be less secure \
+                                 verified next time Zakura starts up. Zakura will be less secure \
                                  until it is restarted. Use consensus.checkpoint_sync = true \
                                  in zakura.toml to make sure you are following a valid chain"
                             );
@@ -344,7 +344,7 @@ where
                         if !already_warned {
                             tracing::warn!(
                                 "unexpected error: {e:?} in state request while verifying previous \
-                                 state checkpoints. Is Zebra shutting down?"
+                                 state checkpoints. Is Zakura shutting down?"
                             );
                             already_warned = true;
                         }

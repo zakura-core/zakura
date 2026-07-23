@@ -38,7 +38,7 @@ where
                 } else if is_shutting_down() {
                     debug!(
                         ?thread_output,
-                        "ignoring thread exit because Zebra is shutting down"
+                        "ignoring thread exit because Zakura is shutting down"
                     );
 
                     thread_output

@@ -16,7 +16,7 @@ SHUTDOWN_DELAY_INCREMENT=1
 # the test stops after a successful run with a delay this long
 SHUTDOWN_DELAY_LIMIT=30
 
-echo "Building Zebra"
+echo "Building Zakura"
 echo
 
 cargo build --bin zakurad || exit $?
@@ -24,7 +24,7 @@ cargo build --bin zakurad || exit $?
 EXIT_STATUS=0
 while [ $EXIT_STATUS -eq 0 ] && [ $SHUTDOWN_DELAY -le $SHUTDOWN_DELAY_LIMIT ]; do
     echo
-    echo "Running Zebra for $SHUTDOWN_DELAY seconds"
+    echo "Running Zakura for $SHUTDOWN_DELAY seconds"
     echo
 
     # shut down Zebra if this script exits while it's running,
@@ -35,7 +35,7 @@ while [ $EXIT_STATUS -eq 0 ] && [ $SHUTDOWN_DELAY -le $SHUTDOWN_DELAY_LIMIT ]; d
     sleep $SHUTDOWN_DELAY
 
     echo
-    echo "Killing Zebra after $SHUTDOWN_DELAY seconds"
+    echo "Killing Zakura after $SHUTDOWN_DELAY seconds"
     echo
 
     kill %?zakurad
@@ -48,7 +48,7 @@ while [ $EXIT_STATUS -eq 0 ] && [ $SHUTDOWN_DELAY -le $SHUTDOWN_DELAY_LIMIT ]; d
     fi
 
     echo
-    echo "Killing Zebra after $SHUTDOWN_DELAY seconds exited with $EXIT_STATUS"
+    echo "Killing Zakura after $SHUTDOWN_DELAY seconds exited with $EXIT_STATUS"
     echo
 
     SHUTDOWN_DELAY=$[SHUTDOWN_DELAY + SHUTDOWN_DELAY_INCREMENT]

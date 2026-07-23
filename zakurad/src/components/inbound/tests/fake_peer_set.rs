@@ -34,7 +34,7 @@ use crate::{
     components::{
         inbound::{downloads::MAX_INBOUND_CONCURRENCY, Inbound, InboundSetupData},
         mempool::{
-            downloads::MAX_INBOUND_CONCURRENCY_PER_PEER, gossip_mempool_transaction_id,
+            downloads::MAX_INBOUND_CONCURRENCY_PER_PEER, run_mempool_transaction_id_gossip,
             Config as MempoolConfig, Mempool, MempoolError, SameEffectsChainRejectionError,
             UnboxMempoolError,
         },
@@ -53,7 +53,14 @@ use InventoryResponse::*;
 /// Increasing this value causes the tests to take longer to complete, so it can't be too large.
 const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_millis(500);
 
-#[tokio::test(flavor = "multi_thread")]
+async fn wait_for_gossip() {
+    // Let background gossip tasks arm their timers before this paused runtime
+    // advances to the next gossip deadline.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn mempool_requests_for_transactions() {
     let (
         inbound_service,
@@ -131,7 +138,7 @@ async fn mempool_requests_for_transactions() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
     // get a block that has at least one non coinbase transaction
     let block: Arc<Block> =
@@ -226,7 +233,7 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn peer_pushed_transaction_is_verified_without_redownload() -> Result<(), crate::BoxError> {
     let block: Arc<Block> =
         zakura_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?;
@@ -313,7 +320,7 @@ async fn peer_pushed_transaction_is_verified_without_redownload() -> Result<(), 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn peer_pushed_transactions_are_limited_by_per_peer_cap() -> Result<(), crate::BoxError> {
     let block: Arc<Block> =
         zakura_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?;
@@ -388,7 +395,7 @@ async fn peer_pushed_transactions_are_limited_by_per_peer_cap() -> Result<(), cr
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
     // get a block that has at least one non coinbase transaction
     let block: Block = zakura_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?;
@@ -498,7 +505,7 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn peer_mempool_full_queue_is_refused_without_disconnect() -> Result<(), crate::BoxError> {
     let (
         inbound_service,
@@ -677,7 +684,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     hs.insert(tx1_id);
 
     // Transaction and Block IDs are gossipped, in any order, after waiting for the gossip delay
-    tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+    wait_for_gossip().await;
     let possible_requests = &mut [
         Request::AdvertiseTransactionIds(hs, None),
         Request::AdvertiseBlock(block_two.hash(), None),
@@ -746,7 +753,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         .unwrap();
 
     // Test the block is gossiped, after waiting for the multi-gossip delay
-    tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+    wait_for_gossip().await;
     peer_set
         .expect_request(Request::AdvertiseBlock(block_three.hash(), None))
         .await
@@ -825,7 +832,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     );
 
     // Test transaction 2 is gossiped, after waiting for the multi-gossip delay
-    tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+    wait_for_gossip().await;
 
     let mut hs = HashSet::new();
     hs.insert(tx2_id);
@@ -856,7 +863,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
             .unwrap();
 
         // Test the block is gossiped, after waiting for the multi-gossip delay
-        tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+        wait_for_gossip().await;
         peer_set
             .expect_request(Request::AdvertiseBlock(block.hash(), None))
             .await
@@ -903,7 +910,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
 /// Test that the inbound downloader rejects blocks above the lookahead limit.
 ///
 /// TODO: also test that it rejects blocks behind the tip limit. (Needs ~100 fake blocks.)
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
     // Get services
     let (
@@ -1259,11 +1266,6 @@ async fn setup(
         .in_current_span(),
     );
 
-    let tx_gossip_task_handle = tokio::spawn(gossip_mempool_transaction_id(
-        transaction_subscriber.subscribe(),
-        peer_set.clone(),
-    ));
-
     // Make sure there is an additional request broadcasting the
     // committed blocks to peers.
     //
@@ -1292,6 +1294,12 @@ async fn setup(
 
     let mempool_service = BoxService::new(mempool_service);
     let mempool_service = ServiceBuilder::new().buffer(1).service(mempool_service);
+
+    let tx_gossip_task_handle = tokio::spawn(run_mempool_transaction_id_gossip(
+        transaction_subscriber.subscribe(),
+        peer_set.clone(),
+        mempool_service.clone(),
+    ));
 
     let (setup_tx, setup_rx) = oneshot::channel();
 

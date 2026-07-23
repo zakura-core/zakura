@@ -25,3 +25,16 @@ pub mod regtest;
 pub mod sync;
 pub mod test_type;
 pub mod zcashd_compat;
+
+/// Returns the path to the compiled `zakurad` binary under test.
+///
+/// Prefers the value the test runner exports at run time
+/// (`CARGO_BIN_EXE_zakurad`), so the tests keep working when the binaries are
+/// relocated away from the directory they were compiled in — for example when
+/// they are run from a `cargo nextest` archive on a different job than the one
+/// that built them. Falls back to the path Cargo bakes in at compile time for
+/// ordinary in-tree `cargo test` runs, where the run-time variable is absent.
+fn zakurad_exe_path() -> String {
+    std::env::var("CARGO_BIN_EXE_zakurad")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_zakurad").to_string())
+}

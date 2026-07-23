@@ -1,0 +1,58 @@
+name: Changelog fragments
+
+on:
+  pull_request:
+    branches: [main, "feat/**", "release/**"]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [main, "feat/**", "release/**"]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  changelog:
+    name: changelog fragment
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate this pull request's fragment
+        if: github.event_name == 'pull_request'
+        env:
+          ALLOW_MISSING: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RELEASE_PR: ${{ contains(github.event.pull_request.labels.*.name, 'A-release') }}
+        run: |
+          args=(
+            check-pr
+            --base "$BASE_SHA"
+            --head "$HEAD_SHA"
+            --pr "$PR_NUMBER"
+          )
+          if [ "$ALLOW_MISSING" = "true" ]; then
+            args+=(--allow-missing)
+          fi
+          if [ "$RELEASE_PR" = "true" ]; then
+            args+=(--release-pr)
+          fi
+          ./scripts/changelog.py "${args[@]}"
+
+      - name: Validate pending fragments
+        if: github.event_name != 'pull_request'
+        run: ./scripts/changelog.py check
+
+      - name: Run changelog tool tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_changelog.py'

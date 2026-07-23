@@ -6,6 +6,7 @@ How and when to update the changelogs in this repository.
 
 | File | Records | Audience |
 | --- | --- | --- |
+| `changelog-unreleased/<PR>.md` | Unreleased root entries owned by one PR | Reviewers and release tooling |
 | `CHANGELOG.md` (root) | User-visible `zakurad` changes | Node operators |
 | `CHANGELOG_PARAMS.md` | Parameter re-tunings (constants, defaults, timeouts, limits) | Reviewers and operators |
 
@@ -32,33 +33,98 @@ no earlier Zakura releases to describe deltas against:
 
 After v1.0.0, normal changelog maintenance (everything below) resumes.
 
+## One fragment per Rust pull request
+
+PRs that change a Rust source file or any `Cargo.toml` do not edit the shared
+root changelog. After opening a draft PR, add exactly one
+`changelog-unreleased/<PR-number>.md` file. Keeping each PR in its own file
+avoids merge conflicts while preserving the link between the change, its
+review, and its release note. Other PRs do not need a fragment.
+
+A user-visible fragment contains one or more Keep a Changelog categories:
+
+```markdown
+## Fixed
+
+- Fixed an operator-visible problem
+  ([#123](https://github.com/zakura-core/zakura/pull/123)).
+```
+
+Internal-only Rust or `Cargo.toml` PRs still own a fragment, but use an explicit
+exclusion with a reason:
+
+```markdown
+<!-- changelog: none -->
+
+This PR only changes tests and has no operator-visible effect.
+```
+
+Dependabot and release PRs are automated exceptions to the one-file check. The
+`C-exclude-from-changelog` label remains useful release metadata, but does not
+replace the explicit fragment for Rust or `Cargo.toml` PRs.
+
+Run `./scripts/changelog.py check` locally. CI validates the syntax and checks
+that the fragment filename matches the PR number. The concise format reference
+is in
+[`changelog-unreleased/README.md`](changelog-unreleased/README.md).
+
 ## Root `CHANGELOG.md`
 
 - Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); versions
   follow [Semantic Versioning](https://semver.org).
-- Add an entry under `## [Unreleased]` in the same PR as any **user-visible**
-  change: behavior, RPCs, command-line, configuration, performance, supported
-  platforms.
-- Skip internal-only changes (refactors, CI, tests, docs). Use the
-  `C-exclude-from-changelog` label for PRs that need no entry.
+- Add a fragment entry in the same PR as any **user-visible** change: behavior,
+  RPCs, command-line, configuration, performance, or supported platforms.
+- Use the explicit no-changelog fragment for internal-only Rust or
+  `Cargo.toml` changes such as refactors and tests.
 - Categories: `### Added`, `### Changed`, `### Deprecated`, `### Removed`,
   `### Fixed`, `### Security`. Prefer `Fixed` if you're not sure.
 - Write for node operators: describe the observable effect, not the
   implementation. Start each item with a verb and link the PR, for example
   `- Fixed X so that Y ([#123](https://github.com/zakura-core/zakura/pull/123))`.
-- Label PRs accurately (`C-feature`, `C-bug`, `C-security`, …) — the labels
-  drive the Release Drafter draft that the release checklist folds into
-  `CHANGELOG.md` at release time (see
-  `.github/PULL_REQUEST_TEMPLATE/release-checklist.md`).
+- Label PRs accurately (`C-feature`, `C-bug`, `C-security`, …) so repository
+  triage agrees with the fragment category.
 - A change to a tunable parameter gets a row in `CHANGELOG_PARAMS.md` _in
   addition to_ a changelog entry when it is user-visible.
 
 ## Library crates
 
-The repository does not maintain per-crate changelogs. Release preparation
-uses `cargo semver-checks`, `cargo public-api diff`, and the code diff to choose
-version bumps for changed publishable crates. Those checks are release inputs,
-not permanent changelog entries.
+The repository does not maintain per-crate changelogs. Version bumps for
+published-API changes land **in the PR that makes the change**: the
+`Semver checks` CI job compares every publishable crate against its latest
+stable crates.io release, and a PR that changes a published API must carry
+the version bump that covers it —
+
+```sh
+cargo release version --verbose --execute --allow-branch '*' -p <crate> major # [ minor ]
+```
+
+(which also rewrites workspace-internal dependency requirements). Release
+preparation reviews the accumulated bumps — with `cargo public-api diff` and
+the code diff where useful — rather than originating them on release day.
+
+## Release assembly
+
+After the `zakura` package version is bumped on the release branch, run:
+
+```sh
+make prepare-release-changelog RELEASE_TAG=vX.Y.Z
+```
+
+The command validates and consumes all pending fragments, merges their entries
+by category, and creates the new root changelog version section. Review and
+commit the generated changelog and fragment deletions. Release candidates get
+temporary version sections. When the matching stable version is assembled,
+the tool combines those sections from oldest to newest with any later
+unreleased entries, removes the release-candidate sections, and creates one
+stable section. Then run the full release gate:
+
+```sh
+make pre-release RELEASE_TAG=vX.Y.Z BASE_TAG=v<previous>
+```
+
+The gate runs the assembler in check mode and fails if fragments remain or the
+generated changelog was not committed. Release PRs must contain no pending
+fragment files.
 
 ## Security entries
 

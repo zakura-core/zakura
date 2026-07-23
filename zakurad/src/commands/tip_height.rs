@@ -22,7 +22,7 @@ use crate::prelude::APPLICATION;
 #[derive(Command, Debug, Default, Parser)]
 pub struct TipHeightCmd {
     /// Path to Zebra's cached state.
-    #[clap(long, short, help = "path to directory with the Zebra chain state")]
+    #[clap(long, short, help = "path to directory with the Zakura chain state")]
     cache_dir: Option<PathBuf>,
 
     /// The network to obtain the chain tip.

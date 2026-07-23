@@ -6,7 +6,6 @@
 //! This file is only for test library code.
 
 use std::{
-    env,
     fmt::Debug,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -46,12 +45,6 @@ pub const EXTENDED_LAUNCH_DELAY: Duration = Duration::from_secs(45);
 /// `lightwalletd`'s actions also depend on the actions of the `zakurad` instance
 /// it is using for its RPCs.
 pub const LIGHTWALLETD_DELAY: Duration = Duration::from_secs(60);
-
-/// The amount of time we wait between launching two conflicting nodes.
-///
-/// We use a longer time to make sure the first node has launched before the second starts,
-/// even if CI is under load.
-pub const BETWEEN_NODES_DELAY: Duration = Duration::from_secs(20);
 
 /// The amount of time we wait for lightwalletd to update to the tip.
 ///
@@ -140,7 +133,7 @@ where
 
         args.merge_with(extra_args);
 
-        self.spawn_child_with_command(env!("CARGO_BIN_EXE_zakurad"), args)
+        self.spawn_child_with_command(&super::zakurad_exe_path(), args)
     }
 
     fn with_config(self, config: &mut ZakuradConfig) -> Result<Self> {

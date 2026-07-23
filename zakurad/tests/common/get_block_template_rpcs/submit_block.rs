@@ -50,7 +50,7 @@ pub(crate) async fn run() -> Result<()> {
     let should_sync = false;
     let (mut zakurad, zakura_rpc_address) =
         spawn_zakurad_for_rpc(network, test_name, test_type, should_sync)?
-            .expect("Already checked zebra state path with can_spawn_zakurad_for_test_type");
+            .expect("already checked Zakura state path with can_spawn_zakurad_for_test_type");
 
     let rpc_address = zakura_rpc_address.expect("submitblock test must have RPC port");
 

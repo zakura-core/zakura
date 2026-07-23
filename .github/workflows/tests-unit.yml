@@ -3,7 +3,7 @@ name: Unit Tests
 on:
   pull_request:
     branches: [main, "feat/**", "release/**"]
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -32,7 +32,7 @@ on:
   merge_group:
 
   schedule:
-    # Keep release-mode coverage off the critical PR path.
+    # Verify the exact production release profile, including ThinLTO, nightly.
     - cron: "0 8 * * *"
 
   workflow_dispatch:
@@ -56,45 +56,108 @@ env:
   COLORBT_SHOW_HIDDEN: 1
 
 jobs:
+  # Compile the whole workspace and every test binary ONCE, then hand the result
+  # to the shard jobs as a nextest archive. Previously each of the 3 shards ran
+  # `cargo nextest run`, so each recompiled the full workspace + all dependencies
+  # from scratch — the same ~5m compile floor paid three times in parallel, and
+  # three jobs racing to save one shared build cache (only one save ever wins).
+  # Building once removes two of the three compile passes while preserving
+  # parallel test execution across the shard jobs.
+  build-tests:
+    name: build test binaries (${{ github.event_name == 'pull_request' && 'debug' || (github.event_name == 'schedule' && 'release' || 'ci-tests') }})
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
+          toolchain: stable
+          # PR debug builds restore the cache populated by the main-branch
+          # config job. Main and nightly runs keep separate caches because main
+          # uses `ci-tests`, while nightly uses the exact release profile.
+          cache-shared-key: ${{ github.event_name == 'pull_request' && 'zakura-drb-debug' || (github.event_name == 'schedule' && 'unit-tests-release' || 'unit-tests-ci-tests') }}
+          cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
+        with:
+          tool: cargo-nextest
+      - uses: ./.github/actions/setup-zakura-build
+
+      - name: Build and archive test binaries
+        run: |
+          # The archive stores compiled binaries, so it must be built in the same
+          # mode the shards run. The run-time-only filters (`--profile`,
+          # `--partition`, `--run-ignored`) are applied by the shard jobs, not here.
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            cargo nextest archive --locked --release --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+          elif [[ "${FULL_COVERAGE}" == "true" ]]; then
+            cargo nextest archive --locked --cargo-profile ci-tests --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+          else
+            cargo nextest archive --locked --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+          fi
+        env:
+          FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}
+
+      - name: Upload nextest archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive.tar.zst
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0 # already zstd-compressed
+
   unit-tests:
     name: ${{ matrix.rust-version }} on ${{ matrix.os }} (shard ${{ matrix.partition }}/3)
+    needs: build-tests
     permissions:
       contents: read
       id-token: write
       statuses: write
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
         rust-version: [stable]
-        features: [default-release-binaries]
-        # Shard the broad suite across 3 runners. Each shard recompiles (the fixed
-        # ~2.5m compile floor every runner pays) but runs only its 1/3 slice of the
-        # tests via nextest `--partition`, so the run phase parallelizes ~3x.
+        # Run only this shard's 1/3 slice of the tests from the prebuilt archive
+        # via nextest `--partition`. No compilation happens here.
         partition: [1, 2, 3]
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
           toolchain: ${{ matrix.rust-version }}
-          cache-key: unit-tests-${{ matrix.os }}-${{ matrix.rust-version }}-${{ matrix.features }}-${{ github.event_name == 'pull_request' && 'debug' || 'release' }}
-          cache-on-failure: true
-      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 #v2.83.2
+          # Nothing is compiled in this job, so there is no build cache to keep.
+          cache: false
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
         with:
           tool: cargo-nextest
+      # RocksDB is dynamically linked, so the prebuilt test binaries still need
+      # librocksdb present at run time (protoc is only needed to build).
       - uses: ./.github/actions/setup-zakura-build
+      - name: Download nextest archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}
 
       - name: Run unit tests
         run: |
           if [[ "${FULL_COVERAGE}" == "true" ]]; then
-            cargo nextest run --profile full-tests --locked --release --features "${{ matrix.features }}" --run-ignored=all --partition "hash:${{ matrix.partition }}/3"
+            cargo nextest run --profile full-tests --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst" --run-ignored=all --partition "hash:${{ matrix.partition }}/3"
           else
-            cargo nextest run --profile all-tests --locked --features "${{ matrix.features }}" --partition "hash:${{ matrix.partition }}/3"
+            cargo nextest run --profile all-tests --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst" --partition "hash:${{ matrix.partition }}/3"
           fi
         env:
           FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}
@@ -108,15 +171,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
           toolchain: stable
-          cache-key: zakura-config
+          # These acceptance jobs all do the same debug build of the workspace
+          # with the same features, so they share one build cache instead of each
+          # keeping its own multi-GB copy. `cache-shared-key` (unlike `cache-key`,
+          # which only appends to a per-job key and never shares) is stable across
+          # jobs, consolidating their cache entries across workflow runs.
+          cache-shared-key: zakura-drb-debug
           cache-on-failure: true
-      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 #v2.83.2
+          # This is the only writer for the shared debug cache.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -132,15 +202,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
           toolchain: stable
-          cache-key: network-dependent
+          cache-shared-key: zakura-drb-debug
           cache-on-failure: true
-      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 #v2.83.2
+          cache-save-if: false
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -157,15 +228,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
           toolchain: stable
-          cache-key: pruned-storage
+          cache-shared-key: zakura-drb-debug
           cache-on-failure: true
-      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 #v2.83.2
+          cache-save-if: false
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -182,14 +254,15 @@ jobs:
     timeout-minutes: 30
     if: contains(github.event.pull_request.labels.*.name, 'A-release')
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
           toolchain: stable
           cache-on-failure: true
-      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 #v2.83.2
+          cache-save-if: false
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -205,6 +278,7 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     needs:
+      - build-tests
       - unit-tests
       - zakura-config
       - network-dependent
@@ -219,3 +293,35 @@ jobs:
           # The release-only dependency check is skipped outside its event scope.
           # Failed, non-skipped jobs still fail this aggregate status.
           allowed-skips: check-no-git-dependencies, pruned-storage
+
+  report-nightly-result:
+    name: report nightly release test result
+    needs: test-success
+    if: always() && github.event_name == 'schedule'
+    permissions:
+      contents: read
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create, update, or close the nightly failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NIGHTLY_RESULT: ${{ needs.test-success.result }}
+        run: |
+          issue_title="[nightly] Release-mode test suite failed"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          issue_number="$(gh issue list --state open --search "\"${issue_title}\" in:title" --json number --jq '.[0].number // empty')"
+
+          if [[ "${NIGHTLY_RESULT}" != "success" ]]; then
+            message="The nightly release-mode test suite failed: ${run_url}"
+            if [[ -n "${issue_number}" ]]; then
+              gh issue comment "${issue_number}" --body "${message}"
+            else
+              gh issue create --title "${issue_title}" --body "${message}"
+            fi
+          elif [[ -n "${issue_number}" ]]; then
+            gh issue comment "${issue_number}" --body "The nightly release-mode test suite recovered: ${run_url}"
+            gh issue close "${issue_number}" --reason completed
+          fi

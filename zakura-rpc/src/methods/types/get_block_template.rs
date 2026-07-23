@@ -770,14 +770,14 @@ where
         tracing::info!(
             ?estimated_distance_to_chain_tip,
             ?local_tip_height,
-            "Zebra has not synced to the chain tip. \
+            "Zakura has not synced to the chain tip. \
              Hint: check your network connection, clock, and time zone settings."
         );
 
         return Err(ErrorObject::owned(
             NOT_SYNCED_ERROR_CODE.code(),
             format!(
-                "Zebra has not synced to the chain tip, \
+                "Zakura has not synced to the chain tip, \
                  estimated distance: {estimated_distance_to_chain_tip:?}, \
                  local tip: {local_tip_height:?}. \
                  Hint: check your network connection, clock, and time zone settings."

@@ -219,14 +219,14 @@ pub fn are_zakurad_and_lightwalletd_tips_synced(
                 lightwalletd_tip_height,
                 zakurad_tip_height,
                 zakura_rpc_address = ?zakura_rpc_address,
-                "lightwalletd tip is behind Zebra tip, waiting for sync",
+                "lightwalletd tip is behind Zakura tip, waiting for sync",
             );
         } else {
             tracing::debug!(
                 lightwalletd_tip_height,
                 zakurad_tip_height,
                 zakura_rpc_address = ?zakura_rpc_address,
-                "lightwalletd tip matches Zebra tip",
+                "lightwalletd tip matches Zakura tip",
             );
         }
 

@@ -1,11 +1,8 @@
 # Private Zakura dev networks (cohorts)
 
-Developer notes for the `[network.zakura] dev_network` cohort tag. For the
-operator-facing setup guide, see
-[`book/src/dev/private-zakura-network.md`](../../../book/src/dev/private-zakura-network.md).
+Developer notes for the `[network.zakura] dev_network` cohort tag.
 
-The native Zakura P2P v2 stack is
-[experimental](../../../book/src/user/p2p.md).
+The native Zakura P2P v2 stack is experimental.
 
 ## What it does
 

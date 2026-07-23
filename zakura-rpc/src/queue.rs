@@ -173,7 +173,7 @@ impl Runner {
                     }
                     Err(TryRecvError::Closed) => {
                         tracing::info!(
-                            "sendrawtransaction queue was closed: is Zebra shutting down?"
+                            "sendrawtransaction queue was closed: is Zakura shutting down?"
                         );
                         return;
                     }

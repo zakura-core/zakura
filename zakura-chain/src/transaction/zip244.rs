@@ -94,9 +94,71 @@ const ZCASH_ORCHARD_SIGS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthOrchaHash";
 const ZCASH_ORCHARD_V6_SIGS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthOrchaH_v6";
 const ZCASH_IRONWOOD_SIGS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthIrnwdH_v6";
 
+const EMPTY_TRANSPARENT_TXID_HASH: &[u8; 32] = &[
+    0xc3, 0x3f, 0x2e, 0x95, 0x70, 0x5f, 0xaa, 0xb3, 0x5f, 0x8d, 0x53, 0x3f, 0xa6, 0x1e, 0x95, 0xc3,
+    0xb7, 0xaa, 0xba, 0x07, 0x76, 0xb8, 0x74, 0xa9, 0xf7, 0x4f, 0xc1, 0x27, 0x84, 0x37, 0x6a, 0x59,
+];
+const EMPTY_SAPLING_TXID_HASH: &[u8; 32] = &[
+    0x6f, 0x2f, 0xc8, 0xf9, 0x8f, 0xea, 0xfd, 0x94, 0xe7, 0x4a, 0x0d, 0xf4, 0xbe, 0xd7, 0x43, 0x91,
+    0xee, 0x0b, 0x5a, 0x69, 0x94, 0x5e, 0x4c, 0xed, 0x8c, 0xa8, 0xa0, 0x95, 0x20, 0x6f, 0x00, 0xae,
+];
+const EMPTY_SAPLING_SPENDS_HASH: &[u8; 32] = &[
+    0xd7, 0x9c, 0x8d, 0xcb, 0x8a, 0xf4, 0x6b, 0xd8, 0x0f, 0xe3, 0xbc, 0xdc, 0x0e, 0x5d, 0x0e, 0xd7,
+    0x34, 0x4d, 0x5f, 0x48, 0xcb, 0xef, 0xf3, 0xc9, 0x4b, 0x13, 0xd4, 0x0a, 0x23, 0x05, 0xf8, 0x4d,
+];
+const EMPTY_SAPLING_OUTPUTS_HASH: &[u8; 32] = &[
+    0x9e, 0x28, 0xee, 0xf8, 0xdf, 0x6f, 0xcc, 0x96, 0x68, 0xef, 0x92, 0xfc, 0xdc, 0x41, 0x2f, 0xc5,
+    0xb6, 0xd7, 0x03, 0x7e, 0xf1, 0xf9, 0x63, 0x76, 0x7b, 0xd7, 0xb8, 0x01, 0x12, 0x67, 0xbf, 0x95,
+];
+const EMPTY_ORCHARD_V5_TXID_HASH: &[u8; 32] = &[
+    0x9f, 0xbe, 0x4e, 0xd1, 0x3b, 0x0c, 0x08, 0xe6, 0x71, 0xc1, 0x1a, 0x34, 0x07, 0xd8, 0x4e, 0x11,
+    0x17, 0xcd, 0x45, 0x02, 0x8a, 0x2e, 0xee, 0x1b, 0x9f, 0xea, 0xe7, 0x8b, 0x48, 0xa6, 0xe2, 0xc1,
+];
+const EMPTY_ORCHARD_V6_TXID_HASH: &[u8; 32] = &[
+    0xa3, 0x36, 0x7d, 0x2f, 0xde, 0xa2, 0x91, 0x01, 0x59, 0xfc, 0x50, 0x26, 0xe9, 0xbf, 0x1f, 0xcc,
+    0xd3, 0xe2, 0x8c, 0xe5, 0xe6, 0xde, 0x46, 0xbf, 0xb7, 0x15, 0x87, 0x23, 0x0e, 0xea, 0x95, 0x15,
+];
+const EMPTY_IRONWOOD_TXID_HASH: &[u8; 32] = &[
+    0xb9, 0xcf, 0xe6, 0x43, 0xce, 0x45, 0xb2, 0x8c, 0x33, 0x19, 0x0f, 0x0d, 0x52, 0x23, 0xe4, 0x75,
+    0x97, 0x2f, 0x2a, 0x14, 0x9d, 0xc5, 0x44, 0x04, 0xfd, 0x83, 0x65, 0x52, 0x1f, 0x84, 0x16, 0xc5,
+];
+const EMPTY_TRANSPARENT_AUTH_HASH: &[u8; 32] = &[
+    0xe9, 0x88, 0x2b, 0xce, 0x1c, 0xf1, 0x35, 0x69, 0x02, 0xc6, 0xe2, 0x58, 0xc5, 0x67, 0xeb, 0xc0,
+    0xd9, 0x92, 0x88, 0x67, 0xde, 0x9a, 0x35, 0x89, 0xbb, 0xbd, 0x31, 0x0e, 0xb6, 0x89, 0x04, 0xe5,
+];
+const EMPTY_SAPLING_V5_AUTH_HASH: &[u8; 32] = &[
+    0xd2, 0x25, 0x67, 0x30, 0x66, 0xb0, 0xcd, 0x76, 0xa7, 0x71, 0x51, 0xbf, 0x05, 0x6d, 0x57, 0x77,
+    0x92, 0xf3, 0x57, 0x73, 0x91, 0x20, 0x8d, 0x4c, 0xec, 0x25, 0x31, 0x8a, 0x8d, 0x5c, 0xd9, 0x6f,
+];
+const EMPTY_SAPLING_V6_AUTH_HASH: &[u8; 32] = &[
+    0x0e, 0xe4, 0xb9, 0x56, 0x0b, 0xae, 0x42, 0x30, 0xa9, 0x9b, 0xfa, 0x52, 0x8e, 0x0a, 0x6a, 0xab,
+    0xc7, 0xe2, 0x53, 0x86, 0xf3, 0x66, 0x59, 0x97, 0x67, 0xe7, 0xca, 0x10, 0x7b, 0x8c, 0x17, 0x46,
+];
+const EMPTY_ORCHARD_V5_AUTH_HASH: &[u8; 32] = &[
+    0x14, 0xed, 0xaa, 0x1e, 0x66, 0x9a, 0x63, 0xa8, 0x00, 0xbf, 0xe0, 0xb8, 0xfc, 0xd3, 0xd1, 0x0e,
+    0x36, 0x81, 0x11, 0x5b, 0xee, 0x03, 0x25, 0x3d, 0xa0, 0x2e, 0x09, 0x80, 0x42, 0xd9, 0xff, 0x90,
+];
+const EMPTY_ORCHARD_V6_AUTH_HASH: &[u8; 32] = &[
+    0x79, 0x8e, 0x7f, 0xcd, 0x05, 0xbb, 0x7b, 0x7e, 0x9e, 0x49, 0x42, 0x4b, 0xdd, 0xe7, 0x68, 0xa5,
+    0x00, 0xb6, 0x6f, 0xf2, 0x3d, 0x75, 0x9b, 0x87, 0x7d, 0x07, 0x54, 0xe3, 0xff, 0x79, 0x7d, 0x91,
+];
+const EMPTY_IRONWOOD_AUTH_HASH: &[u8; 32] = &[
+    0xec, 0x97, 0x68, 0xfd, 0xaa, 0x11, 0xf1, 0x2c, 0xdb, 0x13, 0xf5, 0x66, 0xb5, 0x95, 0x84, 0x3f,
+    0x3d, 0x0e, 0x92, 0xb6, 0x70, 0x3e, 0xaf, 0xff, 0x17, 0x2e, 0x21, 0x34, 0x5b, 0x58, 0x61, 0x33,
+];
+
 /// A new BLAKE2b-256 state with the given 16-byte personalization.
 fn hasher(personal: &[u8; 16]) -> State {
     Params::new().hash_length(32).personal(personal).to_state()
+}
+
+/// Finalizes a ZIP-244 node digest as its fixed-width byte representation.
+fn finalize_node_hash(state: State) -> [u8; 32] {
+    state
+        .finalize()
+        .as_bytes()
+        .try_into()
+        .expect("ZIP-244 node hashers have 32-byte outputs")
 }
 
 /// `io::Write` adapter that feeds bytes into a BLAKE2b [`State`], so Zebra's
@@ -162,6 +224,13 @@ impl Zip244Version {
         match self {
             Self::V5 => ZCASH_SAPLING_SIGS_HASH_PERSONALIZATION,
             Self::V6 => ZCASH_SAPLING_V6_SIGS_HASH_PERSONALIZATION,
+        }
+    }
+
+    fn empty_sapling_auth_hash(self) -> &'static [u8; 32] {
+        match self {
+            Self::V5 => EMPTY_SAPLING_V5_AUTH_HASH,
+            Self::V6 => EMPTY_SAPLING_V6_AUTH_HASH,
         }
     }
 
@@ -247,6 +316,22 @@ impl BundleCommitmentFormat {
         match self {
             Self::OrchardV5 => false,
             Self::OrchardV6 | Self::IronwoodV6 => true,
+        }
+    }
+
+    fn empty_txid_hash(self) -> &'static [u8; 32] {
+        match self {
+            Self::OrchardV5 => EMPTY_ORCHARD_V5_TXID_HASH,
+            Self::OrchardV6 => EMPTY_ORCHARD_V6_TXID_HASH,
+            Self::IronwoodV6 => EMPTY_IRONWOOD_TXID_HASH,
+        }
+    }
+
+    fn empty_auth_hash(self) -> &'static [u8; 32] {
+        match self {
+            Self::OrchardV5 => EMPTY_ORCHARD_V5_AUTH_HASH,
+            Self::OrchardV6 => EMPTY_ORCHARD_V6_AUTH_HASH,
+            Self::IronwoodV6 => EMPTY_IRONWOOD_AUTH_HASH,
         }
     }
 }
@@ -402,14 +487,16 @@ fn hash_transparent_txid_from_digests(
     prevouts: &Blake2bHash,
     sequence: &Blake2bHash,
     outputs: &Blake2bHash,
-) -> Blake2bHash {
-    let mut h = hasher(ZCASH_TRANSPARENT_HASH_PERSONALIZATION);
-    if bundle_present {
-        h.update(prevouts.as_bytes());
-        h.update(sequence.as_bytes());
-        h.update(outputs.as_bytes());
+) -> [u8; 32] {
+    if !bundle_present {
+        return *EMPTY_TRANSPARENT_TXID_HASH;
     }
-    h.finalize()
+
+    let mut h = hasher(ZCASH_TRANSPARENT_HASH_PERSONALIZATION);
+    h.update(prevouts.as_bytes());
+    h.update(sequence.as_bytes());
+    h.update(outputs.as_bytes());
+    finalize_node_hash(h)
 }
 
 /// ZIP-244 §T.2 transparent digest.
@@ -419,9 +506,13 @@ fn hash_transparent_txid_from_digests(
 fn hash_transparent_txid(
     inputs: &[transparent::Input],
     outputs: &[transparent::Output],
-) -> Blake2bHash {
+) -> [u8; 32] {
+    if inputs.is_empty() && outputs.is_empty() {
+        return *EMPTY_TRANSPARENT_TXID_HASH;
+    }
+
     hash_transparent_txid_from_digests(
-        !inputs.is_empty() || !outputs.is_empty(),
+        true,
         &hash_prevouts(inputs),
         &hash_sequence(inputs),
         &hash_outputs(outputs),
@@ -497,18 +588,26 @@ fn hash_sapling_outputs(sapling: &sapling::ShieldedData<sapling::SharedAnchor>) 
 fn hash_sapling_txid(
     sapling: Option<&sapling::ShieldedData<sapling::SharedAnchor>>,
     version: Zip244Version,
-) -> Blake2bHash {
+) -> [u8; 32] {
+    let Some(sapling) = sapling else {
+        return *EMPTY_SAPLING_TXID_HASH;
+    };
+
     let mut h = hasher(ZCASH_SAPLING_HASH_PERSONALIZATION);
-    if let Some(sapling) = sapling {
-        // `ShieldedData` only exists with at least one spend or output, so this
-        // matches librustzcash's "non-empty bundle" branch.
-        if sapling.spends().next().is_some() || sapling.outputs().next().is_some() {
-            h.update(hash_sapling_spends(sapling, version).as_bytes());
-            h.update(hash_sapling_outputs(sapling).as_bytes());
-            h.update(&sapling.value_balance.zatoshis().to_le_bytes());
-        }
+    // `ShieldedData` only exists with at least one spend or output, so this
+    // matches librustzcash's "non-empty bundle" branch.
+    if sapling.spends().next().is_some() {
+        h.update(hash_sapling_spends(sapling, version).as_bytes());
+    } else {
+        h.update(EMPTY_SAPLING_SPENDS_HASH);
     }
-    h.finalize()
+    if sapling.outputs().next().is_some() {
+        h.update(hash_sapling_outputs(sapling).as_bytes());
+    } else {
+        h.update(EMPTY_SAPLING_OUTPUTS_HASH);
+    }
+    h.update(&sapling.value_balance.zatoshis().to_le_bytes());
+    finalize_node_hash(h)
 }
 
 /// ZIP-244 §T.4 Orchard-style bundle digest.
@@ -517,36 +616,38 @@ fn hash_sapling_txid(
 fn hash_bundle_txid(
     bundle: Option<&orchard::ShieldedData>,
     format: BundleCommitmentFormat,
-) -> Blake2bHash {
+) -> [u8; 32] {
+    let Some(bundle) = bundle else {
+        return *format.empty_txid_hash();
+    };
+
     let personalizations = format.personalizations();
     let mut h = hasher(personalizations.bundle);
-    if let Some(bundle) = bundle {
-        let mut ch = hasher(personalizations.actions_compact);
-        let mut mh = hasher(personalizations.actions_memos);
-        let mut nh = hasher(personalizations.actions_noncompact);
-        for action in bundle.actions() {
-            ch.update(&<[u8; 32]>::from(action.nullifier));
-            ch.update(&<[u8; 32]>::from(action.cm_x));
-            update_serialized(&mut ch, &action.ephemeral_key);
-            ch.update(&action.enc_ciphertext.0[..52]);
+    let mut ch = hasher(personalizations.actions_compact);
+    let mut mh = hasher(personalizations.actions_memos);
+    let mut nh = hasher(personalizations.actions_noncompact);
+    for action in bundle.actions() {
+        ch.update(&<[u8; 32]>::from(action.nullifier));
+        ch.update(&<[u8; 32]>::from(action.cm_x));
+        update_serialized(&mut ch, &action.ephemeral_key);
+        ch.update(&action.enc_ciphertext.0[..52]);
 
-            mh.update(&action.enc_ciphertext.0[52..564]);
+        mh.update(&action.enc_ciphertext.0[52..564]);
 
-            update_serialized(&mut nh, &action.cv);
-            nh.update(&<[u8; 32]>::from(action.rk));
-            nh.update(&action.enc_ciphertext.0[564..]);
-            nh.update(&action.out_ciphertext.0[..]);
-        }
-        h.update(ch.finalize().as_bytes());
-        h.update(mh.finalize().as_bytes());
-        h.update(nh.finalize().as_bytes());
-        h.update(&[bundle.flags.bits()]);
-        h.update(&bundle.value_balance.zatoshis().to_le_bytes());
-        if format.includes_anchor_in_txid_digest() {
-            h.update(&<[u8; 32]>::from(bundle.shared_anchor));
-        }
+        update_serialized(&mut nh, &action.cv);
+        nh.update(&<[u8; 32]>::from(action.rk));
+        nh.update(&action.enc_ciphertext.0[564..]);
+        nh.update(&action.out_ciphertext.0[..]);
     }
-    h.finalize()
+    h.update(ch.finalize().as_bytes());
+    h.update(mh.finalize().as_bytes());
+    h.update(nh.finalize().as_bytes());
+    h.update(&[bundle.flags.bits()]);
+    h.update(&bundle.value_balance.zatoshis().to_le_bytes());
+    if format.includes_anchor_in_txid_digest() {
+        h.update(&<[u8; 32]>::from(bundle.shared_anchor));
+    }
+    finalize_node_hash(h)
 }
 
 /// Combine the level-1 digests into the txid (ZIP-244 txid digest).
@@ -556,28 +657,31 @@ fn hash_bundle_txid(
 fn combine_txid_digests(
     consensus_branch_id: u32,
     header: &Blake2bHash,
-    transparent: &Blake2bHash,
-    sapling: &Blake2bHash,
-    orchard: &Blake2bHash,
-    ironwood: Option<&Blake2bHash>,
+    transparent: &[u8; 32],
+    sapling: &[u8; 32],
+    orchard: &[u8; 32],
+    ironwood: Option<&[u8; 32]>,
 ) -> Blake2bHash {
     let mut personal = [0u8; 16];
     personal[..12].copy_from_slice(ZCASH_TX_PERSONALIZATION_PREFIX);
     personal[12..].copy_from_slice(&consensus_branch_id.to_le_bytes());
 
+    // Commit the level-1 nodes in their ZIP-244 order.
     let mut h = hasher(&personal);
     h.update(header.as_bytes());
-    h.update(transparent.as_bytes());
-    h.update(sapling.as_bytes());
-    h.update(orchard.as_bytes());
+    h.update(transparent);
+    h.update(sapling);
+    h.update(orchard);
     if let Some(ironwood) = ironwood {
-        h.update(ironwood.as_bytes());
+        h.update(ironwood);
     }
 
     h.finalize()
 }
 
 fn txid_inner(parts: &Zip244Parts) -> Hash {
+    // Compute the level-1 nodes, substituting personalized empty hashes
+    // for absent bundles.
     let header = hash_header(parts);
     let transparent = hash_transparent_txid(parts.inputs, parts.outputs);
     let sapling = hash_sapling_txid(parts.sapling, parts.version);
@@ -611,25 +715,26 @@ fn txid_inner(parts: &Zip244Parts) -> Hash {
 fn hash_transparent_auth(
     inputs: &[transparent::Input],
     outputs: &[transparent::Output],
-) -> Blake2bHash {
+) -> [u8; 32] {
+    if inputs.is_empty() && outputs.is_empty() {
+        return *EMPTY_TRANSPARENT_AUTH_HASH;
+    }
+
     let mut h = hasher(ZCASH_TRANSPARENT_SCRIPTS_HASH_PERSONALIZATION);
-    // Present only when the transparent bundle is present (any input or output).
-    if !inputs.is_empty() || !outputs.is_empty() {
-        for input in inputs {
-            match input {
-                transparent::Input::PrevOut { unlock_script, .. } => {
-                    update_serialized(&mut h, unlock_script)
-                }
-                transparent::Input::Coinbase { .. } => {
-                    let script = input
-                        .coinbase_script()
-                        .expect("v5 coinbase input has a valid script sig");
-                    update_serialized(&mut h, &script);
-                }
+    for input in inputs {
+        match input {
+            transparent::Input::PrevOut { unlock_script, .. } => {
+                update_serialized(&mut h, unlock_script)
+            }
+            transparent::Input::Coinbase { .. } => {
+                let script = input
+                    .coinbase_script()
+                    .expect("v5 coinbase input has a valid script sig");
+                update_serialized(&mut h, &script);
             }
         }
     }
-    h.finalize()
+    finalize_node_hash(h)
 }
 
 /// ZIP-244 sapling auth digest.
@@ -639,29 +744,31 @@ fn hash_transparent_auth(
 fn hash_sapling_auth(
     sapling: Option<&sapling::ShieldedData<sapling::SharedAnchor>>,
     version: Zip244Version,
-) -> Blake2bHash {
+) -> [u8; 32] {
+    let Some(sapling) = sapling else {
+        return *version.empty_sapling_auth_hash();
+    };
+
     let mut h = hasher(version.sapling_auth_personalization());
-    if let Some(sapling) = sapling {
-        for spend in sapling.spends() {
-            h.update(&spend.zkproof.0[..]);
-        }
-        for spend in sapling.spends() {
-            h.update(&<[u8; 64]>::from(spend.spend_auth_sig)[..]);
-        }
-        for output in sapling.outputs() {
-            h.update(&output.zkproof.0[..]);
-        }
-        h.update(&<[u8; 64]>::from(sapling.binding_sig)[..]);
-        if version.sapling_auth_includes_anchor() && sapling.spends().next().is_some() {
-            let anchor = <[u8; 32]>::from(
-                sapling
-                    .shared_anchor()
-                    .expect("sapling spends share an anchor when present"),
-            );
-            h.update(&anchor);
-        }
+    for spend in sapling.spends() {
+        h.update(&spend.zkproof.0[..]);
     }
-    h.finalize()
+    for spend in sapling.spends() {
+        h.update(&<[u8; 64]>::from(spend.spend_auth_sig)[..]);
+    }
+    for output in sapling.outputs() {
+        h.update(&output.zkproof.0[..]);
+    }
+    h.update(&<[u8; 64]>::from(sapling.binding_sig)[..]);
+    if version.sapling_auth_includes_anchor() && sapling.spends().next().is_some() {
+        let anchor = <[u8; 32]>::from(
+            sapling
+                .shared_anchor()
+                .expect("sapling spends share an anchor when present"),
+        );
+        h.update(&anchor);
+    }
+    finalize_node_hash(h)
 }
 
 /// ZIP-244 Orchard-style auth digest.
@@ -670,19 +777,21 @@ fn hash_sapling_auth(
 fn hash_bundle_auth(
     bundle: Option<&orchard::ShieldedData>,
     format: BundleCommitmentFormat,
-) -> Blake2bHash {
+) -> [u8; 32] {
+    let Some(bundle) = bundle else {
+        return *format.empty_auth_hash();
+    };
+
     let mut h = hasher(format.personalizations().auth);
-    if let Some(bundle) = bundle {
-        h.update(&bundle.proof.0[..]);
-        for action in bundle.actions.iter() {
-            update_serialized(&mut h, &action.spend_auth_sig);
-        }
-        update_serialized(&mut h, &bundle.binding_sig);
-        if format.includes_anchor_in_authorizing_digest() {
-            h.update(&<[u8; 32]>::from(bundle.shared_anchor));
-        }
+    h.update(&bundle.proof.0[..]);
+    for action in bundle.actions.iter() {
+        update_serialized(&mut h, &action.spend_auth_sig);
     }
-    h.finalize()
+    update_serialized(&mut h, &bundle.binding_sig);
+    if format.includes_anchor_in_authorizing_digest() {
+        h.update(&<[u8; 32]>::from(bundle.shared_anchor));
+    }
+    finalize_node_hash(h)
 }
 
 /// Combine the authorizing-data digests into the ZIP-244 auth commitment.
@@ -690,6 +799,8 @@ fn hash_bundle_auth(
 /// Reference implementation:
 /// <https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L426-L448>
 fn auth_digest_inner(parts: &Zip244Parts) -> AuthDigest {
+    // Compute the level-1 nodes, substituting personalized empty hashes
+    // for absent bundles.
     let transparent = hash_transparent_auth(parts.inputs, parts.outputs);
     let sapling = hash_sapling_auth(parts.sapling, parts.version);
     let orchard = hash_bundle_auth(parts.orchard, parts.version.orchard_format());
@@ -702,12 +813,13 @@ fn auth_digest_inner(parts: &Zip244Parts) -> AuthDigest {
     personal[..12].copy_from_slice(ZCASH_AUTH_PERSONALIZATION_PREFIX);
     personal[12..].copy_from_slice(&consensus_branch_id(parts).to_le_bytes());
 
+    // Commit the level-1 nodes in their ZIP-244 order.
     let mut h = hasher(&personal);
-    h.update(transparent.as_bytes());
-    h.update(sapling.as_bytes());
-    h.update(orchard.as_bytes());
+    h.update(&transparent);
+    h.update(&sapling);
+    h.update(&orchard);
     if let Some(ironwood) = ironwood {
-        h.update(ironwood.as_bytes());
+        h.update(&ironwood);
     }
 
     AuthDigest(
@@ -725,19 +837,20 @@ fn auth_digest_inner(parts: &Zip244Parts) -> AuthDigest {
 pub(super) struct Zip244SighashCache {
     consensus_branch_id: u32,
     header: Blake2bHash,
-    transparent_txid: Blake2bHash,
+    transparent_txid: [u8; 32],
     prevouts: Blake2bHash,
     amounts: Blake2bHash,
     scriptpubkeys: Blake2bHash,
     sequence: Blake2bHash,
     outputs: Blake2bHash,
+    transparent_output_count: usize,
     single_outputs: Vec<Blake2bHash>,
     txins: Vec<Option<Blake2bHash>>,
     transparent_bundle_present: bool,
     transparent_is_coinbase_or_has_no_inputs: bool,
-    sapling: Blake2bHash,
-    orchard: Blake2bHash,
-    ironwood: Option<Blake2bHash>,
+    sapling: [u8; 32],
+    orchard: [u8; 32],
+    ironwood: Option<[u8; 32]>,
 }
 
 impl Zip244SighashCache {
@@ -766,6 +879,7 @@ impl Zip244SighashCache {
             scriptpubkeys: hash_scriptpubkeys(previous_outputs),
             sequence,
             outputs,
+            transparent_output_count: parts.outputs.len(),
             single_outputs: parts
                 .outputs
                 .iter()
@@ -819,11 +933,16 @@ impl Zip244SighashCache {
         )
     }
 
+    /// Returns whether `input_index` has a corresponding transparent output.
+    pub(super) fn has_corresponding_output(&self, input_index: usize) -> bool {
+        input_index < self.transparent_output_count
+    }
+
     fn transparent_sig_digest(
         &self,
         hash_type: CanonicalHashType,
         input_index: Option<usize>,
-    ) -> Blake2bHash {
+    ) -> [u8; 32] {
         if !self.transparent_bundle_present || self.transparent_is_coinbase_or_has_no_inputs {
             return self.transparent_txid;
         }
@@ -860,7 +979,7 @@ impl Zip244SighashCache {
                 .single_outputs
                 .get(index)
                 .copied()
-                .unwrap_or_else(|| hash_outputs(&[])),
+                .expect("SIGHASH_SINGLE input has a corresponding transparent output"),
             Some(_) if none => hash_outputs(&[]),
             _ => self.outputs,
         };
@@ -883,7 +1002,7 @@ impl Zip244SighashCache {
         h.update(sequence.as_bytes());
         h.update(outputs.as_bytes());
         h.update(txin.as_bytes());
-        h.finalize()
+        finalize_node_hash(h)
     }
 }
 
@@ -906,4 +1025,72 @@ pub(crate) fn auth_digest(tx: &Transaction) -> Option<AuthDigest> {
 pub(crate) fn txid_and_auth_digest(tx: &Transaction) -> Option<(Hash, AuthDigest)> {
     let parts = zip244_parts(tx)?;
     Some((txid_inner(&parts), auth_digest_inner(&parts)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_hash_constants_match_personalizations() {
+        let empty_hashes = [
+            (
+                ZCASH_TRANSPARENT_HASH_PERSONALIZATION,
+                EMPTY_TRANSPARENT_TXID_HASH,
+            ),
+            (ZCASH_SAPLING_HASH_PERSONALIZATION, EMPTY_SAPLING_TXID_HASH),
+            (
+                ZCASH_SAPLING_SPENDS_HASH_PERSONALIZATION,
+                EMPTY_SAPLING_SPENDS_HASH,
+            ),
+            (
+                ZCASH_SAPLING_OUTPUTS_HASH_PERSONALIZATION,
+                EMPTY_SAPLING_OUTPUTS_HASH,
+            ),
+            (
+                ZCASH_ORCHARD_HASH_PERSONALIZATION,
+                EMPTY_ORCHARD_V5_TXID_HASH,
+            ),
+            (
+                ZCASH_ORCHARD_V6_HASH_PERSONALIZATION,
+                EMPTY_ORCHARD_V6_TXID_HASH,
+            ),
+            (
+                ZCASH_IRONWOOD_HASH_PERSONALIZATION,
+                EMPTY_IRONWOOD_TXID_HASH,
+            ),
+            (
+                ZCASH_TRANSPARENT_SCRIPTS_HASH_PERSONALIZATION,
+                EMPTY_TRANSPARENT_AUTH_HASH,
+            ),
+            (
+                ZCASH_SAPLING_SIGS_HASH_PERSONALIZATION,
+                EMPTY_SAPLING_V5_AUTH_HASH,
+            ),
+            (
+                ZCASH_SAPLING_V6_SIGS_HASH_PERSONALIZATION,
+                EMPTY_SAPLING_V6_AUTH_HASH,
+            ),
+            (
+                ZCASH_ORCHARD_SIGS_HASH_PERSONALIZATION,
+                EMPTY_ORCHARD_V5_AUTH_HASH,
+            ),
+            (
+                ZCASH_ORCHARD_V6_SIGS_HASH_PERSONALIZATION,
+                EMPTY_ORCHARD_V6_AUTH_HASH,
+            ),
+            (
+                ZCASH_IRONWOOD_SIGS_HASH_PERSONALIZATION,
+                EMPTY_IRONWOOD_AUTH_HASH,
+            ),
+        ];
+
+        for (personalization, expected_hash) in empty_hashes {
+            assert_eq!(
+                hasher(personalization).finalize().as_bytes(),
+                expected_hash,
+                "empty hash must match {personalization:?}",
+            );
+        }
+    }
 }

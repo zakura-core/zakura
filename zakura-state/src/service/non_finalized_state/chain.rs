@@ -736,7 +736,7 @@ impl Chain {
         if !self.is_empty() && height < self.non_finalized_tip_height() {
             let next_height = height
                 .next()
-                .expect("Zebra should never reach the max height in normal operation.");
+                .expect("Zakura should never reach the max height in normal operation.");
 
             self.sprout_trees_by_height
                 .entry(next_height)
@@ -935,7 +935,7 @@ impl Chain {
         if !self.is_empty() && height < self.non_finalized_tip_height() {
             let next_height = height
                 .next()
-                .expect("Zebra should never reach the max height in normal operation.");
+                .expect("Zakura should never reach the max height in normal operation.");
 
             self.sapling_trees_by_height
                 .entry(next_height)
@@ -1246,7 +1246,7 @@ impl Chain {
         if !self.is_empty() && height < self.non_finalized_tip_height() {
             let next_height = height
                 .next()
-                .expect("Zebra should never reach the max height in normal operation.");
+                .expect("Zakura should never reach the max height in normal operation.");
 
             self.orchard_trees_by_height
                 .entry(next_height)
@@ -1305,7 +1305,7 @@ impl Chain {
         if !self.is_empty() && height < self.non_finalized_tip_height() {
             let next_height = height
                 .next()
-                .expect("Zebra should never reach the max height in normal operation.");
+                .expect("Zakura should never reach the max height in normal operation.");
 
             self.ironwood_trees_by_height
                 .entry(next_height)

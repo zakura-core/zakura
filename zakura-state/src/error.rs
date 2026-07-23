@@ -151,7 +151,7 @@ pub enum CommitBlockError {
     HeaderCommitError(#[from] Box<CommitHeaderRangeError>),
 
     /// The write task exited (likely during shutdown).
-    #[error("block commit task exited. Is Zebra shutting down?")]
+    #[error("block commit task exited. Is Zakura shutting down?")]
     #[non_exhaustive]
     WriteTaskExited,
 }
@@ -436,6 +436,12 @@ pub enum CommitHeaderRangeError {
         /// The conflicting height.
         height: block::Height,
     },
+
+    /// Local checkpoint-frontier reconstruction failed while preparing the range.
+    #[error("could not update the highest completed checkpoint: {0}")]
+    HighestCompletedCheckpoint(
+        #[from] crate::service::finalized_state::HighestCompletedCheckpointError,
+    ),
 
     /// A provisional reorg tried to overwrite too far behind the best header tip.
     #[error(

@@ -26,7 +26,7 @@ use crate::{application::build_version, components::tracing::Config};
 use super::flame;
 
 // Art generated with these two images.
-// Zakura logo: book/theme/favicon.png
+// Zakura logo: project branding
 // License: MIT or Apache 2.0
 //
 // Heart image: https://commons.wikimedia.org/wiki/File:Love_Heart_SVG.svg

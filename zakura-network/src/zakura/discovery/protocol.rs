@@ -21,9 +21,9 @@ use zakura_chain::{
 };
 
 use crate::zakura::{
-    BlockSyncStatus, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerLimits,
-    ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId, MAX_BS_BLOCKS_PER_REQUEST,
-    MAX_BS_RESPONSE_BYTES,
+    canonical_ip, BlockSyncStatus, ServiceAdmissionDecision, ServicePeerDirection,
+    ServicePeerLimits, ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId,
+    MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES,
 };
 
 /// Native discovery stream kind.
@@ -912,9 +912,9 @@ pub struct ZakuraDiscoveryPersistedEntry {
 
 /// A locally dialable discovery candidate.
 ///
-/// Candidates may come from first-party confirmed signed discovery records or from trusted static
-/// bootstrap configuration. Only signed records are eligible for peer samples; unsigned static
-/// candidates are local dial hints.
+/// Candidates may come from signed discovery records or from trusted static bootstrap
+/// configuration. Only signed records are eligible for peer samples; unsigned static candidates
+/// are local dial hints.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZakuraDiscoveryDialCandidate {
     /// Candidate iroh node id.
@@ -1224,6 +1224,7 @@ struct ZakuraDiscoveryInner {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct ZakuraDiscoveryAdmittedPeer {
     conn_id: ZakuraConnId,
+    session_id: u64,
     direction: ServicePeerDirection,
 }
 
@@ -1523,6 +1524,42 @@ impl ZakuraDiscoveryHandle {
         self.self_record.borrow().clone()
     }
 
+    /// Returns a locally authored record that remains valid through the next refresh interval.
+    ///
+    /// A node can keep its native connections longer than the record TTL. Refreshing lazily before
+    /// a discovery exchange prevents a long-running node from sending an expired `Hello` to a new
+    /// peer after its startup record has aged out.
+    pub(crate) async fn current_self_record_for_gossip(
+        &self,
+    ) -> Result<Arc<ZakuraNodeRecord>, DiscoveryWireError> {
+        self.current_self_record_for_gossip_at(current_unix_secs(), current_sequence_tick())
+            .await
+    }
+
+    async fn current_self_record_for_gossip_at(
+        &self,
+        now_unix_secs: u64,
+        wall_clock_sequence: u64,
+    ) -> Result<Arc<ZakuraNodeRecord>, DiscoveryWireError> {
+        let mut inner = self.inner.lock().await;
+        let current = self.current_self_record();
+        if current.body.expires_at_unix_secs
+            > now_unix_secs.saturating_add(inner.config.refresh_interval.as_secs())
+        {
+            return Ok(current);
+        }
+        let record_ttl = inner.config.record_ttl;
+        let record = Arc::new(inner.local.build_self_record(
+            now_unix_secs,
+            wall_clock_sequence,
+            record_ttl,
+        )?);
+        // Publish before releasing the state lock so concurrent refreshers cannot publish a lower
+        // sequence after a newer record.
+        self.self_record_tx.send_replace(record.clone());
+        Ok(record)
+    }
+
     /// Returns the local node id used in authored self-records.
     pub fn local_node_id(&self) -> NodeId {
         self.self_record.borrow().body.node_id
@@ -1576,13 +1613,28 @@ impl ZakuraDiscoveryHandle {
         peer_id: ZakuraPeerId,
         direction: ServicePeerDirection,
     ) -> ServiceAdmissionDecision {
+        self.admit_peer_session(conn_id, 0, peer_id, direction)
+            .await
+    }
+
+    pub(crate) async fn admit_peer_session(
+        &self,
+        conn_id: ZakuraConnId,
+        session_id: u64,
+        peer_id: ZakuraPeerId,
+        direction: ServicePeerDirection,
+    ) -> ServiceAdmissionDecision {
         let mut inner = self.inner.lock().await;
         if let Some(peer) = inner.admitted_peers.get_mut(&peer_id) {
-            if conn_id < peer.conn_id {
+            if (conn_id, session_id) <= (peer.conn_id, peer.session_id) {
                 return ServiceAdmissionDecision::RejectNotUseful;
             }
 
-            *peer = ZakuraDiscoveryAdmittedPeer { conn_id, direction };
+            *peer = ZakuraDiscoveryAdmittedPeer {
+                conn_id,
+                session_id,
+                direction,
+            };
             self.publish_peer_snapshot_locked(&inner);
             return ServiceAdmissionDecision::Admit;
         }
@@ -1600,9 +1652,14 @@ impl ZakuraDiscoveryHandle {
         if admitted >= cap {
             ServiceAdmissionDecision::RejectFull
         } else {
-            inner
-                .admitted_peers
-                .insert(peer_id, ZakuraDiscoveryAdmittedPeer { conn_id, direction });
+            inner.admitted_peers.insert(
+                peer_id,
+                ZakuraDiscoveryAdmittedPeer {
+                    conn_id,
+                    session_id,
+                    direction,
+                },
+            );
             self.publish_peer_snapshot_locked(&inner);
             ServiceAdmissionDecision::Admit
         }
@@ -1619,6 +1676,38 @@ impl ZakuraDiscoveryHandle {
             inner.admitted_peers.remove(peer_id);
         }
         self.publish_peer_snapshot_locked(&inner);
+    }
+
+    /// Remove one exact ordered discovery stream generation.
+    pub(crate) async fn remove_session(
+        &self,
+        peer_id: &ZakuraPeerId,
+        conn_id: ZakuraConnId,
+        session_id: u64,
+    ) {
+        let mut inner = self.inner.lock().await;
+        if inner
+            .admitted_peers
+            .get(peer_id)
+            .is_some_and(|peer| (peer.conn_id, peer.session_id) == (conn_id, session_id))
+        {
+            inner.admitted_peers.remove(peer_id);
+        }
+        self.publish_peer_snapshot_locked(&inner);
+    }
+
+    /// Returns whether an ordered discovery stream is the currently admitted generation.
+    pub(crate) async fn is_current_session(
+        &self,
+        peer_id: &ZakuraPeerId,
+        conn_id: ZakuraConnId,
+        session_id: u64,
+    ) -> bool {
+        let inner = self.inner.lock().await;
+        inner
+            .admitted_peers
+            .get(peer_id)
+            .is_some_and(|peer| (peer.conn_id, peer.session_id) == (conn_id, session_id))
     }
 
     fn publish_peer_snapshot_locked(&self, inner: &ZakuraDiscoveryInner) {
@@ -1777,9 +1866,11 @@ impl ZakuraDiscoveryHandle {
             return Ok(());
         }
 
-        let Some(expires_at_unix_secs) =
-            effective_live_summary_expiry(services.expires_at_unix_secs, now)
-        else {
+        let Some(expires_at_unix_secs) = effective_live_summary_expiry(
+            services.expires_at_unix_secs,
+            now,
+            inner.config.clock_skew_tolerance,
+        ) else {
             if let Some(entry) = inner.active_services.get_mut(&peer_node_id) {
                 entry.live_summaries.clear();
                 if entry.record.is_none() {
@@ -1949,6 +2040,14 @@ impl ZakuraDiscoveryHandle {
             now,
             (dial_backoff_base, dial_backoff_max),
             &mut rng,
+        )
+    }
+
+    pub(crate) async fn dial_backoff(&self) -> (Duration, Duration) {
+        let inner = self.inner.lock().await;
+        (
+            inner.config.dial_backoff_base,
+            inner.config.dial_backoff_max,
         )
     }
 
@@ -2364,6 +2463,14 @@ impl ZakuraDiscoveryInner {
             .retain(|node_id, _| connected_node_ids.contains(node_id));
         for entry in self.active_services.values_mut() {
             entry.prune_expired_live_summaries(now_unix_secs);
+            if entry
+                .record
+                .as_ref()
+                .is_some_and(|record| record.body.expires_at_unix_secs < now_unix_secs)
+            {
+                entry.record = None;
+                entry.refresh_live_derived_services();
+            }
         }
         self.active_services
             .retain(|_, entry| !entry.is_empty_live_only());
@@ -2551,7 +2658,9 @@ impl ZakuraDiscoveryBook {
                 last_short_lived_exchange: None,
                 failure_count: 0,
             });
-        candidate.direct_addrs = direct_addrs;
+        candidate.direct_addrs.extend(direct_addrs);
+        candidate.direct_addrs.sort_unstable();
+        candidate.direct_addrs.dedup();
         candidate.last_seen = now;
         Ok(())
     }
@@ -2646,20 +2755,20 @@ impl ZakuraDiscoveryBook {
         // — was attacker-paced, allocation-heavy work performed while holding the global discovery
         // mutex. Per-call clone work is now bounded by `limit`, not the book size. See finding
         // `claude-discovery-expensive-work-under-global-mutex` (SR-2/SR-4).
-        self.entries
-            .iter()
-            .filter(|(node_id, entry)| {
-                !exclude_node_ids.contains(*node_id)
-                    && self.local_node_id != Some(**node_id)
-                    && !entry_is_expired(entry, now)
-                    && has_wanted_services(&entry.record, wanted_services)
-                    && has_discovery_dialable_direct_addrs(&entry.record)
-            })
-            .map(|(_, entry)| &entry.record)
-            .choose_multiple(rng, limit)
-            .into_iter()
-            .cloned()
-            .collect()
+        choose_multiple_cloned(
+            self.entries
+                .iter()
+                .filter(|(node_id, entry)| {
+                    !exclude_node_ids.contains(*node_id)
+                        && self.local_node_id != Some(**node_id)
+                        && !entry_is_expired(entry, now)
+                        && has_wanted_services(&entry.record, wanted_services)
+                        && has_discovery_dialable_direct_addrs(&entry.record)
+                })
+                .map(|(_, entry)| &entry.record),
+            limit,
+            rng,
+        )
     }
 
     /// Returns bounded dial candidates for later dial-loop code.
@@ -2691,7 +2800,6 @@ impl ZakuraDiscoveryBook {
                         dial_backoff.0,
                         dial_backoff.1,
                     )
-                    && entry_has_confirmed_dial_authority(entry)
                     && has_wanted_services(&entry.record, wanted_services)
                     && has_discovery_usable_direct_addrs(entry)
             })
@@ -3021,6 +3129,23 @@ impl ZakuraDiscoveryBook {
     }
 }
 
+/// Chooses at most `limit` references, then clones only the chosen values.
+fn choose_multiple_cloned<'a, T, R>(
+    values: impl Iterator<Item = &'a T>,
+    limit: usize,
+    rng: &mut R,
+) -> Vec<T>
+where
+    T: Clone + 'a,
+    R: rand::Rng + ?Sized,
+{
+    values
+        .choose_multiple(rng, limit)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct DiscoveryEntryMetadata {
     source: Option<NodeId>,
@@ -3250,14 +3375,22 @@ fn push_unique_service(services: &mut Vec<ZakuraServiceId>, service: ZakuraServi
     }
 }
 
-fn effective_live_summary_expiry(declared_expires_at: u64, now_unix_secs: u64) -> Option<u64> {
-    if declared_expires_at <= now_unix_secs {
+fn effective_live_summary_expiry(
+    declared_expires_at: u64,
+    now_unix_secs: u64,
+    clock_skew_tolerance: Duration,
+) -> Option<u64> {
+    let local_expiry = now_unix_secs.saturating_add(DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs());
+    if declared_expires_at > now_unix_secs {
+        return Some(declared_expires_at.min(local_expiry));
+    }
+    if declared_expires_at.saturating_add(clock_skew_tolerance.as_secs()) <= now_unix_secs {
         return None;
     }
-    Some(
-        declared_expires_at
-            .min(now_unix_secs.saturating_add(DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs())),
-    )
+    // This response arrived on the authenticated live stream but is already expired locally. Use
+    // a bounded receipt TTL only inside the accepted skew window; future expiries still honor a
+    // peer's intentionally shorter lifetime.
+    Some(local_expiry)
 }
 
 fn header_sync_candidate_preference(
@@ -3405,10 +3538,6 @@ fn has_discovery_usable_direct_addrs(entry: &ZakuraDiscoveryEntry) -> bool {
         })
 }
 
-fn entry_has_confirmed_dial_authority(entry: &ZakuraDiscoveryEntry) -> bool {
-    entry.is_static || entry.source == Some(entry.record.body.node_id)
-}
-
 /// Returns true only for addresses that are safe to dial from untrusted discovery gossip.
 ///
 /// A signed `ZakuraNodeRecord` proves control of the node key, not ownership of the advertised
@@ -3422,24 +3551,34 @@ fn is_discovery_dialable_addr(addr: &SocketAddr) -> bool {
         return false;
     }
 
-    match addr.ip() {
-        IpAddr::V4(ip) => {
-            !ip.is_unspecified()
-                && !ip.is_loopback()
-                && !ip.is_multicast()
-                && !ip.is_broadcast()
-                && !ip.is_link_local()
-                && !ip.is_private()
-                && !is_ipv4_shared(&ip)
-        }
+    match canonical_ip(addr.ip()) {
+        IpAddr::V4(ip) => is_discovery_dialable_ipv4(&ip),
         IpAddr::V6(ip) => {
             !ip.is_unspecified()
                 && !ip.is_loopback()
                 && !ip.is_multicast()
                 && !is_ipv6_unicast_link_local(&ip)
                 && !is_ipv6_unique_local(&ip)
+                && !is_ipv6_site_local(&ip)
+                && !is_ipv6_nat64_translation(&ip)
+                && !is_ipv6_documentation(&ip)
         }
     }
+}
+
+fn is_discovery_dialable_ipv4(ip: &Ipv4Addr) -> bool {
+    !ip.is_unspecified()
+        && ip.octets()[0] != 0
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && !ip.is_broadcast()
+        && !ip.is_link_local()
+        && !ip.is_private()
+        && !is_ipv4_shared(ip)
+        && !is_ipv4_protocol_assignment(ip)
+        && !is_ipv4_documentation(ip)
+        && !is_ipv4_benchmarking(ip)
+        && !is_ipv4_reserved(ip)
 }
 
 fn is_static_discovery_configured_addr_usable(addr: &SocketAddr) -> bool {
@@ -3447,7 +3586,7 @@ fn is_static_discovery_configured_addr_usable(addr: &SocketAddr) -> bool {
         return false;
     }
 
-    match addr.ip() {
+    match canonical_ip(addr.ip()) {
         IpAddr::V4(ip) => !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast(),
         IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_multicast(),
     }
@@ -3455,6 +3594,40 @@ fn is_static_discovery_configured_addr_usable(addr: &SocketAddr) -> bool {
 
 fn is_ipv6_unicast_link_local(ip: &Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+fn is_ipv4_protocol_assignment(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 192 && octets[1] == 0 && octets[2] == 0
+}
+
+fn is_ipv4_benchmarking(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 198 && matches!(octets[1], 18 | 19)
+}
+
+fn is_ipv4_reserved(ip: &Ipv4Addr) -> bool {
+    ip.octets()[0] >= 240
+}
+
+// `Ipv4Addr::is_documentation` is still unstable, so match the three RFC 5737
+// documentation ranges (TEST-NET-1/2/3) directly. These are reserved for docs
+// and examples, never globally routable, so an advertised documentation address
+// can only be an attempt to steer a dial at an internal or bogus target.
+fn is_ipv4_documentation(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    matches!(
+        (octets[0], octets[1], octets[2]),
+        (192, 0, 2) | (198, 51, 100) | (203, 0, 113)
+    )
+}
+
+// `Ipv6Addr::is_documentation` is still unstable, so match the RFC 3849
+// 2001:db8::/32 documentation range directly (IPv6 counterpart of the RFC 5737
+// TEST-NET ranges).
+fn is_ipv6_documentation(ip: &Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x2001 && segments[1] == 0x0db8
 }
 
 // `Ipv4Addr::is_shared` is still unstable, so match the RFC 6598 100.64.0.0/10 range directly,
@@ -3467,6 +3640,17 @@ fn is_ipv4_shared(ip: &Ipv4Addr) -> bool {
 // `Ipv6Addr::is_unique_local` is still unstable, so match the RFC 4193 fc00::/7 range directly.
 fn is_ipv6_unique_local(ip: &Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xfe00) == 0xfc00
+}
+
+// Deprecated RFC 3879 site-local addresses remain internal targets even though they are outside
+// the modern RFC 4193 unique-local range.
+fn is_ipv6_site_local(ip: &Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfec0
+}
+
+fn is_ipv6_nat64_translation(ip: &Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x0064 && segments[1] == 0xff9b && (segments[2..6] == [0; 4] || segments[2] == 1)
 }
 
 // Import accepts records inside the clock-skew window, but runtime liveness is strict.
@@ -4394,7 +4578,14 @@ fn u16_from_usize(value: usize, field: &'static str) -> Result<u16, DiscoveryWir
 
 #[cfg(test)]
 mod tests {
-    use std::{net::IpAddr, time::Duration};
+    use std::{
+        net::IpAddr,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use iroh::SecretKey;
     use rand::{rngs::OsRng, rngs::StdRng, SeedableRng};
@@ -4428,9 +4619,9 @@ mod tests {
         ZakuraNodeRecordBody {
             node_id: secret_key.public(),
             direct_addrs: vec![
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 8233),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 33, 30, 10)), 8233),
                 SocketAddr::new(
-                    IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 10)),
+                    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x10)),
                     18233,
                 ),
             ],
@@ -4504,7 +4695,7 @@ mod tests {
     }
 
     fn test_addr(index: u8) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, index)), 8233)
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 33, 30, index)), 8233)
     }
 
     fn candidate_for(record: &ZakuraNodeRecord, is_static: bool) -> ZakuraDiscoveryDialCandidate {
@@ -4991,7 +5182,7 @@ mod tests {
                 record
                     .body
                     .direct_addrs
-                    .push("198.51.100.1:8233".parse().unwrap())
+                    .push("45.33.30.1:8233".parse().unwrap())
             }),
             Box::new(|record, _context| record.body.services.push(service(9))),
             Box::new(|record, _context| record.body.zakura_protocol_min = 0),
@@ -5109,7 +5300,7 @@ mod tests {
         let secret_key = secret_key();
         let mut too_many_addrs = body(&secret_key);
         too_many_addrs.direct_addrs =
-            vec!["192.0.2.1:8233".parse().unwrap(); MAX_DIRECT_ADDRS_PER_RECORD + 1];
+            vec!["45.33.30.1:8233".parse().unwrap(); MAX_DIRECT_ADDRS_PER_RECORD + 1];
         assert!(ZakuraNodeRecord::sign(too_many_addrs, &secret_key).is_err());
 
         let mut too_many_services = body(&secret_key);
@@ -5657,7 +5848,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 8233),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)), 8233),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 8233),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20)), 0),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 33, 30, 20)), 0),
         ];
 
         for (index, bad_addr) in bad_addrs.into_iter().enumerate() {
@@ -5682,18 +5873,62 @@ mod tests {
         // direct addresses. Untrusted gossip must therefore be restricted to globally routable
         // targets; otherwise an authenticated discovery peer could seed signed records pointing at
         // the honest node's private/internal network and turn the candidate dialer into an internal
-        // SSRF/scanner. RFC 1918 private, RFC 6598 shared (CGNAT), and RFC 4193 unique-local ranges
-        // are neither loopback nor link-local, so the original filter let them through.
+        // SSRF/scanner. Private, shared, special-purpose, IPv4-embedded, NAT64 translation, and
+        // unique/site-local ranges are not all covered by the standard loopback/link-local checks.
         let bad_addrs = [
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 8233),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 5, 5)), 8233),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8233),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 1, 2, 3)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1)), 8233),
+            // RFC 5737 documentation ranges (TEST-NET-1/2/3) are reserved for
+            // docs, never globally routable.
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)), 8233),
+            // RFC 3849 IPv6 documentation range 2001:db8::/32.
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 5)),
+                8233,
+            ),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)), 8233),
             SocketAddr::new(
                 IpAddr::V6(Ipv6Addr::new(0xfd12, 0x3456, 0, 0, 0, 0, 0, 1)),
                 8233,
             ),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 1)),
+                8233,
+            ),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 1)),
+                8233,
+            ),
+            // 6to4 embeds 10.0.0.1 in bits 16..48.
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2002, 0x0a00, 1, 0, 0, 0, 0, 0)),
+                8233,
+            ),
+            // Teredo stores the client IPv4 address bitwise-inverted in the final 32 bits.
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0, 0xc000, 0x022d, 0, 0, 0xf5ff, 0xfffe,
+                )),
+                8233,
+            ),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0a00, 1)), 8233),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x0a00, 1)),
+                8233,
+            ),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0x0a00, 1)),
+                8233,
+            ),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1)), 8233),
         ];
 
         for (index, bad_addr) in bad_addrs.into_iter().enumerate() {
@@ -5745,7 +5980,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_book_gossiped_public_third_party_record_is_not_dialable() {
+    fn discovery_book_gossiped_public_third_party_record_is_dialable() {
         let mut book = ZakuraDiscoveryBook::default();
         let gossip_source = secret_key().public();
         let public_target = signed_record_with_addrs(
@@ -5768,7 +6003,7 @@ mod tests {
             &public_target
         );
 
-        assert!(
+        assert_eq!(
             book.dial_candidates(
                 10,
                 &[service(1)],
@@ -5782,11 +6017,13 @@ mod tests {
                     DEFAULT_DISCOVERY_DIAL_BACKOFF_MAX,
                 ),
                 &mut StdRng::seed_from_u64(7),
-            )
-            .is_empty(),
-            "unconfirmed third-party public gossip must not drive native dials"
+            ),
+            vec![candidate_for(&public_target, false)],
+            "valid public gossip must expand discovery beyond directly connected peers"
         );
 
+        // A later first-party exchange still updates the record's source metadata without changing
+        // its dialability.
         assert_eq!(
             book.import_record(public_target.clone(), Some(target_id), NOW + 1, &context())
                 .expect("first-party self-record confirmation imports"),
@@ -5876,10 +6113,16 @@ mod tests {
         let mut book = ZakuraDiscoveryBook::default();
         let node_id = secret_key().public();
         let loopback_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233);
+        let second_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8234);
         let node_addr = NodeAddr::new(node_id).with_direct_addresses([loopback_addr]);
 
         book.insert_static_candidate(node_addr, NOW)
             .expect("configured static loopback candidate imports");
+        book.insert_static_candidate(
+            NodeAddr::new(node_id).with_direct_addresses([second_addr]),
+            NOW + 1,
+        )
+        .expect("additional address for the same static identity imports");
 
         let mut rng = StdRng::seed_from_u64(7);
         assert!(book.sample_peers(10, &[], &[], NOW, &mut rng).is_empty());
@@ -5900,7 +6143,7 @@ mod tests {
             ),
             vec![ZakuraDiscoveryDialCandidate {
                 node_id,
-                direct_addrs: vec![loopback_addr],
+                direct_addrs: vec![loopback_addr, second_addr],
                 is_static: true,
             }]
         );
@@ -6441,6 +6684,38 @@ mod tests {
             .expect("updated record verifies");
     }
 
+    #[tokio::test]
+    async fn self_record_for_gossip_refreshes_before_expiry() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let config = ZakuraDiscoveryConfig {
+            record_ttl: Duration::from_secs(60),
+            refresh_interval: Duration::from_secs(10),
+            ..ZakuraDiscoveryConfig::default()
+        };
+        let handle = discovery_handle_at_with_sequence(
+            local_config_with(secret_key(), vec![test_addr(43)], vec![service(1)]),
+            config,
+            connected_rx,
+            NOW,
+            100,
+        );
+        let initial = handle.current_self_record();
+
+        let still_current = handle
+            .current_self_record_for_gossip_at(NOW + 49, 101)
+            .await
+            .expect("current self-record remains valid past the refresh window");
+        assert_eq!(still_current, initial);
+
+        let refreshed = handle
+            .current_self_record_for_gossip_at(NOW + 50, 102)
+            .await
+            .expect("self-record refresh signs");
+        assert!(refreshed.body.sequence > initial.body.sequence);
+        assert_eq!(refreshed.body.expires_at_unix_secs, NOW + 110);
+        assert_eq!(handle.current_self_record(), refreshed);
+    }
+
     #[test]
     fn derived_sequence_does_not_regress_after_restart() {
         let secret = secret_key();
@@ -6656,6 +6931,54 @@ mod tests {
             cached[0].summary,
             ZakuraLiveServiceSummary::Discovery(updated_summary)
         );
+    }
+
+    #[tokio::test]
+    async fn connected_services_tolerate_clock_skew_with_a_local_receipt_ttl() {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let node_id = secret_key().public();
+        connected_tx.send_replace(vec![peer_id_for(node_id)]);
+
+        handle
+            .import_connected_peer_services_at(
+                first_party_services(
+                    node_id,
+                    NOW - 1,
+                    vec![ServiceSummaryEnvelope::discovery(&discovery_summary())
+                        .expect("test discovery summary encodes")],
+                ),
+                node_id,
+                NOW,
+            )
+            .await
+            .expect("a live first-party summary inside the clock-skew window imports");
+        let cached = handle
+            .live_service_summaries_at(node_id, NOW)
+            .await
+            .expect("clock-skew-tolerant summary remains live");
+        assert_eq!(
+            cached[0].expires_at_unix_secs,
+            NOW + DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs()
+        );
+
+        handle
+            .import_connected_peer_services_at(
+                first_party_services(
+                    node_id,
+                    NOW - DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs() - 1,
+                    vec![ServiceSummaryEnvelope::discovery(&discovery_summary())
+                        .expect("test discovery summary encodes")],
+                ),
+                node_id,
+                NOW,
+            )
+            .await
+            .expect("a stale live summary is ignored without rejecting the connection");
+        assert!(handle
+            .live_service_summaries_at(node_id, NOW)
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -6992,7 +7315,7 @@ mod tests {
             .import_connected_peer_services_at(
                 first_party_services(
                     preferred_id,
-                    now,
+                    now.saturating_sub(DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs()),
                     vec![ServiceSummaryEnvelope::header_sync(&preferred_summary)
                         .expect("test header summary encodes")],
                 ),
@@ -7000,7 +7323,7 @@ mod tests {
                 now,
             )
             .await
-            .expect("expired first-party header summary is dropped");
+            .expect("stale first-party header summary is dropped");
 
         assert_eq!(
             handle
@@ -7557,7 +7880,7 @@ mod tests {
                 .import_connected_peer_services_at(
                     first_party_services(
                         node_id,
-                        now,
+                        now.saturating_sub(DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs()),
                         vec![ServiceSummaryEnvelope {
                             service_id: service.clone(),
                             summary_tag: 999,
@@ -7568,7 +7891,7 @@ mod tests {
                     now,
                 )
                 .await
-                .expect("expired first-party live summary is dropped");
+                .expect("stale first-party live summary is dropped");
         }
 
         assert_eq!(handle.active_services(live_only_node_id).await, None);
@@ -7582,6 +7905,29 @@ mod tests {
             .connected;
         assert!(!stale_candidates.contains(&live_only_node_id));
         assert!(stale_candidates.contains(&record_backed_node_id));
+    }
+
+    #[tokio::test]
+    async fn expired_connected_record_service_membership_is_pruned() {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let record = runtime_record_with(1, service(43), test_addr(43));
+        let node_id = record.body.node_id;
+        let expires_at = record.body.expires_at_unix_secs;
+        connected_tx.send_replace(vec![peer_id_for(node_id)]);
+
+        handle
+            .import_connected_peer_record(record, node_id)
+            .await
+            .expect("connected record imports");
+        assert_eq!(
+            handle.active_services(node_id).await,
+            Some(vec![service(43)])
+        );
+
+        let mut inner = handle.inner.lock().await;
+        inner.sync_active_services(&[node_id], expires_at.saturating_add(1));
+        assert!(!inner.active_services.contains_key(&node_id));
     }
 
     #[tokio::test]
@@ -7655,94 +8001,38 @@ mod tests {
     /// (`max_records`, default 10_000) — even though at most `max_imported_records_per_response`
     /// records are ever returned. The clone is now bounded to the chosen sample.
     ///
-    /// The bound is proven machine-independently by comparing the production `sample_peers` against
-    /// an in-test reference that reproduces the pre-fix clone-the-whole-filtered-set behavior, over
-    /// the same large book in the same run. With the fix, production clones only the returned sample
-    /// and is markedly cheaper than the clone-everything reference; before the fix the two are the
-    /// same computation, so the production-is-cheaper bound fails.
+    /// The bound is proven machine-independently by counting clones in the same
+    /// helper used by `sample_peers`.
     #[test]
     fn sample_peers_clone_cost_is_bounded_by_returned_sample() {
-        const BOOK: usize = 1024;
-        const ITERS: usize = 400;
+        const BOOK_SIZE: usize = 1024;
+        const SAMPLE_LIMIT: usize = MAX_DISCOVERY_RECORDS_PER_RESPONSE;
 
-        let wanted = service(1);
-        // Heavy records (maximum direct-address fan-out plus many services, with the wanted service
-        // first so the filter match itself stays cheap) make each *record clone* far more expensive
-        // than the allocation-free per-entry filter scan, so the clone count is the dominant cost
-        // and the bounded-vs-unbounded clone gap is large.
-        let addrs: Vec<SocketAddr> = (1u8..=MAX_DIRECT_ADDRS_PER_RECORD as u8)
-            .map(test_addr)
-            .collect();
-        let mut services = vec![wanted.clone()];
-        services.extend((100..100 + (MAX_SERVICES_PER_RECORD - 1)).map(service));
-
-        let mut book = ZakuraDiscoveryBook::new(ZakuraDiscoveryBookLimits {
-            max_records: BOOK,
-            ..ZakuraDiscoveryBookLimits::default()
-        });
-        for seq in 0..BOOK {
-            let secret = secret_key();
-            let mut record_body = body(&secret);
-            record_body.sequence = seq as u64 + 1;
-            record_body.direct_addrs = addrs.clone();
-            record_body.services = services.clone();
-            let record = ZakuraNodeRecord::sign(record_body, &secret).expect("test record signs");
-            book.import_record(record, None, NOW, &context())
-                .expect("test record imports");
+        struct CloneCounter {
+            clone_count: Arc<AtomicUsize>,
         }
 
-        let cap = book.limits.max_imported_records_per_response;
+        impl Clone for CloneCounter {
+            fn clone(&self) -> Self {
+                self.clone_count.fetch_add(1, Ordering::Relaxed);
+                Self {
+                    clone_count: Arc::clone(&self.clone_count),
+                }
+            }
+        }
 
-        // Reference implementation: the pre-fix behavior of cloning every record that passes the
-        // filter, then reservoir-sampling the clones. Mirrors `sample_peers`'s filter exactly.
-        let naive_sample =
-            |book: &ZakuraDiscoveryBook, rng: &mut StdRng| -> Vec<ZakuraNodeRecord> {
-                book.entries
-                    .iter()
-                    .filter(|(node_id, entry)| {
-                        book.local_node_id != Some(**node_id)
-                            && !entry_is_expired(entry, NOW)
-                            && has_wanted_services(&entry.record, std::slice::from_ref(&wanted))
-                            && has_discovery_dialable_direct_addrs(&entry.record)
-                    })
-                    .map(|(_, entry)| entry.record.clone())
-                    .choose_multiple(rng, cap)
-            };
-
+        let clone_count = Arc::new(AtomicUsize::new(0));
+        let records: Vec<_> = (0..BOOK_SIZE)
+            .map(|_| CloneCounter {
+                clone_count: Arc::clone(&clone_count),
+            })
+            .collect();
         let mut rng = StdRng::seed_from_u64(5);
 
-        // Warm up the allocator and instruction caches before timing.
-        let _ = naive_sample(&book, &mut rng);
-        let _ = book.sample_peers(cap, std::slice::from_ref(&wanted), &[], NOW, &mut rng);
+        let sample = choose_multiple_cloned(records.iter(), SAMPLE_LIMIT, &mut rng);
 
-        let naive_start = std::time::Instant::now();
-        for _ in 0..ITERS {
-            assert_eq!(naive_sample(&book, &mut rng).len(), cap);
-        }
-        let naive_time = naive_start.elapsed();
-
-        let production_start = std::time::Instant::now();
-        for _ in 0..ITERS {
-            assert_eq!(
-                book.sample_peers(cap, std::slice::from_ref(&wanted), &[], NOW, &mut rng)
-                    .len(),
-                cap
-            );
-        }
-        let production_time = production_start.elapsed();
-
-        // Both run the same O(book) filter scan and reservoir sampling; the only difference is how
-        // many records are cloned (production: the returned `cap`; reference: every match in the
-        // book). With the bound in place production must be clearly cheaper than cloning the whole
-        // filtered set. Before the fix they are the identical computation, so production is not
-        // meaningfully cheaper and this fails. The 0.8 factor is a ratio on the same machine, so it
-        // is machine-independent.
-        assert!(
-            production_time.as_nanos() * 5 < naive_time.as_nanos() * 4,
-            "sample_peers did not bound its clone work: production={production_time:?} \
-             clone-everything reference={naive_time:?}; production should be clearly cheaper than \
-             cloning every filtered record"
-        );
+        assert_eq!(sample.len(), SAMPLE_LIMIT);
+        assert_eq!(clone_count.load(Ordering::Relaxed), SAMPLE_LIMIT);
     }
 
     /// Guards the bounded top-k dial-candidate selection added for
@@ -7849,6 +8139,38 @@ mod tests {
         );
 
         handle.remove_peer(&peer, 2).await;
+        assert_eq!(handle.peer_snapshot().inbound_peers, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_discovery_stream_cleanup_cannot_remove_newer_stream_on_same_connection() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let peer = peer_id_for(secret_key().public());
+
+        assert_eq!(
+            handle
+                .admit_peer_session(2, 1, peer.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+        assert_eq!(
+            handle
+                .admit_peer_session(2, 2, peer.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+        assert_eq!(
+            handle
+                .admit_peer_session(2, 2, peer.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::RejectNotUseful
+        );
+
+        handle.remove_session(&peer, 2, 1).await;
+        assert_eq!(handle.peer_snapshot().inbound_peers, 1);
+
+        handle.remove_session(&peer, 2, 2).await;
         assert_eq!(handle.peer_snapshot().inbound_peers, 0);
     }
 

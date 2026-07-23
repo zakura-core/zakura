@@ -70,7 +70,7 @@ fn end_of_support_date() {
 }
 
 /// Check that the end of support task is working.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 #[tracing_test::traced_test]
 async fn end_of_support_task() -> Result<()> {
     let (latest_chain_tip, latest_chain_tip_sender) = MockChainTip::new();
@@ -81,7 +81,7 @@ async fn end_of_support_task() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(15), eos_future)
         .await
         .expect_err(
-            "end of support task unexpectedly exited: it should keep running until Zebra exits",
+            "end of support task unexpectedly exited: it should keep running until Zakura exits",
         );
 
     assert!(logs_contain(

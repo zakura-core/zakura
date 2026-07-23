@@ -55,7 +55,7 @@ pub enum PruneFinalizedStateError {
     /// The on-disk state database format does not match the running code.
     #[error(
         "state database format mismatch: on disk {on_disk:?}, running code {in_code}; \
-         use a Zebra binary with the same state format"
+         use a Zakura binary with the same state format"
     )]
     FormatMismatch {
         /// Version read from disk.
@@ -343,13 +343,8 @@ mod tests {
 
     /// Opens a fresh finalized state and commits blocks `0..=TEST_BLOCKS`.
     fn new_state_with_blocks() -> FinalizedState {
-        let mut state = FinalizedState::new(
-            &Config::ephemeral(),
-            &Mainnet,
-            #[cfg(feature = "elasticsearch")]
-            false,
-        )
-        .expect("opening an ephemeral database should succeed");
+        let mut state = FinalizedState::new(&Config::ephemeral(), &Mainnet)
+            .expect("opening an ephemeral database should succeed");
 
         let blocks = Mainnet.blockchain_map();
         for height in 0..=TEST_BLOCKS {

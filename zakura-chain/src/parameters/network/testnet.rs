@@ -41,9 +41,6 @@ pub const RESERVED_NETWORK_NAMES: [&str; 6] = [
 /// Maximum length for a configured network name.
 pub const MAX_NETWORK_NAME_LENGTH: usize = 30;
 
-/// Maximum length for a configured human-readable prefix.
-pub const MAX_HRP_LENGTH: usize = 30;
-
 /// The block hash of the Regtest genesis block, `zcash-cli -regtest getblockhash 0`
 const REGTEST_GENESIS_HASH: &str =
     "029f11d80ef9765602235e1bc9727e3eb6ba20839319f761fee920d63401e327";

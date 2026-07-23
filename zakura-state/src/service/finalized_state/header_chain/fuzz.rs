@@ -7,20 +7,27 @@ use zakura_chain::{
     parameters::{testnet::RegtestParameters, Network},
 };
 use zakura_header_chain::{
-    AlarmSet, ChainScore, CheckpointSet, EngineConfig, EngineMetadata, EngineMode, EvidenceId,
-    FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderGeneration, HeaderNode,
-    HeaderValidationState, RecoveryRepair, StateVersion, SuffixWork, TrustedAnchor,
+    AlarmSet, BodyRuleId, ChainScore, CheckpointSet, EngineConfig, EngineMetadata, EngineMode,
+    EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
+    FullStateEvidenceAuthority, HeaderChainDiskVersion, HeaderGeneration, HeaderNode,
+    HeaderValidationState, MigratedPinRefutation, RecoveryRepair, StateVersion, StoreRead,
+    SuffixWork, SystemClock, TransitionContext, TransitionEvent, TransitionRequest, TrustedAnchor,
     VerifiedGeneration, WorkCoordinate,
 };
 
 use super::{
     super::{
         super::super::constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+        disk_format::{
+            header_chain::HeaderFinalityKey, header_chain_values::HeaderFinalityRecordDisk,
+            IntoDisk,
+        },
         DiskDb, DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE,
     },
-    HeaderChainStore, HEADER_AUX_DELIVERY, HEADER_CANDIDATE, HEADER_CHILD, HEADER_DEFERRED,
-    HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY, HEADER_HEIGHT_HASH,
-    HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
+    HeaderChainStore, HeaderChainStoreError, HEADER_AUX_DELIVERY, HEADER_CANDIDATE, HEADER_CHILD,
+    HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
+    HEADER_HEIGHT_HASH, HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT,
+    HEADER_VERIFIED,
 };
 use crate::Config;
 
@@ -49,6 +56,12 @@ pub struct RecoveryRowsReplaySummary {
     pub repairs: usize,
     /// Whether the mutated store failed closed before publisher construction.
     pub rejected: bool,
+    /// Supported headers-only-to-integrated migrations completed.
+    pub mode_migrations: usize,
+    /// Mode migrations rejected before publication for a mismatched full-state pin.
+    pub mode_migration_rejections: usize,
+    /// Migrated trust pins durably refuted and rejected again on reopen.
+    pub migrated_pin_refutations: usize,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -69,7 +82,18 @@ pub fn replay_recovery_rows_bytes(data: &[u8]) -> RecoveryRowsReplaySummary {
 
     let mut rows = logical_dump(&store);
     let mut mutations = 0;
+    let mut mode_operations = Vec::new();
     for operation in data[..data.len().min(MAX_INPUT_BYTES)].chunks_exact(4) {
+        if recovery_opcode(operation[0]) == 8 {
+            if mode_operations.len() < 2 {
+                mode_operations.push(
+                    operation
+                        .try_into()
+                        .expect("chunks_exact yields four-byte operations"),
+                );
+            }
+            continue;
+        }
         mutate_rows(&mut rows, operation);
         mutations += 1;
     }
@@ -81,6 +105,8 @@ pub fn replay_recovery_rows_bytes(data: &[u8]) -> RecoveryRowsReplaySummary {
         "the logical mutation dump installs exactly"
     );
 
+    let (mode_migrations, mode_migration_rejections, migrated_pin_refutations) =
+        replay_mode_operations(&mode_operations);
     match store.startup(&config) {
         Ok((runtime, report)) => {
             assert!(report.publication_allowed);
@@ -104,6 +130,9 @@ pub fn replay_recovery_rows_bytes(data: &[u8]) -> RecoveryRowsReplaySummary {
                 mutations,
                 repairs,
                 rejected: false,
+                mode_migrations,
+                mode_migration_rejections,
+                migrated_pin_refutations,
             }
         }
         Err(_) => {
@@ -116,13 +145,16 @@ pub fn replay_recovery_rows_bytes(data: &[u8]) -> RecoveryRowsReplaySummary {
                 mutations,
                 repairs: 0,
                 rejected: true,
+                mode_migrations,
+                mode_migration_rejections,
+                migrated_pin_refutations,
             }
         }
     }
 }
 
 fn mutate_rows(rows: &mut Vec<LogicalRow>, operation: &[u8]) {
-    let opcode = operation[0] % 8;
+    let opcode = recovery_opcode(operation[0]);
     if opcode == 0 {
         remove_reconstructible_row(rows, operation[1]);
         return;
@@ -149,7 +181,144 @@ fn mutate_rows(rows: &mut Vec<LogicalRow>, operation: &[u8]) {
         5 => truncate(&mut rows[index].value, operation[2]),
         6 => rows[index].value.push(operation[3]),
         0 | 7 => unreachable!("handled before selecting a row"),
-        _ => unreachable!("the opcode is reduced modulo eight"),
+        8 => unreachable!("mode operations are separated before row mutation"),
+        _ => unreachable!("the opcode is reduced to a known operation"),
+    }
+}
+
+fn recovery_opcode(byte: u8) -> u8 {
+    match byte {
+        8 | 72 => 8,
+        _ => byte % 8,
+    }
+}
+
+fn replay_mode_operations(operations: &[[u8; 4]]) -> (usize, usize, usize) {
+    let mut migrations = 0;
+    let mut rejections = 0;
+    let mut refutations = 0;
+    for operation in operations {
+        let (integrated_config, anchor, mut metadata) = fixture();
+        let mut headers_only_config = integrated_config.clone();
+        headers_only_config.mode = EngineMode::HeadersOnly;
+        metadata.mode = EngineMode::HeadersOnly;
+        let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+        let db = open(&integrated_config.network);
+        let store = HeaderChainStore::new(db.clone());
+        store
+            .initialize(metadata, anchor)
+            .expect("the bounded headers-only migration fixture initializes");
+        let record = FinalityRecord {
+            previous: anchor_frontier,
+            current: anchor_frontier,
+            source: FinalitySource::MigratedHeadersOnly,
+            epoch: FinalityEpoch::new(0),
+        };
+        let mut batch = DiskWriteBatch::new();
+        store
+            .put_value(
+                &mut batch,
+                HEADER_FINALITY_HISTORY,
+                HeaderFinalityKey(record.epoch).as_bytes(),
+                &HeaderFinalityRecordDisk(record),
+            )
+            .expect("the fixed migrated-pin record encodes");
+        db.write(batch)
+            .expect("the fixed migrated-pin record commits");
+        let before = logical_dump(&store);
+
+        let supplied_pin = if operation[3] & 1 == 0 {
+            anchor_frontier
+        } else {
+            Frontier::new(anchor_frontier.height, block::Hash([operation[2]; 32]))
+        };
+        let result = store
+            .clone()
+            .migrate_headers_only_to_integrated(&integrated_config, supplied_pin);
+        if supplied_pin != anchor_frontier {
+            assert!(matches!(
+                result,
+                Err(HeaderChainStoreError::Incoherent(
+                    "integrated migration requires full-state verification through the preserved pin"
+                ))
+            ));
+            assert_eq!(
+                logical_dump(&store),
+                before,
+                "a rejected mode migration performs no durable mutation"
+            );
+            rejections += 1;
+            continue;
+        }
+
+        let (runtime, report) = result.expect("the exact authenticated pin permits migration");
+        assert_eq!(report.current.mode, EngineMode::Integrated);
+        assert!(report.publication_allowed);
+        assert!(matches!(
+            runtime.store.finality_history().as_deref(),
+            Ok([FinalityRecord {
+                source: FinalitySource::MigratedHeadersOnly,
+                ..
+            }])
+        ));
+        migrations += 1;
+
+        if operation[3] & 2 == 0 {
+            drop(runtime);
+            let (reopened, reopened_report) = HeaderChainStore::new(db)
+                .startup(&integrated_config)
+                .expect("the successful mode migration reopens coherently");
+            assert_eq!(reopened_report.current.mode, EngineMode::Integrated);
+            assert_eq!(reopened.publisher().snapshot(), report.current);
+            continue;
+        }
+
+        let evidence = EvidenceId::from_digest([operation[2]; 32]);
+        let authority = FuzzAuthority(evidence);
+        let snapshot = runtime.publisher().snapshot();
+        let context = TransitionContext {
+            config: &integrated_config,
+            clock: &SystemClock,
+            full_state_authority: Some(&authority),
+            startup_capability: None,
+            retention_references: &[],
+        };
+        let result = runtime.apply(
+            TransitionRequest {
+                expected_version: snapshot.state_version,
+                event: TransitionEvent::MigratedPinRefutation(MigratedPinRefutation {
+                    full_state_transition_id: evidence,
+                    pin: anchor_frontier,
+                    invalid_header: anchor_frontier,
+                    rule: BodyRuleId::new("fuzz.migrated-pin-refutation"),
+                }),
+            },
+            &context,
+        );
+        assert!(matches!(
+            result,
+            Err(HeaderChainStoreError::MigratedPinRefuted { pin }) if pin == anchor_frontier
+        ));
+        assert_eq!(
+            runtime.publisher().snapshot(),
+            snapshot,
+            "fail-closed pin refutation is never published as a usable frontier"
+        );
+        drop(runtime);
+        assert!(matches!(
+            HeaderChainStore::new(db).startup(&integrated_config),
+            Err(HeaderChainStoreError::MigratedPinRefuted { pin }) if pin == anchor_frontier
+        ));
+        refutations += 1;
+    }
+    (migrations, rejections, refutations)
+}
+
+struct FuzzAuthority(EvidenceId);
+
+impl FullStateEvidenceAuthority for FuzzAuthority {
+    fn authorizes(&self, evidence: EvidenceId) -> bool {
+        evidence == self.0
     }
 }
 
@@ -397,6 +566,27 @@ mod tests {
                     assert_eq!(first.repairs, 0);
                     assert!(first.rejected);
                 }
+                "mode_migration" => {
+                    assert_eq!(first.mutations, 0);
+                    assert_eq!(first.mode_migrations, 1);
+                    assert_eq!(first.mode_migration_rejections, 0);
+                    assert_eq!(first.migrated_pin_refutations, 0);
+                    assert!(!first.rejected);
+                }
+                "mode_migration_rejection" => {
+                    assert_eq!(first.mutations, 0);
+                    assert_eq!(first.mode_migrations, 0);
+                    assert_eq!(first.mode_migration_rejections, 1);
+                    assert_eq!(first.migrated_pin_refutations, 0);
+                    assert!(!first.rejected);
+                }
+                "migrated_pin_refutation" => {
+                    assert_eq!(first.mutations, 0);
+                    assert_eq!(first.mode_migrations, 1);
+                    assert_eq!(first.mode_migration_rejections, 0);
+                    assert_eq!(first.migrated_pin_refutations, 1);
+                    assert!(!first.rejected);
+                }
                 other => panic!("new recovery corpus seed {other} needs an expected outcome"),
             }
         }
@@ -411,5 +601,21 @@ mod tests {
         let rejection = replay_recovery_rows_bytes(&[5, 0, 0, 0]);
         assert!(rejection.rejected);
         assert_eq!(rejection.repairs, 0);
+    }
+
+    #[test]
+    fn mode_migration_requires_the_exact_pin_and_refutation_fails_closed() {
+        let migrated = replay_recovery_rows_bytes(&[8, 0, 7, 0]);
+        assert_eq!(migrated.mode_migrations, 1);
+        assert_eq!(migrated.mode_migration_rejections, 0);
+        assert_eq!(migrated.migrated_pin_refutations, 0);
+
+        let rejected = replay_recovery_rows_bytes(&[8, 0, 7, 1]);
+        assert_eq!(rejected.mode_migrations, 0);
+        assert_eq!(rejected.mode_migration_rejections, 1);
+
+        let refuted = replay_recovery_rows_bytes(&[8, 0, 7, 2]);
+        assert_eq!(refuted.mode_migrations, 1);
+        assert_eq!(refuted.migrated_pin_refutations, 1);
     }
 }

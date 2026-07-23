@@ -58,4 +58,8 @@ local authority.
 logical dump, applies at most 64 bounded row/key/value mutations, and installs
 the dump in one RocksDB batch. Startup must either perform only a named
 source-derived repair and reopen cleanly at the authenticated frontier, or fail
-without changing any logical row and before constructing a publisher.
+without changing any logical row and before constructing a publisher. Bounded
+mode operations use the real durable headers-only-to-integrated migration,
+reject a mismatched full-state pin without mutation, preserve migrated pin
+history, and require a later pin refutation to remain unpublished and fail
+closed again on reopen. There is no reverse migration operation.

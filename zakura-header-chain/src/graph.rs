@@ -823,29 +823,47 @@ mod tests {
     }
 
     #[test]
-    fn fixed_anchor_selection_has_no_incumbent_relative_rollback_horizon() {
-        let mut store = anchor_store();
-        let anchor = store.finalized();
-        let mut incumbent = anchor;
-        for offset in 0..1_000 {
-            let seed = u8::try_from(offset % 251).expect("reduced nonce fits in u8");
-            incumbent = insert_child(&mut store, incumbent.hash, seed);
+    fn dg_05_fixed_anchor_replacements_cross_999_1000_1001_in_both_orders() {
+        fn insert_branch(
+            store: &mut MemHeaderStore,
+            anchor: Frontier,
+            count: u32,
+            seed_offset: u32,
+        ) -> Frontier {
+            let mut tip = anchor;
+            for offset in 0..count {
+                let seed =
+                    u8::try_from((offset + seed_offset) % 251).expect("reduced nonce fits in u8");
+                tip = insert_child(store, tip.hash, seed);
+            }
+            tip
         }
-        assert_eq!(
-            store.select_header_best().expect("graph is coherent").0,
-            incumbent
-        );
 
-        let mut competitor = anchor;
-        for offset in 0..1_001 {
-            let seed = u8::try_from((offset + 127) % 251).expect("reduced nonce fits in u8");
-            competitor = insert_child(&mut store, competitor.hash, seed);
+        for incumbent_depth in [999, 1_000, 1_001] {
+            for competitor_first in [false, true] {
+                let mut store = anchor_store();
+                let anchor = store.finalized();
+                let (incumbent, competitor) = if competitor_first {
+                    let competitor = insert_branch(&mut store, anchor, incumbent_depth + 1, 127);
+                    let incumbent = insert_branch(&mut store, anchor, incumbent_depth, 0);
+                    (incumbent, competitor)
+                } else {
+                    let incumbent = insert_branch(&mut store, anchor, incumbent_depth, 0);
+                    assert_eq!(
+                        store.select_header_best().expect("graph is coherent").0,
+                        incumbent
+                    );
+                    let competitor = insert_branch(&mut store, anchor, incumbent_depth + 1, 127);
+                    (incumbent, competitor)
+                };
+                assert_ne!(incumbent.hash, competitor.hash);
+                assert_eq!(
+                    store.select_header_best().expect("graph is coherent").0,
+                    competitor,
+                    "selection is anchored at finalized and independent of depth or arrival order"
+                );
+            }
         }
-        assert_eq!(
-            store.select_header_best().expect("graph is coherent").0,
-            competitor,
-            "selection is anchored at finalized and has no incumbent-relative depth rule"
-        );
     }
 
     #[test]

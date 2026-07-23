@@ -48,6 +48,8 @@ pub struct ForkReplaySummary {
     pub permutation_checks: u16,
     /// Consecutive exact-branch reset checks completed.
     pub reset_checks: u16,
+    /// Historical late-A-after-B-promotion incident checks completed.
+    pub incident_checks: u16,
     /// Final authoritative snapshot.
     pub snapshot: EngineSnapshot,
     /// Stable digest of operation outcomes and snapshots.
@@ -446,13 +448,14 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     let mut pressure_checks = 0u16;
     let mut permutation_checks = 0u16;
     let mut reset_checks = 0u16;
+    let mut incident_checks = 0u16;
     let mut transcript = Sha256::new();
     let clock = ManualClock::new();
     let authority = FuzzAuthority;
     assert_exhaustive_oracle(&store);
 
     for (operation, encoded) in bounded.iter().copied().enumerate() {
-        if matches!(bounded.first(), Some(b'A' | b'R' | b'T'))
+        if matches!(bounded.first(), Some(b'A' | b'I' | b'R' | b'T'))
             && encoded == b'\n'
             && operation.saturating_add(1) == bounded.len()
         {
@@ -476,6 +479,15 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
             transcript.update(digest);
             no_effects = no_effects.saturating_add(1);
             reset_checks = reset_checks.saturating_add(1);
+            assert_exhaustive_oracle(&store);
+            continue;
+        }
+        if encoded == b'I' {
+            let digest = assert_incident_recovery();
+            transcript.update(b"incident");
+            transcript.update(digest);
+            no_effects = no_effects.saturating_add(1);
+            incident_checks = incident_checks.saturating_add(1);
             assert_exhaustive_oracle(&store);
             continue;
         }
@@ -719,6 +731,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         pressure_checks,
         permutation_checks,
         reset_checks,
+        incident_checks,
         snapshot: store.snapshot(),
         replay_digest: transcript.finalize().into(),
         retained_digest: retained_digest(&store),
@@ -985,6 +998,113 @@ fn assert_consecutive_resets() -> [u8; 32] {
     );
     assert_exhaustive_oracle(&store);
     retained_digest(&store)
+}
+
+fn assert_incident_recovery() -> [u8; 32] {
+    let mut store = FuzzStore::new(EngineMode::Integrated);
+    let clock = ManualClock::new();
+    let authority = FuzzAuthority;
+    let anchor = store.metadata.frontiers.finalized;
+    let incumbent_a =
+        commit_fixture_insertion(&mut store, &clock, &authority, anchor, 5, 100, 0xa1);
+    assert_eq!(store.metadata.frontiers.header_best, incumbent_a);
+
+    let late_a = store.insertion(incumbent_a, 1, 101, 0xa2);
+    let held_context = TransitionContext {
+        config: &store.config,
+        clock: &clock,
+        full_state_authority: Some(&authority),
+        startup_capability: None,
+        retention_references: &[],
+    };
+    let held_a_plan = apply_transition(&store, late_a.clone(), &held_context)
+        .expect("A's held insertion is valid before B replaces it");
+    assert_eq!(held_a_plan.before(), &store.snapshot());
+
+    let losing_b = commit_fixture_insertion(&mut store, &clock, &authority, anchor, 2, 102, 0xb1);
+    assert_eq!(
+        store.metadata.frontiers.header_best, incumbent_a,
+        "B is retained while it still loses to A"
+    );
+    let promoted_b =
+        commit_fixture_insertion(&mut store, &clock, &authority, losing_b, 4, 103, 0xb2);
+    assert_eq!(
+        store.metadata.frontiers.header_best, promoted_b,
+        "later local work promotes the exact retained B branch"
+    );
+
+    let before_late_a = store.snapshot();
+    let before_late_a_digest = retained_digest(&store);
+    let context = TransitionContext {
+        config: &store.config,
+        clock: &clock,
+        full_state_authority: Some(&authority),
+        startup_capability: None,
+        retention_references: &[],
+    };
+    assert!(matches!(
+        apply_transition(&store, late_a, &context),
+        Err(TransitionFailure::Stale { .. })
+    ));
+    assert_eq!(store.snapshot(), before_late_a);
+    assert_eq!(retained_digest(&store), before_late_a_digest);
+
+    let next_b = commit_fixture_insertion(&mut store, &clock, &authority, promoted_b, 1, 104, 0xb3);
+    assert_eq!(store.metadata.frontiers.header_best, next_b);
+    assert_eq!(
+        store
+            .graph
+            .node(next_b.hash)
+            .expect("B's next child is retained")
+            .parent_hash,
+        promoted_b.hash
+    );
+
+    let reopened = store.clone();
+    assert_eq!(reopened.snapshot(), store.snapshot());
+    assert_eq!(retained_digest(&reopened), retained_digest(&store));
+    assert_eq!(
+        reopened.lease(next_b).parent,
+        next_b,
+        "the reopened exact B tip remains a valid request anchor"
+    );
+    assert_exhaustive_oracle(&reopened);
+    retained_digest(&reopened)
+}
+
+fn commit_fixture_insertion(
+    store: &mut FuzzStore,
+    clock: &ManualClock,
+    authority: &FuzzAuthority,
+    parent: Frontier,
+    count: u32,
+    operation: usize,
+    branch: u8,
+) -> Frontier {
+    let request = store.insertion(parent, count, operation, branch);
+    let target = match &request.event {
+        crate::TransitionEvent::InsertHeaders(event) => {
+            let target = event
+                .batch
+                .headers()
+                .last()
+                .expect("the fixture insertion is nonempty");
+            Frontier::new(target.height, target.hash)
+        }
+        _ => unreachable!("the incident fixture constructs only insertions"),
+    };
+    let context = TransitionContext {
+        config: &store.config,
+        clock,
+        full_state_authority: Some(authority),
+        startup_capability: None,
+        retention_references: &[],
+    };
+    let plan =
+        apply_transition(store, request, &context).expect("the fixture insertion is admissible");
+    store.commit(&plan);
+    assert_exhaustive_oracle(store);
+    target
 }
 
 fn insert_fixture_path(
@@ -1397,6 +1517,15 @@ mod tests {
     }
 
     #[test]
+    fn aud_incident_late_a_completion_cannot_break_promoted_b() {
+        let first = replay_fork_transition_bytes(b"I");
+        let second = replay_fork_transition_bytes(b"I");
+        assert_eq!(first, second);
+        assert_eq!(first.incident_checks, 1);
+        assert_eq!(first.no_effects, 1);
+    }
+
+    #[test]
     #[should_panic(expected = "selected projection must exactly match parent links")]
     fn exhaustive_oracle_rejects_a_projection_gap() {
         let mut store = FuzzStore::new(EngineMode::Integrated);
@@ -1534,6 +1663,12 @@ mod tests {
                     "../../fuzz/header-chain/corpus/fork_transitions/aud_04_consecutive_resets"
                 ),
             ),
+            (
+                "aud_incident_late_a_after_b_promotion",
+                include_bytes!(
+                    "../../fuzz/header-chain/corpus/fork_transitions/aud_incident_late_a_after_b_promotion"
+                ),
+            ),
         ];
         for (name, bytes) in corpus {
             let first = replay_fork_transition_bytes(bytes);
@@ -1556,6 +1691,9 @@ mod tests {
             }
             if *name == "aud_04_consecutive_resets" {
                 assert_eq!(first.reset_checks, 1);
+            }
+            if *name == "aud_incident_late_a_after_b_promotion" {
+                assert_eq!(first.incident_checks, 1);
             }
         }
     }

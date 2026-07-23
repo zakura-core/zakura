@@ -51,7 +51,9 @@ requiring unequal-work and equal-work/raw-hash selection to converge to
 byte-identical retained state. Consecutive-reset replay builds lower,
 same-height, and forward exact-hash verified paths without intervening forward
 work, then requires the next child to anchor to the final reset hash. It is also
-used by deterministic corpus tests.
+used by deterministic corpus tests. The historical incident seed retains A,
+promotes B, rejects a held A insertion without effects, commits B's next child,
+and reopens with the exact B tip still usable as an ancestry lease.
 
 `header_pursuit` consumes at most 512 bytes as four-byte operations over twenty
 logical peers. It drives the production peer work queue, response-page and

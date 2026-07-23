@@ -1625,18 +1625,22 @@ fn random_stream_session_seed() -> u64 {
     }
 }
 
-/// Resolve the inbound peer's UDP source IP from the endpoint's node map so the
-/// per-IP connection cap can be enforced for Router-accepted connections.
+/// Resolve a connected peer's confirmed UDP source IP from the endpoint's node
+/// map so the per-IP connection cap can be enforced against the path that
+/// actually carries the connection.
 ///
-/// Iroh exposes the peer address on `Incoming`, which the Router consumes before
-/// `ProtocolHandler::accept`. After the native control handshake the connection
-/// has exchanged real QUIC payload over its direct path, so the endpoint's node
-/// map knows the peer's UDP address: prefer the connection's confirmed current
-/// path (`conn_type`), then fall back to the direct address that most recently
-/// delivered payload from this peer. Relay-only paths have no single
-/// attributable source IP, so they correctly yield `None` (the global
-/// connection cap still bounds them).
-fn inbound_remote_ip(endpoint: &Endpoint, node_id: NodeId) -> Option<IpAddr> {
+/// Used for both directions. Inbound: iroh exposes the peer address on
+/// `Incoming`, which the Router consumes before `ProtocolHandler::accept`.
+/// Outbound: a dialed peer may advertise several addresses, but only one path
+/// ends up carrying the connection — charging the first *advertised* address
+/// lets a record list a decoy address to escape the cap. In both cases, after
+/// the native control handshake the connection has exchanged real QUIC payload
+/// over its direct path, so the endpoint's node map knows the peer's UDP
+/// address: prefer the connection's confirmed current path (`conn_type`), then
+/// fall back to the direct address that most recently delivered payload from
+/// this peer. Relay-only paths have no single attributable source IP, so they
+/// correctly yield `None` (the global connection cap still bounds them).
+fn confirmed_remote_ip(endpoint: &Endpoint, node_id: NodeId) -> Option<IpAddr> {
     if let Some(mut conn_type) = endpoint.conn_type(node_id) {
         match conn_type.get() {
             ConnectionType::Direct(addr) | ConnectionType::Mixed(addr, _) => {
@@ -1804,7 +1808,7 @@ impl ZakuraProtocolHandler {
         let remote_ip = self
             .endpoint
             .as_ref()
-            .and_then(|endpoint| inbound_remote_ip(endpoint, remote_node_id));
+            .and_then(|endpoint| confirmed_remote_ip(endpoint, remote_node_id));
         let local_node_id = self
             .endpoint
             .as_ref()
@@ -3209,7 +3213,6 @@ pub(crate) async fn serve_native_dial_connection(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ZakuraHandlerError::ResourceLimit("admission"))?;
-    let remote_ip = node_addr.direct_addresses().next().map(|addr| addr.ip());
     let connection = timeout(
         limits.control_timeout,
         endpoint.router.endpoint().connect(node_addr, P2P_V2_ALPN),
@@ -3239,6 +3242,12 @@ pub(crate) async fn serve_native_dial_connection(
         .await?
     };
     let conn_limits = limits.clamp(&negotiated.limits);
+    // Charge the connection to the path iroh actually confirmed, not the first
+    // address the record advertised: a record can list an unreachable decoy as
+    // its first direct address to escape the per-IP cap while the connection is
+    // served over a different (shared) address. The handshake above exchanged
+    // QUIC payload, so the node map now knows the confirmed path.
+    let remote_ip = confirmed_remote_ip(endpoint.router.endpoint(), remote_node_id);
     let direction = ServicePeerDirection::Outbound;
     endpoint
         .handler

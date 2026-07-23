@@ -862,7 +862,7 @@ mod tests {
         let body = ZakuraNodeRecordBody {
             node_id: secret_key.public(),
             direct_addrs: vec![SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44)),
+                IpAddr::V4(Ipv4Addr::new(45, 33, 30, 44)),
                 8233,
             )],
             services: vec![ZakuraServiceId::header_sync()],
@@ -960,7 +960,7 @@ mod tests {
         let body = ZakuraNodeRecordBody {
             node_id: secret_key.public(),
             direct_addrs: vec![SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 45)),
+                IpAddr::V4(Ipv4Addr::new(45, 33, 30, 45)),
                 8233,
             )],
             services: vec![ZakuraServiceId::discovery()],

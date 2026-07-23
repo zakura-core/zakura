@@ -234,11 +234,15 @@ fn root_auth_slot_occupied_failure_kind() -> HeaderRootAuthenticationFailureKind
 fn header_root_authentication_failure_kind(
     error: &(dyn std::error::Error + Send + Sync + 'static),
 ) -> HeaderRootAuthenticationFailureKind {
-    error
-        .downcast_ref::<zakura_state::AuthenticateHeaderRootsError>()
-        .map_or(
-            HeaderRootAuthenticationFailureKind::Local,
-            |error| match error {
+    // Walk the source chain: Tower/state layers may wrap the typed auth error in another
+    // `Error`. A top-level-only downcast would mis-classify every forgery as Local and
+    // silently disable peer scoring while all piecewise tests stay green.
+    let mut current: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(auth_error) =
+            current.downcast_ref::<zakura_state::AuthenticateHeaderRootsError>()
+        {
+            return match auth_error {
                 zakura_state::AuthenticateHeaderRootsError::NonCanonicalHeader { height } => {
                     HeaderRootAuthenticationFailureKind::CanonicalMismatch { height: *height }
                 }
@@ -258,8 +262,13 @@ fn header_root_authentication_failure_kind(
                 | zakura_state::AuthenticateHeaderRootsError::Frontier(_) => {
                     HeaderRootAuthenticationFailureKind::Local
                 }
-            },
-        )
+            };
+        }
+        match current.source() {
+            Some(source) => current = source,
+            None => return HeaderRootAuthenticationFailureKind::Local,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -365,6 +374,12 @@ mod operation_identity_tests {
         let canonical_mismatch = zakura_state::AuthenticateHeaderRootsError::NonCanonicalHeader {
             height: block::Height(2),
         };
+        // Cryptographic forgery is the peer-scoring path: Verification must map to
+        // InvalidPeerRange or the reactor will endlessly retry a poisoned payload.
+        let verification = zakura_state::AuthenticateHeaderRootsError::Verification {
+            height: block::Height(1),
+            source: zakura_chain::parallel::commitment_aux_verify::SuppliedRootsError::MissingHistoryTreeRoot,
+        };
         let local = std::io::Error::other("local state service failure");
 
         assert_eq!(
@@ -382,8 +397,25 @@ mod operation_identity_tests {
             }
         );
         assert_eq!(
+            header_root_authentication_failure_kind(&verification),
+            HeaderRootAuthenticationFailureKind::InvalidPeerRange
+        );
+        assert_eq!(
             header_root_authentication_failure_kind(&local),
             HeaderRootAuthenticationFailureKind::Local
+        );
+
+        // A wrapping layer must not demote Verification to Local.
+        #[derive(Debug, thiserror::Error)]
+        #[error("wrapped authenticate-header-roots failure")]
+        struct WrappedAuthError(#[source] zakura_state::AuthenticateHeaderRootsError);
+        let wrapped = WrappedAuthError(zakura_state::AuthenticateHeaderRootsError::Verification {
+            height: block::Height(1),
+            source: zakura_chain::parallel::commitment_aux_verify::SuppliedRootsError::MissingHistoryTreeRoot,
+        });
+        assert_eq!(
+            header_root_authentication_failure_kind(&wrapped),
+            HeaderRootAuthenticationFailureKind::InvalidPeerRange
         );
     }
 

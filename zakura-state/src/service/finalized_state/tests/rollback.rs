@@ -811,6 +811,85 @@ fn rollback_resets_sprout_tree_changed_in_range() {
     );
 }
 
+/// Rollback must rebase the header-root auth frontier onto the new body tip and
+/// truncate commitment-root rows above that tip. Leaving either stale would let
+/// header sync authenticate or serve roots for heights the database no longer
+/// holds.
+#[test]
+fn rollback_rebases_header_root_auth_frontier_and_truncates_roots() {
+    let _init_guard = zakura_test::init();
+
+    let network = Network::Mainnet;
+    let address = Address::from_script_hash(NetworkKind::Mainnet, [0x42; 20]);
+    let dust = Amount::<NonNegative>::try_from(1).expect("1 fits in Amount<NonNegative>");
+
+    let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("mainnet genesis test vector deserializes");
+    let block1 = child_block(&genesis, vec![coinbase_tx(Height(1), dust, &address)]);
+    let block2 = child_block(&block1, vec![coinbase_tx(Height(2), dust, &address)]);
+    let block1_hash = block1.hash();
+
+    let chain: Vec<SemanticallyVerifiedBlock> = [genesis, block1, block2]
+        .into_iter()
+        .map(SemanticallyVerifiedBlock::from)
+        .collect();
+
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    sync_to(&config, &network, &chain);
+
+    let before = open_unchecked_db(&config, &network);
+    let before_frontier = before
+        .load_header_root_auth_frontier()
+        .expect("frontier loads before rollback")
+        .expect("synced tip has an auth frontier");
+    assert_eq!(before_frontier.confirmed_height(), Height(2));
+    assert!(before.commitment_roots(Height(2)).is_some());
+    drop(before);
+
+    rollback_finalized_state(
+        config.clone(),
+        &network,
+        RollbackFinalizedStateOptions {
+            target_height: Height(1),
+            keep_rolled_back_blocks: false,
+            max_checkpoint_height: None,
+        },
+    )
+    .expect("rollback to height 1 succeeds");
+
+    let after = open_unchecked_db(&config, &network);
+    assert_eq!(after.tip().map(|(h, _)| h), Some(Height(1)));
+    let after_frontier = after
+        .load_header_root_auth_frontier()
+        .expect("frontier loads after rollback")
+        .expect("rolled-back tip keeps an auth frontier");
+    assert_eq!(
+        after_frontier.confirmed_height(),
+        Height(1),
+        "frontier must rebase to the rollback target tip"
+    );
+    assert_eq!(
+        after_frontier.confirmed_hash(),
+        block1_hash,
+        "frontier hash must match the new tip"
+    );
+    assert_eq!(
+        after.commitment_roots(Height(2)),
+        None,
+        "commitment roots above the target must be truncated"
+    );
+    assert!(
+        after.commitment_roots(Height(1)).is_some(),
+        "commitment roots at the target tip must remain"
+    );
+    after
+        .validate_header_root_auth_state()
+        .expect("rolled-back frontier must remain coherent")
+        .expect("frontier exists after rollback");
+}
+
 /// A configured testnet with early modern activation heights, so rollback tests can exercise
 /// Canopy-and-later history roots without syncing hundreds of thousands of blocks.
 fn modern_rollback_network() -> Network {

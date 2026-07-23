@@ -1029,6 +1029,16 @@ impl FaultPoint {
         Self::AfterPublish,
         Self::BeforeReactorObserve,
     ];
+
+    /// Ordered crash surface reached by a transition with no header-chain changes.
+    pub const NO_CHANGE: [Self; 6] = [
+        Self::AfterSnapshot,
+        Self::AfterVersionCheck,
+        Self::BeforeDbCommit,
+        Self::AfterDbCommit,
+        Self::BeforeMemorySwap,
+        Self::BeforeReactorObserve,
+    ];
 }
 
 /// One RocksDB-backed header DAG with a process-local serialized writer.
@@ -2338,12 +2348,13 @@ mod tests {
         parameters::{testnet::RegtestParameters, Network},
     };
     use zakura_header_chain::{
-        AlarmSet, BodyEvidence, BodyRuleId, BodyUnavailableSummary, BodyValidationState,
-        CheckpointSet, EligibilityReason, EngineConfig, EngineMode, FinalityEpoch, FrontierSet,
-        FullStateEvidenceAuthority, HeaderChainDiskVersion, HeaderGeneration,
-        HeaderValidationState, StateVersion, SuffixWork, SystemClock, TransientBodyFailure,
-        TransientBodyFailureKind, TransitionEvent, TrustedAnchor, VerifiedBodyEvidence,
-        VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration, WorkCoordinate,
+        AlarmSet, BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch, BodyRuleId,
+        BodyUnavailableSummary, BodyValidationState, CheckpointSet, EligibilityReason,
+        EngineConfig, EngineMode, FinalityEpoch, FrontierSet, FullStateEvidenceAuthority,
+        HeaderChainDiskVersion, HeaderGeneration, HeaderValidationState, SourceId, StateVersion,
+        SuffixWork, SystemClock, TransientBodyFailure, TransientBodyFailureKind, TransitionEvent,
+        TrustedAnchor, VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause,
+        VerifiedGeneration, WorkCoordinate,
     };
 
     struct Authority(EvidenceId);
@@ -3890,6 +3901,143 @@ mod tests {
             assert_eq!(
                 reopened.store.snapshot().expect("the snapshot reopens"),
                 report.current,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aud_14_no_change_crash_points_preserve_the_paired_full_state_transaction() {
+        for (index, target) in FaultPoint::NO_CHANGE.into_iter().enumerate() {
+            let cache = tempfile::tempdir().expect("the test cache directory is created");
+            let db_config = Config {
+                cache_dir: cache.path().to_owned(),
+                ephemeral: false,
+                debug_skip_non_finalized_state_backup_task: true,
+                ..Config::default()
+            };
+            let (engine_config, anchor, metadata) = fixture();
+            let network = engine_config.network.clone();
+            let db = open(&db_config, &network);
+            let store = HeaderChainStore::new(db.clone());
+            store
+                .initialize(metadata.clone(), anchor.clone())
+                .expect("the empty schema initializes");
+            let (runtime, _) = store
+                .startup(&engine_config)
+                .expect("the initial store audits");
+            let marker = u8::try_from(index + 0x40).expect("the fault-point list fits in u8");
+            let evidence = EvidenceId::from_digest([marker; 32]);
+            let authority = Authority(evidence);
+            let context = TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                startup_capability: None,
+                retention_references: &[],
+            };
+            let request = TransitionRequest {
+                expected_version: metadata.state_version,
+                event: TransitionEvent::BodyEvidence(BodyEvidence::PayloadMismatch(
+                    BodyPayloadMismatch {
+                        evidence,
+                        requested: anchor.hash,
+                        delivered: block::Hash([marker; 32]),
+                        kind: BodyCommitmentKind::HeaderHash,
+                        source: SourceId::from_digest([marker.wrapping_add(1); 32]),
+                    },
+                )),
+            };
+            let marker_key = [marker; 4];
+            let mut full_state_batch = DiskWriteBatch::new();
+            runtime
+                .store
+                .put_raw(
+                    &mut full_state_batch,
+                    ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+                    marker_key,
+                    [marker],
+                )
+                .expect("the paired full-state marker can be staged");
+            let memory_swapped = Arc::new(AtomicBool::new(false));
+            let swap_probe = memory_swapped.clone();
+            let result = runtime.apply_combined_with_fault(
+                request,
+                &context,
+                full_state_batch,
+                move || swap_probe.store(true, Ordering::SeqCst),
+                |point| {
+                    if point == target {
+                        Err(HeaderChainStoreError::InjectedCrash(point))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(HeaderChainStoreError::InjectedCrash(point)) if point == target
+            ));
+
+            let committed = matches!(
+                target,
+                FaultPoint::AfterDbCommit
+                    | FaultPoint::BeforeMemorySwap
+                    | FaultPoint::BeforeReactorObserve
+            );
+            let marker_cf = runtime
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the marker column family is open");
+            assert_eq!(
+                runtime
+                    .store
+                    .db
+                    .raw_get_cf(&marker_cf, &marker_key)
+                    .expect("the paired marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+            assert_eq!(
+                memory_swapped.load(Ordering::SeqCst),
+                target == FaultPoint::BeforeReactorObserve,
+                "{target:?}"
+            );
+            assert_eq!(
+                runtime.publisher().snapshot(),
+                metadata.snapshot(),
+                "a no-change transition never publishes at {target:?}"
+            );
+            drop(runtime);
+            drop(db);
+
+            let (reopened, report) = HeaderChainStore::new(open(&db_config, &network))
+                .startup(&engine_config)
+                .expect("the no-change crash boundary reopens coherently");
+            assert_eq!(report.current, metadata.snapshot(), "{target:?}");
+            assert_eq!(
+                reopened.publisher().snapshot(),
+                report.current,
+                "{target:?}"
+            );
+            assert_eq!(
+                reopened.store.snapshot().expect("the snapshot reopens"),
+                report.current,
+                "{target:?}"
+            );
+            let reopened_marker_cf = reopened
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the reopened marker column family is open");
+            assert_eq!(
+                reopened
+                    .store
+                    .db
+                    .raw_get_cf(&reopened_marker_cf, &marker_key)
+                    .expect("the reopened paired marker read succeeds")
+                    .is_some(),
+                committed,
                 "{target:?}"
             );
         }

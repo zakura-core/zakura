@@ -56,7 +56,10 @@ after the same peer reconnects with a new session generation. The driver has no
 independent durable or ownership state: before a result event is sent, a lost
 read has no effects, a completed atomic write is recovered from its committed
 snapshot, and any delayed event is subject to the tested reactor owner/session
-gates. Shared AUD-15 next-child helpers cover the final exact selected
-header and verified frontiers in every structured replay, the consecutive-reset
-and incident fixtures, and AUD-10 through AUD-13. Direct AUD-15 wiring at the
-network-only AUD-05 through AUD-09 orchestrations is open.
+gates. AUD-15 exact-parent checks now run on a clone of the real post-transition
+store after every changed header or verified frontier, as well as at both final
+frontiers. The same helper runs after each consecutive reset and permutation
+winner; the incident fixture and AUD-10 through AUD-13 retain their focused
+checks. AUD-05 through AUD-09 are snapshot consumers rather than frontier
+mutation sites, so their conformance obligation is the already-tested
+retirement of work owned by the producer's old exact frontier.

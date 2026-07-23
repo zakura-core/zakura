@@ -543,6 +543,26 @@ fn apply_event<S: StoreRead>(
                         "auxiliary delivery does not match the admitted target",
                     ));
                 }
+                let indexed_count = graph
+                    .node(delivery.header_hash)
+                    .expect("the auxiliary header was checked above")
+                    .aux_delivery_ids
+                    .iter()
+                    .filter(|delivery_id| **delivery_id == delivery.delivery_id)
+                    .count();
+                let stored = store
+                    .aux_deliveries(delivery.header_hash)?
+                    .into_iter()
+                    .find(|stored| stored.delivery_id == delivery.delivery_id);
+                match (stored, indexed_count) {
+                    (Some(stored), 1) if stored == *delivery => continue,
+                    (None, 0) => {}
+                    _ => {
+                        return Err(TransitionFailure::InvalidEvidence(
+                            "auxiliary delivery replay changes provenance or indexing",
+                        ));
+                    }
+                }
                 graph
                     .node_mut(delivery.header_hash)?
                     .aux_delivery_ids

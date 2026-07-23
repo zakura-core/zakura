@@ -665,7 +665,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-WIRE-11"
 name = "Peer-attributable violations"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::pipe::run_peer"
+tests = ["PW-04::unsolicited_and_mismatched_responses_are_protocol_rejected", "PW-04::broken_ancestry_and_completed_target_are_rejected", "PW-04::wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable", "PW-04::decode_rejects_each_vector_hint_schema_and_byte_boundary"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-WIRE-12"

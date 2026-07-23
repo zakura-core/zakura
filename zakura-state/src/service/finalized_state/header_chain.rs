@@ -2029,12 +2029,12 @@ mod tests {
         parameters::{testnet::RegtestParameters, Network},
     };
     use zakura_header_chain::{
-        AlarmSet, BodyEvidence, BodyRuleId, BodyValidationState, CheckpointSet, EligibilityReason,
-        EngineConfig, EngineMode, FinalityEpoch, FrontierSet, FullStateEvidenceAuthority,
-        HeaderChainDiskVersion, HeaderGeneration, HeaderValidationState, StateVersion, SuffixWork,
-        SystemClock, TransientBodyFailure, TransientBodyFailureKind, TransitionEvent,
-        TrustedAnchor, VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration,
-        WorkCoordinate,
+        AlarmSet, BodyEvidence, BodyRuleId, BodyUnavailableSummary, BodyValidationState,
+        CheckpointSet, EligibilityReason, EngineConfig, EngineMode, FinalityEpoch, FrontierSet,
+        FullStateEvidenceAuthority, HeaderChainDiskVersion, HeaderGeneration,
+        HeaderValidationState, StateVersion, SuffixWork, SystemClock, TransientBodyFailure,
+        TransientBodyFailureKind, TransitionEvent, TrustedAnchor, VerifiedBodyEvidence,
+        VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration, WorkCoordinate,
     };
 
     struct Authority(EvidenceId);
@@ -2641,6 +2641,11 @@ mod tests {
                 hash: anchor.hash,
                 evidence,
                 kind: TransientBodyFailureKind::Storage,
+                availability: BodyUnavailableSummary {
+                    attempts: 10,
+                    suppliers: 2,
+                    alarmed: true,
+                },
             })),
         };
         let receipt = runtime
@@ -2656,9 +2661,22 @@ mod tests {
             .has_changed()
             .expect("the publisher remains open"));
         assert_eq!(*subscriber.borrow_and_update(), receipt.current);
+        assert_eq!(
+            receipt.current.alarms.header_best_body_unavailable,
+            Some(BodyUnavailableSummary {
+                attempts: 10,
+                suppliers: 2,
+                alarmed: true,
+            })
+        );
         assert!(matches!(
             runtime.store.node(anchor.hash).expect("the node row decodes").expect("the anchor remains").body,
-            BodyValidationState::Unavailable(summary) if summary.attempts == 1
+            BodyValidationState::Unavailable(summary)
+                if summary == BodyUnavailableSummary {
+                    attempts: 10,
+                    suppliers: 2,
+                    alarmed: true,
+                }
         ));
         assert!(matches!(
             runtime.apply(request, &context).expect("idempotent replay succeeds"),
@@ -2692,8 +2710,44 @@ mod tests {
                 .expect("the reopened node row decodes")
                 .expect("the reopened anchor exists")
                 .body,
-            BodyValidationState::Unavailable(summary) if summary.attempts == 1
+            BodyValidationState::Unavailable(summary)
+                if summary == BodyUnavailableSummary {
+                    attempts: 10,
+                    suppliers: 2,
+                    alarmed: true,
+                }
         ));
+        let verified_evidence = EvidenceId::from_digest([8; 32]);
+        let verified_authority = Authority(verified_evidence);
+        let verified_context = TransitionContext {
+            config: &engine_config,
+            clock: &SystemClock,
+            full_state_authority: Some(&verified_authority),
+            startup_capability: None,
+            retention_references: &[],
+        };
+        let verified = reopened
+            .apply(
+                TransitionRequest {
+                    expected_version: StateVersion::new(2),
+                    event: TransitionEvent::BodyEvidence(BodyEvidence::Verified(
+                        VerifiedBodyEvidence {
+                            hash: anchor.hash,
+                            evidence: verified_evidence,
+                        },
+                    )),
+                },
+                &verified_context,
+            )
+            .expect("verified body evidence clears persistent unavailability");
+        let ApplyResult::Committed(verified) = verified else {
+            panic!("new verified body evidence commits");
+        };
+        assert_eq!(
+            verified.current.frontiers.header_best,
+            receipt.current.frontiers.header_best
+        );
+        assert_eq!(verified.current.alarms.header_best_body_unavailable, None);
     }
 
     #[test]
@@ -2775,6 +2829,11 @@ mod tests {
                 hash: anchor.hash,
                 evidence,
                 kind: TransientBodyFailureKind::Storage,
+                availability: BodyUnavailableSummary {
+                    attempts: 1,
+                    suppliers: 1,
+                    alarmed: false,
+                },
             })),
         };
         assert!(matches!(
@@ -3253,6 +3312,11 @@ mod tests {
                         hash: anchor.hash,
                         evidence,
                         kind: TransientBodyFailureKind::Storage,
+                        availability: BodyUnavailableSummary {
+                            attempts: 1,
+                            suppliers: 1,
+                            alarmed: false,
+                        },
                     },
                 )),
             };

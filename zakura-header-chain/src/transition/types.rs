@@ -403,6 +403,8 @@ pub struct TransientBodyFailure {
     pub evidence: EvidenceId,
     /// Exact retry category.
     pub kind: TransientBodyFailureKind,
+    /// Bounded persistent state of the owning retry episode.
+    pub availability: BodyUnavailableSummary,
 }
 
 /// Full-state acceptance of one exact body/header pair.
@@ -901,6 +903,11 @@ mod tests {
                 hash,
                 evidence,
                 kind: TransientBodyFailureKind::MissingContext,
+                availability: BodyUnavailableSummary {
+                    attempts: 1,
+                    suppliers: 1,
+                    alarmed: false,
+                },
             })),
             BodyEvidence::Transient(TransientBodyFailure { hash: actual, .. }) if actual == hash
         ));

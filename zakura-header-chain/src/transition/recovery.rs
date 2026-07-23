@@ -96,6 +96,8 @@ pub enum RecoveryRepair {
     InheritedEligibility,
     /// Oldest-retained metadata differed from source nodes.
     RetentionMetadata,
+    /// Selected-tip body-unavailability alarm differed from its durable node.
+    BodyAvailabilityAlarm,
 }
 
 /// Exact source-derived state to install before startup publication.
@@ -294,6 +296,17 @@ pub fn audit_store<S: StoreAuditRead>(
     if metadata.oldest_retained_height != oldest_retained_height {
         repairs.insert(RecoveryRepair::RetentionMetadata);
     }
+    let body_unavailable_alarm = match &node_map
+        .get(&selected_tip.hash)
+        .ok_or_else(|| source_failure(AuditViolation::ProtectedPath(selected_tip.hash)))?
+        .body
+    {
+        crate::BodyValidationState::Unavailable(summary) if summary.alarmed => Some(*summary),
+        _ => None,
+    };
+    if metadata.alarms.header_best_body_unavailable != body_unavailable_alarm {
+        repairs.insert(RecoveryRepair::BodyAvailabilityAlarm);
+    }
 
     if !repairs.is_empty() {
         metadata.state_version = metadata.state_version.checked_next()?;
@@ -308,6 +321,7 @@ pub fn audit_store<S: StoreAuditRead>(
         metadata.frontiers.header_best = selected_tip;
         metadata.header_best_score = selected_score;
         metadata.oldest_retained_height = oldest_retained_height;
+        metadata.alarms.header_best_body_unavailable = body_unavailable_alarm;
     }
 
     Ok(RecoveryPlan {
@@ -660,8 +674,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        AlarmSet, AuxAuthentication, BodyRuleId, BodySizeHint, BranchId, CheckpointSet,
-        EligibilityState, EngineMode, EvidenceId, FinalityEpoch, FrontierSet,
+        AlarmSet, AuxAuthentication, BodyRuleId, BodySizeHint, BodyUnavailableSummary, BranchId,
+        CheckpointSet, EligibilityState, EngineMode, EvidenceId, FinalityEpoch, FrontierSet,
         HeaderChainDiskVersion, HeaderGeneration, HeaderValidationState, SourceId, StateVersion,
         SuffixWork, TrustedAnchor, ValidationLease, VerifiedGeneration, WorkCoordinate, WorkOwner,
     };
@@ -904,6 +918,29 @@ mod tests {
         let plan = audit_store(&store, &config).expect("the coherent fixture audits cleanly");
         assert!(plan.is_clean());
         assert_eq!(plan.metadata, store.metadata);
+    }
+
+    #[test]
+    fn body_unavailability_alarm_is_reconstructed_from_the_selected_node() {
+        let (mut store, config) = fixture();
+        let summary = BodyUnavailableSummary {
+            attempts: 10,
+            suppliers: 2,
+            alarmed: true,
+        };
+        store.nodes[1].body = crate::BodyValidationState::Unavailable(summary);
+
+        let plan = audit_store(&store, &config).expect("the derived alarm is reconstructible");
+        assert_eq!(
+            plan.repairs,
+            BTreeSet::from([RecoveryRepair::BodyAvailabilityAlarm])
+        );
+        assert_eq!(
+            plan.metadata.alarms.header_best_body_unavailable,
+            Some(summary)
+        );
+        assert_eq!(plan.metadata.state_version, StateVersion::new(2));
+        assert_eq!(plan.metadata.header_generation, HeaderGeneration::new(1));
     }
 
     #[test]

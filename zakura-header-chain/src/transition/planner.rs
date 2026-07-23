@@ -6,12 +6,12 @@ use thiserror::Error;
 use zakura_chain::block;
 
 use crate::{
-    BodyEvidence, BodyUnavailableSummary, BodyValidationState, ChangeSet, CounterExhausted,
-    EligibilityDelta, EligibilityReason, EngineLimits, EngineMetadata, EngineMode, EngineSnapshot,
-    EventAdmission, EvidenceId, FinalityRecord, FinalitySource, Frontier, FrontierSet, GraphError,
-    HeaderNode, HeaderValidationState, IndexChanges, MemHeaderStore, ProjectionDelta,
-    RetentionPlan, StateVersion, StoreError, StoreRead, TargetCompletion, TransitionCause,
-    TransitionContext, TransitionEvent, TransitionRequest, WorkOwner,
+    BodyEvidence, BodyValidationState, ChangeSet, CounterExhausted, EligibilityDelta,
+    EligibilityReason, EngineLimits, EngineMetadata, EngineMode, EngineSnapshot, EventAdmission,
+    EvidenceId, FinalityRecord, FinalitySource, Frontier, FrontierSet, GraphError, HeaderNode,
+    HeaderValidationState, IndexChanges, MemHeaderStore, ProjectionDelta, RetentionPlan,
+    StateVersion, StoreError, StoreRead, TargetCompletion, TransitionCause, TransitionContext,
+    TransitionEvent, TransitionRequest, WorkOwner,
 };
 
 /// A complete write set plus the private projected graph it was verified against.
@@ -568,22 +568,15 @@ fn apply_event<S: StoreRead>(
         }
         TransitionEvent::BodyEvidence(BodyEvidence::PayloadMismatch(_)) => {}
         TransitionEvent::BodyEvidence(BodyEvidence::Transient(event)) => {
-            let previous = graph
-                .node(event.hash)
-                .ok_or(GraphError::UnknownNode(event.hash))?
-                .body
-                .clone();
-            let summary = match previous {
-                BodyValidationState::Unavailable(summary) => BodyUnavailableSummary {
-                    attempts: summary.attempts.saturating_add(1),
-                    ..summary
-                },
-                _ => BodyUnavailableSummary {
-                    attempts: 1,
-                    ..BodyUnavailableSummary::default()
-                },
-            };
-            graph.set_body_state(event.hash, BodyValidationState::Unavailable(summary))?;
+            if event.availability.attempts == 0 {
+                return Err(TransitionFailure::InvalidEvidence(
+                    "body retry evidence has no failed attempt",
+                ));
+            }
+            graph.set_body_state(
+                event.hash,
+                BodyValidationState::Unavailable(event.availability),
+            )?;
         }
         TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(event)) => {
             graph.set_consensus_body_invalid(event.hash, event.evidence, event.rule.clone())?;
@@ -758,6 +751,17 @@ fn derive_plan(
     eligibility_changes.sort_unstable_by_key(|delta| delta.hash.0);
     let selected_changed = selected != old_selected;
     let verified_changed = verified != old_verified;
+    let header_best = *selected.last().ok_or(TransitionFailure::InvalidEvidence(
+        "selected projection is empty",
+    ))?;
+    metadata.alarms.resource_stalled = retention.resource_stalled;
+    let header_best_node = graph
+        .node(header_best.hash)
+        .ok_or(GraphError::UnknownNode(header_best.hash))?;
+    metadata.alarms.header_best_body_unavailable = match &header_best_node.body {
+        BodyValidationState::Unavailable(summary) if summary.alarmed => Some(*summary),
+        _ => None,
+    };
     let alarm_changed = metadata.alarms != before.alarms;
     let changed = !put_nodes.is_empty()
         || !delete_nodes.is_empty()
@@ -781,9 +785,6 @@ fn derive_plan(
             metadata.last_transition_id = event_id;
         }
     }
-    let header_best = *selected.last().ok_or(TransitionFailure::InvalidEvidence(
-        "selected projection is empty",
-    ))?;
     let verified_best = *verified.last().ok_or(TransitionFailure::InvalidEvidence(
         "verified projection is empty",
     ))?;
@@ -798,7 +799,6 @@ fn derive_plan(
         .map(|node| node.height)
         .min()
         .unwrap_or(graph.finalized().height);
-    metadata.alarms.resource_stalled = retention.resource_stalled;
     let inserted = put_nodes
         .iter()
         .filter(|node| !old_nodes.contains_key(&node.hash))

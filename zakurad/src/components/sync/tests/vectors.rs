@@ -2492,6 +2492,7 @@ async fn registry_miss_retry_allows_bounded_reserve_dispatch() {
 /// of the available reserve.
 #[tokio::test]
 async fn registry_missed_hash_retries_while_reserve_dispatch_continues() {
+    // Keep the negative dispatch assertion fast while still allowing the mock service to be polled.
     let (
         mut chain_sync,
         _sync_status,
@@ -2501,6 +2502,8 @@ async fn registry_missed_hash_retries_while_reserve_dispatch_continues() {
         _mock_chain_tip_sender,
     ) = setup_chain_sync_with_options(Height(0), Duration::from_millis(50));
 
+    // Seed the post-NotFoundRegistry backoff state directly. Peer routing is covered elsewhere;
+    // this test follows sync_round across the retry deadline.
     let missing_hash = block::Hash::from([0xAB; 32]);
     chain_sync
         .handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::DownloadFailed {
@@ -2510,6 +2513,8 @@ async fn registry_missed_hash_retries_while_reserve_dispatch_continues() {
         .await
         .expect("a registry miss within budget should stay within the retry loop");
 
+    // The first reserve hash proves progress during the backoff. The second proves dispatch stays
+    // bounded until the missed hash has been retried.
     let first_reserve_hash = block::Hash::from([0x11; 32]);
     let second_reserve_hash = block::Hash::from([0x22; 32]);
     let reserve = [first_reserve_hash, second_reserve_hash]
@@ -2520,6 +2525,7 @@ async fn registry_missed_hash_retries_while_reserve_dispatch_continues() {
         let sync_round = chain_sync.sync_round(reserve);
         tokio::pin!(sync_round);
 
+        // Keep the round polled while the mock verifies the externally observable request order.
         tokio::select! {
             result = &mut sync_round => {
                 panic!("the sync round should still be waiting, got {result:?}")
@@ -2532,6 +2538,8 @@ async fn registry_missed_hash_retries_while_reserve_dispatch_continues() {
                         iter::once(first_reserve_hash).collect(),
                     ))
                     .await;
+
+                // This negative assertion distinguishes bounded dispatch from normal batching.
                 peer_set.expect_no_requests().await;
 
                 // Wait out the backoff (with margin for a delayed timer under test load): the
@@ -2539,11 +2547,16 @@ async fn registry_missed_hash_retries_while_reserve_dispatch_continues() {
                 // the deferred reserve hash.
                 tokio::time::sleep(sync::REGISTRY_MISS_RETRY_BACKOFF + Duration::from_millis(100))
                     .await;
+
+                // The retry timer is the first biased select arm, so the missed hash must be the
+                // next request rather than being overtaken by the deferred reserve hash.
                 let retry = peer_set
                     .expect_request(zn::Request::BlocksByHash(
                         iter::once(missing_hash).collect(),
                     ))
                     .await;
+
+                // Once the due retry is queued, the remaining reserve work may resume.
                 let second = peer_set
                     .expect_request(zn::Request::BlocksByHash(
                         iter::once(second_reserve_hash).collect(),
@@ -2555,6 +2568,8 @@ async fn registry_missed_hash_retries_while_reserve_dispatch_continues() {
         }
     };
 
+    // All three requests are deliberately left unanswered; cancel their download tasks before
+    // dropping the mock request handles.
     chain_sync.downloads.cancel_all();
     drop(requests);
 }

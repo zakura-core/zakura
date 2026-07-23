@@ -2146,12 +2146,20 @@ impl HeaderSyncReactor {
         self.schedule().await;
     }
 
+    /// Admit buffered payloads that can now advance root auth or the header tip.
+    ///
+    /// Headers arrive out of order relative to state progress, so validated responses
+    /// sit in `buffered` until their predecessor tip is ready and an action permit is
+    /// available. Prefer root-auth drain first (serial frontier), then ordered commits.
     async fn drain_buffered_with_permit(
         &mut self,
         mut reserved: Option<mpsc::OwnedPermit<HeaderSyncAction>>,
     ) {
         loop {
+            // Fallback root-auth: a peer-fetched AuthenticateRoots range whose start
+            // is exactly authenticated_height+1 (see next_buffered_root_auth).
             if let Some((key, expected_state)) = self.next_buffered_root_auth() {
+                // Reject if headers do not chain from the authenticated tip hash.
                 let invalid = self.state.buffered.get(&key).and_then(|buffered| {
                     validate_header_range_links(
                         expected_state.authenticated_hash,
@@ -2183,6 +2191,7 @@ impl HeaderSyncReactor {
                     continue;
                 }
 
+                // No capacity yet: leave the buffer parked and wait for a permit.
                 let Some(permit) = self.take_buffered_action_permit(&mut reserved) else {
                     return;
                 };
@@ -2192,6 +2201,7 @@ impl HeaderSyncReactor {
                     .remove(&key)
                     .expect("root-auth candidate exists until action admission");
                 let original = buffered.range;
+                // Pin the range to the live authenticated tip before admission.
                 buffered.range.anchor_hash = Some(expected_state.authenticated_hash);
                 self.state
                     .schedule
@@ -2349,9 +2359,17 @@ impl HeaderSyncReactor {
         }
     }
 
+    /// Pick the next buffered root-auth range that can advance the authenticated tip.
+    ///
+    /// This is the fallback path used by `drain_buffered_with_permit` when retained
+    /// reuse (`try_start_retained_root_authentication`) did not supply the frontier.
+    /// A peer-fetched `AuthenticateRoots` payload sits in `buffered` until it is the
+    /// exact next height after `header_root_auth` and no root-auth op is already
+    /// in flight. Returns the buffer key plus the auth snapshot to validate against.
     fn next_buffered_root_auth(
         &self,
     ) -> Option<((RangePriority, block::Height), HeaderRootAuthState)> {
+        // Root auth is serial: one in-flight AuthenticateRoots at a time.
         if self
             .state
             .pending_operations
@@ -2361,6 +2379,7 @@ impl HeaderSyncReactor {
             return None;
         }
         let auth = self.state.header_root_auth?;
+        // Only the contiguous successor of the authenticated tip is eligible.
         let start = next_height(auth.authenticated_height)?;
         let key = (RangePriority::AuthenticateRoots, start);
         self.state
@@ -2435,7 +2454,8 @@ impl HeaderSyncReactor {
         let Some((start, retained)) = self.state.retained_ready(auth, Instant::now()) else {
             return false;
         };
-        let Some(range) = retained_root_auth_range(auth, &retained.payload, last_checkpoint_height) else {
+        let Some(range) = retained_root_auth_range(auth, &retained.payload, last_checkpoint_height)
+        else {
             return false;
         };
         let wire_request = retained.wire_request.clone();

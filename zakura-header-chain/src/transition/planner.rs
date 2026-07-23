@@ -1588,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_actions_reselect_same_height_verified_forks_and_preserve_nested_reasons() {
+    fn aud_10_invalidation_promotes_alternate_and_aud_12_preserves_nested_reasons() {
         let (mut store, config) = TestStore::new(EngineMode::Integrated);
         let clock = ManualClock(Utc::now());
         let anchor = store.graph.finalized();
@@ -1628,6 +1628,35 @@ mod tests {
             VerifiedGeneration::new(1)
         );
         store.commit(&first);
+
+        let mut promoted = store.clone();
+        let child_request = insertion(&promoted, 1, EvidenceId::from_digest([0x36; 32]));
+        let child = match &child_request.event {
+            TransitionEvent::InsertHeaders(event) => {
+                assert_eq!(
+                    event.parent_hash, loser.hash,
+                    "the next request anchors to the exact promoted branch"
+                );
+                event.target_tip_hash
+            }
+            _ => unreachable!("the next-child fixture constructs one insertion"),
+        };
+        let child_plan =
+            apply_transition(&promoted, child_request, &context(&config, &clock, None))
+                .expect("the promoted branch accepts its next child");
+        assert_eq!(
+            child_plan.change_set.metadata.frontiers.header_best,
+            Frontier::new(block::Height(2), child)
+        );
+        promoted.commit(&child_plan);
+        assert_eq!(
+            promoted
+                .graph
+                .node(child)
+                .expect("the promoted child is retained")
+                .parent_hash,
+            loser.hash
+        );
 
         let second = apply_transition(
             &store,
@@ -1689,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn reconsider_restores_a_shorter_higher_work_verified_branch() {
+    fn aud_12_reconsider_restores_a_shorter_higher_work_verified_branch() {
         use zakura_chain::work::difficulty::{ExpandedDifficulty, U256};
 
         let (mut store, config) = TestStore::new(EngineMode::Integrated);
@@ -1745,7 +1774,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidating_the_only_non_finalized_verified_path_falls_back_to_finalized() {
+    fn aud_11_invalidating_only_verified_path_keeps_independent_header_best() {
         let (mut store, config) = TestStore::new(EngineMode::Integrated);
         let clock = ManualClock(Utc::now());
         let anchor = store.graph.finalized();
@@ -1755,8 +1784,21 @@ mod tests {
             .expect("the anchor exists")
             .header
             .difficulty_threshold;
-        let tip = insert_verified_branch(&mut store.graph, anchor, 2, difficulty, 0x51);
-        synchronize_fixture(&mut store, tip);
+        let verified_tip = insert_verified_branch(&mut store.graph, anchor, 2, difficulty, 0x51);
+        let header_tip = insert_verified_branch(&mut store.graph, anchor, 3, difficulty, 0x53);
+        for frontier in path(&store.graph, header_tip)
+            .expect("the independent header path is retained")
+            .into_iter()
+            .skip(1)
+        {
+            store
+                .graph
+                .set_body_state(frontier.hash, BodyValidationState::Unknown)
+                .expect("the independent candidate deliberately has no verified body");
+        }
+        synchronize_fixture(&mut store, verified_tip);
+        assert_eq!(store.metadata.frontiers.header_best, header_tip);
+        assert_eq!(store.metadata.frontiers.verified_best, verified_tip);
 
         let plan = apply_transition(
             &store,
@@ -1769,7 +1811,10 @@ mod tests {
             &context(&config, &clock, None),
         )
         .expect("invalidating the only full-state branch falls back atomically");
-        assert_eq!(plan.change_set.metadata.frontiers.header_best, anchor);
+        assert_eq!(
+            plan.change_set.metadata.frontiers.header_best, header_tip,
+            "the independently eligible header branch remains selected"
+        );
         assert_eq!(plan.change_set.metadata.frontiers.verified_best, anchor);
         assert_eq!(
             plan.change_set.verified_projection,

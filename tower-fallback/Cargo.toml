@@ -16,6 +16,7 @@ categories = ["algorithms", "asynchronous"]
 
 [lib]
 name = "tower_fallback"
+test = false
 
 [dependencies]
 pin-project = { workspace = true }

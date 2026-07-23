@@ -16,6 +16,9 @@ keywords.workspace = true
 # Must be one of <https://crates.io/category_slugs>
 categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
 
+[lib]
+test = false
+
 [[bin]]
 name = "zakura-checkpoints"
 # this setting is required for Zakura's Docker build caches

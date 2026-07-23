@@ -1079,6 +1079,17 @@ impl HeaderChainStore {
         self,
         config: &EngineConfig,
     ) -> Result<(HeaderChainRuntime, StartupReport), HeaderChainStoreError> {
+        self.startup_with_fault(config, |_| Ok(()))
+    }
+
+    fn startup_with_fault<F>(
+        self,
+        config: &EngineConfig,
+        mut fault: F,
+    ) -> Result<(HeaderChainRuntime, StartupReport), HeaderChainStoreError>
+    where
+        F: FnMut(FaultPoint) -> Result<(), HeaderChainStoreError>,
+    {
         let writer = self
             .writer
             .lock()
@@ -1087,10 +1098,13 @@ impl HeaderChainStore {
         if let Some(pin) = plan.metadata.alarms.migrated_pin_refuted {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
         }
+        fault(FaultPoint::AfterSnapshot)?;
         let previous = plan.before.clone();
         let repairs = plan.repairs.clone();
         if !plan.is_clean() {
+            fault(FaultPoint::BeforeDbCommit)?;
             self.db.write(self.recovery_batch(&plan)?)?;
+            fault(FaultPoint::AfterDbCommit)?;
         }
         let current = plan.metadata.snapshot();
         let report = StartupReport {
@@ -1099,7 +1113,9 @@ impl HeaderChainStore {
             repairs,
             publication_allowed: true,
         };
+        fault(FaultPoint::BeforePublish)?;
         let publisher = Publisher::new(current);
+        fault(FaultPoint::AfterPublish)?;
         drop(writer);
         Ok((
             HeaderChainRuntime {
@@ -3727,6 +3743,135 @@ mod tests {
             .expect("the atomic repair reopens coherently");
         assert!(reopened_report.repairs.is_empty());
         assert_eq!(reopened.publisher().snapshot(), report.current);
+    }
+
+    #[test]
+    fn aud_14_startup_recovery_reopens_complete_before_or_after_without_publication() {
+        const STARTUP_FAULT_POINTS: [FaultPoint; 5] = [
+            FaultPoint::AfterSnapshot,
+            FaultPoint::BeforeDbCommit,
+            FaultPoint::AfterDbCommit,
+            FaultPoint::BeforePublish,
+            FaultPoint::AfterPublish,
+        ];
+
+        for target in STARTUP_FAULT_POINTS {
+            let cache = tempfile::tempdir().expect("the test cache directory is created");
+            let db_config = Config {
+                cache_dir: cache.path().to_owned(),
+                ephemeral: false,
+                debug_skip_non_finalized_state_backup_task: true,
+                ..Config::default()
+            };
+            let (engine_config, anchor, metadata) = fixture();
+            let network = engine_config.network.clone();
+            let db = open(&db_config, &network);
+            let store = HeaderChainStore::new(db.clone());
+            store
+                .initialize(metadata.clone(), anchor.clone())
+                .expect("the empty schema initializes");
+            let mut corrupt = DiskWriteBatch::new();
+            store
+                .delete_raw(
+                    &mut corrupt,
+                    HEADER_SELECTED,
+                    HeaderHeightKey(anchor.height).as_bytes(),
+                )
+                .expect("the selected projection row is addressable");
+            db.write(corrupt)
+                .expect("the reconstructible selected-index corruption is durable");
+            assert_eq!(store.selected_hash(anchor.height), Ok(None));
+
+            let observer = store.clone();
+            let result = store.startup_with_fault(&engine_config, |point| {
+                if point == target {
+                    Err(HeaderChainStoreError::InjectedCrash(point))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(
+                result,
+                Err(HeaderChainStoreError::InjectedCrash(point)) if point == target
+            ));
+
+            let committed = matches!(
+                target,
+                FaultPoint::AfterDbCommit | FaultPoint::BeforePublish | FaultPoint::AfterPublish
+            );
+            assert_eq!(
+                observer.selected_hash(anchor.height),
+                if committed {
+                    Ok(Some(anchor.hash))
+                } else {
+                    Ok(None)
+                },
+                "{target:?}"
+            );
+            let durable = observer
+                .metadata()
+                .expect("the startup-recovery metadata is readable");
+            assert_eq!(
+                durable.state_version,
+                if committed {
+                    StateVersion::new(2)
+                } else {
+                    metadata.state_version
+                },
+                "{target:?}"
+            );
+            assert_eq!(
+                durable.header_generation,
+                if committed {
+                    HeaderGeneration::new(2)
+                } else {
+                    metadata.header_generation
+                },
+                "{target:?}"
+            );
+            assert_eq!(
+                durable.verified_generation, metadata.verified_generation,
+                "{target:?}"
+            );
+
+            drop(db);
+            let (reopened, report) = observer
+                .startup(&engine_config)
+                .expect("the interrupted startup recovery completes before publication");
+            assert_eq!(
+                report.repairs,
+                if committed {
+                    BTreeSet::new()
+                } else {
+                    BTreeSet::from([RecoveryRepair::SelectedProjection])
+                },
+                "{target:?}"
+            );
+            assert_eq!(
+                report.current.state_version,
+                StateVersion::new(2),
+                "{target:?}"
+            );
+            assert_eq!(
+                report.current.header_generation,
+                HeaderGeneration::new(2),
+                "{target:?}"
+            );
+            assert_eq!(
+                report.current.verified_generation, metadata.verified_generation,
+                "{target:?}"
+            );
+            assert_eq!(
+                reopened.store.selected_hash(anchor.height),
+                Ok(Some(anchor.hash)),
+                "{target:?}"
+            );
+            assert_eq!(
+                reopened.publisher().snapshot(),
+                report.current,
+                "{target:?}"
+            );
+        }
     }
 
     #[test]

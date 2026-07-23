@@ -858,24 +858,39 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-ACCEPT-01"
 name = "Complete regression coverage"
-status = "unimplemented"
+status = "implemented"
+owner = "xtask::header_conformance::validate_acceptance_claims"
+tests = ["AUD-01::named_losing_branch_can_be_extended_past_the_incumbent", "AUD-02::shorter_higher_work_branch_replaces_a_taller_incumbent", "AUD-03::same_height_forks_are_insertion_order_independent", "AUD-04::consecutive_resets_use_exact_branch_identity", "AUD-05::aud_05_old_network_response_has_no_effects_after_reset", "AUD-06::aud_06_late_state_success_cannot_publish_cover_or_schedule", "AUD-07::aud_07_late_state_failure_cannot_retry_repair_or_score", "AUD-08::aud_08_old_coverage_misses_until_the_exact_reset_branch_completes", "AUD-09::aud_09_every_repair_phase_retires_before_new_generation_work", "AUD-10::aud_10_invalidation_promotes_alternate_and_aud_12_preserves_nested_reasons", "AUD-11::aud_11_invalidating_only_verified_path_keeps_independent_header_best", "AUD-12::aud_12_reconsider_restores_a_shorter_higher_work_verified_branch", "AUD-13::aud_13_finalization_and_replacement_match_complete_serial_histories", "AUD-14::aud_14_every_state_writer_crash_point_reopens_complete_before_or_after", "AUD-14::aud_14_requester_insertion_reopens_complete_before_or_after", "AUD-14::aud_14_verified_grow_and_reset_reopen_complete_before_or_after", "AUD-14::aud_14_body_conclusions_reopen_complete_before_or_after", "AUD-14::aud_14_operator_reason_changes_reopen_complete_before_or_after", "AUD-14::aud_14_finality_advance_reopens_complete_before_or_after", "AUD-14::aud_14_selected_auxiliary_repair_reopens_complete_before_or_after", "AUD-14::aud_14_aux_authentication_reopens_complete_before_or_after", "AUD-14::aud_14_startup_recovery_reopens_complete_before_or_after_without_publication", "AUD-15::every_changed_frontier_accepts_an_exact_parent_next_child", "AUD-INCIDENT::aud_incident_late_a_completion_cannot_break_promoted_b"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-ACCEPT-02"
 name = "Durable deterministic frontiers"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::apply_transition + zakura_state::HeaderChainRuntime::apply_combined"
+tests = ["AUD-15::every_changed_frontier_accepts_an_exact_parent_next_child", "DG-03::aud_14_every_state_writer_crash_point_reopens_complete_before_or_after", "DG-01::same_height_forks_are_insertion_order_independent", "PW-03::complete_target_is_independent_of_page_partition", "DG-07::aud_13_finalization_and_replacement_match_complete_serial_histories", "DG-07::headers_only_finalizes_exactly_tip_minus_one_thousand_before_publication", "DG-07::migrated_headers_only_pin_refutation_is_durable_and_fail_closed"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-ACCEPT-03"
 name = "Zero stale-generation effects"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::NoEffectsProbe"
+tests = ["AUD-05::aud_05_old_network_response_has_no_effects_after_reset", "AUD-06::aud_06_late_state_success_cannot_publish_cover_or_schedule", "AUD-07::aud_07_late_state_failure_cannot_retry_repair_or_score", "IN-05::all_work_types_require_generation_and_branch", "AUD-08::generation_change_conservatively_reuses_no_finalized_or_forward_coverage", "AUD-09::aud_09_every_repair_phase_retires_before_new_generation_work", "IN-05::committed_reanchor_releases_stale_submitted_bodies", "IN-05::aud_06_07_live_reactor_ignores_results_retired_by_a_committed_snapshot"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-ACCEPT-04"
 name = "Terminating body-failure handling"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::BodyRetryEpisode"
+tests = ["IN-02::in_02_header_valid_body_invalid_reselects_after_exact_authenticated_evidence", "IN-03::exact_backoff_caps_then_alarms_and_probes_every_ten_minutes", "IN-03::elapsed_alarm_waits_until_every_known_supplier_was_tried", "IN-03::persisted_body_alarm_is_exact_global_and_survives_reconnect", "DG-02::body_availability_does_not_override_header_work_or_mark_other_bodies", "AUD-14::aud_14_body_retry_restarts_reopen_complete_before_or_after"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-ACCEPT-05"
 name = "Explained parity differences"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::BodyVerificationClass + xtask::header_conformance::validate_acceptance_claims"
+tests = ["DF-01::df_01_generated_nu5_graph_matches_full_state_before_finalization", "DF-02::df_02_full_state_failures_have_exact_intentional_difference_types", "DF-02::df_02_contextual_body_failures_have_exact_intentional_difference_types", "conformance::acceptance_is_all_or_nothing_and_requires_every_named_audit", "conformance::implementation_claims_require_real_owner_tests_and_networks"]
+networks = ["mainnet", "testnet", "custom"]

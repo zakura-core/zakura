@@ -17,6 +17,7 @@ pub fn run(repo_root: &Path, requested_rule: Option<&str>) -> Result<(), Box<dyn
     let manifest = fs::read_to_string(repo_root.join(MANIFEST_PATH))?;
     let report = validate(&spec, &manifest, &production_expectations())?;
     validate_repository_evidence(repo_root, &manifest)?;
+    validate_acceptance_claims(&report, &spec, &manifest, &production_expectations())?;
 
     if let Some(rule_id) = requested_rule {
         let rule = report
@@ -494,6 +495,77 @@ fn validate_repository_evidence(
     Ok(())
 }
 
+fn validate_acceptance_claims(
+    report: &Report,
+    spec: &str,
+    manifest_text: &str,
+    expected: &Expectations<'_>,
+) -> Result<(), ValidationError> {
+    let acceptance_rules = report
+        .rules
+        .values()
+        .filter(|rule| rule.id.starts_with("LC-ACCEPT-"))
+        .collect::<Vec<_>>();
+    let implemented_acceptance = acceptance_rules
+        .iter()
+        .filter(|rule| rule.status == RuleStatus::Implemented)
+        .count();
+    if implemented_acceptance == 0 {
+        return Ok(());
+    }
+    if implemented_acceptance != acceptance_rules.len() {
+        return Err(ValidationError(
+            "acceptance rules must become implemented together".to_owned(),
+        ));
+    }
+
+    let unimplemented = report
+        .rules
+        .values()
+        .filter(|rule| rule.status == RuleStatus::Unimplemented)
+        .map(|rule| rule.id.as_str())
+        .collect::<Vec<_>>();
+    if !unimplemented.is_empty() {
+        return Err(ValidationError(format!(
+            "acceptance requires every normative rule to be implemented; remaining: [{}]",
+            unimplemented.join(", ")
+        )));
+    }
+
+    let manifest: Manifest = toml::from_str(manifest_text)
+        .map_err(|error| ValidationError(format!("invalid conformance manifest: {error}")))?;
+    let acceptance = manifest
+        .rule
+        .iter()
+        .find(|rule| rule.id == "LC-ACCEPT-01")
+        .ok_or_else(|| ValidationError("manifest has no LC-ACCEPT-01 rule".to_owned()))?;
+    let covered_audits = acceptance
+        .tests
+        .iter()
+        .filter_map(|test| test.split_once("::").map(|(suite, _)| suite.to_owned()))
+        .filter(|suite| suite.starts_with("AUD-"))
+        .collect::<BTreeSet<_>>();
+    let required_audits = expected
+        .audit_ids
+        .iter()
+        .map(|id| (*id).to_owned())
+        .collect::<BTreeSet<_>>();
+    check_set_equality("acceptance audit", &required_audits, &covered_audits)?;
+
+    for (document, text) in [(SPEC_PATH, spec), (MANIFEST_PATH, manifest_text)] {
+        let uppercase = text.to_ascii_uppercase();
+        for marker in ["TODO", "TBD", "FIXME", "???"] {
+            if uppercase.contains(marker) {
+                return Err(ValidationError(format!(
+                    "acceptance document `{document}` contains unresolved marker `{marker}`"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn collect_test_functions(
     repo_root: &Path,
 ) -> Result<BTreeMap<String, Vec<PathBuf>>, ValidationError> {
@@ -724,6 +796,94 @@ status = "unimplemented"
 
         validate_repository_evidence(repo_root, &manifest)
             .expect("every claimed test should resolve to one Rust test function");
+    }
+
+    #[test]
+    fn acceptance_is_all_or_nothing_and_requires_every_named_audit() {
+        fn report(second_status: RuleStatus) -> Report {
+            Report {
+                spec_version: "1.3".to_owned(),
+                rules: [
+                    (
+                        "LC-ACCEPT-01".to_owned(),
+                        RuleReport {
+                            id: "LC-ACCEPT-01".to_owned(),
+                            name: "Complete".to_owned(),
+                            status: RuleStatus::Implemented,
+                            spec_text: "complete".to_owned(),
+                        },
+                    ),
+                    (
+                        "LC-ACCEPT-02".to_owned(),
+                        RuleReport {
+                            id: "LC-ACCEPT-02".to_owned(),
+                            name: "Durable".to_owned(),
+                            status: second_status,
+                            spec_text: "durable".to_owned(),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                audit_ids: ["AUD-01".to_owned(), "AUD-INCIDENT".to_owned()]
+                    .into_iter()
+                    .collect(),
+            }
+        }
+
+        let partial_manifest = r#"spec_version = "1.3"
+[[rule]]
+id = "LC-ACCEPT-01"
+name = "Complete"
+status = "implemented"
+owner = "gate"
+tests = ["AUD-01::matching_documents_validate"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-ACCEPT-02"
+name = "Durable"
+status = "unimplemented"
+"#;
+        let expectations = Expectations {
+            spec_version: "1.3",
+            rule_count: 2,
+            audit_ids: &["AUD-01", "AUD-INCIDENT"],
+        };
+        let error = validate_acceptance_claims(
+            &report(RuleStatus::Unimplemented),
+            "complete specification",
+            partial_manifest,
+            &expectations,
+        )
+        .expect_err("acceptance rules cannot be promoted piecemeal");
+        assert!(error.to_string().contains("implemented together"));
+
+        let complete_manifest = partial_manifest
+            .replace("status = \"unimplemented\"", "status = \"implemented\"")
+            .replace(
+                "tests = [\"AUD-01::matching_documents_validate\"]",
+                "tests = [\"AUD-01::matching_documents_validate\", \
+                 \"AUD-INCIDENT::matching_documents_validate\"]",
+            );
+        validate_acceptance_claims(
+            &report(RuleStatus::Implemented),
+            "complete specification",
+            &complete_manifest,
+            &expectations,
+        )
+        .expect("all rules and named audits close acceptance together");
+
+        let missing_audit =
+            complete_manifest.replace(", \"AUD-INCIDENT::matching_documents_validate\"", "");
+        let error = validate_acceptance_claims(
+            &report(RuleStatus::Implemented),
+            "complete specification",
+            &missing_audit,
+            &expectations,
+        )
+        .expect_err("every named audit must be explicit");
+        assert!(error.to_string().contains("AUD-INCIDENT"));
     }
 
     #[test]

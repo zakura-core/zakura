@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     Clock, EngineConfig, EvidenceId, HeaderContextFact, HeaderValidationState, PreparedHeader,
-    PreparedHeaderBatch, ValidationLease,
+    PreparedHeaderBatch, RuleId, ValidationLease,
 };
 
 /// Ordered, nonempty canonical headers to validate against one exact parent lease.
@@ -93,6 +93,41 @@ pub enum HeaderRule {
     ValidationLease,
     /// Exact per-block work calculation.
     Work,
+}
+
+impl HeaderRule {
+    /// Return every normative rule implemented by this validation stage.
+    pub const fn rule_ids(self) -> &'static [RuleId] {
+        const ENCODING_VERSION_HASH: &[RuleId] = &[RuleId::new("LC-VAL-02")];
+        const PARENT_LINK: &[RuleId] = &[RuleId::new("LC-VAL-03")];
+        const INFERRED_HEIGHT: &[RuleId] = &[RuleId::new("LC-HEIGHT-01")];
+        const COMMITMENT_STRUCTURE: &[RuleId] =
+            &[RuleId::new("LC-COMMIT-01"), RuleId::new("LC-COMMIT-02")];
+        const TARGET: &[RuleId] = &[RuleId::new("LC-VAL-05")];
+        const EQUIHASH: &[RuleId] = &[RuleId::new("LC-VAL-04")];
+        const CONTEXTUAL_DIFFICULTY_AND_TIME: &[RuleId] = &[
+            RuleId::new("LC-VAL-06"),
+            RuleId::new("LC-VAL-07"),
+            RuleId::new("LC-TIME-01"),
+        ];
+        const LOCAL_FUTURE_TIME: &[RuleId] = &[RuleId::new("LC-VAL-08")];
+        const VALIDATION_LEASE: &[RuleId] =
+            &[RuleId::new("LC-ANCHOR-03"), RuleId::new("LC-VAL-11")];
+        const WORK: &[RuleId] = &[RuleId::new("LC-VAL-10")];
+
+        match self {
+            Self::EncodingVersionHash => ENCODING_VERSION_HASH,
+            Self::ParentLink => PARENT_LINK,
+            Self::InferredHeight => INFERRED_HEIGHT,
+            Self::CommitmentStructure => COMMITMENT_STRUCTURE,
+            Self::CompactTarget | Self::HashToTarget => TARGET,
+            Self::Equihash => EQUIHASH,
+            Self::ContextualDifficultyAndTime => CONTEXTUAL_DIFFICULTY_AND_TIME,
+            Self::LocalFutureTime => LOCAL_FUTURE_TIME,
+            Self::ValidationLease => VALIDATION_LEASE,
+            Self::Work => WORK,
+        }
+    }
 }
 
 /// Failure to prepare a batch. Only local future time is represented in a successful batch.
@@ -410,5 +445,39 @@ mod tests {
             ),
             Err(HeaderFailure::InvalidLease)
         ));
+    }
+
+    #[test]
+    fn validation_stages_expose_their_exact_normative_rule_ids() {
+        let cases: &[(HeaderRule, &[RuleId])] = &[
+            (HeaderRule::EncodingVersionHash, &[RuleId::new("LC-VAL-02")]),
+            (HeaderRule::ParentLink, &[RuleId::new("LC-VAL-03")]),
+            (HeaderRule::InferredHeight, &[RuleId::new("LC-HEIGHT-01")]),
+            (
+                HeaderRule::CommitmentStructure,
+                &[RuleId::new("LC-COMMIT-01"), RuleId::new("LC-COMMIT-02")],
+            ),
+            (HeaderRule::CompactTarget, &[RuleId::new("LC-VAL-05")]),
+            (HeaderRule::HashToTarget, &[RuleId::new("LC-VAL-05")]),
+            (HeaderRule::Equihash, &[RuleId::new("LC-VAL-04")]),
+            (
+                HeaderRule::ContextualDifficultyAndTime,
+                &[
+                    RuleId::new("LC-VAL-06"),
+                    RuleId::new("LC-VAL-07"),
+                    RuleId::new("LC-TIME-01"),
+                ],
+            ),
+            (HeaderRule::LocalFutureTime, &[RuleId::new("LC-VAL-08")]),
+            (
+                HeaderRule::ValidationLease,
+                &[RuleId::new("LC-ANCHOR-03"), RuleId::new("LC-VAL-11")],
+            ),
+            (HeaderRule::Work, &[RuleId::new("LC-VAL-10")]),
+        ];
+
+        for (stage, expected) in cases {
+            assert_eq!(stage.rule_ids(), *expected, "{stage:?}");
+        }
     }
 }

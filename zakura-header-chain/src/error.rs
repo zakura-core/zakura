@@ -65,6 +65,24 @@ pub enum ErrorCategory {
     LocalResourceOrStorage,
 }
 
+impl ErrorCategory {
+    /// Stable low-cardinality label for metrics and traces.
+    pub const fn metrics_label(self) -> &'static str {
+        match self {
+            Self::MalformedProtocol => "malformed_protocol",
+            Self::InvalidHeader => "invalid_header",
+            Self::ValidLosingFork => "valid_losing_fork",
+            Self::DeferredHeader => "deferred_header",
+            Self::BodyPayloadMismatch => "body_payload_mismatch",
+            Self::ConsensusBodyInvalid => "consensus_body_invalid",
+            Self::OperatorIneligible => "operator_ineligible",
+            Self::StaleTargetOrGeneration => "stale_target_or_generation",
+            Self::LocalAnchorOrIncoherence => "local_anchor_or_incoherence",
+            Self::LocalResourceOrStorage => "local_resource_or_storage",
+        }
+    }
+}
+
 /// Explicit source attribution for evidence and peer scoring.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Attribution {
@@ -76,6 +94,18 @@ pub enum Attribution {
     BodyPeer(SourceId),
     /// Auxiliary-metadata peer is responsible.
     AuxPeer(SourceId),
+}
+
+impl Attribution {
+    /// Stable low-cardinality label for metrics and traces.
+    pub const fn metrics_label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::HeaderPeer(_) => "header_peer",
+            Self::BodyPeer(_) => "body_peer",
+            Self::AuxPeer(_) => "aux_peer",
+        }
+    }
 }
 
 /// Complete typed header-chain failure record.
@@ -177,6 +207,30 @@ impl HeaderChainError {
     pub fn unknown_anchor(subject: ErrorSubject, source: Option<BoxError>) -> Self {
         Self::new(
             ErrorCategory::LocalAnchorOrIncoherence,
+            subject,
+            None,
+            None,
+            Attribution::None,
+            source,
+        )
+    }
+
+    /// Construct a stale target, version, generation, or validation owner.
+    pub fn stale_target(subject: ErrorSubject) -> Self {
+        Self::new(
+            ErrorCategory::StaleTargetOrGeneration,
+            subject,
+            None,
+            None,
+            Attribution::None,
+            None,
+        )
+    }
+
+    /// Construct a local resource, task, service, or storage failure.
+    pub fn local_resource(subject: ErrorSubject, source: Option<BoxError>) -> Self {
+        Self::new(
+            ErrorCategory::LocalResourceOrStorage,
             subject,
             None,
             None,
@@ -313,5 +367,46 @@ mod tests {
         assert_eq!(advertised.attribution, Attribution::None);
         assert!(!advertised.is_automatic_header_peer_fault());
         assert!(!advertised.is_automatic_body_peer_fault());
+    }
+
+    #[test]
+    fn taxonomy_has_stable_exhaustive_metric_and_attribution_labels() {
+        let categories = [
+            (ErrorCategory::MalformedProtocol, "malformed_protocol"),
+            (ErrorCategory::InvalidHeader, "invalid_header"),
+            (ErrorCategory::ValidLosingFork, "valid_losing_fork"),
+            (ErrorCategory::DeferredHeader, "deferred_header"),
+            (ErrorCategory::BodyPayloadMismatch, "body_payload_mismatch"),
+            (
+                ErrorCategory::ConsensusBodyInvalid,
+                "consensus_body_invalid",
+            ),
+            (ErrorCategory::OperatorIneligible, "operator_ineligible"),
+            (
+                ErrorCategory::StaleTargetOrGeneration,
+                "stale_target_or_generation",
+            ),
+            (
+                ErrorCategory::LocalAnchorOrIncoherence,
+                "local_anchor_or_incoherence",
+            ),
+            (
+                ErrorCategory::LocalResourceOrStorage,
+                "local_resource_or_storage",
+            ),
+        ];
+        for (category, expected) in categories {
+            assert_eq!(category.metrics_label(), expected);
+        }
+
+        let source = SourceId::from_digest([9; 32]);
+        for (attribution, expected) in [
+            (Attribution::None, "none"),
+            (Attribution::HeaderPeer(source), "header_peer"),
+            (Attribution::BodyPeer(source), "body_peer"),
+            (Attribution::AuxPeer(source), "aux_peer"),
+        ] {
+            assert_eq!(attribution.metrics_label(), expected);
+        }
     }
 }

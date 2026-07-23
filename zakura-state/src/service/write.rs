@@ -353,6 +353,23 @@ impl HeaderChainWriter {
         )
     }
 
+    fn record_body_invalid(
+        &self,
+        expected_version: StateVersion,
+        invalid: zakura_header_chain::ConsensusBodyInvalid,
+    ) -> Result<ApplyResult, HeaderChainStoreError> {
+        let authority = PreparedAuthority(invalid.evidence);
+        let mut context = self.context();
+        context.full_state_authority = Some(&authority);
+        self.runtime.apply(
+            TransitionRequest {
+                expected_version,
+                event: TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(invalid)),
+            },
+            &context,
+        )
+    }
+
     fn restart_body_availability(
         &self,
         expected_version: StateVersion,
@@ -927,6 +944,12 @@ pub enum NonFinalizedWriteMessage {
         failure: zakura_header_chain::TransientBodyFailure,
         rsp_tx: oneshot::Sender<Result<ApplyResult, HeaderChainStoreError>>,
     },
+    /// One commitment-matching deterministic body rejection admitted by the full verifier.
+    RecordHeaderChainBodyInvalid {
+        expected_version: StateVersion,
+        invalid: zakura_header_chain::ConsensusBodyInvalid,
+        rsp_tx: oneshot::Sender<Result<ApplyResult, HeaderChainStoreError>>,
+    },
     /// A changed authenticated supplier set restarts one persistent alarm.
     RestartHeaderChainBodyAvailability {
         expected_version: StateVersion,
@@ -1490,6 +1513,18 @@ impl WriteBlockWorkerTask {
                     let _ = rsp_tx.send(result);
                     None
                 }
+                NonFinalizedWriteMessage::RecordHeaderChainBodyInvalid {
+                    expected_version,
+                    invalid,
+                    rsp_tx,
+                } => {
+                    let result = header_chain
+                        .as_ref()
+                        .ok_or(HeaderChainStoreError::Uninitialized)
+                        .and_then(|writer| writer.record_body_invalid(expected_version, invalid));
+                    let _ = rsp_tx.send(result);
+                    None
+                }
                 NonFinalizedWriteMessage::RestartHeaderChainBodyAvailability {
                     expected_version,
                     discovery,
@@ -1769,7 +1804,7 @@ mod tests {
     use std::sync::Arc;
 
     use zakura_chain::{
-        block,
+        block::{self, genesis::regtest_genesis_block},
         parameters::{Network, NetworkUpgrade},
         serialization::ZcashDeserializeInto,
         transaction::{arbitrary::transaction_to_fake_v5, Transaction},
@@ -1793,12 +1828,14 @@ mod tests {
         CheckpointVerifiedBlock, Config,
     };
     use zakura_header_chain::{
-        AlarmSet, ApplyResult, AuxAuthentication, BodyUnavailableSummary, BodyValidationState,
-        ChainScore, CheckpointSet, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot,
-        EvidenceId, FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderGeneration,
-        HeaderNode, HeaderValidationState, StateVersion, SuffixWork, TransientBodyFailure,
-        TransientBodyFailureKind, TransitionEvent, TransitionFailure, TrustedAnchor,
-        VerifiedGeneration, WorkCoordinate, WorkScope,
+        AlarmSet, ApplyResult, AuxAuthentication, BodyRuleId, BodyUnavailableSummary,
+        BodyValidationState, BranchId, ChainScore, CheckpointSet, ConsensusBodyInvalid,
+        EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, EvidenceId, FinalityEpoch,
+        Frontier, FrontierSet, HeaderBatchInput, HeaderChainDiskVersion, HeaderGeneration,
+        HeaderNode, HeaderRules, HeaderValidationState, InsertHeaders, SourceId, StateVersion,
+        SuffixWork, SystemClock, TargetCompletion, TransientBodyFailure, TransientBodyFailureKind,
+        TransitionContext, TransitionEvent, TransitionFailure, TransitionRequest, TrustedAnchor,
+        VerifiedGeneration, WorkCoordinate, WorkOwner, WorkScope,
     };
 
     #[test]
@@ -2217,6 +2254,117 @@ mod tests {
                 )
             ))
         ));
+    }
+
+    #[test]
+    fn production_invalid_body_writer_reselects_after_exact_authenticated_evidence() {
+        let _init_guard = zakura_test::init();
+        let network = Network::new_regtest(Default::default());
+        let finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        )
+        .expect("the fixture finalized state opens");
+        let anchor = regtest_genesis_block();
+        let anchor_height = anchor
+            .coinbase_height()
+            .expect("the regtest genesis block has a height");
+        let writer = header_writer(&finalized_state, &network, anchor_height, &anchor);
+        let initial = writer.runtime.publisher().snapshot();
+        let anchor_frontier = initial.frontiers.finalized;
+        let lease = writer
+            .runtime
+            .reader()
+            .validation_context(anchor.hash())
+            .expect("the anchor context read succeeds")
+            .expect("the anchor context exists");
+        let rules = HeaderRules::for_validation_lease(network.clone(), &lease)
+            .expect("the regtest validation policy is coherent");
+        let mut child_header = *anchor.header;
+        child_header.previous_block_hash = anchor.hash();
+        child_header.time += chrono::Duration::seconds(1);
+        let child_header = Arc::new(child_header);
+        let batch = zakura_header_chain::prepare_headers(
+            HeaderBatchInput::new(std::slice::from_ref(&child_header)),
+            &lease,
+            &rules,
+            &SystemClock,
+        )
+        .expect("the exact child passes production header validation");
+        let child = Frontier::new(
+            anchor_height
+                .next()
+                .expect("the genesis fixture has a next height"),
+            child_header.hash(),
+        );
+        let owner = WorkOwner {
+            state_version: initial.state_version,
+            header_generation: initial.header_generation,
+            verified_generation: None,
+            branch: BranchId::new(anchor.hash(), child.hash),
+            session_id: 1,
+            request_id: std::num::NonZeroU64::new(2).expect("two is nonzero"),
+        };
+        writer
+            .runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: initial.state_version,
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner,
+                        source: SourceId::from_digest([3; 32]),
+                        parent_hash: anchor.hash(),
+                        target_tip_hash: child.hash,
+                        completion: TargetCompletion::TargetComplete {
+                            common_ancestor: anchor_frontier,
+                        },
+                        batch,
+                        aux: Vec::new(),
+                    })),
+                },
+                &TransitionContext {
+                    config: &writer.config,
+                    clock: &SystemClock,
+                    full_state_authority: None,
+                    retention_references: &[],
+                },
+            )
+            .expect("the header-only child commits");
+        let selected = writer.runtime.publisher().snapshot();
+        assert_eq!(selected.frontiers.header_best, child);
+
+        let evidence = EvidenceId::from_digest([4; 32]);
+        let rule = BodyRuleId::new("test.commitment_matching_invalid");
+        let result = writer
+            .record_body_invalid(
+                selected.state_version,
+                ConsensusBodyInvalid {
+                    hash: child.hash,
+                    evidence,
+                    rule: rule.clone(),
+                    source: SourceId::from_digest([5; 32]),
+                },
+            )
+            .expect("the exact verifier evidence reaches the production writer");
+        assert!(matches!(result, ApplyResult::Committed(_)));
+        let rejected = writer.runtime.publisher().snapshot();
+        assert_eq!(rejected.frontiers.header_best, anchor_frontier);
+        assert_eq!(
+            rejected.state_version,
+            selected
+                .state_version
+                .checked_next()
+                .expect("the bounded fixture version advances")
+        );
+        assert_eq!(
+            rejected.header_generation,
+            selected
+                .header_generation
+                .checked_next()
+                .expect("the bounded fixture generation advances")
+        );
     }
 
     #[test]

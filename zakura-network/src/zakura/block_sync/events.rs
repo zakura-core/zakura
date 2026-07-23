@@ -183,6 +183,19 @@ impl BlockApplyOutcome {
         *self.verification
     }
 
+    pub(crate) fn attributed_source(&self) -> Option<zakura_header_chain::SourceId> {
+        match self.verification.as_ref() {
+            zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(evidence) => {
+                Some(evidence.source)
+            }
+            zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(evidence) => {
+                Some(evidence.source)
+            }
+            zakura_header_chain::BodyVerificationOutcome::Verified(_)
+            | zakura_header_chain::BodyVerificationOutcome::Retryable(_) => None,
+        }
+    }
+
     pub(crate) fn retryable_mut(
         &mut self,
     ) -> Option<&mut zakura_header_chain::TransientBodyFailure> {
@@ -281,6 +294,13 @@ pub enum BlockSyncAction {
         /// Typed retry result with its bounded episode summary.
         failure: zakura_header_chain::TransientBodyFailure,
     },
+    /// Persist one exact commitment-matching deterministic body rejection.
+    RecordBodyInvalid {
+        /// Durable version that owned the verification attempt.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Exact invalid body conclusion and its authenticated supplier.
+        invalid: zakura_header_chain::ConsensusBodyInvalid,
+    },
     /// Persist a fresh episode after discovering a changed eligible supplier set.
     RestartBodyAvailability {
         /// Durable version whose selected alarm is being restarted.
@@ -312,6 +332,7 @@ impl BlockSyncAction {
             Self::QueryBlocksByHeightRange { .. } => "query_blocks_by_height_range",
             Self::SubmitBlock { .. } => "submit_block",
             Self::RecordBodyUnavailable { .. } => "record_body_unavailable",
+            Self::RecordBodyInvalid { .. } => "record_body_invalid",
             Self::RestartBodyAvailability { .. } => "restart_body_availability",
             Self::RetryBodyAvailability { .. } => "retry_body_availability",
             Self::Misbehavior { .. } => "misbehavior",

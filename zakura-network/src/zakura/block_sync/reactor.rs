@@ -2836,6 +2836,9 @@ impl BlockSyncReactor {
             BlockSyncAction::RecordBodyUnavailable { .. } => {
                 bs_insert_str(row, bs_trace::KIND, "record_body_unavailable");
             }
+            BlockSyncAction::RecordBodyInvalid { .. } => {
+                bs_insert_str(row, bs_trace::KIND, "record_body_invalid");
+            }
             BlockSyncAction::RestartBodyAvailability { .. } => {
                 bs_insert_str(row, bs_trace::KIND, "restart_body_availability");
             }

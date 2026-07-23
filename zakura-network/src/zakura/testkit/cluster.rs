@@ -457,6 +457,7 @@ mod tests {
                             .await;
                     }
                     BlockSyncAction::RecordBodyUnavailable { .. }
+                    | BlockSyncAction::RecordBodyInvalid { .. }
                     | BlockSyncAction::RestartBodyAvailability { .. }
                     | BlockSyncAction::RetryBodyAvailability { .. } => {}
                     BlockSyncAction::Misbehavior { .. } => {}

@@ -260,6 +260,40 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     Err(_) => warn!("timed out persisting header-chain body retry evidence"),
                 }
             }
+            BlockSyncAction::RecordBodyInvalid {
+                expected_version,
+                invalid,
+            } => {
+                let Some(writer) = header_chain_write.as_ref() else {
+                    debug!(
+                        ?invalid,
+                        "header-chain invalid-body persistence is not wired in this harness"
+                    );
+                    continue;
+                };
+                match tokio::time::timeout(
+                    ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+                    writer
+                        .clone()
+                        .oneshot(zakura_state::Request::RecordHeaderChainBodyInvalid {
+                            expected_version,
+                            invalid,
+                        }),
+                )
+                .await
+                {
+                    Ok(Ok(zakura_state::Response::HeaderChainBodyInvalidRecorded(_))) => {}
+                    Ok(Ok(response)) => warn!(
+                        ?response,
+                        "unexpected header-chain invalid-body persistence response"
+                    ),
+                    Ok(Err(error)) => debug!(
+                        ?error,
+                        "header-chain invalid-body persistence was stale or unavailable"
+                    ),
+                    Err(_) => warn!("timed out persisting header-chain invalid-body evidence"),
+                }
+            }
             BlockSyncAction::RestartBodyAvailability {
                 expected_version,
                 discovery,
@@ -1722,6 +1756,9 @@ fn trace_block_driver_action(trace: &ZakuraTrace, action: &BlockSyncAction) {
             }
             BlockSyncAction::RecordBodyUnavailable { .. } => {
                 insert_cs_str(row, cs_trace::ACTION, "record_body_unavailable");
+            }
+            BlockSyncAction::RecordBodyInvalid { .. } => {
+                insert_cs_str(row, cs_trace::ACTION, "record_body_invalid");
             }
             BlockSyncAction::RestartBodyAvailability { .. } => {
                 insert_cs_str(row, cs_trace::ACTION, "restart_body_availability");

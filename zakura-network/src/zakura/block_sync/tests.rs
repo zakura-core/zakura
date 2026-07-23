@@ -9232,6 +9232,7 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             BlockSyncAction::QueryBlocksByHeightRange { .. } => {}
             BlockSyncAction::RecordBodyUnavailable { .. }
+            | BlockSyncAction::RecordBodyInvalid { .. }
             | BlockSyncAction::RestartBodyAvailability { .. }
             | BlockSyncAction::RetryBodyAvailability { .. } => {}
         }
@@ -9345,6 +9346,7 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
             BlockSyncAction::QueryNeededBlocks { .. }
             | BlockSyncAction::QueryBlocksByHeightRange { .. }
             | BlockSyncAction::RecordBodyUnavailable { .. }
+            | BlockSyncAction::RecordBodyInvalid { .. }
             | BlockSyncAction::RestartBodyAvailability { .. }
             | BlockSyncAction::RetryBodyAvailability { .. } => {}
         }

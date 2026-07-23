@@ -898,6 +898,15 @@ pub enum Request {
         failure: zakura_header_chain::TransientBodyFailure,
     },
 
+    /// Persist one commitment-matching deterministic body rejection through the
+    /// serialized fork-aware header-chain writer.
+    RecordHeaderChainBodyInvalid {
+        /// Durable version that owned the body verification attempt.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Exact invalid body conclusion and its authenticated supplier.
+        invalid: zakura_header_chain::ConsensusBodyInvalid,
+    },
+
     /// Persist a fresh retry episode after authenticated supplier discovery.
     RestartHeaderChainBodyAvailability {
         /// Durable version whose selected alarm is being restarted.
@@ -1206,6 +1215,7 @@ impl Request {
             Request::RecordHeaderChainBodyUnavailable { .. } => {
                 "record_header_chain_body_unavailable"
             }
+            Request::RecordHeaderChainBodyInvalid { .. } => "record_header_chain_body_invalid",
             Request::RestartHeaderChainBodyAvailability { .. } => {
                 "restart_header_chain_body_availability"
             }
@@ -1837,6 +1847,7 @@ impl TryFrom<Request> for ReadRequest {
 
             Request::ApplyHeaderChainInsert { .. }
             | Request::RecordHeaderChainBodyUnavailable { .. }
+            | Request::RecordHeaderChainBodyInvalid { .. }
             | Request::RestartHeaderChainBodyAvailability { .. }
             | Request::RetryHeaderChainBodyAvailability { .. }
             | Request::CommitSemanticallyVerifiedBlock(_)

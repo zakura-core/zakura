@@ -1065,6 +1065,32 @@ impl StateService {
         rsp_rx
     }
 
+    fn send_header_chain_body_invalid(
+        &self,
+        expected_version: zakura_header_chain::StateVersion,
+        invalid: zakura_header_chain::ConsensusBodyInvalid,
+    ) -> oneshot::Receiver<Result<zakura_header_chain::ApplyResult, HeaderChainStoreError>> {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        let Some(sender) = &self.block_write_sender.non_finalized else {
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+            return rsp_rx;
+        };
+        if let Err(tokio::sync::mpsc::error::SendError(message)) =
+            sender.send(NonFinalizedWriteMessage::RecordHeaderChainBodyInvalid {
+                expected_version,
+                invalid,
+                rsp_tx,
+            })
+        {
+            let NonFinalizedWriteMessage::RecordHeaderChainBodyInvalid { rsp_tx, .. } = message
+            else {
+                unreachable!("the failed send returns the same invalid-body message");
+            };
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+        }
+        rsp_rx
+    }
+
     fn send_header_chain_body_availability_restart(
         &self,
         expected_version: zakura_header_chain::StateVersion,
@@ -1284,6 +1310,20 @@ impl Service<Request> for StateService {
                         .await
                         .map_err(|_| BoxError::from("header-chain writer exited"))?
                         .map(Response::HeaderChainBodyUnavailableRecorded)
+                        .map_err(BoxError::from)
+                }
+                .boxed()
+            }
+            Request::RecordHeaderChainBodyInvalid {
+                expected_version,
+                invalid,
+            } => {
+                let rsp_rx = self.send_header_chain_body_invalid(expected_version, invalid);
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| BoxError::from("header-chain writer exited"))?
+                        .map(Response::HeaderChainBodyInvalidRecorded)
                         .map_err(BoxError::from)
                 }
                 .boxed()

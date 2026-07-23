@@ -620,6 +620,7 @@ async fn drive_mock_block_sync_actions(
                     }
                 }
                 BlockSyncAction::RecordBodyUnavailable { .. }
+                | BlockSyncAction::RecordBodyInvalid { .. }
                 | BlockSyncAction::RestartBodyAvailability { .. }
                 | BlockSyncAction::RetryBodyAvailability { .. } => {}
                 BlockSyncAction::Misbehavior { .. } => {}

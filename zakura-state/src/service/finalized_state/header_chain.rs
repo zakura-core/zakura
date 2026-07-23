@@ -4129,6 +4129,261 @@ mod tests {
     }
 
     #[test]
+    fn aud_14_finality_advance_reopens_complete_before_or_after() {
+        for (index, target) in FaultPoint::ALL.into_iter().enumerate() {
+            let cache = tempfile::tempdir().expect("the test cache directory is created");
+            let db_config = Config {
+                cache_dir: cache.path().to_owned(),
+                ephemeral: false,
+                debug_skip_non_finalized_state_backup_task: true,
+                ..Config::default()
+            };
+            let (engine_config, anchor, metadata) = fixture();
+            let network = engine_config.network.clone();
+            let db = open(&db_config, &network);
+            let store = HeaderChainStore::new(db.clone());
+            store
+                .initialize(metadata, anchor.clone())
+                .expect("the empty schema initializes");
+            let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+            let mut child_header = *anchor.header;
+            child_header.previous_block_hash = anchor.hash;
+            child_header.time += chrono::Duration::seconds(1);
+            let child_header = Arc::new(child_header);
+            let child = VerifiedHeaderRef {
+                height: anchor
+                    .height
+                    .next()
+                    .expect("the genesis anchor has a next height"),
+                hash: child_header.hash(),
+                header: child_header,
+            };
+            let mut grandchild_header = *child.header;
+            grandchild_header.previous_block_hash = child.hash;
+            grandchild_header.time += chrono::Duration::seconds(1);
+            let grandchild_header = Arc::new(grandchild_header);
+            let grandchild = VerifiedHeaderRef {
+                height: child.height.next().expect("the child has a next height"),
+                hash: grandchild_header.hash(),
+                header: grandchild_header,
+            };
+            let (runtime, _) = store
+                .startup_reconciled(
+                    &engine_config,
+                    anchor_frontier,
+                    Vec::new(),
+                    vec![child.clone(), grandchild.clone()],
+                )
+                .expect("the verified suffix reconciles before the faulted finality transition");
+            let before = runtime.publisher().snapshot();
+            let new_finalized = Frontier::new(child.height, child.hash);
+            let proof = runtime
+                .verified_projection()
+                .expect("the verified projection is readable")
+                .into_iter()
+                .take_while(|frontier| frontier.height <= new_finalized.height)
+                .map(|frontier| frontier.hash)
+                .collect::<Vec<_>>();
+            let marker = u8::try_from(index + 0x60).expect("the fault-point list fits in u8");
+            let evidence = EvidenceId::from_digest([marker; 32]);
+            let authority = Authority(evidence);
+            let context = TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                startup_capability: None,
+                retention_references: &[],
+            };
+            let request = TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::FullStateFinalized(FullStateFinalized {
+                    full_state_transition_id: evidence,
+                    new_finalized,
+                    verified_path_proof: proof,
+                }),
+            };
+            let marker_key = [marker; 4];
+            let mut full_state_batch = DiskWriteBatch::new();
+            runtime
+                .store
+                .put_raw(
+                    &mut full_state_batch,
+                    ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+                    marker_key,
+                    [marker],
+                )
+                .expect("the paired finality marker can be staged");
+            let memory_swapped = Arc::new(AtomicBool::new(false));
+            let swap_probe = memory_swapped.clone();
+            let result = runtime.apply_combined_with_fault(
+                request,
+                &context,
+                full_state_batch,
+                move || swap_probe.store(true, Ordering::SeqCst),
+                |point| {
+                    if point == target {
+                        Err(HeaderChainStoreError::InjectedCrash(point))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(HeaderChainStoreError::InjectedCrash(point)) if point == target
+            ));
+
+            let committed = matches!(
+                target,
+                FaultPoint::AfterDbCommit
+                    | FaultPoint::BeforeMemorySwap
+                    | FaultPoint::BeforePublish
+                    | FaultPoint::AfterPublish
+                    | FaultPoint::BeforeReactorObserve
+            );
+            let durable = runtime
+                .store
+                .snapshot()
+                .expect("the finality snapshot read succeeds");
+            assert_eq!(
+                durable.frontiers.finalized,
+                if committed {
+                    new_finalized
+                } else {
+                    anchor_frontier
+                },
+                "{target:?}"
+            );
+            assert_eq!(
+                durable.frontiers.header_best,
+                Frontier::new(grandchild.height, grandchild.hash),
+                "{target:?}"
+            );
+            assert_eq!(
+                runtime
+                    .store
+                    .node(anchor.hash)
+                    .expect("the old anchor row read succeeds")
+                    .is_none(),
+                committed,
+                "{target:?}"
+            );
+            assert!(runtime
+                .store
+                .node(child.hash)
+                .expect("the new anchor row read succeeds")
+                .is_some());
+            assert!(runtime
+                .store
+                .node(grandchild.hash)
+                .expect("the retained suffix row read succeeds")
+                .is_some());
+            let durable_metadata = runtime
+                .store
+                .metadata()
+                .expect("the finality metadata read succeeds");
+            assert_eq!(durable_metadata.work_origin, anchor_frontier, "{target:?}");
+            assert_eq!(
+                runtime
+                    .store
+                    .finality_history()
+                    .expect("the finality history read succeeds")
+                    .len(),
+                usize::from(committed),
+                "{target:?}"
+            );
+            let marker_cf = runtime
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the marker column family is open");
+            assert_eq!(
+                runtime
+                    .store
+                    .db
+                    .raw_get_cf(&marker_cf, &marker_key)
+                    .expect("the paired marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+            assert_eq!(
+                memory_swapped.load(Ordering::SeqCst),
+                matches!(
+                    target,
+                    FaultPoint::BeforePublish
+                        | FaultPoint::AfterPublish
+                        | FaultPoint::BeforeReactorObserve
+                ),
+                "{target:?}"
+            );
+            assert_eq!(
+                runtime.publisher().snapshot().frontiers.finalized,
+                if matches!(
+                    target,
+                    FaultPoint::AfterPublish | FaultPoint::BeforeReactorObserve
+                ) {
+                    new_finalized
+                } else {
+                    anchor_frontier
+                },
+                "{target:?}"
+            );
+            drop(runtime);
+            drop(db);
+
+            let (reopened, report) = HeaderChainStore::new(open(&db_config, &network))
+                .startup(&engine_config)
+                .expect("the finality crash boundary reopens coherently");
+            assert_eq!(
+                reopened.publisher().snapshot(),
+                report.current,
+                "{target:?}"
+            );
+            assert_eq!(
+                report.current.frontiers.finalized,
+                if committed {
+                    new_finalized
+                } else {
+                    anchor_frontier
+                },
+                "{target:?}"
+            );
+            assert_eq!(
+                reopened
+                    .store
+                    .metadata()
+                    .expect("the reopened metadata is readable")
+                    .work_origin,
+                anchor_frontier,
+                "{target:?}"
+            );
+            assert_eq!(
+                reopened
+                    .store
+                    .finality_history()
+                    .expect("the reopened finality history is readable")
+                    .len(),
+                usize::from(committed),
+                "{target:?}"
+            );
+            let reopened_marker_cf = reopened
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the reopened marker column family is open");
+            assert_eq!(
+                reopened
+                    .store
+                    .db
+                    .raw_get_cf(&reopened_marker_cf, &marker_key)
+                    .expect("the reopened marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
     fn aud_14_no_change_crash_points_preserve_the_paired_full_state_transaction() {
         for (index, target) in FaultPoint::NO_CHANGE.into_iter().enumerate() {
             let cache = tempfile::tempdir().expect("the test cache directory is created");

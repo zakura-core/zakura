@@ -43,7 +43,7 @@ the remaining gap. Fuzzer reachability alone is not requirement coverage.
 | --- | --- | --- | --- | --- |
 | `header_codec` | Sole codec and four fixed discriminants | LC-SCOPE-09, LC-WIRE-01, LC-WIRE-06 | golden/truncation/discriminant corpus | Covered |
 | `recovery_rows` | Twelve RocksDB families and startup audit | LC-RECOVER-01..03, LC-TXN-01 | row mutation, migration, and refutation seeds | Covered for bounded mutations and mode transitions |
-| State-writer crash harness | `FaultPoint::ALL` and `FaultPoint::NO_CHANGE` durable/memory/publication handoffs | LC-TXN-01, LC-FRONTIER-04, LC-RECOVER-02 | durable AUD-14 | Partial: body-state, no-change, and requester node/index/projection insertions with paired full-state batches are covered; remaining transition variants and cross-process response/reactor boundaries remain open |
+| State-writer crash harness | `FaultPoint::ALL` and `FaultPoint::NO_CHANGE` durable/memory/publication handoffs | LC-TXN-01, LC-FRONTIER-04, LC-RECOVER-02 | durable AUD-14 | Partial: body-state, no-change, requester insertion, and authenticated finality/history/pruning shapes with paired full-state batches are covered; remaining transition variants and cross-process response/reactor boundaries remain open |
 
 ## Named audit status
 

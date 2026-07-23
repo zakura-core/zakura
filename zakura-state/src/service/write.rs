@@ -2627,15 +2627,9 @@ mod tests {
             .expect("the replacement invalidates in staged full state");
         commit_operator_change(&writer, &mut live, staged, replacement_frontier.hash, true)
             .expect("invalidation commits both frontiers before swapping full state");
-        assert_eq!(
-            writer
-                .runtime
-                .publisher()
-                .snapshot()
-                .frontiers
-                .verified_best,
-            incumbent
-        );
+        let invalidated = writer.runtime.publisher().snapshot();
+        assert_eq!(invalidated.frontiers.verified_best, incumbent);
+        assert_eq!(invalidated.frontiers.header_best, incumbent);
 
         let mut staged = live.clone();
         staged
@@ -2643,15 +2637,9 @@ mod tests {
             .expect("the replacement replays into staged full state");
         commit_operator_change(&writer, &mut live, staged, replacement_frontier.hash, false)
             .expect("reconsider commits both frontiers before swapping full state");
-        assert_eq!(
-            writer
-                .runtime
-                .publisher()
-                .snapshot()
-                .frontiers
-                .verified_best,
-            replacement_frontier
-        );
+        let reconsidered = writer.runtime.publisher().snapshot();
+        assert_eq!(reconsidered.frontiers.verified_best, replacement_frontier);
+        assert_eq!(reconsidered.frontiers.header_best, replacement_frontier);
 
         let first_non_finalized = chain[31].hash();
         let mut staged = live.clone();
@@ -2666,6 +2654,7 @@ mod tests {
             snapshot.frontiers.verified_best,
             snapshot.frontiers.finalized
         );
+        assert_eq!(snapshot.frontiers.header_best, snapshot.frontiers.finalized);
     }
 
     #[test]

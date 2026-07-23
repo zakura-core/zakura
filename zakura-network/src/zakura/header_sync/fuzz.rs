@@ -301,7 +301,7 @@ impl PursuitHarness {
         };
         let production_accepts = self.queue.active(&peer(peer_key)).is_some_and(|request| {
             request.target.session_id == supplied_session
-                && request.accepts_response_page(supplied_target, returned_ancestor, 0)
+                && request.matches_response_page(supplied_target, returned_ancestor)
         });
         let matches = matches!(
             self.model.get(&peer_key),
@@ -750,7 +750,7 @@ impl PursuitHarness {
             for count in partition {
                 let returned_ancestor = active.staged_tip().unwrap_or(anchor);
                 assert!(
-                    active.accepts_response_page(target, returned_ancestor, count),
+                    active.matches_response_page(target, returned_ancestor),
                     "each continuation page preserves exact staged ancestry"
                 );
                 active.common_ancestor.get_or_insert(returned_ancestor);

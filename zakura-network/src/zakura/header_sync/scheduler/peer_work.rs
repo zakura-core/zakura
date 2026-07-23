@@ -3,11 +3,13 @@ use std::{cmp::Ordering, collections::HashMap};
 use tokio::time::Instant;
 
 use zakura_header_chain::{
-    EngineSnapshot, Frontier, HeaderLocator, SourceId, WorkOwner, MAX_NON_FINALIZED_NODES_V1,
-    MAX_STAGED_TARGETS_V1,
+    EngineSnapshot, Frontier, HeaderLocator, SourceId, WorkOwner, MAX_STAGED_TARGETS_V1,
 };
 
 use super::super::{AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId};
+
+/// Exact aggregate cap for response headers awaiting one complete-target admission.
+pub(in crate::zakura::header_sync) const MAX_STAGED_HEADERS_V1: usize = 4_096;
 
 /// One peer's exact, session-bound target claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,12 +83,11 @@ pub enum HeaderTargetPhase {
 }
 
 impl ActiveHeaderRequest {
-    /// Whether one page preserves the active phase, target, ancestry, and staging bound.
-    pub fn accepts_response_page(
+    /// Whether one page preserves the active phase, target, and exact ancestry.
+    pub fn matches_response_page(
         &self,
         target_tip_hash: zakura_chain::block::Hash,
         returned_ancestor: Frontier,
-        entry_count: usize,
     ) -> bool {
         let expected_ancestor = match self.common_ancestor {
             Some(_) => self.staged_tip(),
@@ -100,7 +101,6 @@ impl ActiveHeaderRequest {
         self.phase == HeaderTargetPhase::Receiving
             && self.target.status.selected_tip_hash == target_tip_hash
             && expected_ancestor == Some(returned_ancestor)
-            && self.entries.len().saturating_add(entry_count) <= MAX_NON_FINALIZED_NODES_V1
     }
 
     /// Whether one explicit outcome exactly matches the active request.
@@ -310,17 +310,33 @@ impl PeerWorkQueue {
             _ => None,
         }
     }
+
+    pub(in crate::zakura::header_sync) fn has_staging_capacity(
+        &self,
+        additional_headers: usize,
+    ) -> bool {
+        self.work_by_peer
+            .values()
+            .filter_map(|work| match work {
+                PeerWorkState::Active(request) => Some(request.entries.len()),
+                PeerWorkState::AwaitingLocator { .. } => None,
+            })
+            .fold(0usize, usize::saturating_add)
+            .saturating_add(additional_headers)
+            <= MAX_STAGED_HEADERS_V1
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use zakura_chain::{block, work::difficulty::U256};
+    use std::sync::Arc;
+
+    use super::*;
+    use zakura_chain::{block, block::genesis::regtest_genesis_block, work::difficulty::U256};
     use zakura_header_chain::{
         AlarmSet, ChainScore, EngineMode, Frontier, FrontierSet, HeaderGeneration, StateVersion,
         SuffixWork, VerifiedGeneration,
     };
-
-    use super::*;
 
     fn hash(byte: u8) -> block::Hash {
         block::Hash([byte; 32])
@@ -366,6 +382,40 @@ mod tests {
 
     fn peer(marker: u8) -> ZakuraPeerId {
         ZakuraPeerId::new(vec![marker; 32]).expect("the test peer ID has the required length")
+    }
+
+    fn active_request(
+        marker: u8,
+        target: AdvertisedHeaderTarget,
+        local: &EngineSnapshot,
+        entries: Vec<HeaderEntry>,
+    ) -> ActiveHeaderRequest {
+        let request_id =
+            HeaderSyncRequestId::new(u64::from(marker)).expect("the marker is nonzero");
+        ActiveHeaderRequest {
+            peer: peer(marker),
+            source: SourceId::from_digest([marker; 32]),
+            sent_locator: HeaderLocator::for_continuation(local.frontiers.finalized),
+            owner: WorkOwner {
+                state_version: local.state_version,
+                header_generation: local.header_generation,
+                verified_generation: None,
+                branch: zakura_header_chain::BranchId::new(
+                    local.frontiers.finalized.hash,
+                    target.status.selected_tip_hash,
+                ),
+                session_id: target.session_id,
+                request_id: std::num::NonZeroU64::new(request_id.get())
+                    .expect("header-sync request IDs are nonzero"),
+            },
+            target,
+            request_id,
+            common_ancestor: Some(local.frontiers.finalized),
+            entries,
+            phase: HeaderTargetPhase::Receiving,
+            max_header_count: 1_000,
+            tree_aux_schema: AuxSchema::None,
+        }
     }
 
     #[test]
@@ -490,5 +540,37 @@ mod tests {
             QueueWorkResult::NeedsLocator
         );
         assert!(queue.awaiting(&peer(17), 7, hash(17)).is_some());
+    }
+
+    #[test]
+    fn aggregate_staged_header_cap_spans_all_peers_and_releases_on_retirement() {
+        let local = snapshot();
+        let entry = HeaderEntry {
+            header: Arc::new(*regtest_genesis_block().header),
+            body_size: 0,
+            tree_aux: None,
+        };
+        let mut queue = PeerWorkQueue::default();
+
+        let first = advertisement(1);
+        assert_eq!(
+            queue.stage(peer(1), first.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        assert!(queue.start(active_request(1, first, &local, vec![entry.clone(); 3_000],)));
+        assert!(queue.has_staging_capacity(1_096));
+        assert!(!queue.has_staging_capacity(1_097));
+
+        let second = advertisement(2);
+        assert_eq!(
+            queue.stage(peer(2), second.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        assert!(queue.start(active_request(2, second, &local, vec![entry; 1_096],)));
+        assert!(queue.has_staging_capacity(0));
+        assert!(!queue.has_staging_capacity(1));
+
+        queue.remove(&peer(1));
+        assert!(queue.has_staging_capacity(3_000));
     }
 }

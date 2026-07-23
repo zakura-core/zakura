@@ -195,6 +195,22 @@ impl CommitBlockError {
     pub fn misbehavior_score(&self) -> u32 {
         0
     }
+
+    /// Classify this commit result before supplier identity and stable evidence are attached.
+    pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
+        use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
+
+        match self {
+            Self::Duplicate { .. } => BodyVerificationClass::Duplicate,
+            Self::ValidateContextError(error) => error.body_verification_class(),
+            Self::HeaderChainError { .. } => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
+            }
+            Self::WriteTaskExited => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
+        }
+    }
 }
 
 /// An error describing why a `CommitSemanticallyVerified` request failed.
@@ -631,6 +647,114 @@ pub enum ValidateContextError {
 }
 
 impl ValidateContextError {
+    /// Classify contextual validation without conflating peer data and local availability.
+    pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
+        use zakura_chain::block::CommitmentError;
+        use zakura_header_chain::{
+            BodyCommitmentKind, BodyRuleId, BodyVerificationClass, TransientBodyFailureKind,
+        };
+
+        let consensus = |rule| BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(rule));
+        match self {
+            Self::MissingSproutTipTree(_) | Self::NotReadyToBeCommitted => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
+            }
+            Self::BlockPreviouslyInvalidated { .. } | Self::OrphanedBlock { .. } => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::Canceled)
+            }
+            Self::VctSuppliedRootUnavailable { .. }
+            | Self::VctSuppliedRootAwaitingSuccessor { .. } => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
+            }
+            Self::VctBlockAuthDataRootMismatch { .. } => {
+                BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
+            }
+            Self::VctSproutHandoffRootMismatch { .. }
+            | Self::NoteCommitmentTreeError(_)
+            | Self::HistoryTreeError(_) => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
+            }
+            Self::InvalidBlockCommitment(error) => {
+                let kind = match error {
+                    CommitmentError::InvalidAuthDataRoot { .. } => BodyCommitmentKind::AuthDataRoot,
+                    CommitmentError::InvalidFinalSaplingRoot { .. } => {
+                        BodyCommitmentKind::Other("final_sapling_root")
+                    }
+                    CommitmentError::InvalidChainHistoryActivationReserved { .. } => {
+                        BodyCommitmentKind::Other("chain_history_activation_reserved")
+                    }
+                    CommitmentError::InvalidChainHistoryRoot { .. } => {
+                        BodyCommitmentKind::Other("chain_history_root")
+                    }
+                    CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. } => {
+                        BodyCommitmentKind::Other("chain_history_block_tx_auth_commitment")
+                    }
+                    CommitmentError::InvalidPreNu5OrchardRoot { .. } => {
+                        BodyCommitmentKind::Other("pre_nu5_orchard_root")
+                    }
+                    CommitmentError::InvalidPreNu6_3IronwoodRoot { .. } => {
+                        BodyCommitmentKind::Other("pre_nu6_3_ironwood_root")
+                    }
+                    CommitmentError::MissingBlockHeight { .. } => {
+                        BodyCommitmentKind::Other("missing_block_height")
+                    }
+                    CommitmentError::InvalidSapingRootBytes => {
+                        BodyCommitmentKind::Other("invalid_sapling_root_bytes")
+                    }
+                };
+                BodyVerificationClass::PayloadMismatch(kind)
+            }
+            Self::NonSequentialBlock { .. } => consensus("context.non_sequential_block"),
+            Self::TimeTooEarly { .. } => consensus("context.time_too_early"),
+            Self::TimeTooLate { .. } => consensus("context.time_too_late"),
+            Self::InvalidDifficultyThreshold { .. } => {
+                consensus("context.invalid_difficulty_threshold")
+            }
+            Self::DuplicateTransparentSpend { .. } => {
+                consensus("context.duplicate_transparent_spend")
+            }
+            Self::MissingTransparentOutput { .. } => {
+                consensus("context.missing_transparent_output")
+            }
+            Self::EarlyTransparentSpend { .. } => consensus("context.early_transparent_spend"),
+            Self::UnshieldedTransparentCoinbaseSpend { .. } => {
+                consensus("context.unshielded_transparent_coinbase_spend")
+            }
+            Self::ImmatureTransparentCoinbaseSpend { .. } => {
+                consensus("context.immature_transparent_coinbase_spend")
+            }
+            Self::DuplicateSproutNullifier { .. } => {
+                consensus("context.duplicate_sprout_nullifier")
+            }
+            Self::DuplicateSaplingNullifier { .. } => {
+                consensus("context.duplicate_sapling_nullifier")
+            }
+            Self::DuplicateOrchardNullifier { .. } => {
+                consensus("context.duplicate_orchard_nullifier")
+            }
+            Self::DuplicateIronwoodNullifier { .. } => {
+                consensus("context.duplicate_ironwood_nullifier")
+            }
+            Self::NegativeRemainingTransactionValue { .. } => {
+                consensus("context.negative_remaining_transaction_value")
+            }
+            Self::CalculateRemainingTransactionValue { .. } => {
+                consensus("context.calculate_remaining_transaction_value")
+            }
+            Self::CalculateTransactionValueBalances { .. } => {
+                consensus("context.calculate_transaction_value_balances")
+            }
+            Self::CalculateBlockChainValueChange { .. } => {
+                consensus("context.calculate_block_chain_value_change")
+            }
+            Self::AddValuePool { .. } => consensus("context.add_value_pool"),
+            Self::UnknownSproutAnchor { .. } => consensus("context.unknown_sprout_anchor"),
+            Self::UnknownSaplingAnchor { .. } => consensus("context.unknown_sapling_anchor"),
+            Self::UnknownOrchardAnchor { .. } => consensus("context.unknown_orchard_anchor"),
+            Self::UnknownIronwoodAnchor { .. } => consensus("context.unknown_ironwood_anchor"),
+        }
+    }
+
     /// Returns the missing VCT supplied-root height for retryable root stalls.
     ///
     /// This is the subset of [`Self::vct_retryable_height`] where the supplied root itself is
@@ -703,6 +827,52 @@ impl DuplicateNullifierError for orchard::Nullifier {
 mod tests {
     use super::*;
     use zakura_chain::block::Height;
+    use zakura_header_chain::{
+        BodyCommitmentKind, BodyVerificationClass, TransientBodyFailureKind,
+    };
+
+    #[test]
+    fn body_verification_classes_preserve_attribution_boundaries() {
+        assert_eq!(
+            ValidateContextError::VctSuppliedRootUnavailable { height: Height(7) }
+                .body_verification_class(),
+            BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
+        );
+        assert_eq!(
+            ValidateContextError::VctBlockAuthDataRootMismatch {
+                height: Height(7),
+                expected: block::merkle::AuthDataRoot::from([1; 32]),
+                actual: block::merkle::AuthDataRoot::from([2; 32]),
+            }
+            .body_verification_class(),
+            BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
+        );
+        assert_eq!(
+            ValidateContextError::NonSequentialBlock {
+                candidate_height: Height(7),
+                parent_height: Height(5),
+            }
+            .body_verification_class(),
+            BodyVerificationClass::ConsensusInvalid(zakura_header_chain::BodyRuleId::new(
+                "context.non_sequential_block"
+            ))
+        );
+        assert_eq!(
+            CommitBlockError::HeaderChainError {
+                error: "local transition failure".to_owned(),
+            }
+            .body_verification_class(),
+            BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
+        );
+        assert_eq!(
+            CommitBlockError::Duplicate {
+                hash_or_height: None,
+                location: KnownBlock::BestChain,
+            }
+            .body_verification_class(),
+            BodyVerificationClass::Duplicate
+        );
+    }
 
     #[test]
     fn commit_block_error_misbehavior_scores() {

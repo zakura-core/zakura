@@ -429,6 +429,19 @@ pub enum BodyVerificationOutcome {
     Retryable(TransientBodyFailure),
 }
 
+/// Evidence-free verifier classification used before supplier and stable evidence are attached.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BodyVerificationClass {
+    /// The exact body was already accepted by full state.
+    Duplicate,
+    /// Delivered body data disagrees with a commitment in its admitted header.
+    PayloadMismatch(BodyCommitmentKind),
+    /// All applicable commitments matched before one deterministic consensus rule failed.
+    ConsensusInvalid(BodyRuleId),
+    /// Verification could not reach a durable consensus conclusion.
+    Retryable(TransientBodyFailureKind),
+}
+
 impl From<BodyVerificationOutcome> for BodyEvidence {
     fn from(outcome: BodyVerificationOutcome) -> Self {
         match outcome {

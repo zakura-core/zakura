@@ -60,29 +60,14 @@ env:
   CLICOLOR: 1
 
 jobs:
-  clippy:
-    name: clippy ${{ matrix.rust-version }} / ${{ matrix.type }}
+  rust-checks:
+    name: rust checks
     permissions:
       contents: read
       id-token: write
       statuses: write
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        # `beta` was dropped from the PR path: it doubled the clippy compile
-        # cost for marginal early-warning value. Re-add it on the nightly
-        # schedule if upcoming-toolchain regressions need tracking.
-        rust-version: [stable]
-        type: [release, tests]
-        include:
-          - type: release
-            args: --workspace --all-targets
-            features: default-release-binaries
-          - type: tests
-            args: --workspace --all-targets
-            features: default-release-binaries proptest-impl lightwalletd-grpc-tests zakura-checkpoints
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -91,12 +76,15 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
           components: clippy
-          toolchain: ${{ matrix.rust-version }}
+          toolchain: stable
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/setup-zakura-build
       - name: Run clippy
-        run: cargo clippy ${{ matrix.args }} --features "${{ matrix.features }}"
+        run: cargo clippy --workspace --all-targets --features default-release-binaries
+      - name: Check locked all-feature build
+        if: ${{ !cancelled() }}
+        run: cargo check --locked --all-features --all-targets
 
   # NOTE: per-crate default / no-default-features checks moved to
   # `test-crates.yml`, which runs `cargo hack check --workspace` (and again with
@@ -155,8 +143,8 @@ jobs:
           # https://github.com/ZcashFoundation/zebra/blob/main/.cargo/config.toml#L87
           RUSTDOCFLAGS: -A rustdoc::private_intra_doc_links -D warnings
 
-  fmt:
-    name: fmt
+  fast-lints:
+    name: fast lints
     permissions:
       contents: read
       statuses: write
@@ -168,54 +156,42 @@ jobs:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
+          toolchain: stable
+          # These checks do not compile workspace crates.
+          cache: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
           toolchain: nightly
           components: rustfmt
-          # rustfmt does not compile workspace crates.
           cache: false
       - name: Run fmt
-        run: cargo fmt --all -- --check
-
-  shellcheck:
-    name: shellcheck
-    permissions:
-      contents: read
-      statuses: write
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-
+        if: ${{ !cancelled() }}
+        run: cargo +nightly fmt --all -- --check
       - name: Run shellcheck
+        if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned
         # droplets, where a shell bug costs a full provisioning cycle to find.
         run: shellcheck scripts/*.sh .github/workflows/scripts/*.sh
-
-  ci-python-tests:
-    name: ci python tests
-    permissions:
-      contents: read
-      statuses: write
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-
       # Stdlib-only, so there is nothing to install.
       - name: Mempool load harness tests
+        if: ${{ !cancelled() }}
         run: python3 .github/workflows/scripts/test_mempool_load.py
 
       - name: Affected semver package tests
+        if: ${{ !cancelled() }}
         run: python3 .github/workflows/scripts/test_affected_semver_packages.py
 
       - name: Deployer tests
+        if: ${{ !cancelled() }}
         run: python3 deploy/deployer/test_deploy.py
 
       - name: Continuous-sync tests
+        if: ${{ !cancelled() }}
         run: python3 deploy/continuous-sync/tests/test_continuous_sync.py
+
+      - name: Ensure no arbitrary or proptest dependency on default build
+        if: ${{ !cancelled() }}
+        run: cargo +stable tree --package zakura -e=features,no-dev | grep -Eq "arbitrary|proptest" && exit 1 || exit 0
 
   unused-deps:
     name: unused-deps
@@ -244,69 +220,16 @@ jobs:
       - uses: ./.github/actions/setup-zakura-build
       - run: cargo udeps --workspace --all-targets --all-features --locked
 
-  no-test-deps:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
-        with:
-          toolchain: stable
-          # cargo tree does not compile workspace crates.
-          cache: false
-      - name: Ensure no arbitrary or proptest dependency on default build
-        run: cargo tree --package zakura -e=features,no-dev | grep -Eq "arbitrary|proptest" && exit 1 || exit 0
-
   # NOTE: the old `features` job (`cargo hack check --all`) is subsumed by the
   # `cargo hack check --workspace` pass in `test-crates.yml`.
 
-  check-cargo-lock:
-    name: check-cargo-lock
-    permissions:
-      contents: read
-      id-token: write
-      statuses: write
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
-        with:
-          toolchain: stable
-          cache-on-failure: true
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: ./.github/actions/setup-zakura-build
-      - run: cargo check --locked --all-features --all-targets
-
-  deny:
-    name: Check deny ${{ matrix.checks }} ${{ matrix.features }}
+  supply-chain:
+    name: supply chain
     permissions:
       contents: read
       statuses: write
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        checks:
-          - bans
-          - sources
-          - advisories
-          - licenses
-        # We don't need to check `--no-default-features` here, because (except in very rare cases):
-        # - disabling features isn't going to add duplicate dependencies
-        # - disabling features isn't going to add more crate sources
-        # For advisories and licenses, feature flags don't change the dependency tree materially,
-        # so we only need the default and --all-features variants.
-        features: ["", --features default-release-binaries, --all-features]
-      # Always run the --all-features job, to get accurate "skip tree root was not found" warnings
-      fail-fast: false
-
-    # Prevent sudden announcement of a new advisory from failing ci:
-    continue-on-error: ${{ matrix.checks == 'advisories' }}
-
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
@@ -322,36 +245,46 @@ jobs:
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
         with:
           tool: cargo-deny@0.19.5
-      - name: Check ${{ matrix.checks }} with features ${{ matrix.features }}
-        # --all-features spuriously activates openssl, but we want to ban that dependency in
-        # all of zakurad's production features for security reasons. But the --all-features job is
-        # the only job that gives accurate "skip tree root was not found" warnings.
-        # In other jobs, we expect some of these warnings, due to disabled features.
-        run: cargo deny --workspace ${{ matrix.features }} check ${{ matrix.checks }} ${{ matrix.features == '--all-features' && '--allow banned' || '--allow unmatched-skip-root' }}
 
-  vet:
-    name: cargo-vet check
-    permissions:
-      contents: read
-      statuses: write
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
-        with:
-          # cargo-vet is installed separately and does not compile workspace
-          # crates.
-          cache: false
       - name: Install cargo-vet
         # v2.84.1 resolves `latest` to cargo-vet 0.10.0, which cannot read
         # trusted-publisher entries generated by cargo-vet 0.10.2.
         uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
         with:
           tool: cargo-vet@0.10.2
+
+      # Disabled features generally cannot add duplicate dependencies or new
+      # crate sources, so no-default-features checks are unnecessary here.
+      - name: Check default dependency policy
+        if: ${{ !cancelled() }}
+        run: cargo deny --workspace check bans licenses sources --allow unmatched-skip-root
+
+      # Prevent a newly announced advisory from suddenly failing CI.
+      - name: Check default dependency advisories
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: cargo deny --workspace check advisories --allow unmatched-skip-root
+
+      # Advisories and licenses do not need this intermediate feature set:
+      # their default and all-features checks cover its dependency graph.
+      - name: Check release-feature dependency policy
+        if: ${{ !cancelled() }}
+        run: cargo deny --workspace --features default-release-binaries check bans sources --allow unmatched-skip-root
+
+      # All features spuriously activate openssl, but production features must
+      # still ban it. This variant also produces accurate unmatched skip-root
+      # warnings, so the expected openssl ban is allowed only here.
+      - name: Check all-feature dependency policy
+        if: ${{ !cancelled() }}
+        run: cargo deny --workspace --all-features check bans licenses sources --allow banned
+
+      - name: Check all-feature dependency advisories
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: cargo deny --workspace --all-features check advisories --allow banned
+
       - name: Run cargo-vet check
+        if: ${{ !cancelled() }}
         run: cargo vet check
 
   lint-success:
@@ -359,16 +292,12 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     needs:
-      - clippy
+      - rust-checks
+      - msrv
       - docs
-      - fmt
-      - shellcheck
-      - ci-python-tests
+      - fast-lints
       - unused-deps
-      - check-cargo-lock
-      - no-test-deps
-      - deny
-      - vet
+      - supply-chain
     timeout-minutes: 30
     steps:
       - name: Decide whether the needed jobs succeeded or failed

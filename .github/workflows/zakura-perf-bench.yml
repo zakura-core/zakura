@@ -1,0 +1,373 @@
+name: Perf bench (ephemeral droplets)
+
+# CPU-profiled mainnet sync bench on throwaway DigitalOcean droplets.
+#
+# Each leg boots a droplet from the weekly-baked PR-node golden image, attaches
+# a clone of the baked mainnet `sandblast` state volume (tip 1,707,210 — the
+# same window as the checkpoint-sync bench), builds the requested ref against
+# the baked cargo cache, and syncs forward to a stop height while collecting a
+# sampled CPU flamegraph, the Zakura JSONL traces, a recorded metrics series
+# with a bottleneck verdict, and block-latency + top-functions digests
+# (.github/workflows/scripts/perf-bench-run.sh). `verify_mode: semantic` reruns
+# the same blocks under full script+proof verification.
+#
+# Setting `baseline_ref` runs BOTH legs in parallel on identical fresh droplets
+# and adds a compare job: blocks/s speedup, per-function CPU self-share diff,
+# and a differential flamegraph. No queueing, no shared host, droplet size is
+# an input. Weekly scheduled runs keep profiled baselines of `main` in both
+# verify modes. See docs/cpu-profiling.md for how to read the results.
+#
+# Droplets are tagged `zakura-pr-node`, so the hourly reaper removes anything a
+# failed teardown leaves behind. Requires the pr-node bake to have run (image +
+# state volume snapshots) and the same DO secrets as zakura-pr-node.yml.
+
+on:
+  schedule:
+    # Weekly profiled baselines of main (UTC Monday, after the 04:00 pr-node
+    # bake). The cron string picks the verify mode — see the plan job.
+    - cron: "17 5 * * 1" # checkpoint-zone sync profile
+    - cron: "47 6 * * 1" # semantic full-verification profile
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/tag/SHA to bench"
+        required: false
+        default: "main"
+      baseline_ref:
+        description: "Optional second ref benched in parallel on an identical droplet, with an A/B compare (e.g. main)"
+        required: false
+        default: ""
+      verify_mode:
+        description: "checkpoint = checkpoint-zone sync; semantic = full script+proof verification (consensus.checkpoint_sync=false)"
+        type: choice
+        required: false
+        default: "checkpoint"
+        options:
+          - checkpoint
+          - semantic
+      profile:
+        description: "CPU profiling: cpu = sampled flamegraph + digests (default); off = bench only"
+        type: choice
+        required: false
+        default: "cpu"
+        options:
+          - cpu
+          - "off"
+      stop_height:
+        description: "Sync stops after committing this height (sandblast volume tip is 1,707,210)"
+        required: false
+        default: "1730000"
+      wall_cap_seconds:
+        description: "Hard wall-clock cap for the sync phase, seconds"
+        required: false
+        default: "2000"
+      droplet_size:
+        description: "Droplet size per leg (disk must be >= the baked image's disk)"
+        required: false
+        default: "c-16"
+      peerset_size:
+        description: "Target peer count (blank feed_peer = public DNS-seeder peers)"
+        required: false
+        default: "75"
+      feed_peer:
+        description: "Peer to pin (ip:port). Leave blank to use public DNS-seeder peers."
+        required: false
+        default: ""
+      teardown_after_run:
+        description: "Delete the droplets + volumes when the run ends (else the reaper removes them within 24h)"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: plan legs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # scheduled baselines only make sense where the DO secrets + bake exist
+    if: github.event_name != 'schedule' || github.repository == 'zakura-core/zakura'
+    outputs:
+      legs: ${{ steps.legs.outputs.legs }}
+      has_baseline: ${{ steps.legs.outputs.has_baseline }}
+      verify_mode: ${{ steps.legs.outputs.verify_mode }}
+    steps:
+      - name: Resolve legs and modes
+        id: legs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # inputs.* is empty on scheduled runs; schedule benches main, and the
+          # 06:47 cron is the semantic baseline
+          REF: ${{ inputs.ref || 'main' }}
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+          VERIFY_MODE: ${{ github.event_name == 'schedule' && (github.event.schedule == '47 6 * * 1' && 'semantic' || 'checkpoint') || inputs.verify_mode || 'checkpoint' }}
+        run: |
+          set -euo pipefail
+          resolve() { gh api "repos/${REPO}/commits/$1" --jq .sha; }
+          PRIMARY_SHA=$(resolve "$REF")
+          legs="[{\"leg\":\"primary\",\"ref\":\"${REF}\",\"sha\":\"${PRIMARY_SHA}\"}"
+          has_baseline=false
+          if [ -n "$BASELINE_REF" ]; then
+            BASELINE_SHA=$(resolve "$BASELINE_REF")
+            legs="${legs},{\"leg\":\"baseline\",\"ref\":\"${BASELINE_REF}\",\"sha\":\"${BASELINE_SHA}\"}"
+            has_baseline=true
+          fi
+          legs="${legs}]"
+          {
+            echo "legs=${legs}"
+            echo "has_baseline=${has_baseline}"
+            echo "verify_mode=${VERIFY_MODE}"
+          } >> "$GITHUB_OUTPUT"
+          echo "plan: ${legs} (verify_mode=${VERIFY_MODE})"
+
+  bench:
+    name: "bench ${{ matrix.leg.leg }}: ${{ matrix.leg.ref }} (${{ needs.plan.outputs.verify_mode }})"
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJSON(needs.plan.outputs.legs) }}
+    steps:
+      - name: Checkout (for the run + digest scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install doctl
+        env:
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          DOCTL_VERSION=1.120.0
+          curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
+          sudo install /tmp/doctl /usr/local/bin/doctl
+          doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
+
+      - name: Write SSH key
+        env:
+          DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+        run: |
+          install -m 600 /dev/null /tmp/do_ssh
+          printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh
+
+      - name: Pick baked image and sandblast state snapshot
+        id: baked
+        run: |
+          set -euo pipefail
+          IMAGE=$(doctl compute image list-user --format ID,Name --no-header | \
+            awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | tail -1 | awk '{print $2}')
+          if [ -z "${IMAGE}" ]; then
+            echo "no zakura-pr-node-* image found; run the 'PR node image bake' workflow first" >&2
+            exit 1
+          fi
+          echo "image_id=${IMAGE}" >> "$GITHUB_OUTPUT"
+          SNAP=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
+            awk -v pre="zakura-pr-state-mainnet-" 'index($2, pre) == 1 {print $2, $1}' | \
+            sort | tail -1 | awk '{print $2}')
+          if [ -z "${SNAP}" ]; then
+            echo "no zakura-pr-state-mainnet-* volume snapshot found; run the bake workflow first" >&2
+            exit 1
+          fi
+          echo "vol_snap_id=${SNAP}" >> "$GITHUB_OUTPUT"
+
+      - name: Create droplet (+ state volume)
+        id: droplet
+        env:
+          LEG: ${{ matrix.leg.leg }}
+          DROPLET_SIZE: ${{ inputs.droplet_size || 'c-16' }}
+          SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+          IMAGE_ID: ${{ steps.baked.outputs.image_id }}
+          VOL_SNAP_ID: ${{ steps.baked.outputs.vol_snap_id }}
+        run: |
+          set -euo pipefail
+          VOLUME_NAME="zakura-perf-vol-${GITHUB_RUN_ID}-${LEG}"
+          SIZE=$(doctl compute snapshot get "${VOL_SNAP_ID}" --format MinDiskSize --no-header)
+          VOLUME_ID=$(doctl compute volume create "${VOLUME_NAME}" \
+            --region nyc3 --snapshot "${VOL_SNAP_ID}" --size "${SIZE}GiB" \
+            --format ID --no-header)
+          NAME="zakura-perf-${LEG}-${GITHUB_RUN_ID}"
+          # tagged zakura-pr-node so the hourly reaper covers failed teardowns
+          doctl compute droplet create "$NAME" \
+            --region nyc3 \
+            --size "${DROPLET_SIZE}" \
+            --image "${IMAGE_ID}" \
+            --ssh-keys "${SSH_FINGERPRINT}" \
+            --volumes "${VOLUME_ID}" \
+            --tag-name zakura-pr-node \
+            --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
+          {
+            echo "id=$(awk '{print $1}' /tmp/droplet.txt)"
+            echo "ip=$(awk '{print $2}' /tmp/droplet.txt)"
+            echo "volume_name=${VOLUME_NAME}"
+            echo "volume_id=${VOLUME_ID}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i /tmp/do_ssh "root@${IP}" true 2>/dev/null; then
+              echo "SSH up"; exit 0
+            fi
+            sleep 10
+          done
+          echo "SSH did not come up in time"; exit 1
+
+      - name: Run the profiled bench leg
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+          GH_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LEG: ${{ matrix.leg.leg }}
+          SHA: ${{ matrix.leg.sha }}
+          VERIFY_MODE: ${{ needs.plan.outputs.verify_mode }}
+          PROFILE: ${{ inputs.profile || 'cpu' }}
+          STOP_HEIGHT: ${{ inputs.stop_height || '1730000' }}
+          WALL_CAP: ${{ inputs.wall_cap_seconds || '2000' }}
+          START_HEIGHT: ${{ vars.PERF_BENCH_START_HEIGHT || '1707210' }}
+          PEERSET_SIZE: ${{ inputs.peerset_size || '75' }}
+          FEED_PEER: ${{ inputs.feed_peer }}
+          VOLUME_NAME: ${{ steps.droplet.outputs.volume_name }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          {
+            printf 'GH_REPO=%q\n'          "${GITHUB_REPOSITORY}"
+            printf 'GH_CLONE_TOKEN=%q\n'   "${GH_CLONE_TOKEN}"
+            printf 'SHA=%q\n'              "${SHA}"
+            printf 'REFSPEC=%q\n'          "${SHA}"
+            printf 'LEG=%q\n'              "${LEG}"
+            printf 'VERIFY_MODE=%q\n'      "${VERIFY_MODE}"
+            printf 'PROFILE=%q\n'          "${PROFILE}"
+            printf 'STOP_HEIGHT=%q\n'      "${STOP_HEIGHT}"
+            printf 'WALL_CAP=%q\n'         "${WALL_CAP}"
+            printf 'START_HEIGHT=%q\n'     "${START_HEIGHT}"
+            printf 'PEERSET_SIZE=%q\n'     "${PEERSET_SIZE}"
+            printf 'FEED_PEER=%q\n'        "${FEED_PEER}"
+            printf 'VOLUME_NAME=%q\n'      "${VOLUME_NAME}"
+            printf 'GITHUB_RUN_URL=%q\n'   "${GITHUB_RUN_URL}"
+            printf 'GITHUB_RUN_ID=%q\n'    "${GITHUB_RUN_ID}"
+          } > /tmp/run.env
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            /tmp/run.env \
+            .github/workflows/scripts/perf-bench-run.sh \
+            scripts/zakura-bench-digest.py \
+            scripts/zakura-metrics-dashboard.py \
+            "root@${IP}:/root/"
+          rm -f /tmp/run.env
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh "root@${IP}" \
+            'set -euo pipefail; set -a; . /root/run.env; set +a; bash /root/perf-bench-run.sh'
+
+      - name: Collect leg outputs
+        if: always() && steps.droplet.outputs.ip != ''
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+        run: |
+          set -euo pipefail
+          mkdir -p leg-out
+          scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            "root@${IP}:/root/out/." leg-out/ || true
+          if [ -f leg-out/leg-summary.md ]; then
+            cat leg-out/leg-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Leg: ${{ matrix.leg.leg }} — no outputs collected" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload leg artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: zakura-perf-bench-${{ github.run_id }}-${{ matrix.leg.leg }}
+          path: leg-out/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Teardown droplet + volume
+        if: always() && steps.droplet.outputs.id != ''
+        env:
+          DROPLET_ID: ${{ steps.droplet.outputs.id }}
+          VOLUME_ID: ${{ steps.droplet.outputs.volume_id }}
+          TEARDOWN: ${{ inputs.teardown_after_run == false && 'false' || 'true' }}
+        run: |
+          set -euo pipefail
+          if [ "${TEARDOWN}" != "true" ]; then
+            echo "teardown_after_run=false; droplet ${DROPLET_ID} left up (reaper removes it within 24h)"
+            exit 0
+          fi
+          doctl compute droplet delete -f "${DROPLET_ID}" || true
+          # volume detach happens as part of droplet deletion; retry the delete
+          for _ in $(seq 1 10); do
+            if doctl compute volume delete -f "${VOLUME_ID}" 2>/dev/null; then exit 0; fi
+            sleep 6
+          done
+          echo "volume ${VOLUME_ID} still attached; the reaper will remove it" >&2
+
+  compare:
+    name: A/B compare
+    needs: [plan, bench]
+    if: always() && needs.plan.outputs.has_baseline == 'true' && needs.bench.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (for the digest script)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+
+      - name: Download leg artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: zakura-perf-bench-${{ github.run_id }}-*
+          path: legs/
+
+      - name: Compare legs
+        run: |
+          set -euo pipefail
+          P="legs/zakura-perf-bench-${GITHUB_RUN_ID}-primary"
+          B="legs/zakura-perf-bench-${GITHUB_RUN_ID}-baseline"
+          [ -f "$P/meta.json" ] && [ -f "$B/meta.json" ] \
+            || { echo "one or both legs produced no meta.json; nothing to compare" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          python3 - "$P/meta.json" "$B/meta.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          p, b = (json.load(open(a)) for a in sys.argv[1:3])
+          speedup = p["bps"] / b["bps"] if b["bps"] else float("nan")
+          print("## A/B result\n")
+          print("| leg | ref | blocks/s | post-commit blk/s | verdict |")
+          print("|---|---|---:|---:|---|")
+          for m in (b, p):
+              print(f"| {m['leg']} | `{m['sha'][:9]}` | {m['bps']} | {m['post_bps']} | {m.get('verdict') or 'n/a'} |")
+          print(f"\n**Speedup (primary vs baseline): {speedup:.2f}×** ({b['bps']} → {p['bps']} blocks/s, both legs on identical parallel droplets)")
+          PY
+          mkdir -p compare-out
+          if [ -s "$P/profile.folded" ] && [ -s "$B/profile.folded" ]; then
+            python3 scripts/zakura-bench-digest.py diff \
+              --baseline "$B/profile.folded" --primary "$P/profile.folded" \
+              --title "primary vs baseline" | tee compare-out/profile-diff.md >> "$GITHUB_STEP_SUMMARY"
+            if cargo install inferno --locked >/dev/null 2>&1; then
+              export PATH="$HOME/.cargo/bin:$PATH"
+              inferno-diff-folded "$B/profile.folded" "$P/profile.folded" 2>/dev/null \
+                | inferno-flamegraph --title "CPU diff: baseline → primary" \
+                > compare-out/flamegraph-diff.svg 2>/dev/null \
+                || rm -f compare-out/flamegraph-diff.svg
+            fi
+          else
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "_(no CPU diff: one or both legs have no folded stacks)_" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload compare artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: zakura-perf-bench-${{ github.run_id }}-compare
+          path: compare-out/
+          if-no-files-found: ignore
+          retention-days: 30

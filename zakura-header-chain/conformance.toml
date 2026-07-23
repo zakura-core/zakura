@@ -215,7 +215,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-VAL-01"
 name = "Bounded response decoding"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::HeaderSyncCodec::decode"
+tests = ["HV-01::declares_only_capability_bit_five_at_stream_version_eight", "HV-01::unsolicited_and_mismatched_responses_are_protocol_rejected", "HV-01::bounded_decode_rejects_discriminants_ids_bools_heights_and_trailing_bytes", "HV-01::payload_and_response_count_caps_apply_before_vector_decode", "HV-01::decode_rejects_each_vector_hint_schema_and_byte_boundary"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-VAL-02"
@@ -244,12 +247,18 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-COMMIT-01"
 name = "Production commitment parsing"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::validate_commitment_structure"
+tests = ["HV-08::df_01_observable_activation_headers_pass_shared_rules"]
+networks = ["mainnet", "testnet"]
 
 [[rule]]
 id = "LC-COMMIT-02"
 name = "Custom-schedule commitment parsing"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::validate_commitment_structure"
+tests = ["HV-08::custom_overlapping_activations_select_the_configured_commitment_variant"]
+networks = ["custom"]
 
 [[rule]]
 id = "LC-VAL-05"
@@ -294,7 +303,10 @@ networks = ["mainnet", "testnet"]
 [[rule]]
 id = "LC-TIME-01"
 name = "Custom-network time rules"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::validate_contextual_difficulty_and_time"
+tests = ["HV-05::custom_mtp_and_max_time_use_local_parameters_with_pow_on_or_off"]
+networks = ["custom"]
 
 [[rule]]
 id = "LC-VAL-08"
@@ -341,7 +353,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-ANCHOR-02"
 name = "Trusted-anchor validation"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::EngineConfig::new"
+tests = ["HV-06::production_config_always_installs_the_release_manifest", "HV-06::trusted_anchor_still_runs_every_directly_observable_check"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-ANCHOR-03"

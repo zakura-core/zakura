@@ -191,20 +191,6 @@ pub struct Config {
     /// This is intended for testing scenarios where blocks are committed rapidly and the
     /// async backup task may not flush all blocks before shutdown.
     pub debug_skip_non_finalized_state_backup_task: bool,
-
-    // Elasticsearch configs
-    //
-    #[cfg(feature = "elasticsearch")]
-    /// The elasticsearch database url.
-    pub elasticsearch_url: String,
-
-    #[cfg(feature = "elasticsearch")]
-    /// The elasticsearch database username.
-    pub elasticsearch_username: String,
-
-    #[cfg(feature = "elasticsearch")]
-    /// The elasticsearch database password.
-    pub elasticsearch_password: String,
 }
 
 fn gen_temp_path(prefix: &str) -> PathBuf {
@@ -449,12 +435,6 @@ impl Default for Config {
             debug_stop_at_height: None,
             debug_validity_check_interval: None,
             debug_skip_non_finalized_state_backup_task: false,
-            #[cfg(feature = "elasticsearch")]
-            elasticsearch_url: "https://localhost:9200".to_string(),
-            #[cfg(feature = "elasticsearch")]
-            elasticsearch_username: "elastic".to_string(),
-            #[cfg(feature = "elasticsearch")]
-            elasticsearch_password: "".to_string(),
         }
     }
 }

@@ -31,15 +31,18 @@ use crate::common::{
     launch::{ZakuradTestDirExt, EXTENDED_LAUNCH_DELAY},
 };
 
-/// Number of blocks that should be submitted before the test is considered successful.
-const NUM_BLOCKS_TO_SUBMIT: usize = 200;
+/// The early NU5 boundary used to cover pre-NU5 and NU5 block submissions.
+const NU5_ACTIVATION_HEIGHT: u32 = 5;
+
+/// Number of blocks submitted across the configured NU5 boundary.
+const NUM_BLOCKS_TO_SUBMIT: usize = 10;
 
 pub(crate) async fn submit_blocks_test() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     let net = Network::new_regtest(
         ConfiguredActivationHeights {
-            nu5: Some(100),
+            nu5: Some(NU5_ACTIVATION_HEIGHT),
             ..Default::default()
         }
         .into(),

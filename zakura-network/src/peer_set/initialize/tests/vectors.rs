@@ -37,6 +37,7 @@ use crate::{
     constants, init,
     meta_addr::{MetaAddr, PeerAddrState},
     peer::{self, ClientTestHarness, ConnectedAddr, HandshakeRequest, OutboundConnectorRequest},
+    peer_cache_updater::update_peer_cache_once,
     peer_set::{
         initialize::{
             accept_inbound_connections, add_initial_peers, crawl_and_dial, open_listener,
@@ -51,22 +52,15 @@ use crate::{
 
 use Network::*;
 
-/// The amount of time to run the crawler, before testing what it has done.
-///
-/// Using a very short time can make the crawler not run at all.
-const CRAWLER_RUN_DURATION: Duration = Duration::from_secs(10);
-
 /// The maximum wall-clock time to wait for expected crawler test progress.
 const CRAWLER_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The maximum wall-clock time to wait for peer-cache startup progress.
+const PEER_CACHE_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A crawler peer limit large enough to exercise multi-peer behavior without
 /// flooding the test runtime with hundreds of immediate fake handshakes.
 const CRAWLER_MANY_PEER_LIMIT_FOR_TESTS: usize = 15;
-
-/// The amount of time to run the peer cache updater task, before testing what it has done.
-///
-/// Using a very short time can make the peer cache updater not run at all.
-const PEER_CACHE_UPDATER_TEST_DURATION: Duration = Duration::from_secs(25);
 
 /// The maximum time to wait for the listener tests to make expected progress.
 const LISTENER_TEST_DURATION: Duration = Duration::from_secs(10);
@@ -275,11 +269,6 @@ async fn peer_limit_one_mainnet() {
     let nil_inbound_service = service_fn(|_| async { Ok(Response::Nil) });
 
     let _ = init_with_peer_limit(1, nil_inbound_service, Mainnet, None, None).await;
-
-    // Let the crawler run for a while.
-    tokio::time::sleep(CRAWLER_RUN_DURATION).await;
-
-    // Any number of address book peers is valid here, because some peers might have failed.
 }
 
 /// Test zakura-network with a peer limit of one inbound and one outbound peer on testnet.
@@ -301,11 +290,6 @@ async fn peer_limit_one_testnet() {
         None,
     )
     .await;
-
-    // Let the crawler run for a while.
-    tokio::time::sleep(CRAWLER_RUN_DURATION).await;
-
-    // Any number of address book peers is valid here, because some peers might have failed.
 }
 
 /// Test zakura-network with a peer limit of two inbound and three outbound peers on mainnet.
@@ -320,11 +304,6 @@ async fn peer_limit_two_mainnet() {
     let nil_inbound_service = service_fn(|_| async { Ok(Response::Nil) });
 
     let _ = init_with_peer_limit(2, nil_inbound_service, Mainnet, None, None).await;
-
-    // Let the crawler run for a while.
-    tokio::time::sleep(CRAWLER_RUN_DURATION).await;
-
-    // Any number of address book peers is valid here, because some peers might have failed.
 }
 
 /// Test zakura-network with a peer limit of two inbound and three outbound peers on testnet.
@@ -346,11 +325,6 @@ async fn peer_limit_two_testnet() {
         None,
     )
     .await;
-
-    // Let the crawler run for a while.
-    tokio::time::sleep(CRAWLER_RUN_DURATION).await;
-
-    // Any number of address book peers is valid here, because some peers might have failed.
 }
 
 /// Test zakura-network writes a peer cache file, and can read it back manually.
@@ -374,8 +348,9 @@ async fn written_peer_cache_can_be_read_manually() {
         init_with_peer_limit(1, nil_inbound_service, Mainnet, None, config.clone()).await;
     let expected_cached_peer = add_cacheable_peer(&address_book);
 
-    // Let the peer cache updater run for a while.
-    tokio::time::sleep(PEER_CACHE_UPDATER_TEST_DURATION).await;
+    update_peer_cache_once(&config, &address_book)
+        .await
+        .expect("writing the peer cache should succeed");
 
     let cached_peers = config
         .load_peer_cache()
@@ -425,24 +400,34 @@ async fn written_peer_cache_is_automatically_read_on_startup() {
         init_with_peer_limit(1, nil_inbound_service, Mainnet, None, config.clone()).await;
     let expected_cached_peer = add_cacheable_peer(&address_book);
 
-    // Let the peer cache updater run for a while.
-    tokio::time::sleep(PEER_CACHE_UPDATER_TEST_DURATION).await;
+    update_peer_cache_once(&config, &address_book)
+        .await
+        .expect("writing the peer cache should succeed");
 
     let address_book =
         init_with_peer_limit(1, nil_inbound_service, Mainnet, None, config.clone()).await;
 
-    // Let the peer cache reader fill the address book.
-    tokio::time::sleep(CRAWLER_RUN_DURATION).await;
+    tokio::time::timeout(PEER_CACHE_TEST_TIMEOUT, async {
+        loop {
+            if address_book
+                .lock()
+                .expect("previous thread panicked while holding address book lock")
+                .get(expected_cached_peer)
+                .is_some()
+            {
+                break;
+            }
 
-    assert!(
-        address_book
-            .lock()
-            .expect("previous thread panicked while holding address book lock")
-            .get(expected_cached_peer)
-            .is_some(),
-        "expected peer missing from address book loaded from cache: {:?}",
-        config.cache_dir.peer_cache_file_path(&config.network)
-    );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "expected peer missing from address book loaded from cache: {:?}",
+            config.cache_dir.peer_cache_file_path(&config.network)
+        )
+    });
 }
 
 /// Adds a recent gossiped peer that is eligible for the disk cache.

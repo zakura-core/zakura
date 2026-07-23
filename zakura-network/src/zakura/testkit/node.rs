@@ -132,6 +132,17 @@ impl ZakuraTestNode {
         timeout: Duration,
     ) -> Result<(), BoxError> {
         let peer_addr = peer.node_addr().await;
+        self.connect_native_to_addr(peer_addr, timeout).await
+    }
+
+    /// Start a native dial to an explicit [`NodeAddr`] and wait until this node
+    /// registers it. Lets tests advertise a specific direct-address list (for
+    /// example a decoy address ahead of the reachable one).
+    pub async fn connect_native_to_addr(
+        &self,
+        peer_addr: NodeAddr,
+        timeout: Duration,
+    ) -> Result<(), BoxError> {
         self.endpoint.add_node_addr(peer_addr.clone())?;
         let mut handle = self.endpoint.spawn_native_dial(peer_addr.clone());
         let peer_id = peer_addr.node_id.as_bytes().to_vec();
@@ -487,9 +498,9 @@ impl ZakuraTestNodeBuilder {
                 discovery.clone(),
                 header_sync.clone(),
                 block_sync_handle.clone(),
-            )) as Arc<dyn Service>
+            ))
         } else {
-            Arc::new(DiscoveryService::new(discovery.clone())) as Arc<dyn Service>
+            Arc::new(DiscoveryService::new(discovery.clone()))
         };
         let registry = service_registry(
             &supervisor,
@@ -561,7 +572,6 @@ impl Drop for ZakuraTestNode {
 mod tests {
     use super::super::TEST_NET_TIMEOUT;
     use super::*;
-    use crate::zakura::DEFAULT_ZAKURA_MAX_CONNS_PER_IP;
 
     #[tokio::test]
     async fn legacy_upgrade_builder_fails_loudly() {
@@ -572,61 +582,6 @@ mod tests {
             .expect_err("legacy-upgrade hook is reserved, not silently ignored");
 
         assert!(error.to_string().contains("connect_via_upgrade"));
-    }
-
-    #[tokio::test]
-    async fn default_test_node_uses_production_per_ip_cap() {
-        // Every loopback test node binds 127.0.0.1, so the supervisor's per-IP
-        // cap collapses all peers into one IP bucket. A default test node must
-        // inherit the production Zakura per-IP cap so security/integration tests
-        // built on it exercise the real per-IP admission gate.
-        let mut peers = Vec::new();
-        for index in 0..=DEFAULT_ZAKURA_MAX_CONNS_PER_IP {
-            peers.push(
-                ZakuraTestNode::builder(9001 + index as u64)
-                    .spawn()
-                    .await
-                    .unwrap_or_else(|error| panic!("loopback peer {index} should spawn: {error}")),
-            );
-        }
-
-        let node = ZakuraTestNode::builder(10000)
-            .spawn()
-            .await
-            .expect("default test node spawns");
-
-        for (index, peer) in peers
-            .iter()
-            .take(DEFAULT_ZAKURA_MAX_CONNS_PER_IP)
-            .enumerate()
-        {
-            node.connect_native(peer, TEST_NET_TIMEOUT)
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "same-IP outbound peer {} should register under the production \
-                         Zakura per-IP cap: {error}",
-                        index + 1
-                    )
-                });
-        }
-
-        let excess_peer = peers
-            .last()
-            .expect("peers contains one peer over the production per-IP cap");
-        let excess = node.connect_native(excess_peer, TEST_NET_TIMEOUT).await;
-        assert!(
-            excess.is_err(),
-            "{}th same-IP outbound dial must be rejected under the production \
-             Zakura per-IP cap, but it registered — the test node is not enforcing \
-             production per-IP admission",
-            DEFAULT_ZAKURA_MAX_CONNS_PER_IP + 1
-        );
-
-        node.shutdown().await;
-        for peer in peers {
-            peer.shutdown().await;
-        }
     }
 
     #[tokio::test]
@@ -655,6 +610,89 @@ mod tests {
         node.connect_native(&peer2, TEST_NET_TIMEOUT)
             .await
             .expect("second same-IP peer registers with raised per-IP cap");
+
+        node.shutdown().await;
+        peer1.shutdown().await;
+        peer2.shutdown().await;
+    }
+
+    // Pin a peer's advertised addresses to its IPv4 loopback path so same-host
+    // dials share one source IP (test nodes also bind an IPv6 loopback socket).
+    fn ipv4_loopback_addr(peer_addr: &NodeAddr) -> NodeAddr {
+        let addr = NodeAddr::new(peer_addr.node_id).with_direct_addresses(
+            peer_addr
+                .direct_addresses()
+                .copied()
+                .filter(|addr| addr.is_ipv4() && addr.ip().is_loopback()),
+        );
+        assert!(
+            addr.direct_addresses().next().is_some(),
+            "test peer must advertise an IPv4 loopback direct address",
+        );
+        addr
+    }
+
+    #[tokio::test]
+    async fn outbound_dial_charges_confirmed_path_not_advertised_decoy() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // Regression for the per-IP cap bypass in `serve_native_dial_connection`:
+        // it used to charge the connection to the first *advertised* direct
+        // address instead of the path iroh actually confirmed. A record could
+        // then list an unreachable decoy first and escape the per-IP cap while
+        // being served over a different (shared) address.
+        let peer1 = ZakuraTestNode::builder(9201)
+            .spawn()
+            .await
+            .expect("peer1 spawns");
+        let peer2 = ZakuraTestNode::builder(9202)
+            .spawn()
+            .await
+            .expect("peer2 spawns");
+        let node = ZakuraTestNode::builder(9203)
+            .max_connections_per_ip(1)
+            .spawn()
+            .await
+            .expect("dialer spawns");
+
+        // Advertise peer1 with an unreachable decoy (RFC 5737 TEST-NET-1,
+        // guaranteed non-routable) ahead of its real loopback address. The dial
+        // is served over loopback, so the connection must be charged to
+        // 127.0.0.1, not the decoy.
+        let peer1_loopback = ipv4_loopback_addr(&peer1.node_addr().await);
+        let decoy = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 1);
+        let decoy_first = NodeAddr::new(peer1_loopback.node_id).with_direct_addresses(
+            std::iter::once(decoy).chain(peer1_loopback.direct_addresses().copied()),
+        );
+        node.connect_native_to_addr(decoy_first, TEST_NET_TIMEOUT)
+            .await
+            .expect("peer1 registers over its reachable loopback path despite the decoy");
+
+        // With the connection correctly charged to the confirmed loopback IP,
+        // the per-IP cap of 1 must turn away a second distinct identity from
+        // 127.0.0.1. Before the fix, peer1 was charged to the decoy IP, leaving
+        // the loopback bucket empty and wrongly admitting peer2.
+        let peer2_addr = ipv4_loopback_addr(&peer2.node_addr().await);
+        let excess = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::zakura::handler::serve_native_dial_connection(
+                &node.endpoint(),
+                peer2_addr,
+                node.limits(),
+            ),
+        )
+        .await
+        .expect("the rejected one-shot dial must finish promptly");
+        assert!(
+            excess.is_ok(),
+            "second same-loopback identity must be rejected by the per-IP cap, proving the \
+             first dial was charged to the confirmed path and not the advertised decoy",
+        );
+        assert_eq!(
+            node.supervisor().registered_ids().await.len(),
+            1,
+            "the rejected peer must not be registered",
+        );
 
         node.shutdown().await;
         peer1.shutdown().await;

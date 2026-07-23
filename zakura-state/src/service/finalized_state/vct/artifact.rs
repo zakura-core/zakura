@@ -551,6 +551,41 @@ mod tests {
     #[test]
     fn embedded_mainnet_artifact_matches_frozen_identity_and_current_sprout_root() {
         let (handoff, handoff_hash, sprout_root) = mainnet_artifact_identity();
+        assert_eq!(
+            zakura_vct_sprout_history::TOTAL_LEN,
+            MAINNET_ARTIFACT_LEN,
+            "the embedded artifact length matches its reviewed identity"
+        );
+        assert_eq!(
+            zakura_vct_sprout_history::SHA256,
+            MAINNET_ARTIFACT_SHA256,
+            "the embedded artifact digest matches its reviewed identity"
+        );
+
+        let mut reader = zakura_vct_sprout_history::Reader::new();
+        let mut header = [0; HEADER_LEN];
+        read_exact(&mut reader, &mut header).expect("the embedded artifact header is readable");
+        let (actual_handoff, actual_hash, _record_count, terminal_root, _payload_digest) =
+            decode_header(&header).expect("the embedded artifact header is valid");
+        assert_eq!(actual_handoff, handoff);
+        assert_eq!(actual_hash, handoff_hash);
+        assert_eq!(terminal_root, sprout_root);
+
+        let current_frontier =
+            embedded_final_frontiers(&zakura_chain::parameters::Network::Mainnet)
+                .expect("Mainnet has an embedded final frontier");
+        assert_eq!(
+            sprout_root,
+            current_frontier.sprout.root(),
+            "the frozen repair artifact must remain Sprout-compatible with the latest checkpoint \
+             frontier; regenerate or remove it if Sprout changes"
+        );
+    }
+
+    #[test]
+    #[ignore = "full 71.7 MB artifact replay runs in full-coverage CI"]
+    fn embedded_mainnet_artifact_fully_replays() {
+        let (handoff, handoff_hash, sprout_root) = mainnet_artifact_identity();
         let artifact = embedded_mainnet().expect("the reviewed Mainnet artifact decodes");
 
         artifact

@@ -24,6 +24,12 @@ canary soak, announcement) apply on top of this checklist.
       release — the `Create release` workflow refuses to tag `v<version>`
       from any other branch. The `hotfix/v*` ruleset blocks deletion and
       force-pushes.
+- [ ] Embargoed main-base hotfix: the T-0 public PR branch is **also** named
+      `hotfix/v<version>` (based on `main`, pushed at T-0). Whatever the
+      base, the hotfix process never pushes `release/v*` or `bump-v*` —
+      those names belong to the regular release process, and disjoint
+      namespaces are what prevent an embargo-blind collision with it (see
+      the process doc's branch namespace rule).
 - [ ] Make the required changes, minimal and with tests.
 - [ ] For a public (non-embargoed) hotfix: open this PR from the branch with
       `&template=hotfix-release-checklist.md` in the compare URL, and add the
@@ -45,6 +51,13 @@ for the commands, using the branch checkout (release.toml allows
 `hotfix/v*`).
 
 - [ ] Bump the `zakura` package version and changed-crate versions.
+- [ ] De-rc'ing an rc line to its stable version? Re-run `cargo
+      semver-checks` against the published **stable** baselines — post-rc
+      changes can raise the required bump level (v1.0.3's planned patch
+      de-rcs became major bumps) — and normalize internal dependency
+      requirements: `dependent-version = "fix"` leaves stale `^X.Y.Z-rcN`
+      requirements in place when the stable version still matches them
+      (`make pre-release` fails on any left behind).
 - [ ] Generate and commit the stored config snapshot
       (`zakurad/tests/common/configs/v<version>.toml`) — `last_config_is_stored`
       fails without it.
@@ -65,19 +78,37 @@ for the commands, using the branch checkout (release.toml allows
 
 ## Publish the Release
 
-- [ ] Push the final branch to `zakura-core/zakura`.
-- [ ] Dispatch the
-      [Create release workflow](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml)
-      **from the `hotfix/v<version>` branch** with the exact tag. The
-      workflow validates, builds and verifies the assets, then waits at the
-      `release` environment.
-- [ ] Approve the `release` environment deployment (right commit? right
-      tag?). The workflow publishes a complete pre-release and creates the
-      protected tag; the tag push starts Docker publishing.
+- [ ] Confirm every release-capable maintainer has been told to hold
+      releases (for an embargoed hotfix, the day-before heads-up in the
+      process doc), and check for an in-flight regular release before
+      pushing anything: open PRs labeled `A-release`, `release/v*` or
+      `bump-v*` branches, and running `Create release` dispatches. Two
+      trains must never claim the same version — tags are immutable and
+      never reused.
+- [ ] Run the T-0 orchestrator — its preflight detects in-flight regular
+      releases, then it pushes the branch, dispatches
+      [Create release](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml),
+      and verifies each step's target state (resumable — re-runs skip
+      completed steps):
+
+      ```sh
+      ./scripts/release-t0.sh publish --hotfix --tag v<version> \
+          --mode branch --head-sha <final-commit>
+      ```
+
+      Manual fallback: push `hotfix/v<version>`, dispatch `Create release`
+      **from the branch** with the exact tag, and verify each step landed
+      before the next.
+- [ ] Approve the `release` environment deployment when the script announces
+      it (right commit? right tag?). The workflow publishes a complete
+      pre-release and creates the protected tag; the tag push starts Docker
+      publishing.
 - [ ] Update the release description from the changelog section.
 - [ ] Sign the release: `make sign-release TAG=v<version>`.
-- [ ] Stable hotfix only: promote the release — disable 'pre-release' **and**
-      "Set as the latest release". Release candidates are never promoted.
+- [ ] Stable hotfix only: promote —
+      `./scripts/release-t0.sh promote --tag v<version>` refuses unsigned
+      releases, clears 'pre-release', sets "latest", and verifies both.
+      Release candidates are never promoted.
 
 ## Publish Crates
 
@@ -98,14 +129,25 @@ for the commands, using the branch checkout (release.toml allows
 
 ## Merge the Hotfix into Main
 
+This section applies to hotfix-branch releases only: a main-base hotfix
+entered `main` at T-0 (the tag points at its squash commit) and has nothing
+to forward-merge.
+
 - [ ] Forward-merge `hotfix/v<version>` into `main` **immediately** via this
       PR. Solve conflicts in the branch without force-pushing — the released
       commit must become an ancestor of `main`.
-- [ ] Merge with a **merge commit** (admin merge; do not squash), so the
-      tagged commit is preserved in `main`'s history. **The merge button
-      defaults to squash — change the dropdown before clicking.** (A squash
-      copies the content but orphans the tagged commit from `main`'s
-      history, breaking later base-tag ancestry checks from `main`.)
+      `./scripts/release-t0.sh forward-merge --tag v<version> --pr <this PR>`
+      merges and verifies the ancestry postcondition.
+- [ ] Merge with a **merge commit** (do not squash), so the tagged commit is
+      preserved in `main`'s history. **The merge button defaults to squash —
+      change the dropdown before clicking.** (A squash copies the content
+      but orphans the tagged commit from `main`'s history, breaking later
+      base-tag ancestry checks — this happened to both rc-drill
+      forward-merges, #350 and #354.) The `main` ruleset only offers squash
+      and rebase, so this depends on the merge-method standing precondition
+      in the process doc: if `merge` is not permanently allowed there,
+      temporarily add it to the ruleset's allowed merge methods, merge, then
+      revert the edit.
 - [ ] Delete the hotfix branch after the merge; the tag is permanent.
 
 ## Release Failures

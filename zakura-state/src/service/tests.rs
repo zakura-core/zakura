@@ -1251,13 +1251,8 @@ fn read_only_completed_checkpoint_subscription_stays_open() {
         ..Config::default()
     };
 
-    let mut finalized_state = FinalizedState::new(
-        &config,
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("writable state creates the database");
+    let mut finalized_state =
+        FinalizedState::new(&config, &network).expect("writable state creates the database");
     finalized_state.db.shutdown(true);
     drop(finalized_state);
 
@@ -1335,13 +1330,7 @@ async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Re
     let network = Network::Mainnet;
     let winning_block = Arc::new(network.test_block(653599, 583999).unwrap());
     let config = Config::ephemeral();
-    let finalized_state = FinalizedState::new(
-        &config,
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .unwrap();
+    let finalized_state = FinalizedState::new(&config, &network).unwrap();
     let mut stale_block = winning_block.clone();
     // Production inserts blocks only after semantic verification. This state-layer
     // regression bypasses that boundary and mutates the nonce only to give the

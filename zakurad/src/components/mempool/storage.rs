@@ -217,6 +217,9 @@ pub struct Storage {
     /// Same as [`config::Config::eviction_memory_time`].
     eviction_memory_time: Duration,
 
+    /// Maximum entries retained in each rejection list.
+    rejection_list_capacity: usize,
+
     /// Max total cost of the verified mempool set, beyond which transactions
     /// are evicted to make room.
     tx_cost_limit: u64,
@@ -234,9 +237,27 @@ impl Drop for Storage {
 impl Storage {
     #[allow(clippy::field_reassign_with_default)]
     pub(crate) fn new(config: &config::Config) -> Self {
+        Self::new_with_rejection_list_capacity(config, MAX_EVICTION_MEMORY_ENTRIES)
+    }
+
+    /// Constructs storage with a configurable rejection-list capacity.
+    ///
+    /// Production always uses [`MAX_EVICTION_MEMORY_ENTRIES`]. Unit tests use
+    /// smaller capacities to exercise boundary behavior without tens of
+    /// thousands of insertions per property-test case.
+    fn new_with_rejection_list_capacity(
+        config: &config::Config,
+        rejection_list_capacity: usize,
+    ) -> Self {
+        assert!(
+            rejection_list_capacity > 0,
+            "rejection lists must retain at least one entry"
+        );
+
         Self {
             tx_cost_limit: config.tx_cost_limit,
             eviction_memory_time: config.eviction_memory_time,
+            rejection_list_capacity,
             max_datacarrier_bytes: config
                 .max_datacarrier_bytes
                 .unwrap_or(config::DEFAULT_MAX_DATACARRIER_BYTES),
@@ -680,10 +701,10 @@ impl Storage {
     /// Otherwise, peers could make our reject lists use a lot of RAM.
     fn limit_rejection_list_memory(&mut self) {
         // These lists are an optimisation - it's ok to totally clear them as needed.
-        if self.tip_rejected_exact.len() > MAX_EVICTION_MEMORY_ENTRIES {
+        if self.tip_rejected_exact.len() > self.rejection_list_capacity {
             self.tip_rejected_exact.clear();
         }
-        if self.tip_rejected_same_effects.len() > MAX_EVICTION_MEMORY_ENTRIES {
+        if self.tip_rejected_same_effects.len() > self.rejection_list_capacity {
             self.tip_rejected_same_effects.clear();
         }
         // `chain_rejected_same_effects` limits its size by itself
@@ -821,10 +842,11 @@ impl Storage {
             }
             RejectionError::SameEffectsChain(e) => {
                 let eviction_memory_time = self.eviction_memory_time;
+                let rejection_list_capacity = self.rejection_list_capacity;
                 self.chain_rejected_same_effects
                     .entry(e)
                     .or_insert_with(|| {
-                        EvictionList::new(MAX_EVICTION_MEMORY_ENTRIES, eviction_memory_time)
+                        EvictionList::new(rejection_list_capacity, eviction_memory_time)
                     })
                     .insert(tx_id.mined_id());
             }

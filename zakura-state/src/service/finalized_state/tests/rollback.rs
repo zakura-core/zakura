@@ -70,13 +70,8 @@ fn height(n: usize) -> Height {
 /// Syncs a fresh finalized state at `config` by committing `blocks` in order, then drops it so the
 /// database lock is released for the rollback utility to reopen.
 fn sync_to(config: &Config, network: &Network, blocks: &[SemanticallyVerifiedBlock]) {
-    let mut state = FinalizedState::new(
-        config,
-        network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let mut state =
+        FinalizedState::new(config, network).expect("opening an ephemeral database should succeed");
 
     for block in blocks {
         let checkpoint_verified = CheckpointVerifiedBlock::from(block.block.clone());
@@ -88,13 +83,7 @@ fn sync_to(config: &Config, network: &Network, blocks: &[SemanticallyVerifiedBlo
 
 /// Reopens the finalized state at `config` for read queries.
 fn reopen(config: &Config, network: &Network) -> FinalizedState {
-    FinalizedState::new(
-        config,
-        network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed")
+    FinalizedState::new(config, network).expect("opening an ephemeral database should succeed")
 }
 
 /// Opens the database at `config` directly, skipping format upgrades and their validation. The
@@ -1152,13 +1141,15 @@ fn modern_rollback_preserves_empty_genesis_ironwood_tree() -> Result<()> {
 
     proptest!(
         ProptestConfig::with_cases(proptest_cases()),
-        |((chain, _count, network, _history_tree) in PreparedChain::default()
-            .with_ledger_strategy(ledger_strategy)
-            .with_valid_commitments()
+        |((chain, network) in super::valid_commitment_chain(ledger_strategy, target_index + 2)
             .no_shrink())
             | {
-            let synced: Vec<SemanticallyVerifiedBlock> = chain.iter().cloned().collect();
-            prop_assume!(synced.len() > target_index + 1);
+            let synced = chain;
+            prop_assert_eq!(
+                synced.len(),
+                target_index + 2,
+                "generated chain must contain the target and one removed block"
+            );
 
             let dir = TempDir::new().expect("temp dir");
             let config = config_at(dir.path());

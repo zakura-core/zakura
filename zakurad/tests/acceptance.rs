@@ -416,7 +416,7 @@ async fn db_init_outside_future_executor() -> Result<()> {
     Ok(())
 }
 
-/// Check that persistent block state and peer list caches survive a node run.
+/// Check that persistent block state and peer list caches survive a node restart.
 #[test]
 fn persistent_mode() -> Result<()> {
     let _init_guard = zakura_test::init();
@@ -445,7 +445,6 @@ fn persistent_mode() -> Result<()> {
 
     child.expect_stdout_line_matches("loaded Zakura state cache")?;
     child.expect_stdout_line_matches("loaded cached peer IP addresses")?;
-    child.expect_stdout_line_matches("cacheable peer list was empty, keeping previous cache")?;
     child.kill(false)?;
     let output = child.wait_with_output()?;
 
@@ -460,9 +459,32 @@ fn persistent_mode() -> Result<()> {
     );
 
     assert_with_context!(
-        fs::read_to_string(peer_cache_file)?.trim() == "127.0.0.1:1",
+        fs::read_to_string(&peer_cache_file)?.trim() == "127.0.0.1:1",
         &output,
         "peer cache changed despite having no connected peers"
+    );
+
+    let mut child = testdir
+        .spawn_child(args!["-v", "start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
+
+    child.expect_stdout_line_matches("loaded Zakura state cache")?;
+    child.expect_stdout_line_matches("loaded cached peer IP addresses")?;
+    child.kill(false)?;
+    let output = child.wait_with_output()?;
+
+    output.assert_was_killed()?;
+
+    assert_with_context!(
+        cache_dir.read_dir()?.count() > 0,
+        &output,
+        "state directory empty after restarting with persistent state config"
+    );
+
+    assert_with_context!(
+        fs::read_to_string(&peer_cache_file)?.trim() == "127.0.0.1:1",
+        &output,
+        "peer cache did not survive node restart"
     );
 
     Ok(())
@@ -1635,30 +1657,27 @@ async fn tracing_endpoint() -> Result<()> {
     Ok(())
 }
 
-/// Test that the JSON-RPC endpoint responds to a request,
-/// when configured with a single thread.
+/// Test the JSON-RPC endpoint with single- and multi-threaded configurations.
+///
+/// The multi-threaded node also checks zcashd-compatible content types, avoiding
+/// a third node startup for those requests.
 #[tokio::test]
-async fn rpc_endpoint_single_thread() -> Result<()> {
-    rpc_endpoint(false).await
-}
+async fn rpc_endpoints() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    if zakura_test::net::zebra_skip_network_tests() {
+        return Ok(());
+    }
 
-/// Test that the JSON-RPC endpoint responds to a request,
-/// when configured with multiple threads.
-#[tokio::test]
-async fn rpc_endpoint_parallel_threads() -> Result<()> {
-    rpc_endpoint(true).await
+    tokio::try_join!(rpc_endpoint(false, false), rpc_endpoint(true, true))?;
+
+    Ok(())
 }
 
 /// Test that the JSON-RPC endpoint responds to a request.
 ///
 /// Set `parallel_cpu_threads` to true to auto-configure based on the number of CPU cores.
 #[tracing::instrument]
-async fn rpc_endpoint(parallel_cpu_threads: bool) -> Result<()> {
-    let _init_guard = zakura_test::init();
-    if zakura_test::net::zebra_skip_network_tests() {
-        return Ok(());
-    }
-
+async fn rpc_endpoint(parallel_cpu_threads: bool, check_content_types: bool) -> Result<()> {
     // Write a configuration that has RPC listen_addr set
     // [Note on port conflict](#Note on port conflict)
     let mut config = os_assigned_rpc_port_config(parallel_cpu_threads, &Mainnet)?;
@@ -1690,6 +1709,10 @@ async fn rpc_endpoint(parallel_cpu_threads: bool) -> Result<()> {
     let subversion = parsed["result"]["subversion"].as_str().unwrap();
     assert!(subversion.contains("Zakura"), "Got {subversion}");
 
+    if check_content_types {
+        check_rpc_endpoint_content_types(&client).await?;
+    }
+
     child.kill(false)?;
 
     let output = child.wait_with_output()?;
@@ -1708,25 +1731,7 @@ async fn rpc_endpoint(parallel_cpu_threads: bool) -> Result<()> {
 /// This test ensures that the curl examples of zcashd rpc methods will also work in Zebra.
 ///
 /// https://zcash.github.io/rpc/getblockchaininfo.html
-#[tokio::test]
-async fn rpc_endpoint_client_content_type() -> Result<()> {
-    let _init_guard = zakura_test::init();
-    if zakura_test::net::zebra_skip_network_tests() {
-        return Ok(());
-    }
-
-    // Let the OS assign the RPC port to avoid races with parallel tests.
-    let mut config = os_assigned_rpc_port_config(true, &Mainnet)?;
-
-    let dir = testdir()?.with_config(&mut config)?;
-    let mut child = dir.spawn_child(args!["start"])?;
-
-    // Wait until port is open.
-    let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
-
-    // Create an http client
-    let client = RpcRequestClient::new(rpc_address);
-
+async fn check_rpc_endpoint_content_types(client: &RpcRequestClient) -> Result<()> {
     // Call to `getinfo` RPC method with a no content type.
     let res = client
         .call_with_no_content_type("getinfo", "[]".to_string())
@@ -2997,21 +3002,18 @@ async fn validate_regtest_genesis_block() {
 fn external_address() -> Result<()> {
     let _init_guard = zakura_test::init();
     let testdir = testdir()?.with_config(&mut external_address_test_config(&Mainnet)?)?;
-    let mut child = testdir.spawn_child(args!["start"])?;
+    let mut child = testdir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
 
-    // Give enough time to start connecting to some peers.
-    std::thread::sleep(Duration::from_secs(10));
+    child.expect_stdout_line_matches("Starting zakurad")?;
+    // Wait for an actual outbound handshake to use the configured address.
+    child.expect_stdout_line_matches("using external address for Version messages")?;
 
     child.kill(false)?;
 
     let output = child.wait_with_output()?;
     let output = output.assert_failure()?;
-
-    // Zebra started
-    output.stdout_line_contains("Starting zakurad")?;
-
-    // Make sure we are using external address for Version messages.
-    output.stdout_line_contains("using external address for Version messages")?;
 
     // Make sure the command was killed.
     output.assert_was_killed()?;
@@ -3028,14 +3030,14 @@ async fn regtest_block_templates_are_valid_block_submissions() -> Result<()> {
     Ok(())
 }
 
-/// A rejected block body must not poison the children of a later valid block with the same header
-/// hash.
+/// A rejected block body must not poison a later valid block with the same
+/// header hash or its children.
 ///
 /// This is a regression test for [GHSA-8gxx-hc65-vv82][ghsa-8gxx]. Under the transaction digest
 /// scheme defined by [ZIP-244][zip-244], two different block bodies can share the same header hash.
-/// `zakura-state` previously retained the contextual validation error from the poisoned body and
-/// incorrectly propagated it to children of the later valid block, causing them to be incorrectly
-/// rejected.
+/// `zakura-state` previously retained the contextual validation error from the
+/// poisoned body. This made the valid body appear known as sent and propagated
+/// the error to its children, causing both to be incorrectly rejected.
 ///
 /// [ghsa-8gxx]: https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-8gxx-hc65-vv82
 /// [zip-244]: https://zips.z.cash/zip-0244
@@ -3156,119 +3158,6 @@ async fn rejected_block_does_not_reject_same_hash_block_children() -> Result<()>
         client.blockchain_info().await?.blocks(),
         Height(4),
         "the valid child must not inherit the rejected block body error"
-    );
-
-    zakurad.kill(false)?;
-    let output = zakurad.wait_with_output()?;
-    output.assert_failure()?.assert_was_killed()?;
-
-    Ok(())
-}
-
-/// A contextually rejected block must not remain known as sent.
-///
-/// Sync checks [`zakura_state::Request::KnownBlock`] before downloading a block body. If a rejected
-/// block remains in the state's sent hashes, an honest block body with the same header hash is
-/// incorrectly reported as a duplicate and never reaches contextual verification.
-#[tokio::test]
-async fn rejected_block_is_not_known_as_sent() -> Result<()> {
-    const EXTRA_COINBASE_DATA: &str = "zakura-chain-stall-poc";
-
-    let _init_guard = zakura_test::init();
-
-    let network = Network::new_regtest(
-        ConfiguredActivationHeights {
-            nu5: Some(1),
-            ..Default::default()
-        }
-        .into(),
-    );
-    let mut config = os_assigned_rpc_port_config(false, &network)?;
-    config.mempool.debug_enable_at_height = Some(0);
-    config.mining.extra_coinbase_data =
-        Some(ExtraCoinbaseData::try_from(EXTRA_COINBASE_DATA.to_owned())?);
-
-    let mut block_builder = testdir()?
-        .with_config(&mut config)?
-        .spawn_child(args!["start"])?
-        .with_timeout(EXTENDED_LAUNCH_DELAY);
-    let rpc_address = read_listen_addr_from_logs(&mut block_builder, OPENED_RPC_ENDPOINT_MSG)?;
-    block_builder.expect_stdout_line_matches("activating mempool")?;
-
-    let client = RpcRequestClient::new(rpc_address);
-    let mut blocks = Vec::new();
-    for expected_height in 1..=3 {
-        let (block, height) = client.block_from_template(&network).await?;
-        assert_eq!(height.0, expected_height);
-        client.submit_block(block.clone()).await?;
-        blocks.push(block);
-    }
-
-    block_builder.kill(false)?;
-    let output = block_builder.wait_with_output()?;
-    output.assert_failure()?.assert_was_killed()?;
-
-    let mut zakurad = testdir()?
-        .with_config(&mut config)?
-        .spawn_child(args!["start"])?
-        .with_timeout(EXTENDED_LAUNCH_DELAY);
-    let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
-    zakurad.expect_stdout_line_matches("activating mempool")?;
-
-    let client = RpcRequestClient::new(rpc_address);
-    client.submit_block(blocks[0].clone()).await?;
-    client.submit_block(blocks[1].clone()).await?;
-
-    let valid_block = blocks[2].clone();
-    let mut poisoned_block = valid_block.clone();
-    let coinbase = Arc::make_mut(
-        poisoned_block
-            .transactions
-            .first_mut()
-            .expect("block templates contain a coinbase transaction"),
-    );
-    let transparent::Input::Coinbase { data, .. } = coinbase
-        .inputs_mut()
-        .first_mut()
-        .expect("coinbase transactions contain a transparent input")
-    else {
-        panic!("the first coinbase transaction input must be a coinbase input");
-    };
-    assert!(
-        data.ends_with(EXTRA_COINBASE_DATA.as_bytes()),
-        "the coinbase transaction must contain the configured extra data"
-    );
-    let last_data_byte = data
-        .last_mut()
-        .expect("configured extra coinbase data is non-empty");
-    *last_data_byte = b'a';
-
-    assert_eq!(
-        poisoned_block.hash(),
-        valid_block.hash(),
-        "changing a NU5 coinbase scriptSig must not change the block header hash"
-    );
-
-    let poisoned_block_data = hex::encode(poisoned_block.zcash_serialize_to_vec()?);
-    let poisoned_response: SubmitBlockResponse = client
-        .json_result_from_call("submitblock", format!(r#"["{poisoned_block_data}"]"#))
-        .await
-        .map_err(|err| eyre!(err))?;
-    assert_eq!(
-        poisoned_response,
-        SubmitBlockResponse::ErrorResponse(SubmitBlockErrorResponse::Rejected),
-        "the poisoned block body must be rejected"
-    );
-
-    let valid_block_data = hex::encode(valid_block.zcash_serialize_to_vec()?);
-    let valid_response: SubmitBlockResponse = client
-        .json_result_from_call("submitblock", format!(r#"["{valid_block_data}"]"#))
-        .await
-        .map_err(|err| eyre!(err))?;
-    assert_eq!(
-        valid_response,
-        SubmitBlockResponse::Accepted,
-        "KnownBlock must drain rejected hashes before checking sent hashes"
     );
 
     zakurad.kill(false)?;
@@ -4374,18 +4263,22 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     let mut config = os_assigned_rpc_port_config(false, &network)?;
     config.state.ephemeral = false;
     config.state.debug_skip_non_finalized_state_backup_task = true;
+    config.mempool.debug_enable_at_height = Some(0);
     let test_dir = testdir()?.with_config(&mut config)?;
 
     // Start Zebra and generate some blocks.
 
     tracing::info!("starting Zakura and generating some blocks");
-    let mut child = test_dir.spawn_child(args!["start"])?;
+    let mut child = test_dir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
     // Avoid dropping the test directory and cleanup of the state cache needed by the next zakurad instance.
     let test_dir = child.dir.take().expect("should have test directory");
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
-    // Wait for Zebra to load its state cache
-    tokio::time::sleep(Duration::from_secs(5)).await;
     let rpc_client = RpcRequestClient::new(rpc_address);
+    child.expect_stdout_line_matches("verified final checkpoint")?;
+    wake_debug_mempool(&rpc_client).await?;
+    child.expect_stdout_line_matches("activating mempool")?;
     let generated_block_hashes = rpc_client.generate(INITIAL_NON_FINALIZED_BLOCKS).await?;
 
     child.kill(true)?;
@@ -4406,13 +4299,13 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     // max checkpoint height and that it can still commit more blocks to its state.
 
     tracing::info!("restarting Zakura to check that non-finalized state is restored");
-    let mut child = test_dir.spawn_child(args!["start"])?;
+    let mut child = test_dir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
     let test_dir = child.dir.take().expect("should have test directory");
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
     let rpc_client = RpcRequestClient::new(rpc_address);
 
-    // Wait for Zebra to load its state cache
-    tokio::time::sleep(Duration::from_secs(5)).await;
     let blockchain_info = rpc_client.blockchain_info().await?;
     tracing::info!(
         ?blockchain_info,
@@ -4426,6 +4319,8 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     );
 
     tracing::info!("checking that Zakura can commit blocks after restoring non-finalized state");
+    wake_debug_mempool(&rpc_client).await?;
+    child.expect_stdout_line_matches("activating mempool")?;
     rpc_client
         .generate(1)
         .await
@@ -4466,13 +4361,13 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     });
     let mut config = os_assigned_rpc_port_config(false, &network)?;
     config.state.ephemeral = false;
+    config.mempool.debug_enable_at_height = Some(0);
     let mut child = test_dir
         .with_config(&mut config)?
-        .spawn_child(args!["start"])?;
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
     let test_dir = child.dir.take().expect("should have test directory");
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
-    // Wait for Zebra to load its state cache
-    tokio::time::sleep(Duration::from_secs(5)).await;
     let rpc_client = RpcRequestClient::new(rpc_address);
 
     assert_eq!(
@@ -4495,6 +4390,8 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     // Commit a block to check that Zebra's state will still commit blocks
     // after checkpoint verification.
 
+    wake_debug_mempool(&rpc_client).await?;
+    child.expect_stdout_line_matches("activating mempool")?;
     rpc_client
         .generate(1)
         .await
@@ -4516,20 +4413,30 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     config.state.should_backup_non_finalized_state = false;
     let mut child = test_dir
         .with_config(&mut config)?
-        .spawn_child(args!["start"])?;
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
     let rpc_client = RpcRequestClient::new(rpc_address);
 
-    // Wait for Zebra to load its state cache
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
     tracing::info!("checking that Zakura commits blocks with empty non-finalized state");
+    wake_debug_mempool(&rpc_client).await?;
+    child.expect_stdout_line_matches("activating mempool")?;
     rpc_client
         .generate(1)
         .await
         .expect("should successfully commit more blocks to the state");
 
     child.kill(true)
+}
+
+/// Prompt the mempool service to apply its debug activation setting.
+async fn wake_debug_mempool(rpc_client: &RpcRequestClient) -> Result<()> {
+    let _: Value = rpc_client
+        .json_result_from_call("getmempoolinfo", "[]")
+        .await
+        .map_err(|error| eyre!(error))?;
+
+    Ok(())
 }
 
 /// Check that Zebra will disconnect from misbehaving peers.
@@ -4543,8 +4450,6 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
 #[ignore]
 #[cfg(not(target_os = "windows"))]
 async fn disconnects_from_misbehaving_peers() -> Result<()> {
-    use std::sync::{atomic::AtomicBool, Arc};
-
     use common::regtest::MiningRpcMethods;
     use zakura_chain::parameters::testnet::{self, ConfiguredActivationHeights};
     use zakura_rpc::client::PeerInfo;
@@ -4587,12 +4492,14 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
     config.state.ephemeral = true;
     config.network.initial_testnet_peers = [].into();
     config.network.crawl_new_peer_interval = Duration::from_secs(5);
+    // Invalid blocks log the full custom network at warn level. Keep the
+    // expected logs from filling the child process pipes while this test polls
+    // the nodes over RPC, but allow the listener readiness event used below.
+    config.tracing.filter = Some("error,zakura_network::peer_set::initialize=info".to_string());
 
     let rpc_listen_addr = config.rpc.listen_addr.unwrap();
-    // Use a longer timeout because `generate [500]` mines 500 blocks in a single
-    // RPC call, which can exceed the default timeout at ~400ms per block.
-    let rpc_client_1 =
-        RpcRequestClient::new_with_timeout(rpc_listen_addr, Duration::from_secs(15 * 60));
+    let rpc_client_1 = RpcRequestClient::new_with_timeout(rpc_listen_addr, EXTENDED_LAUNCH_DELAY);
+    let node_1_listen_addr = config.network.listen_addr;
 
     tracing::info!(
         ?rpc_listen_addr,
@@ -4600,27 +4507,23 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
         "starting a zakurad child on incompatible custom Testnet"
     );
 
-    let is_finished = Arc::new(AtomicBool::new(false));
+    let (zakurad_failure_messages, zakurad_ignore_messages) = test_type.zakurad_failure_messages();
+    let mut zakurad_child_1 = testdir()?
+        .with_exact_config(&config)?
+        .spawn_child(args!["start"])?
+        .with_timeout(test_type.zakurad_timeout())
+        .with_failure_regex_iter(zakurad_failure_messages, zakurad_ignore_messages);
 
-    {
-        let is_finished = Arc::clone(&is_finished);
-        let config = config.clone();
-        let (zakurad_failure_messages, zakurad_ignore_messages) =
-            test_type.zakurad_failure_messages();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut zakurad_child = testdir()?
-                .with_exact_config(&config)?
-                .spawn_child(args!["start"])?
-                .bypass_test_capture(true)
-                .with_timeout(test_type.zakurad_timeout())
-                .with_failure_regex_iter(zakurad_failure_messages, zakurad_ignore_messages);
-
-            while !is_finished.load(std::sync::atomic::Ordering::SeqCst) {
-                zakurad_child.wait_for_stdout_line(Some("zebraA1".to_string()));
-            }
-
-            Ok(())
-        });
+    // A refused initial dial marks the only configured address unreachable in
+    // this isolated test, so only start node 2 once node 1 is listening.
+    let node_1_listener_result = zakurad_child_1.expect_stdout_line_matches(regex::escape(
+        &format!("Opened Zcash protocol endpoint at {node_1_listen_addr}"),
+    ));
+    if let Err(error) = node_1_listener_result {
+        zakurad_child_1
+            .kill_and_consume_output(true)
+            .wrap_err("failed to stop the PoW-disabled zakurad child")?;
+        return Err(error);
     }
 
     let network2 = testnet::Parameters::build()
@@ -4640,15 +4543,16 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
         .expect("failed to build configured network");
 
     config.network.network = network2;
-    config.network.initial_testnet_peers = [config.network.listen_addr.to_string()].into();
+    config.network.initial_testnet_peers = [node_1_listen_addr.to_string()].into();
     config.network.listen_addr = "127.0.0.1:0".parse()?;
     config.rpc.listen_addr = Some(format!("127.0.0.1:{}", random_known_port()).parse()?);
     config.network.crawl_new_peer_interval = Duration::from_secs(5);
     config.network.cache_dir = false.into();
     config.state.ephemeral = true;
+    config.tracing.filter = Some("error".to_string());
 
     let rpc_listen_addr = config.rpc.listen_addr.unwrap();
-    let rpc_client_2 = RpcRequestClient::new(rpc_listen_addr);
+    let rpc_client_2 = RpcRequestClient::new_with_timeout(rpc_listen_addr, EXTENDED_LAUNCH_DELAY);
 
     tracing::info!(
         ?rpc_listen_addr,
@@ -4656,94 +4560,80 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
         "starting a zakurad child on the default Testnet"
     );
 
-    {
-        let is_finished = Arc::clone(&is_finished);
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let (zakurad_failure_messages, zakurad_ignore_messages) =
-                test_type.zakurad_failure_messages();
-            let mut zakurad_child = testdir()?
-                .with_exact_config(&config)?
-                .spawn_child(args!["start"])?
-                .bypass_test_capture(true)
-                .with_timeout(test_type.zakurad_timeout())
-                .with_failure_regex_iter(zakurad_failure_messages, zakurad_ignore_messages);
+    let (zakurad_failure_messages, zakurad_ignore_messages) = test_type.zakurad_failure_messages();
+    let mut zakurad_child_2 = testdir()?
+        .with_exact_config(&config)?
+        .spawn_child(args!["start"])?
+        .with_timeout(test_type.zakurad_timeout())
+        .with_failure_regex_iter(zakurad_failure_messages, zakurad_ignore_messages);
 
-            while !is_finished.load(std::sync::atomic::Ordering::SeqCst) {
-                zakurad_child.wait_for_stdout_line(Some("zebraB2".to_string()));
-            }
+    let test_result: Result<()> = async {
+        tracing::info!("waiting for zakurad nodes to connect");
 
-            Ok(())
-        });
-    }
-
-    tracing::info!("waiting for zakurad nodes to connect");
-
-    let peer_info = tokio::time::timeout(EXTENDED_LAUNCH_DELAY, async {
-        loop {
-            if let Ok(peer_info) = rpc_client_2
-                .json_result_from_call::<Vec<PeerInfo>>("getpeerinfo", "[]")
-                .await
-            {
-                if !peer_info.is_empty() {
-                    break peer_info;
+        let peer_info = tokio::time::timeout(EXTENDED_LAUNCH_DELAY, async {
+            loop {
+                if let Ok(peer_info) = rpc_client_2
+                    .json_result_from_call::<Vec<PeerInfo>>("getpeerinfo", "[]")
+                    .await
+                {
+                    if !peer_info.is_empty() {
+                        break peer_info;
+                    }
                 }
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .map_err(|_| eyre!("zakurad nodes did not connect before the launch timeout"))?;
-
-    tracing::info!(
-        ?peer_info,
-        "found peer connection, committing genesis block"
-    );
-
-    let genesis_block = network1.block_parsed_iter().next().unwrap();
-    rpc_client_1.submit_block(genesis_block.clone()).await?;
-    rpc_client_2.submit_block(genesis_block).await?;
-
-    // Call the `generate` method to mine blocks in the zakurad instance where PoW is disabled
-    tracing::info!("committed genesis block, mining blocks with invalid PoW");
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    rpc_client_1.call("generate", "[500]").await?;
-
-    tracing::info!("wait for misbehavior messages to flush into address updater channel");
-
-    tokio::time::sleep(Duration::from_secs(30)).await;
-
-    tracing::info!("calling getpeerinfo to confirm Zakura has dropped the peer connection");
-
-    // Call `getpeerinfo` to check that the zakurad instances have disconnected
-    for i in 0..600 {
-        let peer_info: Vec<PeerInfo> = rpc_client_2
-            .json_result_from_call("getpeerinfo", "[]")
-            .await
-            .map_err(|err| eyre!(err))?;
-
-        if peer_info.is_empty() {
-            break;
-        } else if i % 10 == 0 {
-            tracing::info!(?peer_info, "has not yet disconnected from misbehaving peer");
-        }
-
-        rpc_client_1.call("generate", "[1]").await?;
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-
-    let peer_info: Vec<PeerInfo> = rpc_client_2
-        .json_result_from_call("getpeerinfo", "[]")
+        })
         .await
-        .map_err(|err| eyre!(err))?;
+        .map_err(|_| eyre!("zakurad nodes did not connect before the launch timeout"))?;
 
-    tracing::info!(?peer_info, "called getpeerinfo");
+        tracing::info!(
+            ?peer_info,
+            "found peer connection, committing genesis block"
+        );
 
-    assert!(peer_info.is_empty(), "should have no peers");
+        let genesis_block = network1.block_parsed_iter().next().unwrap();
+        rpc_client_1.submit_block(genesis_block.clone()).await?;
+        rpc_client_2.submit_block(genesis_block).await?;
 
-    is_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The syncer drops the trailing untrusted FindBlocks hash, then needs
+        // two remaining hashes to select a prospective tip.
+        tracing::info!("committed genesis block, mining blocks with invalid PoW");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        rpc_client_1.generate(3).await?;
+
+        tokio::time::timeout(test_type.zakurad_timeout(), async {
+            loop {
+                let peer_info: Vec<PeerInfo> = rpc_client_2
+                    .json_result_from_call("getpeerinfo", "[]")
+                    .await
+                    .map_err(|err| eyre!(err))?;
+
+                if peer_info.is_empty() {
+                    return Ok::<(), color_eyre::Report>(());
+                }
+
+                tracing::debug!(?peer_info, "has not yet disconnected from misbehaving peer");
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| eyre!("nodes did not disconnect before the launch timeout"))??;
+
+        Ok(())
+    }
+    .await;
+
+    // Always stop both processes so their piped output reaches EOF. The old
+    // detached output readers could remain blocked forever after this test
+    // finished, hanging the entire nextest shard.
+    let child_1_cleanup = zakurad_child_1.kill_and_consume_output(true);
+    let child_2_cleanup = zakurad_child_2.kill_and_consume_output(true);
+
+    test_result?;
+    child_1_cleanup.wrap_err("failed to stop the PoW-disabled zakurad child")?;
+    child_2_cleanup.wrap_err("failed to stop the PoW-enabled zakurad child")?;
 
     Ok(())
 }

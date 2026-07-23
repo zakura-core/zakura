@@ -39,7 +39,13 @@ proptest! {
         let (runtime, _init_guard) = zakura_test::init_async();
         let _guard = runtime.enter();
 
-        runtime.block_on(timeout(MAX_TEST_EXECUTION, root_task(sync_lengths)))??;
+        runtime.block_on(async move {
+            // These tasks only use mocked synchronization events. Preserve the
+            // timeout behavior without making every negative check wait in real
+            // time.
+            tokio::time::pause();
+            timeout(MAX_TEST_EXECUTION, root_task(sync_lengths)).await
+        })??;
 
         /// The root task that the runtime executes.
         ///

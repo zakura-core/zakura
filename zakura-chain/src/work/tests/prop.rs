@@ -14,6 +14,24 @@ use super::super::*;
 
 const DEFAULT_TEST_INPUT_PROPTEST_CASES: u32 = 64;
 
+fn equihash_proptest_cases() -> u32 {
+    env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_TEST_INPUT_PROPTEST_CASES)
+}
+
+fn test_headers() -> Vec<block::Header> {
+    zakura_test::vectors::BLOCKS
+        .iter()
+        .map(|block_bytes| {
+            let block = Block::zcash_deserialize(&block_bytes[..])
+                .expect("block test vector should deserialize");
+            *block.header
+        })
+        .collect()
+}
+
 #[test]
 fn equihash_solution_roundtrip() {
     let _init_guard = zakura_test::init();
@@ -46,29 +64,43 @@ prop_compose! {
 }
 
 #[test]
+fn equihash_test_vectors_validate() -> color_eyre::eyre::Result<()> {
+    let _init_guard = zakura_test::init();
+
+    for header in test_headers() {
+        header.solution.check(&header, &Network::Mainnet)?;
+    }
+
+    Ok(())
+}
+
+#[test]
 fn equihash_prop_test_solution() -> color_eyre::eyre::Result<()> {
     let _init_guard = zakura_test::init();
 
-    for block_bytes in zakura_test::vectors::BLOCKS.iter() {
-        let block = Block::zcash_deserialize(&block_bytes[..])
-            .expect("block test vector should deserialize");
-        block
-            .header
-            .solution
-            .check(&block.header, &Network::Mainnet)?;
+    let headers = test_headers();
 
-        // The equihash solution test can be really slow, so we use fewer cases by
-        // default. Set the PROPTEST_CASES env var to override this default.
-        proptest!(Config::with_cases(env::var("PROPTEST_CASES")
-                                      .ok()
-                                      .and_then(|v| v.parse().ok())
-                                      .unwrap_or(DEFAULT_TEST_INPUT_PROPTEST_CASES)),
-                |(fake_header in randomized_solutions(*block.header.as_ref()))| {
-            fake_header.solution
-                .check(&fake_header, &Network::Mainnet)
-                .expect_err("block header should not validate on randomized solution");
-        });
+    // Every test vector gets a deterministic invalid solution, so vector
+    // coverage does not depend on random case selection.
+    for real_header in &headers {
+        let mut fake_header = *real_header;
+        fake_header.solution = equihash::Solution::for_proposal();
+        assert_ne!(fake_header.solution, real_header.solution);
+        fake_header
+            .solution
+            .check(&fake_header, &Network::Mainnet)
+            .expect_err("block header should not validate with the null solution");
     }
+
+    // Randomized cases sample across the complete vector set instead of
+    // multiplying the same case budget by every vector.
+    let randomized_headers = proptest::sample::select(headers).prop_flat_map(randomized_solutions);
+    proptest!(Config::with_cases(equihash_proptest_cases()),
+        |(fake_header in randomized_headers)| {
+        fake_header.solution
+            .check(&fake_header, &Network::Mainnet)
+            .expect_err("block header should not validate on randomized solution");
+    });
 
     Ok(())
 }
@@ -92,20 +124,25 @@ prop_compose! {
 fn equihash_prop_test_nonce() -> color_eyre::eyre::Result<()> {
     let _init_guard = zakura_test::init();
 
-    for block_bytes in zakura_test::vectors::BLOCKS.iter() {
-        let block = Block::zcash_deserialize(&block_bytes[..])
-            .expect("block test vector should deserialize");
-        block
-            .header
-            .solution
-            .check(&block.header, &Network::Mainnet)?;
+    let headers = test_headers();
 
-        proptest!(|(fake_header in randomized_nonce(*block.header.as_ref()))| {
-            fake_header.solution
-                .check(&fake_header, &Network::Mainnet)
-                .expect_err("block header should not validate on randomized nonce");
-        });
+    for real_header in &headers {
+        let mut fake_header = *real_header;
+        fake_header.nonce.0[0] ^= 1;
+        assert_ne!(fake_header.nonce, real_header.nonce);
+        fake_header
+            .solution
+            .check(&fake_header, &Network::Mainnet)
+            .expect_err("block header should not validate with a changed nonce");
     }
+
+    let randomized_headers = proptest::sample::select(headers).prop_flat_map(randomized_nonce);
+    proptest!(Config::with_cases(equihash_proptest_cases()),
+        |(fake_header in randomized_headers)| {
+        fake_header.solution
+            .check(&fake_header, &Network::Mainnet)
+            .expect_err("block header should not validate on randomized nonce");
+    });
 
     Ok(())
 }
@@ -131,24 +168,25 @@ prop_compose! {
 fn equihash_prop_test_input() -> color_eyre::eyre::Result<()> {
     let _init_guard = zakura_test::init();
 
-    for block_bytes in zakura_test::vectors::BLOCKS.iter() {
-        let block = Block::zcash_deserialize(&block_bytes[..])
-            .expect("block test vector should deserialize");
-        block
-            .header
-            .solution
-            .check(&block.header, &Network::Mainnet)?;
+    let headers = test_headers();
 
-        proptest!(Config::with_cases(env::var("PROPTEST_CASES")
-                                  .ok()
-                                  .and_then(|v| v.parse().ok())
-                                 .unwrap_or(DEFAULT_TEST_INPUT_PROPTEST_CASES)),
-              |(fake_header in randomized_input(*block.header.as_ref()))| {
-            fake_header.solution
-                .check(&fake_header, &Network::Mainnet)
-                .expect_err("equihash solution should not validate on randomized input");
-        });
+    for real_header in &headers {
+        let mut fake_header = *real_header;
+        fake_header.previous_block_hash.0[0] ^= 1;
+        assert_ne!(fake_header, *real_header);
+        fake_header
+            .solution
+            .check(&fake_header, &Network::Mainnet)
+            .expect_err("equihash solution should not validate with changed input");
     }
+
+    let randomized_headers = proptest::sample::select(headers).prop_flat_map(randomized_input);
+    proptest!(Config::with_cases(equihash_proptest_cases()),
+        |(fake_header in randomized_headers)| {
+        fake_header.solution
+            .check(&fake_header, &Network::Mainnet)
+            .expect_err("equihash solution should not validate on randomized input");
+    });
 
     Ok(())
 }

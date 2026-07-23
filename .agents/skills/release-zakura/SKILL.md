@@ -26,6 +26,9 @@ defining it, and adds the Zakura-specific checks that are easy to miss.
 - Do not promote a release candidate from pre-release to Latest. Published
   release candidates stay up as pre-releases; removing one is an owner-level
   decision, never part of a release flow.
+- If a release-capable maintainer has announced a release hold, stop: do not
+  prepare or publish until it is lifted. A security hotfix may be in flight
+  for the same version, invisible under embargo.
 
 ## Gather release context
 
@@ -51,6 +54,11 @@ git diff --stat <previous-tag>
 ```
 
 ## Prepare the release branch
+
+Name the branch `release/v<version>`. Never use `hotfix/v*` — that namespace
+is reserved for the hotfix release process
+(`docs/security-hotfix-release.md`), and keeping the namespaces disjoint is
+what prevents collisions with an embargoed hotfix.
 
 ### Package versions
 
@@ -163,7 +171,16 @@ checks and why.
 
 ## Publish
 
-After the release PR is merged and explicit confirmation is given:
+After the release PR is merged and explicit confirmation is given, run the
+T-0 orchestrator — it preflights competing release trains, dispatches,
+watches to the approval gate, and verifies the published release; it is
+resumable and re-runs skip completed steps:
+
+```bash
+./scripts/release-t0.sh publish --tag <tag> --mode main --head-sha <merged-commit>
+```
+
+Raw dispatch fallback:
 
 ```bash
 gh workflow run create-release.yml \
@@ -195,6 +212,8 @@ still has the previous package version.
 - Install the exact version from crates.io and run `zakurad --version`.
 - Replace the boilerplate GitHub release body with concrete notes from the final
   changelog or approved release-note draft.
+- Promote stable releases with `./scripts/release-t0.sh promote --tag <tag>`
+  after signing; it refuses unsigned releases and release candidates.
 - Keep release candidates marked as pre-releases.
 
 ## Review output

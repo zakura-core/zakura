@@ -1317,6 +1317,14 @@ impl LegacyGossipOutbound {
         }
     }
 
+    fn contains_connection(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        self.sessions
+            .lock()
+            .expect("legacy gossip outbound mutex is never poisoned")
+            .get(peer)
+            .is_some_and(|session| session.conn_id() == conn_id)
+    }
+
     #[cfg(test)]
     fn contains(&self, peer: &ZakuraPeerId) -> bool {
         self.sessions
@@ -1540,9 +1548,9 @@ impl Service<Request> for LegacyGossipAdapter {
 
 /// Tower service that adapts legacy request/response traffic onto Zakura streams.
 ///
-/// Legacy `Peers` discovery is intentionally not adapted here. Zakura v1 controlled
-/// networks use configured [`crate::zakura::ZakuraConfig::bootstrap_peers`] until
-/// native Zakura discovery is available, keeping this compatibility layer narrow.
+/// Legacy `Peers` discovery is intentionally not adapted here. Native peers use
+/// the signed Zakura discovery protocol, while legacy address discovery stays on
+/// the legacy peer set, keeping this compatibility layer narrow.
 #[derive(Clone, Debug)]
 pub struct LegacyRequestAdapter {
     client: ZakuraRequestClient,
@@ -2341,6 +2349,10 @@ impl ZakuraService for LegacyGossipSink {
         legacy_gossip_streams()
     }
 
+    fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        self.outbound.contains_connection(peer, conn_id)
+    }
+
     fn add_peer(&self, mut peer: Peer) {
         let Some((mut recv, send)) = peer.take_stream(ZAKURA_STREAM_GOSSIP) else {
             return;
@@ -2378,15 +2390,14 @@ impl ZakuraService for LegacyGossipSink {
         );
 
         let recv_task_peer_id = peer_id.clone();
-        let recv_panic_peer_id = recv_task_peer_id.clone();
-        let recv_panic_outbound = outbound.clone();
+        let recv_teardown_peer_id = recv_task_peer_id.clone();
+        let recv_teardown_outbound = outbound.clone();
         let recv_panic_cancel = cancel_token.clone();
         spawn_supervised_peer_task(
             recv_task_peer_id,
-            || {},
+            move || recv_teardown_outbound.remove(&recv_teardown_peer_id, conn_id),
             move || {
                 recv_panic_cancel.cancel();
-                recv_panic_outbound.remove(&recv_panic_peer_id, conn_id);
             },
             async move {
                 loop {
@@ -4303,6 +4314,8 @@ mod tests {
             outbound.contains(&peer_id),
             "replacement legacy gossip session is registered",
         );
+        assert!(!sink.owns_connection_for_peer(&peer_id, old_conn_id));
+        assert!(sink.owns_connection_for_peer(&peer_id, new_conn_id));
 
         let (stale_peer, _stale_peer_send) = legacy_gossip_peer_with_conn(
             peer_id.clone(),
@@ -4322,6 +4335,35 @@ mod tests {
             !outbound.contains(&peer_id),
             "live cleanup removes the replacement legacy gossip session",
         );
+    }
+
+    #[tokio::test]
+    async fn local_legacy_gossip_exit_releases_connection_ownership() -> Result<(), BoxError> {
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        drop(inbound_rx);
+        let outbound = LegacyGossipOutbound::default();
+        let sink = LegacyGossipSink {
+            inbound_tx,
+            outbound: outbound.clone(),
+            trace: ZakuraTrace::noop(),
+        };
+        let peer_id = ZakuraPeerId::new(vec![95; 32]).expect("test peer id is within bounds");
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let (peer, peer_send) = legacy_gossip_peer(peer_id.clone(), cancel_token);
+        sink.add_peer(peer);
+        peer_send
+            .send(LegacyGossipFrame::AdvertiseBlock(block_hash(95)).encode_frame()?)
+            .await
+            .map_err(|_| -> BoxError { "failed to send test gossip frame".into() })?;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while outbound.contains(&peer_id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError { "local gossip exit kept stale ownership".into() })?;
+        Ok(())
     }
 
     #[tokio::test]

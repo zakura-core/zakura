@@ -52,7 +52,11 @@ impl RecentByIp {
     ///
     /// Returns true if the recently attempted inbound connection count is past the configured limit.
     pub fn is_past_limit_or_add(&mut self, ip: IpAddr) -> bool {
-        let now = Instant::now();
+        self.is_past_limit_or_add_at(ip, Instant::now())
+    }
+
+    /// Applies [`Self::is_past_limit_or_add`] using `now` as the current time.
+    fn is_past_limit_or_add_at(&mut self, ip: IpAddr, now: Instant) -> bool {
         self.prune_by_time(now);
 
         let count = self.by_ip.entry(ip).or_default();

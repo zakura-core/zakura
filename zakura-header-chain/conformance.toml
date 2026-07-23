@@ -689,7 +689,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-TEST-02"
 name = "Rule-to-test completeness"
-status = "unimplemented"
+status = "implemented"
+owner = "xtask::header_conformance::parse_rule_matrix_ids"
+tests = ["conformance::rule_to_test_matrix_must_cover_every_exact_rule_once_as_a_set", "conformance::checked_in_documents_validate"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-ACCEPT-01"

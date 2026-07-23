@@ -24,6 +24,9 @@ pub use events::{
 };
 pub use reactor::spawn_header_sync_reactor;
 pub use scheduler::peer_work::{ActiveHeaderRequest, AdvertisedHeaderTarget};
+pub use scheduler::retry::{
+    BodyRetryEpisode, BodyRetryQueue, RetryJitter, RetryUpdate, SeededRetryJitter,
+};
 pub use service::HeaderSyncPeerSession;
 pub(crate) use service::{
     drive_header_sync_actions, HeaderSyncPassthroughService, HeaderSyncService,

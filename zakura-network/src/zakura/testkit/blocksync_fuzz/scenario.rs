@@ -266,9 +266,9 @@ impl PeerSpec {
 /// What changes at a scheduled point in a run (relative to run start).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum TipEventKind {
-    /// Advance the best-header download target to `height` (`HeaderAdvanced`).
+    /// Advance the committed best-header download target to `height`.
     GrowTo(block::Height),
-    /// Move the best-header target down to `height` (`HeaderReanchored`).
+    /// Reanchor the committed best-header target at `height`.
     HeaderReanchor(block::Height),
     /// Reset the verified-body tip down to `height` (`VerifiedReset`) — a reorg/rollback.
     VerifiedReset(block::Height),

@@ -19,8 +19,8 @@ use super::{
     *,
 };
 use crate::zakura::{
-    FrontierChange, FrontierUpdate, OrderedSendError, ServicePeerDirection, ServicePeerSnapshot,
-    ZakuraHeaderSyncCandidateState, ZakuraPeerId,
+    OrderedSendError, ServicePeerDirection, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
+    ZakuraPeerId,
 };
 
 const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
@@ -200,7 +200,6 @@ fn vct_repair_task(
 
 impl HeaderSyncReactor {
     async fn run(mut self) {
-        let mut frontier_updates = self.startup.frontier_updates.clone();
         let mut committed_snapshots = self.startup.committed_snapshots.clone();
         let mut vct_root_repairs = self.startup.vct_root_repairs.clone();
         let _ = self
@@ -239,20 +238,6 @@ impl HeaderSyncReactor {
                         }
                     } else {
                         committed_snapshots = None;
-                    }
-                }
-                changed = async {
-                    match frontier_updates.as_mut() {
-                        Some(updates) => updates.changed().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    if changed.is_ok() {
-                        if let Some(update) = frontier_updates.as_ref().map(|updates| *updates.borrow()) {
-                            self.observe_frontier_update(update);
-                        }
-                    } else {
-                        frontier_updates = None;
                     }
                 }
                 changed = async {
@@ -1501,20 +1486,6 @@ impl HeaderSyncReactor {
         }
         if old_tip != Some(new_tip) {
             let _ = self.tip.send((new_tip.height, new_tip.hash));
-            if let Some(old) = old_tip {
-                let action = if new_tip.height >= old.height {
-                    HeaderSyncAction::HeaderAdvanced {
-                        height: new_tip.height,
-                        hash: new_tip.hash,
-                    }
-                } else {
-                    HeaderSyncAction::HeaderReanchored {
-                        old: (old.height, old.hash),
-                        new: (new_tip.height, new_tip.hash),
-                    }
-                };
-                let _ = self.dispatch_action(action);
-            }
             self.publish_peer_state();
         }
         self.refresh_statuses();
@@ -1716,19 +1687,6 @@ impl HeaderSyncReactor {
             for owner in retired_owners {
                 self.peer_work_queue.remove_owner(owner);
             }
-        }
-    }
-
-    fn observe_frontier_update(&mut self, update: FrontierUpdate) {
-        if matches!(
-            update.change,
-            FrontierChange::Snapshot | FrontierChange::VerifiedGrow | FrontierChange::VerifiedReset
-        ) {
-            self.startup.frontiers = FullStateFrontiers {
-                finalized_height: update.frontier.finalized.height,
-                verified_block_tip: update.frontier.verified_body.height,
-                verified_block_hash: update.frontier.verified_body.hash,
-            };
         }
     }
 

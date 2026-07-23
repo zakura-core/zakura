@@ -20,7 +20,7 @@ use zakura_chain::{block, chain_tip::ChainTip};
 use zakura_network::zakura::{
     commit_state_trace as cs_trace, BlockApplyOutcome, BlockApplyResult, BlockApplyToken,
     BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncHandle,
-    BlockSyncMisbehavior, Frontier, FrontierChange, ZakuraEndpoint, ZakuraTrace,
+    BlockSyncMisbehavior, ZakuraEndpoint, ZakuraTrace,
 };
 
 use crate::components::sync;
@@ -1217,7 +1217,7 @@ pub(crate) fn block_apply_class(
 pub(crate) async fn apply_block_sync_body<BlockVerifier, ReadState>(
     block_verifier: BlockVerifier,
     latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
-    endpoint: Option<ZakuraEndpoint>,
+    _endpoint: Option<ZakuraEndpoint>,
     read_state: ReadState,
     block_sync: BlockSyncHandle,
     owner: zakura_header_chain::WorkOwner,
@@ -1316,17 +1316,6 @@ where
         Some(_) => probe_frontier,
         None => query_block_sync_frontiers(read_state.clone(), latest_chain_tip.clone()).await,
     };
-    if let Some(frontiers) = local_frontier {
-        let change =
-            if result == BlockApplyResult::Committed || result == BlockApplyResult::Duplicate {
-                FrontierChange::VerifiedGrow
-            } else {
-                FrontierChange::Snapshot
-            };
-        if class == BlockApplyClass::Full || change != FrontierChange::VerifiedGrow {
-            publish_body_frontier(endpoint.as_ref(), frontiers, change);
-        }
-    }
     emit_commit_state(
         &trace,
         cs_trace::FRONTIER_QUERY_FINISH,
@@ -1723,7 +1712,7 @@ fn transient_failure_kind_label(
 async fn refresh_block_sync_frontiers_for_checkpoint_window<ReadState>(
     read_state: ReadState,
     latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
-    endpoint: Option<ZakuraEndpoint>,
+    _endpoint: Option<ZakuraEndpoint>,
     block_sync: Option<BlockSyncHandle>,
     trace: ZakuraTrace,
     refresh: &mut CheckpointFrontierRefresh,
@@ -1763,7 +1752,6 @@ async fn refresh_block_sync_frontiers_for_checkpoint_window<ReadState>(
     }
 
     highest_sent = frontiers.verified_block_tip;
-    publish_body_frontier(endpoint.as_ref(), frontiers, FrontierChange::VerifiedGrow);
     if let Some(block_sync) = &block_sync {
         let _ = block_sync.send_control(BlockSyncEvent::ChainTipGrow(frontiers));
     }
@@ -1776,27 +1764,6 @@ async fn refresh_block_sync_frontiers_for_checkpoint_window<ReadState>(
         },
     );
     refresh.finish_attempt(highest_sent);
-}
-
-fn publish_body_frontier(
-    endpoint: Option<&ZakuraEndpoint>,
-    frontiers: zakura_network::zakura::BlockSyncFrontiers,
-    change: FrontierChange,
-) {
-    let Some(endpoint) = endpoint else {
-        return;
-    };
-    let Some(mut update) = endpoint.current_sync_frontier() else {
-        return;
-    };
-    if frontiers.finalized_height == frontiers.verified_block_tip {
-        update.frontier.finalized =
-            Frontier::new(frontiers.finalized_height, frontiers.verified_block_hash);
-    }
-    update.frontier.verified_body =
-        Frontier::new(frontiers.verified_block_tip, frontiers.verified_block_hash);
-    update.change = change;
-    endpoint.publish_sync_frontier_from(update, "block_sync_driver");
 }
 
 pub(crate) async fn query_block_sync_needed_blocks<ReadState>(

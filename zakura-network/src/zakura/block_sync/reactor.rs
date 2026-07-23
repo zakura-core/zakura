@@ -5,8 +5,8 @@ use super::{
     config::*, events::*, peer_registry::*, sequencer::*, sequencer_task::*, state::*, wire::*, *,
 };
 use crate::zakura::{
-    FrontierChange, FrontierUpdate, OrderedSendError, ServiceAdmissionDecision,
-    ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState,
+    OrderedSendError, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
+    ZakuraBlockSyncCandidateState,
 };
 use iroh::NodeId;
 use rand::{rngs::OsRng, RngCore};
@@ -103,8 +103,8 @@ pub fn spawn_block_sync_reactor(
     debug_assert!(
         !startup.state_queries_enabled
             || startup.committed_snapshots.is_some()
-            || (startup.header_tip.is_some() ^ startup.frontier_updates.is_some()),
-        "state-backed block sync must have exactly one frontier source",
+            || startup.header_tip.is_some(),
+        "state-backed block sync must have a frontier source",
     );
 
     let committed_snapshot = startup
@@ -336,8 +336,6 @@ impl BlockSyncReactor {
     async fn run(mut self) {
         let mut header_tip = self.startup.header_tip.clone();
         let mut header_tip_open = header_tip.is_some();
-        let mut frontier_updates = self.startup.frontier_updates.clone();
-        let mut frontier_updates_open = frontier_updates.is_some();
         let mut committed_snapshots = self.startup.committed_snapshots.clone();
         set_block_reactor_active_connection_gauge(self.state.peers.len());
         // Metrics/trace snapshot cadence only. Per-peer request timeouts are owned
@@ -407,24 +405,6 @@ impl BlockSyncReactor {
                             self.publish_metrics();
                         }
                         Err(_) => header_tip_open = false,
-                    }
-                }
-                changed = async {
-                    match frontier_updates.as_mut() {
-                        Some(frontier_updates) => frontier_updates.changed().await,
-                        None => std::future::pending().await,
-                    }
-                }, if frontier_updates_open => {
-                    match changed {
-                        Ok(()) => {
-                            let frontier_updates = frontier_updates
-                                .as_mut()
-                                .expect("frontier update receiver exists while frontier_updates_open is true");
-                            let update = *frontier_updates.borrow_and_update();
-                            self.handle_frontier_update(update).await;
-                            self.publish_metrics();
-                        }
-                        Err(_) => frontier_updates_open = false,
                     }
                 }
                 changed = self.sequencer_view.changed() => {
@@ -842,62 +822,6 @@ impl BlockSyncReactor {
         if header_changed || current_scope != previous_scope {
             self.query_needed_blocks_with_options(true).await;
         }
-    }
-
-    async fn handle_frontier_update(&mut self, update: FrontierUpdate) {
-        let frontier = update.frontier;
-        let state_frontiers = BlockSyncFrontiers {
-            finalized_height: frontier.finalized.height,
-            verified_block_tip: frontier.verified_body.height,
-            verified_block_hash: frontier.verified_body.hash,
-        };
-        match update.change {
-            FrontierChange::Snapshot => {
-                self.handle_header_tip_changed(
-                    frontier.best_header.height,
-                    frontier.best_header.hash,
-                )
-                .await;
-                self.handle_state_frontiers_changed(state_frontiers).await;
-            }
-            FrontierChange::HeaderAdvanced => {
-                self.handle_header_tip_changed(
-                    frontier.best_header.height,
-                    frontier.best_header.hash,
-                )
-                .await;
-                if frontier.verified_body.height > self.verified_block_tip {
-                    self.handle_state_frontiers_changed(state_frontiers).await;
-                }
-            }
-            FrontierChange::HeaderReanchored => {
-                self.state.best_header_tip = frontier.best_header.height;
-                self.state.best_header_hash = frontier.best_header.hash;
-                self.handle_chain_tip_reset(state_frontiers, false).await;
-            }
-            FrontierChange::VerifiedGrow => {
-                self.handle_state_frontiers_changed(state_frontiers).await;
-                if frontier.best_header.height > self.state.best_header_tip {
-                    self.handle_header_tip_changed(
-                        frontier.best_header.height,
-                        frontier.best_header.hash,
-                    )
-                    .await;
-                }
-            }
-            FrontierChange::VerifiedReset => {
-                self.handle_chain_tip_reset(state_frontiers, true).await;
-                if frontier.best_header.height > self.state.best_header_tip {
-                    self.handle_header_tip_changed(
-                        frontier.best_header.height,
-                        frontier.best_header.hash,
-                    )
-                    .await;
-                }
-            }
-        }
-        // Per-peer request timeouts are reclaimed by the routines themselves (each
-        // sleeps to its earliest deadline); the reactor no longer sweeps here.
     }
 
     async fn handle_state_frontiers_changed(&mut self, frontiers: BlockSyncFrontiers) {

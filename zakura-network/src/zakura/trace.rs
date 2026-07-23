@@ -451,36 +451,6 @@ pub mod commit_state_trace {
     pub const CHAIN_TIP_ACTION: &str = "chain_tip_action";
     /// Chain-tip mirror derived local frontiers.
     pub const FRONTIER_DERIVED: &str = "frontier_derived";
-    /// Shared sync exchange accepted or ignored a frontier update.
-    pub const SYNC_FRONTIER_TRANSITION: &str = "sync_frontier_transition";
-    /// Monotonic shared sync exchange transition sequence.
-    pub const SEQUENCE: &str = "sequence";
-    /// Shared sync exchange transition cause.
-    pub const CAUSE: &str = "cause";
-    /// Previous finalized frontier height.
-    pub const OLD_FINALIZED_HEIGHT: &str = "old_finalized_height";
-    /// Previous finalized frontier hash.
-    pub const OLD_FINALIZED_HASH: &str = "old_finalized_hash";
-    /// Previous verified body frontier height.
-    pub const OLD_VERIFIED_BODY_HEIGHT: &str = "old_verified_body_height";
-    /// Previous verified body frontier hash.
-    pub const OLD_VERIFIED_BODY_HASH: &str = "old_verified_body_hash";
-    /// Previous best header frontier height.
-    pub const OLD_BEST_HEADER_HEIGHT: &str = "old_best_header_height";
-    /// Previous best header frontier hash.
-    pub const OLD_BEST_HEADER_HASH: &str = "old_best_header_hash";
-    /// New finalized frontier height.
-    pub const NEW_FINALIZED_HEIGHT: &str = "new_finalized_height";
-    /// New finalized frontier hash.
-    pub const NEW_FINALIZED_HASH: &str = "new_finalized_hash";
-    /// New verified body frontier height.
-    pub const NEW_VERIFIED_BODY_HEIGHT: &str = "new_verified_body_height";
-    /// New verified body frontier hash.
-    pub const NEW_VERIFIED_BODY_HASH: &str = "new_verified_body_hash";
-    /// New best header frontier height.
-    pub const NEW_BEST_HEADER_HEIGHT: &str = "new_best_header_height";
-    /// New best header frontier hash.
-    pub const NEW_BEST_HEADER_HASH: &str = "new_best_header_hash";
 }
 
 /// Cloneable Zakura trace emitter.

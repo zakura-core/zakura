@@ -8,23 +8,21 @@ use tracing::{debug, warn};
 
 use zakura_chain::{
     block::{self},
-    chain_tip::ChainTip,
     parallel::commitment_aux::BlockCommitmentRoots,
 };
 use zakura_network::zakura::{
-    commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange,
-    FullStateFrontiers, HeaderEntry, HeaderPathLease, HeaderPathLeaseResult, HeaderPathPage,
-    HeaderPathPageResult, HeaderSyncAction, HeaderSyncEvent, HeaderTargetAdmissionResult,
-    HeaderTargetPreparationResult, HeadersOutcomeCode, ZakuraEndpoint,
+    commit_state_trace as cs_trace, FullStateFrontiers, HeaderEntry, HeaderPathLease,
+    HeaderPathLeaseResult, HeaderPathPage, HeaderPathPageResult, HeaderSyncAction, HeaderSyncEvent,
+    HeaderTargetAdmissionResult, HeaderTargetPreparationResult, HeadersOutcomeCode, ZakuraEndpoint,
     ZakuraHeaderSyncDriverStartup, ZakuraPeerId, ZakuraTrace, DEFAULT_HS_RANGE,
 };
 
 #[cfg(test)]
-use zakura_network::zakura::{BlockSyncEvent, BlockSyncHandle};
+use zakura_network::zakura::{BlockSyncEvent, BlockSyncFrontiers, BlockSyncHandle};
 
 use super::{
-    emit_commit_state, insert_cs_frontiers, insert_cs_hash, insert_cs_height, insert_cs_peer,
-    insert_cs_str, insert_cs_u64, verified_block_tip_from_state,
+    emit_commit_state, insert_cs_hash, insert_cs_height, insert_cs_peer, insert_cs_str,
+    insert_cs_u64, verified_block_tip_from_state,
 };
 
 pub(crate) async fn zakura_header_sync_driver_startup(
@@ -184,7 +182,6 @@ pub(crate) fn block_roots_cover_range(
 
 #[derive(Clone)]
 pub(crate) struct ZakuraHeaderSyncDriverHandles {
-    pub(crate) endpoint: ZakuraEndpoint,
     pub(crate) header_sync: zakura_network::zakura::HeaderSyncHandle,
 }
 
@@ -458,24 +455,6 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         .saturating_add(1)
                         .min(DEFAULT_HS_RANGE);
                 log_missing_block_bodies(read_state.clone(), from, limit, &trace).await;
-            }
-            HeaderSyncAction::HeaderAdvanced { height, hash } => {
-                publish_header_frontier(
-                    &handles.endpoint,
-                    height,
-                    hash,
-                    FrontierChange::HeaderAdvanced,
-                    &trace,
-                );
-            }
-            HeaderSyncAction::HeaderReanchored { old: _, new } => {
-                publish_header_frontier(
-                    &handles.endpoint,
-                    new.0,
-                    new.1,
-                    FrontierChange::HeaderReanchored,
-                    &trace,
-                );
             }
         }
     }
@@ -795,31 +774,6 @@ fn source_id(peer: &ZakuraPeerId) -> Option<zakura_header_chain::SourceId> {
     Some(zakura_header_chain::SourceId::from_digest(digest))
 }
 
-pub(crate) fn publish_header_frontier(
-    endpoint: &ZakuraEndpoint,
-    height: block::Height,
-    hash: block::Hash,
-    change: FrontierChange,
-    trace: &ZakuraTrace,
-) {
-    let Some(mut update) = endpoint.current_sync_frontier() else {
-        return;
-    };
-
-    update.frontier.best_header = Frontier::new(height, hash);
-    update.change = change;
-    endpoint.publish_sync_frontier_from(update, "header_sync_driver");
-    emit_commit_state(
-        trace,
-        cs_trace::BLOCK_SYNC_NOTIFY_SENT,
-        "header_sync_driver",
-        |row| {
-            insert_cs_height(row, cs_trace::HEIGHT, height);
-            insert_cs_hash(row, cs_trace::HASH, hash);
-        },
-    );
-}
-
 #[cfg(test)]
 pub(crate) async fn notify_block_sync_header_tip(
     block_sync: Option<&BlockSyncHandle>,
@@ -916,10 +870,10 @@ async fn log_missing_block_bodies<ReadState>(
 
 pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
     mut chain_tip_change: zakura_state::ChainTipChange,
-    latest_chain_tip: zakura_state::LatestChainTip,
+    _latest_chain_tip: zakura_state::LatestChainTip,
     read_state: ReadState,
     header_sync: zakura_network::zakura::HeaderSyncHandle,
-    endpoint: ZakuraEndpoint,
+    _endpoint: ZakuraEndpoint,
     trace: ZakuraTrace,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) where
@@ -955,80 +909,6 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
                 insert_cs_hash(row, cs_trace::HASH, hash);
             },
         );
-
-        let finalized_tip = match read_state
-            .clone()
-            .oneshot(zakura_state::ReadRequest::FinalizedTip)
-            .await
-        {
-            Ok(zakura_state::ReadResponse::FinalizedTip(tip)) => tip,
-            Ok(response) => {
-                warn!(?response, "unexpected FinalizedTip response");
-                None
-            }
-            Err(error) => {
-                warn!(?error, "failed to query Zakura finalized frontier");
-                None
-            }
-        };
-        let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
-        emit_commit_state(
-            &trace,
-            cs_trace::STATE_READ_SUCCESS,
-            "chain_tip_mirror",
-            |row| {
-                insert_cs_str(row, cs_trace::ACTION, "finalized_tip");
-                insert_cs_height(row, cs_trace::FINALIZED_HEIGHT, finalized_height);
-            },
-        );
-        let action_tip = Some((height, hash));
-        let verified_block_tip =
-            verified_block_tip_from_state(finalized_tip, action_tip, (height, hash));
-        let verified_block_tip = verified_block_tip_from_state(
-            Some(verified_block_tip),
-            latest_chain_tip.best_tip_height_and_hash(),
-            verified_block_tip,
-        );
-
-        emit_commit_state(
-            &trace,
-            cs_trace::FRONTIER_DERIVED,
-            "chain_tip_mirror",
-            |row| {
-                insert_cs_str(row, cs_trace::ACTION, "sync_exchange_frontier_derived");
-                insert_cs_height(row, cs_trace::FINALIZED_HEIGHT, finalized_height);
-                insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, verified_block_tip.0);
-                insert_cs_hash(row, cs_trace::VERIFIED_BLOCK_HASH, verified_block_tip.1);
-            },
-        );
-        if let Some(mut update) = endpoint.current_sync_frontier() {
-            let previous_verified_body = update.frontier.verified_body.height;
-            if let Some((finalized_height, finalized_hash)) = finalized_tip {
-                update.frontier.finalized = Frontier::new(finalized_height, finalized_hash);
-            }
-            update.frontier.verified_body =
-                Frontier::new(verified_block_tip.0, verified_block_tip.1);
-            update.change = chain_tip_mirror_frontier_change(
-                &action,
-                previous_verified_body,
-                verified_block_tip.0,
-            );
-            endpoint.publish_sync_frontier_from(update, "chain_tip_mirror");
-            emit_commit_state(
-                &trace,
-                cs_trace::FRONTIER_DERIVED,
-                "chain_tip_mirror",
-                |row| {
-                    let frontiers = BlockSyncFrontiers {
-                        finalized_height,
-                        verified_block_tip: verified_block_tip.0,
-                        verified_block_hash: verified_block_tip.1,
-                    };
-                    insert_cs_str(row, cs_trace::ACTION, "sync_exchange_frontier_sent");
-                    insert_cs_frontiers(row, &frontiers);
-                },
-            );
-        }
 
         emit_commit_state(
             &trace,
@@ -1128,20 +1008,6 @@ pub(crate) fn block_sync_chain_tip_event(
     }
 }
 
-pub(crate) fn chain_tip_mirror_frontier_change(
-    action: &zakura_state::TipAction,
-    previous_verified_body: block::Height,
-    verified_block_tip: block::Height,
-) -> FrontierChange {
-    match action {
-        zakura_state::TipAction::Grow { .. } => FrontierChange::VerifiedGrow,
-        zakura_state::TipAction::Reset { .. } if verified_block_tip > previous_verified_body => {
-            FrontierChange::VerifiedGrow
-        }
-        zakura_state::TipAction::Reset { .. } => FrontierChange::VerifiedReset,
-    }
-}
-
 fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
     emit_commit_state(
         trace,
@@ -1222,17 +1088,6 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
                     cs_trace::RANGE_COUNT,
                     u64::from(to.0.saturating_sub(from.0).saturating_add(1)),
                 );
-            }
-            HeaderSyncAction::HeaderAdvanced { height, hash } => {
-                insert_cs_str(row, cs_trace::ACTION, "header_advanced");
-                insert_cs_height(row, cs_trace::HEIGHT, *height);
-                insert_cs_hash(row, cs_trace::HASH, *hash);
-            }
-            HeaderSyncAction::HeaderReanchored { old, new } => {
-                insert_cs_str(row, cs_trace::ACTION, "header_reanchored");
-                insert_cs_height(row, cs_trace::BEST_HEADER_TIP, old.0);
-                insert_cs_height(row, cs_trace::HEIGHT, new.0);
-                insert_cs_hash(row, cs_trace::HASH, new.1);
             }
         },
     );

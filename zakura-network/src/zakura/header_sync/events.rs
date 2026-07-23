@@ -9,8 +9,8 @@ use super::{
     HeadersOutcomeCode, ZakuraHeaderSyncConfig,
 };
 use crate::zakura::{
-    FrontierUpdate, HeaderSyncServiceSummary, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
-    ZakuraPeerId, ZakuraTrace,
+    HeaderSyncServiceSummary, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState, ZakuraPeerId,
+    ZakuraTrace,
 };
 
 /// Cached full-state frontiers used by header sync and block sync.
@@ -35,8 +35,6 @@ pub struct HeaderSyncStartup {
     pub frontiers: FullStateFrontiers,
     /// Durable best header tip loaded at startup.
     pub best_header_tip: Option<(block::Height, block::Hash)>,
-    /// Shared sync frontier updates.
-    pub frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
     /// Atomic snapshots from the durable header engine.
     pub committed_snapshots: Option<watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>>,
     /// VCT metadata repair needs published by the finalized writer.
@@ -71,7 +69,6 @@ impl HeaderSyncStartup {
             anchor,
             frontiers,
             best_header_tip,
-            frontier_updates: None,
             committed_snapshots: None,
             vct_root_repairs: None,
             config,
@@ -508,20 +505,6 @@ pub enum HeaderSyncAction {
         from: block::Height,
         /// Last missing height.
         to: block::Height,
-    },
-    /// Notify wiring that the selected header target advanced.
-    HeaderAdvanced {
-        /// New height.
-        height: block::Height,
-        /// New hash.
-        hash: block::Hash,
-    },
-    /// Notify wiring that the selected header target re-anchored.
-    HeaderReanchored {
-        /// Previous target.
-        old: (block::Height, block::Hash),
-        /// New target.
-        new: (block::Height, block::Hash),
     },
 }
 

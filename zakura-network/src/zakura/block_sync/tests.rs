@@ -28,9 +28,8 @@ use super::{
 use crate::zakura::{
     framed_channel,
     testkit::{TraceCapture, TraceValue},
-    ChainFrontier, FramedRecv, FramedSend, Frontier, FrontierChange, FrontierUpdate, Peer, Service,
-    ServicePeerSnapshot, ServiceRegistry, StreamMode, ZakuraBlockSyncCandidateState,
-    ZakuraSyncExchange,
+    FramedRecv, FramedSend, Peer, Service, ServicePeerSnapshot, ServiceRegistry, StreamMode,
+    ZakuraBlockSyncCandidateState,
 };
 use zakura_chain::{
     fmt::HexDebug,
@@ -187,11 +186,6 @@ fn fill_loop_mechanics_config() -> ZakuraBlockSyncConfig {
     }
 }
 
-fn test_frontier(height: u32) -> Frontier {
-    let hash_byte = u8::try_from(height % 251).expect("height modulo 251 fits in u8");
-    Frontier::new(block::Height(height), block::Hash([hash_byte; 32]))
-}
-
 fn alarmed_committed_snapshot(
     header: zakura_header_chain::Frontier,
 ) -> zakura_header_chain::EngineSnapshot {
@@ -257,40 +251,72 @@ fn committed_snapshot(
     }
 }
 
-fn test_frontier_update(
-    finalized: u32,
-    verified_body: u32,
-    best_header: u32,
-    change: FrontierChange,
-) -> FrontierUpdate {
-    FrontierUpdate {
-        frontier: ChainFrontier {
-            finalized: test_frontier(finalized),
-            verified_body: test_frontier(verified_body),
-            best_header: test_frontier(best_header),
-        },
-        change,
-    }
-}
-
-fn exchange_block_sync_startup(
-    initial: FrontierUpdate,
+fn committed_block_sync_startup(
+    initial: zakura_header_chain::EngineSnapshot,
     config: ZakuraBlockSyncConfig,
-) -> (ZakuraSyncExchange, BlockSyncStartup) {
-    let exchange = ZakuraSyncExchange::new(initial, ZakuraTrace::noop());
-    let frontier = initial.frontier;
-    let startup = BlockSyncStartup::new_with_exchange(
-        BlockSyncFrontiers {
-            finalized_height: frontier.finalized.height,
-            verified_block_tip: frontier.verified_body.height,
-            verified_block_hash: frontier.verified_body.hash,
-        },
-        (frontier.best_header.height, frontier.best_header.hash),
-        exchange.subscribe_frontier(),
+) -> (
+    watch::Sender<Option<zakura_header_chain::EngineSnapshot>>,
+    BlockSyncStartup,
+) {
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: initial.frontiers.finalized.height,
+        verified_block_tip: initial.frontiers.verified_best.height,
+        verified_block_hash: initial.frontiers.verified_best.hash,
+    };
+    let best_header_tip = (
+        initial.frontiers.header_best.height,
+        initial.frontiers.header_best.hash,
+    );
+    let (snapshots, committed_snapshots) = watch::channel(Some(initial));
+    let startup = BlockSyncStartup::new_with_committed_snapshots(
+        frontiers,
+        best_header_tip,
+        committed_snapshots,
         config,
     );
 
-    (exchange, startup)
+    (snapshots, startup)
+}
+
+fn test_committed_snapshot(
+    state_version: u64,
+    header_generation: u64,
+    verified_generation: u64,
+    finalized: (u32, block::Hash),
+    verified: (u32, block::Hash),
+    header: (u32, block::Hash),
+) -> zakura_header_chain::EngineSnapshot {
+    committed_snapshot(
+        state_version,
+        header_generation,
+        verified_generation,
+        zakura_header_chain::Frontier::new(block::Height(finalized.0), finalized.1),
+        zakura_header_chain::Frontier::new(block::Height(verified.0), verified.1),
+        zakura_header_chain::Frontier::new(block::Height(header.0), header.1),
+    )
+}
+
+fn committed_block_sync_startup_at_heights(
+    finalized: u32,
+    verified: u32,
+    header: u32,
+    config: ZakuraBlockSyncConfig,
+) -> (
+    watch::Sender<Option<zakura_header_chain::EngineSnapshot>>,
+    BlockSyncStartup,
+) {
+    let initial = test_committed_snapshot(
+        1,
+        1,
+        1,
+        (finalized, block::Hash([0; 32])),
+        (
+            verified,
+            block::Hash([u8::try_from(verified).unwrap_or(0); 32]),
+        ),
+        (header, block::Hash([u8::try_from(header).unwrap_or(0); 32])),
+    );
+    committed_block_sync_startup(initial, config)
 }
 
 fn round_trip(message: BlockSyncMessage) {
@@ -330,7 +356,6 @@ async fn committed_snapshots_are_the_sole_production_frontier_source() {
         ZakuraBlockSyncConfig::default(),
     );
     assert!(startup.header_tip.is_none());
-    assert!(startup.frontier_updates.is_none());
 
     let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     match tokio::time::timeout(Duration::from_millis(50), actions.recv()).await {
@@ -5412,28 +5437,6 @@ async fn inert_reactor_parks_after_header_tip_watch_closes() {
         elapsed.is_err(),
         "paused-time timeout only elapses if the inert reactor has no always-ready branch"
     );
-}
-
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "state-backed block sync must have exactly one frontier source")]
-fn state_backed_reactor_panics_with_two_frontier_sources() {
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let (_frontier_tx, frontier_rx) =
-        watch::channel(test_frontier_update(0, 0, 0, FrontierChange::Snapshot));
-    let mut startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        ZakuraBlockSyncConfig::default(),
-    );
-    startup.frontier_updates = Some(frontier_rx);
-
-    let (_handle, _actions, _task) = spawn_block_sync_reactor(startup);
 }
 
 #[tokio::test]
@@ -11525,153 +11528,6 @@ async fn reactor_does_not_ping_pong_rapid_repeated_status() {
 }
 
 #[tokio::test]
-async fn reactor_exchange_watch_converges_to_latest_valid_frontier() {
-    let initial = test_frontier_update(0, 0, 0, FrontierChange::Snapshot);
-    let (exchange, startup) =
-        exchange_block_sync_startup(initial, immediate_body_download_config());
-
-    exchange.publish_frontier(
-        test_frontier_update(0, 0, 3, FrontierChange::HeaderAdvanced),
-        "test",
-    );
-    exchange.publish_frontier(
-        test_frontier_update(0, 0, 2, FrontierChange::HeaderAdvanced),
-        "test",
-    );
-    exchange.publish_frontier(
-        test_frontier_update(0, 0, 5, FrontierChange::HeaderAdvanced),
-        "test",
-    );
-    exchange.publish_frontier(
-        test_frontier_update(0, 0, 5, FrontierChange::HeaderAdvanced),
-        "test",
-    );
-
-    let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-
-    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(5)).await;
-    assert_eq!(
-        exchange.current_frontier().frontier.best_header,
-        test_frontier(5)
-    );
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_exchange_progress_retries_after_empty_needed_blocks() {
-    let initial = test_frontier_update(0, 0, 0, FrontierChange::Snapshot);
-    let (exchange, startup) =
-        exchange_block_sync_startup(initial, immediate_body_download_config());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-
-    exchange.publish_frontier(
-        test_frontier_update(0, 0, 3, FrontierChange::HeaderAdvanced),
-        "test",
-    );
-    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
-
-    handle
-        .send(BlockSyncEvent::NeededBlocks(Vec::new()))
-        .await
-        .expect("empty needed-blocks event queues");
-
-    exchange.publish_frontier(
-        test_frontier_update(0, 0, 4, FrontierChange::HeaderAdvanced),
-        "test",
-    );
-    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(4)).await;
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_exchange_body_progress_retries_after_header_tip_stops() {
-    let initial = test_frontier_update(0, 0, 0, FrontierChange::Snapshot);
-    let (exchange, startup) =
-        exchange_block_sync_startup(initial, immediate_body_download_config());
-    let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-
-    exchange.publish_frontier(
-        test_frontier_update(0, 0, 3, FrontierChange::HeaderAdvanced),
-        "test",
-    );
-    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
-
-    exchange.publish_frontier(
-        test_frontier_update(0, 1, 0, FrontierChange::VerifiedGrow),
-        "test",
-    );
-    wait_for_query_needed_blocks(&mut actions, block::Height(1), block::Height(3)).await;
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_exchange_coalesced_header_advance_catches_body_frontier_up() {
-    let initial = test_frontier_update(0, 0, 0, FrontierChange::Snapshot);
-    let (exchange, startup) =
-        exchange_block_sync_startup(initial, immediate_body_download_config());
-
-    exchange.publish_frontier(
-        test_frontier_update(0, 3, 0, FrontierChange::VerifiedGrow),
-        "test",
-    );
-    exchange.publish_frontier(
-        test_frontier_update(0, 0, 3, FrontierChange::HeaderAdvanced),
-        "test",
-    );
-
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
-
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let status = handle.local_status();
-            if status.servable_high == block::Height(3) {
-                assert_eq!(status.tip_hash, test_frontier(3).hash);
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("coalesced header update catches the body frontier up");
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_exchange_ignores_stale_grow_but_accepts_reset() {
-    let initial = test_frontier_update(0, 5, 10, FrontierChange::Snapshot);
-    let (exchange, startup) =
-        exchange_block_sync_startup(initial, immediate_body_download_config());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-
-    wait_for_query_needed_blocks(&mut actions, block::Height(5), block::Height(10)).await;
-
-    exchange.publish_frontier(
-        test_frontier_update(0, 4, 10, FrontierChange::VerifiedGrow),
-        "test",
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), actions.recv())
-            .await
-            .is_err(),
-        "stale lower VerifiedGrow must not trigger a lower body query"
-    );
-    assert_eq!(handle.local_status().servable_high, block::Height(5));
-
-    exchange.publish_frontier(
-        test_frontier_update(0, 4, 0, FrontierChange::VerifiedReset),
-        "test",
-    );
-    wait_for_query_needed_blocks(&mut actions, block::Height(4), block::Height(10)).await;
-    assert_eq!(handle.local_status().servable_high, block::Height(4));
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
 async fn reactor_preserves_successor_work_across_stale_finalized_reset() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
@@ -11766,18 +11622,23 @@ async fn reactor_preserves_successor_work_across_stale_finalized_reset() {
 }
 
 #[tokio::test]
-async fn reactor_exchange_reanchor_lowers_only_best_header_target() {
-    let initial = test_frontier_update(0, 5, 10, FrontierChange::Snapshot);
-    let (exchange, startup) =
-        exchange_block_sync_startup(initial, immediate_body_download_config());
+async fn committed_reanchor_lowers_only_best_header_target() {
+    let (snapshots, startup) =
+        committed_block_sync_startup_at_heights(0, 5, 10, immediate_body_download_config());
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
 
     wait_for_query_needed_blocks(&mut actions, block::Height(5), block::Height(10)).await;
 
-    exchange.publish_frontier(
-        test_frontier_update(0, 1, 7, FrontierChange::HeaderReanchored),
-        "test",
-    );
+    snapshots
+        .send(Some(test_committed_snapshot(
+            2,
+            2,
+            1,
+            (0, block::Hash([0; 32])),
+            (5, block::Hash([5; 32])),
+            (7, block::Hash([7; 32])),
+        )))
+        .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(5), block::Height(7)).await;
     assert_eq!(handle.local_status().servable_high, block::Height(5));
 
@@ -11789,15 +11650,22 @@ async fn reactor_exchange_reanchor_lowers_only_best_header_target() {
 /// `fuzz_large_to_small`: the post-reset producer used to skip refill when the
 /// registry still mirrored pre-reset outstanding, leaving an empty work queue.
 #[tokio::test]
-async fn reactor_exchange_reanchor_requeries_while_downloads_in_flight() {
+async fn committed_reanchor_requeries_while_downloads_in_flight() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
     config.max_inflight_block_bytes =
         BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
     config.request_timeout = Duration::from_secs(300);
 
-    let initial = test_frontier_update(0, 0, 3, FrontierChange::Snapshot);
-    let (exchange, startup) = exchange_block_sync_startup(initial, config.clone());
+    let initial = test_committed_snapshot(
+        1,
+        1,
+        1,
+        (0, block::Hash([0; 32])),
+        (0, block::Hash([0; 32])),
+        (3, blocks[2].hash()),
+    );
+    let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
@@ -11825,23 +11693,35 @@ async fn reactor_exchange_reanchor_requeries_while_downloads_in_flight() {
     // Reanchor the header tip below the in-flight range while the GetBlocks is
     // still outstanding. The forced post-reset producer query must fire even if
     // the registry still briefly counts those outstanding heights.
-    exchange.publish_frontier(
-        test_frontier_update(0, 0, 1, FrontierChange::HeaderReanchored),
-        "test",
-    );
+    snapshots
+        .send(Some(test_committed_snapshot(
+            2,
+            2,
+            1,
+            (0, block::Hash([0; 32])),
+            (0, block::Hash([0; 32])),
+            (1, blocks[0].hash()),
+        )))
+        .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
 
-    exchange.publish_frontier(
-        test_frontier_update(0, 0, 3, FrontierChange::HeaderAdvanced),
-        "test",
-    );
+    snapshots
+        .send(Some(test_committed_snapshot(
+            3,
+            3,
+            1,
+            (0, block::Hash([0; 32])),
+            (0, block::Hash([0; 32])),
+            (3, blocks[2].hash()),
+        )))
+        .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
 
     reactor_task.abort();
 }
 
 #[tokio::test]
-async fn reactor_exchange_reanchor_releases_stale_submitted_bodies() {
+async fn committed_reanchor_releases_stale_submitted_bodies() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
     // Worst-case reservation: budget for exactly the three in-flight bodies.
@@ -11849,8 +11729,15 @@ async fn reactor_exchange_reanchor_releases_stale_submitted_bodies() {
         BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
     config.request_timeout = Duration::from_secs(300);
 
-    let initial = test_frontier_update(0, 0, 3, FrontierChange::Snapshot);
-    let (exchange, startup) = exchange_block_sync_startup(initial, config.clone());
+    let initial = test_committed_snapshot(
+        1,
+        1,
+        1,
+        (0, block::Hash([0; 32])),
+        (0, block::Hash([0; 32])),
+        (3, blocks[2].hash()),
+    );
+    let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
@@ -11903,16 +11790,28 @@ async fn reactor_exchange_reanchor_releases_stale_submitted_bodies() {
         vec![block::Height(1), block::Height(2), block::Height(3)]
     );
 
-    exchange.publish_frontier(
-        test_frontier_update(0, 0, 1, FrontierChange::HeaderReanchored),
-        "test",
-    );
+    snapshots
+        .send(Some(test_committed_snapshot(
+            2,
+            2,
+            1,
+            (0, block::Hash([0; 32])),
+            (0, block::Hash([0; 32])),
+            (1, blocks[0].hash()),
+        )))
+        .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
 
-    exchange.publish_frontier(
-        test_frontier_update(0, 0, 3, FrontierChange::HeaderAdvanced),
-        "test",
-    );
+    snapshots
+        .send(Some(test_committed_snapshot(
+            3,
+            3,
+            1,
+            (0, block::Hash([0; 32])),
+            (0, block::Hash([0; 32])),
+            (3, blocks[2].hash()),
+        )))
+        .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
 
     handle

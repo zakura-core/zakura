@@ -133,8 +133,8 @@ pub(crate) use block_sync_driver::{
 pub(crate) use frontier::{query_block_sync_frontiers, verified_block_tip_from_state};
 #[cfg(test)]
 pub(crate) use header_sync_driver::{
-    block_roots_cover_range, block_sync_chain_tip_event, chain_tip_mirror_frontier_change,
-    notify_block_sync_header_tip, root_covered_query_best_header_tip,
+    block_roots_cover_range, block_sync_chain_tip_event, notify_block_sync_header_tip,
+    root_covered_query_best_header_tip,
 };
 pub(crate) use header_sync_driver::{
     drive_zakura_header_sync_actions, mirror_zakura_full_block_commits,

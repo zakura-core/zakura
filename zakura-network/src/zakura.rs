@@ -17,7 +17,6 @@ use crate::{
 
 mod block_sync;
 mod discovery;
-mod exchange;
 mod handler;
 mod handshake;
 mod header_sync;
@@ -29,7 +28,6 @@ pub mod transport;
 
 pub use block_sync::*;
 pub use discovery::*;
-pub use exchange::*;
 pub use handler::*;
 pub use handshake::*;
 pub use header_sync::*;

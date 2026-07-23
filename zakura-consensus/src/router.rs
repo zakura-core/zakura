@@ -134,6 +134,14 @@ impl From<VerifyBlockError> for RouterError {
 }
 
 impl RouterError {
+    /// Classify the concrete verifier failure selected by the routing boundary.
+    pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
+        match self {
+            Self::Checkpoint { source } => source.body_verification_class(),
+            Self::Block { source } => source.body_verification_class(),
+        }
+    }
+
     /// Returns `true` if this is definitely a duplicate request.
     /// Some duplicate requests might not be detected, and therefore return `false`.
     pub fn is_duplicate_request(&self) -> bool {

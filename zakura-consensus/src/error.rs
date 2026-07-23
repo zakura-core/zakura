@@ -381,6 +381,126 @@ impl From<BoxError> for TransactionError {
 }
 
 impl TransactionError {
+    /// Classify a transaction-verification failure for the body-evidence boundary.
+    pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
+        use zakura_header_chain::{BodyRuleId, BodyVerificationClass, TransientBodyFailureKind};
+
+        let consensus = |rule| BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(rule));
+        match self {
+            Self::CoinbasePosition => consensus("transaction.coinbase_position"),
+            Self::CoinbaseAfterFirst => consensus("transaction.coinbase_after_first"),
+            Self::CoinbaseHasJoinSplit => consensus("transaction.coinbase_has_joinsplit"),
+            Self::CoinbaseHasSpend => consensus("transaction.coinbase_has_spend"),
+            Self::CoinbaseHasOutputPreHeartwood => {
+                consensus("transaction.coinbase_has_output_pre_heartwood")
+            }
+            Self::CoinbaseHasEnableSpendsOrchard => {
+                consensus("transaction.coinbase_enables_orchard_spends")
+            }
+            Self::CoinbaseHasEnableSpendsIronwood => {
+                consensus("transaction.coinbase_enables_ironwood_spends")
+            }
+            Self::CoinbaseHasOrchardShieldedData => {
+                consensus("transaction.coinbase_has_orchard_shielded_data")
+            }
+            Self::CoinbaseOutputsNotDecryptable => {
+                consensus("transaction.coinbase_outputs_not_decryptable")
+            }
+            Self::CoinbaseInMempool => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
+            Self::NonCoinbaseHasCoinbaseInput => {
+                consensus("transaction.non_coinbase_has_coinbase_input")
+            }
+            Self::NotCoinbase => consensus("transaction.not_coinbase"),
+            Self::LockedUntilAfterBlockHeight(_) => {
+                consensus("transaction.locked_until_after_block_height")
+            }
+            Self::LockedUntilAfterBlockTime(_) => {
+                consensus("transaction.locked_until_after_block_time")
+            }
+            Self::CoinbaseExpiryBlockHeight { .. } => {
+                consensus("transaction.coinbase_expiry_block_height")
+            }
+            Self::CoinbaseConstruction(_) => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
+            Self::MaximumExpiryHeight { .. } => consensus("transaction.maximum_expiry_height"),
+            Self::ExpiredTransaction { .. } => consensus("transaction.expired"),
+            Self::Subsidy(_) => consensus("transaction.subsidy"),
+            Self::WrongVersion => consensus("transaction.wrong_version"),
+            Self::UnsupportedByNetworkUpgrade(_, _) => {
+                consensus("transaction.unsupported_by_network_upgrade")
+            }
+            Self::NoInputs => consensus("transaction.no_inputs"),
+            Self::NoOutputs => consensus("transaction.no_outputs"),
+            Self::BadBalance => consensus("transaction.bad_balance"),
+            Self::Script(_) => consensus("transaction.script"),
+            Self::SaplingVerificationFailed => consensus("transaction.sapling_verification"),
+            Self::Halo2VerificationFailed => consensus("transaction.halo2_verification"),
+            Self::SmallOrder => consensus("transaction.small_order"),
+            Self::Groth16(_) => consensus("transaction.groth16"),
+            Self::MalformedGroth16(_) => consensus("transaction.malformed_groth16"),
+            Self::Ed25519(_) => consensus("transaction.ed25519"),
+            Self::RedJubjub(_) => consensus("transaction.redjubjub"),
+            Self::RedPallas(_) => consensus("transaction.redpallas"),
+            Self::InternalDowncastError(_) => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
+            Self::BothVPubsNonZero => consensus("transaction.both_vpubs_nonzero"),
+            Self::DisabledAddToSproutPool => consensus("transaction.disabled_sprout_pool_add"),
+            Self::DisabledAddToOrchardPool => consensus("transaction.disabled_orchard_pool_add"),
+            Self::IncorrectFee => consensus("transaction.incorrect_fee"),
+            Self::DuplicateTransparentSpend(_) => {
+                consensus("transaction.duplicate_transparent_spend")
+            }
+            Self::DuplicateSproutNullifier(_) => {
+                consensus("transaction.duplicate_sprout_nullifier")
+            }
+            Self::DuplicateSaplingNullifier(_) => {
+                consensus("transaction.duplicate_sapling_nullifier")
+            }
+            Self::DuplicateOrchardNullifier(_) => {
+                consensus("transaction.duplicate_orchard_nullifier")
+            }
+            Self::DuplicateIronwoodNullifier(_) => {
+                consensus("transaction.duplicate_ironwood_nullifier")
+            }
+            Self::NotEnoughFlags => consensus("transaction.orchard_flags"),
+            Self::NotEnoughIronwoodFlags => consensus("transaction.ironwood_flags"),
+            Self::OrchardHasEnableCrossAddress => {
+                consensus("transaction.orchard_enable_cross_address")
+            }
+            Self::TransparentInputNotFound => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
+            }
+            Self::ValidateContextError(error) => error.body_verification_class(),
+            Self::ValidateMempoolLockTimeError(_)
+            | Self::Zip317(_)
+            | Self::NonStandardScriptSigSize { .. }
+            | Self::NonStandardScriptSigNotPushOnly { .. }
+            | Self::NonStandardInputs
+            | Self::WrongConsensusBranchIdNu6_3GracePeriod => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
+            Self::WrongConsensusBranchId => consensus("transaction.wrong_consensus_branch_id"),
+            Self::MissingConsensusBranchId => consensus("transaction.missing_consensus_branch_id"),
+            Self::Io(_) | Self::TryFromSlice(_) | Self::Other(_) => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
+            Self::Amount(_) => consensus("transaction.amount"),
+            Self::Balance(_) => consensus("transaction.balance"),
+            Self::OrchardProofSize => consensus("transaction.orchard_proof_size"),
+            Self::IronwoodProofSize => consensus("transaction.ironwood_proof_size"),
+            Self::ImmatureTransparentCoinbaseSpend { .. } => {
+                consensus("transaction.immature_transparent_coinbase_spend")
+            }
+            Self::UnshieldedTransparentCoinbaseSpend { .. } => {
+                consensus("transaction.unshielded_transparent_coinbase_spend")
+            }
+        }
+    }
+
     /// Returns a suggested misbehaviour score increment for a certain error when
     /// verifying a mempool transaction.
     pub fn mempool_misbehavior_score(&self) -> u32 {

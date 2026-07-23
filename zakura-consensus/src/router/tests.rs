@@ -30,6 +30,53 @@ use super::*;
 /// high system load.
 const VERIFY_TIMEOUT_SECONDS: u64 = 10;
 
+#[test]
+fn routed_body_failures_keep_payload_consensus_and_local_results_distinct() {
+    use zakura_header_chain::{
+        BodyCommitmentKind, BodyRuleId, BodyVerificationClass, TransientBodyFailureKind,
+    };
+
+    let payload = RouterError::Block {
+        source: Box::new(VerifyBlockError::Block {
+            source: crate::error::BlockError::BadMerkleRoot {
+                actual: zakura_chain::block::merkle::Root([0; 32]),
+                expected: zakura_chain::block::merkle::Root([1; 32]),
+            },
+        }),
+    };
+    assert_eq!(
+        payload.body_verification_class(),
+        BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot)
+    );
+
+    let consensus = RouterError::Block {
+        source: Box::new(VerifyBlockError::Transaction(TransactionError::NoInputs)),
+    };
+    assert_eq!(
+        consensus.body_verification_class(),
+        BodyVerificationClass::ConsensusInvalid(BodyRuleId::new("transaction.no_inputs"))
+    );
+
+    let local = RouterError::Block {
+        source: Box::new(VerifyBlockError::StateService {
+            source: BoxError::from("state unavailable"),
+            hash: block::Hash([2; 32]),
+        }),
+    };
+    assert_eq!(
+        local.body_verification_class(),
+        BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+    );
+
+    let checkpoint = RouterError::Checkpoint {
+        source: Box::new(VerifyCheckpointError::Dropped),
+    };
+    assert_eq!(
+        checkpoint.body_verification_class(),
+        BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+    );
+}
+
 /// Generate a block with no transactions (not even a coinbase transaction).
 ///
 /// The generated block should fail validation.

@@ -118,6 +118,9 @@ pub fn spawn_block_sync_reactor(
     let (sequencer_input_tx, sequencer_body_input_rx) =
         mpsc::channel(startup.config.submitted_apply_limit().max(1));
     let (sequencer_control_tx, sequencer_control_rx) = mpsc::unbounded_channel();
+    let initial_body_scope = committed_snapshot
+        .as_ref()
+        .map(zakura_header_chain::WorkScope::for_body_work);
     let sequencer_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sequencer_input_decoded_attributed_memory_bytes =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -130,6 +133,7 @@ pub fn spawn_block_sync_reactor(
         actions_tx.clone(),
         committed_throughput,
         startup.frontiers,
+        initial_body_scope,
         sequencer_body_input_rx,
         sequencer_control_rx,
         sequencer_input_bytes.clone(),
@@ -335,6 +339,11 @@ impl BlockSyncReactor {
                                 None => self.state.work_queue.retire_all(),
                             };
                             self.state.budget.release(released);
+                            let _ = self.sequencer_control.send(
+                                SequencerControlInput::WorkScopeChanged {
+                                    scope: current_scope,
+                                },
+                            );
                             if current_scope.is_some() {
                                 self.query_needed_blocks_with_options(true).await;
                             }
@@ -540,6 +549,10 @@ impl BlockSyncReactor {
                 outcome,
                 local_frontier,
             } => {
+                let semantic_current = matches!(
+                    outcome.verification(),
+                    zakura_header_chain::BodyVerificationOutcome::Verified(_)
+                ) || self.body_completion_is_current(source, &owner);
                 self.handle_block_apply_finished(
                     owner,
                     source,
@@ -547,6 +560,7 @@ impl BlockSyncReactor {
                     height,
                     hash,
                     outcome,
+                    semantic_current,
                     local_frontier,
                 )
                 .await
@@ -1258,6 +1272,7 @@ impl BlockSyncReactor {
         height: block::Height,
         hash: block::Hash,
         outcome: BlockApplyOutcome,
+        semantic_current: bool,
         local_frontier: Option<BlockSyncFrontiers>,
     ) {
         // The whole commit-pipeline body (token validate, embedded local-frontier
@@ -1283,6 +1298,7 @@ impl BlockSyncReactor {
                 height,
                 hash,
                 outcome,
+                semantic_current,
                 local_frontier,
             });
         self.trace_sequencer_control_send(
@@ -1404,6 +1420,38 @@ impl BlockSyncReactor {
                     self.state.best_header_hash,
                 ),
             }))
+        }
+    }
+
+    fn body_completion_is_current(
+        &self,
+        source: zakura_header_chain::SourceId,
+        owner: &zakura_header_chain::WorkOwner,
+    ) -> bool {
+        let current = self
+            .startup
+            .committed_snapshots
+            .as_ref()
+            .and_then(|snapshots| snapshots.borrow().clone());
+        #[cfg(test)]
+        if current.is_none() {
+            return self.body_work_scope() == Some(owner.scope());
+        }
+        let Some(current) = current else {
+            return false;
+        };
+        let mut pending = zakura_header_chain::PendingOwners::default();
+        pending.insert(source, *owner);
+        match zakura_header_chain::CompletionGate::check(&current, &pending, source, owner) {
+            zakura_header_chain::CompletionDecision::Current => true,
+            zakura_header_chain::CompletionDecision::Stale(reason) => {
+                metrics::counter!(
+                    "sync.header_chain.stale_completion.total",
+                    "kind" => format!("body_{reason:?}")
+                )
+                .increment(1);
+                false
+            }
         }
     }
 

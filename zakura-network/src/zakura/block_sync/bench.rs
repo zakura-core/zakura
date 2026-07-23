@@ -192,6 +192,7 @@ pub fn spawn_bench_sequencer(
         actions_tx,
         throughput,
         frontiers,
+        Some(owner.scope()),
         body_input_rx,
         control_rx,
         body_input_bytes.clone(),
@@ -305,6 +306,7 @@ impl BenchCommitter {
                 hash,
                 evidence: zakura_header_chain::EvidenceId::from_digest([0xb5; 32]),
             }),
+            semantic_current: true,
             local_frontier: Some(local_frontier),
         });
     }

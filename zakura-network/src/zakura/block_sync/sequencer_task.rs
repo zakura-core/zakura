@@ -143,6 +143,10 @@ impl Drop for SequencerInputAccounting {
 /// they use a separate prioritized channel.
 #[derive(Debug)]
 pub(super) enum SequencerControlInput {
+    /// Retire all body work from the previous authoritative scope before accepting new work.
+    WorkScopeChanged {
+        scope: Option<zakura_header_chain::WorkScope>,
+    },
     /// A verified-tip advance (frontier growth/commit).
     FrontierAdvance {
         frontiers: BlockSyncFrontiers,
@@ -170,6 +174,7 @@ pub(super) enum SequencerControlInput {
         height: block::Height,
         hash: block::Hash,
         outcome: BlockApplyOutcome,
+        semantic_current: bool,
         local_frontier: Option<BlockSyncFrontiers>,
     },
 }
@@ -251,6 +256,7 @@ pub(super) struct SequencerTask {
     verified_block_hash: block::Hash,
     reset_epoch: u64,
     reaction_epoch: u64,
+    current_scope: Option<zakura_header_chain::WorkScope>,
     body_input_rx: mpsc::Receiver<SequencedBody>,
     control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
     _body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
@@ -286,6 +292,7 @@ impl SequencerTask {
         actions: mpsc::Sender<BlockSyncAction>,
         committed_throughput: ThroughputMeter,
         frontiers: BlockSyncFrontiers,
+        current_scope: Option<zakura_header_chain::WorkScope>,
         body_input_rx: mpsc::Receiver<SequencedBody>,
         control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
         body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
@@ -304,6 +311,7 @@ impl SequencerTask {
             verified_block_hash: frontiers.verified_block_hash,
             reset_epoch: 0,
             reaction_epoch: 0,
+            current_scope,
             body_input_rx,
             control_input_rx,
             _body_input_bytes: body_input_bytes,
@@ -377,6 +385,12 @@ impl SequencerTask {
         // the reactor from re-querying/-scheduling on a pure body buffer/submit or
         // a no-op (stale/duplicate) apply completion.
         match input {
+            SequencerControlInput::WorkScopeChanged { scope } => {
+                self.current_scope = scope;
+                let verified_tip = self.sequencer.verified_tip();
+                let _ = self.sequencer.reset_to(verified_tip, false);
+                true
+            }
             SequencerControlInput::FrontierAdvance {
                 frontiers,
                 release_applied,
@@ -407,9 +421,10 @@ impl SequencerTask {
                 height,
                 hash,
                 outcome,
+                semantic_current,
                 local_frontier,
             } => {
-                let needs_reaction = self
+                let (needs_reaction, allow_submit) = self
                     .handle_apply_finished(
                         *owner,
                         source,
@@ -417,10 +432,13 @@ impl SequencerTask {
                         height,
                         hash,
                         outcome,
+                        semantic_current,
                         local_frontier,
                     )
                     .await;
-                self.submit_pending_blocks().await;
+                if allow_submit {
+                    self.submit_pending_blocks().await;
+                }
                 needs_reaction
             }
         }
@@ -429,6 +447,13 @@ impl SequencerTask {
     /// Body-acceptance tail: offer the body to the reorder buffer, then drain the
     /// ready contiguous prefix into applying.
     fn handle_accept_body(&mut self, body: SequencedBody) {
+        let scope_is_current = self.current_scope == Some(body.owner.scope());
+        #[cfg(test)]
+        let scope_is_current = scope_is_current || self.current_scope.is_none();
+        if !scope_is_current {
+            self.trace_body_accepted(body.height, body.received_at.elapsed(), "stale_scope");
+            return;
+        }
         let queued_elapsed = body.received_at.elapsed();
         let outcome = match self.sequencer.accept_buffered_body(
             body.owner,
@@ -589,8 +614,9 @@ impl SequencerTask {
         height: block::Height,
         hash: block::Hash,
         outcome: BlockApplyOutcome,
+        semantic_current: bool,
         local_frontier: Option<BlockSyncFrontiers>,
-    ) -> bool {
+    ) -> (bool, bool) {
         let result = outcome.result();
         // A stale completion (no live applying entry, or token/hash mismatch)
         // releases only its exact token-aware in-flight-submission charge and
@@ -598,9 +624,14 @@ impl SequencerTask {
         let Some((applying_owner, applying_source, applying_token, applying_hash)) =
             self.sequencer.applying_identity(height)
         else {
-            self.sequencer
+            let released = self
+                .sequencer
                 .finish_submission(owner, source, token, height, hash);
-            return false;
+            let verified = matches!(
+                outcome.verification(),
+                zakura_header_chain::BodyVerificationOutcome::Verified(_)
+            );
+            return (false, released && verified && semantic_current);
         };
         if applying_owner != owner
             || applying_source != source
@@ -609,7 +640,13 @@ impl SequencerTask {
         {
             self.sequencer
                 .finish_submission(owner, source, token, height, hash);
-            return false;
+            return (false, false);
+        }
+        if !semantic_current {
+            let _ = self.sequencer.remove_applying(height);
+            self.sequencer
+                .finish_submission(owner, source, token, height, hash);
+            return (false, false);
         }
         let accepted_local_frontier = if let Some(frontiers) = local_frontier {
             // Fold the `local_frontier` advance in as a frontier advance without
@@ -633,7 +670,7 @@ impl SequencerTask {
             // copy, so release the token-aware decode-window charge now.
             self.sequencer
                 .finish_attached_submission(owner, source, token, height, hash);
-            return accepted_local_frontier.is_some();
+            return (accepted_local_frontier.is_some(), true);
         }
         let applying = self
             .sequencer
@@ -686,7 +723,7 @@ impl SequencerTask {
         }
 
         self.release_contiguous_blocks().await;
-        true
+        (true, true)
     }
 
     /// Drain the contiguous reorder prefix into applying, then submit it.
@@ -1264,6 +1301,91 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stale_retry_completion_releases_only_exact_infrastructure() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, mut actions_rx) = mpsc::channel(4);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(super::test_work_scope()),
+            body_rx,
+            control_rx,
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+
+        let mut body = queued_test_body(input_bytes.clone(), input_decoded_bytes.clone());
+        body.leave_queue();
+        task.handle_accept_body(body);
+        task.submit_pending_blocks().await;
+        let BlockSyncAction::SubmitBlock {
+            owner,
+            source,
+            token,
+            block,
+        } = actions_rx.recv().await.expect("body is submitted")
+        else {
+            panic!("expected a body submission");
+        };
+        let height = block.coinbase_height().expect("test block has height");
+        let hash = block.hash();
+
+        assert_eq!(
+            task.handle_apply_finished(
+                owner,
+                source,
+                token,
+                height,
+                hash,
+                super::test_block_apply_outcome(BlockApplyResult::Unavailable),
+                false,
+                None,
+            )
+            .await,
+            (false, false),
+            "a stale transient completion cannot trigger scheduling or reaction"
+        );
+        assert!(!task.sequencer.applying_contains(height));
+        assert_eq!(task.sequencer.in_flight_submission_count(), 0);
+        assert!(
+            actions_rx.try_recv().is_err(),
+            "stale completion emits no action"
+        );
+
+        let mut current_scope = super::test_work_scope();
+        current_scope.state_version = zakura_header_chain::StateVersion::new(9);
+        assert!(
+            task.handle_control_input(SequencerControlInput::WorkScopeChanged {
+                scope: Some(current_scope),
+            })
+            .await
+        );
+        assert_eq!(task.sequencer.floor(), block::Height(0));
+
+        let mut old_body = queued_test_body(input_bytes, input_decoded_bytes);
+        old_body.leave_queue();
+        task.handle_accept_body(old_body);
+        assert_eq!(task.sequencer.reorder_len(), 0);
+        assert_eq!(task.sequencer.applying_len(), 0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn submission_retries_after_action_channel_capacity_returns() {
         let frontiers = BlockSyncFrontiers {
@@ -1302,6 +1424,7 @@ mod tests {
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
+            Some(super::test_work_scope()),
             body_rx,
             control_rx,
             body_input_bytes.clone(),
@@ -1375,6 +1498,7 @@ mod tests {
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
+            Some(super::test_work_scope()),
             body_rx,
             control_rx,
             body_input_bytes,
@@ -1432,6 +1556,7 @@ mod tests {
             actions,
             ThroughputMeter::new(Instant::now()),
             frontiers,
+            Some(super::test_work_scope()),
             body_rx,
             control_rx,
             body_input_bytes.clone(),

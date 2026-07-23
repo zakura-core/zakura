@@ -3842,6 +3842,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
         actions_tx,
         ThroughputMeter::new(Instant::now()),
         frontiers,
+        Some(test_work_scope()),
         body_rx,
         control_rx,
         body_input_bytes.clone(),
@@ -3926,6 +3927,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
             height: block::Height(1),
             hash: block_1.hash(),
             outcome: test_block_apply_outcome(BlockApplyResult::Committed),
+            semantic_current: true,
             local_frontier: Some(BlockSyncFrontiers {
                 finalized_height: block::Height(0),
                 verified_block_tip: block::Height(3),
@@ -3956,6 +3958,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
                 height,
                 hash: block.hash(),
                 outcome: test_block_apply_outcome(BlockApplyResult::Committed),
+                semantic_current: true,
                 local_frontier: Some(BlockSyncFrontiers {
                     finalized_height: block::Height(0),
                     verified_block_tip: block::Height(3),

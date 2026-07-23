@@ -42,6 +42,8 @@ fn operation_strategy() -> impl Strategy<Value = Op> {
         3 => (source_strategy(), 0..TRUNK_LEN)
             .prop_map(|(source, index)| Op::Verify { source, index }),
         2 => (1..=8usize).prop_map(|count| Op::Finalize { count }),
+        1 => (source_strategy(), 0..TRUNK_LEN)
+            .prop_map(|(source, index)| Op::MalformedVerify { source, index }),
         1 => Just(Op::Reopen),
     ]
 }

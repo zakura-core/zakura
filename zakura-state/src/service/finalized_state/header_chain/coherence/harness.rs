@@ -80,6 +80,10 @@ pub(super) enum Op {
     Finalize {
         count: usize,
     },
+    MalformedVerify {
+        source: Source,
+        index: usize,
+    },
     Reopen,
 }
 
@@ -109,6 +113,7 @@ pub(super) struct Harness {
     finalized: Frontier,
     verified_path: Vec<Frontier>,
     next_request_id: u64,
+    rejections: usize,
     _tempdir: tempfile::TempDir,
 }
 
@@ -202,6 +207,7 @@ impl Harness {
             finalized: frontier,
             verified_path: vec![frontier],
             next_request_id: 1,
+            rejections: 0,
             _tempdir: tempdir,
         };
         harness.assert_coherent();
@@ -214,6 +220,10 @@ impl Harness {
         }
     }
 
+    pub fn rejections(&self) -> usize {
+        self.rejections
+    }
+
     fn run(&mut self, operation: &Op) {
         match *operation {
             Op::InsertHeaders {
@@ -224,6 +234,7 @@ impl Harness {
             } => self.insert_headers(source, offset, len, anchor),
             Op::Verify { source, index } => self.verify(source, index),
             Op::Finalize { count } => self.finalize(count),
+            Op::MalformedVerify { source, index } => self.malformed_verify(source, index),
             Op::Reopen => self.reopen(),
         }
         self.assert_coherent();
@@ -244,6 +255,7 @@ impl Harness {
             .expect("the coherence lease read succeeds")
         else {
             assert_eq!(self.logical_dump(), before);
+            self.rejections += 1;
             return;
         };
         let rules = HeaderRules::for_validation_lease(self.config.network.clone(), &lease)
@@ -260,6 +272,7 @@ impl Harness {
                 before,
                 "a rejected prepared range must not mutate any header family"
             );
+            self.rejections += 1;
             return;
         };
         let snapshot = self.runtime().publisher().snapshot();
@@ -430,6 +443,58 @@ impl Harness {
             Some(self.finalized),
             "the verified projection is rebased to new finality"
         );
+    }
+
+    fn malformed_verify(&mut self, source: Source, index: usize) {
+        let rows = self.rows(source);
+        let header = rows[index.min(rows.len() - 1)].clone();
+        if header.header.previous_block_hash == self.finalized.hash {
+            return;
+        }
+        let before_rows = self.logical_dump();
+        let before_snapshot = self.runtime().publisher().snapshot();
+        let evidence = self.next_evidence(0x80);
+        let authority = Authority(evidence);
+        let result = self.runtime().apply(
+            TransitionRequest {
+                expected_version: before_snapshot.state_version,
+                event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+                    full_state_transition_id: evidence,
+                    old_tip: *self
+                        .verified_path
+                        .last()
+                        .expect("the verified model path includes finality"),
+                    new_path: vec![VerifiedHeaderRef {
+                        height: header.height,
+                        hash: header.hash,
+                        header: header.header,
+                    }],
+                    cause: VerifiedChangeCause::Reset,
+                }),
+            },
+            &TransitionContext {
+                config: &self.config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                startup_capability: None,
+                retention_references: &[],
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a full-state reset whose first header is not a finalized child must fail"
+        );
+        assert_eq!(
+            self.logical_dump(),
+            before_rows,
+            "a rejected unlinked full-state reset must mutate no header family"
+        );
+        assert_eq!(
+            self.runtime().publisher().snapshot(),
+            before_snapshot,
+            "a rejected unlinked full-state reset must not publish"
+        );
+        self.rejections += 1;
     }
 
     fn reopen(&mut self) {

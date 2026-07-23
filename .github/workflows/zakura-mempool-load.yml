@@ -17,14 +17,6 @@ name: Mempool load
 # and no public peers. No Mainnet state and no real funds are involved.
 
 on:
-  # TEMPORARY -- REMOVE BEFORE MERGING.
-  # `workflow_dispatch` only works once the workflow is on the default branch,
-  # so this is the only way to exercise the droplet path pre-merge. A `push`
-  # event reads the workflow from the pushed commit. Every push to this branch
-  # provisions a droplet, which is exactly why it must not survive the merge.
-  push:
-    branches: [ci/mempool-load-harness]
-
   workflow_dispatch:
     inputs:
       pr_number:
@@ -69,7 +61,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: zakura-mempool-load-${{ inputs.pr_number || inputs.ref || github.ref_name }}
+  group: zakura-mempool-load-${{ inputs.pr_number || inputs.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -92,14 +84,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
-          # On a push event every input is empty, so each falls back to the
-          # dispatch default. The ref defaults to the pushed branch by name
-          # (not SHA) so the PR lookup below can still match on head branch.
-          REF: ${{ inputs.ref || (github.event_name == 'push' && github.ref_name || '') }}
-          # TEMPORARY, with the push trigger: gives the smoke run a real
-          # baseline so the two-leg A/B path is actually exercised. main and
-          # this branch have identical Rust, so the second build is cached.
-          BASELINE_REF: ${{ inputs.baseline_ref || (github.event_name == 'push' && 'main' || '') }}
+          REF: ${{ inputs.ref }}
+          BASELINE_REF: ${{ inputs.baseline_ref }}
           NODE_COUNT: ${{ inputs.node_count || '2' }}
           TX_RATE: ${{ inputs.tx_rate || '2' }}
           DURATION_MINUTES: ${{ inputs.duration_minutes || '2' }}
@@ -377,10 +363,7 @@ jobs:
         if: always()
         env:
           DROPLET_ID: ${{ steps.droplet.outputs.id }}
-          # Explicit event check: on a push `inputs.teardown_after_run` is
-          # empty, and an empty value compares equal to `false` in GitHub
-          # expressions -- which silently left the smoke-run droplet alive.
-          TEARDOWN: ${{ github.event_name == 'push' && 'true' || (inputs.teardown_after_run && 'true' || 'false') }}
+          TEARDOWN: ${{ inputs.teardown_after_run && 'true' || 'false' }}
           SSH_FAILED: ${{ steps.sshwait.outcome == 'failure' }}
         run: |
           set +e

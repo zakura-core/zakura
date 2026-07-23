@@ -202,6 +202,15 @@ def cmd_genesis(args) -> int:
     config = build_kresko_config(args)
     (lab / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
+    # NU6.3 gates the Ironwood shielded pool, so a chain that stops below it
+    # cannot exercise Ironwood at all. Nu7 is deliberately not requested: a
+    # release zakurad compiles its consensus branch id out, and no block at an
+    # Nu7 activation height can be mined.
+    env = {**os.environ, "KRESKO_LATEST_NETWORK_UPGRADE": args.latest_upgrade}
+    # Recorded so the blast uses the same upgrade as the chain. Kresko's
+    # transaction builder derives its consensus branch id from this, and a
+    # builder that disagrees with the chain has every transaction rejected.
+    (lab / "latest-upgrade").write_text(args.latest_upgrade + "\n")
     run(
         [
             args.kresko_binary,
@@ -218,7 +227,8 @@ def cmd_genesis(args) -> int:
             str(args.orchard_lane_value_zats),
             "-d",
             str(lab),
-        ]
+        ],
+        env=env,
     )
 
     payload = lab / "payload"
@@ -802,11 +812,20 @@ def cmd_blast(args) -> int:
         str(orchard["fanout_outputs"]),
     ]
     print(f"+ {' '.join(cmd)}", flush=True)
+    # Same upgrade the chain was generated with -- see cmd_genesis.
+    upgrade_file = lab / "latest-upgrade"
+    blast_env = {**os.environ}
+    if upgrade_file.is_file():
+        blast_env["KRESKO_LATEST_NETWORK_UPGRADE"] = upgrade_file.read_text().strip()
     log_path = lab / "txblast.log"
     with open(log_path, "ab") as log:
         # Own process group so the whole blaster can be signalled as a unit.
         proc = subprocess.Popen(
-            cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+            cmd,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=blast_env,
         )
         try:
             proc.wait(timeout=args.duration_secs)
@@ -894,6 +913,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     gen = sub.add_parser("genesis", help="generate the local-genesis chain payload")
     gen.add_argument("--chain-id", default="mempool-load")
+    gen.add_argument(
+        "--latest-upgrade",
+        # nu6_1, not nu6_3, until Kresko's transaction builder can follow. Its
+        # zcash_protocol 0.7 has no Nu6_2/Nu6_3 variants, so on an NU6.3 chain
+        # it signs at NU6.1's consensus branch id and every transaction is
+        # rejected -- the blast dies during bootstrap and the run measures
+        # nothing. Kresko can now *express* NU6.2/NU6.3 (valargroup/kresko),
+        # so this becomes nu6_3 once its zcash stack is bumped to the 0.10 /
+        # 0.29 / orchard 0.15 line that Zakura already uses.
+        #
+        # Ironwood is gated on NU6.3, so Ironwood coverage waits on that too.
+        default="nu6_1",
+        help="newest network upgrade the generated chain activates "
+        "(nu6_3 needs a Kresko built against zcash_protocol 0.10+)",
+    )
     gen.add_argument("--experiment", default="mempool-load")
     gen.add_argument("--block-time-secs", type=int, default=5)
     gen.add_argument("--maturity-padding-blocks", type=int, default=125)

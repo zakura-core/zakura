@@ -85,7 +85,9 @@ if [ -d "$LOADGEN_DIR" ]; then
 fi
 BAKED_SHA=$(cat "${LOADGEN_DIR}/.baked-ref" 2>/dev/null || true)
 
-if [ -x "${LOADGEN_DIR}/target/release/kresko" ] && [ -n "$WANT_SHA" ] && [ "$BAKED_SHA" = "$WANT_SHA" ]; then
+if [ "$SKIP_KRESKO_BUILD" = "1" ] && [ -x "${LOADGEN_DIR}/target/release/kresko" ]; then
+  echo "reusing the caller-provided kresko binary"
+elif [ -x "${LOADGEN_DIR}/target/release/kresko" ] && [ -n "$WANT_SHA" ] && [ "$BAKED_SHA" = "$WANT_SHA" ]; then
   echo "reusing baked kresko at ${BAKED_SHA}"
 else
   echo "building kresko at ${KRESKO_REF} (baked: ${BAKED_SHA:-none}, want: ${WANT_SHA:-unknown})"

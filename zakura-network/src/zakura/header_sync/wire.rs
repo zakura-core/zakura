@@ -1589,6 +1589,37 @@ mod tests {
     }
 
     #[test]
+    fn broken_ancestry_and_completed_target_are_rejected() {
+        let header = regtest_genesis_block().header.clone();
+        let mut response = Headers {
+            request_id: 1,
+            target_tip_hash: header.hash(),
+            common_ancestor_height: block::Height(0),
+            common_ancestor_hash: header.previous_block_hash,
+            complete: true,
+            tree_aux_schema: AuxSchema::None,
+            entries: vec![HeaderEntry {
+                header,
+                body_size: 0,
+                tree_aux: None,
+            }],
+        };
+
+        response.common_ancestor_hash = hash(0x41);
+        assert!(matches!(
+            codec().encode(&HeaderSyncMessage::Headers(response.clone())),
+            Err(HeaderSyncWireError::NonContiguousHeaders)
+        ));
+
+        response.common_ancestor_hash = response.entries[0].header.previous_block_hash;
+        response.target_tip_hash = hash(0x42);
+        assert!(matches!(
+            codec().encode(&HeaderSyncMessage::Headers(response)),
+            Err(HeaderSyncWireError::InvalidHeadersCompletion)
+        ));
+    }
+
+    #[test]
     fn discriminator_four_never_guesses_block_relay_payload() {
         let block = regtest_genesis_block();
         let mut block_relay_payload = vec![MSG_HS_HEADERS_OUTCOME];

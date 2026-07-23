@@ -2054,6 +2054,125 @@ mod tests {
         (source, owner, range)
     }
 
+    fn peer_violation_fixture() -> (
+        HeaderSyncReactor,
+        mpsc::Receiver<HeaderSyncAction>,
+        zakura_header_chain::EngineSnapshot,
+        ZakuraPeerId,
+        zakura_header_chain::SourceId,
+        zakura_header_chain::WorkOwner,
+    ) {
+        let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown);
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let snapshot = committed_snapshot(anchor);
+        let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+        startup.committed_snapshots = Some(snapshots_rx);
+        let (_handle, actions, mut reactor) =
+            build_header_sync_reactor(startup).expect("the violation fixture starts");
+        let peer = peer();
+        let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 0);
+        (reactor, actions, snapshot, peer, source, owner)
+    }
+
+    fn assert_peer_violation(
+        actions: &mut mpsc::Receiver<HeaderSyncAction>,
+        expected: HeaderSyncMisbehavior,
+    ) {
+        assert!(matches!(
+            actions.try_recv(),
+            Ok(HeaderSyncAction::Misbehavior { reason, .. }) if reason == expected
+        ));
+        assert!(
+            actions.try_recv().is_err(),
+            "one invalid response emits exactly one peer violation"
+        );
+    }
+
+    #[test]
+    fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
+        let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
+        let active = reactor
+            .peer_work_queue
+            .active_mut(&peer)
+            .expect("the fixture has active work");
+        let wrong_ancestor = zakura_header_chain::Frontier::new(
+            snapshot.frontiers.finalized.height,
+            block::Hash([0x41; 32]),
+        );
+        let mut wrong_ancestor_header = *active.entries[0].header;
+        wrong_ancestor_header.previous_block_hash = wrong_ancestor.hash;
+        active.phase = HeaderTargetPhase::Receiving;
+        active.common_ancestor = None;
+        active.entries.clear();
+        let wrong_ancestor_response = Headers {
+            request_id: owner.request_id.get(),
+            target_tip_hash: owner.branch.target_tip_hash,
+            common_ancestor_height: wrong_ancestor.height,
+            common_ancestor_hash: wrong_ancestor.hash,
+            complete: false,
+            tree_aux_schema: AuxSchema::None,
+            entries: vec![HeaderEntry {
+                header: Arc::new(wrong_ancestor_header),
+                body_size: 0,
+                tree_aux: None,
+            }],
+        };
+        assert!(
+            reactor
+                .codec
+                .encode(&HeaderSyncMessage::Headers(wrong_ancestor_response.clone()))
+                .is_ok(),
+            "the wrong locator member is otherwise wire-valid"
+        );
+        reactor.handle_headers(peer.clone(), 0, wrong_ancestor_response);
+        assert_peer_violation(&mut actions, HeaderSyncMisbehavior::MalformedMessage);
+
+        let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
+        let active = reactor
+            .peer_work_queue
+            .active_mut(&peer)
+            .expect("the fixture has active work");
+        let header = active.entries[0].header.clone();
+        let mut wrong_target_header = *header;
+        wrong_target_header.time += chrono::Duration::seconds(1);
+        active.phase = HeaderTargetPhase::Receiving;
+        active.common_ancestor = None;
+        active.entries.clear();
+        reactor.handle_headers(
+            peer.clone(),
+            0,
+            Headers {
+                request_id: owner.request_id.get(),
+                target_tip_hash: owner.branch.target_tip_hash,
+                common_ancestor_height: snapshot.frontiers.finalized.height,
+                common_ancestor_hash: snapshot.frontiers.finalized.hash,
+                complete: true,
+                tree_aux_schema: AuxSchema::None,
+                entries: vec![HeaderEntry {
+                    header: Arc::new(wrong_target_header),
+                    body_size: 0,
+                    tree_aux: None,
+                }],
+            },
+        );
+        assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+
+        let (mut reactor, mut actions, _snapshot, peer, source, owner) = peer_violation_fixture();
+        reactor
+            .peer_work_queue
+            .active_mut(&peer)
+            .expect("the fixture has active work")
+            .phase = HeaderTargetPhase::Preparing;
+        reactor.handle_header_target_prepared(
+            peer,
+            source,
+            owner,
+            HeaderTargetPreparationResult::InvalidHeader,
+        );
+        assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+    }
+
     #[test]
     fn aud_06_07_live_reactor_ignores_results_retired_by_a_committed_snapshot() {
         {

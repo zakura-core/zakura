@@ -215,12 +215,15 @@ impl HeaderSyncCore {
             }
             let range = CheckedHeaderRange::from_count(batch_start, batch_len)
                 .expect("bounded non-empty batch has checked geometry");
-            let want_tree_aux_roots = !retain_roots || batch_end <= handoff;
+            // Non-empty Headers responses are all-or-nothing on the wire: root
+            // count must match header count. Requesting without roots makes the
+            // serve path clear any non-empty reply, so post-handoff forward sync
+            // would stall forever at the final checkpoint tip.
             self.schedule.ensure_forward(RangeRequest {
                 range,
                 anchor_hash,
                 finalized,
-                want_tree_aux_roots,
+                want_tree_aux_roots: true,
                 priority: RangePriority::Forward,
             });
             remaining = remaining.saturating_sub(batch_len);

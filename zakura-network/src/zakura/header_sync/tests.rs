@@ -5187,7 +5187,10 @@ async fn forward_ranges_below_checkpoint_handoff_request_tree_aux_roots() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn forward_ranges_above_handoff_do_not_request_tree_aux_roots() {
+async fn forward_ranges_above_handoff_still_request_tree_aux_roots() {
+    // Regtest e2e: after the final checkpoint tip, forward ranges past handoff
+    // must still request roots. Without them the serve path clears non-empty
+    // Headers replies and catch-up stalls at the handoff height.
     let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
     let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
     let checkpoint = (block::Height(3), checkpoint_hash);
@@ -5220,7 +5223,10 @@ async fn forward_ranges_above_handoff_do_not_request_tree_aux_roots() {
         } = next_non_query_action(&mut fixture.actions).await
         {
             assert_eq!(start_height, block::Height(4));
-            assert!(!want_tree_aux_roots);
+            assert!(
+                want_tree_aux_roots,
+                "post-handoff forward ranges must request roots for non-empty Headers"
+            );
             break;
         }
     }

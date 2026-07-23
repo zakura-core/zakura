@@ -609,15 +609,6 @@ pub enum VctRootRepairState {
     },
 }
 
-/// Startup-only recovery evidence.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct RecoveryEvidence {
-    /// Stable recovery/audit identity.
-    pub evidence: EvidenceId,
-    /// Digest of the audited source rows.
-    pub source_digest: [u8; 32],
-}
-
 /// Every chain-changing input accepted by the sole transition planner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransitionEvent {
@@ -643,8 +634,6 @@ pub enum TransitionEvent {
     AuxEvidence(Box<AuxEvidence>),
     /// Reevaluate all locally due future-time deferrals.
     ReevaluateDeferred,
-    /// Startup-only reconstruction or audit repair.
-    Recover(RecoveryEvidence),
 }
 
 /// Authority/mode gate checked before any transition effect.
@@ -654,8 +643,6 @@ pub enum EventAdmission {
     AnyMode,
     /// Requires authenticated integrated full-state authority.
     IntegratedFullState,
-    /// Requires startup authority while normal publication is disabled.
-    StartupOnly,
 }
 
 impl TransitionEvent {
@@ -668,7 +655,6 @@ impl TransitionEvent {
             | Self::FullStateFinalized(_)
             | Self::MigratedPinRefutation(_)
             | Self::AuxEvidence(_) => EventAdmission::IntegratedFullState,
-            Self::Recover(_) => EventAdmission::StartupOnly,
             Self::InsertHeaders(_)
             | Self::OperatorBodyRetry(_)
             | Self::OperatorInvalidate(_)
@@ -702,7 +688,6 @@ impl TransitionEvent {
                 AuxAuthentication::Authenticated { evidence, .. }
                 | AuxAuthentication::Rejected { evidence } => Some(evidence),
             },
-            Self::Recover(event) => Some(event.evidence),
             Self::ReevaluateDeferred => None,
         }
     }
@@ -934,14 +919,6 @@ mod tests {
         assert_eq!(reconsider.idempotency_key(), Some(evidence));
         assert_eq!(reconsider.work_owner(), None);
 
-        let recovery = RecoveryEvidence {
-            evidence,
-            source_digest: [3; 32],
-        };
-        let recovery = TransitionEvent::Recover(recovery);
-        assert_eq!(recovery.admission(), EventAdmission::StartupOnly);
-        assert_eq!(recovery.idempotency_key(), Some(evidence));
-
         let refutation = TransitionEvent::MigratedPinRefutation(MigratedPinRefutation {
             full_state_transition_id: evidence,
             pin: Frontier::new(block::Height(2), block::Hash([4; 32])),
@@ -1027,7 +1004,6 @@ mod tests {
             "MigratedPinRefutation(MigratedPinRefutation)",
             "AuxEvidence(Box<AuxEvidence>)",
             "ReevaluateDeferred",
-            "Recover(RecoveryEvidence)",
         ] {
             assert!(source.contains(variant), "missing event variant {variant}");
         }

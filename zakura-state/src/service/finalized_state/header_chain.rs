@@ -940,7 +940,6 @@ impl HeaderChainRuntime {
             config: context.config,
             clock: context.clock,
             full_state_authority: context.full_state_authority,
-            startup_capability: context.startup_capability,
             retention_references: &retention_references,
         };
         let before = self.store.snapshot()?;
@@ -1252,7 +1251,6 @@ impl HeaderChainStore {
                 config,
                 clock: &SystemClock,
                 full_state_authority: Some(&authority),
-                startup_capability: None,
                 retention_references: &[],
             };
             let plan = apply_transition(
@@ -1295,7 +1293,6 @@ impl HeaderChainStore {
                 config,
                 clock: &SystemClock,
                 full_state_authority: Some(&authority),
-                startup_capability: None,
                 retention_references: &[],
             };
             let plan = apply_transition(
@@ -2735,7 +2732,6 @@ mod tests {
                     config: &engine_config,
                     clock: &SystemClock,
                     full_state_authority: None,
-                    startup_capability: None,
                     retention_references: &[],
                 },
             )
@@ -3060,7 +3056,6 @@ mod tests {
             config: &integrated_config,
             clock: &SystemClock,
             full_state_authority: Some(&authority),
-            startup_capability: None,
             retention_references: &[],
         };
         let result = runtime.apply(
@@ -3150,7 +3145,6 @@ mod tests {
             config: &engine_config,
             clock: &SystemClock,
             full_state_authority: Some(&authority),
-            startup_capability: None,
             retention_references: &[],
         };
         let request = TransitionRequest {
@@ -3225,7 +3219,6 @@ mod tests {
             config: &engine_config,
             clock: &SystemClock,
             full_state_authority: Some(&verified_authority),
-            startup_capability: None,
             retention_references: &[],
         };
         let verified = reopened
@@ -3386,7 +3379,6 @@ mod tests {
             config: &engine_config,
             clock: &SystemClock,
             full_state_authority: None,
-            startup_capability: None,
             retention_references: &[],
         };
         let result = prepared
@@ -3455,7 +3447,6 @@ mod tests {
                     config: &engine_config,
                     clock: &SystemClock,
                     full_state_authority: None,
-                    startup_capability: None,
                     retention_references: &[],
                 },
             )
@@ -3518,7 +3509,6 @@ mod tests {
                     config: &engine_config,
                     clock: &SystemClock,
                     full_state_authority: None,
-                    startup_capability: None,
                     retention_references: &[],
                 },
                 full_state_batch,
@@ -3791,7 +3781,6 @@ mod tests {
                 config: &engine_config,
                 clock: &SystemClock,
                 full_state_authority: Some(&authority),
-                startup_capability: None,
                 retention_references: &[],
             };
             let request = TransitionRequest {
@@ -3997,7 +3986,6 @@ mod tests {
                 config: &engine_config,
                 clock: &SystemClock,
                 full_state_authority: None,
-                startup_capability: None,
                 retention_references: &[],
             };
             let marker_key = [marker; 4];
@@ -4206,7 +4194,6 @@ mod tests {
                 config: &engine_config,
                 clock: &SystemClock,
                 full_state_authority: Some(&authority),
-                startup_capability: None,
                 retention_references: &[],
             };
             let request = TransitionRequest {
@@ -4477,7 +4464,6 @@ mod tests {
                     config: &engine_config,
                     clock: &SystemClock,
                     full_state_authority: None,
-                    startup_capability: None,
                     retention_references: &[],
                 };
                 runtime
@@ -4807,7 +4793,6 @@ mod tests {
                     config: &engine_config,
                     clock: &SystemClock,
                     full_state_authority: Some(&authority),
-                    startup_capability: None,
                     retention_references: &[],
                 };
                 let request = TransitionRequest {
@@ -5065,7 +5050,6 @@ mod tests {
                     config: &engine_config,
                     clock: &SystemClock,
                     full_state_authority: Some(&seed_authority),
-                    startup_capability: None,
                     retention_references: &[],
                 };
                 runtime
@@ -5116,7 +5100,6 @@ mod tests {
                     } else {
                         Some(&authority)
                     },
-                    startup_capability: None,
                     retention_references: &[],
                 };
                 let event = if operator_retry {
@@ -5374,7 +5357,6 @@ mod tests {
                     config: &engine_config,
                     clock: &SystemClock,
                     full_state_authority: None,
-                    startup_capability: None,
                     retention_references: &[],
                 };
                 runtime
@@ -5431,7 +5413,6 @@ mod tests {
                     config: &engine_config,
                     clock: &SystemClock,
                     full_state_authority: Some(&authority),
-                    startup_capability: None,
                     retention_references: &[],
                 };
                 let marker_key = [marker; 4];
@@ -5727,7 +5708,6 @@ mod tests {
                 config: &engine_config,
                 clock: &preparation_clock,
                 full_state_authority: None,
-                startup_capability: None,
                 retention_references: &[],
             };
             runtime
@@ -5773,7 +5753,6 @@ mod tests {
                 config: &engine_config,
                 clock: &reevaluation_clock,
                 full_state_authority: None,
-                startup_capability: None,
                 retention_references: &[],
             };
             let marker_key = [marker; 4];
@@ -6050,7 +6029,6 @@ mod tests {
                 config: &engine_config,
                 clock: &SystemClock,
                 full_state_authority: None,
-                startup_capability: None,
                 retention_references: &[],
             };
             runtime
@@ -6121,7 +6099,6 @@ mod tests {
                 config: &engine_config,
                 clock: &SystemClock,
                 full_state_authority: None,
-                startup_capability: None,
                 retention_references: &[],
             };
             let marker_key = [marker; 4];
@@ -6437,7 +6414,6 @@ mod tests {
                 config: &engine_config,
                 clock: &SystemClock,
                 full_state_authority: None,
-                startup_capability: None,
                 retention_references: &[],
             };
             runtime
@@ -6471,7 +6447,6 @@ mod tests {
                 config: &engine_config,
                 clock: &SystemClock,
                 full_state_authority: Some(&authority),
-                startup_capability: None,
                 retention_references: &[],
             };
             let request = TransitionRequest {
@@ -6749,7 +6724,6 @@ mod tests {
                 config: &engine_config,
                 clock: &SystemClock,
                 full_state_authority: Some(&authority),
-                startup_capability: None,
                 retention_references: &[],
             };
             let marker_key = [marker; 4];
@@ -6987,7 +6961,6 @@ mod tests {
                 config: &integrated_config,
                 clock: &SystemClock,
                 full_state_authority: Some(&authority),
-                startup_capability: None,
                 retention_references: &[],
             };
             let marker_key = [marker; 4];
@@ -7138,7 +7111,6 @@ mod tests {
                 config: &engine_config,
                 clock: &SystemClock,
                 full_state_authority: Some(&authority),
-                startup_capability: None,
                 retention_references: &[],
             };
             let request = TransitionRequest {

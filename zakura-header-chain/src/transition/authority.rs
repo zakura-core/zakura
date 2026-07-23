@@ -26,19 +26,6 @@ pub trait FullStateEvidenceAuthority: Send + Sync {
     fn authorizes(&self, evidence: EvidenceId) -> bool;
 }
 
-/// Unforgeable startup-only capability created while publication is disabled.
-#[derive(Debug)]
-pub struct StartupCapability {
-    _private: (),
-}
-
-impl StartupCapability {
-    #[allow(dead_code)] // Used by the durable startup adapter introduced in PR-8.
-    pub(crate) const fn new() -> Self {
-        Self { _private: () }
-    }
-}
-
 /// Trusted dependencies used while deriving a transition plan.
 pub struct TransitionContext<'a> {
     /// Immutable mode, anchors, and resource limits.
@@ -47,8 +34,6 @@ pub struct TransitionContext<'a> {
     pub clock: &'a dyn Clock,
     /// Integrated full-state authority, available only inside the state writer.
     pub full_state_authority: Option<&'a dyn FullStateEvidenceAuthority>,
-    /// Startup capability, available only before publication.
-    pub startup_capability: Option<&'a StartupCapability>,
     /// Active retained-path targets that resource eviction must protect.
     pub retention_references: &'a [zakura_chain::block::Hash],
 }

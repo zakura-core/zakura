@@ -727,7 +727,6 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
             config: &store.config,
             clock: &clock,
             full_state_authority: Some(&authority),
-            startup_capability: None,
             retention_references: &[],
         };
         match apply_transition(&store, request, &context) {
@@ -880,7 +879,6 @@ fn assert_candidate_eviction_boundary(seed: usize) -> [u8; 32] {
             config: &store.config,
             clock: &clock,
             full_state_authority: Some(&authority),
-            startup_capability: None,
             retention_references: &[],
         };
         let plan = apply_transition(&store, request, &context)
@@ -969,7 +967,6 @@ fn assert_consecutive_resets() -> [u8; 32] {
             config: &store.config,
             clock: &clock,
             full_state_authority: Some(&authority),
-            startup_capability: None,
             retention_references: &[],
         };
         let plan = apply_transition(&store, request, &context)
@@ -1052,7 +1049,6 @@ fn assert_incident_recovery() -> [u8; 32] {
         config: &store.config,
         clock: &clock,
         full_state_authority: Some(&authority),
-        startup_capability: None,
         retention_references: &[],
     };
     let held_a_plan = apply_transition(&store, late_a.clone(), &held_context)
@@ -1077,7 +1073,6 @@ fn assert_incident_recovery() -> [u8; 32] {
         config: &store.config,
         clock: &clock,
         full_state_authority: Some(&authority),
-        startup_capability: None,
         retention_references: &[],
     };
     assert!(matches!(
@@ -1306,7 +1301,6 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
         config: &store.config,
         clock: &clock,
         full_state_authority: Some(&authority),
-        startup_capability: None,
         retention_references: &[],
     };
 
@@ -1502,7 +1496,6 @@ fn commit_fixture_insertion(
         config: &store.config,
         clock,
         full_state_authority: Some(authority),
-        startup_capability: None,
         retention_references: &[],
     };
     let plan =
@@ -1550,7 +1543,6 @@ fn commit_next_child_exactly(
         config: &store.config,
         clock,
         full_state_authority: Some(authority),
-        startup_capability: None,
         retention_references: &[],
     };
     let plan = apply_transition(store, request, &context)
@@ -1601,7 +1593,6 @@ fn insert_fixture_path(
         config: &store.config,
         clock,
         full_state_authority: Some(authority),
-        startup_capability: None,
         retention_references: &[],
     };
     let plan =
@@ -1636,7 +1627,6 @@ fn permutation_fixture(
             config: &store.config,
             clock: &clock,
             full_state_authority: Some(&authority),
-            startup_capability: None,
             retention_references: &[],
         };
         let plan = apply_transition(&store, request, &context)

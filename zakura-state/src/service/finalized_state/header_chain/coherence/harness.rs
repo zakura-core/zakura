@@ -420,7 +420,6 @@ impl Harness {
                     config: &self.config,
                     clock: &SystemClock,
                     full_state_authority: None,
-                    startup_capability: None,
                     retention_references: &[],
                 },
             )
@@ -479,7 +478,6 @@ impl Harness {
                     config: &self.config,
                     clock: &SystemClock,
                     full_state_authority: Some(&authority),
-                    startup_capability: None,
                     retention_references: &[],
                 },
             )
@@ -532,7 +530,6 @@ impl Harness {
                     config: &self.config,
                     clock: &SystemClock,
                     full_state_authority: Some(&authority),
-                    startup_capability: None,
                     retention_references: &[],
                 },
             )
@@ -586,7 +583,6 @@ impl Harness {
                 config: &self.config,
                 clock: &SystemClock,
                 full_state_authority: Some(&authority),
-                startup_capability: None,
                 retention_references: &[],
             },
         );

@@ -7,9 +7,7 @@ mod recovery;
 mod store;
 mod types;
 
-pub use authority::{
-    Clock, FullStateEvidenceAuthority, StartupCapability, SystemClock, TransitionContext,
-};
+pub use authority::{Clock, FullStateEvidenceAuthority, SystemClock, TransitionContext};
 pub use invariants::{verify_plan, InvariantViolation};
 pub use planner::{apply_transition, TransitionFailure, TransitionPlan};
 pub use recovery::{

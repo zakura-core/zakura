@@ -434,8 +434,6 @@ fn validate_authority(
                 Err(TransitionFailure::Authority)
             }
         }
-        EventAdmission::StartupOnly if context.startup_capability.is_some() => Ok(()),
-        EventAdmission::StartupOnly => Err(TransitionFailure::Authority),
     }
 }
 
@@ -863,7 +861,6 @@ fn apply_event<S: StoreRead>(
                 graph.set_validation(hash, HeaderValidationState::Valid)?;
             }
         }
-        TransitionEvent::Recover(_) => {}
     }
     Ok(())
 }
@@ -1404,7 +1401,6 @@ mod tests {
             config,
             clock,
             full_state_authority,
-            startup_capability: None,
             retention_references: &[],
         }
     }
@@ -2255,9 +2251,6 @@ mod tests {
                 current
             }) if current == StateVersion::new(0)
         ));
-
-        let startup = super::super::StartupCapability::new();
-        assert_eq!(std::mem::size_of_val(&startup), 0);
     }
 
     #[test]

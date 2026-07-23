@@ -1807,7 +1807,12 @@ impl Service<ReadRequest> for ReadStateService {
 
                 let next_height = height.next()?;
                 let next_block_hash =
-                    read::find::hash_by_height(best_chain.clone(), &state.db, next_height);
+                    read::find::hash_by_height(best_chain.clone(), &state.db, next_height).filter(
+                        |next_hash| {
+                            read::block_header(best_chain.clone(), &state.db, (*next_hash).into())
+                                .is_some_and(|next_header| next_header.previous_block_hash == hash)
+                        },
+                    );
 
                 let header = read::block_header(best_chain, &state.db, hash.into())
                     .ok_or_else(|| BoxError::from("block hash or height not found"))?;

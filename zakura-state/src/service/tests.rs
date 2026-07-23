@@ -1320,7 +1320,7 @@ fn read_only_open_with_ephemeral_config_returns_error() {
 }
 
 /// A delayed read can retain a pre-reorg chain after the winning fork has finalized.
-/// Looking up the requested finalized hash by height must not return the stale fork's header.
+/// A hash lookup must not mix the finalized header with the stale fork's successor.
 #[tokio::test(flavor = "multi_thread")]
 async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Result<()> {
     use crate::{
@@ -1350,17 +1350,28 @@ async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Re
         .nonce
         .0[0] ^= 1;
     let stale_hash = stale_block.hash();
+    let stale_child = stale_block.make_fake_child();
+    let stale_child_hash = stale_child.hash();
     let winning_height = winning_block.coinbase_height().unwrap();
     assert_ne!(stale_hash, winning_block.hash());
     let mut stale_state = NonFinalizedState::new(&network);
     stale_state
         .commit_new_chain(stale_block.prepare(), &finalized_state)
         .unwrap();
+    stale_state
+        .commit_block(stale_child.prepare(), &finalized_state)
+        .unwrap();
     assert_eq!(
         stale_state
             .best_chain()
             .and_then(|chain| chain.hash_by_height(winning_height)),
         Some(stale_hash)
+    );
+    assert_eq!(
+        stale_state
+            .best_chain()
+            .and_then(|chain| chain.hash_by_height(winning_height.next().unwrap())),
+        Some(stale_child_hash)
     );
     let (_stale_sender, stale_receiver) = tokio::sync::watch::channel(stale_state);
     let (_checkpoint_sender, checkpoint_receiver) = tokio::sync::watch::channel(None);
@@ -1391,6 +1402,7 @@ async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Re
         .unwrap();
     finalized_state.db.write_batch(batch).unwrap();
     let response = read_state
+        .clone()
         .oneshot(ReadRequest::BlockHeader(winning_block.hash().into()))
         .await
         .unwrap();
@@ -1398,7 +1410,7 @@ async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Re
         header,
         hash,
         height,
-        ..
+        next_block_hash,
     } = response
     else {
         unreachable!();
@@ -1406,5 +1418,24 @@ async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Re
     assert_eq!(height, winning_height);
     assert_eq!(hash, winning_block.hash());
     assert_eq!(block::Hash::from(header.as_ref()), winning_block.hash());
+    assert_eq!(next_block_hash, None);
+
+    let response = read_state
+        .oneshot(ReadRequest::BlockHeader(winning_height.into()))
+        .await
+        .unwrap();
+    let ReadResponse::BlockHeader {
+        header,
+        hash,
+        height,
+        next_block_hash,
+    } = response
+    else {
+        unreachable!();
+    };
+    assert_eq!(height, winning_height);
+    assert_eq!(hash, stale_hash);
+    assert_eq!(block::Hash::from(header.as_ref()), stale_hash);
+    assert_eq!(next_block_hash, Some(stale_child_hash));
     Ok(())
 }

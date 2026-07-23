@@ -564,13 +564,13 @@ pub struct AdvanceLocalCheckpoint {
 }
 
 /// Auxiliary metadata authentication update.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuxEvidence {
     /// Current work owner.
     pub owner: WorkOwner,
-    /// Exact delivery and provenance.
-    pub delivery: PreparedAuxDelivery,
-    /// New authentication state.
+    /// One or two exact deliveries and their immutable provenance.
+    pub deliveries: Vec<PreparedAuxDelivery>,
+    /// New authentication state applied atomically to every named delivery.
     pub authentication: AuxAuthentication,
 }
 

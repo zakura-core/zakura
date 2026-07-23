@@ -691,73 +691,94 @@ fn apply_event<S: StoreRead>(
             }
         }
         TransitionEvent::AuxEvidence(event) => {
-            let header = graph.node(event.delivery.header_hash).ok_or(
-                TransitionFailure::InvalidEvidence(
-                    "auxiliary evidence references an unknown header",
-                ),
-            )?;
-            let header_frontier = Frontier::new(header.height, header.hash);
-            if graph.ancestor(event.owner.branch.target_tip_hash, header.height)?
-                != Some(header_frontier)
-            {
+            if event.deliveries.is_empty() || event.deliveries.len() > 2 {
                 return Err(TransitionFailure::InvalidEvidence(
-                    "auxiliary evidence is outside its owned branch",
+                    "auxiliary evidence must name one or two exact deliveries",
                 ));
             }
-            let existing = store
-                .aux_deliveries(event.delivery.header_hash)?
-                .into_iter()
-                .find(|delivery| delivery.delivery_id == event.delivery.delivery_id)
-                .ok_or(TransitionFailure::InvalidEvidence(
-                    "auxiliary evidence references an unknown delivery",
-                ))?;
-            if existing != event.delivery
-                || !header.aux_delivery_ids.contains(&existing.delivery_id)
-            {
-                return Err(TransitionFailure::InvalidEvidence(
-                    "auxiliary evidence changes delivery provenance",
-                ));
-            }
-            if existing.authentication == event.authentication {
-                return Ok(());
-            }
-            if existing.authentication != crate::AuxAuthentication::Unauthenticated {
-                return Err(TransitionFailure::InvalidEvidence(
-                    "an authenticated or rejected auxiliary delivery is immutable",
-                ));
-            }
-            if let crate::AuxAuthentication::Authenticated { boundary_hash, .. } =
-                event.authentication
-            {
-                let boundary =
-                    graph
-                        .node(boundary_hash)
-                        .ok_or(TransitionFailure::InvalidEvidence(
-                            "auxiliary authentication boundary is unknown",
-                        ))?;
-                let expected_height = header.height.next().map_err(|_| {
-                    TransitionFailure::InvalidEvidence(
-                        "auxiliary authentication boundary height overflowed",
-                    )
-                })?;
-                let boundary_frontier = Frontier::new(boundary.height, boundary.hash);
-                if boundary.height != expected_height
-                    || boundary.parent_hash != header.hash
-                    || graph.ancestor(event.owner.branch.target_tip_hash, boundary.height)?
-                        != Some(boundary_frontier)
-                {
+
+            for (index, event_delivery) in event.deliveries.iter().enumerate() {
+                if event.deliveries[..index].iter().any(|prior| {
+                    prior.header_hash == event_delivery.header_hash
+                        && prior.delivery_id == event_delivery.delivery_id
+                }) {
                     return Err(TransitionFailure::InvalidEvidence(
-                        "auxiliary authentication is not the owned one-header-later boundary",
+                        "auxiliary evidence names the same delivery more than once",
                     ));
                 }
-            } else if event.authentication == crate::AuxAuthentication::Unauthenticated {
+                let header = graph.node(event_delivery.header_hash).ok_or(
+                    TransitionFailure::InvalidEvidence(
+                        "auxiliary evidence references an unknown header",
+                    ),
+                )?;
+                let header_frontier = Frontier::new(header.height, header.hash);
+                if graph.ancestor(event.owner.branch.target_tip_hash, header.height)?
+                    != Some(header_frontier)
+                {
+                    return Err(TransitionFailure::InvalidEvidence(
+                        "auxiliary evidence is outside its owned branch",
+                    ));
+                }
+                let existing = store
+                    .aux_deliveries(event_delivery.header_hash)?
+                    .into_iter()
+                    .find(|delivery| delivery.delivery_id == event_delivery.delivery_id)
+                    .ok_or(TransitionFailure::InvalidEvidence(
+                        "auxiliary evidence references an unknown delivery",
+                    ))?;
+                if existing != *event_delivery
+                    || !header.aux_delivery_ids.contains(&existing.delivery_id)
+                {
+                    return Err(TransitionFailure::InvalidEvidence(
+                        "auxiliary evidence changes delivery provenance",
+                    ));
+                }
+                if existing.authentication == event.authentication {
+                    continue;
+                }
+                if existing.authentication != crate::AuxAuthentication::Unauthenticated {
+                    return Err(TransitionFailure::InvalidEvidence(
+                        "an authenticated or rejected auxiliary delivery is immutable",
+                    ));
+                }
+                if let crate::AuxAuthentication::Authenticated { boundary_hash, .. } =
+                    event.authentication
+                {
+                    let boundary =
+                        graph
+                            .node(boundary_hash)
+                            .ok_or(TransitionFailure::InvalidEvidence(
+                                "auxiliary authentication boundary is unknown",
+                            ))?;
+                    let expected_height = header.height.next().map_err(|_| {
+                        TransitionFailure::InvalidEvidence(
+                            "auxiliary authentication boundary height overflowed",
+                        )
+                    })?;
+                    let boundary_frontier = Frontier::new(boundary.height, boundary.hash);
+                    if boundary.height != expected_height
+                        || boundary.parent_hash != header.hash
+                        || graph.ancestor(event.owner.branch.target_tip_hash, boundary.height)?
+                            != Some(boundary_frontier)
+                    {
+                        return Err(TransitionFailure::InvalidEvidence(
+                            "auxiliary authentication is not the owned one-header-later boundary",
+                        ));
+                    }
+                } else if event.authentication == crate::AuxAuthentication::Unauthenticated {
+                    return Err(TransitionFailure::InvalidEvidence(
+                        "auxiliary evidence cannot remove authentication",
+                    ));
+                }
+                let mut delivery = existing;
+                delivery.authentication = event.authentication;
+                aux_changes.push(crate::AuxDelta::Put(Box::new(delivery)));
+            }
+            if event.authentication == crate::AuxAuthentication::Unauthenticated {
                 return Err(TransitionFailure::InvalidEvidence(
                     "auxiliary evidence cannot remove authentication",
                 ));
             }
-            let mut delivery = existing;
-            delivery.authentication = event.authentication;
-            aux_changes.push(crate::AuxDelta::Put(Box::new(delivery)));
         }
         TransitionEvent::ReevaluateDeferred => {
             let due: Vec<_> = graph
@@ -2058,7 +2079,19 @@ mod tests {
             }),
             authentication: crate::AuxAuthentication::Unauthenticated,
         };
-        insert_event.aux.push(delivery);
+        let second_delivery = crate::AuxDelivery {
+            delivery_id: EvidenceId::from_digest([0xc1; 32]),
+            source: SourceId::from_digest([0xc2; 32]),
+            ..delivery
+        };
+        let third_delivery = crate::AuxDelivery {
+            delivery_id: EvidenceId::from_digest([0xc3; 32]),
+            source: SourceId::from_digest([0xc4; 32]),
+            ..delivery
+        };
+        insert_event
+            .aux
+            .extend([delivery, second_delivery, third_delivery]);
         let inserted = apply_transition(&store, insert, &context(&config, &clock, None))
             .expect("the target and unauthenticated delivery insert atomically");
         store.commit(&inserted);
@@ -2082,7 +2115,7 @@ mod tests {
             expected_version: store.metadata.state_version,
             event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence {
                 owner: repair_owner,
-                delivery,
+                deliveries: vec![delivery],
                 authentication,
             })),
         };
@@ -2143,6 +2176,53 @@ mod tests {
             }))]
         );
         store.commit(&authenticated);
+
+        let rejection = crate::AuxAuthentication::Rejected {
+            evidence: EvidenceId::from_digest([0xc5; 32]),
+        };
+        let rejection_owner = WorkOwner {
+            state_version: store.metadata.state_version,
+            header_generation: store.metadata.header_generation,
+            verified_generation: Some(store.metadata.verified_generation),
+            ..repair_owner
+        };
+        let rejected = apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: store.metadata.state_version,
+                event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence {
+                    owner: rejection_owner,
+                    deliveries: vec![second_delivery, third_delivery],
+                    authentication: rejection,
+                })),
+            },
+            &context(&config, &clock, Some(&Authority)),
+        )
+        .expect("two exact metadata deliveries reject in one atomic transition");
+        assert_eq!(
+            rejected.change_set.aux_changes,
+            vec![
+                crate::AuxDelta::Put(Box::new(crate::AuxDelivery {
+                    authentication: rejection,
+                    ..second_delivery
+                })),
+                crate::AuxDelta::Put(Box::new(crate::AuxDelivery {
+                    authentication: rejection,
+                    ..third_delivery
+                })),
+            ],
+        );
+        assert_eq!(
+            rejected.change_set.metadata.state_version,
+            store
+                .metadata
+                .state_version
+                .checked_next()
+                .expect("the fixture state version can advance"),
+            "the two-delivery rejection advances one atomic state version"
+        );
+        store.commit(&rejected);
+
         let replay = apply_transition(
             &store,
             TransitionRequest {
@@ -2154,10 +2234,10 @@ mod tests {
                         verified_generation: Some(store.metadata.verified_generation),
                         ..repair_owner
                     },
-                    delivery: crate::AuxDelivery {
+                    deliveries: vec![crate::AuxDelivery {
                         authentication,
                         ..delivery
-                    },
+                    }],
                     authentication,
                 })),
             },

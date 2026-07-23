@@ -4624,11 +4624,12 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
     config.network.crawl_new_peer_interval = Duration::from_secs(5);
     // Invalid blocks log the full custom network at warn level. Keep the
     // expected logs from filling the child process pipes while this test polls
-    // the nodes over RPC.
-    config.tracing.filter = Some("error".to_string());
+    // the nodes over RPC, but allow the listener readiness event used below.
+    config.tracing.filter = Some("error,zakura_network::peer_set::initialize=info".to_string());
 
     let rpc_listen_addr = config.rpc.listen_addr.unwrap();
     let rpc_client_1 = RpcRequestClient::new_with_timeout(rpc_listen_addr, EXTENDED_LAUNCH_DELAY);
+    let node_1_listen_addr = config.network.listen_addr;
 
     tracing::info!(
         ?rpc_listen_addr,
@@ -4642,6 +4643,18 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
         .spawn_child(args!["start"])?
         .with_timeout(test_type.zakurad_timeout())
         .with_failure_regex_iter(zakurad_failure_messages, zakurad_ignore_messages);
+
+    // A refused initial dial marks the only configured address unreachable in
+    // this isolated test, so only start node 2 once node 1 is listening.
+    let node_1_listener_result = zakurad_child_1.expect_stdout_line_matches(regex::escape(
+        &format!("Opened Zcash protocol endpoint at {node_1_listen_addr}"),
+    ));
+    if let Err(error) = node_1_listener_result {
+        zakurad_child_1
+            .kill_and_consume_output(true)
+            .wrap_err("failed to stop the PoW-disabled zakurad child")?;
+        return Err(error);
+    }
 
     let network2 = testnet::Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
@@ -4660,12 +4673,13 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
         .expect("failed to build configured network");
 
     config.network.network = network2;
-    config.network.initial_testnet_peers = [config.network.listen_addr.to_string()].into();
+    config.network.initial_testnet_peers = [node_1_listen_addr.to_string()].into();
     config.network.listen_addr = "127.0.0.1:0".parse()?;
     config.rpc.listen_addr = Some(format!("127.0.0.1:{}", random_known_port()).parse()?);
     config.network.crawl_new_peer_interval = Duration::from_secs(5);
     config.network.cache_dir = false.into();
     config.state.ephemeral = true;
+    config.tracing.filter = Some("error".to_string());
 
     let rpc_listen_addr = config.rpc.listen_addr.unwrap();
     let rpc_client_2 = RpcRequestClient::new_with_timeout(rpc_listen_addr, EXTENDED_LAUNCH_DELAY);

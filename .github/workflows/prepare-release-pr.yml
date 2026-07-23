@@ -149,6 +149,25 @@ jobs:
           path: target/semver-checks/cache
           key: prepare-release-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ github.run_id }}
 
+      # cargo package (run by the packaging check) refuses a dirty tree, so
+      # verification runs on a temporary local commit; it is soft-reset away
+      # before PR creation so peter-evans/create-pull-request makes the real,
+      # signed commit itself.
+      - name: Commit temporarily for verification
+        id: verify-commit
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "chore(release): prepare ${RELEASE_TAG} (verification only)"
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # Verification is continue-on-error: the draft PR opens either way with
       # the failure summarized in its body, and the final step fails the run.
       - name: Verify with make pre-release
@@ -284,10 +303,14 @@ jobs:
           PY
           cat "$RUNNER_TEMP/pr-body.md" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Restore the uncommitted state for PR creation
+        if: steps.verify-commit.outputs.committed == 'true'
+        run: git reset --soft HEAD~1
+
       - name: Upload the prepared diff
         if: ${{ inputs.dry_run }}
         run: |
-          git diff > "$RUNNER_TEMP/prepared.diff"
+          git diff HEAD > "$RUNNER_TEMP/prepared.diff"
           git status --porcelain > "$RUNNER_TEMP/prepared-status.txt"
 
       - name: Upload dry-run artifact

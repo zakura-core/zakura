@@ -411,14 +411,25 @@ cargo metadata --format-version 1 --locked >/dev/null
 
 # Regenerate the stored config fixture after the version bump so the binary
 # self-reports the new version. Generated fixtures are exactly the v*.toml
-# files; custom test configurations are kept.
+# files; custom test configurations are kept. The default cache and identity
+# paths are read back from the generated config (they are platform-dependent:
+# XDG on Linux, ~/Library/Caches on macOS) and replaced globally, matching
+# the acceptance test's normalization — the cache path also appears in other
+# fields such as cookie_dir.
 echo
 echo "==> Regenerating the stored config fixture"
 rm -f zakurad/tests/common/configs/v*.toml
 cargo build --bin zakurad
-./target/debug/zakurad generate \
-  | sed "s#${XDG_CACHE_HOME:-$HOME/.cache}/zakura#cache_dir#g" \
-  | sed "s#$HOME/.zakura#identity_dir#g" \
+generated="$(./target/debug/zakurad generate)"
+default_cache_dir="$(printf '%s\n' "$generated" | awk -F'"' '/^cache_dir = "/ { print $2; exit }')"
+default_identity_dir="$(printf '%s\n' "$generated" | awk -F'"' '/^identity_dir = "/ { print $2; exit }')"
+if [ -z "$default_cache_dir" ] || [ -z "$default_identity_dir" ]; then
+  echo "ERROR: could not read default cache/identity paths from 'zakurad generate' output." >&2
+  exit 1
+fi
+printf '%s\n' "$generated" \
+  | sed "s#${default_cache_dir}#cache_dir#g" \
+  | sed "s#${default_identity_dir}#identity_dir#g" \
   > "zakurad/tests/common/configs/v${version}.toml"
 
 if [ -z "$suffix" ]; then

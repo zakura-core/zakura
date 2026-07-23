@@ -188,6 +188,8 @@ fn validate(
     }
 
     let spec_ids = spec_rules.keys().cloned().collect::<BTreeSet<_>>();
+    let matrix_ids = parse_rule_matrix_ids(spec)?;
+    check_set_equality("rule-to-test matrix", &spec_ids, &matrix_ids)?;
     let manifest_ids = manifest_rules.keys().cloned().collect::<BTreeSet<_>>();
     check_set_equality("normative rule", &spec_ids, &manifest_ids)?;
 
@@ -297,6 +299,67 @@ fn parse_audit_ids(spec: &str) -> Result<BTreeSet<String>, ValidationError> {
     Ok(audit_ids)
 }
 
+fn parse_rule_matrix_ids(spec: &str) -> Result<BTreeSet<String>, ValidationError> {
+    let matrix = spec
+        .split_once("### 7.4 Normative rule-to-test mapping")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| {
+            rest.split_once("### 7.5 Acceptance criteria")
+                .map(|(matrix, _)| matrix)
+        })
+        .ok_or_else(|| {
+            ValidationError(
+                "specification has no bounded section 7.4 rule-to-test matrix".to_owned(),
+            )
+        })?;
+    let mut ids = BTreeSet::new();
+
+    for line in matrix.lines() {
+        let Some(line) = line.strip_prefix("| LC-") else {
+            continue;
+        };
+        let cell = format!(
+            "LC-{}",
+            line.split_once('|')
+                .map(|(cell, _)| cell.trim())
+                .ok_or_else(|| ValidationError(format!("malformed rule-to-test row: `{line}`")))?
+        );
+        for item in cell.split(',').map(str::trim) {
+            if let Some((start, end)) = item.split_once("..") {
+                let separator = start
+                    .rfind('-')
+                    .ok_or_else(|| ValidationError(format!("malformed rule range `{item}`")))?;
+                let prefix = &start[..=separator];
+                let start_digits = &start[separator + 1..];
+                let start_number = start_digits
+                    .parse::<u32>()
+                    .map_err(|_| ValidationError(format!("malformed rule range start `{item}`")))?;
+                let end_digits = end.rsplit_once('-').map_or(end, |(_, digits)| digits);
+                let end_number = end_digits
+                    .parse::<u32>()
+                    .map_err(|_| ValidationError(format!("malformed rule range end `{item}`")))?;
+                if end_number < start_number {
+                    return Err(ValidationError(format!("descending rule range `{item}`")));
+                }
+                for number in start_number..=end_number {
+                    ids.insert(format!(
+                        "{prefix}{number:0width$}",
+                        width = start_digits.len()
+                    ));
+                }
+            } else if valid_rule_id(item) {
+                ids.insert(item.to_owned());
+            } else {
+                return Err(ValidationError(format!(
+                    "malformed rule-to-test matrix ID `{item}`"
+                )));
+            }
+        }
+    }
+
+    Ok(ids)
+}
+
 fn validate_manifest_rule(rule: &ManifestRule) -> Result<(), ValidationError> {
     if !valid_rule_id(&rule.id) || rule.name.trim().is_empty() {
         return Err(ValidationError(format!(
@@ -400,6 +463,14 @@ Version: 1.3<br>
 
 1. **AUD-01 `first`:** text
 **AUD-INCIDENT `incident`:** text
+
+### 7.4 Normative rule-to-test mapping
+
+| Normative rule IDs | Required test IDs |
+| --- | --- |
+| LC-ONE-01, LC-TWO-02 | TEST-01 |
+
+### 7.5 Acceptance criteria
 "#;
 
     const MANIFEST: &str = r#"spec_version = "1.3"
@@ -474,6 +545,26 @@ status = "unimplemented"
             "{MANIFEST}\n[[rule]]\nid = \"LC-ONE-01\"\nname = \"First rule\"\nstatus = \"unimplemented\"\n"
         );
         assert!(validate(SPEC, &duplicate_manifest, &EXPECTED).is_err());
+    }
+
+    #[test]
+    fn rule_to_test_matrix_must_cover_every_exact_rule_once_as_a_set() {
+        let missing = SPEC.replace("LC-ONE-01, LC-TWO-02", "LC-ONE-01");
+        let error =
+            validate(&missing, MANIFEST, &EXPECTED).expect_err("a missing matrix rule must fail");
+        assert!(error.to_string().contains("LC-TWO-02"));
+
+        let unknown = SPEC.replace("LC-ONE-01, LC-TWO-02", "LC-ONE-01, LC-TWO-02, LC-THREE-03");
+        let error =
+            validate(&unknown, MANIFEST, &EXPECTED).expect_err("an unknown matrix rule must fail");
+        assert!(error.to_string().contains("LC-THREE-03"));
+
+        let ranged = SPEC
+            .replace("**LC-TWO-02", "**LC-ONE-02")
+            .replace("LC-ONE-01, LC-TWO-02", "LC-ONE-01..02");
+        let ranged_manifest = MANIFEST.replace("LC-TWO-02", "LC-ONE-02");
+        validate(&ranged, &ranged_manifest, &EXPECTED)
+            .expect("an inclusive same-prefix range expands to both rules");
     }
 
     #[test]

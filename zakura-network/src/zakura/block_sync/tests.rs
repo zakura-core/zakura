@@ -552,6 +552,127 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     reactor_task.abort();
 }
 
+#[tokio::test]
+async fn newly_eligible_supplier_restarts_persistent_body_alarm_once() {
+    let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x55; 32]));
+    let snapshot = alarmed_committed_snapshot(header);
+    let previous = snapshot
+        .alarms
+        .header_best_body_unavailable
+        .expect("the fixture contains a persistent body alarm");
+    let (_snapshot_tx, snapshot_rx) = watch::channel(Some(snapshot));
+    let config = ZakuraBlockSyncConfig::default();
+    let mut startup = BlockSyncStartup::inert(config.clone());
+    startup.frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(9),
+        verified_block_tip: block::Height(9),
+        verified_block_hash: block::Hash([0x50; 32]),
+    };
+    startup.best_header_tip = (header.height, header.hash);
+    startup.committed_snapshots = Some(snapshot_rx);
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle);
+    let (_supplier, inbound, _outbound) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        0x56,
+        header.height,
+        header.hash,
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    let discovery = loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::RestartBodyAvailability {
+                expected_version,
+                discovery,
+            } => {
+                assert_eq!(expected_version, zakura_header_chain::StateVersion::new(7));
+                break discovery;
+            }
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action before supplier restart: {action:?}"),
+        }
+    };
+    assert_eq!(discovery.hash, header.hash);
+    assert_eq!(discovery.availability.attempts, 0);
+    assert_eq!(discovery.availability.suppliers, 1);
+    assert!(!discovery.availability.alarmed);
+    assert_eq!(
+        discovery.availability.started_at,
+        discovery.availability.next_probe_at
+    );
+    assert_ne!(
+        discovery.availability.supplier_set_digest, previous.supplier_set_digest,
+        "the restart must authenticate the newly eligible supplier identity set"
+    );
+
+    inbound
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: header.height,
+                tip_hash: header.hash,
+                max_blocks_per_response: 16,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("the duplicate status encodes"),
+        )
+        .await
+        .expect("the duplicate status queues");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                match actions.recv().await.expect("the action channel is live") {
+                    BlockSyncAction::RestartBodyAvailability { .. } => {
+                        panic!("one durable snapshot must dispatch at most one supplier restart")
+                    }
+                    BlockSyncAction::QueryNeededBlocks { .. } => {}
+                    action => panic!("unexpected action after supplier restart: {action:?}"),
+                }
+            }
+        })
+        .await
+        .is_err(),
+        "a duplicate status must not dispatch another restart"
+    );
+
+    reactor_task.abort();
+}
+
+#[test]
+fn persistent_body_alarm_metrics_expose_every_required_dimension() {
+    let reactor = include_str!("reactor.rs");
+    let metrics = reactor
+        .split_once("fn publish_body_unavailable_metrics")
+        .expect("the body-unavailable metric publisher exists")
+        .1
+        .split_once("fn clamp_served_block_count")
+        .expect("the metric publisher remains a focused function")
+        .0;
+    for required in [
+        "sync.header_chain.body_unavailable.active",
+        "sync.header_chain.body_unavailable",
+        "sync.header_chain.body_unavailable.age_seconds",
+        "sync.header_chain.body_unavailable.attempts",
+        "sync.header_chain.body_unavailable.available_suppliers",
+        "\"hash\" =>",
+        "\"height\" =>",
+        "summary.started_at",
+        "summary.attempts",
+        "summary.suppliers",
+    ] {
+        assert!(
+            metrics.contains(required),
+            "persistent body-alarm metrics must retain `{required}`"
+        );
+    }
+}
+
 async fn wait_for_query_needed_blocks(
     actions: &mut mpsc::Receiver<BlockSyncAction>,
     verified_block_tip: block::Height,

@@ -3030,14 +3030,14 @@ async fn regtest_block_templates_are_valid_block_submissions() -> Result<()> {
     Ok(())
 }
 
-/// A rejected block body must not poison the children of a later valid block with the same header
-/// hash.
+/// A rejected block body must not poison a later valid block with the same
+/// header hash or its children.
 ///
 /// This is a regression test for [GHSA-8gxx-hc65-vv82][ghsa-8gxx]. Under the transaction digest
 /// scheme defined by [ZIP-244][zip-244], two different block bodies can share the same header hash.
-/// `zakura-state` previously retained the contextual validation error from the poisoned body and
-/// incorrectly propagated it to children of the later valid block, causing them to be incorrectly
-/// rejected.
+/// `zakura-state` previously retained the contextual validation error from the
+/// poisoned body. This made the valid body appear known as sent and propagated
+/// the error to its children, causing both to be incorrectly rejected.
 ///
 /// [ghsa-8gxx]: https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-8gxx-hc65-vv82
 /// [zip-244]: https://zips.z.cash/zip-0244
@@ -3158,119 +3158,6 @@ async fn rejected_block_does_not_reject_same_hash_block_children() -> Result<()>
         client.blockchain_info().await?.blocks(),
         Height(4),
         "the valid child must not inherit the rejected block body error"
-    );
-
-    zakurad.kill(false)?;
-    let output = zakurad.wait_with_output()?;
-    output.assert_failure()?.assert_was_killed()?;
-
-    Ok(())
-}
-
-/// A contextually rejected block must not remain known as sent.
-///
-/// Sync checks [`zakura_state::Request::KnownBlock`] before downloading a block body. If a rejected
-/// block remains in the state's sent hashes, an honest block body with the same header hash is
-/// incorrectly reported as a duplicate and never reaches contextual verification.
-#[tokio::test]
-async fn rejected_block_is_not_known_as_sent() -> Result<()> {
-    const EXTRA_COINBASE_DATA: &str = "zakura-chain-stall-poc";
-
-    let _init_guard = zakura_test::init();
-
-    let network = Network::new_regtest(
-        ConfiguredActivationHeights {
-            nu5: Some(1),
-            ..Default::default()
-        }
-        .into(),
-    );
-    let mut config = os_assigned_rpc_port_config(false, &network)?;
-    config.mempool.debug_enable_at_height = Some(0);
-    config.mining.extra_coinbase_data =
-        Some(ExtraCoinbaseData::try_from(EXTRA_COINBASE_DATA.to_owned())?);
-
-    let mut block_builder = testdir()?
-        .with_config(&mut config)?
-        .spawn_child(args!["start"])?
-        .with_timeout(EXTENDED_LAUNCH_DELAY);
-    let rpc_address = read_listen_addr_from_logs(&mut block_builder, OPENED_RPC_ENDPOINT_MSG)?;
-    block_builder.expect_stdout_line_matches("activating mempool")?;
-
-    let client = RpcRequestClient::new(rpc_address);
-    let mut blocks = Vec::new();
-    for expected_height in 1..=3 {
-        let (block, height) = client.block_from_template(&network).await?;
-        assert_eq!(height.0, expected_height);
-        client.submit_block(block.clone()).await?;
-        blocks.push(block);
-    }
-
-    block_builder.kill(false)?;
-    let output = block_builder.wait_with_output()?;
-    output.assert_failure()?.assert_was_killed()?;
-
-    let mut zakurad = testdir()?
-        .with_config(&mut config)?
-        .spawn_child(args!["start"])?
-        .with_timeout(EXTENDED_LAUNCH_DELAY);
-    let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
-    zakurad.expect_stdout_line_matches("activating mempool")?;
-
-    let client = RpcRequestClient::new(rpc_address);
-    client.submit_block(blocks[0].clone()).await?;
-    client.submit_block(blocks[1].clone()).await?;
-
-    let valid_block = blocks[2].clone();
-    let mut poisoned_block = valid_block.clone();
-    let coinbase = Arc::make_mut(
-        poisoned_block
-            .transactions
-            .first_mut()
-            .expect("block templates contain a coinbase transaction"),
-    );
-    let transparent::Input::Coinbase { data, .. } = coinbase
-        .inputs_mut()
-        .first_mut()
-        .expect("coinbase transactions contain a transparent input")
-    else {
-        panic!("the first coinbase transaction input must be a coinbase input");
-    };
-    assert!(
-        data.ends_with(EXTRA_COINBASE_DATA.as_bytes()),
-        "the coinbase transaction must contain the configured extra data"
-    );
-    let last_data_byte = data
-        .last_mut()
-        .expect("configured extra coinbase data is non-empty");
-    *last_data_byte = b'a';
-
-    assert_eq!(
-        poisoned_block.hash(),
-        valid_block.hash(),
-        "changing a NU5 coinbase scriptSig must not change the block header hash"
-    );
-
-    let poisoned_block_data = hex::encode(poisoned_block.zcash_serialize_to_vec()?);
-    let poisoned_response: SubmitBlockResponse = client
-        .json_result_from_call("submitblock", format!(r#"["{poisoned_block_data}"]"#))
-        .await
-        .map_err(|err| eyre!(err))?;
-    assert_eq!(
-        poisoned_response,
-        SubmitBlockResponse::ErrorResponse(SubmitBlockErrorResponse::Rejected),
-        "the poisoned block body must be rejected"
-    );
-
-    let valid_block_data = hex::encode(valid_block.zcash_serialize_to_vec()?);
-    let valid_response: SubmitBlockResponse = client
-        .json_result_from_call("submitblock", format!(r#"["{valid_block_data}"]"#))
-        .await
-        .map_err(|err| eyre!(err))?;
-    assert_eq!(
-        valid_response,
-        SubmitBlockResponse::Accepted,
-        "KnownBlock must drain rejected hashes before checking sent hashes"
     );
 
     zakurad.kill(false)?;

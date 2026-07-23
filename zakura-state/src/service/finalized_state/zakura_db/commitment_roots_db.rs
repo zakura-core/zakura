@@ -1723,6 +1723,139 @@ mod tests {
     }
 
     #[test]
+    fn simulated_authentication_storage_failure_advances_no_state() {
+        let cache = tempfile::tempdir().expect("temporary cache directory is created");
+        let config = Config {
+            cache_dir: cache.path().to_owned(),
+            ephemeral: false,
+            ..Config::default()
+        };
+        let (mut writable_db, block, successor, current) =
+            two_block_checkpoint_fixture_with_config(&config);
+        let network = writable_db.network();
+        writable_db.shutdown(true);
+        drop(writable_db);
+        let db = ZakuraDb::new(
+            &config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &network,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            true,
+        )
+        .expect("fixture reopens read-only");
+        let completed = HighestCompletedCheckpoint {
+            height: current.completed_checkpoint_height,
+            hash: current.completed_checkpoint_hash,
+        };
+        let (sender, mut receiver) = tokio::sync::watch::channel(Some(current));
+        let _ = receiver.borrow_and_update();
+
+        let result = db.authenticate_header_roots(
+            completed,
+            current,
+            current.authenticated_hash,
+            Height(1),
+            &[block.header.clone(), successor.header.clone()],
+            &[roots_from_block(&block), roots_from_block(&successor)],
+        );
+        if let Ok(success) = &result {
+            let _ = sender.send(Some(success.state));
+        }
+
+        let error = result.expect_err("simulated storage failure rejects the write");
+        assert!(matches!(
+            error,
+            AuthenticateHeaderRootsError::Frontier(HeaderRootAuthFrontierError::Storage(_))
+        ));
+        assert_eq!(error.outcome(), AuthenticateHeaderRootsOutcome::Local);
+        assert_eq!(db.commitment_roots(Height(1)), None);
+        assert_eq!(
+            db.validate_header_root_auth_state()
+                .expect("failed write leaves coherent durable state")
+                .expect("frontier remains present")
+                .state(completed),
+            current
+        );
+        assert!(!receiver.has_changed().expect("watch sender remains open"));
+    }
+
+    #[test]
+    fn body_frontier_advance_moves_forward_and_preserves_newer_authentication() {
+        let (db, block, _successor, current) = two_block_checkpoint_fixture();
+        let mut batch = DiskWriteBatch::new();
+        batch
+            .advance_header_root_auth_frontier_from_body(
+                &db,
+                Height(1),
+                block.hash(),
+                &HistoryTree::default(),
+            )
+            .expect("pre-Heartwood body frontier is coherent");
+        db.write_batch(batch).expect("body frontier batch writes");
+
+        let advanced = db
+            .load_header_root_auth_frontier()
+            .expect("advanced frontier decodes")
+            .expect("advanced frontier exists");
+        assert_eq!(advanced.confirmed_height, Height(1));
+        assert_eq!(advanced.confirmed_hash, block.hash());
+
+        let mut lagging_body_batch = DiskWriteBatch::new();
+        lagging_body_batch
+            .advance_header_root_auth_frontier_from_body(
+                &db,
+                current.authenticated_height,
+                current.authenticated_hash,
+                &HistoryTree::default(),
+            )
+            .expect("lagging body commit preserves the newer frontier");
+        db.write_batch(lagging_body_batch)
+            .expect("no-op body frontier batch writes");
+
+        assert_eq!(
+            db.load_header_root_auth_frontier()
+                .expect("preserved frontier decodes")
+                .expect("preserved frontier exists"),
+            advanced
+        );
+    }
+
+    #[test]
+    fn body_frontier_advance_rejects_inconsistent_history_tree_without_writing() {
+        let (db, _block, successor, _current) = two_block_checkpoint_fixture();
+        let before = db
+            .load_header_root_auth_frontier()
+            .expect("initial frontier decodes")
+            .expect("initial frontier exists");
+        let mut batch = DiskWriteBatch::new();
+
+        assert!(matches!(
+            batch.advance_header_root_auth_frontier_from_body(
+                &db,
+                Height(2),
+                successor.hash(),
+                &HistoryTree::default(),
+            ),
+            Err(HeaderRootAuthFrontierError::EmptyHistoryTree {
+                confirmed_height: Height(2),
+                ..
+            })
+        ));
+        db.write_batch(batch)
+            .expect("rejected frontier leaves an empty batch");
+        assert_eq!(
+            db.load_header_root_auth_frontier()
+                .expect("unchanged frontier decodes")
+                .expect("unchanged frontier exists"),
+            before
+        );
+    }
+
+    #[test]
     fn checkpoint_progress_does_not_stale_an_unchanged_authentication_frontier() {
         let (db, block, successor, current) = two_block_checkpoint_fixture();
         let completed = HighestCompletedCheckpoint {

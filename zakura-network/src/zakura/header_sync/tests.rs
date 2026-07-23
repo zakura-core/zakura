@@ -654,6 +654,63 @@ fn root_auth_miss_prefetches_bounded_overlapping_ranges() {
 }
 
 #[test]
+fn root_auth_frontier_advance_refills_released_fallback_capacity() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(
+        network,
+        anchor,
+        Some((block::Height(100), block::Hash([100; 32]))),
+    );
+    startup.config.max_headers_per_response = 3;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(100),
+        completed_checkpoint_hash: block::Hash([100; 32]),
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
+
+    state.refresh_root_auth_range(&startup);
+    let initial_resident = state
+        .schedule
+        .resident_heights_for(RangePriority::AuthenticateRoots);
+    let initial_end = state
+        .schedule
+        .highest_end(RangePriority::AuthenticateRoots)
+        .expect("initial fallback window is populated");
+
+    let advanced = HeaderRootAuthState {
+        authenticated_height: block::Height(3),
+        authenticated_hash: block::Hash([3; 32]),
+        ..startup
+            .header_root_auth
+            .expect("test authentication state exists")
+    };
+    state.header_root_auth = Some(advanced);
+    state.prune_root_auth_pipeline(advanced, true);
+    let pruned_resident = state
+        .schedule
+        .resident_heights_for(RangePriority::AuthenticateRoots);
+    assert!(pruned_resident < initial_resident);
+
+    state.refresh_root_auth_range(&startup);
+    assert_eq!(
+        state
+            .schedule
+            .resident_heights_for(RangePriority::AuthenticateRoots),
+        initial_resident
+    );
+    assert!(
+        state
+            .schedule
+            .highest_end(RangePriority::AuthenticateRoots)
+            .expect("refilled fallback window has a high end")
+            > initial_end
+    );
+}
+
+#[test]
 fn root_auth_does_not_schedule_without_checkpoint_covered_witness() {
     let network = Network::Mainnet;
     let anchor = (block::Height(0), network.genesis_hash());
@@ -2534,6 +2591,260 @@ async fn committed_forward_payload_authenticates_without_fallback_request() {
     fixture.task.abort();
 }
 
+async fn reactor_with_pending_retained_root_authentication(
+    additional_peer: Option<ZakuraPeerId>,
+) -> (
+    ReactorFixture,
+    HeaderSyncOperationIdentity,
+    HeaderRootAuthState,
+    ZakuraPeerId,
+) {
+    let header_1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let header_2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    let header_2_hash = block::Hash::from(header_2.as_ref());
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, checkpoint_hash) =
+        checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let anchor = (block::Height(0), network.genesis_hash());
+    let auth = HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(3),
+        completed_checkpoint_hash: checkpoint_hash,
+    };
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(auth);
+    let mut fixture = spawn_test_reactor(startup);
+    let source_peer = peer(239);
+
+    connect_peer(&fixture, source_peer.clone()).await;
+    advertise_tip(
+        &fixture,
+        source_peer.clone(),
+        anchor.0,
+        block::Height(3),
+        2,
+        1,
+    )
+    .await;
+    let (requested_peer, request_id, start, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, source_peer);
+    assert_eq!((start, count), (block::Height(1), 2));
+    send_headers(
+        &fixture,
+        &source_peer,
+        request_id,
+        headers_message_from(block::Height(1), vec![header_1, header_2]),
+    )
+    .await;
+
+    let commit_operation = loop {
+        if let HeaderSyncAction::CommitHeaderRange { operation, .. } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            break operation;
+        }
+    };
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeOperationCompleted {
+            operation: commit_operation,
+            tip_hash: header_2_hash,
+        })
+        .await
+        .unwrap();
+    let mut auth_operation = None;
+    let mut next_range_observed = false;
+    while auth_operation.is_none() || !next_range_observed {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::AuthenticateHeaderRoots { operation, .. } => {
+                auth_operation = Some(operation);
+            }
+            HeaderSyncAction::SendMessage {
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        want_tree_aux_roots: true,
+                        ..
+                    },
+                ..
+            } if start_height == block::Height(2) => {
+                next_range_observed = true;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(peer_id) = additional_peer {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(&fixture, peer_id, anchor.0, block::Height(3), 2, 1).await;
+    }
+
+    (
+        fixture,
+        auth_operation.expect("root authentication action was observed"),
+        auth,
+        source_peer,
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_peer_root_auth_failure_scores_and_retries_avoiding_peer() {
+    let retry_peer = peer(240);
+    let (mut fixture, operation, _auth, source_peer) =
+        reactor_with_pending_retained_root_authentication(Some(retry_peer.clone())).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+            operation,
+            kind: HeaderRootAuthenticationFailureKind::InvalidPeerRange,
+        })
+        .await
+        .unwrap();
+
+    let mut scored = false;
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, source_peer);
+                assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+                scored = true;
+            }
+            HeaderSyncAction::SendMessage {
+                peer,
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                        want_tree_aux_roots: true,
+                    },
+                ..
+            } => {
+                assert!(scored, "invalid roots are scored before retrying");
+                assert_eq!(peer, retry_peer);
+                assert_eq!((start_height, count), (block::Height(1), 2));
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_root_auth_failure_waits_for_watch_without_scoring() {
+    let (mut fixture, operation, auth, _source_peer) =
+        reactor_with_pending_retained_root_authentication(None).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+            operation,
+            kind: HeaderRootAuthenticationFailureKind::Stale,
+        })
+        .await
+        .unwrap();
+    assert_no_root_authentication_or_misbehavior(&mut fixture.actions).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(auth)))
+        .await
+        .unwrap();
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::AuthenticateHeaderRoots { .. } => break,
+            HeaderSyncAction::Misbehavior { .. } => {
+                panic!("stale root authentication failure must not score a peer")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn canonical_mismatch_root_auth_failure_drops_retained_and_retries_without_scoring() {
+    let retry_peer = peer(241);
+    let (mut fixture, operation, _auth, _source_peer) =
+        reactor_with_pending_retained_root_authentication(Some(retry_peer.clone())).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+            operation,
+            kind: HeaderRootAuthenticationFailureKind::CanonicalMismatch {
+                height: block::Height(1),
+            },
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior { .. } => {
+                panic!("canonical mismatch must not score a peer")
+            }
+            HeaderSyncAction::SendMessage {
+                peer,
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                        want_tree_aux_roots: true,
+                    },
+                ..
+            } => {
+                assert_eq!(peer, retry_peer);
+                assert_eq!((start_height, count), (block::Height(1), 2));
+                break;
+            }
+            HeaderSyncAction::AuthenticateHeaderRoots { .. } => {
+                panic!("canonical mismatch must drop the retained payload")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn local_root_auth_failure_retries_retained_payload_without_scoring() {
+    let (mut fixture, operation, _auth, source_peer) =
+        reactor_with_pending_retained_root_authentication(None).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+            operation,
+            kind: HeaderRootAuthenticationFailureKind::Local,
+        })
+        .await
+        .unwrap();
+    assert_no_root_authentication_or_misbehavior(&mut fixture.actions).await;
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::AuthenticateHeaderRoots { operation, .. } => {
+                assert_eq!(operation.wire_request.peer, source_peer);
+                break;
+            }
+            HeaderSyncAction::Misbehavior { .. } => {
+                panic!("local root authentication failure must not score a peer")
+            }
+            HeaderSyncAction::SendMessage {
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        want_tree_aux_roots: true,
+                        ..
+                    },
+                ..
+            } => panic!("retained local failure must not immediately fall back to the network"),
+            _ => {}
+        }
+    }
+}
+
 async fn reactor_with_two_retained_root_batches(
 ) -> (ReactorFixture, HeaderSyncOperationIdentity, block::Hash) {
     let header_1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
@@ -2654,6 +2965,23 @@ async fn assert_no_root_authentication(actions: &mut mpsc::Receiver<HeaderSyncAc
         assert!(
             !matches!(action, HeaderSyncAction::AuthenticateHeaderRoots { .. }),
             "a second durable root authentication was admitted early"
+        );
+    }
+}
+
+async fn assert_no_root_authentication_or_misbehavior(
+    actions: &mut mpsc::Receiver<HeaderSyncAction>,
+) {
+    while let Ok(Some(action)) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), actions.recv()).await
+    {
+        assert!(
+            !matches!(
+                action,
+                HeaderSyncAction::AuthenticateHeaderRoots { .. }
+                    | HeaderSyncAction::Misbehavior { .. }
+            ),
+            "unexpected root authentication or peer score: {action:?}"
         );
     }
 }
@@ -6665,6 +6993,146 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
         }
         action => panic!("unexpected action: {action:?}"),
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn two_peers_serving_the_same_range_complete_independently() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let first_peer = peer(242);
+    let second_peer = peer(243);
+    let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let (first_send, mut first_recv) = crate::zakura::framed_channel(8);
+    let (second_send, mut second_recv) = crate::zakura::framed_channel(8);
+
+    for (peer_id, send) in [
+        (first_peer.clone(), first_send),
+        (second_peer.clone(), second_send),
+    ] {
+        let session = HeaderSyncPeerSession::from_parts_with_direction(
+            peer_id.clone(),
+            ServicePeerDirection::Inbound,
+            send,
+            CancellationToken::new(),
+        );
+        fixture
+            .handle
+            .send(HeaderSyncEvent::PeerConnected(session))
+            .await
+            .unwrap();
+        advertise_tip(
+            &fixture,
+            peer_id,
+            block::Height(0),
+            block::Height(0),
+            DEFAULT_HS_RANGE,
+            1,
+        )
+        .await;
+    }
+    for recv in [&mut first_recv, &mut second_recv] {
+        tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
+            .await
+            .expect("initial status arrives")
+            .expect("v7 stream stays open");
+    }
+
+    for peer_id in [&first_peer, &second_peer] {
+        fixture
+            .handle
+            .send(HeaderSyncEvent::WireGetHeaders {
+                peer: peer_id.clone(),
+                session_id: 0,
+                request_id,
+                start_height: block::Height(1),
+                count: 2,
+                want_tree_aux_roots: true,
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut queried = std::collections::HashSet::new();
+    while queried.len() < 2 {
+        match next_query_headers_action(&mut fixture.actions).await {
+            HeaderSyncAction::QueryHeadersByHeightRange {
+                peer,
+                request_id: action_request_id,
+                start,
+                count,
+                want_tree_aux_roots,
+                ..
+            } => {
+                assert_eq!(action_request_id, request_id);
+                assert_eq!((start, count), (block::Height(1), 2));
+                assert!(want_tree_aux_roots);
+                queried.insert(peer);
+            }
+            action => panic!("unexpected action: {action:?}"),
+        }
+    }
+    assert_eq!(
+        queried,
+        std::collections::HashSet::from([first_peer.clone(), second_peer.clone()])
+    );
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeResponseReady {
+            peer: first_peer.clone(),
+            session_id: 0,
+            request_id,
+            start_height: block::Height(1),
+            requested_count: 2,
+            want_tree_aux_roots: true,
+            headers: Vec::new(),
+            body_sizes: Vec::new(),
+            tree_aux_roots: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let first_frame = tokio::time::timeout(std::time::Duration::from_secs(1), first_recv.recv())
+        .await
+        .expect("first response arrives")
+        .expect("first stream stays open");
+    assert_eq!(
+        HeaderSyncMessage::peek_headers_request_id(&first_frame.payload).unwrap(),
+        request_id
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), second_recv.recv())
+            .await
+            .is_err(),
+        "first peer completion must not settle the second peer request"
+    );
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeResponseReady {
+            peer: second_peer,
+            session_id: 0,
+            request_id,
+            start_height: block::Height(1),
+            requested_count: 2,
+            want_tree_aux_roots: true,
+            headers: Vec::new(),
+            body_sizes: Vec::new(),
+            tree_aux_roots: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let second_frame = tokio::time::timeout(std::time::Duration::from_secs(1), second_recv.recv())
+        .await
+        .expect("second response arrives")
+        .expect("second stream stays open");
+    assert_eq!(
+        HeaderSyncMessage::peek_headers_request_id(&second_frame.payload).unwrap(),
+        request_id
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

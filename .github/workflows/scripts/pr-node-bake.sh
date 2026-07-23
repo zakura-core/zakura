@@ -51,6 +51,34 @@ cargo build --release --locked -p zakura
 /root/cargo-target/release/zakurad --version
 
 # --------------------------------------------------------------------------- #
+# Kresko: the mempool-load workload generator (zakura-mempool-load.yml)
+# --------------------------------------------------------------------------- #
+# Worth baking because it is expensive and constant: it compiles ~730 crates,
+# including RocksDB, the halo2/Orchard proving stack, and the whole node (it
+# pins its own zakura version, so it does not track the ref under test and does
+# not change between A/B legs). Building it per run costs ~20 minutes every time
+# for a binary that is byte-identical.
+#
+# The ref is recorded so a run asking for a different one rebuilds rather than
+# silently using a stale binary.
+
+KRESKO_BAKE_REPO="${KRESKO_BAKE_REPO:-https://github.com/valargroup/kresko.git}"
+KRESKO_BAKE_REF="${KRESKO_BAKE_REF:-main}"
+
+if [ ! -d /root/kresko ]; then
+  git clone "${KRESKO_BAKE_REPO}" /root/kresko
+fi
+git -C /root/kresko fetch --no-tags origin "${KRESKO_BAKE_REF}"
+git -C /root/kresko checkout --detach FETCH_HEAD
+# Own target dir, for the same reasons as mempool-load-run.sh: the binary
+# must land where that script looks for it, and kresko must not share a
+# cargo cache with zakurad.
+( cd /root/kresko && CARGO_TARGET_DIR=/root/kresko/target cargo build --release )
+test -x /root/kresko/target/release/kresko
+git -C /root/kresko rev-parse HEAD > /root/kresko/.baked-ref
+echo "baked kresko at $(cat /root/kresko/.baked-ref)"
+
+# --------------------------------------------------------------------------- #
 # Loopback SSH identity: deploy.py drives the node over root@localhost
 # --------------------------------------------------------------------------- #
 

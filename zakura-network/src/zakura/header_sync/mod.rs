@@ -23,7 +23,9 @@ pub use events::{
     HeaderTargetPreparationResult,
 };
 pub use reactor::spawn_header_sync_reactor;
+pub use scheduler::coverage::BranchRange;
 pub use scheduler::peer_work::{ActiveHeaderRequest, AdvertisedHeaderTarget};
+pub use scheduler::repair::{RepairPhase, RepairTaskError, VctRepairQueue, VctRepairTask};
 pub use scheduler::retry::{
     BodyRetryEpisode, BodyRetryQueue, RetryJitter, RetryUpdate, SeededRetryJitter,
 };

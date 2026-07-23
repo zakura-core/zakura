@@ -7,18 +7,18 @@ use zakura_header_chain::{BranchId, Frontier, HeaderGeneration};
 
 /// One exact branch-qualified inclusive height range.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(in crate::zakura::header_sync) struct BranchRange {
-    pub(in crate::zakura::header_sync) branch: BranchId,
-    pub(in crate::zakura::header_sync) start: block::Height,
-    pub(in crate::zakura::header_sync) end: block::Height,
+pub struct BranchRange {
+    /// Exact anchor and target branch identity.
+    pub branch: BranchId,
+    /// Inclusive first covered height.
+    pub start: block::Height,
+    /// Inclusive last covered height.
+    pub end: block::Height,
 }
 
 impl BranchRange {
-    pub(in crate::zakura::header_sync) fn new(
-        branch: BranchId,
-        start: block::Height,
-        end: block::Height,
-    ) -> Option<Self> {
+    /// Construct an ordered inclusive range, rejecting reversed bounds.
+    pub fn new(branch: BranchId, start: block::Height, end: block::Height) -> Option<Self> {
         (start <= end).then_some(Self { branch, start, end })
     }
 }

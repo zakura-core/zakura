@@ -594,7 +594,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-AVAIL-02"
 name = "Persistent body-unavailable alarm"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::BodyRetryEpisode::record_failure"
+tests = ["IN-03::exact_backoff_caps_then_alarms_and_probes_every_ten_minutes", "IN-03::elapsed_alarm_waits_until_every_known_supplier_was_tried", "IN-03::restored_alarm_preserves_episode_age_attempts_and_probe_cadence", "IN-03::persisted_body_alarm_is_exact_global_and_survives_reconnect", "IN-03::newly_eligible_supplier_restarts_persistent_body_alarm_once", "IN-03::operator_body_retry_is_exact_deduplicated_and_requires_a_supplier", "IN-03::new_body_supplier_restarts_only_the_selected_persistent_alarm", "IN-03::operator_body_retry_restarts_the_selected_alarm_with_the_same_suppliers", "IN-03::serialized_apply_commits_before_receipt_and_reopens_exactly", "IN-03::persistent_body_alarm_metrics_expose_every_required_dimension", "DF-02::header_chain_info_exposes_mode_frontiers_and_persistent_alarms", "AUD-14::aud_14_body_retry_restarts_reopen_complete_before_or_after"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-AVAIL-03"

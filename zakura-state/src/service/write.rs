@@ -1828,14 +1828,15 @@ mod tests {
         CheckpointVerifiedBlock, Config,
     };
     use zakura_header_chain::{
-        AlarmSet, ApplyResult, AuxAuthentication, BodyRuleId, BodyUnavailableSummary,
-        BodyValidationState, BranchId, ChainScore, CheckpointSet, ConsensusBodyInvalid,
-        EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, EvidenceId, FinalityEpoch,
-        Frontier, FrontierSet, HeaderBatchInput, HeaderChainDiskVersion, HeaderGeneration,
-        HeaderNode, HeaderRules, HeaderValidationState, InsertHeaders, SourceId, StateVersion,
-        SuffixWork, SystemClock, TargetCompletion, TransientBodyFailure, TransientBodyFailureKind,
-        TransitionContext, TransitionEvent, TransitionFailure, TransitionRequest, TrustedAnchor,
-        VerifiedGeneration, WorkCoordinate, WorkOwner, WorkScope,
+        AdjustedDifficulty, AlarmSet, ApplyResult, AuxAuthentication, BodyRuleId,
+        BodyUnavailableSummary, BodyValidationState, BranchId, ChainScore, CheckpointSet,
+        ConsensusBodyInvalid, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, EvidenceId,
+        FinalityEpoch, Frontier, FrontierSet, HeaderBatchInput, HeaderChainDiskVersion,
+        HeaderContextFact, HeaderGeneration, HeaderNode, HeaderRules, HeaderValidationState,
+        InsertHeaders, SourceId, StateVersion, SuffixWork, SystemClock, TargetCompletion,
+        TransientBodyFailure, TransientBodyFailureKind, TransitionContext, TransitionEvent,
+        TransitionFailure, TransitionRequest, TrustedAnchor, ValidationLease, VerifiedGeneration,
+        WorkCoordinate, WorkOwner, WorkScope, POW_ADJUSTMENT_BLOCK_SPAN,
     };
 
     #[test]
@@ -2210,6 +2211,135 @@ mod tests {
                 harder_frontier,
                 "greater cumulative work wins independently of the prior tie order"
             );
+        }
+    }
+
+    #[test]
+    fn df_01_observable_activation_headers_pass_shared_rules() {
+        let _init_guard = zakura_test::init();
+
+        for network in Network::iter() {
+            let blocks = network.block_map();
+
+            for upgrade in [
+                NetworkUpgrade::Overwinter,
+                NetworkUpgrade::Sapling,
+                NetworkUpgrade::Blossom,
+                NetworkUpgrade::Heartwood,
+            ] {
+                let height = upgrade
+                    .activation_height(&network)
+                    .expect("every production network configures this upgrade");
+                let parent_height = height
+                    .previous()
+                    .expect("the tested upgrades activate after genesis");
+                let parent = blocks
+                    .get(&parent_height.0)
+                    .expect("the parent activation vector exists")
+                    .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
+                    .expect("the parent activation vector deserializes");
+                let candidate = blocks
+                    .get(&height.0)
+                    .expect("the activation vector exists")
+                    .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
+                    .expect("the activation vector deserializes");
+                assert_eq!(candidate.header.previous_block_hash, parent.hash());
+
+                let parent_frontier = Frontier::new(parent_height, parent.hash());
+                let config = EngineConfig::new(
+                    EngineMode::Integrated,
+                    network.clone(),
+                    TrustedAnchor {
+                        frontier: parent_frontier,
+                        header: parent.header.clone(),
+                    },
+                    CheckpointSet::default(),
+                )
+                .expect("the historical activation parent is a coherent trusted anchor");
+                let spacing = NetworkUpgrade::target_spacing_for_height(&network, height);
+                let context_times: Vec<_> = (1..=POW_ADJUSTMENT_BLOCK_SPAN)
+                    .map(|offset| {
+                        let offset_i32 =
+                            i32::try_from(offset).expect("the DAA context length fits in i32");
+                        candidate.header.time - spacing * offset_i32
+                    })
+                    .collect();
+                let candidate_bits =
+                    u32::from_le_bytes(candidate.header.difficulty_threshold.to_le_bytes());
+                let context_threshold = (-16..=16)
+                    .filter_map(|delta| {
+                        let bits = i64::from(candidate_bits).checked_add(i64::from(delta))?;
+                        let bits = u32::try_from(bits).ok()?;
+                        let threshold =
+                            zakura_chain::work::difficulty::CompactDifficulty::from_le_bytes(
+                                bits.to_le_bytes(),
+                            );
+                        let expected = AdjustedDifficulty::new_from_header_time(
+                            candidate.header.time,
+                            parent_height,
+                            &network,
+                            context_times.iter().copied().map(|time| (threshold, time)),
+                        )
+                        .expected_difficulty_threshold();
+                        (expected == candidate.header.difficulty_threshold).then_some(threshold)
+                    })
+                    .next()
+                    .expect("a nearby compact context exactly reproduces the historical target");
+                let predecessors = (1..=POW_ADJUSTMENT_BLOCK_SPAN)
+                    .map(|offset| {
+                        let offset_u32 =
+                            u32::try_from(offset).expect("the DAA context length fits in u32");
+                        let fact_height = block::Height(
+                            height
+                                .0
+                                .checked_sub(offset_u32)
+                                .expect("production activations have a complete DAA window"),
+                        );
+                        let frontier = if offset == 1 {
+                            parent_frontier
+                        } else {
+                            let offset_u8 = u8::try_from(offset)
+                                .expect("the DAA context length fits in one byte");
+                            Frontier::new(fact_height, block::Hash([offset_u8; 32]))
+                        };
+                        let offset_i32 =
+                            i32::try_from(offset).expect("the DAA context length fits in i32");
+                        HeaderContextFact {
+                            frontier,
+                            difficulty_threshold: context_threshold,
+                            time: candidate.header.time - spacing * offset_i32,
+                        }
+                    })
+                    .collect();
+                let lease = ValidationLease::new(
+                    parent_frontier,
+                    predecessors,
+                    config.trust_anchor_digest(),
+                );
+                let rules = HeaderRules::for_validation_lease(network.clone(), &lease)
+                    .expect("production network parameters require proof of work");
+                let batch = zakura_header_chain::prepare_headers(
+                    HeaderBatchInput::new(std::slice::from_ref(&candidate.header)),
+                    &lease,
+                    &rules,
+                    &SystemClock,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{network:?} {upgrade:?} activation header must pass the shared observable rules: {error}"
+                    )
+                });
+                assert_eq!(batch.headers()[0].height, height);
+                assert_eq!(batch.headers()[0].hash, candidate.hash());
+                assert_eq!(
+                    batch.headers()[0].block_work,
+                    candidate
+                        .header
+                        .difficulty_threshold
+                        .to_work()
+                        .expect("the historical target has exact work")
+                );
+            }
         }
     }
 

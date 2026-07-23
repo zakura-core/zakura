@@ -36,7 +36,7 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 ## Release pipeline
 
 - **`create-release.yml`** — the only supported path for creating `v*` release tags. Calls `release-binaries.yml` (as a reusable workflow) to build and verify every asset, then a protected environment lets the release GitHub App publish the draft and create the immutable tag. See the release runbook before using it.
-- **`release-binaries.yml`** — builds and publishes `zakurad` release assets and Docker images when a `v*` tag is pushed. Also callable from `create-release.yml` for pre-tag staging, and manually dispatchable to repair assets on an existing tag. Gated on the tag matching the `zakura` package version.
+- **`release-binaries.yml`** — builds and publishes `zakurad` release assets and Docker images when a `v*` tag is pushed. Also callable from `create-release.yml` for pre-tag staging, and manually dispatchable to repair assets on an existing tag. The canonical repository uses Depot builders by default; set the `RELEASE_BUILD_BACKEND` repository variable to `github` for an immediate fallback. Gated on the tag matching the `zakura` package version.
 - **`release-drafter.yml`** — manual: compiles PR titles since the last release
   into a draft GitHub release note.
 - **Changelog assembly** — `make prepare-release-changelog` consumes reviewed

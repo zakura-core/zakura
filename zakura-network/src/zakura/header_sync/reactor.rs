@@ -12,6 +12,8 @@ use super::{
     scheduler::{
         coverage::{BranchRange, CoverageMap},
         peer_work::{HeaderTargetPhase, PeerWorkPriority, PeerWorkQueue, QueueWorkResult},
+        repair::VctRepairQueue,
+        retry::BodyRetryQueue,
         status::StatusPublisher,
     },
     *,
@@ -96,6 +98,8 @@ pub fn spawn_header_sync_reactor(
         peer_state: HashMap::new(),
         peer_work_queue: PeerWorkQueue::default(),
         coverage: CoverageMap::default(),
+        body_retries: BodyRetryQueue::default(),
+        vct_repairs: VctRepairQueue::default(),
         pending_owners: zakura_header_chain::PendingOwners::default(),
         served_paths: HashMap::new(),
     };
@@ -140,6 +144,8 @@ struct HeaderSyncReactor {
     peer_state: HashMap<ZakuraPeerId, PeerState>,
     peer_work_queue: PeerWorkQueue,
     coverage: CoverageMap,
+    body_retries: BodyRetryQueue,
+    vct_repairs: VctRepairQueue,
     pending_owners: zakura_header_chain::PendingOwners,
     served_paths: HashMap<ZakuraPeerId, ServedPathState>,
 }
@@ -1036,20 +1042,7 @@ impl HeaderSyncReactor {
     }
 
     fn observe_committed_snapshot(&mut self, snapshot: zakura_header_chain::EngineSnapshot) {
-        self.coverage
-            .retain_current(snapshot.header_generation, snapshot.frontiers.finalized);
-        if let Some(previous) = self.committed_snapshot.as_ref() {
-            let retired = zakura_header_chain::RetiredWork {
-                header_generation_changed: previous.header_generation != snapshot.header_generation,
-                verified_generation_changed: previous.verified_generation
-                    != snapshot.verified_generation,
-                owners: Vec::new(),
-            };
-            let retired_owners = self.pending_owners.apply_retirement(&retired, &snapshot);
-            for owner in retired_owners {
-                self.peer_work_queue.remove_owner(owner);
-            }
-        }
+        self.retire_obsolete_work(&snapshot);
         let old_tip = self
             .committed_snapshot
             .as_ref()
@@ -1089,6 +1082,26 @@ impl HeaderSyncReactor {
             self.publish_peer_state();
         }
         self.refresh_statuses();
+    }
+
+    fn retire_obsolete_work(&mut self, snapshot: &zakura_header_chain::EngineSnapshot) {
+        self.body_retries
+            .retain_current(snapshot.header_generation, snapshot.frontiers.finalized);
+        self.vct_repairs.retain_current(snapshot);
+        self.coverage
+            .retain_current(snapshot.header_generation, snapshot.frontiers.finalized);
+        if let Some(previous) = self.committed_snapshot.as_ref() {
+            let retired = zakura_header_chain::RetiredWork {
+                header_generation_changed: previous.header_generation != snapshot.header_generation,
+                verified_generation_changed: previous.verified_generation
+                    != snapshot.verified_generation,
+                owners: Vec::new(),
+            };
+            let retired_owners = self.pending_owners.apply_retirement(&retired, snapshot);
+            for owner in retired_owners {
+                self.peer_work_queue.remove_owner(owner);
+            }
+        }
     }
 
     fn observe_frontier_update(&mut self, update: FrontierUpdate) {

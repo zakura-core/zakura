@@ -28,10 +28,12 @@ apt-get -o DPkg::Lock::Timeout=600 install -y -qq \
   build-essential clang cmake pkg-config libssl-dev protobuf-compiler \
   git curl zstd jq python3
 # CPU-profiling tools for zakura-perf-bench.yml (best-effort: perf still gets
-# installed at run time if the kernel-matched package is missing here)
+# installed at run time if the kernel-matched package is missing here);
+# libc6-dbg restores glibc's internal symbols for stack sampling
 apt-get -o DPkg::Lock::Timeout=600 install -y -qq \
   "linux-tools-$(uname -r)" 2>/dev/null \
   || apt-get -o DPkg::Lock::Timeout=600 install -y -qq linux-tools-generic 2>/dev/null || true
+apt-get -o DPkg::Lock::Timeout=600 install -y -qq libc6-dbg 2>/dev/null || true
 
 # --------------------------------------------------------------------------- #
 # Rust toolchain + repo clone + warm release build
@@ -41,10 +43,12 @@ curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolcha
 # deploy.py runs bare `cargo` from a non-login SSH shell where ~/.cargo/env has
 # not been sourced, so the toolchain must be reachable from the default PATH.
 ln -sf /root/.cargo/bin/cargo /root/.cargo/bin/rustc /root/.cargo/bin/rustup /usr/local/bin/
-# flamegraph renderer for zakura-perf-bench.yml (best-effort; the run script
-# falls back to folded stacks + digests without it)
+# flamegraph renderer + Rust v0 symbol demangler for zakura-perf-bench.yml
+# (best-effort; the run script falls back gracefully without either)
 cargo install inferno --locked >/dev/null 2>&1 || true
-ln -sf /root/.cargo/bin/inferno-flamegraph /root/.cargo/bin/inferno-diff-folded /usr/local/bin/ 2>/dev/null || true
+cargo install rustfilt --locked >/dev/null 2>&1 || true
+ln -sf /root/.cargo/bin/inferno-flamegraph /root/.cargo/bin/inferno-diff-folded \
+  /root/.cargo/bin/rustfilt /usr/local/bin/ 2>/dev/null || true
 
 git clone "https://x-access-token:${GH_CLONE_TOKEN}@github.com/${GH_REPO}.git" /root/zakura
 # Strip the token from the baked image; run droplets fetch with a fresh

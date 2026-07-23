@@ -21,7 +21,7 @@ Every Monday two scheduled runs profile `main` as standing baselines: 05:17 UTC 
 
 ## Read the results
 
-Each leg appends to the run's **step summary**: a throughput row (blocks/s, post-commit blocks/s, reached-stop), the bottleneck verdict (commit / download / verify), the **block-latency digest**, and the **CPU digest** (share per thread pool: `rayon`, `commit-compute`, `tokio-runtime-w`, the committer thread; then the hottest functions by self time). A/B runs add the compare section. The per-leg **artifacts** (`zakura-perf-bench-<run>-<leg>`) contain:
+Each leg appends to the run's **step summary**: a throughput row (blocks/s, post-commit blocks/s, reached-stop), the bottleneck verdict (commit / download / verify), the **block-latency digest**, and the **CPU digest** (share per thread pool: `rayon`, `commit-compute`, `tokio-runtime-w`, the committer thread; then the hottest functions by self time). A/B runs add the compare section. To view a flamegraph: open the run page, scroll to **Artifacts** at the bottom, download `zakura-perf-bench-<run>-<leg>`, unzip, and open `flamegraph.svg` in any browser (click a frame to zoom, ctrl-F to search) — or from the CLI: `gh run download <run-id> -n zakura-perf-bench-<run-id>-primary -D out && open out/flamegraph.svg`. The per-leg **artifacts** contain:
 
 | file | what it is |
 | --- | --- |
@@ -37,7 +37,7 @@ Interpretation notes:
 
 - Per-block latency comes from the `commit_state.jsonl` trace (`commit_start` → `commit_finish` around the verifier commit). In `checkpoint` mode a block's latency includes waiting for its checkpoint range to fill, so high p99 there is batching, not slow verification; `semantic` mode is true per-block verify+commit latency.
 - Stage timings are cumulative Prometheus histograms at run end (ops + mean only; the exporter's summary quantiles are rolling-window values and are deliberately not shown): the `commit-metrics` phases (`update_trees`, `commitment_check`, `checkpoint_compute`), the always-on RocksDB batch-commit histogram, batch-verifier durations (`halo2`, `redpallas`, `groth16`, ...), and the sequencer submit queue wait. In `checkpoint` mode with VCT fast sync (the default) the tree/commitment phases never run, so those rows are absent; `semantic` mode populates them.
-- The profile window starts when the sync escapes cold start and lasts `PROFILE_SECONDS` (default 300s at 99 Hz, DWARF unwinding). Droplets expose no PMU, so sampling uses the software `cpu-clock` event — equivalent for on-CPU flamegraph purposes. Release binaries already carry `debug = "line-tables-only"` and full `.eh_frame` (`panic = "unwind"`), which is why no special build is needed.
+- The profile window starts when the sync escapes cold start and lasts `PROFILE_SECONDS` (default 300s at 49 Hz, DWARF unwinding — 49 Hz keeps the `perf script` fold to seconds). Sampling uses hardware `cycles` when the droplet exposes a PMU (current DO images do), else the software `cpu-clock` event. Rust symbols are demangled via `rustfilt` and glibc internals resolved via `libc6-dbg`/debuginfod; residual `[unknown]` frames are DWARF-unwind gaps. Release binaries already carry `debug = "line-tables-only"` and full `.eh_frame` (`panic = "unwind"`), which is why no special build is needed.
 - Both legs of an A/B fetch from the public P2P network concurrently, so residual noise is peer-delivery variance; identical droplet specs remove the hardware variance a shared host cannot.
 
 ## Knobs

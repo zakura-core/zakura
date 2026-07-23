@@ -68,6 +68,15 @@ class CollapseTests(unittest.TestCase):
         self.assertNotIn("+0x", folded)
         self.assertNotIn("::hdeadbeef", folded)
 
+    def test_llvm_internalization_suffix_is_stripped(self):
+        text = (
+            "zakurad  1/1  [000]  1.0: 1 cycles:u:\n"
+            "\t    aa pasta_curves::fields::fp::Fp::square"
+            "::h1405046f7da51426.llvm.2791652607651103975 (/bin/z)\n"
+        )
+        folded = self.collapse(text)
+        self.assertIn("zakurad;pasta_curves::fields::fp::Fp::square 1", folded)
+
     def test_comm_with_spaces_and_symbol_parens_survive(self):
         folded = self.collapse(PERF_SCRIPT)
         rayon_lines = [line for line in folded.splitlines() if line.startswith("rayon 3;")]

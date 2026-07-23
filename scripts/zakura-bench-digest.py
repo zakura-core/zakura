@@ -42,6 +42,7 @@ HEADER_NO_CPU = re.compile(r"^(\S.*?)\s+(\d+)(?:/(\d+))?\s+")
 # parentheses inside demangled Rust symbols don't confuse the parse.
 FRAME = re.compile(r"^\s+([0-9a-fx]+)\s+(.*)$")
 RUST_HASH_SUFFIX = re.compile(r"::h[0-9a-f]{16}$")
+LLVM_SUFFIX = re.compile(r"\.llvm\.\d+$")
 
 
 def clean_symbol(raw):
@@ -51,10 +52,12 @@ def clean_symbol(raw):
         raw = raw[:idx]
     if not raw or raw == "[unknown]":
         return "[unknown]"
-    # strip "+0x1a" offsets and rustc's "::h0123456789abcdef" hash suffixes
+    # strip "+0x1a" offsets, LLVM internalization suffixes (".llvm.123..."),
+    # and rustc's "::h0123456789abcdef" hash suffixes
     plus = raw.rfind("+0x")
     if plus > 0:
         raw = raw[:plus]
+    raw = LLVM_SUFFIX.sub("", raw)
     raw = RUST_HASH_SUFFIX.sub("", raw)
     # ";" is the folded-format frame separator
     return raw.replace(";", ":").strip() or "[unknown]"

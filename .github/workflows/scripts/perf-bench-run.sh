@@ -130,12 +130,26 @@ log "built ${SHA} in ${BUILD_SECS}s (warm baked cache): $("$ZAKURAD_BIN" --versi
 
 PERF_EVENT="cycles:u"
 INFERNO_OK=0
+DEMANGLE=(cat)
 if [[ "$PROFILE" == "cpu" ]]; then
   if ! command -v perf >/dev/null 2>&1; then
     log "perf not found; installing linux-tools"
     apt-get install -y -qq "linux-tools-$(uname -r)" 2>/dev/null \
       || apt-get install -y -qq linux-tools-generic 2>/dev/null || true
   fi
+  # glibc's internal (static) allocator symbols are not in the stripped libc's
+  # dynsym, which made ~20% of leaf frames "[unknown]" under malloc/free in the
+  # A/A validation; libc6-dbg restores them, and debuginfod covers other system
+  # libraries at `perf script` time. Both best-effort.
+  apt-get install -y -qq libc6-dbg 2>/dev/null || true
+  export DEBUGINFOD_URLS="${DEBUGINFOD_URLS:-https://debuginfod.ubuntu.com}"
+  # the droplet's binutils demangler predates Rust v0 mangling, so digest
+  # tables show raw _R... names without rustfilt
+  if ! command -v rustfilt >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
+    log "installing rustfilt (Rust symbol demangler) via cargo ..."
+    cargo install rustfilt --locked >/dev/null 2>&1 || true
+  fi
+  command -v rustfilt >/dev/null 2>&1 && DEMANGLE=(rustfilt)
   found=0
   if command -v perf >/dev/null 2>&1; then
     # DO droplets expose no PMU, so hardware cycles falls back to cpu-clock
@@ -313,6 +327,7 @@ if [[ -s "$OUT_DIR/perf.data" ]]; then
   log "folding $(du -m "$OUT_DIR/perf.data" | cut -f1)MB of perf data (dwarf unwinding) ..."
   FOLD_START=$(date +%s)
   if ! perf script --no-inline -i "$OUT_DIR/perf.data" 2>>"$OUT_DIR/perf.log" \
+        | "${DEMANGLE[@]}" \
         | python3 "$DIGEST_PY" collapse > "$OUT_DIR/profile.folded" \
         || [[ ! -s "$OUT_DIR/profile.folded" ]]; then
     log "WARNING: perf script/collapse produced no stacks:" \

@@ -6325,6 +6325,195 @@ mod tests {
     }
 
     #[test]
+    fn aud_14_migrated_pin_refutation_fails_closed_at_every_reachable_boundary() {
+        const REFUTATION_FAULT_POINTS: [FaultPoint; 7] = [
+            FaultPoint::AfterSnapshot,
+            FaultPoint::AfterVersionCheck,
+            // Refutation changes only the incident alarm, not a retained node.
+            FaultPoint::AfterEachIndexWrite,
+            FaultPoint::AfterProjectionWrite,
+            FaultPoint::AfterMetadataWrite,
+            FaultPoint::BeforeDbCommit,
+            FaultPoint::AfterDbCommit,
+        ];
+
+        for (index, target) in REFUTATION_FAULT_POINTS.into_iter().enumerate() {
+            let cache = tempfile::tempdir().expect("the test cache directory is created");
+            let db_config = Config {
+                cache_dir: cache.path().to_owned(),
+                ephemeral: false,
+                debug_skip_non_finalized_state_backup_task: true,
+                ..Config::default()
+            };
+            let (integrated_config, anchor, mut metadata) = fixture();
+            let mut headers_only_config = integrated_config.clone();
+            headers_only_config.mode = EngineMode::HeadersOnly;
+            metadata.mode = EngineMode::HeadersOnly;
+            let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+            let network = integrated_config.network.clone();
+            let db = open(&db_config, &network);
+            let store = HeaderChainStore::new(db.clone());
+            store
+                .initialize(metadata, anchor)
+                .expect("the headers-only schema initializes");
+            let migrated_record = FinalityRecord {
+                previous: anchor_frontier,
+                current: anchor_frontier,
+                source: FinalitySource::MigratedHeadersOnly,
+                epoch: FinalityEpoch::new(0),
+            };
+            let mut migration_batch = DiskWriteBatch::new();
+            store
+                .put_value(
+                    &mut migration_batch,
+                    HEADER_FINALITY_HISTORY,
+                    HeaderFinalityKey(migrated_record.epoch).as_bytes(),
+                    &HeaderFinalityRecordDisk(migrated_record),
+                )
+                .expect("the migrated finality record encodes");
+            db.write(migration_batch)
+                .expect("the migrated finality record commits");
+            audit_store(&store, &headers_only_config)
+                .expect("the headers-only source store is coherent");
+            let (runtime, _) = store
+                .migrate_headers_only_to_integrated(&integrated_config, anchor_frontier)
+                .expect("the explicit mode migration succeeds before publication");
+            let before = runtime.publisher().snapshot();
+            assert_eq!(before.mode, EngineMode::Integrated);
+            assert_eq!(before.alarms.migrated_pin_refuted, None);
+
+            let marker = u8::try_from(index + 0xf0).expect("the fault-point list fits in u8");
+            let evidence = EvidenceId::from_digest([marker; 32]);
+            let authority = Authority(evidence);
+            let context = TransitionContext {
+                config: &integrated_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                startup_capability: None,
+                retention_references: &[],
+            };
+            let marker_key = [marker; 4];
+            let mut full_state_batch = DiskWriteBatch::new();
+            runtime
+                .store
+                .put_raw(
+                    &mut full_state_batch,
+                    ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+                    marker_key,
+                    [marker],
+                )
+                .expect("the paired refutation marker can be staged");
+            let memory_swapped = Arc::new(AtomicBool::new(false));
+            let swap_probe = memory_swapped.clone();
+            let result = runtime.apply_combined_with_fault(
+                TransitionRequest {
+                    expected_version: before.state_version,
+                    event: TransitionEvent::MigratedPinRefutation(
+                        zakura_header_chain::MigratedPinRefutation {
+                            full_state_transition_id: evidence,
+                            pin: anchor_frontier,
+                            invalid_header: anchor_frontier,
+                            rule: BodyRuleId::new("aud14.migrated_pin_refutation"),
+                        },
+                    ),
+                },
+                &context,
+                full_state_batch,
+                move || swap_probe.store(true, Ordering::SeqCst),
+                |point| {
+                    if point == target {
+                        Err(HeaderChainStoreError::InjectedCrash(point))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(HeaderChainStoreError::InjectedCrash(point)) if point == target
+            ));
+
+            let committed = target == FaultPoint::AfterDbCommit;
+            let committed_version = before
+                .state_version
+                .checked_next()
+                .expect("the short fixture state version can advance");
+            let durable = runtime
+                .store
+                .snapshot()
+                .expect("the refutation snapshot read succeeds");
+            assert_eq!(
+                durable.state_version,
+                if committed {
+                    committed_version
+                } else {
+                    before.state_version
+                },
+                "{target:?}"
+            );
+            assert_eq!(
+                durable.alarms.migrated_pin_refuted,
+                committed.then_some(anchor_frontier),
+                "{target:?}"
+            );
+            assert_eq!(durable.frontiers, before.frontiers, "{target:?}");
+            let marker_cf = runtime
+                .store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the marker column family is open");
+            assert_eq!(
+                runtime
+                    .store
+                    .db
+                    .raw_get_cf(&marker_cf, &marker_key)
+                    .expect("the paired marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+            assert!(!memory_swapped.load(Ordering::SeqCst), "{target:?}");
+            assert_eq!(runtime.publisher().snapshot(), before, "{target:?}");
+            drop(runtime);
+            drop(db);
+
+            let reopened_store = HeaderChainStore::new(open(&db_config, &network));
+            let reopened_metadata = reopened_store
+                .metadata()
+                .expect("the refutation metadata reopens");
+            assert_eq!(
+                reopened_metadata.alarms.migrated_pin_refuted,
+                committed.then_some(anchor_frontier),
+                "{target:?}"
+            );
+            let reopened_marker_cf = reopened_store
+                .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                .expect("the reopened marker column family is open");
+            assert_eq!(
+                reopened_store
+                    .db
+                    .raw_get_cf(&reopened_marker_cf, &marker_key)
+                    .expect("the reopened paired marker read succeeds")
+                    .is_some(),
+                committed,
+                "{target:?}"
+            );
+            if committed {
+                assert!(matches!(
+                    reopened_store.startup(&integrated_config),
+                    Err(HeaderChainStoreError::MigratedPinRefuted { pin })
+                        if pin == anchor_frontier
+                ));
+            } else {
+                let (reopened, report) = reopened_store
+                    .startup(&integrated_config)
+                    .expect("the uncommitted refutation reopens normally");
+                assert_eq!(report.current, before, "{target:?}");
+                assert_eq!(reopened.publisher().snapshot(), before, "{target:?}");
+            }
+        }
+    }
+
+    #[test]
     fn aud_14_no_change_crash_points_preserve_the_paired_full_state_transaction() {
         for (index, target) in FaultPoint::NO_CHANGE.into_iter().enumerate() {
             let cache = tempfile::tempdir().expect("the test cache directory is created");

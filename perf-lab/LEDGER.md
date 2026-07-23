@@ -351,3 +351,24 @@ This file is the sole reporting channel (design D5). Entry template:
   (curl --http1.1 + primary-source double-try, baked into prepare_remote as
   the fourth marker-guarded patch) and applied live to s3; settle1 restarted
   under it.
+
+### settle1 second failure — root cause found, resumable-fetch rescue (2026-07-23)
+
+- settle1 retry FAILED the download again even under B-16 (both primary
+  attempts died mid-stream; second at 11.5G with curl 18 "transfer closed").
+  So the protocol version was never the root cause.
+- Diagnosis: origin file is INTACT (HEAD Content-Length 32104948084, range
+  probe at the 32.1G tail returns 206 with data; Cloudflare-fronted). The
+  failure class is long-single-stream deaths through the CDN path — any
+  one-shot streaming download loses everything on a mid-stream cut.
+- Rescue (one bounded attempt before the halt rule fires): resumable fetch
+  to a file on the droplet (`curl -C -` retry loop, 90 tries, progress is
+  monotonic), sha256-verify against the harness's pin, manual extract into
+  /opt/zakura-bench/master-1707210 — the harness then skips its own download
+  forever on this droplet. Disk fits (182G free; ~30G tarball + ~40G master).
+- If this also fails: halt the droplet lane for the night per the
+  twice-in-a-row rule. NOTE FOR ADAM either way: the snapshot origin
+  (zakura.valargroup.dev via Cloudflare) cannot reliably serve a ~32G single
+  stream tonight — 4 consecutive mid-stream deaths across two protocols.
+  Worth either a chunk-friendly mirror or accepting resume-style fetch as
+  the default (harness patch B-16 v2, planned).

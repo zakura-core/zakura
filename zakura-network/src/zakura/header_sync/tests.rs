@@ -2665,12 +2665,12 @@ async fn reactor_with_pending_retained_root_authentication(
             HeaderSyncAction::SendMessage {
                 msg:
                     HeaderSyncMessage::GetHeaders {
-                        start_height,
+                        start_height: block::Height(2),
                         want_tree_aux_roots: true,
                         ..
                     },
                 ..
-            } if start_height == block::Height(2) => {
+            } => {
                 next_range_observed = true;
             }
             _ => {}

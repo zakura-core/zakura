@@ -794,11 +794,12 @@ where
     /// Required blocks that registry-missed and are waiting for their backoff to elapse before being
     /// retried, keyed by hash with the [`tokio::time::Instant`] each backoff expires.
     ///
-    /// While this is non-empty, new speculative downloads are gated in [`Self::sync_round`] so the
-    /// in-flight pipeline drains and frees ready-peer slots for the critical head-of-line block.
-    /// The retries themselves are never gated: they fire from the `select!` timer arm so draining
-    /// and tip extension continue concurrently during the backoff. A map so that a second block missing while the first is still
-    /// backing off isn't dropped: every registry-missed required block stays scheduled.
+    /// While this is non-empty, [`Self::sync_round`] limits new speculative dispatch to one hash per
+    /// loop step: unrelated reserve hashes keep flowing (one unavailable hash must not stall the
+    /// whole reserve), but the loop still returns to the `select!` timer arm that fires the retries,
+    /// instead of blocking on peer-set readiness behind a full-reserve dispatch. A map so that a
+    /// second block missing while the first is still backing off isn't dropped: every
+    /// registry-missed required block stays scheduled.
     registry_miss_retry: HashMap<block::Hash, tokio::time::Instant>,
 
     /// Receiver that is `true` when the downloader is past the lookahead limit.
@@ -1339,13 +1340,15 @@ where
                 || (self.downloads.in_flight() >= lookahead_limit / 2
                     && self.past_lookahead_limit_receiver.cloned_watch_data());
 
-            // Head-of-line priority: while a required block is missing from all current peers and
-            // waiting on its registry-miss backoff, pause *new* speculative dispatch so in-flight
-            // downloads drain and free up ready-peer slots. Otherwise lookahead work can keep every
-            // peer busy and starve the critical retry. This is inert in healthy sync.
-            let head_of_line_starved = !self.registry_miss_retry.is_empty();
+            // While a required block is waiting on its registry-miss backoff, keep dispatching
+            // unrelated reserve hashes, but only one per loop step. Pausing dispatch entirely
+            // would let one unavailable hash stall every other download for its whole retry
+            // budget, and dispatching the whole reserve can block on peer-set readiness until
+            // in-flight downloads drain, starving the retry timer in the `select!` below. One
+            // hash per step keeps the timer reachable while unrelated sync work continues.
+            let registry_retry_pending = !self.registry_miss_retry.is_empty();
 
-            if !past_lookahead && !head_of_line_starved && !reserve.is_empty() {
+            if !past_lookahead && !reserve.is_empty() {
                 debug!(
                     tips.len = self.prospective_tips.len(),
                     in_flight = self.downloads.in_flight(),
@@ -1355,15 +1358,25 @@ where
                     "requesting more blocks",
                 );
 
-                let response = timeout(
-                    BLOCK_VERIFY_TIMEOUT,
-                    self.request_blocks(std::mem::take(&mut reserve)),
-                )
-                .await
-                .map_err(Report::from)?;
-                reserve = Self::handle_hash_response(response, self.expose_peer_addresses)?;
+                let mut dispatch = std::mem::take(&mut reserve);
+                let deferred = if registry_retry_pending {
+                    dispatch.split_off(1)
+                } else {
+                    IndexSet::new()
+                };
+
+                let response = timeout(BLOCK_VERIFY_TIMEOUT, self.request_blocks(dispatch))
+                    .await
+                    .map_err(Report::from)?;
+                let mut undispatched =
+                    Self::handle_hash_response(response, self.expose_peer_addresses)?;
+                undispatched.extend(deferred);
+                reserve = undispatched;
                 last_progress = Instant::now();
-                continue;
+
+                if !registry_retry_pending {
+                    continue;
+                }
             }
 
             // There's nothing left to discover, but blocks are still in flight. Those blocks can be
@@ -1453,7 +1466,7 @@ where
 
                     // Retry required blocks that registry-missed once their backoff elapses. This
                     // is not gated by speculative lookahead dispatch, so the head-of-line block gets
-                    // another chance after the in-flight downloads have had time to drain.
+                    // another chance while unrelated dispatch continues in bounded steps.
                     _ = OptionFuture::from(registry_retry_at.map(sleep_until)),
                         if registry_retry_at.is_some() =>
                     {
@@ -2158,11 +2171,11 @@ where
     /// A [`NotFoundKind::Registry`] miss means the peer set found that *every* ready peer is marked
     /// missing the block, so it can't be served right now. Rather than blocking the loop on an inline
     /// `sleep`, the hash is recorded in [`Self::registry_miss_retry`] with a backoff deadline; while
-    /// any such retry is pending, [`Self::sync_round`] gives it head-of-line priority by pausing new
-    /// speculative dispatch and re-dispatching the hash from its `select!` timer arm once the backoff
-    /// elapses. Bounded by [`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`]; only a block that stays missing
-    /// for the whole budget (e.g. a bad tip) falls through to [`Self::handle_block_response`] and
-    /// restarts the round to obtain fresh tips and peers.
+    /// any such retry is pending, [`Self::sync_round`] limits unrelated dispatch to one hash per loop
+    /// step and re-dispatches the hash from its `select!` timer arm once the backoff elapses.
+    /// Bounded by [`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`]; only a block that stays missing for the
+    /// whole budget (e.g. a bad tip) falls through to [`Self::handle_block_response`] and restarts
+    /// the round to obtain fresh tips and peers.
     async fn handle_block_response_with_missing_retry(
         &mut self,
         response: Result<(Height, block::Hash), BlockDownloadVerifyError>,
@@ -2243,10 +2256,9 @@ where
                         );
                         metrics::counter!("sync.missing.block.registry.retry.count").increment(1);
 
-                        // Schedule the retry instead of blocking the loop on an inline `sleep`. While
-                        // it's pending, `sync_round` gates new speculative dispatch (head-of-line
-                        // priority) and keeps draining, so peers free up before the timer fires and
-                        // the block can finally reach one that has it.
+                        // Schedule the retry instead of blocking the loop on an inline `sleep`.
+                        // `sync_round` keeps dispatching unrelated work in bounded steps while the
+                        // timer runs; see `Self::registry_miss_retry` for the dispatch invariant.
                         self.registry_miss_retry.insert(
                             hash,
                             tokio::time::Instant::now() + REGISTRY_MISS_RETRY_BACKOFF,

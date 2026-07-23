@@ -93,6 +93,26 @@ impl BlockSyncStartup {
         }
     }
 
+    /// Build production block sync from the sole committed frontier publisher.
+    pub fn new_with_committed_snapshots(
+        frontiers: BlockSyncFrontiers,
+        best_header_tip: (block::Height, block::Hash),
+        committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        config: ZakuraBlockSyncConfig,
+    ) -> Self {
+        Self {
+            frontiers,
+            best_header_tip,
+            header_tip: None,
+            frontier_updates: None,
+            committed_snapshots: Some(committed_snapshots),
+            config,
+            shutdown: CancellationToken::new(),
+            state_queries_enabled: true,
+            trace: ZakuraTrace::noop(),
+        }
+    }
+
     /// Build a latest-value frontier update stream from legacy startup pieces.
     pub fn frontier_update_from_parts(
         frontiers: BlockSyncFrontiers,

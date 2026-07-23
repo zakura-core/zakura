@@ -82,7 +82,7 @@ pub(crate) async fn zakura_header_sync_driver_startup(
         },
         best_header_tip: Some(best_header_tip),
         verified_block_tip_hash: verified_block_tip.1,
-        committed_snapshots: Some(committed_snapshots),
+        committed_snapshots,
         vct_root_repairs: Some(vct_root_repairs),
     })
 }

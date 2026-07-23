@@ -27,7 +27,7 @@ const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
 
 /// Spawn the canonical header-sync reactor.
 pub fn spawn_header_sync_reactor(
-    startup: HeaderSyncStartup,
+    mut startup: HeaderSyncStartup,
 ) -> Result<
     (
         HeaderSyncHandle,
@@ -36,6 +36,21 @@ pub fn spawn_header_sync_reactor(
     ),
     HeaderSyncStartError,
 > {
+    let committed_snapshot = startup
+        .committed_snapshots
+        .as_ref()
+        .and_then(|snapshots| snapshots.borrow().clone());
+    if let Some(snapshot) = committed_snapshot.as_ref() {
+        startup.frontiers = FullStateFrontiers {
+            finalized_height: snapshot.frontiers.finalized.height,
+            verified_block_tip: snapshot.frontiers.verified_best.height,
+            verified_block_hash: snapshot.frontiers.verified_best.hash,
+        };
+        startup.best_header_tip = Some((
+            snapshot.frontiers.header_best.height,
+            snapshot.frontiers.header_best.hash,
+        ));
+    }
     if startup.anchor.0 > startup.frontiers.verified_block_tip {
         return Err(HeaderSyncStartError::AnchorAboveVerifiedBlockTip {
             anchor_height: startup.anchor.0,
@@ -74,10 +89,6 @@ pub fn spawn_header_sync_reactor(
         serving_limits.max_headers_per_response(),
         serving_limits.tree_aux_schema_mask(),
     );
-    let committed_snapshot = startup
-        .committed_snapshots
-        .as_ref()
-        .and_then(|snapshots| snapshots.borrow().clone());
     let vct_repair_status = startup
         .vct_root_repairs
         .as_ref()
@@ -1454,6 +1465,11 @@ impl HeaderSyncReactor {
             .as_ref()
             .map(|old| old.frontiers.header_best);
         let new_tip = snapshot.frontiers.header_best;
+        self.startup.frontiers = FullStateFrontiers {
+            finalized_height: snapshot.frontiers.finalized.height,
+            verified_block_tip: snapshot.frontiers.verified_best.height,
+            verified_block_hash: snapshot.frontiers.verified_best.hash,
+        };
         let status = Status::from_snapshot(&snapshot, &self.serving_limits);
         let now = Instant::now();
         self.committed_snapshot = Some(snapshot);
@@ -1992,6 +2008,39 @@ mod tests {
             oldest_retained_height: anchor.height,
             alarms: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn initial_committed_snapshot_overrides_legacy_startup_frontiers() {
+        let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown);
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let header_best =
+            zakura_header_chain::Frontier::new(block::Height(7), block::Hash([0x77; 32]));
+        let mut snapshot = committed_snapshot(anchor);
+        snapshot.frontiers.header_best = header_best;
+        snapshot.header_best_score = zakura_header_chain::ChainScore::new(
+            zakura_header_chain::SuffixWork::zero(),
+            header_best.hash,
+        );
+        let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot));
+        startup.committed_snapshots = Some(snapshots_rx);
+
+        let (handle, mut actions, reactor) =
+            spawn_header_sync_reactor(startup).expect("the snapshot-authoritative reactor starts");
+        assert_eq!(
+            handle.best_header_tip(),
+            (header_best.height, header_best.hash)
+        );
+        assert!(matches!(
+            next_action(&mut actions).await,
+            HeaderSyncAction::QueryMissingBlockBodies {
+                from: block::Height(1),
+                ..
+            }
+        ));
+
+        reactor.abort();
     }
 
     #[test]

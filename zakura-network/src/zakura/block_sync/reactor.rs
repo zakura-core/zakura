@@ -84,9 +84,17 @@ fn synchronize_persisted_body_alarm(
     registry.set_persisted_body_alarm(alarm);
 }
 
+fn block_sync_frontiers(snapshot: &zakura_header_chain::EngineSnapshot) -> BlockSyncFrontiers {
+    BlockSyncFrontiers {
+        finalized_height: snapshot.frontiers.finalized.height,
+        verified_block_tip: snapshot.frontiers.verified_best.height,
+        verified_block_hash: snapshot.frontiers.verified_best.hash,
+    }
+}
+
 /// Spawn a block-sync reactor and return its handle plus action stream.
 pub fn spawn_block_sync_reactor(
-    startup: BlockSyncStartup,
+    mut startup: BlockSyncStartup,
 ) -> (
     BlockSyncHandle,
     mpsc::Receiver<BlockSyncAction>,
@@ -94,6 +102,7 @@ pub fn spawn_block_sync_reactor(
 ) {
     debug_assert!(
         !startup.state_queries_enabled
+            || startup.committed_snapshots.is_some()
             || (startup.header_tip.is_some() ^ startup.frontier_updates.is_some()),
         "state-backed block sync must have exactly one frontier source",
     );
@@ -102,6 +111,13 @@ pub fn spawn_block_sync_reactor(
         .committed_snapshots
         .as_ref()
         .and_then(|snapshots| snapshots.borrow().clone());
+    if let Some(snapshot) = committed_snapshot.as_ref() {
+        startup.frontiers = block_sync_frontiers(snapshot);
+        startup.best_header_tip = (
+            snapshot.frontiers.header_best.height,
+            snapshot.frontiers.header_best.hash,
+        );
+    }
 
     let state = BlockSyncState::new(&startup);
     let (events_tx, events_rx) =
@@ -365,59 +381,11 @@ impl BlockSyncReactor {
                     }
                 } => {
                     if changed.is_ok() {
-                        let previous_scope = self.body_work_scope();
-                        let previous_body_alarm =
-                            self.committed_snapshot.as_ref().and_then(|snapshot| {
-                                snapshot
-                                    .alarms
-                                    .header_best_body_unavailable
-                                    .filter(|summary| summary.alarmed)
-                                    .map(|_| {
-                                        (
-                                            zakura_header_chain::WorkScope::for_body_work(snapshot),
-                                            snapshot.frontiers.header_best.hash,
-                                        )
-                                    })
-                            });
-                        self.committed_snapshot = committed_snapshots
+                        if let Some(snapshot) = committed_snapshots
                             .as_ref()
-                            .and_then(|snapshots| snapshots.borrow().clone());
-                        self.pending_body_supplier_restart = None;
-                        self.pending_operator_body_retry = None;
-                        synchronize_persisted_body_alarm(
-                            &self.registry,
-                            self.committed_snapshot.as_ref(),
-                        );
-                        let current_alarm_hash =
-                            self.committed_snapshot.as_ref().and_then(|snapshot| {
-                                snapshot
-                                    .alarms
-                                    .header_best_body_unavailable
-                                    .filter(|summary| summary.alarmed)
-                                    .map(|_| snapshot.frontiers.header_best.hash)
-                            });
-                        if let Some((scope, hash)) = previous_body_alarm
-                            .filter(|(_, hash)| Some(*hash) != current_alarm_hash)
+                            .and_then(|snapshots| snapshots.borrow().clone())
                         {
-                            let _ = self
-                                .sequencer_control
-                                .send(SequencerControlInput::BodyAlarmCleared { scope, hash });
-                        }
-                        let current_scope = self.body_work_scope();
-                        if current_scope != previous_scope {
-                            let released = match current_scope {
-                                Some(scope) => self.state.work_queue.retire_obsolete_scope(scope),
-                                None => self.state.work_queue.retire_all(),
-                            };
-                            self.state.budget.release(released);
-                            let _ = self.sequencer_control.send(
-                                SequencerControlInput::WorkScopeChanged {
-                                    scope: current_scope,
-                                },
-                            );
-                            if current_scope.is_some() {
-                                self.query_needed_blocks_with_options(true).await;
-                            }
+                            self.observe_committed_snapshot(snapshot).await;
                         }
                     } else {
                         committed_snapshots = None;
@@ -798,6 +766,82 @@ impl BlockSyncReactor {
         self.state.best_header_tip = height;
         self.state.best_header_hash = hash;
         self.query_needed_blocks().await;
+    }
+
+    async fn observe_committed_snapshot(&mut self, snapshot: zakura_header_chain::EngineSnapshot) {
+        let previous = self.committed_snapshot.clone();
+        let previous_scope = self.body_work_scope();
+        let previous_body_alarm = previous.as_ref().and_then(|snapshot| {
+            snapshot
+                .alarms
+                .header_best_body_unavailable
+                .filter(|summary| summary.alarmed)
+                .map(|_| {
+                    (
+                        zakura_header_chain::WorkScope::for_body_work(snapshot),
+                        snapshot.frontiers.header_best.hash,
+                    )
+                })
+        });
+        let frontiers = block_sync_frontiers(&snapshot);
+        let header_best = snapshot.frontiers.header_best;
+        self.committed_snapshot = Some(snapshot.clone());
+        self.pending_body_supplier_restart = None;
+        self.pending_operator_body_retry = None;
+        synchronize_persisted_body_alarm(&self.registry, Some(&snapshot));
+
+        let current_alarm_hash = snapshot
+            .alarms
+            .header_best_body_unavailable
+            .filter(|summary| summary.alarmed)
+            .map(|_| header_best.hash);
+        if let Some((scope, hash)) =
+            previous_body_alarm.filter(|(_, hash)| Some(*hash) != current_alarm_hash)
+        {
+            let _ = self
+                .sequencer_control
+                .send(SequencerControlInput::BodyAlarmCleared { scope, hash });
+        }
+
+        let current_scope = self.body_work_scope();
+        if current_scope != previous_scope {
+            let released = match current_scope {
+                Some(scope) => self.state.work_queue.retire_obsolete_scope(scope),
+                None => self.state.work_queue.retire_all(),
+            };
+            self.state.budget.release(released);
+            let _ = self
+                .sequencer_control
+                .send(SequencerControlInput::WorkScopeChanged {
+                    scope: current_scope,
+                });
+        }
+
+        let header_changed = previous
+            .as_ref()
+            .is_none_or(|old| old.frontiers.header_best != header_best);
+        if header_changed {
+            self.state.best_header_tip = header_best.height;
+            self.state.best_header_hash = header_best.hash;
+        }
+
+        match previous.as_ref() {
+            None => self.handle_chain_tip_reset(frontiers, false).await,
+            Some(old) if old.verified_generation != snapshot.verified_generation => {
+                self.handle_chain_tip_reset(frontiers, false).await;
+            }
+            Some(old)
+                if old.frontiers.verified_best != snapshot.frontiers.verified_best
+                    || old.frontiers.finalized != snapshot.frontiers.finalized =>
+            {
+                self.handle_state_frontiers_changed(frontiers).await;
+            }
+            Some(_) => {}
+        }
+
+        if header_changed || current_scope != previous_scope {
+            self.query_needed_blocks_with_options(true).await;
+        }
     }
 
     async fn handle_frontier_update(&mut self, update: FrontierUpdate) {
@@ -1619,15 +1663,19 @@ impl BlockSyncReactor {
         }
         #[cfg(test)]
         {
-            scope.or(Some(zakura_header_chain::WorkScope {
-                state_version: zakura_header_chain::StateVersion::new(0),
-                header_generation: zakura_header_chain::HeaderGeneration::new(0),
-                verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(0)),
-                branch: zakura_header_chain::BranchId::new(
-                    self.startup.frontiers.verified_block_hash,
-                    self.state.best_header_hash,
-                ),
-            }))
+            scope.or_else(|| {
+                self.startup.committed_snapshots.is_none().then_some(
+                    zakura_header_chain::WorkScope {
+                        state_version: zakura_header_chain::StateVersion::new(0),
+                        header_generation: zakura_header_chain::HeaderGeneration::new(0),
+                        verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(0)),
+                        branch: zakura_header_chain::BranchId::new(
+                            self.startup.frontiers.verified_block_hash,
+                            self.state.best_header_hash,
+                        ),
+                    },
+                )
+            })
         }
     }
 

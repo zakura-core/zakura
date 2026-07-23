@@ -549,8 +549,8 @@ pub struct ZakuraHeaderSyncDriverStartup {
     pub best_header_tip: Option<(block::Height, block::Hash)>,
     /// Hash of `frontiers.verified_block_tip`.
     pub verified_block_tip_hash: block::Hash,
-    /// Durable header snapshots, absent until the semantic handoff audit succeeds.
-    pub committed_snapshots: Option<watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>>,
+    /// Durable header snapshots, whose value is absent until semantic handoff succeeds.
+    pub committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
     /// VCT metadata repair needs published by the finalized writer.
     pub vct_root_repairs: Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
 }
@@ -3061,12 +3061,9 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         limits.max_frame_bytes,
     );
     startup.trace = trace.clone();
-    startup.frontier_updates = sync_frontier
-        .as_ref()
-        .map(ZakuraSyncExchange::subscribe_frontier);
     startup.committed_snapshots = header_sync_driver_startup
         .as_ref()
-        .and_then(|driver| driver.committed_snapshots.clone());
+        .map(|driver| driver.committed_snapshots.clone());
     startup.vct_root_repairs = header_sync_driver_startup
         .as_ref()
         .and_then(|driver| driver.vct_root_repairs.clone());
@@ -3077,21 +3074,16 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     let (block_sync, block_sync_actions, block_sync_task) =
         if let Some(driver_startup) = header_sync_driver_startup.as_ref() {
             let best_header_tip = driver_startup.best_header_tip.unwrap_or(anchor);
-            let frontier_updates = sync_frontier
-                .as_ref()
-                .expect("sync frontier is initialized when block sync driver is enabled")
-                .subscribe_frontier();
-            let mut startup = BlockSyncStartup::new_with_exchange(
+            let mut startup = BlockSyncStartup::new_with_committed_snapshots(
                 BlockSyncFrontiers {
                     finalized_height: driver_startup.frontiers.finalized_height,
                     verified_block_tip: driver_startup.frontiers.verified_block_tip,
                     verified_block_hash: driver_startup.verified_block_tip_hash,
                 },
                 best_header_tip,
-                frontier_updates,
+                driver_startup.committed_snapshots.clone(),
                 config.zakura.block_sync.clone(),
             );
-            startup.committed_snapshots = driver_startup.committed_snapshots.clone();
             startup.shutdown = header_sync_shutdown.clone();
             startup.trace = trace.clone();
             let (handle, actions, task) = spawn_block_sync_reactor(startup);
@@ -3138,7 +3130,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     });
     let committed_snapshots = header_sync_driver_startup
         .as_ref()
-        .and_then(|startup| startup.committed_snapshots.clone());
+        .map(|startup| startup.committed_snapshots.clone());
     let header_sync_ready = committed_snapshots
         .as_ref()
         .is_some_and(|snapshots| snapshots.borrow().is_some());

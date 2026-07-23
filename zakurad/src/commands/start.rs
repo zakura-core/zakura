@@ -2305,6 +2305,7 @@ mod zakura_header_sync_driver_tests {
             ..zakura_network::Config::for_test(P2pStack::Dual)
         };
         config.zakura.listen_addr = None;
+        let (_snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(None);
         let endpoint = zakura_network::zakura::spawn_zakura_endpoint_with_header_sync_driver(
             &config,
             |_supervisor, _trace| Arc::new(NoopZakuraService) as Arc<dyn ZakuraService>,
@@ -2316,7 +2317,7 @@ mod zakura_header_sync_driver_tests {
                 },
                 best_header_tip: Some((block::Height(0), genesis_hash)),
                 verified_block_tip_hash: genesis_hash,
-                committed_snapshots: None,
+                committed_snapshots: snapshot_rx,
                 vct_root_repairs: None,
             }),
         )

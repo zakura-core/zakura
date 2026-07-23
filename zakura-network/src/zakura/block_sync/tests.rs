@@ -230,6 +230,33 @@ fn alarmed_committed_snapshot(
     }
 }
 
+fn committed_snapshot(
+    state_version: u64,
+    header_generation: u64,
+    verified_generation: u64,
+    finalized: zakura_header_chain::Frontier,
+    verified: zakura_header_chain::Frontier,
+    header: zakura_header_chain::Frontier,
+) -> zakura_header_chain::EngineSnapshot {
+    zakura_header_chain::EngineSnapshot {
+        mode: zakura_header_chain::EngineMode::Integrated,
+        state_version: zakura_header_chain::StateVersion::new(state_version),
+        header_generation: zakura_header_chain::HeaderGeneration::new(header_generation),
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(verified_generation),
+        frontiers: zakura_header_chain::FrontierSet {
+            finalized,
+            header_best: header,
+            verified_best: verified,
+        },
+        header_best_score: zakura_header_chain::ChainScore::new(
+            zakura_header_chain::SuffixWork::zero(),
+            header.hash,
+        ),
+        oldest_retained_height: finalized.height,
+        alarms: zakura_header_chain::AlarmSet::default(),
+    }
+}
+
 fn test_frontier_update(
     finalized: u32,
     verified_body: u32,
@@ -285,6 +312,82 @@ async fn next_action(actions: &mut mpsc::Receiver<BlockSyncAction>) -> BlockSync
         .await
         .expect("block-sync action should arrive")
         .expect("block-sync action channel should stay open")
+}
+
+#[tokio::test]
+async fn committed_snapshots_are_the_sole_production_frontier_source() {
+    let legacy_frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(40),
+        verified_block_tip: block::Height(40),
+        verified_block_hash: block::Hash([0x40; 32]),
+    };
+    let legacy_header = (block::Height(50), block::Hash([0x50; 32]));
+    let (snapshot_tx, snapshot_rx) = watch::channel(None);
+    let startup = BlockSyncStartup::new_with_committed_snapshots(
+        legacy_frontiers,
+        legacy_header,
+        snapshot_rx,
+        ZakuraBlockSyncConfig::default(),
+    );
+    assert!(startup.header_tip.is_none());
+    assert!(startup.frontier_updates.is_none());
+
+    let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    match tokio::time::timeout(Duration::from_millis(50), actions.recv()).await {
+        Err(_) => {}
+        Ok(action) => panic!(
+            "legacy startup facts must not schedule work before semantic handoff: {action:?}"
+        ),
+    }
+
+    let finalized = zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0x01; 32]));
+    let verified = finalized;
+    let first_header =
+        zakura_header_chain::Frontier::new(block::Height(3), block::Hash([0x03; 32]));
+    let first = committed_snapshot(1, 1, 1, finalized, verified, first_header);
+    snapshot_tx
+        .send(Some(first.clone()))
+        .expect("the committed snapshot receiver is live");
+
+    let first_query = next_action(&mut actions).await;
+    let BlockSyncAction::QueryNeededBlocks {
+        from,
+        best_header_tip,
+        scope,
+        ..
+    } = first_query
+    else {
+        panic!("the first committed snapshot must initialize body scheduling");
+    };
+    assert_eq!(from, block::Height(1));
+    assert_eq!(best_header_tip, first_header.height);
+    assert_eq!(scope, zakura_header_chain::WorkScope::for_body_work(&first));
+
+    let second_header =
+        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x22; 32]));
+    let second = committed_snapshot(2, 2, 1, finalized, verified, second_header);
+    snapshot_tx
+        .send(Some(second.clone()))
+        .expect("the committed snapshot receiver is live");
+
+    let second_query = next_action(&mut actions).await;
+    let BlockSyncAction::QueryNeededBlocks {
+        from,
+        best_header_tip,
+        scope,
+        ..
+    } = second_query
+    else {
+        panic!("the reanchored committed snapshot must replace the old target");
+    };
+    assert_eq!(from, block::Height(1));
+    assert_eq!(best_header_tip, second_header.height);
+    assert_eq!(
+        scope,
+        zakura_header_chain::WorkScope::for_body_work(&second)
+    );
+
+    reactor_task.abort();
 }
 
 #[tokio::test]

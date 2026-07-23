@@ -22,6 +22,13 @@ name: Perf bench (ephemeral droplets)
 # state volume snapshots) and the same DO secrets as zakura-pr-node.yml.
 
 on:
+  # TEMPORARY (remove before merge): workflow_dispatch only works once the file
+  # is on the default branch, so pre-merge validation runs via this PR trigger
+  # as a parallel A/A of main (see the plan job's BASELINE_REF mapping).
+  pull_request:
+    paths:
+      - ".github/workflows/zakura-perf-bench.yml"
+      - ".github/workflows/scripts/perf-bench-run.sh"
   schedule:
     # Weekly profiled baselines of main (UTC Monday, after the 04:00 pr-node
     # bake). The cron string picks the verify mode — see the plan job.
@@ -102,7 +109,9 @@ jobs:
           # inputs.* is empty on scheduled runs; schedule benches main, and the
           # 06:47 cron is the semantic baseline
           REF: ${{ inputs.ref || 'main' }}
-          BASELINE_REF: ${{ inputs.baseline_ref }}
+          # TEMPORARY (remove before merge): PR-triggered validation runs are a
+          # parallel A/A of main so the compare job gets exercised too
+          BASELINE_REF: ${{ github.event_name == 'pull_request' && 'main' || inputs.baseline_ref }}
           VERIFY_MODE: ${{ github.event_name == 'schedule' && (github.event.schedule == '47 6 * * 1' && 'semantic' || 'checkpoint') || inputs.verify_mode || 'checkpoint' }}
         run: |
           set -euo pipefail

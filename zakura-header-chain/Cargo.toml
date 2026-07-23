@@ -23,6 +23,7 @@ zakura-chain = { path = "../zakura-chain", version = "1.2.1-rc0" }
 [dev-dependencies]
 proptest = { workspace = true }
 toml = { workspace = true }
+zakura-test = { path = "../zakura-test/", version = "1.0.1-rc0" }
 
 [lints]
 workspace = true

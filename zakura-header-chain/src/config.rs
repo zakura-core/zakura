@@ -206,7 +206,12 @@ impl EngineConfig {
         bootstrap_anchor: TrustedAnchor,
         local_checkpoints: CheckpointSet,
     ) -> Result<Self, EngineConfigError> {
-        let actual_anchor = bootstrap_anchor.header.hash();
+        let actual_anchor = crate::validation::validate_trusted_anchor_observables(
+            &bootstrap_anchor.header,
+            &network,
+            bootstrap_anchor.frontier.height,
+        )
+        .map_err(EngineConfigError::InvalidTrustedAnchor)?;
         if actual_anchor != bootstrap_anchor.frontier.hash {
             return Err(EngineConfigError::AnchorHashMismatch {
                 expected: bootstrap_anchor.frontier.hash,
@@ -247,6 +252,9 @@ impl EngineConfig {
 /// Invalid immutable engine or trust-anchor configuration.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum EngineConfigError {
+    /// A supplied trusted header failed a directly observable validation rule.
+    #[error("trusted anchor failed {0}")]
+    InvalidTrustedAnchor(&'static str),
     /// The canonical trusted header did not match its configured hash.
     #[error("trusted anchor header hashes to {actual:?}, expected {expected:?}")]
     AnchorHashMismatch {
@@ -314,9 +322,13 @@ const _: () = assert!(MAX_STAGED_TARGETS_V1 == 16);
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use zakura_chain::{
-        block::genesis::regtest_genesis_block, parameters::testnet::RegtestParameters,
+        block::{genesis::regtest_genesis_block, Block},
+        parameters::testnet::RegtestParameters,
+        serialization::ZcashDeserialize,
     };
 
     #[test]
@@ -370,23 +382,121 @@ mod tests {
 
     #[test]
     fn production_config_always_installs_the_release_manifest() {
-        let block = regtest_genesis_block();
-        for mode in [EngineMode::Integrated, EngineMode::HeadersOnly] {
-            let config = EngineConfig::new(
-                mode,
+        for (network, bytes) in [
+            (
                 Network::Mainnet,
+                zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice(),
+            ),
+            (
+                Network::new_default_testnet(),
+                zakura_test::vectors::BLOCK_TESTNET_GENESIS_BYTES.as_slice(),
+            ),
+        ] {
+            let block = Arc::<Block>::zcash_deserialize(bytes)
+                .expect("the production genesis vector is canonical");
+            let config = EngineConfig::new(
+                EngineMode::Integrated,
+                network.clone(),
                 TrustedAnchor {
                     frontier: Frontier::new(block::Height(0), block.hash()),
                     header: block.header.clone(),
                 },
                 CheckpointSet::default(),
             )
-            .expect("the compiled mainnet manifest is complete in every mode");
-            assert!(config
-                .settled_manifest
-                .pin_for_network(&Network::Mainnet)
-                .is_some());
+            .expect("the production genesis anchor passes every direct check");
+            assert!(config.settled_manifest.pin_for_network(&network).is_some());
         }
+    }
+
+    #[test]
+    fn trusted_anchor_still_runs_every_directly_observable_check() {
+        let sapling =
+            Arc::<Block>::zcash_deserialize(zakura_test::vectors::MAINNET_BLOCKS[&419_200])
+                .expect("the Mainnet Sapling activation vector is canonical");
+        let make_config = |network: Network, height: block::Height, header: Arc<block::Header>| {
+            let frontier_hash =
+                crate::validate_encoding_version_hash(&header).unwrap_or(block::Hash([0; 32]));
+            EngineConfig::new(
+                EngineMode::Integrated,
+                network,
+                TrustedAnchor {
+                    frontier: Frontier::new(height, frontier_hash),
+                    header,
+                },
+                CheckpointSet::default(),
+            )
+        };
+        make_config(
+            Network::Mainnet,
+            block::Height(419_200),
+            sapling.header.clone(),
+        )
+        .expect("the real production activation anchor passes every direct check");
+
+        let mut bad_version = *sapling.header;
+        bad_version.version = 3;
+        assert_eq!(
+            make_config(
+                Network::Mainnet,
+                block::Height(419_200),
+                Arc::new(bad_version)
+            ),
+            Err(EngineConfigError::InvalidTrustedAnchor(
+                "canonical header version and hash"
+            ))
+        );
+
+        let mut bad_commitment = *sapling.header;
+        bad_commitment.commitment_bytes.0 = [0xff; 32];
+        assert_eq!(
+            make_config(
+                Network::Mainnet,
+                block::Height(419_200),
+                Arc::new(bad_commitment)
+            ),
+            Err(EngineConfigError::InvalidTrustedAnchor(
+                "height-dependent commitment structure"
+            ))
+        );
+
+        let mut bad_target = *sapling.header;
+        bad_target.difficulty_threshold =
+            zakura_chain::work::difficulty::CompactDifficulty::from_le_bytes([0; 4]);
+        assert_eq!(
+            make_config(
+                Network::Mainnet,
+                block::Height(419_200),
+                Arc::new(bad_target)
+            ),
+            Err(EngineConfigError::InvalidTrustedAnchor(
+                "compact target and network limit"
+            ))
+        );
+
+        let target = crate::validate_compact_target(&sapling.header, &Network::Mainnet)
+            .expect("the vector target is valid");
+        let mut bad_hash = *sapling.header;
+        bad_hash.nonce.0[0] = bad_hash.nonce.0[0].wrapping_add(1);
+        assert!(
+            crate::validate_hash_filter(bad_hash.hash(), target).is_err(),
+            "the deterministic nonce mutation no longer satisfies production work"
+        );
+        assert_eq!(
+            make_config(Network::Mainnet, block::Height(419_200), Arc::new(bad_hash)),
+            Err(EngineConfigError::InvalidTrustedAnchor(
+                "header hash filter"
+            ))
+        );
+
+        let regtest = Network::new_regtest(RegtestParameters::default());
+        let mut wrong_solution_shape = *regtest_genesis_block().header;
+        wrong_solution_shape.solution = zakura_chain::work::equihash::Solution::for_proposal();
+        assert_eq!(
+            make_config(regtest, block::Height(0), Arc::new(wrong_solution_shape)),
+            Err(EngineConfigError::InvalidTrustedAnchor(
+                "Equihash solution shape or proof"
+            ))
+        );
     }
 
     #[test]

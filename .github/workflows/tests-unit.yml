@@ -32,7 +32,7 @@ on:
   merge_group:
 
   schedule:
-    # Keep release-mode coverage off the critical PR path.
+    # Verify the exact production release profile, including ThinLTO, nightly.
     - cron: "0 8 * * *"
 
   workflow_dispatch:
@@ -64,7 +64,7 @@ jobs:
   # Building once removes two of the three compile passes while preserving
   # parallel test execution across the shard jobs.
   build-tests:
-    name: build test binaries (${{ github.event_name == 'pull_request' && 'debug' || 'release' }})
+    name: build test binaries (${{ github.event_name == 'pull_request' && 'debug' || (github.event_name == 'schedule' && 'release' || 'ci-tests') }})
     permissions:
       contents: read
       id-token: write
@@ -79,8 +79,9 @@ jobs:
         with:
           toolchain: stable
           # PR debug builds restore the cache populated by the main-branch
-          # config job. Full-coverage runs keep a separate release cache.
-          cache-shared-key: ${{ github.event_name == 'pull_request' && 'zakura-drb-debug' || 'unit-tests-release' }}
+          # config job. Main and nightly runs keep separate caches because main
+          # uses `ci-tests`, while nightly uses the exact release profile.
+          cache-shared-key: ${{ github.event_name == 'pull_request' && 'zakura-drb-debug' || (github.event_name == 'schedule' && 'unit-tests-release' || 'unit-tests-ci-tests') }}
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
@@ -93,8 +94,10 @@ jobs:
           # The archive stores compiled binaries, so it must be built in the same
           # mode the shards run. The run-time-only filters (`--profile`,
           # `--partition`, `--run-ignored`) are applied by the shard jobs, not here.
-          if [[ "${FULL_COVERAGE}" == "true" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             cargo nextest archive --locked --release --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+          elif [[ "${FULL_COVERAGE}" == "true" ]]; then
+            cargo nextest archive --locked --cargo-profile ci-tests --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           else
             cargo nextest archive --locked --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           fi
@@ -290,3 +293,35 @@ jobs:
           # The release-only dependency check is skipped outside its event scope.
           # Failed, non-skipped jobs still fail this aggregate status.
           allowed-skips: check-no-git-dependencies, pruned-storage
+
+  report-nightly-result:
+    name: report nightly release test result
+    needs: test-success
+    if: always() && github.event_name == 'schedule'
+    permissions:
+      contents: read
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create, update, or close the nightly failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NIGHTLY_RESULT: ${{ needs.test-success.result }}
+        run: |
+          issue_title="[nightly] Release-mode test suite failed"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          issue_number="$(gh issue list --state open --search "\"${issue_title}\" in:title" --json number --jq '.[0].number // empty')"
+
+          if [[ "${NIGHTLY_RESULT}" != "success" ]]; then
+            message="The nightly release-mode test suite failed: ${run_url}"
+            if [[ -n "${issue_number}" ]]; then
+              gh issue comment "${issue_number}" --body "${message}"
+            else
+              gh issue create --title "${issue_title}" --body "${message}"
+            fi
+          elif [[ -n "${issue_number}" ]]; then
+            gh issue comment "${issue_number}" --body "The nightly release-mode test suite recovered: ${run_url}"
+            gh issue close "${issue_number}" --reason completed
+          fi

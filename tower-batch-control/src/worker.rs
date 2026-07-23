@@ -53,9 +53,6 @@ where
     /// The total weight of pending requests sent to `service`, since the last batch flush.
     pending_items_weight: usize,
 
-    /// The number of pending requests sent to `service`, since the last batch flush.
-    pending_items_count: usize,
-
     /// The timer for the pending batch, if it has any items.
     ///
     /// The timer is started when the first entry of a new batch is
@@ -123,7 +120,6 @@ where
             rx,
             service,
             pending_items_weight: 0,
-            pending_items_count: 0,
             pending_batch_timer: None,
             concurrent_batches: FuturesUnordered::new(),
             failed: None,
@@ -151,7 +147,6 @@ where
         match self.service.ready().await {
             Ok(svc) => {
                 self.pending_items_weight += req.request_weight();
-                self.pending_items_count += 1;
                 let rsp = svc.call(req.into());
                 let _ = tx.send(Ok(rsp));
             }
@@ -171,7 +166,7 @@ where
     /// Waits until the inner service is ready,
     /// then stores a future which resolves when the batch finishes.
     async fn flush_service(&mut self) {
-        if self.pending_items_count == 0 {
+        if self.pending_items_weight == 0 {
             tracing::trace!("skipping flush for empty batch");
             self.pending_batch_timer = None;
             return;
@@ -189,7 +184,6 @@ where
 
                 // Now we have an empty batch.
                 self.pending_items_weight = 0;
-                self.pending_items_count = 0;
                 self.pending_batch_timer = None;
             }
             Err(error) => {
@@ -258,7 +252,7 @@ where
                             "batch message received",
                         );
 
-                        let is_new_batch = self.pending_items_count == 0;
+                        let is_new_batch = self.pending_items_weight == 0;
 
                         self.process_req(request, tx)
                             // Apply the provided span to request processing.

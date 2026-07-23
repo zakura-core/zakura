@@ -35,31 +35,21 @@ type VerifyResult = Result<(), Error>;
 type Sender = watch::Sender<Option<VerifyResult>>;
 
 /// The type of the batch item.
-/// An Ed25519 item and its batch weight.
+/// A newtype around an `Ed25519Item` which implements [`RequestWeight`].
 #[derive(Clone, Debug)]
-struct Item {
-    item: batch::Item,
-    weight: usize,
-}
+struct Item(batch::Item);
 
-impl RequestWeight for Item {
-    fn request_weight(&self) -> usize {
-        self.weight
-    }
-}
+impl RequestWeight for Item {}
 
 impl<'msg, M: AsRef<[u8]> + ?Sized> From<(VerificationKeyBytes, Signature, &'msg M)> for Item {
     fn from(tup: (VerificationKeyBytes, Signature, &'msg M)) -> Self {
-        Self {
-            item: batch::Item::from(tup),
-            weight: 1,
-        }
+        Self(batch::Item::from(tup))
     }
 }
 
 impl Item {
     fn verify_single(self) -> VerifyResult {
-        self.item.verify_single()
+        self.0.verify_single()
     }
 }
 
@@ -133,7 +123,7 @@ impl Service<BatchControl<Item>> for Verifier {
 
     fn call(&mut self, req: BatchControl<Item>) -> Self::Future {
         match req {
-            BatchControl::Item(Item { item, .. }) => {
+            BatchControl::Item(Item(item)) => {
                 tracing::trace!("got ed25519 item");
                 self.batch.queue(item);
                 let mut rx = self.tx.subscribe();
@@ -236,7 +226,6 @@ where
 async fn sign_and_verify_after_explicit_flush(
     mut verifier: Batch<Verifier, Item>,
     n: usize,
-    weight: usize,
 ) -> Result<(), BoxError> {
     let mut results = FuturesOrdered::new();
     for _ in 0..n {
@@ -245,11 +234,8 @@ async fn sign_and_verify_after_explicit_flush(
         let msg = b"BatchVerifyTest";
         let sig = sk.sign(&msg[..]);
 
-        let mut item: Item = (vk_bytes, sig, msg).into();
-        item.weight = weight;
-
         verifier.ready().await?;
-        results.push_back(verifier.call(item));
+        results.push_back(verifier.call((vk_bytes, sig, msg).into()));
     }
 
     verifier.flush().await?;
@@ -307,7 +293,7 @@ async fn batch_flushes_on_explicit_flush() -> Result<(), Report> {
     let verifier = Batch::new(Verifier::default(), 100, 10, Duration::from_secs(1000));
     timeout(
         Duration::from_secs(1),
-        sign_and_verify_after_explicit_flush(verifier, 10, 1),
+        sign_and_verify_after_explicit_flush(verifier, 10),
     )
     .await
     .map_err(|e| eyre!(e))?
@@ -326,7 +312,7 @@ async fn batch_flush_on_empty_batch_is_noop() -> Result<(), Report> {
 
     timeout(
         Duration::from_secs(1),
-        sign_and_verify_after_explicit_flush(verifier, 10, 1),
+        sign_and_verify_after_explicit_flush(verifier, 10),
     )
     .await
     .map_err(|e| eyre!(e))?
@@ -346,23 +332,6 @@ async fn batch_flush_uses_existing_readiness_permit() -> Result<(), Report> {
         .await
         .map_err(|e| eyre!(e))?
         .map_err(|e| eyre!(e))?;
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn batch_flushes_zero_weight_item_on_explicit_flush() -> Result<(), Report> {
-    use tokio::time::timeout;
-    let _init_guard = zakura_test::init();
-
-    let verifier = Batch::new(Verifier::default(), 100, 10, Duration::from_secs(1000));
-    timeout(
-        Duration::from_secs(1),
-        sign_and_verify_after_explicit_flush(verifier, 1, 0),
-    )
-    .await
-    .map_err(|e| eyre!(e))?
-    .map_err(|e| eyre!(e))?;
 
     Ok(())
 }

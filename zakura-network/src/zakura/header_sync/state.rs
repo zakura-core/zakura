@@ -211,7 +211,6 @@ impl HeaderSyncCore {
                 .and_then(|start| checkpoints.min_height_in_range(start..=batch_end))
             {
                 batch_len = count_between(batch_start, checkpoint);
-                batch_end = checkpoint;
             }
             let range = CheckedHeaderRange::from_count(batch_start, batch_len)
                 .expect("bounded non-empty batch has checked geometry");

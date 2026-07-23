@@ -606,7 +606,11 @@ impl TransitionEvent {
             Self::FullStateFinalized(event) => Some(event.full_state_transition_id),
             Self::MigratedPinRefutation(event) => Some(event.full_state_transition_id),
             Self::AdvanceLocalCheckpoint(event) => Some(event.evidence),
-            Self::AuxEvidence(event) => Some(event.delivery.delivery_id),
+            Self::AuxEvidence(event) => match event.authentication {
+                AuxAuthentication::Unauthenticated => None,
+                AuxAuthentication::Authenticated { evidence, .. }
+                | AuxAuthentication::Rejected { evidence } => Some(evidence),
+            },
             Self::Recover(event) => Some(event.evidence),
             Self::ReevaluateDeferred => None,
         }

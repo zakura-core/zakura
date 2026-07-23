@@ -54,6 +54,8 @@ pub struct ForkReplaySummary {
     pub boundary_checks: u16,
     /// Production preparation mutation matrices completed.
     pub validation_checks: u16,
+    /// Exact selected/verified next-child assertions completed.
+    pub next_child_checks: u16,
     /// Final authoritative snapshot.
     pub snapshot: EngineSnapshot,
     /// Stable digest of operation outcomes and snapshots.
@@ -455,6 +457,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     let mut incident_checks = 0u16;
     let mut boundary_checks = 0u16;
     let mut validation_checks = 0u16;
+    let mut next_child_checks = 0u16;
     let mut transcript = Sha256::new();
     let clock = ManualClock::new();
     let authority = FuzzAuthority;
@@ -749,6 +752,31 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         append_snapshot(&mut transcript, &store.snapshot());
     }
 
+    let mut next_child_store = store.clone();
+    let header_best = store.metadata.frontiers.header_best;
+    commit_next_child_exactly(
+        &mut next_child_store,
+        &clock,
+        &authority,
+        header_best,
+        0xf000,
+        0xf0,
+    );
+    next_child_checks = next_child_checks.saturating_add(1);
+    let verified_best = store.metadata.frontiers.verified_best;
+    if verified_best != header_best {
+        next_child_store = store.clone();
+        commit_next_child_exactly(
+            &mut next_child_store,
+            &clock,
+            &authority,
+            verified_best,
+            0xf001,
+            0xf1,
+        );
+        next_child_checks = next_child_checks.saturating_add(1);
+    }
+
     ForkReplaySummary {
         operations: u16::try_from(bounded.len()).expect("the operation cap fits in u16"),
         commits,
@@ -760,6 +788,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         incident_checks,
         boundary_checks,
         validation_checks,
+        next_child_checks,
         snapshot: store.snapshot(),
         replay_digest: transcript.finalize().into(),
         retained_digest: retained_digest(&store),
@@ -987,44 +1016,7 @@ fn assert_consecutive_resets() -> [u8; 32] {
     );
 
     let final_tip = store.metadata.frontiers.verified_best;
-    let request = store.insertion(final_tip, 1, 90, 35);
-    let inserted_tip = match &request.event {
-        crate::TransitionEvent::InsertHeaders(event) => {
-            assert_eq!(event.parent_hash, final_tip.hash);
-            assert_eq!(
-                event.completion,
-                TargetCompletion::TargetComplete {
-                    common_ancestor: final_tip,
-                }
-            );
-            assert_eq!(
-                event.batch.headers()[0].header.previous_block_hash,
-                final_tip.hash,
-                "the first forward request after consecutive resets anchors to the final exact hash"
-            );
-            event.target_tip_hash
-        }
-        _ => unreachable!("the next-child fixture constructs one header insertion"),
-    };
-    let context = TransitionContext {
-        config: &store.config,
-        clock: &clock,
-        full_state_authority: Some(&authority),
-        startup_capability: None,
-        retention_references: &[],
-    };
-    let plan =
-        apply_transition(&store, request, &context).expect("the exact next child is admissible");
-    store.commit(&plan);
-    assert_eq!(
-        store
-            .graph
-            .node(inserted_tip)
-            .expect("the committed next child is retained")
-            .parent_hash,
-        final_tip.hash
-    );
-    assert_exhaustive_oracle(&store);
+    commit_next_child_exactly(&mut store, &clock, &authority, final_tip, 90, 35);
     retained_digest(&store)
 }
 
@@ -1077,16 +1069,8 @@ fn assert_incident_recovery() -> [u8; 32] {
     assert_eq!(store.snapshot(), before_late_a);
     assert_eq!(retained_digest(&store), before_late_a_digest);
 
-    let next_b = commit_fixture_insertion(&mut store, &clock, &authority, promoted_b, 1, 104, 0xb3);
+    let next_b = commit_next_child_exactly(&mut store, &clock, &authority, promoted_b, 104, 0xb3);
     assert_eq!(store.metadata.frontiers.header_best, next_b);
-    assert_eq!(
-        store
-            .graph
-            .node(next_b.hash)
-            .expect("B's next child is retained")
-            .parent_hash,
-        promoted_b.hash
-    );
 
     let reopened = store.clone();
     assert_eq!(reopened.snapshot(), store.snapshot());
@@ -1291,6 +1275,69 @@ fn commit_fixture_insertion(
     store.commit(&plan);
     assert_exhaustive_oracle(store);
     target
+}
+
+fn commit_next_child_exactly(
+    store: &mut FuzzStore,
+    clock: &ManualClock,
+    authority: &FuzzAuthority,
+    expected_parent: Frontier,
+    operation: usize,
+    branch: u8,
+) -> Frontier {
+    let was_header_best = store.metadata.frontiers.header_best == expected_parent;
+    let request = store.insertion_with_validation(
+        expected_parent,
+        1,
+        operation,
+        branch,
+        HeaderValidationState::Valid,
+        true,
+    );
+    let child = match &request.event {
+        crate::TransitionEvent::InsertHeaders(event) => {
+            assert_eq!(event.parent_hash, expected_parent.hash);
+            assert_eq!(
+                event.completion,
+                TargetCompletion::TargetComplete {
+                    common_ancestor: expected_parent,
+                }
+            );
+            assert_eq!(
+                event.batch.headers()[0].header.previous_block_hash,
+                expected_parent.hash
+            );
+            Frontier::new(event.batch.headers()[0].height, event.target_tip_hash)
+        }
+        _ => unreachable!("the next-child helper constructs one header insertion"),
+    };
+    let context = TransitionContext {
+        config: &store.config,
+        clock,
+        full_state_authority: Some(authority),
+        startup_capability: None,
+        retention_references: &[],
+    };
+    let plan = apply_transition(store, request, &context)
+        .expect("the exact frontier accepts its next child");
+    if was_header_best {
+        assert_eq!(
+            plan.change_set().metadata.frontiers.header_best,
+            child,
+            "the exact header frontier selects its harder next child"
+        );
+    }
+    store.commit(&plan);
+    assert_eq!(
+        store
+            .graph
+            .node(child.hash)
+            .expect("the committed next child is retained")
+            .parent_hash,
+        expected_parent.hash
+    );
+    assert_exhaustive_oracle(store);
+    child
 }
 
 fn insert_fixture_path(
@@ -1663,6 +1710,7 @@ mod tests {
             promoted.snapshot.frontiers.header_best.hash,
             incumbent.snapshot.frontiers.header_best.hash
         );
+        assert_eq!(promoted.next_child_checks, 2);
     }
 
     #[test]
@@ -1682,6 +1730,7 @@ mod tests {
             replacement.snapshot.frontiers.header_best.hash,
             incumbent.snapshot.frontiers.header_best.hash
         );
+        assert_eq!(replacement.next_child_checks, 2);
     }
 
     #[test]

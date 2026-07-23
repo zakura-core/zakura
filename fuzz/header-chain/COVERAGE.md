@@ -49,6 +49,8 @@ the remaining gap. Fuzzer reachability alone is not requirement coverage.
 
 AUD-01 through AUD-13 and AUD-INCIDENT have named deterministic
 orchestrations. The durable state-writer portion of AUD-14 is covered, but its
-full transition/response/reactor matrix is open. The shared AUD-15 next-child
-helper currently covers AUD-10 through AUD-13; the remaining call sites are
-open.
+full transition/response/reactor matrix is open. Shared AUD-15 next-child
+helpers cover the final exact selected header and verified frontiers in every
+structured replay, the consecutive-reset and incident fixtures, and AUD-10
+through AUD-13. Direct AUD-15 wiring at the network-only AUD-05 through AUD-09
+orchestrations and the remaining AUD-14 matrix is open.

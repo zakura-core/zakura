@@ -672,16 +672,26 @@ mod tests {
         // the per-IP cap of 1 must turn away a second distinct identity from
         // 127.0.0.1. Before the fix, peer1 was charged to the decoy IP, leaving
         // the loopback bucket empty and wrongly admitting peer2.
-        let excess = node
-            .connect_native_to_addr(
-                ipv4_loopback_addr(&peer2.node_addr().await),
-                TEST_NET_TIMEOUT,
-            )
-            .await;
+        let peer2_addr = ipv4_loopback_addr(&peer2.node_addr().await);
+        let excess = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::zakura::handler::serve_native_dial_connection(
+                &node.endpoint(),
+                peer2_addr,
+                node.limits(),
+            ),
+        )
+        .await
+        .expect("the rejected one-shot dial must finish promptly");
         assert!(
-            excess.is_err(),
+            excess.is_ok(),
             "second same-loopback identity must be rejected by the per-IP cap, proving the \
              first dial was charged to the confirmed path and not the advertised decoy",
+        );
+        assert_eq!(
+            node.supervisor().registered_ids().await.len(),
+            1,
+            "the rejected peer must not be registered",
         );
 
         node.shutdown().await;

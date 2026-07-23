@@ -59,6 +59,30 @@ fn early_upgrade_network() -> zakura_chain::parameters::Network {
         .expect("failed to build configured network")
 }
 
+/// A testnet with room between upgrades for tests that need era-specific
+/// transactions or several consecutive blocks within one upgrade.
+fn spaced_upgrade_network() -> zakura_chain::parameters::Network {
+    ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu6_3: Some(48),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network")
+}
+
 type TestRootMap = HashMap<
     u32,
     (
@@ -277,25 +301,7 @@ fn v4_transaction_with_interstitial_anchor(old_anchor_tree: &SproutTree) -> Arc<
 fn vct_generated_final_frontier_bytes_are_node_loader_compatible() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -670,25 +676,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
 fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -775,25 +763,7 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
 fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -879,25 +849,7 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
 
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = spaced_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -1120,25 +1072,7 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
 
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let nu5_height = NetworkUpgrade::Nu5
         .activation_height(&network)
         .expect("NU5 activation height is configured");
@@ -1263,25 +1197,7 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
 fn vct_frozen_frontier_survives_reopen() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -1440,25 +1356,7 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
 fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = spaced_upgrade_network();
     let nu5_height = NetworkUpgrade::Nu5
         .activation_height(&network)
         .expect("NU5 activation height is configured");
@@ -1791,25 +1689,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
 fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let nu5_height = NetworkUpgrade::Nu5
         .activation_height(&network)
         .expect("NU5 activation height is configured");
@@ -2021,25 +1901,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
 fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = spaced_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -2321,25 +2183,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
 fn vct_clear_prevalidation_cache_disarms_skip_then_dedup_resumes() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -2429,25 +2273,7 @@ fn vct_clear_prevalidation_cache_disarms_skip_then_dedup_resumes() -> Result<()>
 fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
@@ -2570,25 +2396,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
 fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
+    let network = early_upgrade_network();
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 

@@ -172,3 +172,9 @@ harness = false
 
 [lints]
 workspace = true
+
+# Removing the experimental `elasticsearch` feature is intentional. It never
+# provided a supported downstream library API, so do not require a major
+# version solely to remove its Cargo feature name.
+[package.metadata.cargo-semver-checks.lints]
+feature_missing = "warn"

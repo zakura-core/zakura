@@ -1979,6 +1979,7 @@ mod tests {
         reactor: &mut HeaderSyncReactor,
         snapshot: &zakura_header_chain::EngineSnapshot,
         peer: ZakuraPeerId,
+        session_id: u64,
     ) -> (
         zakura_header_chain::SourceId,
         zakura_header_chain::WorkOwner,
@@ -2003,7 +2004,7 @@ mod tests {
             header_generation: snapshot.header_generation,
             verified_generation: None,
             branch: zakura_header_chain::BranchId::new(anchor.hash, target.hash),
-            session_id: 7,
+            session_id,
             request_id: NonZeroU64::new(request_id.get()).expect("the request ID is nonzero"),
         };
         let advertised = AdvertisedHeaderTarget {
@@ -2065,7 +2066,7 @@ mod tests {
                 build_header_sync_reactor(startup).expect("the current-result control builds");
             let peer = peer();
             let (source, owner, range) =
-                seed_applying_request(&mut reactor, &initial, peer.clone());
+                seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
             reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
                 peer,
                 source,
@@ -2094,7 +2095,7 @@ mod tests {
                 build_header_sync_reactor(startup).expect("the live reactor fixture builds");
             let peer = peer();
             let (source, owner, old_range) =
-                seed_applying_request(&mut reactor, &initial, peer.clone());
+                seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
 
             let replacement =
                 zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0xb2; 32]));
@@ -2159,7 +2160,7 @@ mod tests {
             build_header_sync_reactor(old_startup).expect("the pre-crash reactor builds");
         let peer = peer();
         let (source, owner, old_range) =
-            seed_applying_request(&mut old_reactor, &initial, peer.clone());
+            seed_applying_request(&mut old_reactor, &initial, peer.clone(), 7);
         old_reactor
             .peer_work_queue
             .active_mut(&peer)
@@ -2247,6 +2248,117 @@ mod tests {
             committed_actions.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn aud_14_reactor_restart_rejects_an_old_ordered_stream_response() {
+        let mut old_startup = startup(CancellationToken::new());
+        let anchor = zakura_header_chain::Frontier::new(old_startup.anchor.0, old_startup.anchor.1);
+        let snapshot = committed_snapshot(anchor);
+        let (_old_snapshots_tx, old_snapshots_rx) = watch::channel(Some(snapshot.clone()));
+        old_startup.committed_snapshots = Some(old_snapshots_rx);
+        let (_old_handle, _old_actions, mut old_reactor) =
+            build_header_sync_reactor(old_startup).expect("the pre-crash reactor builds");
+        let peer = peer();
+        let (old_send, _old_outbound) = framed_channel(8);
+        old_reactor.handle_event(HeaderSyncEvent::PeerConnected(
+            HeaderSyncPeerSession::from_parts_with_session_id(
+                peer.clone(),
+                7,
+                old_send,
+                CancellationToken::new(),
+            ),
+        ));
+        let _ = seed_applying_request(&mut old_reactor, &snapshot, peer.clone(), 7);
+        let old_active = old_reactor
+            .peer_work_queue
+            .active_mut(&peer)
+            .expect("the old ordered stream has one request");
+        old_active.phase = HeaderTargetPhase::Receiving;
+        old_active.common_ancestor = None;
+        let response_entry = old_active
+            .entries
+            .pop()
+            .expect("the fixture has one response entry");
+        let stale_response = Headers {
+            request_id: old_active.request_id.get(),
+            target_tip_hash: old_active.target.status.selected_tip_hash,
+            common_ancestor_height: anchor.height,
+            common_ancestor_hash: anchor.hash,
+            complete: true,
+            tree_aux_schema: AuxSchema::None,
+            entries: vec![response_entry],
+        };
+        drop(old_reactor);
+
+        let mut fresh_startup = startup(CancellationToken::new());
+        let (_fresh_snapshots_tx, fresh_snapshots_rx) = watch::channel(Some(snapshot.clone()));
+        fresh_startup.committed_snapshots = Some(fresh_snapshots_rx);
+        let (fresh_handle, mut fresh_actions, mut fresh_reactor) =
+            build_header_sync_reactor(fresh_startup).expect("the replacement reactor builds");
+        let (fresh_send, mut fresh_outbound) = framed_channel(8);
+        fresh_reactor.handle_event(HeaderSyncEvent::PeerConnected(
+            HeaderSyncPeerSession::from_parts_with_session_id(
+                peer.clone(),
+                8,
+                fresh_send,
+                CancellationToken::new(),
+            ),
+        ));
+        let status = fresh_outbound
+            .recv()
+            .await
+            .expect("the replacement stream receives its initial status");
+        assert!(matches!(
+            fresh_handle
+                .codec()
+                .decode_frame(status, None)
+                .expect("the replacement status decodes"),
+            HeaderSyncMessage::Status(_)
+        ));
+        let _ = seed_applying_request(&mut fresh_reactor, &snapshot, peer.clone(), 8);
+        let fresh_active = fresh_reactor
+            .peer_work_queue
+            .active_mut(&peer)
+            .expect("the replacement stream has one request");
+        fresh_active.phase = HeaderTargetPhase::Receiving;
+        fresh_active.common_ancestor = None;
+        fresh_active.entries.clear();
+        let expected_active = fresh_active.clone();
+        let published_tip = fresh_handle.best_header_tip();
+        let published_candidates = fresh_handle.candidate_state();
+
+        fresh_reactor.handle_event(HeaderSyncEvent::SessionWireMessage {
+            peer: peer.clone(),
+            session_id: 7,
+            msg: HeaderSyncMessage::Headers(stale_response),
+        });
+
+        assert_eq!(
+            fresh_reactor
+                .peer_state
+                .get(&peer)
+                .expect("the replacement peer remains connected")
+                .session
+                .session_id(),
+            8
+        );
+        assert_eq!(
+            fresh_reactor.peer_work_queue.active(&peer),
+            Some(&expected_active)
+        );
+        assert_eq!(fresh_handle.best_header_tip(), published_tip);
+        assert_eq!(fresh_handle.candidate_state(), published_candidates);
+        assert!(matches!(
+            fresh_actions.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(
+            time::timeout(std::time::Duration::from_millis(10), fresh_outbound.recv())
+                .await
+                .is_err(),
+            "the stale response emits no replacement-stream frame"
+        );
     }
 
     #[tokio::test]

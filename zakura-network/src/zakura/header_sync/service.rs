@@ -102,6 +102,23 @@ impl HeaderSyncPeerSession {
     }
 
     #[cfg(test)]
+    pub(crate) fn from_parts_with_session_id(
+        peer_id: ZakuraPeerId,
+        session_id: u64,
+        send: FramedSend,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        Self::from_parts_with_direction_and_commands(
+            peer_id,
+            session_id,
+            ServicePeerDirection::Inbound,
+            send,
+            cancel_token,
+            None,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_parts_with_direction(
         peer_id: ZakuraPeerId,
         direction: ServicePeerDirection,

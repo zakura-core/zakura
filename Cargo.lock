@@ -8724,6 +8724,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "sha2 0.10.9",
  "toml 1.1.2+spec-1.1.0",
 ]
 

@@ -19,6 +19,15 @@ Minimized artifacts belong in the matching checked-in `corpus/<target>/`
 directory and must also receive a deterministic regression test in the owning
 crate. Record the target, artifact SHA-256, decoded input or operation list,
 first divergent snapshots, and transition receipt in the regression comment.
+For a standard `artifacts/<target>/crash-*` path, run:
+
+```console
+cargo xtask minimize-header-fuzz fuzz/header-chain/artifacts/<target>/crash-…
+```
+
+The command invokes `cargo fuzz tmin` with the CI-pinned nightly and prints the
+minimized SHA-256, bounded operation bytes, and a target-specific Rust
+regression template.
 
 `fork_transitions` consumes at most 512 operation bytes. Bits 3–5 select linear
 or fork insertion, stale-version work, operator invalidation/reconsideration,

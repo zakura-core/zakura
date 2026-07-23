@@ -8,6 +8,7 @@ use std::{
 };
 
 mod header_conformance;
+mod header_fuzz;
 
 const DEFAULT_FEATURES: &str = "default-release-binaries";
 const DEFAULT_UBUNTU_IMAGE: &str = "ubuntu:22.04";
@@ -47,6 +48,19 @@ fn try_main() -> Result<(), BoxError> {
             }
 
             header_conformance::run(&repo_root()?, rule_id.as_deref())
+        }
+        Some("minimize-header-fuzz") => {
+            let artifact = args.next().ok_or_else(|| {
+                Box::new(UsageError(
+                    "expected an artifact after `cargo xtask minimize-header-fuzz`",
+                )) as BoxError
+            })?;
+            if args.next().is_some() {
+                return Err(Box::new(UsageError(
+                    "expected exactly one artifact after `cargo xtask minimize-header-fuzz`",
+                )));
+            }
+            header_fuzz::minimize(&repo_root()?, Path::new(&artifact))
         }
         Some("-h" | "--help") | None => {
             if args.next().is_some() {
@@ -247,6 +261,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output, "Usage:")?;
     writeln!(output, "  cargo xtask package ubuntu")?;
     writeln!(output, "  cargo xtask header-conformance [LC-…]")?;
+    writeln!(output, "  cargo xtask minimize-header-fuzz <artifact>")?;
     writeln!(output)?;
     writeln!(
         output,
@@ -261,5 +276,14 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "Validates the fork-aware header-chain specification and conformance manifest."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Minimizes a header fuzz crash with pinned nightly cargo-fuzz, then prints"
+    )?;
+    writeln!(
+        output,
+        "its SHA-256, decoded bounded operations, and a deterministic Rust regression."
     )
 }

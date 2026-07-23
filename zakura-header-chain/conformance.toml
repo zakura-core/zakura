@@ -15,12 +15,18 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-SCOPE-02"
 name = "Correctness assumptions"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::EngineConfig"
+tests = ["architecture::engine_config_binds_and_validates_every_trust_anchor", "architecture::production_config_always_installs_the_release_manifest", "PW-05::unknown_status_targets_remain_eligible_regardless_of_advisory_shape"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-SCOPE-03"
 name = "Header-validity boundary"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::apply_transition"
+tests = ["DF-02::header_acceptance_cannot_construct_body_or_state_validity", "DF-02::body_verification_outcomes_preserve_distinct_transition_effects"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-SCOPE-08"
@@ -33,22 +39,34 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-SCOPE-04"
 name = "Wallet features excluded"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain"
+tests = ["architecture::architecture_excludes_wallet_flyclient_and_block_sync_surfaces"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-SCOPE-05"
 name = "FlyClient proofs excluded"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain"
+tests = ["architecture::architecture_excludes_wallet_flyclient_and_block_sync_surfaces"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-SCOPE-06"
 name = "Block-sync concerns excluded"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::EngineConfig"
+tests = ["architecture::architecture_excludes_wallet_flyclient_and_block_sync_surfaces", "architecture::architecture_dependencies_stay_sync_only_and_layered"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-SCOPE-07"
 name = "Auxiliary-evidence boundary"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::AuxAuthentication"
+tests = ["IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header", "IN-06::selected_auxiliary_repair_adds_only_one_exact_provenance_record"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-SCOPE-09"

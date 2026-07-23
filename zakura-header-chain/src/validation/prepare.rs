@@ -149,6 +149,15 @@ pub fn prepare_headers(
         return Err(HeaderFailure::InvalidLease);
     }
 
+    let hashes: Vec<_> = input
+        .headers
+        .iter()
+        .enumerate()
+        .map(|(offset, header)| {
+            validate_encoding_version_hash(header)
+                .map_err(|error| invalid(offset, HeaderRule::EncodingVersionHash, error))
+        })
+        .collect::<Result<_, _>>()?;
     let raw_headers: Vec<_> = input.headers.iter().map(|header| **header).collect();
     validate_link(lease.parent.hash, &raw_headers)
         .map_err(|error| invalid(error.offset, HeaderRule::ParentLink, error))?;
@@ -162,8 +171,7 @@ pub fn prepare_headers(
     let mut prepared = Vec::with_capacity(input.headers.len());
 
     for (offset, header) in input.headers.iter().enumerate() {
-        let hash = validate_encoding_version_hash(header)
-            .map_err(|error| invalid(offset, HeaderRule::EncodingVersionHash, error))?;
+        let hash = hashes[offset];
         let height = infer_height(parent.height, None)
             .map_err(|error| invalid(offset, HeaderRule::InferredHeight, error))?;
         validate_commitment_structure(header, &rules.network, height)
@@ -351,6 +359,27 @@ mod tests {
             ),
             Err(HeaderFailure::Invalid {
                 rule: HeaderRule::ParentLink,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn invalid_version_is_rejected_before_link_hashing() {
+        let (rules, lease, anchor) = fixture();
+        let mut invalid = *child(lease.parent, &anchor, 1);
+        invalid.version = 3;
+        let invalid = Arc::new(invalid);
+
+        assert!(matches!(
+            prepare_headers(
+                HeaderBatchInput::new(std::slice::from_ref(&invalid)),
+                &lease,
+                &rules,
+                &FixedClock(anchor.time),
+            ),
+            Err(HeaderFailure::Invalid {
+                rule: HeaderRule::EncodingVersionHash,
                 ..
             })
         ));

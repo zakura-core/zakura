@@ -177,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn lower_same_and_forward_resets_cannot_reuse_old_height_coverage() {
+    fn aud_08_old_coverage_misses_until_the_exact_reset_branch_completes() {
         let old_generation = HeaderGeneration::new(4);
         let new_generation = HeaderGeneration::new(5);
         let old_branch = branch(1, 9);
@@ -194,6 +194,18 @@ mod tests {
 
             assert_eq!(reset_coverage.len(), 0);
             assert!(!reset_coverage.covers_tip(new_generation, new_branch, block::Height(height)));
+
+            reset_coverage.mark(new_generation, range(old_branch, 11, height));
+            assert!(
+                !reset_coverage.covers_tip(new_generation, new_branch, block::Height(height)),
+                "height coverage on the old branch cannot alias the reset branch"
+            );
+
+            reset_coverage.mark(new_generation, range(new_branch, 11, height));
+            assert!(
+                reset_coverage.covers_tip(new_generation, new_branch, block::Height(height)),
+                "coverage starts only after the new exact branch completes"
+            );
         }
 
         coverage.retain_current(old_generation, Frontier::new(block::Height(12), hash(2)));

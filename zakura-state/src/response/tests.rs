@@ -33,13 +33,8 @@ fn fake_chain(network: &Network, len: usize) -> Vec<Arc<Block>> {
 /// Commits a single chain in ascending height order into a fresh non-finalized
 /// state.
 fn state_from_chain(network: &Network, blocks: &[Arc<Block>]) -> NonFinalizedState {
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), network)
+        .expect("opening an ephemeral database should succeed");
     finalized_state.set_finalized_value_pool(ValueBalance::<NonNegative>::fake_populated_pool());
 
     let mut state = NonFinalizedState::new(network);

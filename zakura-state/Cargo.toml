@@ -42,13 +42,6 @@ proptest-impl = [
     "zakura-chain/proptest-impl"
 ]
 
-# Experimental elasticsearch support
-elasticsearch = [
-    "dep:elasticsearch",
-    "dep:serde_json",
-    "zakura-chain/elasticsearch",
-]
-
 [dependencies]
 bincode = { workspace = true }
 chrono = { workspace = true, features = ["clock", "std"] }
@@ -81,11 +74,6 @@ tracing = { workspace = true }
 
 sapling-crypto = { workspace = true }
 zakura-vct-sprout-history = { workspace = true }
-
-# elasticsearch specific dependencies.
-# Security: avoid default dependency on openssl
-elasticsearch = { workspace = true, features = ["rustls-tls"], optional = true }
-serde_json = { workspace = true, optional = true }
 
 zakura-node-services = { path = "../zakura-node-services", version = "2.0.0" }
 zakura-chain = { path = "../zakura-chain", version = "2.0.0", features = ["async-error"] }

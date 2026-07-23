@@ -97,11 +97,6 @@ internal-miner = [
     "zakura-rpc/internal-miner",
 ]
 
-# Experimental elasticsearch indexing
-elasticsearch = [
-    "zakura-state/elasticsearch",
-]
-
 # Tracing and monitoring
 sentry = ["dep:sentry"]
 journald = ["tracing-journald"]

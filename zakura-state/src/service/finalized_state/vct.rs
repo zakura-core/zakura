@@ -22,6 +22,7 @@ use zakura_chain::{
     parameters::{Network, NetworkUpgrade},
     sapling, sprout,
 };
+use zakura_header_chain::AuxDelivery;
 
 use super::{
     commitment_aux::{CommitmentRootSource, FinalFrontiers, PeerSource},
@@ -40,10 +41,13 @@ pub struct NextVctBlock {
     pub(crate) hash: block::Hash,
     /// The successor block's precomputed ZIP-244 auth-data root, if available.
     pub(crate) auth_data_root: Option<AuthDataRoot>,
+    /// Exact auxiliary delivery that supplied the successor auth-data root.
+    pub(crate) delivery: Option<AuxDelivery>,
 }
 
 impl NextVctBlock {
     /// Build a successor witness from a header and its precomputed auth-data root.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_header(
         header: Arc<Header>,
         height: block::Height,
@@ -56,7 +60,58 @@ impl NextVctBlock {
             height,
             hash,
             auth_data_root: Some(auth_data_root),
+            delivery: None,
         }
+    }
+
+    /// Build a successor witness while retaining its exact auxiliary delivery.
+    pub(crate) fn from_delivery(
+        header: Arc<Header>,
+        height: block::Height,
+        delivery: AuxDelivery,
+    ) -> Option<Self> {
+        let aux = delivery.tree_aux?;
+        if delivery.header_hash != header.hash() || aux.height != height {
+            return None;
+        }
+        let hash = block::Hash::from(&header);
+
+        Some(Self {
+            header,
+            height,
+            hash,
+            auth_data_root: Some(aux.auth_data_root),
+            delivery: Some(delivery),
+        })
+    }
+}
+
+/// One atomically selected current delivery and its optional direct-successor witness.
+#[derive(Clone, Debug)]
+pub(crate) struct VctAuxWindow {
+    /// Exact auxiliary delivery whose roots are folded for the current block.
+    pub(crate) current: AuxDelivery,
+    /// Exact direct-successor witness used for one-header-later authentication.
+    pub(crate) successor: Option<NextVctBlock>,
+}
+
+impl VctAuxWindow {
+    /// Return the exact current roots when the delivery still agrees with the block.
+    pub(crate) fn current_roots(
+        &self,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> Option<(
+        sapling::tree::Root,
+        orchard::tree::Root,
+        ironwood::tree::Root,
+    )> {
+        let aux = self.current.tree_aux?;
+        (self.current.header_hash == hash && aux.height == height).then_some((
+            aux.sapling_root,
+            aux.orchard_root,
+            aux.ironwood_root,
+        ))
     }
 }
 

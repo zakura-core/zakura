@@ -111,6 +111,7 @@ pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
     MAX_ON_DISK_HEIGHT,
 };
+pub(crate) use vct::VctAuxWindow;
 pub use vct::{
     generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
     GeneratorError, NextVctBlock,
@@ -675,12 +676,58 @@ impl FinalizedState {
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
     > {
+        self.commit_finalized_inner(
+            ordered_block,
+            prev_note_commitment_trees,
+            next_vct_block,
+            None,
+        )
+    }
+
+    /// Commit a checkpoint-verified block using one exact selected auxiliary window.
+    pub(in crate::service) fn commit_finalized_with_aux(
+        &mut self,
+        ordered_block: QueuedCheckpointVerified,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        vct_aux_window: Option<VctAuxWindow>,
+    ) -> Result<
+        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
+    > {
+        let next_vct_block = vct_aux_window
+            .as_ref()
+            .and_then(|window| window.successor.clone());
+        self.commit_finalized_inner(
+            ordered_block,
+            prev_note_commitment_trees,
+            next_vct_block,
+            vct_aux_window,
+        )
+    }
+
+    fn commit_finalized_inner(
+        &mut self,
+        ordered_block: QueuedCheckpointVerified,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        next_vct_block: Option<NextVctBlock>,
+        vct_aux_window: Option<VctAuxWindow>,
+    ) -> Result<
+        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
+    > {
         let (checkpoint_verified, rsp_tx) = ordered_block;
-        let result = self.commit_finalized_direct(
+        let result = self.commit_finalized_direct_with_aux(
             checkpoint_verified.clone().into(),
             prev_note_commitment_trees,
             next_vct_block,
+            vct_aux_window,
             "commit checkpoint-verified request",
+            |db, batch| {
+                db.header_chain_disk_db()
+                    .write(batch)
+                    .expect("unexpected rocksdb error while writing block");
+                Ok(())
+            },
         );
 
         if result.is_ok() {
@@ -756,6 +803,29 @@ impl FinalizedState {
     where
         C: FnOnce(&mut ZakuraDb, DiskWriteBatch) -> Result<(), CommitCheckpointVerifiedError>,
     {
+        self.commit_finalized_direct_with_aux(
+            finalizable_block,
+            prev_note_commitment_trees,
+            next_vct_block,
+            None,
+            source,
+            commit,
+        )
+    }
+
+    /// Prepare a finalized block with exact auxiliary provenance and delegate its durable batch.
+    fn commit_finalized_direct_with_aux<C>(
+        &mut self,
+        finalizable_block: FinalizableBlock,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        next_vct_block: Option<NextVctBlock>,
+        vct_aux_window: Option<VctAuxWindow>,
+        source: &str,
+        commit: C,
+    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError>
+    where
+        C: FnOnce(&mut ZakuraDb, DiskWriteBatch) -> Result<(), CommitCheckpointVerifiedError>,
+    {
         let (height, hash, finalized, prev_note_commitment_trees, retention, fast_write) =
             match finalizable_block {
                 FinalizableBlock::Checkpoint {
@@ -793,15 +863,21 @@ impl FinalizedState {
                     // last checkpoint height, we skip the per-block note-commitment frontier recompute
                     // (`update_trees_parallel`). Instead, we validate the peer-supplied roots
                     // against the successor block's header/MMR.
-                    let vct_roots = self.vct.source().and_then(|v| {
-                        if vct_last_checkpoint_height
-                            .is_some_and(|last_checkpoint_height| height > last_checkpoint_height)
-                        {
-                            None
-                        } else {
-                            v.vct_roots_at_height(height)
-                        }
-                    });
+                    let exact_vct_roots = vct_aux_window
+                        .as_ref()
+                        .and_then(|window| window.current_roots(height, block.hash()));
+                    let vct_roots = match vct_aux_window {
+                        Some(_) => exact_vct_roots,
+                        None => self.vct.source().and_then(|v| {
+                            if vct_last_checkpoint_height.is_some_and(|last_checkpoint_height| {
+                                height > last_checkpoint_height
+                            }) {
+                                None
+                            } else {
+                                v.vct_roots_at_height(height)
+                            }
+                        }),
+                    };
 
                     let mut vct_write = VctWriteData::default();
 
@@ -828,16 +904,23 @@ impl FinalizedState {
                         // should never fire in production.
                         let next_vct_block = next_vct_block.filter(|next_vct_block| {
                             let links = next_vct_block.header.previous_block_hash == block_hash;
-                            if !links {
+                            let delivery_matches = next_vct_block.delivery.is_none_or(|delivery| {
+                                delivery.header_hash == next_vct_block.hash
+                                    && delivery.tree_aux.is_some_and(|aux| {
+                                        aux.height == next_vct_block.height
+                                            && Some(aux.auth_data_root)
+                                                == next_vct_block.auth_data_root
+                                    })
+                            });
+                            if !links || !delivery_matches {
                                 tracing::warn!(
                                     ?height,
                                     witness_parent = ?next_vct_block.header.previous_block_hash,
                                     expected_parent = ?block_hash,
-                                    "VCT: ignoring a successor witness that does not link \
-                                     to the block being committed"
+                                    "VCT: ignoring an incoherent successor witness"
                                 );
                             }
-                            links
+                            links && delivery_matches
                         });
 
                         // NU5+ block hashes do not commit to authorizing data. Include the

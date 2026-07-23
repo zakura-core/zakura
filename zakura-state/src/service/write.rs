@@ -38,7 +38,7 @@ use crate::{
                 migration::{initialize_header_chain_reconciled, HeaderChainInitializationError},
                 HeaderChainReader, HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError,
             },
-            DiskWriteBatch, FinalizedState, NextVctBlock, ZakuraDb,
+            DiskWriteBatch, FinalizedState, NextVctBlock, VctAuxWindow, ZakuraDb,
         },
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
@@ -240,19 +240,23 @@ impl HeaderChainWriter {
         }
     }
 
-    fn vct_successor(&self, height: block::Height, hash: block::Hash) -> Option<NextVctBlock> {
+    fn vct_aux_window(&self, height: block::Height, hash: block::Hash) -> Option<VctAuxWindow> {
         let window = self
             .runtime
             .reader()
             .selected_aux_window(height, hash)
             .ok()??;
-        let (successor, deliveries) = window.successor?;
-        let aux = select_vct_aux_delivery(deliveries)?.tree_aux?;
-        Some(NextVctBlock::from_header(
-            successor.header,
-            successor.height,
-            aux.auth_data_root,
-        ))
+        let current = select_vct_aux_delivery(window.current_deliveries)?;
+        let current_aux = current.tree_aux?;
+        if current.header_hash != window.current.hash || current_aux.height != window.current.height
+        {
+            return None;
+        }
+        let successor = window.successor.and_then(|(successor, deliveries)| {
+            let delivery = select_vct_aux_delivery(deliveries)?;
+            NextVctBlock::from_delivery(successor.header, successor.height, delivery)
+        });
+        Some(VctAuxWindow { current, successor })
     }
 
     fn attach_at_semantic_handoff(
@@ -1086,15 +1090,22 @@ impl WriteBlockWorkerTask {
             // invalid. The buffered body remains in the look-ahead for its own commit.
             let needs_vct_successor =
                 finalized_state.vct_fast_needs_successor(ordered_block.0.height);
-            let next_vct_block = if needs_vct_successor {
+            let next_block_took_vct_path =
+                finalized_state.vct_fast_will_apply(ordered_block.0.height);
+            let vct_aux_window = if next_block_took_vct_path {
                 header_chain.as_ref().and_then(|writer| {
-                    writer.vct_successor(ordered_block.0.height, ordered_block.0.hash)
+                    writer.vct_aux_window(ordered_block.0.height, ordered_block.0.hash)
                 })
             } else {
                 None
             };
 
-            if needs_vct_successor && next_vct_block.is_none() {
+            if needs_vct_successor
+                && vct_aux_window
+                    .as_ref()
+                    .and_then(|window| window.successor.as_ref())
+                    .is_none()
+            {
                 let height = ordered_block.0.height;
                 let wait =
                     vct_write_manager.on_retryable_error(height, false, false, ordered_block);
@@ -1108,14 +1119,11 @@ impl WriteBlockWorkerTask {
             let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
             let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
 
-            let next_block_took_vct_path =
-                finalized_state.vct_fast_will_apply(ordered_block.0.height);
-
             // Try committing the block
-            match finalized_state.commit_finalized(
+            match finalized_state.commit_finalized_with_aux(
                 ordered_block,
                 prev_note_commitment_trees,
-                next_vct_block,
+                vct_aux_window,
             ) {
                 Ok((finalized, note_commitment_trees)) => {
                     // Whether this successful commit consumed header-carried
@@ -1533,7 +1541,7 @@ mod tests {
         service::{
             finalized_state::{
                 header_chain::{HeaderChainStore, HeaderChainStoreError},
-                FinalizedState,
+                FinalizedState, VctAuxWindow,
             },
             non_finalized_state::NonFinalizedState,
             write::{
@@ -1625,6 +1633,29 @@ mod tests {
         assert_eq!(
             super::select_vct_aux_delivery(vec![rejected, incomplete]),
             None
+        );
+
+        let window = VctAuxWindow {
+            current: authenticated,
+            successor: None,
+        };
+        let expected_roots = authenticated
+            .tree_aux
+            .map(|aux| (aux.sapling_root, aux.orchard_root, aux.ironwood_root))
+            .expect("the authenticated fixture contains tree auxiliary data");
+        assert_eq!(
+            window.current_roots(block::Height(1), block::Hash([1; 32])),
+            Some(expected_roots)
+        );
+        assert_eq!(
+            window.current_roots(block::Height(2), block::Hash([1; 32])),
+            None,
+            "height-mismatched provenance fails closed"
+        );
+        assert_eq!(
+            window.current_roots(block::Height(1), block::Hash([2; 32])),
+            None,
+            "hash-mismatched provenance fails closed"
         );
     }
 

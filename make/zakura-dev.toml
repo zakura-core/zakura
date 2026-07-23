@@ -16,9 +16,6 @@ p2p_stack = "zakura"
 # Bind on all interfaces: iroh uses one UDP socket for send+recv, so a loopback
 # bind breaks outbound connections to external peers.
 listen_addr = "0.0.0.0:8234"
-# Structured Zakura JSONL traces (block_sync, commit_state, header_sync, legacy_sync).
-# Default path is ${ZAKURA_DEV_HOME}/traces from make/zakura-dev.mk.
-trace_dir = "@@TRACE_DIR@@"
 # Selected by `NETWORK` in make/zakura-dev.mk.
 bootstrap_peers = [
 @@BOOTSTRAP_PEERS@@

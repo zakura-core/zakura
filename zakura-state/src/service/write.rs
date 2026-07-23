@@ -1078,13 +1078,8 @@ mod tests {
     fn missing_completed_checkpoint_is_a_local_frontier_error() {
         let _init_guard = zakura_test::init();
 
-        let finalized_state = FinalizedState::new(
-            &Config::ephemeral(),
-            &Network::Mainnet,
-            #[cfg(feature = "elasticsearch")]
-            false,
-        )
-        .expect("opening an ephemeral database should succeed");
+        let finalized_state = FinalizedState::new(&Config::ephemeral(), &Network::Mainnet)
+            .expect("opening an ephemeral database should succeed");
         let (completed_checkpoint, _receiver) =
             HighestCompletedCheckpointTracker::open(&finalized_state.db);
 
@@ -1137,13 +1132,8 @@ mod tests {
     fn publish_skips_when_durable_frontier_lacks_completed_checkpoint() {
         let _init_guard = zakura_test::init();
 
-        let finalized_state = FinalizedState::new(
-            &Config::ephemeral(),
-            &Network::Mainnet,
-            #[cfg(feature = "elasticsearch")]
-            false,
-        )
-        .expect("opening an ephemeral database should succeed");
+        let finalized_state = FinalizedState::new(&Config::ephemeral(), &Network::Mainnet)
+            .expect("opening an ephemeral database should succeed");
         let genesis = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
             .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
             .expect("mainnet genesis block deserializes");

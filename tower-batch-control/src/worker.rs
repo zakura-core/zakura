@@ -146,7 +146,10 @@ where
 
         match self.service.ready().await {
             Ok(svc) => {
-                self.pending_items_weight += req.request_weight();
+                // Floor each item at weight 1 so `pending_items_weight == 0` always
+                // means "no queued items": a zero-weight item must still start the
+                // batch timer and be flushed. See `RequestWeight::request_weight`.
+                self.pending_items_weight += req.request_weight().max(1);
                 let rsp = svc.call(req.into());
                 let _ = tx.send(Ok(rsp));
             }

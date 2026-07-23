@@ -585,12 +585,18 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-WIRE-13"
 name = "Body-size hint safety"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::HeaderSyncCodec::decode_headers"
+tests = ["PW-06::body_hints_completion_and_aux_defaults_are_enforced", "PW-06::decode_rejects_each_vector_hint_schema_and_byte_boundary", "PW-06::headers_golden_vector_uses_parallel_wire_sections"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-WIRE-14"
 name = "Auxiliary-schema validation"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::TreeAuxRecordV1::validate_for"
+tests = ["PW-06::request_bounds_and_schema_advertisement_are_enforced", "PW-06::headers_golden_vector_uses_parallel_wire_sections", "PW-06::body_hints_completion_and_aux_defaults_are_enforced", "PW-06::decode_rejects_each_vector_hint_schema_and_byte_boundary"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-WIRE-15"
@@ -635,17 +641,26 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-WIRE-08"
 name = "Correlated response validation"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::ActiveHeaderRequest::accepts_response_page"
+tests = ["PW-03::unsolicited_and_mismatched_responses_are_protocol_rejected", "PW-03::requester_stages_all_pages_before_one_exact_admission", "PW-03::only_exact_prepared_current_targets_reach_state"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-WIRE-09"
 name = "Continuation target integrity"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::ActiveHeaderRequest::continuation_locator"
+tests = ["PW-03::requester_stages_all_pages_before_one_exact_admission", "PW-03::complete_target_is_independent_of_page_partition", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-WIRE-10"
 name = "Non-punitive retry outcomes"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::HeaderSyncReactor::handle_headers_outcome"
+tests = ["PW-04::explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh", "PW-04::every_unservable_path_result_is_a_correlated_explicit_outcome", "PW-07::initial_refresh_and_coalesced_change_deadlines_are_bounded"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-WIRE-11"
@@ -655,7 +670,10 @@ status = "unimplemented"
 [[rule]]
 id = "LC-WIRE-12"
 name = "Unknown-fork discovery"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::AdvertisedHeaderTarget::is_discovery_eligible"
+tests = ["PW-05::unknown_status_targets_remain_eligible_regardless_of_advisory_shape", "PW-05::corrupted_advisory_fields_never_change_local_authority"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-PARITY-01"

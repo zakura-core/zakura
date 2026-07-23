@@ -235,7 +235,7 @@ impl HeaderSyncReactor {
                             .as_ref()
                             .and_then(|snapshots| snapshots.borrow().clone())
                         {
-                            self.observe_committed_snapshot(snapshot);
+                            self.observe_latest_committed_snapshot(snapshot);
                         }
                     } else {
                         committed_snapshots = None;
@@ -351,6 +351,15 @@ impl HeaderSyncReactor {
     }
 
     fn handle_peer_connected(&mut self, session: HeaderSyncPeerSession) {
+        let latest_snapshot = self
+            .startup
+            .committed_snapshots
+            .as_ref()
+            .and_then(|snapshots| snapshots.borrow().clone());
+        if let Some(snapshot) = latest_snapshot {
+            self.observe_latest_committed_snapshot(snapshot);
+        }
+
         let peer = session.peer_id().clone();
         let direction = session.direction();
         let replaced_repair = self.peer_state.get(&peer).and_then(|state| {
@@ -1458,7 +1467,11 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn observe_committed_snapshot(&mut self, snapshot: zakura_header_chain::EngineSnapshot) {
+    fn observe_latest_committed_snapshot(&mut self, snapshot: zakura_header_chain::EngineSnapshot) {
+        if self.committed_snapshot.as_ref() == Some(&snapshot) {
+            return;
+        }
+
         self.retire_obsolete_work(&snapshot);
         let old_tip = self
             .committed_snapshot
@@ -2039,6 +2052,53 @@ mod tests {
                 ..
             }
         ));
+
+        reactor.abort();
+    }
+
+    #[tokio::test]
+    async fn peer_admission_catches_up_snapshot_before_initial_status() {
+        let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown);
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let (snapshots_tx, snapshots_rx) = watch::channel(None);
+        startup.committed_snapshots = Some(snapshots_rx);
+        let (handle, _actions, reactor) =
+            spawn_header_sync_reactor(startup).expect("the pre-handoff reactor starts");
+
+        let header_best =
+            zakura_header_chain::Frontier::new(block::Height(7), block::Hash([0x77; 32]));
+        let mut snapshot = committed_snapshot(anchor);
+        snapshot.frontiers.header_best = header_best;
+        snapshot.header_best_score = zakura_header_chain::ChainScore::new(
+            zakura_header_chain::SuffixWork::zero(),
+            header_best.hash,
+        );
+        snapshots_tx
+            .send(Some(snapshot))
+            .expect("the committed snapshot receiver is live");
+
+        let (send, mut outbound) = framed_channel(8);
+        handle
+            .send(HeaderSyncEvent::PeerConnected(
+                HeaderSyncPeerSession::from_parts(peer(), send, CancellationToken::new()),
+            ))
+            .await
+            .expect("peer admission queues before the watch arm runs");
+
+        let status_frame = time::timeout(time::Duration::from_secs(1), outbound.recv())
+            .await
+            .expect("the initial status is sent promptly")
+            .expect("the peer outbound remains open");
+        let HeaderSyncMessage::Status(status) = handle
+            .codec()
+            .decode_frame(status_frame, None)
+            .expect("the initial status decodes")
+        else {
+            panic!("the first session message must be the committed status");
+        };
+        assert_eq!(status.selected_tip_height, header_best.height);
+        assert_eq!(status.selected_tip_hash, header_best.hash);
 
         reactor.abort();
     }

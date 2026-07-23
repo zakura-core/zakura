@@ -542,6 +542,22 @@ fn full_state_evidence(
     EvidenceId::from_digest(hasher.finalize().into())
 }
 
+fn classify_verified_change<'a>(
+    old_path: &[VerifiedHeaderRef],
+    new_path: &'a [VerifiedHeaderRef],
+) -> (VerifiedChangeCause, &'a [VerifiedHeaderRef]) {
+    let grows = new_path.len() > old_path.len()
+        && new_path
+            .iter()
+            .zip(old_path)
+            .all(|(new, old)| new.hash == old.hash);
+    if grows {
+        (VerifiedChangeCause::Grow, &new_path[old_path.len()..])
+    } else {
+        (VerifiedChangeCause::Reset, new_path)
+    }
+}
+
 fn verified_request(
     writer: &HeaderChainWriter,
     before: &NonFinalizedState,
@@ -562,18 +578,13 @@ fn verified_request(
         old_path.last().map(|header| header.hash) != new_path.last().map(|header| header.hash);
     let event_path;
     let event = if best_changed {
-        let grows = new_path.len() > old_path.len()
-            && new_path
-                .iter()
-                .zip(&old_path)
-                .all(|(new, old)| new.hash == old.hash);
-        event_path = if grows {
-            new_path[old_path.len()..].to_vec()
-        } else {
-            new_path.clone()
-        };
+        let (cause, changed_path) = classify_verified_change(&old_path, &new_path);
+        event_path = changed_path.to_vec();
         let evidence = full_state_evidence(
-            if grows { b"grow" } else { b"reset" },
+            match cause {
+                VerifiedChangeCause::Grow => b"grow",
+                VerifiedChangeCause::Reset => b"reset",
+            },
             snapshot.state_version,
             accepted.hash,
             &event_path,
@@ -587,11 +598,7 @@ fn verified_request(
                     full_state_transition_id: evidence,
                     old_tip: old_frontier,
                     new_path: event_path,
-                    cause: if grows {
-                        VerifiedChangeCause::Grow
-                    } else {
-                        VerifiedChangeCause::Reset
-                    },
+                    cause,
                 }),
             },
         ));
@@ -1829,8 +1836,8 @@ mod tests {
             },
             non_finalized_state::NonFinalizedState,
             write::{
-                commit_contextual_finalization, commit_operator_change, verified_path,
-                verified_request, HeaderChainWriter, PreparedFullStateTransition,
+                classify_verified_change, commit_contextual_finalization, commit_operator_change,
+                verified_path, verified_request, HeaderChainWriter, PreparedFullStateTransition,
             },
         },
         tests::FakeChainHelper,
@@ -1844,8 +1851,9 @@ mod tests {
         HeaderContextFact, HeaderGeneration, HeaderNode, HeaderRules, HeaderValidationState,
         InsertHeaders, SourceId, StateVersion, SuffixWork, SystemClock, TargetCompletion,
         TransientBodyFailure, TransientBodyFailureKind, TransitionContext, TransitionEvent,
-        TransitionFailure, TransitionRequest, TrustedAnchor, ValidationLease, VerifiedGeneration,
-        WorkCoordinate, WorkOwner, WorkScope, POW_ADJUSTMENT_BLOCK_SPAN,
+        TransitionFailure, TransitionRequest, TrustedAnchor, ValidationLease, VerifiedChangeCause,
+        VerifiedGeneration, VerifiedHeaderRef, WorkCoordinate, WorkOwner, WorkScope,
+        POW_ADJUSTMENT_BLOCK_SPAN,
     };
 
     #[test]
@@ -2098,6 +2106,49 @@ mod tests {
         .expect("the generated full-state and header paths agree")
         .commit(&writer.runtime, live, &writer.context())
         .expect("the generated full-state and header transition commits");
+    }
+
+    #[test]
+    fn same_lower_forward_resets_use_identical_branch_path() {
+        let header = regtest_genesis_block().header.clone();
+        let reference = |height: u32, hash: u8| VerifiedHeaderRef {
+            height: block::Height(height),
+            hash: block::Hash([hash; 32]),
+            header: header.clone(),
+        };
+        let old = vec![reference(1, 1), reference(2, 2), reference(3, 3)];
+        let direct_growth = vec![
+            reference(1, 1),
+            reference(2, 2),
+            reference(3, 3),
+            reference(4, 4),
+        ];
+        let lower = vec![reference(1, 1), reference(2, 12)];
+        let same_height = vec![reference(1, 1), reference(2, 12), reference(3, 13)];
+        let forward = vec![
+            reference(1, 1),
+            reference(2, 12),
+            reference(3, 13),
+            reference(4, 14),
+        ];
+
+        let (cause, changed_path) = classify_verified_change(&old, &direct_growth);
+        assert_eq!(cause, VerifiedChangeCause::Grow);
+        assert_eq!(changed_path, &direct_growth[old.len()..]);
+
+        for reset in [&lower, &same_height, &forward] {
+            let (cause, changed_path) = classify_verified_change(&old, reset);
+            assert_eq!(
+                cause,
+                VerifiedChangeCause::Reset,
+                "height relative to the old tip cannot turn a divergent branch into growth"
+            );
+            assert_eq!(
+                changed_path,
+                reset.as_slice(),
+                "every reset shape replaces the verified path from its exact branch identity"
+            );
+        }
     }
 
     fn assert_selected_header_matches_full_state(

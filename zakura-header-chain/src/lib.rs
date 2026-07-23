@@ -10,6 +10,7 @@ mod graph;
 mod ids;
 mod locator;
 mod node;
+mod ownership;
 mod retention;
 mod transition;
 mod validation;
@@ -33,6 +34,7 @@ pub use node::{
     BodyRuleId, BodyUnavailableSummary, BodyValidationState, DurableNodeError, EligibilityReason,
     EligibilityState, HeaderNode, HeaderValidationState,
 };
+pub use ownership::{CompletionDecision, CompletionGate, PendingOwners, StaleReason};
 pub use retention::RetentionPlan;
 pub use transition::*;
 pub use validation::{

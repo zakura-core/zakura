@@ -43,14 +43,14 @@ the remaining gap. Fuzzer reachability alone is not requirement coverage.
 | --- | --- | --- | --- | --- |
 | `header_codec` | Sole codec and four fixed discriminants | LC-SCOPE-09, LC-WIRE-01, LC-WIRE-06 | golden/truncation/discriminant corpus | Covered |
 | `recovery_rows` | Twelve RocksDB families and startup audit | LC-RECOVER-01..03, LC-TXN-01 | row mutation, migration, and refutation seeds | Covered for bounded mutations and mode transitions |
-| State-writer crash harness | `FaultPoint::ALL` and `FaultPoint::NO_CHANGE` durable/memory/publication handoffs | LC-TXN-01, LC-FRONTIER-04, LC-RECOVER-02 | durable AUD-14 | Partial: transient, verified, consensus-invalid, and no-change body conclusions; requester insertion and selected auxiliary repair; verified grow/reset; authenticated finality/history/pruning; migrated-pin fail-closed refutation; reversible operator invalidation/reconsideration; supplier/operator body-retry restarts; deferred-time reevaluation; exact auxiliary authentication; and atomic two-delivery auxiliary rejection with paired full-state batches are covered. Startup recovery and cross-process response/reactor boundaries remain open |
+| State-writer crash harness | `FaultPoint::ALL` and `FaultPoint::NO_CHANGE` durable/memory/publication handoffs | LC-TXN-01, LC-FRONTIER-04, LC-RECOVER-02 | durable AUD-14 | Covered for every real semantic transition/completion shape, repeated multi-row auxiliary writes, fail-closed migrated-pin commit, and the private startup `RecoveryPlan` transaction through publisher construction. True cross-process response/reactor boundaries remain open |
 | Header/full-state differential | Combined full-state/header writer before finalization | LC-PARITY-01..03, LC-SELECT-01..03 | `df_01_body_valid_fork_graph_matches_full_state_before_finalization` | Partial: both production network configurations compare body-valid fork work, equal-work raw-hash order, and selected tips; direct observable-header acceptance vectors and activation-boundary graph generation remain open |
 
 ## Named audit status
 
 AUD-01 through AUD-13 and AUD-INCIDENT have named deterministic
-orchestrations. The durable state-writer portion of AUD-14 is covered, but its
-full transition/response/reactor matrix is open. Shared AUD-15 next-child
+orchestrations. The durable state-writer and startup-recovery portions of
+AUD-14 are covered, but its cross-process response/reactor matrix is open. Shared AUD-15 next-child
 helpers cover the final exact selected header and verified frontiers in every
 structured replay, the consecutive-reset and incident fixtures, and AUD-10
 through AUD-13. Direct AUD-15 wiring at the network-only AUD-05 through AUD-09

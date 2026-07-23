@@ -28,6 +28,7 @@ use crate::{
     TransientBodyFailure, TransientBodyFailureKind, TransitionContext, TransitionFailure,
     TransitionPlan, TransitionRequest, TrustedAnchor, ValidationLease, VerifiedBodyEvidence,
     VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef, WorkOwner,
+    MAX_CANDIDATE_TIPS_V1,
 };
 
 /// Deterministic summary of one bounded structured-operation replay.
@@ -41,6 +42,8 @@ pub struct ForkReplaySummary {
     pub refused: u16,
     /// Valid idempotent or informational operations with no durable effect.
     pub no_effects: u16,
+    /// Exact candidate-tip-cap pressure checks completed.
+    pub pressure_checks: u16,
     /// Final authoritative snapshot.
     pub snapshot: EngineSnapshot,
     /// Stable digest of operation outcomes and snapshots.
@@ -401,6 +404,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     let mut commits = 0u16;
     let mut refused = 0u16;
     let mut no_effects = 0u16;
+    let mut pressure_checks = 0u16;
     let mut transcript = Sha256::new();
     let clock = ManualClock::new();
     let authority = FuzzAuthority;
@@ -563,6 +567,15 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                     },
                 )),
             },
+            15 => {
+                let digest = assert_candidate_eviction_boundary(operation);
+                transcript.update(b"pressure");
+                transcript.update(digest);
+                no_effects = no_effects.saturating_add(1);
+                pressure_checks = pressure_checks.saturating_add(1);
+                assert_exhaustive_oracle(&store);
+                continue;
+            }
             _ => {
                 // Explicit stale/no-op references are part of the operation language.
                 refused = refused.saturating_add(1);
@@ -619,10 +632,98 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         commits,
         refused,
         no_effects,
+        pressure_checks,
         snapshot: store.snapshot(),
         replay_digest: transcript.finalize().into(),
         retained_digest: retained_digest(&store),
     }
+}
+
+fn assert_candidate_eviction_boundary(seed: usize) -> [u8; 32] {
+    let mut store = FuzzStore::new(EngineMode::Integrated);
+    let clock = ManualClock::new();
+    let authority = FuzzAuthority;
+    let finalized = store.metadata.frontiers.finalized;
+    for index in 0..=MAX_CANDIDATE_TIPS_V1 {
+        assert_eq!(
+            store.graph.eligible_tips().len(),
+            index.max(1),
+            "candidate pressure seed {seed} retains every pre-cap tip at step {index}"
+        );
+        let branch = u8::try_from(index).expect("the candidate-tip bound fits in u8");
+        let operation = seed
+            .saturating_mul(MAX_CANDIDATE_TIPS_V1.saturating_add(1))
+            .saturating_add(index);
+        let request = store.insertion(finalized, 1, operation, branch);
+        let new_hash = match &request.event {
+            crate::TransitionEvent::InsertHeaders(event) => event.target_tip_hash,
+            _ => unreachable!("the pressure fixture constructs only header insertions"),
+        };
+        let expected_evicted = if index < MAX_CANDIDATE_TIPS_V1 {
+            None
+        } else {
+            let new_work = store
+                .graph
+                .node(finalized.hash)
+                .expect("the fixed anchor is retained")
+                .block_work;
+            store
+                .graph
+                .eligible_tips()
+                .into_iter()
+                .map(|tip| {
+                    (
+                        store
+                            .graph
+                            .score(tip.hash)
+                            .expect("eligible retained tips have scores"),
+                        tip.hash,
+                    )
+                })
+                .chain(std::iter::once((
+                    ChainScore::new(
+                        SuffixWork::zero()
+                            .checked_add(new_work)
+                            .expect("one fixed-work child cannot overflow"),
+                        new_hash,
+                    ),
+                    new_hash,
+                )))
+                .min_by_key(|(score, _)| *score)
+                .map(|(_, hash)| hash)
+        };
+        let context = TransitionContext {
+            config: &store.config,
+            clock: &clock,
+            full_state_authority: Some(&authority),
+            startup_capability: None,
+            retention_references: &[],
+        };
+        let plan = apply_transition(&store, request, &context)
+            .expect("the candidate-tip pressure fixture remains admissible");
+        assert_eq!(
+            plan.change_set().delete_nodes,
+            expected_evicted
+                .filter(|hash| *hash != new_hash)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "candidate pressure seed {seed} step {index} evicts exactly the independently lowest work/hash tip"
+        );
+        store.commit(&plan);
+        if let Some(evicted) = expected_evicted {
+            assert!(
+                store.graph.node(evicted).is_none(),
+                "the independently lowest candidate is absent after pressure"
+            );
+        }
+        assert_exhaustive_oracle(&store);
+    }
+    assert_eq!(
+        store.graph.eligible_tips().len(),
+        MAX_CANDIDATE_TIPS_V1,
+        "candidate-tip retention ends exactly at the configured cap"
+    );
+    retained_digest(&store)
 }
 
 fn assert_exhaustive_oracle(store: &FuzzStore) {
@@ -870,6 +971,15 @@ mod tests {
     }
 
     #[test]
+    fn candidate_pressure_evicts_exactly_the_lowest_tip_at_the_cap() {
+        let first = replay_fork_transition_bytes(b"x");
+        let second = replay_fork_transition_bytes(b"x");
+        assert_eq!(first, second);
+        assert_eq!(first.pressure_checks, 1);
+        assert_eq!(first.no_effects, 1);
+    }
+
+    #[test]
     #[should_panic(expected = "selected projection must exactly match parent links")]
     fn exhaustive_oracle_rejects_a_projection_gap() {
         let mut store = FuzzStore::new(EngineMode::Integrated);
@@ -978,6 +1088,10 @@ mod tests {
             (
                 "body_mismatch",
                 include_bytes!("../../fuzz/header-chain/corpus/fork_transitions/body_mismatch"),
+            ),
+            (
+                "evict_pressure",
+                include_bytes!("../../fuzz/header-chain/corpus/fork_transitions/evict_pressure"),
             ),
         ];
         for (name, bytes) in corpus {

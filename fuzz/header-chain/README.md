@@ -38,7 +38,10 @@ headers. Invalid references are explicit refused operations; valid
 informational/idempotent no-effects are counted separately. The shared
 feature-gated replay function runs the production planner and independently
 rebuilds retained indexes, eligibility, work ordering, and projections after
-every operation. It is also used by deterministic corpus tests.
+every operation. Candidate-pressure operations cross the exact tip cap in a
+bounded fixture and independently predict the lowest work/raw-hash eviction,
+including the case where the newly offered tip is discarded without a durable
+delete. The replay function is also used by deterministic corpus tests.
 
 `header_pursuit` consumes at most 512 bytes as four-byte operations over twenty
 logical peers. It drives the production peer work queue, response-page and

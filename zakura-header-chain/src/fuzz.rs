@@ -516,7 +516,11 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
             continue;
         }
         if encoded == b'V' {
-            let digest = assert_block_spec_mutations();
+            let digest = assert_block_spec_mutations(
+                bounded
+                    .get(operation.saturating_add(1)..)
+                    .unwrap_or_default(),
+            );
             transcript.update(b"block-spec-mutations");
             transcript.update(digest);
             no_effects = no_effects.saturating_add(1);
@@ -1163,7 +1167,8 @@ fn assert_fixed_anchor_boundaries() -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn assert_block_spec_mutations() -> [u8; 32] {
+fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
+    let parameter = |index: usize, default: u8| parameters.get(index).copied().unwrap_or(default);
     let store = FuzzStore::new(EngineMode::Integrated);
     let anchor = store.metadata.frontiers.finalized;
     let anchor_node = store
@@ -1208,8 +1213,19 @@ fn assert_block_spec_mutations() -> [u8; 32] {
         prepared.headers()[0].validation,
         HeaderValidationState::Valid
     );
+    let mut historical_version = *valid;
+    historical_version.version = 5;
+    let historical_version = Arc::new(historical_version);
+    crate::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&historical_version)),
+        &lease,
+        &rules,
+        &clock,
+    )
+    .expect("a high-bit-clear historical version above four is canonical");
 
-    let future = child(3 * 60 * 60);
+    let future_offset = (2 * 60 * 60) + 1 + i64::from(parameter(0, 0));
+    let future = child(future_offset);
     let prepared = crate::prepare_headers(
         HeaderBatchInput::new(std::slice::from_ref(&future)),
         &lease,
@@ -1224,21 +1240,40 @@ fn assert_block_spec_mutations() -> [u8; 32] {
 
     let mut cases = Vec::new();
     let mut wrong_parent = *valid;
-    wrong_parent.previous_block_hash = block::Hash([0x41; 32]);
+    let mut wrong_parent_hash = block::Hash([parameter(1, 0x41); 32]);
+    if wrong_parent_hash == anchor.hash {
+        wrong_parent_hash.0[0] ^= 1;
+    }
+    wrong_parent.previous_block_hash = wrong_parent_hash;
     cases.push((Arc::new(wrong_parent), HeaderRule::ParentLink));
     let mut bad_version = *valid;
-    bad_version.version = 3;
+    bad_version.version = if parameter(2, 0) & 1 == 0 {
+        u32::from(parameter(2, 0) % 4)
+    } else {
+        0x8000_0000 | u32::from(parameter(2, 0))
+    };
     cases.push((Arc::new(bad_version), HeaderRule::EncodingVersionHash));
     let mut bad_commitment = *valid;
-    bad_commitment.commitment_bytes = [0x42; 32].into();
+    let mut commitment = [parameter(3, 0x42); 32];
+    commitment[0] |= 1;
+    bad_commitment.commitment_bytes = commitment.into();
     cases.push((Arc::new(bad_commitment), HeaderRule::CommitmentStructure));
     let mut bad_target = *valid;
     bad_target.difficulty_threshold =
-        zakura_chain::work::difficulty::CompactDifficulty::from_le_bytes([0; 4]);
+        zakura_chain::work::difficulty::CompactDifficulty::from_le_bytes([
+            parameter(4, 0),
+            parameter(5, 0),
+            parameter(6, 0) | 0x80,
+            0x1d,
+        ]);
     cases.push((Arc::new(bad_target), HeaderRule::CompactTarget));
-    cases.push((child(0), HeaderRule::ContextualDifficultyAndTime));
+    cases.push((
+        child(-i64::from(parameter(7, 0))),
+        HeaderRule::ContextualDifficultyAndTime,
+    ));
 
     let mut hasher = Sha256::new();
+    hasher.update(parameters.get(..8).unwrap_or(parameters));
     for (header, expected_rule) in cases {
         let failure = crate::prepare_headers(
             HeaderBatchInput::new(std::slice::from_ref(&header)),
@@ -1976,6 +2011,19 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.validation_checks, 1);
         assert_eq!(first.no_effects, 1);
+
+        for parameters in [
+            &[][..],
+            &[0; 8][..],
+            &[u8::MAX; 8][..],
+            &[1, 17, 2, 33, 4, 55, 6, 77][..],
+        ] {
+            assert_eq!(
+                assert_block_spec_mutations(parameters),
+                assert_block_spec_mutations(parameters),
+                "byte-parameterized single-field mutations are deterministic"
+            );
+        }
     }
 
     #[test]

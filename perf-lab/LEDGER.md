@@ -372,3 +372,13 @@ This file is the sole reporting channel (design D5). Entry template:
   stream tonight — 4 consecutive mid-stream deaths across two protocols.
   Worth either a chunk-friendly mirror or accepting resume-style fetch as
   the default (harness patch B-16 v2, planned).
+
+### Rescue succeeded — settle1 relaunched (2026-07-23 ~03:10Z)
+
+- resumable fetch completed (single unbroken stream this time — the CDN
+  cutting is intermittent), sha256 matched the harness pin, manual extract
+  verified against the harness's own presence check
+  (state/v28/mainnet/version). Master cached on-droplet; no more downloads
+  needed for perf-lab-s3's lifetime.
+- settle1 relaunched (build + two k=1 legs only, ~45 min). Chain unchanged:
+  settle1 → exp002-k8-c confirmation → two-leg WIN test.

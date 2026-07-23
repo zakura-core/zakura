@@ -7,7 +7,7 @@ use super::{
     reactor::*,
     state::{
         BufferedHeaderRange, HeaderSyncCore, OutstandingPhase, OutstandingRange, PendingOperation,
-        RangePriority, RangePurpose, RangeRequest, RootAuthSource, VctRootRepair,
+        PendingRootAuth, RangePriority, RangePurpose, RangeRequest, RootAuthSource, VctRootRepair,
         RETAINED_ROOT_LOCAL_MAX_ATTEMPTS, ROOT_AUTH_MIN_BODY_LEAD, VCT_ROOT_REPAIR_BACKOFFS,
         VCT_ROOT_REPAIR_MAX_WALL_TIME,
     },
@@ -1332,7 +1332,7 @@ fn commit_and_authentication_operations_from_one_request_are_distinct() {
         range,
         purpose: RangePurpose::Sync,
         retention_candidate: None,
-        root_auth_source: None,
+        root_auth: None,
         completion_observed: false,
     };
     state
@@ -1424,7 +1424,15 @@ fn session_retirement_cleans_auth_and_retained_payloads() {
             range: auth_range,
             purpose: RangePurpose::AuthenticateRoots,
             retention_candidate: None,
-            root_auth_source: Some(RootAuthSource::Fallback),
+            root_auth: Some(PendingRootAuth {
+                source: RootAuthSource::Fallback,
+                expected: HeaderRootAuthState {
+                    authenticated_height: block::Height(0),
+                    authenticated_hash: network.genesis_hash(),
+                    completed_checkpoint_height: block::Height(0),
+                    completed_checkpoint_hash: network.genesis_hash(),
+                },
+            }),
             completion_observed: false,
         },
     );
@@ -1437,7 +1445,7 @@ fn session_retirement_cleans_auth_and_retained_payloads() {
             },
             purpose: RangePurpose::Sync,
             retention_candidate: Some(payload.clone()),
-            root_auth_source: None,
+            root_auth: None,
             completion_observed: false,
         },
     );
@@ -1538,7 +1546,15 @@ fn clear_inflight_root_auth_completes_on_advancement() {
             range: auth_range,
             purpose: RangePurpose::AuthenticateRoots,
             retention_candidate: None,
-            root_auth_source: Some(RootAuthSource::Fallback),
+            root_auth: Some(PendingRootAuth {
+                source: RootAuthSource::Fallback,
+                expected: HeaderRootAuthState {
+                    authenticated_height: block::Height(0),
+                    authenticated_hash: network.genesis_hash(),
+                    completed_checkpoint_height: block::Height(0),
+                    completed_checkpoint_hash: network.genesis_hash(),
+                },
+            }),
             completion_observed: false,
         },
     );
@@ -1551,7 +1567,7 @@ fn clear_inflight_root_auth_completes_on_advancement() {
             },
             purpose: RangePurpose::Sync,
             retention_candidate: None,
-            root_auth_source: None,
+            root_auth: None,
             completion_observed: false,
         },
     );
@@ -1597,7 +1613,15 @@ fn completed_inflight_root_auth_waits_for_driver_completion() {
             range: auth_range,
             purpose: RangePurpose::AuthenticateRoots,
             retention_candidate: None,
-            root_auth_source: Some(RootAuthSource::Fallback),
+            root_auth: Some(PendingRootAuth {
+                source: RootAuthSource::Fallback,
+                expected: HeaderRootAuthState {
+                    authenticated_height: block::Height(0),
+                    authenticated_hash: network.genesis_hash(),
+                    completed_checkpoint_height: block::Height(0),
+                    completed_checkpoint_hash: network.genesis_hash(),
+                },
+            }),
             completion_observed: false,
         },
     );
@@ -1654,7 +1678,15 @@ fn clear_inflight_root_auth_retires_without_requeue_on_rebase() {
             range: auth_range,
             purpose: RangePurpose::AuthenticateRoots,
             retention_candidate: None,
-            root_auth_source: Some(RootAuthSource::Fallback),
+            root_auth: Some(PendingRootAuth {
+                source: RootAuthSource::Fallback,
+                expected: HeaderRootAuthState {
+                    authenticated_height: block::Height(0),
+                    authenticated_hash: network.genesis_hash(),
+                    completed_checkpoint_height: block::Height(0),
+                    completed_checkpoint_hash: network.genesis_hash(),
+                },
+            }),
             completion_observed: false,
         },
     );
@@ -2756,6 +2788,48 @@ async fn stale_root_auth_failure_waits_for_watch_without_scoring() {
     loop {
         match next_non_query_action(&mut fixture.actions).await {
             HeaderSyncAction::AuthenticateHeaderRoots { .. } => break,
+            HeaderSyncAction::Misbehavior { .. } => {
+                panic!("stale root authentication failure must not score a peer")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_root_auth_failure_reschedules_when_watch_already_advanced() {
+    let (mut fixture, operation, auth, _source_peer) =
+        reactor_with_pending_retained_root_authentication(None).await;
+
+    // Checkpoint-only watch update: auth tip unchanged so retained coverage stays
+    // valid, but the launch snapshot no longer matches reactor-local state.
+    let advanced = HeaderRootAuthState {
+        completed_checkpoint_height: block::Height(4),
+        completed_checkpoint_hash: block::Hash([4; 32]),
+        ..auth
+    };
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(advanced)))
+        .await
+        .unwrap();
+    assert_no_root_authentication_or_misbehavior(&mut fixture.actions).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+            operation,
+            kind: HeaderRootAuthenticationFailureKind::Stale,
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::AuthenticateHeaderRoots { expected_state, .. } => {
+                assert_eq!(expected_state, advanced);
+                break;
+            }
             HeaderSyncAction::Misbehavior { .. } => {
                 panic!("stale root authentication failure must not score a peer")
             }

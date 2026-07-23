@@ -553,7 +553,9 @@ impl HeaderSyncCore {
             .collect();
         for (operation, range) in auth_operations {
             if let Some(pending) = self.pending_operations.remove(&operation) {
-                if let Some(RootAuthSource::Retained(start)) = pending.root_auth_source {
+                if let Some(RootAuthSource::Retained(start)) =
+                    pending.root_auth.map(|auth| auth.source)
+                {
                     if let Some(retained) = self.retained_roots.get_mut(&start) {
                         retained.authenticating = false;
                     }
@@ -656,7 +658,9 @@ impl HeaderSyncCore {
 
     pub(super) fn retire_stale_auth_operation(&mut self, operation: &HeaderSyncOperationIdentity) {
         if let Some(pending) = self.pending_operations.remove(operation) {
-            if let Some(RootAuthSource::Retained(start)) = pending.root_auth_source {
+            if let Some(RootAuthSource::Retained(start)) =
+                pending.root_auth.map(|auth| auth.source)
+            {
                 self.remove_retained_root(start, "session_retired");
             }
             self.schedule.retire_operation(operation, pending.range);
@@ -1053,8 +1057,16 @@ pub(super) struct PendingOperation {
     pub(super) range: RangeRequest,
     pub(super) purpose: RangePurpose,
     pub(super) retention_candidate: Option<HeaderRangePayload>,
-    pub(super) root_auth_source: Option<RootAuthSource>,
+    /// Present for `AuthenticateRoots` only: source plus launch snapshot.
+    pub(super) root_auth: Option<PendingRootAuth>,
     pub(super) completion_observed: bool,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct PendingRootAuth {
+    pub(super) source: RootAuthSource,
+    /// Launch snapshot; used to detect watch-first stale races.
+    pub(super) expected: HeaderRootAuthState,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

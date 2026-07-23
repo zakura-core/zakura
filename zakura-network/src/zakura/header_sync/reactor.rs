@@ -1342,7 +1342,7 @@ impl HeaderSyncReactor {
         };
         let source_wire_request = operation.wire_request;
         let peer = source_wire_request.peer.clone();
-        let retained_start = match pending.root_auth_source {
+        let retained_start = match pending.root_auth.map(|auth| auth.source) {
             Some(RootAuthSource::Retained(start)) => Some(start),
             _ => None,
         };
@@ -1378,7 +1378,13 @@ impl HeaderSyncReactor {
                 } else if retained_start.is_none() {
                     self.state.schedule.clear_assignment(pending.range);
                 }
-                self.state.root_auth_waiting_for_watch = true;
+                // Park only when the watch that invalidated this attempt has not
+                // already been applied. Otherwise the lane waits forever for a
+                // notification that already fired.
+                let expected = pending.root_auth.map(|auth| auth.expected);
+                if self.state.header_root_auth == expected {
+                    self.state.root_auth_waiting_for_watch = true;
+                }
             }
             HeaderRootAuthenticationFailureKind::CanonicalMismatch { height } => {
                 self.state.drop_retained_from(height, "canonical_mismatch");
@@ -2194,7 +2200,10 @@ impl HeaderSyncReactor {
                         range: buffered.range,
                         purpose: RangePurpose::AuthenticateRoots,
                         retention_candidate: None,
-                        root_auth_source: Some(RootAuthSource::Fallback),
+                        root_auth: Some(PendingRootAuth {
+                            source: RootAuthSource::Fallback,
+                            expected: expected_state,
+                        }),
                         completion_observed: false,
                     },
                 );
@@ -2314,7 +2323,7 @@ impl HeaderSyncReactor {
                         && buffered.payload.range().end()
                             <= self.startup.network.checkpoint_list().max_height())
                     .then(|| buffered.payload.clone()),
-                    root_auth_source: None,
+                    root_auth: None,
                     completion_observed: false,
                 },
             );
@@ -2437,7 +2446,10 @@ impl HeaderSyncReactor {
                 range,
                 purpose: RangePurpose::AuthenticateRoots,
                 retention_candidate: None,
-                root_auth_source: Some(RootAuthSource::Retained(start)),
+                root_auth: Some(PendingRootAuth {
+                    source: RootAuthSource::Retained(start),
+                    expected: auth,
+                }),
                 completion_observed: false,
             },
         );

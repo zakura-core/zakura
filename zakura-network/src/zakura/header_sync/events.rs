@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -363,16 +363,12 @@ pub struct HeaderPathPage {
 }
 
 /// Result of preparing and atomically applying one complete requester target.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum HeaderTargetAdmissionResult {
     /// State committed the insertion or recognized its idempotent replay.
     Applied,
-    /// The durable generation or validation lease changed before admission.
-    Stale,
-    /// A deterministic peer-supplied header rule failed.
-    InvalidHeader,
-    /// Local state, configuration, or service availability prevented admission.
-    LocalFailure,
+    /// Exact typed failure preserved from the state/driver boundary.
+    Failed(Arc<zakura_header_chain::HeaderChainError>),
 }
 
 /// Sealed complete-target insertion returned by off-reactor validation.
@@ -380,12 +376,8 @@ pub enum HeaderTargetAdmissionResult {
 pub enum HeaderTargetPreparationResult {
     /// All deterministic rules passed and the target is ready for the completion gate.
     Prepared(Box<zakura_header_chain::InsertHeaders>),
-    /// Durable context changed before preparation completed.
-    Stale,
-    /// A deterministic peer-supplied header rule failed.
-    InvalidHeader,
-    /// Local state, configuration, clock, or task availability failed.
-    LocalFailure,
+    /// Exact typed failure preserved from the validation/driver boundary.
+    Failed(Arc<zakura_header_chain::HeaderChainError>),
 }
 
 /// Actions emitted by the header-sync reactor for node wiring.

@@ -1,4 +1,4 @@
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 
 use color_eyre::eyre::{eyre, Report};
 use sha2::{Digest, Sha256};
@@ -406,7 +406,11 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         )
                         .await
                     }
-                    _ => HeaderTargetPreparationResult::Stale,
+                    _ => typed_preparation_failure(
+                        zakura_header_chain::HeaderChainError::stale_target(
+                            zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                        ),
+                    ),
                 };
                 let _ = handles
                     .header_sync
@@ -456,6 +460,105 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
     }
 }
 
+fn typed_preparation_failure(
+    error: zakura_header_chain::HeaderChainError,
+) -> HeaderTargetPreparationResult {
+    HeaderTargetPreparationResult::Failed(Arc::new(error))
+}
+
+fn typed_admission_failure(
+    error: zakura_header_chain::HeaderChainError,
+) -> HeaderTargetAdmissionResult {
+    HeaderTargetAdmissionResult::Failed(Arc::new(error))
+}
+
+fn header_failure_evidence(
+    source: zakura_header_chain::SourceId,
+    owner: zakura_header_chain::WorkOwner,
+    hash: block::Hash,
+    rule: zakura_header_chain::RuleId,
+) -> zakura_header_chain::EvidenceId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-header-validation-failure-v1");
+    hasher.update(source.digest());
+    hasher.update(owner.session_id.to_le_bytes());
+    hasher.update(owner.request_id.get().to_le_bytes());
+    hasher.update(hash.0);
+    hasher.update(rule.as_str().as_bytes());
+    zakura_header_chain::EvidenceId::from_digest(hasher.finalize().into())
+}
+
+fn classify_header_preparation_failure(
+    error: zakura_header_chain::HeaderFailure,
+    entries: &[HeaderEntry],
+    source: zakura_header_chain::SourceId,
+    owner: zakura_header_chain::WorkOwner,
+) -> zakura_header_chain::HeaderChainError {
+    match error {
+        zakura_header_chain::HeaderFailure::Invalid {
+            offset,
+            rule,
+            reason,
+        } => {
+            let hash = entries
+                .get(offset)
+                .expect("the validation failure offset comes from this exact header batch")
+                .header
+                .hash();
+            let rule_id = rule
+                .rule_ids()
+                .first()
+                .copied()
+                .expect("every validation stage has normative rule ownership");
+            zakura_header_chain::HeaderChainError::invalid_header(
+                zakura_header_chain::ErrorSubject::Header(zakura_header_chain::HeaderId::new(hash)),
+                rule_id,
+                header_failure_evidence(source, owner, hash, rule_id),
+                source,
+                Some(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    reason,
+                ))),
+            )
+        }
+        zakura_header_chain::HeaderFailure::Empty => {
+            zakura_header_chain::HeaderChainError::malformed_protocol(
+                zakura_header_chain::ErrorSubject::Request {
+                    source,
+                    request_id: owner.request_id,
+                },
+                zakura_header_chain::RuleId::new("LC-WIRE-08"),
+                source,
+                None,
+            )
+        }
+        zakura_header_chain::HeaderFailure::InvalidLease => {
+            zakura_header_chain::HeaderChainError::stale_target(
+                zakura_header_chain::ErrorSubject::Branch(owner.branch),
+            )
+        }
+        zakura_header_chain::HeaderFailure::ClockRange => {
+            zakura_header_chain::HeaderChainError::local_resource(
+                zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                Some(Box::new(zakura_header_chain::HeaderFailure::ClockRange)),
+            )
+        }
+    }
+}
+
+fn classify_body_size_hint_failure(
+    error: zakura_header_chain::TransitionTypeError,
+    hash: block::Hash,
+    source: zakura_header_chain::SourceId,
+) -> zakura_header_chain::HeaderChainError {
+    zakura_header_chain::HeaderChainError::malformed_protocol(
+        zakura_header_chain::ErrorSubject::Header(zakura_header_chain::HeaderId::new(hash)),
+        zakura_header_chain::RuleId::new("LC-WIRE-13"),
+        source,
+        Some(Box::new(error)),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn prepare_header_target<ReadState>(
     read_state: ReadState,
@@ -489,7 +592,9 @@ where
             lease
         }
         Ok(zakura_state::ReadResponse::HeaderValidationLease(_)) => {
-            return HeaderTargetPreparationResult::Stale;
+            return typed_preparation_failure(zakura_header_chain::HeaderChainError::stale_target(
+                zakura_header_chain::ErrorSubject::Branch(owner.branch),
+            ));
         }
         Ok(response) => {
             warn!(
@@ -497,17 +602,32 @@ where
                 ?response,
                 "unexpected header validation lease response"
             );
-            return HeaderTargetPreparationResult::LocalFailure;
+            return typed_preparation_failure(
+                zakura_header_chain::HeaderChainError::local_resource(
+                    zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                    None,
+                ),
+            );
         }
         Err(error) => {
             warn!(?peer, ?error, "failed to acquire header validation lease");
-            return HeaderTargetPreparationResult::LocalFailure;
+            return typed_preparation_failure(
+                zakura_header_chain::HeaderChainError::local_resource(
+                    zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                    Some(error),
+                ),
+            );
         }
     };
 
     let prepared = tokio::task::spawn_blocking(move || {
         let rules = zakura_header_chain::HeaderRules::for_validation_lease(network, &lease)
-            .map_err(|_| HeaderTargetPreparationResult::LocalFailure)?;
+            .map_err(|error| {
+                typed_preparation_failure(zakura_header_chain::HeaderChainError::unknown_anchor(
+                    zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                    Some(Box::new(error)),
+                ))
+            })?;
         let headers: Vec<_> = entries.iter().map(|entry| entry.header.clone()).collect();
         let batch = zakura_header_chain::prepare_headers(
             zakura_header_chain::HeaderBatchInput::new(&headers),
@@ -515,20 +635,21 @@ where
             &rules,
             &zakura_header_chain::SystemClock,
         )
-        .map_err(|error| match error {
-            zakura_header_chain::HeaderFailure::Invalid { .. } => {
-                HeaderTargetPreparationResult::InvalidHeader
-            }
-            zakura_header_chain::HeaderFailure::Empty
-            | zakura_header_chain::HeaderFailure::InvalidLease
-            | zakura_header_chain::HeaderFailure::ClockRange => {
-                HeaderTargetPreparationResult::LocalFailure
-            }
+        .map_err(|error| {
+            typed_preparation_failure(classify_header_preparation_failure(
+                error, &entries, source, owner,
+            ))
         })?;
         let mut aux = Vec::with_capacity(entries.len());
         for (entry, prepared) in entries.iter().zip(batch.headers()) {
-            let body_size = zakura_header_chain::BodySizeHint::new(entry.body_size)
-                .map_err(|_| HeaderTargetPreparationResult::InvalidHeader)?;
+            let body_size =
+                zakura_header_chain::BodySizeHint::new(entry.body_size).map_err(|error| {
+                    typed_preparation_failure(classify_body_size_hint_failure(
+                        error,
+                        prepared.hash,
+                        source,
+                    ))
+                })?;
             let mut hasher = Sha256::new();
             hasher.update(b"zakura-header-aux-delivery-v1");
             hasher.update(source.digest());
@@ -553,7 +674,12 @@ where
         Ok(Err(result)) => return result,
         Err(error) => {
             warn!(?peer, ?error, "header target preparation task failed");
-            return HeaderTargetPreparationResult::LocalFailure;
+            return typed_preparation_failure(
+                zakura_header_chain::HeaderChainError::local_resource(
+                    zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                    Some(Box::new(error)),
+                ),
+            );
         }
     };
 
@@ -596,14 +722,22 @@ where
         )) => HeaderTargetAdmissionResult::Applied,
         Ok(zakura_state::Response::HeaderChainInsertApplied(
             zakura_header_chain::ApplyResult::Stale(_),
-        )) => HeaderTargetAdmissionResult::Stale,
+        )) => typed_admission_failure(zakura_header_chain::HeaderChainError::stale_target(
+            zakura_header_chain::ErrorSubject::Branch(owner.branch),
+        )),
         Ok(response) => {
             warn!(?peer, ?response, "unexpected header insertion response");
-            HeaderTargetAdmissionResult::LocalFailure
+            typed_admission_failure(zakura_header_chain::HeaderChainError::local_resource(
+                zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                None,
+            ))
         }
         Err(error) => {
             warn!(?peer, ?error, "failed to atomically admit header target");
-            HeaderTargetAdmissionResult::LocalFailure
+            typed_admission_failure(zakura_header_chain::HeaderChainError::local_resource(
+                zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                Some(error),
+            ))
         }
     }
 }
@@ -853,5 +987,124 @@ fn header_misbehavior_label(reason: zakura_network::zakura::HeaderSyncMisbehavio
     match reason {
         zakura_network::zakura::HeaderSyncMisbehavior::MalformedMessage => "malformed_message",
         zakura_network::zakura::HeaderSyncMisbehavior::InvalidHeader => "invalid_header",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use zakura_chain::block::genesis::regtest_genesis_block;
+
+    use super::*;
+
+    fn owner() -> zakura_header_chain::WorkOwner {
+        zakura_header_chain::WorkScope {
+            state_version: zakura_header_chain::StateVersion::new(1),
+            header_generation: zakura_header_chain::HeaderGeneration::new(2),
+            verified_generation: None,
+            branch: zakura_header_chain::BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
+        }
+        .bind(
+            3,
+            NonZeroU64::new(4).expect("the fixture request ID is nonzero"),
+        )
+    }
+
+    #[test]
+    fn driver_preserves_every_header_preparation_failure_category() {
+        let source = zakura_header_chain::SourceId::from_digest([5; 32]);
+        let owner = owner();
+        let header = regtest_genesis_block().header.clone();
+        let entries = [HeaderEntry {
+            header: header.clone(),
+            body_size: 0,
+            tree_aux: None,
+        }];
+
+        let invalid = classify_header_preparation_failure(
+            zakura_header_chain::HeaderFailure::Invalid {
+                offset: 0,
+                rule: zakura_header_chain::HeaderRule::ParentLink,
+                reason: "wrong parent".to_owned(),
+            },
+            &entries,
+            source,
+            owner,
+        );
+        assert_eq!(
+            invalid.category,
+            zakura_header_chain::ErrorCategory::InvalidHeader
+        );
+        assert_eq!(
+            invalid.subject,
+            zakura_header_chain::ErrorSubject::Header(zakura_header_chain::HeaderId::new(
+                header.hash()
+            ))
+        );
+        assert_eq!(
+            invalid.rule,
+            Some(zakura_header_chain::RuleId::new("LC-VAL-03"))
+        );
+        assert!(invalid.evidence.is_some());
+        assert_eq!(
+            invalid.attribution,
+            zakura_header_chain::Attribution::HeaderPeer(source)
+        );
+
+        for (failure, expected_category, expected_attribution) in [
+            (
+                zakura_header_chain::HeaderFailure::Empty,
+                zakura_header_chain::ErrorCategory::MalformedProtocol,
+                zakura_header_chain::Attribution::HeaderPeer(source),
+            ),
+            (
+                zakura_header_chain::HeaderFailure::InvalidLease,
+                zakura_header_chain::ErrorCategory::StaleTargetOrGeneration,
+                zakura_header_chain::Attribution::None,
+            ),
+            (
+                zakura_header_chain::HeaderFailure::ClockRange,
+                zakura_header_chain::ErrorCategory::LocalResourceOrStorage,
+                zakura_header_chain::Attribution::None,
+            ),
+        ] {
+            let error = classify_header_preparation_failure(failure, &entries, source, owner);
+            assert_eq!(error.category, expected_category);
+            assert_eq!(error.attribution, expected_attribution);
+        }
+    }
+
+    #[test]
+    fn oversized_body_hint_is_malformed_metadata_not_an_invalid_header() {
+        let source = zakura_header_chain::SourceId::from_digest([6; 32]);
+        let hash = block::Hash([7; 32]);
+        let error = classify_body_size_hint_failure(
+            zakura_header_chain::BodySizeHint::new(2_000_001)
+                .expect_err("the fixture exceeds the canonical body-size hint limit"),
+            hash,
+            source,
+        );
+
+        assert_eq!(
+            error.category,
+            zakura_header_chain::ErrorCategory::MalformedProtocol
+        );
+        assert_ne!(
+            error.category,
+            zakura_header_chain::ErrorCategory::InvalidHeader
+        );
+        assert_eq!(
+            error.subject,
+            zakura_header_chain::ErrorSubject::Header(zakura_header_chain::HeaderId::new(hash))
+        );
+        assert_eq!(
+            error.rule,
+            Some(zakura_header_chain::RuleId::new("LC-WIRE-13"))
+        );
+        assert_eq!(
+            error.attribution,
+            zakura_header_chain::Attribution::HeaderPeer(source)
+        );
     }
 }

@@ -715,7 +715,7 @@ impl HeaderSyncReactor {
         if complete {
             if staged_tip.hash != active.target.status.selected_tip_hash {
                 self.retire_peer_work(&peer);
-                self.report_misbehavior(peer, HeaderSyncMisbehavior::InvalidHeader);
+                self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
                 return;
             }
             active.phase = HeaderTargetPhase::Preparing;
@@ -817,7 +817,7 @@ impl HeaderSyncReactor {
         }
         if response.entries[0].header.hash() != context.target.hash {
             self.retry_vct_repair(task.owner, source);
-            self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidHeader);
+            self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::MalformedMessage);
             return true;
         }
         if self
@@ -953,7 +953,7 @@ impl HeaderSyncReactor {
         {
             return;
         }
-        let admitted_range = if result == HeaderTargetAdmissionResult::Applied {
+        let admitted_range = if matches!(result, HeaderTargetAdmissionResult::Applied) {
             active
                 .common_ancestor
                 .zip(active.staged_tip())
@@ -975,10 +975,9 @@ impl HeaderSyncReactor {
                 }
                 metrics::counter!("sync.header.target.admitted").increment(1);
             }
-            HeaderTargetAdmissionResult::InvalidHeader => {
-                self.report_misbehavior(peer, HeaderSyncMisbehavior::InvalidHeader);
+            HeaderTargetAdmissionResult::Failed(error) => {
+                self.handle_typed_failure(peer, source, &error);
             }
-            HeaderTargetAdmissionResult::Stale | HeaderTargetAdmissionResult::LocalFailure => {}
         }
     }
 
@@ -1015,12 +1014,9 @@ impl HeaderSyncReactor {
                     self.retire_peer_work(&peer);
                 }
             }
-            HeaderTargetPreparationResult::InvalidHeader => {
+            HeaderTargetPreparationResult::Failed(error) => {
                 self.retire_peer_work(&peer);
-                self.report_misbehavior(peer, HeaderSyncMisbehavior::InvalidHeader);
-            }
-            HeaderTargetPreparationResult::Stale | HeaderTargetPreparationResult::LocalFailure => {
-                self.retire_peer_work(&peer);
+                self.handle_typed_failure(peer, source, &error);
             }
         }
     }
@@ -1072,12 +1068,9 @@ impl HeaderSyncReactor {
                 }
                 self.dispatch_vct_apply(peer, source, owner);
             }
-            HeaderTargetPreparationResult::InvalidHeader => {
+            HeaderTargetPreparationResult::Failed(error) => {
                 self.retry_vct_repair(owner, source);
-                self.report_misbehavior(peer, HeaderSyncMisbehavior::InvalidHeader);
-            }
-            HeaderTargetPreparationResult::Stale | HeaderTargetPreparationResult::LocalFailure => {
-                self.retry_vct_repair(owner, source);
+                self.handle_typed_failure(peer, source, &error);
             }
         }
     }
@@ -1124,7 +1117,7 @@ impl HeaderSyncReactor {
 
     fn handle_vct_repair_admission_ready(
         &mut self,
-        _peer: ZakuraPeerId,
+        peer: ZakuraPeerId,
         source: zakura_header_chain::SourceId,
         owner: zakura_header_chain::WorkOwner,
         result: HeaderTargetAdmissionResult,
@@ -1144,9 +1137,8 @@ impl HeaderSyncReactor {
                 self.completed_vct_repair_generation = Some(generation);
                 metrics::counter!("sync.header.vct.repair.admitted.total").increment(1);
             }
-            HeaderTargetAdmissionResult::Stale
-            | HeaderTargetAdmissionResult::InvalidHeader
-            | HeaderTargetAdmissionResult::LocalFailure => {
+            HeaderTargetAdmissionResult::Failed(error) => {
+                self.handle_typed_failure(peer, source, &error);
                 if generation == self.vct_repair_status.generation {
                     self.schedule_current_vct_repair();
                 }
@@ -2015,7 +2007,56 @@ impl HeaderSyncReactor {
         }
     }
 
+    fn handle_typed_failure(
+        &self,
+        peer: ZakuraPeerId,
+        source: zakura_header_chain::SourceId,
+        error: &zakura_header_chain::HeaderChainError,
+    ) {
+        metrics::counter!(
+            "sync.header.failure.total",
+            "category" => error.category.metrics_label(),
+            "attribution" => error.attribution.metrics_label(),
+        )
+        .increment(1);
+        let zakura_header_chain::Attribution::HeaderPeer(attributed_source) = error.attribution
+        else {
+            return;
+        };
+        if attributed_source != source || !error.is_automatic_header_peer_fault() {
+            return;
+        }
+        let reason = match error.category {
+            zakura_header_chain::ErrorCategory::MalformedProtocol => {
+                HeaderSyncMisbehavior::MalformedMessage
+            }
+            zakura_header_chain::ErrorCategory::InvalidHeader => {
+                HeaderSyncMisbehavior::InvalidHeader
+            }
+            _ => return,
+        };
+        self.dispatch_misbehavior(peer, reason);
+    }
+
     fn report_misbehavior(&self, peer: ZakuraPeerId, reason: HeaderSyncMisbehavior) {
+        let category = match reason {
+            HeaderSyncMisbehavior::MalformedMessage => {
+                zakura_header_chain::ErrorCategory::MalformedProtocol
+            }
+            HeaderSyncMisbehavior::InvalidHeader => {
+                zakura_header_chain::ErrorCategory::InvalidHeader
+            }
+        };
+        metrics::counter!(
+            "sync.header.failure.total",
+            "category" => category.metrics_label(),
+            "attribution" => "header_peer",
+        )
+        .increment(1);
+        self.dispatch_misbehavior(peer, reason);
+    }
+
+    fn dispatch_misbehavior(&self, peer: ZakuraPeerId, reason: HeaderSyncMisbehavior) {
         let _ = self.dispatch_action(HeaderSyncAction::Misbehavior { peer, reason });
     }
 }
@@ -2054,6 +2095,38 @@ mod tests {
 
     fn peer() -> ZakuraPeerId {
         ZakuraPeerId::new(vec![0x71; 32]).expect("the test peer ID has the required length")
+    }
+
+    fn stale_failure(
+        owner: zakura_header_chain::WorkOwner,
+    ) -> Arc<zakura_header_chain::HeaderChainError> {
+        Arc::new(zakura_header_chain::HeaderChainError::stale_target(
+            zakura_header_chain::ErrorSubject::Branch(owner.branch),
+        ))
+    }
+
+    fn local_failure(
+        owner: zakura_header_chain::WorkOwner,
+    ) -> Arc<zakura_header_chain::HeaderChainError> {
+        Arc::new(zakura_header_chain::HeaderChainError::local_resource(
+            zakura_header_chain::ErrorSubject::Branch(owner.branch),
+            None,
+        ))
+    }
+
+    fn invalid_header_failure(
+        source: zakura_header_chain::SourceId,
+        owner: zakura_header_chain::WorkOwner,
+    ) -> Arc<zakura_header_chain::HeaderChainError> {
+        Arc::new(zakura_header_chain::HeaderChainError::invalid_header(
+            zakura_header_chain::ErrorSubject::Header(zakura_header_chain::HeaderId::new(
+                owner.branch.target_tip_hash,
+            )),
+            zakura_header_chain::RuleId::new("LC-VAL-02"),
+            zakura_header_chain::EvidenceId::from_digest([0x71; 32]),
+            source,
+            None,
+        ))
     }
 
     fn request(request_id: u64, target: block::Hash, locator: block::Hash) -> GetHeaders {
@@ -2290,7 +2363,7 @@ mod tests {
                 }],
             },
         );
-        assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+        assert_peer_violation(&mut actions, HeaderSyncMisbehavior::MalformedMessage);
 
         let (mut reactor, mut actions, _snapshot, peer, source, owner) = peer_violation_fixture();
         reactor
@@ -2302,9 +2375,89 @@ mod tests {
             peer,
             source,
             owner,
-            HeaderTargetPreparationResult::InvalidHeader,
+            HeaderTargetPreparationResult::Failed(invalid_header_failure(source, owner)),
         );
         assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+    }
+
+    #[test]
+    fn typed_taxonomy_scores_only_exact_attributed_header_peer_faults() {
+        let (reactor, mut actions, _snapshot, peer, source, owner) = peer_violation_fixture();
+        let subject = zakura_header_chain::ErrorSubject::Branch(owner.branch);
+
+        for (category, expected) in [
+            (
+                zakura_header_chain::ErrorCategory::MalformedProtocol,
+                HeaderSyncMisbehavior::MalformedMessage,
+            ),
+            (
+                zakura_header_chain::ErrorCategory::InvalidHeader,
+                HeaderSyncMisbehavior::InvalidHeader,
+            ),
+        ] {
+            let error = zakura_header_chain::HeaderChainError::new(
+                category,
+                subject,
+                None,
+                None,
+                zakura_header_chain::Attribution::HeaderPeer(source),
+                None,
+            );
+            reactor.handle_typed_failure(peer.clone(), source, &error);
+            assert_peer_violation(&mut actions, expected);
+        }
+
+        for category in [
+            zakura_header_chain::ErrorCategory::ValidLosingFork,
+            zakura_header_chain::ErrorCategory::DeferredHeader,
+            zakura_header_chain::ErrorCategory::BodyPayloadMismatch,
+            zakura_header_chain::ErrorCategory::ConsensusBodyInvalid,
+            zakura_header_chain::ErrorCategory::OperatorIneligible,
+            zakura_header_chain::ErrorCategory::StaleTargetOrGeneration,
+            zakura_header_chain::ErrorCategory::LocalAnchorOrIncoherence,
+            zakura_header_chain::ErrorCategory::LocalResourceOrStorage,
+        ] {
+            let error = zakura_header_chain::HeaderChainError::new(
+                category,
+                subject,
+                None,
+                None,
+                zakura_header_chain::Attribution::HeaderPeer(source),
+                None,
+            );
+            reactor.handle_typed_failure(peer.clone(), source, &error);
+            assert!(
+                actions.try_recv().is_err(),
+                "{category:?} cannot cross the header-peer scoring boundary"
+            );
+        }
+
+        let wrong_source = zakura_header_chain::SourceId::from_digest([0x72; 32]);
+        for category in [
+            zakura_header_chain::ErrorCategory::MalformedProtocol,
+            zakura_header_chain::ErrorCategory::InvalidHeader,
+        ] {
+            for attribution in [
+                zakura_header_chain::Attribution::None,
+                zakura_header_chain::Attribution::HeaderPeer(wrong_source),
+                zakura_header_chain::Attribution::BodyPeer(source),
+                zakura_header_chain::Attribution::AuxPeer(source),
+            ] {
+                let error = zakura_header_chain::HeaderChainError::new(
+                    category,
+                    subject,
+                    None,
+                    None,
+                    attribution,
+                    None,
+                );
+                reactor.handle_typed_failure(peer.clone(), source, &error);
+                assert!(
+                    actions.try_recv().is_err(),
+                    "{category:?} with {attribution:?} cannot score this header peer"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2443,10 +2596,7 @@ mod tests {
             );
         }
 
-        for result in [
-            HeaderTargetAdmissionResult::Applied,
-            HeaderTargetAdmissionResult::LocalFailure,
-        ] {
+        for is_local_failure in [false, true] {
             let shutdown = CancellationToken::new();
             let mut startup = startup(shutdown);
             let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
@@ -2458,6 +2608,11 @@ mod tests {
             let peer = peer();
             let (source, owner, old_range) =
                 seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
+            let result = if is_local_failure {
+                HeaderTargetAdmissionResult::Failed(local_failure(owner))
+            } else {
+                HeaderTargetAdmissionResult::Applied
+            };
 
             let replacement =
                 zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0xb2; 32]));
@@ -2547,7 +2702,7 @@ mod tests {
             peer: peer.clone(),
             source,
             owner,
-            result: HeaderTargetAdmissionResult::Stale,
+            result: HeaderTargetAdmissionResult::Failed(stale_failure(owner)),
         });
 
         assert!(reactor.peer_work_queue.active(&peer).is_none());
@@ -2672,7 +2827,7 @@ mod tests {
             peer: peer.clone(),
             source,
             owner,
-            result: HeaderTargetPreparationResult::LocalFailure,
+            result: HeaderTargetPreparationResult::Failed(local_failure(owner)),
         });
         assert_eq!(same_handle.best_header_tip(), same_tip);
         assert_eq!(same_handle.candidate_state(), same_candidates);
@@ -2724,7 +2879,7 @@ mod tests {
             peer: peer.clone(),
             source,
             owner,
-            result: HeaderTargetAdmissionResult::LocalFailure,
+            result: HeaderTargetAdmissionResult::Failed(local_failure(owner)),
         });
         assert_eq!(committed_reactor.committed_snapshot, Some(committed));
         assert_eq!(committed_handle.best_header_tip(), committed_tip);
@@ -3745,7 +3900,7 @@ mod tests {
                 peer: peer.clone(),
                 source: zakura_header_chain::SourceId::from_digest([8; 32]),
                 owner,
-                result: HeaderTargetAdmissionResult::InvalidHeader,
+                result: HeaderTargetAdmissionResult::Failed(invalid_header_failure(source, owner)),
             })
             .await
             .expect("the wrong-source state result reaches the reactor");

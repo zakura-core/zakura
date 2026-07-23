@@ -301,7 +301,7 @@ mod tests {
         let source = SourceId::from_digest([1; 32]);
         let subject = ErrorSubject::Header(HeaderId::new(block::Hash([2; 32])));
         let malformed =
-            HeaderChainError::malformed_protocol(subject, RuleId::new("LC-V8-01"), source, None);
+            HeaderChainError::malformed_protocol(subject, RuleId::new("LC-WIRE-01"), source, None);
         let invalid = HeaderChainError::invalid_header(
             subject,
             RuleId::new("LC-VAL-01"),

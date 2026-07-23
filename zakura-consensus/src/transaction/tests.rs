@@ -1484,10 +1484,10 @@ async fn mempool_request_with_transparent_coinbase_spend_is_accepted_on_regtest(
         .expect("verification of transaction with mature spend to transparent outputs should pass");
 }
 
-/// Tests that errors from the read state service are correctly converted into
-/// transaction verifier errors.
+/// Tests that errors from the read state service are returned before asynchronous verifier errors
+/// and correctly converted into transaction verifier errors.
 #[tokio::test]
-async fn state_error_converted_correctly() {
+async fn best_tip_state_error_precedes_async_verification_errors() {
     use zakura_state::DuplicateNullifierError;
 
     let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
@@ -1499,7 +1499,7 @@ async fn state_error_converted_correctly() {
     let fund_height = (height - 1).expect("fake source fund block height is too small");
     let (input, output, known_utxos) = mock_transparent_transfer(
         fund_height,
-        true,
+        false,
         0,
         Amount::try_from(10001).expect("invalid value"),
     );
@@ -1533,7 +1533,7 @@ async fn state_error_converted_correctly() {
                     .map(|utxo| utxo.utxo.clone()),
             ));
 
-        state
+        let best_tip_request = state
             .expect_request_that(|req| {
                 matches!(
                     req,
@@ -1541,10 +1541,13 @@ async fn state_error_converted_correctly() {
                 )
             })
             .await
-            .expect("verifier should call mock state service with correct request")
-            .respond(Err::<zakura_state::Response, zakura_state::BoxError>(
-                make_validate_context_error().into(),
-            ));
+            .expect("verifier should call mock state service with correct request");
+
+        // Let the invalid script check win if it is incorrectly polled concurrently.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        best_tip_request.respond(Err::<zakura_state::Response, zakura_state::BoxError>(
+            make_validate_context_error().into(),
+        ));
     });
 
     let verifier_response = verifier

@@ -5021,6 +5021,296 @@ mod tests {
     }
 
     #[test]
+    fn aud_14_body_retry_restarts_reopen_complete_before_or_after() {
+        for operator_retry in [false, true] {
+            for (index, target) in FaultPoint::ALL.into_iter().enumerate() {
+                let cache = tempfile::tempdir().expect("the test cache directory is created");
+                let db_config = Config {
+                    cache_dir: cache.path().to_owned(),
+                    ephemeral: false,
+                    debug_skip_non_finalized_state_backup_task: true,
+                    ..Config::default()
+                };
+                let (engine_config, anchor, metadata) = fixture();
+                let network = engine_config.network.clone();
+                let db = open(&db_config, &network);
+                let store = HeaderChainStore::new(db.clone());
+                store
+                    .initialize(metadata, anchor.clone())
+                    .expect("the empty schema initializes");
+                let (runtime, _) = store
+                    .startup(&engine_config)
+                    .expect("the initial store audits");
+                let initial = runtime.publisher().snapshot();
+                let started_at = Utc
+                    .timestamp_opt(1_000, 0)
+                    .single()
+                    .expect("the fixture timestamp is valid");
+                let old = BodyUnavailableSummary {
+                    started_at,
+                    attempts: 10,
+                    suppliers: 2,
+                    supplier_set_digest: [0x31; 32],
+                    alarmed: true,
+                    next_probe_at: Utc
+                        .timestamp_opt(1_600, 0)
+                        .single()
+                        .expect("the fixture probe timestamp is valid"),
+                };
+                let seed_evidence = EvidenceId::from_digest(
+                    [u8::try_from(index + 0x60).expect("the fault-point list fits in u8"); 32],
+                );
+                let seed_authority = Authority(seed_evidence);
+                let seed_context = TransitionContext {
+                    config: &engine_config,
+                    clock: &SystemClock,
+                    full_state_authority: Some(&seed_authority),
+                    startup_capability: None,
+                    retention_references: &[],
+                };
+                runtime
+                    .apply(
+                        TransitionRequest {
+                            expected_version: initial.state_version,
+                            event: TransitionEvent::BodyEvidence(BodyEvidence::Transient(
+                                TransientBodyFailure {
+                                    hash: anchor.hash,
+                                    evidence: seed_evidence,
+                                    kind: TransientBodyFailureKind::Timeout,
+                                    availability: old,
+                                },
+                            )),
+                        },
+                        &seed_context,
+                    )
+                    .expect("the persistent body alarm fixture commits");
+                let before = runtime.publisher().snapshot();
+                assert_eq!(before.alarms.header_best_body_unavailable, Some(old));
+
+                let marker = u8::try_from(index + if operator_retry { 0x90 } else { 0x70 })
+                    .expect("the fault-point list fits in u8");
+                let fresh_at = started_at + chrono::Duration::minutes(20);
+                let fresh = BodyUnavailableSummary {
+                    started_at: fresh_at,
+                    attempts: 0,
+                    suppliers: if operator_retry {
+                        old.suppliers
+                    } else {
+                        old.suppliers.saturating_add(1)
+                    },
+                    supplier_set_digest: if operator_retry {
+                        old.supplier_set_digest
+                    } else {
+                        [0x32; 32]
+                    },
+                    alarmed: false,
+                    next_probe_at: fresh_at,
+                };
+                let evidence = EvidenceId::from_digest([marker; 32]);
+                let authority = Authority(evidence);
+                let context = TransitionContext {
+                    config: &engine_config,
+                    clock: &SystemClock,
+                    full_state_authority: if operator_retry {
+                        None
+                    } else {
+                        Some(&authority)
+                    },
+                    startup_capability: None,
+                    retention_references: &[],
+                };
+                let event = if operator_retry {
+                    TransitionEvent::OperatorBodyRetry(zakura_header_chain::OperatorBodyRetry {
+                        hash: anchor.hash,
+                        evidence,
+                        availability: fresh,
+                    })
+                } else {
+                    TransitionEvent::BodySupplierDiscovered(
+                        zakura_header_chain::BodySupplierDiscovered {
+                            hash: anchor.hash,
+                            evidence,
+                            availability: fresh,
+                        },
+                    )
+                };
+                let marker_key = [marker; 4];
+                let mut full_state_batch = DiskWriteBatch::new();
+                runtime
+                    .store
+                    .put_raw(
+                        &mut full_state_batch,
+                        ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+                        marker_key,
+                        [marker],
+                    )
+                    .expect("the paired retry marker can be staged");
+                let memory_swapped = Arc::new(AtomicBool::new(false));
+                let swap_probe = memory_swapped.clone();
+                let result = runtime.apply_combined_with_fault(
+                    TransitionRequest {
+                        expected_version: before.state_version,
+                        event,
+                    },
+                    &context,
+                    full_state_batch,
+                    move || swap_probe.store(true, Ordering::SeqCst),
+                    |point| {
+                        if point == target {
+                            Err(HeaderChainStoreError::InjectedCrash(point))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+                assert!(matches!(
+                    result,
+                    Err(HeaderChainStoreError::InjectedCrash(point)) if point == target
+                ));
+
+                let committed = matches!(
+                    target,
+                    FaultPoint::AfterDbCommit
+                        | FaultPoint::BeforeMemorySwap
+                        | FaultPoint::BeforePublish
+                        | FaultPoint::AfterPublish
+                        | FaultPoint::BeforeReactorObserve
+                );
+                let published = matches!(
+                    target,
+                    FaultPoint::AfterPublish | FaultPoint::BeforeReactorObserve
+                );
+                let committed_version = before
+                    .state_version
+                    .checked_next()
+                    .expect("the short fixture state version can advance");
+                let durable = runtime
+                    .store
+                    .snapshot()
+                    .expect("the retry snapshot read succeeds");
+                assert_eq!(
+                    durable.state_version,
+                    if committed {
+                        committed_version
+                    } else {
+                        before.state_version
+                    },
+                    "{target:?}, operator_retry={operator_retry}"
+                );
+                assert_eq!(
+                    durable.frontiers, before.frontiers,
+                    "{target:?}, operator_retry={operator_retry}"
+                );
+                assert_eq!(
+                    durable.header_generation, before.header_generation,
+                    "{target:?}, operator_retry={operator_retry}"
+                );
+                assert_eq!(
+                    durable.verified_generation, before.verified_generation,
+                    "{target:?}, operator_retry={operator_retry}"
+                );
+                assert_eq!(
+                    durable.alarms.header_best_body_unavailable,
+                    if committed { None } else { Some(old) },
+                    "{target:?}, operator_retry={operator_retry}"
+                );
+                assert_eq!(
+                    runtime
+                        .store
+                        .node(anchor.hash)
+                        .expect("the retry node read succeeds")
+                        .expect("the selected retry node remains retained")
+                        .body,
+                    BodyValidationState::Unavailable(if committed { fresh } else { old }),
+                    "{target:?}, operator_retry={operator_retry}"
+                );
+                let marker_cf = runtime
+                    .store
+                    .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                    .expect("the marker column family is open");
+                assert_eq!(
+                    runtime
+                        .store
+                        .db
+                        .raw_get_cf(&marker_cf, &marker_key)
+                        .expect("the paired marker read succeeds")
+                        .is_some(),
+                    committed,
+                    "{target:?}, operator_retry={operator_retry}"
+                );
+                assert_eq!(
+                    memory_swapped.load(Ordering::SeqCst),
+                    matches!(
+                        target,
+                        FaultPoint::BeforePublish
+                            | FaultPoint::AfterPublish
+                            | FaultPoint::BeforeReactorObserve
+                    ),
+                    "{target:?}, operator_retry={operator_retry}"
+                );
+                assert_eq!(
+                    runtime.publisher().snapshot().state_version,
+                    if published {
+                        committed_version
+                    } else {
+                        before.state_version
+                    },
+                    "{target:?}, operator_retry={operator_retry}"
+                );
+                drop(runtime);
+                drop(db);
+
+                let (reopened, report) = HeaderChainStore::new(open(&db_config, &network))
+                    .startup(&engine_config)
+                    .expect("the retry crash boundary reopens coherently");
+                assert_eq!(
+                    reopened.publisher().snapshot(),
+                    report.current,
+                    "{target:?}, operator_retry={operator_retry}"
+                );
+                assert_eq!(
+                    report.current.state_version,
+                    if committed {
+                        committed_version
+                    } else {
+                        before.state_version
+                    },
+                    "{target:?}, operator_retry={operator_retry}"
+                );
+                assert_eq!(
+                    report.current.alarms.header_best_body_unavailable,
+                    if committed { None } else { Some(old) },
+                    "{target:?}, operator_retry={operator_retry}"
+                );
+                assert_eq!(
+                    reopened
+                        .store
+                        .node(anchor.hash)
+                        .expect("the reopened retry node read succeeds")
+                        .expect("the reopened selected retry node remains retained")
+                        .body,
+                    BodyValidationState::Unavailable(if committed { fresh } else { old }),
+                    "{target:?}, operator_retry={operator_retry}"
+                );
+                let reopened_marker_cf = reopened
+                    .store
+                    .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+                    .expect("the reopened marker column family is open");
+                assert_eq!(
+                    reopened
+                        .store
+                        .db
+                        .raw_get_cf(&reopened_marker_cf, &marker_key)
+                        .expect("the reopened paired marker read succeeds")
+                        .is_some(),
+                    committed,
+                    "{target:?}, operator_retry={operator_retry}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn aud_14_aux_authentication_reopens_complete_before_or_after() {
         const AUX_FAULT_POINTS: [FaultPoint; 11] = [
             FaultPoint::AfterSnapshot,

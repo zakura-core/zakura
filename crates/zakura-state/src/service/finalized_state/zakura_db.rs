@@ -35,6 +35,7 @@ pub mod block;
 pub mod chain;
 pub(crate) mod commitment_roots_db;
 pub mod highest_completed_checkpoint;
+pub mod metadata;
 pub mod metrics;
 
 /// Minimum number of transactions in a block before the per-transaction batch
@@ -60,6 +61,8 @@ pub mod prune;
 pub mod rollback;
 pub mod shielded;
 pub mod transparent;
+
+pub use metadata::DatabaseWriterMetadata;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 // TODO: when the database is split out of zakura-state, always expose these methods.
@@ -126,6 +129,31 @@ impl ZakuraDb {
         debug_skip_format_upgrades: bool,
         column_families_in_code: impl IntoIterator<Item = String>,
         read_only: bool,
+    ) -> Result<ZakuraDb, StateInitError> {
+        Self::new_with_database_writer_metadata(
+            config,
+            db_kind,
+            format_version_in_code,
+            network,
+            debug_skip_format_upgrades,
+            column_families_in_code,
+            read_only,
+            Some(&DatabaseWriterMetadata::default_zakura()),
+        )
+    }
+
+    /// Opens or creates the database, recording the supplied node software
+    /// metadata when opened writable.
+    #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
+    pub(crate) fn new_with_database_writer_metadata(
+        config: &Config,
+        db_kind: impl AsRef<str>,
+        format_version_in_code: &Version,
+        network: &Network,
+        debug_skip_format_upgrades: bool,
+        column_families_in_code: impl IntoIterator<Item = String>,
+        read_only: bool,
+        database_writer_metadata: Option<&DatabaseWriterMetadata>,
     ) -> Result<ZakuraDb, StateInitError> {
         // A read-only secondary follows another process's primary database and must never delete
         // it, whereas an ephemeral database deletes its files on drop, so the two modes are
@@ -213,6 +241,26 @@ impl ZakuraDb {
         // longer be made safe: refuse to expose it at all, in every open mode.
         if is_unrepairable_vct_database(&db, disk_version_before_open.as_ref()) {
             return Err(StateInitError::VctSproutHistoryUnrepairable);
+        }
+
+        if !read_only {
+            if let Some(database_writer_metadata) = database_writer_metadata {
+                let previous_database_writer_metadata = db.database_writer_metadata();
+                info!(
+                    previous_writer = ?previous_database_writer_metadata,
+                    "opened state database with previous node software writer metadata"
+                );
+
+                // This operational metadata is intentionally outside the format-upgrade batches:
+                // if startup exits early, the recorded writer is still useful and harmless.
+                if let Err(source) = db.record_database_writer_metadata(database_writer_metadata) {
+                    warn!(
+                        ?source,
+                        writer = ?database_writer_metadata,
+                        "failed to record current node software writer metadata"
+                    );
+                }
+            }
         }
 
         let zero_location_utxos =

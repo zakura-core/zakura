@@ -618,7 +618,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-WORK-02"
 name = "Safe finalized-coverage reuse"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::CoverageMap::retain_current"
+tests = ["AUD-08::generation_change_conservatively_reuses_no_finalized_or_forward_coverage", "AUD-08::aud_08_old_coverage_misses_until_the_exact_reset_branch_completes"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-WORK-03"

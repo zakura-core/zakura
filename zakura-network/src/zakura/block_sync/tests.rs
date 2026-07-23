@@ -1,4 +1,7 @@
-use std::{collections::HashMap, future};
+use std::{
+    collections::{BTreeSet, HashMap},
+    future,
+};
 
 use proptest::{prop_assert, prop_assert_eq};
 
@@ -3843,6 +3846,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
         ThroughputMeter::new(Instant::now()),
         frontiers,
         Some(test_work_scope()),
+        crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
         body_rx,
         control_rx,
         body_input_bytes.clone(),
@@ -3927,6 +3931,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
             height: block::Height(1),
             hash: block_1.hash(),
             outcome: test_block_apply_outcome(BlockApplyResult::Committed),
+            eligible_sources: BTreeSet::new(),
             semantic_current: true,
             local_frontier: Some(BlockSyncFrontiers {
                 finalized_height: block::Height(0),
@@ -3958,6 +3963,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
                 height,
                 hash: block.hash(),
                 outcome: test_block_apply_outcome(BlockApplyResult::Committed),
+                eligible_sources: BTreeSet::new(),
                 semantic_current: true,
                 local_frontier: Some(BlockSyncFrontiers {
                     finalized_height: block::Height(0),
@@ -6984,7 +6990,12 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
             token: submit_token,
             height: block::Height(1),
             hash: block.hash(),
-            outcome: test_block_apply_outcome(BlockApplyResult::Unavailable),
+            outcome: BlockApplyOutcome::retryable(zakura_header_chain::TransientBodyFailure {
+                hash: block.hash(),
+                evidence: zakura_header_chain::EvidenceId::from_digest([0xa5; 32]),
+                kind: zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable,
+                availability: zakura_header_chain::BodyUnavailableSummary::default(),
+            }),
             local_frontier: None,
         })
         .await
@@ -6999,6 +7010,7 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
         hash: block.hash(),
         size: BlockSizeEstimate::Advertised(block_bytes),
     }];
+    let mut saw_retry_persistence = false;
     loop {
         tokio::select! {
             biased;
@@ -7027,6 +7039,21 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
                             .await
                             .expect("needed metadata queues after unavailable result");
                     }
+                    BlockSyncAction::RecordBodyUnavailable {
+                        expected_version,
+                        failure,
+                    } => {
+                        assert_eq!(expected_version, submit_owner.state_version);
+                        assert_eq!(failure.hash, block.hash());
+                        assert_eq!(
+                            failure.kind,
+                            zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable
+                        );
+                        assert_eq!(failure.availability.attempts, 1);
+                        assert_eq!(failure.availability.suppliers, 1);
+                        assert!(!failure.availability.alarmed);
+                        saw_retry_persistence = true;
+                    }
                     BlockSyncAction::Misbehavior { .. } => {
                         panic!("a local/transient unavailable result must not score its supplier")
                     }
@@ -7035,6 +7062,10 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
             }
         }
     }
+    assert!(
+        saw_retry_persistence,
+        "the completion-gated transient result must persist its exact retry summary"
+    );
 
     reactor_task.abort();
 }
@@ -8886,6 +8917,7 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             BlockSyncAction::QueryBlocksByHeightRange { .. } => {}
+            BlockSyncAction::RecordBodyUnavailable { .. } => {}
         }
     }
 
@@ -8995,7 +9027,8 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
                 );
             }
             BlockSyncAction::QueryNeededBlocks { .. }
-            | BlockSyncAction::QueryBlocksByHeightRange { .. } => {}
+            | BlockSyncAction::QueryBlocksByHeightRange { .. }
+            | BlockSyncAction::RecordBodyUnavailable { .. } => {}
         }
     }
 

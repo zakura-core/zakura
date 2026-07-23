@@ -9,6 +9,7 @@ use crate::zakura::{
     ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState,
 };
 use iroh::NodeId;
+use rand::{rngs::OsRng, RngCore};
 use std::num::NonZeroU64;
 
 /// Upper bound on how long the Sequencer task will wait to enqueue a verifier
@@ -125,6 +126,8 @@ pub fn spawn_block_sync_reactor(
     let sequencer_input_decoded_attributed_memory_bytes =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
+    let mut retry_jitter_seed = [0u8; 32];
+    OsRng.fill_bytes(&mut retry_jitter_seed);
 
     let sequencer_task = SequencerTask::new(
         sequencer,
@@ -134,6 +137,7 @@ pub fn spawn_block_sync_reactor(
         committed_throughput,
         startup.frontiers,
         initial_body_scope,
+        crate::zakura::header_sync::SeededRetryJitter::new(retry_jitter_seed),
         sequencer_body_input_rx,
         sequencer_control_rx,
         sequencer_input_bytes.clone(),
@@ -1298,6 +1302,7 @@ impl BlockSyncReactor {
                 height,
                 hash,
                 outcome,
+                eligible_sources: self.registry.eligible_sources(height),
                 semantic_current,
                 local_frontier,
             });
@@ -2580,6 +2585,9 @@ impl BlockSyncReactor {
                 if let Some(height) = block.coinbase_height() {
                     bs_insert_height(row, bs_trace::HEIGHT, height);
                 }
+            }
+            BlockSyncAction::RecordBodyUnavailable { .. } => {
+                bs_insert_str(row, bs_trace::KIND, "record_body_unavailable");
             }
             BlockSyncAction::Misbehavior { peer, reason } => {
                 bs_insert_str(row, bs_trace::KIND, "misbehavior");

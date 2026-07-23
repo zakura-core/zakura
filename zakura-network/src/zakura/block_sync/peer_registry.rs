@@ -21,7 +21,7 @@
 //! misbehavior state.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Mutex as StdMutex,
     time::Instant,
 };
@@ -139,6 +139,24 @@ impl PeerRegistry {
             parked_peers: StdMutex::new(HashMap::new()),
             next_generation: std::sync::atomic::AtomicU64::new(1),
         }
+    }
+
+    pub(super) fn eligible_sources(
+        &self,
+        height: block::Height,
+    ) -> BTreeSet<zakura_header_chain::SourceId> {
+        self.lock()
+            .iter()
+            .filter(|(_, entry)| {
+                entry.received_status
+                    && entry.servable_low <= height
+                    && height <= entry.servable_high
+            })
+            .filter_map(|(peer, _)| {
+                let digest: [u8; 32] = peer.as_bytes().try_into().ok()?;
+                Some(zakura_header_chain::SourceId::from_digest(digest))
+            })
+            .collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ZakuraPeerId, Entry>> {

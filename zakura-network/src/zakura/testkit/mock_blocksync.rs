@@ -615,6 +615,7 @@ async fn drive_mock_block_sync_actions(
                         })
                         .await;
                 }
+                BlockSyncAction::RecordBodyUnavailable { .. } => {}
                 BlockSyncAction::Misbehavior { .. } => {}
             }
         }

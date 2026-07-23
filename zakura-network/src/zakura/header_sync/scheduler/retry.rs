@@ -296,8 +296,17 @@ impl BodyRetryQueue {
 
     /// Retire episodes outside the exact current generation and finalized anchor.
     pub fn retain_current(&mut self, generation: HeaderGeneration, finalized: Frontier) {
+        self.retain_scope(generation, finalized.hash);
+    }
+
+    /// Retire episodes outside the exact current generation and finalized anchor hash.
+    pub fn retain_scope(
+        &mut self,
+        generation: HeaderGeneration,
+        finalized_hash: zakura_chain::block::Hash,
+    ) {
         self.0.retain(|key, _| {
-            key.generation == generation && key.branch.anchor_hash == finalized.hash
+            key.generation == generation && key.branch.anchor_hash == finalized_hash
         });
     }
 }

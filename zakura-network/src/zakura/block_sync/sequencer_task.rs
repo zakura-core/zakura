@@ -25,6 +25,7 @@ use super::{
     work_queue::WorkQueue,
     *,
 };
+use std::collections::BTreeSet;
 
 /// Delay before retrying a verifier submission that could not enter the shared
 /// action channel.
@@ -174,6 +175,7 @@ pub(super) enum SequencerControlInput {
         height: block::Height,
         hash: block::Hash,
         outcome: BlockApplyOutcome,
+        eligible_sources: BTreeSet<zakura_header_chain::SourceId>,
         semantic_current: bool,
         local_frontier: Option<BlockSyncFrontiers>,
     },
@@ -257,6 +259,8 @@ pub(super) struct SequencerTask {
     reset_epoch: u64,
     reaction_epoch: u64,
     current_scope: Option<zakura_header_chain::WorkScope>,
+    body_retries: crate::zakura::header_sync::BodyRetryQueue,
+    retry_jitter: crate::zakura::header_sync::SeededRetryJitter,
     body_input_rx: mpsc::Receiver<SequencedBody>,
     control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
     _body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
@@ -293,6 +297,7 @@ impl SequencerTask {
         committed_throughput: ThroughputMeter,
         frontiers: BlockSyncFrontiers,
         current_scope: Option<zakura_header_chain::WorkScope>,
+        retry_jitter: crate::zakura::header_sync::SeededRetryJitter,
         body_input_rx: mpsc::Receiver<SequencedBody>,
         control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
         body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
@@ -312,6 +317,8 @@ impl SequencerTask {
             reset_epoch: 0,
             reaction_epoch: 0,
             current_scope,
+            body_retries: crate::zakura::header_sync::BodyRetryQueue::default(),
+            retry_jitter,
             body_input_rx,
             control_input_rx,
             _body_input_bytes: body_input_bytes,
@@ -387,6 +394,12 @@ impl SequencerTask {
         match input {
             SequencerControlInput::WorkScopeChanged { scope } => {
                 self.current_scope = scope;
+                if let Some(scope) = scope {
+                    self.body_retries
+                        .retain_scope(scope.header_generation, scope.branch.anchor_hash);
+                } else {
+                    self.body_retries = crate::zakura::header_sync::BodyRetryQueue::default();
+                }
                 let verified_tip = self.sequencer.verified_tip();
                 let _ = self.sequencer.reset_to(verified_tip, false);
                 true
@@ -420,7 +433,8 @@ impl SequencerTask {
                 token,
                 height,
                 hash,
-                outcome,
+                mut outcome,
+                eligible_sources,
                 semantic_current,
                 local_frontier,
             } => {
@@ -431,7 +445,8 @@ impl SequencerTask {
                         token,
                         height,
                         hash,
-                        outcome,
+                        &mut outcome,
+                        eligible_sources,
                         semantic_current,
                         local_frontier,
                     )
@@ -613,7 +628,8 @@ impl SequencerTask {
         token: BlockApplyToken,
         height: block::Height,
         hash: block::Hash,
-        outcome: BlockApplyOutcome,
+        outcome: &mut BlockApplyOutcome,
+        mut eligible_sources: BTreeSet<zakura_header_chain::SourceId>,
         semantic_current: bool,
         local_frontier: Option<BlockSyncFrontiers>,
     ) -> (bool, bool) {
@@ -647,6 +663,16 @@ impl SequencerTask {
             self.sequencer
                 .finish_submission(owner, source, token, height, hash);
             return (false, false);
+        }
+        self.record_body_retry(owner, source, height, hash, outcome, &mut eligible_sources);
+        if let zakura_header_chain::BodyVerificationOutcome::Retryable(failure) =
+            outcome.verification()
+        {
+            self.send_action(BlockSyncAction::RecordBodyUnavailable {
+                expected_version: owner.state_version,
+                failure: *failure,
+            })
+            .await;
         }
         let accepted_local_frontier = if let Some(frontiers) = local_frontier {
             // Fold the `local_frontier` advance in as a frontier advance without
@@ -724,6 +750,49 @@ impl SequencerTask {
 
         self.release_contiguous_blocks().await;
         (true, true)
+    }
+
+    fn record_body_retry(
+        &mut self,
+        owner: zakura_header_chain::WorkOwner,
+        source: zakura_header_chain::SourceId,
+        height: block::Height,
+        hash: block::Hash,
+        outcome: &mut BlockApplyOutcome,
+        eligible_sources: &mut BTreeSet<zakura_header_chain::SourceId>,
+    ) {
+        let Some(failure) = outcome.retryable_mut() else {
+            self.body_retries
+                .remove(owner.header_generation, owner.branch, hash);
+            return;
+        };
+        eligible_sources.insert(source);
+        let header = zakura_header_chain::Frontier::new(height, hash);
+        if self
+            .body_retries
+            .get_mut(owner.header_generation, owner.branch, hash)
+            .is_none()
+        {
+            self.body_retries
+                .insert(crate::zakura::header_sync::BodyRetryEpisode::new(
+                    owner.branch,
+                    owner.header_generation,
+                    header,
+                    eligible_sources.clone(),
+                    &zakura_header_chain::SystemClock,
+                ));
+        }
+        let episode = self
+            .body_retries
+            .get_mut(owner.header_generation, owner.branch, hash)
+            .expect("the exact retry episode exists because it was inserted above");
+        episode.refresh_suppliers(eligible_sources.clone(), &zakura_header_chain::SystemClock);
+        let _ = episode.record_failure(
+            source,
+            &zakura_header_chain::SystemClock,
+            &self.retry_jitter,
+        );
+        failure.availability = episode.summary();
     }
 
     /// Drain the contiguous reorder prefix into applying, then submit it.
@@ -1322,6 +1391,7 @@ mod tests {
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
             body_rx,
             control_rx,
             input_bytes.clone(),
@@ -1346,6 +1416,7 @@ mod tests {
         };
         let height = block.coinbase_height().expect("test block has height");
         let hash = block.hash();
+        let mut outcome = super::test_block_apply_outcome(BlockApplyResult::Unavailable);
 
         assert_eq!(
             task.handle_apply_finished(
@@ -1354,7 +1425,8 @@ mod tests {
                 token,
                 height,
                 hash,
-                super::test_block_apply_outcome(BlockApplyResult::Unavailable),
+                &mut outcome,
+                BTreeSet::new(),
                 false,
                 None,
             )
@@ -1364,6 +1436,10 @@ mod tests {
         );
         assert!(!task.sequencer.applying_contains(height));
         assert_eq!(task.sequencer.in_flight_submission_count(), 0);
+        assert!(
+            task.body_retries.is_empty(),
+            "stale transient completion cannot create a retry episode"
+        );
         assert!(
             actions_rx.try_recv().is_err(),
             "stale completion emits no action"
@@ -1425,6 +1501,7 @@ mod tests {
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
             body_rx,
             control_rx,
             body_input_bytes.clone(),
@@ -1499,6 +1576,7 @@ mod tests {
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
             body_rx,
             control_rx,
             body_input_bytes,
@@ -1557,6 +1635,7 @@ mod tests {
             ThroughputMeter::new(Instant::now()),
             frontiers,
             Some(super::test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
             body_rx,
             control_rx,
             body_input_bytes.clone(),

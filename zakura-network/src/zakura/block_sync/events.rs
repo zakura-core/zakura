@@ -175,6 +175,15 @@ impl BlockApplyOutcome {
         *self.verification
     }
 
+    pub(crate) fn retryable_mut(
+        &mut self,
+    ) -> Option<&mut zakura_header_chain::TransientBodyFailure> {
+        match self.verification.as_mut() {
+            zakura_header_chain::BodyVerificationOutcome::Retryable(failure) => Some(failure),
+            _ => None,
+        }
+    }
+
     /// Stable evidence identity for this exact outcome.
     pub fn evidence(&self) -> zakura_header_chain::EvidenceId {
         match self.verification.as_ref() {
@@ -257,6 +266,13 @@ pub enum BlockSyncAction {
         /// Block body that is contiguous above `verified_block_tip`.
         block: Arc<block::Block>,
     },
+    /// Persist one completion-gated transient body result.
+    RecordBodyUnavailable {
+        /// Durable version that owned the attempt.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Typed retry result with its bounded episode summary.
+        failure: zakura_header_chain::TransientBodyFailure,
+    },
     /// Report peer misbehavior to the supervisor.
     Misbehavior {
         /// Misbehaving peer.
@@ -273,6 +289,7 @@ impl BlockSyncAction {
             Self::QueryNeededBlocks { .. } => "query_needed_blocks",
             Self::QueryBlocksByHeightRange { .. } => "query_blocks_by_height_range",
             Self::SubmitBlock { .. } => "submit_block",
+            Self::RecordBodyUnavailable { .. } => "record_body_unavailable",
             Self::Misbehavior { .. } => "misbehavior",
         }
     }

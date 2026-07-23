@@ -521,6 +521,7 @@ impl StartCmd {
                             block_sync.clone(),
                             latest_chain_tip.clone(),
                             read_only_state_service.clone(),
+                            Some(tower::util::BoxCloneService::new(state.clone())),
                             block_verifier_router.clone(),
                             max_checkpoint_height,
                             config.sync.checkpoint_verify_concurrency_limit,
@@ -2512,6 +2513,95 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[tokio::test]
+    async fn block_sync_driver_persists_exact_body_retry_evidence() {
+        let (action_tx, action_rx) = mpsc::channel(1);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zakura_network::zakura::spawn_block_sync_reactor(startup);
+        let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
+            panic!("unexpected read request while persisting body retry evidence: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::Tip(None))
+        });
+        let verifier = service_fn(|request: zakura_consensus::Request| async move {
+            panic!("unexpected verifier request while persisting body retry evidence: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zakura_consensus::BoxError>(block::Hash([0; 32]))
+        });
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let header_chain_write =
+            BoxCloneService::new(service_fn(move |request: zakura_state::Request| {
+                let request_tx = request_tx.clone();
+                async move {
+                    let zakura_state::Request::RecordHeaderChainBodyUnavailable {
+                        expected_version,
+                        failure,
+                    } = request
+                    else {
+                        panic!("unexpected state write while persisting body retry evidence")
+                    };
+                    request_tx
+                        .send((expected_version, failure))
+                        .await
+                        .expect("body retry request receiver stays open");
+                    Err::<zakura_state::Response, zakura_state::BoxError>(
+                        "test writer stops after recording the request".into(),
+                    )
+                }
+            }));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zakura_chain::chain_tip::NoChainTip,
+            read_state,
+            Some(header_chain_write),
+            verifier,
+            block::Height::MAX,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+            zakura_network::zakura::ZakuraTrace::noop(),
+            None,
+            super::zakura::BlockSyncHandoff::new(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let expected_version = zakura_header_chain::StateVersion::new(7);
+        let failure = zakura_header_chain::TransientBodyFailure {
+            hash: block::Hash([3; 32]),
+            evidence: zakura_header_chain::EvidenceId::from_digest([4; 32]),
+            kind: zakura_header_chain::TransientBodyFailureKind::Storage,
+            availability: zakura_header_chain::BodyUnavailableSummary {
+                attempts: 3,
+                suppliers: 2,
+                alarmed: false,
+            },
+        };
+        action_tx
+            .send(BlockSyncAction::RecordBodyUnavailable {
+                expected_version,
+                failure,
+            })
+            .await
+            .expect("body retry persistence action queues");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), request_rx.recv())
+                .await
+                .expect("state writer receives body retry evidence"),
+            Some((expected_version, failure))
+        );
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver exits after shutdown");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
     async fn block_sync_driver_answers_needed_block_queries_from_state() {
         let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
@@ -2581,6 +2671,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -2727,6 +2818,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -2881,6 +2973,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -2999,6 +3092,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height(2),
             2,
@@ -3105,6 +3199,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height(2),
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -3212,6 +3307,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height(0),
             2,
@@ -3297,6 +3393,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height(0),
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -3394,6 +3491,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height(0),
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -3507,6 +3605,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height(0),
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -3583,6 +3682,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height(0),
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -3711,6 +3811,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height(0),
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -4180,6 +4281,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -4280,6 +4382,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height::MAX,
             two_checkpoint_gaps,
@@ -4404,6 +4507,7 @@ mod zakura_header_sync_driver_tests {
             block_sync.clone(),
             latest_chain_tip,
             read_state,
+            None,
             verifier,
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -4534,6 +4638,7 @@ mod zakura_header_sync_driver_tests {
             block_sync.clone(),
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -4676,6 +4781,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             verifier,
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -4808,6 +4914,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             _latest_tip,
             read_state.clone(),
+            None,
             verifier,
             // Every block 0..=10 is at or below the checkpoint, so all are Checkpoint-class
             // (indefinite-wait) commits — the path that wedges in production.
@@ -4969,6 +5076,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             latest_tip,
             read_state.clone(),
+            None,
             verifier,
             second_checkpoint_height,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,

@@ -13,7 +13,7 @@ use futures::{
 use sha2::{Digest, Sha256};
 use tokio::time::Instant as TokioInstant;
 use tokio::{pin, select, sync::mpsc};
-use tower::{Service, ServiceExt};
+use tower::{util::BoxCloneService, Service, ServiceExt};
 use tracing::{debug, warn};
 
 use zakura_chain::{block, chain_tip::ChainTip};
@@ -107,6 +107,9 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     block_sync: BlockSyncHandle,
     latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
     read_state: ReadState,
+    header_chain_write: Option<
+        BoxCloneService<zakura_state::Request, zakura_state::Response, zakura_state::BoxError>,
+    >,
     block_verifier: BlockVerifier,
     max_checkpoint_height: block::Height,
     checkpoint_apply_limit: usize,
@@ -286,6 +289,40 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
 
         trace_block_driver_action(&trace, &action);
         match action {
+            BlockSyncAction::RecordBodyUnavailable {
+                expected_version,
+                failure,
+            } => {
+                let Some(writer) = header_chain_write.as_ref() else {
+                    debug!(
+                        ?failure,
+                        "header-chain body retry persistence is not wired in this harness"
+                    );
+                    continue;
+                };
+                match tokio::time::timeout(
+                    ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+                    writer.clone().oneshot(
+                        zakura_state::Request::RecordHeaderChainBodyUnavailable {
+                            expected_version,
+                            failure,
+                        },
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(zakura_state::Response::HeaderChainBodyUnavailableRecorded(_))) => {}
+                    Ok(Ok(response)) => warn!(
+                        ?response,
+                        "unexpected header-chain body retry persistence response"
+                    ),
+                    Ok(Err(error)) => debug!(
+                        ?error,
+                        "header-chain body retry persistence was stale or unavailable"
+                    ),
+                    Err(_) => warn!("timed out persisting header-chain body retry evidence"),
+                }
+            }
             BlockSyncAction::Misbehavior { peer, reason } => {
                 // Record-only: peer scoring no longer drives disconnects.
                 debug!(?peer, ?reason, "recorded Zakura block-sync peer violation");
@@ -1836,6 +1873,9 @@ fn trace_block_driver_action(trace: &ZakuraTrace, action: &BlockSyncAction) {
                 if let Some(height) = block.coinbase_height() {
                     insert_cs_height(row, cs_trace::HEIGHT, height);
                 }
+            }
+            BlockSyncAction::RecordBodyUnavailable { .. } => {
+                insert_cs_str(row, cs_trace::ACTION, "record_body_unavailable");
             }
         },
     );

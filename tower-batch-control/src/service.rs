@@ -229,6 +229,11 @@ where
     /// The flush is queued after item requests that have already been sent to
     /// this batch worker. This method waits for queue capacity and returns when
     /// the command has been queued, not when the underlying batch has completed.
+    ///
+    /// If this service holds a readiness reservation from an earlier
+    /// [`poll_ready`](Service::poll_ready) call, the flush consumes it, so
+    /// callers must poll readiness again before the next
+    /// [`call`](Service::call).
     pub async fn flush(&mut self) -> Result<(), crate::BoxError> {
         let _permit = match self.permit.take() {
             Some(permit) => permit,

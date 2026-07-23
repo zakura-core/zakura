@@ -684,7 +684,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-TEST-01"
 name = "Cross-network conformance coverage"
-status = "unimplemented"
+status = "implemented"
+owner = ".github/workflows/tests-unit.yml"
+tests = ["conformance::network_matrix_complete", "conformance::implemented_test_symbols_exist"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-TEST-02"

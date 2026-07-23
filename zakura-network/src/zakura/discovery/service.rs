@@ -773,7 +773,7 @@ mod tests {
     };
     use crate::zakura::{
         framed_channel, spawn_block_sync_reactor, spawn_header_sync_reactor, BlockSyncFrontiers,
-        BlockSyncStartup, HeaderSyncAction, HeaderSyncFrontiers, HeaderSyncPeerSession,
+        BlockSyncStartup, FullStateFrontiers, HeaderSyncAction, HeaderSyncPeerSession,
         HeaderSyncStartup, ServicePeerLimits, ZakuraBlockSyncConfig, ZakuraDiscoveryConfig,
         ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig,
         LOCAL_MAX_MESSAGE_BYTES, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_BLOCK_SYNC,
@@ -812,7 +812,7 @@ mod tests {
         let startup = HeaderSyncStartup::new(
             network,
             anchor,
-            HeaderSyncFrontiers {
+            FullStateFrontiers {
                 finalized_height: anchor.0,
                 verified_block_tip: anchor.0,
                 verified_block_hash: anchor.1,

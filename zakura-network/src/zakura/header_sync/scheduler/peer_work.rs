@@ -8,7 +8,7 @@ use super::super::{HeaderSyncRequestId, Status, ZakuraPeerId};
 
 /// One peer's exact, session-bound target claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PeerTargetAdvertisement {
+pub struct AdvertisedHeaderTarget {
     /// Ordered-stream generation that supplied this status.
     pub session_id: u64,
     /// Local receipt time, used only for freshness and scheduling.
@@ -17,7 +17,7 @@ pub struct PeerTargetAdvertisement {
     pub status: Status,
 }
 
-impl PeerTargetAdvertisement {
+impl AdvertisedHeaderTarget {
     /// Compare claimed suffix work only when both snapshots use the same anchor.
     pub fn claimed_work_order(&self, local: &EngineSnapshot) -> Option<Ordering> {
         let local_anchor = local.frontiers.finalized;
@@ -41,19 +41,19 @@ impl PeerTargetAdvertisement {
 
 /// One published request for an exact advertised target.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TargetPursuit {
+pub struct ActiveHeaderRequest {
     /// Peer whose current session owns the request.
     pub peer: ZakuraPeerId,
     /// Exact status snapshot being pursued.
-    pub advertised: PeerTargetAdvertisement,
+    pub target: AdvertisedHeaderTarget,
     /// Exact coherent state locator sent in the request.
     pub sent_locator: HeaderLocator,
     /// Nonzero request correlation identifier.
     pub request_id: HeaderSyncRequestId,
 }
 
-impl TargetPursuit {
-    /// Select the continuation-only locator without changing this pursuit's target.
+impl ActiveHeaderRequest {
+    /// Select the continuation-only locator without changing this request's target.
     pub fn continuation_locator(
         &self,
         returned_suffix_tip: zakura_header_chain::Frontier,
@@ -63,23 +63,23 @@ impl TargetPursuit {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum TargetSlot {
+enum PeerWorkState {
     AwaitingLocator {
-        advertisement: PeerTargetAdvertisement,
-        priority: TargetPriority,
+        target: AdvertisedHeaderTarget,
+        priority: PeerWorkPriority,
     },
-    Active(TargetPursuit),
+    Active(ActiveHeaderRequest),
 }
 
 /// Advisory discovery priority. Incomparable claims deliberately map to normal.
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(in crate::zakura::header_sync) enum TargetPriority {
+pub(in crate::zakura::header_sync) enum PeerWorkPriority {
     LowerComparableWork,
     Normal,
     HigherComparableWork,
 }
 
-impl TargetPriority {
+impl PeerWorkPriority {
     pub(in crate::zakura::header_sync) fn from_work_order(order: Option<Ordering>) -> Self {
         match order {
             Some(Ordering::Greater) => Self::HigherComparableWork,
@@ -90,44 +90,44 @@ impl TargetPriority {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(in crate::zakura::header_sync) enum StageTargetResult {
-    QueryLocator,
-    Active,
+pub(in crate::zakura::header_sync) enum QueueWorkResult {
+    NeedsLocator,
+    AlreadyActive,
     AtCapacity,
 }
 
-/// Bounded one-target-per-peer pursuit ownership.
+/// Bounded queue of exact, session-bound peer work.
 #[derive(Clone, Debug, Default)]
-pub(in crate::zakura::header_sync) struct TargetPursuitRegistry {
-    slots: HashMap<ZakuraPeerId, TargetSlot>,
+pub(in crate::zakura::header_sync) struct PeerWorkQueue {
+    work_by_peer: HashMap<ZakuraPeerId, PeerWorkState>,
 }
 
-impl TargetPursuitRegistry {
+impl PeerWorkQueue {
     pub(in crate::zakura::header_sync) fn stage(
         &mut self,
         peer: ZakuraPeerId,
-        advertisement: PeerTargetAdvertisement,
-        priority: TargetPriority,
-    ) -> StageTargetResult {
-        if let Some(slot) = self.slots.get_mut(&peer) {
-            return match slot {
-                TargetSlot::AwaitingLocator {
-                    advertisement: current,
+        target: AdvertisedHeaderTarget,
+        priority: PeerWorkPriority,
+    ) -> QueueWorkResult {
+        if let Some(work) = self.work_by_peer.get_mut(&peer) {
+            return match work {
+                PeerWorkState::AwaitingLocator {
+                    target: current,
                     priority: current_priority,
                 } => {
-                    *current = advertisement;
+                    *current = target;
                     *current_priority = priority;
-                    StageTargetResult::QueryLocator
+                    QueueWorkResult::NeedsLocator
                 }
-                TargetSlot::Active(_) => StageTargetResult::Active,
+                PeerWorkState::Active(_) => QueueWorkResult::AlreadyActive,
             };
         }
-        if self.slots.len() >= MAX_STAGED_TARGETS_V1 {
+        if self.work_by_peer.len() >= MAX_STAGED_TARGETS_V1 {
             let replace = self
-                .slots
+                .work_by_peer
                 .iter()
-                .filter_map(|(peer, slot)| match slot {
-                    TargetSlot::AwaitingLocator {
+                .filter_map(|(peer, work)| match work {
+                    PeerWorkState::AwaitingLocator {
                         priority: current, ..
                     } if *current < priority => Some((peer.clone(), *current)),
                     _ => None,
@@ -139,18 +139,13 @@ impl TargetPursuitRegistry {
                 })
                 .map(|(peer, _)| peer);
             let Some(replace) = replace else {
-                return StageTargetResult::AtCapacity;
+                return QueueWorkResult::AtCapacity;
             };
-            self.slots.remove(&replace);
+            self.work_by_peer.remove(&replace);
         }
-        self.slots.insert(
-            peer,
-            TargetSlot::AwaitingLocator {
-                advertisement,
-                priority,
-            },
-        );
-        StageTargetResult::QueryLocator
+        self.work_by_peer
+            .insert(peer, PeerWorkState::AwaitingLocator { target, priority });
+        QueueWorkResult::NeedsLocator
     }
 
     pub(in crate::zakura::header_sync) fn awaiting(
@@ -158,41 +153,42 @@ impl TargetPursuitRegistry {
         peer: &ZakuraPeerId,
         session_id: u64,
         target_tip_hash: zakura_chain::block::Hash,
-    ) -> Option<&PeerTargetAdvertisement> {
-        match self.slots.get(peer) {
-            Some(TargetSlot::AwaitingLocator { advertisement, .. })
-                if advertisement.session_id == session_id
-                    && advertisement.status.selected_tip_hash == target_tip_hash =>
+    ) -> Option<&AdvertisedHeaderTarget> {
+        match self.work_by_peer.get(peer) {
+            Some(PeerWorkState::AwaitingLocator { target, .. })
+                if target.session_id == session_id
+                    && target.status.selected_tip_hash == target_tip_hash =>
             {
-                Some(advertisement)
+                Some(target)
             }
             _ => None,
         }
     }
 
-    pub(in crate::zakura::header_sync) fn start(&mut self, pursuit: TargetPursuit) -> bool {
-        let peer = pursuit.peer.clone();
+    pub(in crate::zakura::header_sync) fn start(&mut self, request: ActiveHeaderRequest) -> bool {
+        let peer = request.peer.clone();
         let matches = self.awaiting(
             &peer,
-            pursuit.advertised.session_id,
-            pursuit.advertised.status.selected_tip_hash,
-        ) == Some(&pursuit.advertised);
+            request.target.session_id,
+            request.target.status.selected_tip_hash,
+        ) == Some(&request.target);
         if matches {
-            self.slots.insert(peer, TargetSlot::Active(pursuit));
+            self.work_by_peer
+                .insert(peer, PeerWorkState::Active(request));
         }
         matches
     }
 
     pub(in crate::zakura::header_sync) fn remove(&mut self, peer: &ZakuraPeerId) {
-        self.slots.remove(peer);
+        self.work_by_peer.remove(peer);
     }
 
     pub(in crate::zakura::header_sync) fn remove_unstarted(&mut self, peer: &ZakuraPeerId) {
         if matches!(
-            self.slots.get(peer),
-            Some(TargetSlot::AwaitingLocator { .. })
+            self.work_by_peer.get(peer),
+            Some(PeerWorkState::AwaitingLocator { .. })
         ) {
-            self.slots.remove(peer);
+            self.work_by_peer.remove(peer);
         }
     }
 
@@ -200,9 +196,9 @@ impl TargetPursuitRegistry {
     pub(in crate::zakura::header_sync) fn active(
         &self,
         peer: &ZakuraPeerId,
-    ) -> Option<&TargetPursuit> {
-        match self.slots.get(peer) {
-            Some(TargetSlot::Active(pursuit)) => Some(pursuit),
+    ) -> Option<&ActiveHeaderRequest> {
+        match self.work_by_peer.get(peer) {
+            Some(PeerWorkState::Active(request)) => Some(request),
             _ => None,
         }
     }
@@ -241,8 +237,8 @@ mod tests {
         }
     }
 
-    fn advertisement(marker: u8) -> PeerTargetAdvertisement {
-        PeerTargetAdvertisement {
+    fn advertisement(marker: u8) -> AdvertisedHeaderTarget {
+        AdvertisedHeaderTarget {
             session_id: 7,
             observed_at: Instant::now(),
             status: Status {
@@ -302,25 +298,29 @@ mod tests {
     }
 
     #[test]
-    fn registry_caps_targets_and_only_supersedes_unstarted_work() {
-        let mut registry = TargetPursuitRegistry::default();
+    fn peer_work_queue_caps_targets_and_only_supersedes_unstarted_work() {
+        let mut queue = PeerWorkQueue::default();
         for marker in 1..=16 {
             assert_eq!(
-                registry.stage(peer(marker), advertisement(marker), TargetPriority::Normal),
-                StageTargetResult::QueryLocator
+                queue.stage(
+                    peer(marker),
+                    advertisement(marker),
+                    PeerWorkPriority::Normal
+                ),
+                QueueWorkResult::NeedsLocator
             );
         }
         assert_eq!(
-            registry.stage(peer(17), advertisement(17), TargetPriority::Normal),
-            StageTargetResult::AtCapacity
+            queue.stage(peer(17), advertisement(17), PeerWorkPriority::Normal),
+            QueueWorkResult::AtCapacity
         );
 
         let replacement = advertisement(42);
         assert_eq!(
-            registry.stage(peer(1), replacement.clone(), TargetPriority::Normal),
-            StageTargetResult::QueryLocator
+            queue.stage(peer(1), replacement.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
         );
-        assert_eq!(registry.awaiting(&peer(1), 7, hash(42)), Some(&replacement));
+        assert_eq!(queue.awaiting(&peer(1), 7, hash(42)), Some(&replacement));
 
         let local = snapshot();
         let locator = HeaderLocator::for_selected_path(&local, |height| {
@@ -328,42 +328,42 @@ mod tests {
             Ok(Some(hash(marker)))
         })
         .expect("the test projection contains every requested frontier");
-        let pursuit = TargetPursuit {
+        let request = ActiveHeaderRequest {
             peer: peer(1),
-            advertised: replacement.clone(),
+            target: replacement.clone(),
             sent_locator: locator.clone(),
             request_id: HeaderSyncRequestId::new(1).expect("one is a nonzero request ID"),
         };
-        assert!(registry.start(pursuit.clone()));
-        assert_eq!(registry.active(&peer(1)), Some(&pursuit));
+        assert!(queue.start(request.clone()));
+        assert_eq!(queue.active(&peer(1)), Some(&request));
         assert_eq!(
-            registry.stage(
+            queue.stage(
                 peer(1),
                 advertisement(43),
-                TargetPriority::HigherComparableWork
+                PeerWorkPriority::HigherComparableWork
             ),
-            StageTargetResult::Active
+            QueueWorkResult::AlreadyActive
         );
-        assert_eq!(registry.active(&peer(1)), Some(&pursuit));
-        assert_eq!(registry.active(&peer(1)).unwrap().sent_locator, locator);
+        assert_eq!(queue.active(&peer(1)), Some(&request));
+        assert_eq!(queue.active(&peer(1)).unwrap().sent_locator, locator);
         let continuation_tip = Frontier::new(block::Height(101), hash(101));
         assert_eq!(
-            pursuit.continuation_locator(continuation_tip).entries(),
+            request.continuation_locator(continuation_tip).entries(),
             &[continuation_tip]
         );
-        assert_eq!(pursuit.advertised.status.selected_tip_hash, hash(42));
+        assert_eq!(request.target.status.selected_tip_hash, hash(42));
         assert_eq!(
-            TargetPriority::from_work_order(None),
-            TargetPriority::Normal
+            PeerWorkPriority::from_work_order(None),
+            PeerWorkPriority::Normal
         );
         assert_eq!(
-            registry.stage(
+            queue.stage(
                 peer(17),
                 advertisement(17),
-                TargetPriority::HigherComparableWork,
+                PeerWorkPriority::HigherComparableWork,
             ),
-            StageTargetResult::QueryLocator
+            QueueWorkResult::NeedsLocator
         );
-        assert!(registry.awaiting(&peer(17), 7, hash(17)).is_some());
+        assert!(queue.awaiting(&peer(17), 7, hash(17)).is_some());
     }
 }

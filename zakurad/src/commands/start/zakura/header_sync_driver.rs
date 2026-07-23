@@ -11,9 +11,9 @@ use zakura_chain::{
     parallel::commitment_aux::BlockCommitmentRoots,
 };
 use zakura_network::zakura::{
-    commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange, HeaderSyncAction,
-    HeaderSyncEvent, HeaderSyncFrontiers, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup,
-    ZakuraTrace, DEFAULT_HS_RANGE,
+    commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange,
+    FullStateFrontiers, HeaderSyncAction, HeaderSyncEvent, ZakuraEndpoint,
+    ZakuraHeaderSyncDriverStartup, ZakuraTrace, DEFAULT_HS_RANGE,
 };
 
 #[cfg(test)]
@@ -71,7 +71,7 @@ pub(crate) async fn zakura_header_sync_driver_startup(
     .await?;
 
     Ok(ZakuraHeaderSyncDriverStartup {
-        frontiers: HeaderSyncFrontiers {
+        frontiers: FullStateFrontiers {
             finalized_height,
             verified_block_tip: verified_block_tip.0,
             verified_block_hash: verified_block_tip.1,

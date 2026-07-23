@@ -229,7 +229,7 @@ pub struct Status {
 
 /// Effective nonzero local serving limits advertised in [`Status`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct ServeCapabilities {
+pub struct HeaderServingLimits {
     /// Maximum headers returned in one response.
     max_headers_per_response: u32,
     /// Maximum concurrent requests served for one peer.
@@ -240,7 +240,7 @@ pub struct ServeCapabilities {
     tree_aux_schema_mask: u32,
 }
 
-impl ServeCapabilities {
+impl HeaderServingLimits {
     /// Construct effective local limits, rejecting unusable zero serving caps.
     pub fn new(
         max_headers_per_response: u32,
@@ -270,7 +270,7 @@ impl Status {
     /// Build one advertisement exclusively from an atomic committed snapshot and local limits.
     pub fn from_snapshot(
         snapshot: &zakura_header_chain::EngineSnapshot,
-        capabilities: &ServeCapabilities,
+        limits: &HeaderServingLimits,
     ) -> Self {
         Self {
             work_anchor_height: snapshot.frontiers.finalized.height,
@@ -279,10 +279,10 @@ impl Status {
             selected_tip_hash: snapshot.frontiers.header_best.hash,
             suffix_cumulative_work: snapshot.header_best_score.suffix_work.as_u256(),
             oldest_retained_height: snapshot.oldest_retained_height,
-            max_headers_per_response: capabilities.max_headers_per_response,
-            max_inflight_requests: capabilities.max_inflight_requests,
-            max_message_bytes: capabilities.max_message_bytes,
-            tree_aux_schema_mask: capabilities.tree_aux_schema_mask,
+            max_headers_per_response: limits.max_headers_per_response,
+            max_inflight_requests: limits.max_inflight_requests,
+            max_message_bytes: limits.max_message_bytes,
+            tree_aux_schema_mask: limits.tree_aux_schema_mask,
         }
     }
 }
@@ -1101,11 +1101,11 @@ mod tests {
     }
 
     #[test]
-    fn local_serve_capabilities_reject_zero_resource_limits() {
-        assert!(ServeCapabilities::new(0, 1, 1, 1).is_none());
-        assert!(ServeCapabilities::new(1, 0, 1, 1).is_none());
-        assert!(ServeCapabilities::new(1, 1, 0, 1).is_none());
-        assert!(ServeCapabilities::new(1, 1, 1, 0).is_some());
+    fn local_serving_limits_reject_zero_resource_limits() {
+        assert!(HeaderServingLimits::new(0, 1, 1, 1).is_none());
+        assert!(HeaderServingLimits::new(1, 0, 1, 1).is_none());
+        assert!(HeaderServingLimits::new(1, 1, 0, 1).is_none());
+        assert!(HeaderServingLimits::new(1, 1, 1, 0).is_some());
     }
 
     fn request() -> GetHeaders {

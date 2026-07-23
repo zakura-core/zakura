@@ -10,7 +10,7 @@ const PUBLICATION_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Per-session status timing state.
 #[derive(Clone, Debug)]
-pub(in crate::zakura::header_sync) struct StatusScheduler {
+pub(in crate::zakura::header_sync) struct StatusPublisher {
     desired: Status,
     last_sent: Option<Status>,
     last_sent_at: Option<Instant>,
@@ -18,7 +18,7 @@ pub(in crate::zakura::header_sync) struct StatusScheduler {
     refresh_interval: Duration,
 }
 
-impl StatusScheduler {
+impl StatusPublisher {
     /// Start with an immediate publication for a newly negotiated session.
     pub(in crate::zakura::header_sync) fn new(
         desired: Status,
@@ -106,25 +106,25 @@ mod tests {
     #[test]
     fn initial_refresh_and_coalesced_change_deadlines_are_bounded() {
         let now = Instant::now();
-        let mut scheduler = StatusScheduler::new(status(1), Duration::from_secs(30), now);
-        assert!(scheduler.due(now));
+        let mut publisher = StatusPublisher::new(status(1), Duration::from_secs(30), now);
+        assert!(publisher.due(now));
 
-        scheduler.record_sent(status(1), now);
-        assert_eq!(scheduler.next_deadline(), now + Duration::from_secs(30));
+        publisher.record_sent(status(1), now);
+        assert_eq!(publisher.next_deadline(), now + Duration::from_secs(30));
 
-        scheduler.observe(status(2), now + Duration::from_millis(100));
-        scheduler.observe(status(3), now + Duration::from_millis(200));
-        assert_eq!(scheduler.desired(), status(3));
-        assert_eq!(scheduler.next_deadline(), now + Duration::from_secs(1));
-        assert!(!scheduler.due(now + Duration::from_millis(999)));
-        assert!(scheduler.due(now + Duration::from_secs(1)));
+        publisher.observe(status(2), now + Duration::from_millis(100));
+        publisher.observe(status(3), now + Duration::from_millis(200));
+        assert_eq!(publisher.desired(), status(3));
+        assert_eq!(publisher.next_deadline(), now + Duration::from_secs(1));
+        assert!(!publisher.due(now + Duration::from_millis(999)));
+        assert!(publisher.due(now + Duration::from_secs(1)));
 
-        scheduler.record_sent(status(3), now + Duration::from_secs(1));
+        publisher.record_sent(status(3), now + Duration::from_secs(1));
         let refresh_at = now + Duration::from_secs(31);
-        assert!(scheduler.due(refresh_at));
-        scheduler.record_failed(refresh_at);
+        assert!(publisher.due(refresh_at));
+        publisher.record_failed(refresh_at);
         assert_eq!(
-            scheduler.next_deadline(),
+            publisher.next_deadline(),
             refresh_at + PUBLICATION_RETRY_DELAY
         );
     }

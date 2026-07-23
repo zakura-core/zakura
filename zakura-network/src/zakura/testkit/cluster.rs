@@ -152,7 +152,7 @@ mod tests {
             block_sync::{MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC},
             BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta,
             BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus,
-            DiscoveryMessage, Frame, FramedSend, HeaderSyncFrontiers, Peer, Service,
+            DiscoveryMessage, Frame, FramedSend, FullStateFrontiers, Peer, Service,
             ServicePeerLimits, Stream, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraLocalLimits,
             MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
             ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
@@ -711,7 +711,7 @@ mod tests {
             .header_sync_driver(
                 e2e_network([3]),
                 anchor,
-                HeaderSyncFrontiers {
+                FullStateFrontiers {
                     finalized_height: block::Height(0),
                     verified_block_tip: block::Height(0),
                     verified_block_hash: anchor.1,

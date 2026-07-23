@@ -404,7 +404,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-RETAIN-04"
 name = "Staged-target limits"
 status = "implemented"
-owner = "zakura_network::PeerTargetAdvertisement"
+owner = "zakura_network::AdvertisedHeaderTarget"
 tests = ["PW-05::registry_caps_targets_and_only_supersedes_unstarted_work"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -541,7 +541,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-WIRE-17"
 name = "Status publication cadence"
 status = "implemented"
-owner = "zakura_network::zakura::header_sync::scheduler::status::StatusScheduler"
+owner = "zakura_network::zakura::header_sync::scheduler::status::StatusPublisher"
 tests = ["PW-07::status_uses_committed_snapshots_and_bounded_cadence", "PW-07::initial_refresh_and_coalesced_change_deadlines_are_bounded"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -557,7 +557,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-WIRE-04"
 name = "Advertised-target scheduling"
 status = "implemented"
-owner = "zakura_network::TargetPursuit"
+owner = "zakura_network::ActiveHeaderRequest"
 tests = ["PW-05::unknown_status_targets_remain_eligible_regardless_of_advisory_shape", "PW-05::registry_caps_targets_and_only_supersedes_unstarted_work", "PW-05::target_from_status_supersedes_only_before_exact_locator_publication"]
 networks = ["mainnet", "testnet", "custom"]
 

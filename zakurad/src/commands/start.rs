@@ -1543,7 +1543,7 @@ mod zakura_header_sync_driver_tests {
     use zakura_network::zakura::{
         commit_state_trace as cs_trace, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,
         BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers, BlockSyncMisbehavior,
-        HeaderSyncFrontiers, Peer as ZakuraPeer, Service as ZakuraService, Stream as ZakuraStream,
+        FullStateFrontiers, Peer as ZakuraPeer, Service as ZakuraService, Stream as ZakuraStream,
         ZakuraHeaderSyncDriverStartup, BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, DEFAULT_HS_RANGE,
     };
     use zakura_network::P2pStack;
@@ -2149,7 +2149,7 @@ mod zakura_header_sync_driver_tests {
             &config,
             |_supervisor, _trace| Arc::new(NoopZakuraService) as Arc<dyn ZakuraService>,
             Some(ZakuraHeaderSyncDriverStartup {
-                frontiers: HeaderSyncFrontiers {
+                frontiers: FullStateFrontiers {
                     finalized_height: block::Height(0),
                     verified_block_tip: block::Height(0),
                     verified_block_hash: genesis_hash,

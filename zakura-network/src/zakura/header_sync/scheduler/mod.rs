@@ -1,2 +1,2 @@
+pub(super) mod peer_work;
 pub(super) mod status;
-pub(super) mod target;

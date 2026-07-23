@@ -10,8 +10,8 @@ use zakura_chain::block;
 
 use super::{
     scheduler::{
-        status::StatusScheduler,
-        target::{StageTargetResult, TargetPriority, TargetPursuitRegistry},
+        peer_work::{PeerWorkPriority, PeerWorkQueue, QueueWorkResult},
+        status::StatusPublisher,
     },
     *,
 };
@@ -56,18 +56,18 @@ pub fn spawn_header_sync_reactor(
         .saturating_sub(FRAME_HEADER_BYTES as u32)
         .min(MAX_HS_MESSAGE_BYTES as u32)
         .max(1);
-    let serve_capabilities = ServeCapabilities::new(
+    let serving_limits = HeaderServingLimits::new(
         startup.config.advertised_max_headers_per_response(),
         startup.config.advertised_max_inflight_requests(),
         max_message_bytes,
         AuxSchema::V1.mask_bit(),
     )
-    .expect("clamped header-sync serving capabilities are nonzero");
+    .expect("clamped header-sync serving limits are nonzero");
     let codec = HeaderSyncCodec::new(
         startup.network.clone(),
         max_message_bytes,
-        serve_capabilities.max_headers_per_response(),
-        serve_capabilities.tree_aux_schema_mask(),
+        serving_limits.max_headers_per_response(),
+        serving_limits.tree_aux_schema_mask(),
     );
     let committed_snapshot = startup
         .committed_snapshots
@@ -90,10 +90,10 @@ pub fn spawn_header_sync_reactor(
         peers: peers_tx,
         candidates: candidates_tx,
         codec,
-        serve_capabilities,
+        serving_limits,
         committed_snapshot,
         peer_state: HashMap::new(),
-        target_pursuits: TargetPursuitRegistry::default(),
+        peer_work_queue: PeerWorkQueue::default(),
     };
     Ok((handle, actions_rx, tokio::spawn(reactor.run())))
 }
@@ -101,7 +101,7 @@ pub fn spawn_header_sync_reactor(
 #[derive(Debug)]
 struct PeerState {
     session: HeaderSyncPeerSession,
-    status: Option<StatusScheduler>,
+    status_publisher: Option<StatusPublisher>,
     last_received_status_at: Option<Instant>,
 }
 
@@ -115,10 +115,10 @@ struct HeaderSyncReactor {
     peers: watch::Sender<ServicePeerSnapshot>,
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
     codec: HeaderSyncCodec,
-    serve_capabilities: ServeCapabilities,
+    serving_limits: HeaderServingLimits,
     committed_snapshot: Option<zakura_header_chain::EngineSnapshot>,
     peer_state: HashMap<ZakuraPeerId, PeerState>,
-    target_pursuits: TargetPursuitRegistry,
+    peer_work_queue: PeerWorkQueue,
 }
 
 impl HeaderSyncReactor {
@@ -225,9 +225,9 @@ impl HeaderSyncReactor {
             return;
         }
 
-        let status = self.committed_snapshot.as_ref().map(|snapshot| {
-            StatusScheduler::new(
-                Status::from_snapshot(snapshot, &self.serve_capabilities),
+        let status_publisher = self.committed_snapshot.as_ref().map(|snapshot| {
+            StatusPublisher::new(
+                Status::from_snapshot(snapshot, &self.serving_limits),
                 self.startup.status_refresh_interval,
                 Instant::now(),
             )
@@ -236,12 +236,12 @@ impl HeaderSyncReactor {
             peer.clone(),
             PeerState {
                 session,
-                status,
+                status_publisher,
                 last_received_status_at: None,
             },
         ) {
             previous.session.cancel_token().cancel();
-            self.target_pursuits.remove(&peer);
+            self.peer_work_queue.remove(&peer);
         }
         self.publish_peer_state();
         self.send_status(&peer);
@@ -249,7 +249,7 @@ impl HeaderSyncReactor {
 
     fn handle_peer_disconnected(&mut self, peer: &ZakuraPeerId) {
         self.peer_state.remove(peer);
-        self.target_pursuits.remove(peer);
+        self.peer_work_queue.remove(peer);
         self.publish_peer_state();
     }
 
@@ -276,7 +276,7 @@ impl HeaderSyncReactor {
             return;
         }
 
-        let advertisement = PeerTargetAdvertisement {
+        let target = AdvertisedHeaderTarget {
             session_id,
             observed_at: Instant::now(),
             status: status.clone(),
@@ -284,33 +284,33 @@ impl HeaderSyncReactor {
         let Some(local) = self.committed_snapshot.as_ref() else {
             return;
         };
-        let work_order = advertisement.claimed_work_order(local);
-        let eligible = advertisement.is_discovery_eligible(local);
+        let work_order = target.claimed_work_order(local);
+        let eligible = target.is_discovery_eligible(local);
         if let Some(state) = self.peer_state.get_mut(&peer) {
             state.last_received_status_at = Some(Instant::now());
         }
         if !eligible {
-            self.target_pursuits.remove_unstarted(&peer);
+            self.peer_work_queue.remove_unstarted(&peer);
             return;
         }
-        match self.target_pursuits.stage(
+        match self.peer_work_queue.stage(
             peer.clone(),
-            advertisement,
-            TargetPriority::from_work_order(work_order),
+            target,
+            PeerWorkPriority::from_work_order(work_order),
         ) {
-            StageTargetResult::QueryLocator => {
+            QueueWorkResult::NeedsLocator => {
                 if !self.dispatch_action(HeaderSyncAction::QueryHeaderLocator {
                     peer: peer.clone(),
                     session_id,
                     target_tip_hash: status.selected_tip_hash,
                 }) {
-                    self.target_pursuits.remove_unstarted(&peer);
+                    self.peer_work_queue.remove_unstarted(&peer);
                 }
             }
-            StageTargetResult::Active => {
+            QueueWorkResult::AlreadyActive => {
                 metrics::counter!("sync.header.target.already_active").increment(1);
             }
-            StageTargetResult::AtCapacity => {
+            QueueWorkResult::AtCapacity => {
                 metrics::counter!("sync.header.target.capacity_refused").increment(1);
             }
         }
@@ -323,8 +323,8 @@ impl HeaderSyncReactor {
         target_tip_hash: block::Hash,
         locator: Option<zakura_header_chain::HeaderLocator>,
     ) {
-        let Some(advertisement) = self
-            .target_pursuits
+        let Some(target) = self
+            .peer_work_queue
             .awaiting(&peer, session_id, target_tip_hash)
             .cloned()
         else {
@@ -332,7 +332,7 @@ impl HeaderSyncReactor {
             return;
         };
         let Some(locator) = locator else {
-            self.target_pursuits.remove_unstarted(&peer);
+            self.peer_work_queue.remove_unstarted(&peer);
             metrics::counter!("sync.header.target.locator_unavailable").increment(1);
             return;
         };
@@ -341,12 +341,12 @@ impl HeaderSyncReactor {
             .get(&peer)
             .map(|state| state.session.clone())
         else {
-            self.target_pursuits.remove_unstarted(&peer);
+            self.peer_work_queue.remove_unstarted(&peer);
             return;
         };
 
-        let tree_aux_schema = if advertisement.status.tree_aux_schema_mask
-            & self.serve_capabilities.tree_aux_schema_mask()
+        let tree_aux_schema = if target.status.tree_aux_schema_mask
+            & self.serving_limits.tree_aux_schema_mask()
             & AuxSchema::V1.mask_bit()
             != 0
         {
@@ -363,7 +363,7 @@ impl HeaderSyncReactor {
                 0
             });
         let byte_limited_count = usize::try_from(
-            advertisement
+            target
                 .status
                 .max_message_bytes
                 .saturating_sub(response_overhead),
@@ -372,14 +372,14 @@ impl HeaderSyncReactor {
         .checked_div(per_header)
         .and_then(|count| u32::try_from(count).ok())
         .unwrap_or(0);
-        let max_header_count = advertisement
+        let max_header_count = target
             .status
             .max_headers_per_response
-            .min(self.serve_capabilities.max_headers_per_response())
+            .min(self.serving_limits.max_headers_per_response())
             .min(byte_limited_count)
             .min(MAX_HS_RANGE);
         if max_header_count == 0 {
-            self.target_pursuits.remove_unstarted(&peer);
+            self.peer_work_queue.remove_unstarted(&peer);
             return;
         }
 
@@ -391,9 +391,9 @@ impl HeaderSyncReactor {
             tree_aux_schema,
         ) {
             Ok(request_id) => {
-                let started = self.target_pursuits.start(TargetPursuit {
+                let started = self.peer_work_queue.start(ActiveHeaderRequest {
                     peer,
-                    advertised: advertisement,
+                    target,
                     sent_locator: locator,
                     request_id,
                 });
@@ -404,7 +404,7 @@ impl HeaderSyncReactor {
                 metrics::counter!("sync.header.target.requested").increment(1);
             }
             Err(error) => {
-                self.target_pursuits.remove_unstarted(&peer);
+                self.peer_work_queue.remove_unstarted(&peer);
                 metrics::counter!(
                     "sync.header.target.send_failed",
                     "reason" => ordered_send_error_label(&error)
@@ -420,14 +420,14 @@ impl HeaderSyncReactor {
             .as_ref()
             .map(|old| old.frontiers.header_best);
         let new_tip = snapshot.frontiers.header_best;
-        let status = Status::from_snapshot(&snapshot, &self.serve_capabilities);
+        let status = Status::from_snapshot(&snapshot, &self.serving_limits);
         let now = Instant::now();
         self.committed_snapshot = Some(snapshot);
         for state in self.peer_state.values_mut() {
-            match state.status.as_mut() {
-                Some(scheduler) => scheduler.observe(status.clone(), now),
+            match state.status_publisher.as_mut() {
+                Some(publisher) => publisher.observe(status.clone(), now),
                 None => {
-                    state.status = Some(StatusScheduler::new(
+                    state.status_publisher = Some(StatusPublisher::new(
                         status.clone(),
                         self.startup.status_refresh_interval,
                         now,
@@ -461,7 +461,7 @@ impl HeaderSyncReactor {
             update.change,
             FrontierChange::Snapshot | FrontierChange::VerifiedGrow | FrontierChange::VerifiedReset
         ) {
-            self.startup.frontiers = HeaderSyncFrontiers {
+            self.startup.frontiers = FullStateFrontiers {
                 finalized_height: update.frontier.finalized.height,
                 verified_block_tip: update.frontier.verified_body.height,
                 verified_block_hash: update.frontier.verified_body.hash,
@@ -472,32 +472,32 @@ impl HeaderSyncReactor {
     fn send_status(&mut self, peer: &ZakuraPeerId) -> bool {
         let now = Instant::now();
         let Some((session, status)) = self.peer_state.get(peer).and_then(|state| {
-            let scheduler = state.status.as_ref()?;
-            scheduler
+            let publisher = state.status_publisher.as_ref()?;
+            publisher
                 .due(now)
-                .then(|| (state.session.clone(), scheduler.desired()))
+                .then(|| (state.session.clone(), publisher.desired()))
         }) else {
             return false;
         };
         match session.try_send_status(&self.codec, status.clone()) {
             Ok(()) => {
-                if let Some(scheduler) = self
+                if let Some(publisher) = self
                     .peer_state
                     .get_mut(peer)
-                    .and_then(|state| state.status.as_mut())
+                    .and_then(|state| state.status_publisher.as_mut())
                 {
-                    scheduler.record_sent(status, now);
+                    publisher.record_sent(status, now);
                 }
                 metrics::counter!("sync.header.peer.status.sent").increment(1);
                 true
             }
             Err(error) => {
-                if let Some(scheduler) = self
+                if let Some(publisher) = self
                     .peer_state
                     .get_mut(peer)
-                    .and_then(|state| state.status.as_mut())
+                    .and_then(|state| state.status_publisher.as_mut())
                 {
-                    scheduler.record_failed(now);
+                    publisher.record_failed(now);
                 }
                 tracing::debug!(?peer, ?error, "failed to queue header-sync Status");
                 false
@@ -510,7 +510,12 @@ impl HeaderSyncReactor {
         let peers: Vec<_> = self
             .peer_state
             .iter()
-            .filter(|(_, state)| state.status.as_ref().is_some_and(|status| status.due(now)))
+            .filter(|(_, state)| {
+                state
+                    .status_publisher
+                    .as_ref()
+                    .is_some_and(|publisher| publisher.due(now))
+            })
             .map(|(peer, _)| peer.clone())
             .collect();
         for peer in peers {
@@ -521,7 +526,12 @@ impl HeaderSyncReactor {
     fn next_maintenance_deadline(&self) -> Instant {
         self.peer_state
             .values()
-            .filter_map(|state| state.status.as_ref().map(StatusScheduler::next_deadline))
+            .filter_map(|state| {
+                state
+                    .status_publisher
+                    .as_ref()
+                    .map(StatusPublisher::next_deadline)
+            })
             .min()
             .unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(60))
     }

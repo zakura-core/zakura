@@ -22,7 +22,7 @@ use super::{await_until, ZakuraTestCluster, ZakuraTestNode};
 use crate::{
     zakura::{
         BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
-        BlockSyncFrontiers, HeaderSyncFrontiers, ServicePeerLimits, ZakuraBlockSyncConfig,
+        BlockSyncFrontiers, FullStateFrontiers, ServicePeerLimits, ZakuraBlockSyncConfig,
         ZakuraLocalLimits,
     },
     BoxError, Config,
@@ -491,7 +491,7 @@ async fn spawn_mock_node(
         .header_sync_driver(
             Config::default().network,
             anchor,
-            HeaderSyncFrontiers {
+            FullStateFrontiers {
                 finalized_height: initial_frontiers.finalized_height,
                 verified_block_tip: initial_frontiers.verified_block_tip,
                 verified_block_hash: initial_frontiers.verified_block_hash,

@@ -15,11 +15,10 @@ use crate::{
     zakura::{
         discovery::build_discovery_handle, service_registry, spawn_block_sync_reactor,
         spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
-        BlockSyncStartup, DiscoveryService, HeaderSyncAction, HeaderSyncFrontiers,
-        HeaderSyncHandle, HeaderSyncStartup, Service, ZakuraBlockSyncConfig, ZakuraDiscoveryHandle,
-        ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
-        ZakuraPeerId, ZakuraProtocolHandler, ZakuraServiceId, ZakuraSupervisorHandle, ZakuraTrace,
-        P2P_V2_ALPN,
+        BlockSyncStartup, DiscoveryService, FullStateFrontiers, HeaderSyncAction, HeaderSyncHandle,
+        HeaderSyncStartup, Service, ZakuraBlockSyncConfig, ZakuraDiscoveryHandle, ZakuraEndpoint,
+        ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraPeerId,
+        ZakuraProtocolHandler, ZakuraServiceId, ZakuraSupervisorHandle, ZakuraTrace, P2P_V2_ALPN,
     },
     BoxError, Config,
 };
@@ -222,7 +221,7 @@ pub struct ZakuraTestNodeBuilder {
 struct TestHeaderSyncStartup {
     network: Network,
     anchor: (block::Height, block::Hash),
-    frontiers: HeaderSyncFrontiers,
+    frontiers: FullStateFrontiers,
     best_header_tip: Option<(block::Height, block::Hash)>,
     verified_block_tip_hash: block::Hash,
 }
@@ -345,7 +344,7 @@ impl ZakuraTestNodeBuilder {
         mut self,
         network: Network,
         anchor: (block::Height, block::Hash),
-        frontiers: HeaderSyncFrontiers,
+        frontiers: FullStateFrontiers,
         best_header_tip: Option<(block::Height, block::Hash)>,
     ) -> Self {
         self.header_sync = Some(TestHeaderSyncStartup {

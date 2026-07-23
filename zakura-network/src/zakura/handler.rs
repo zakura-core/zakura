@@ -51,7 +51,7 @@ use crate::{
         direct_endpoint_builder, drive_header_sync_actions, spawn_block_sync_reactor,
         spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
         BlockSyncService, BlockSyncStartup, Clock, CloseCause, Frame, FramedRecv, FramedSend,
-        Frontier, FrontierChange, FrontierUpdate, HeaderSyncAction, HeaderSyncFrontiers,
+        Frontier, FrontierChange, FrontierUpdate, FullStateFrontiers, HeaderSyncAction,
         HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup, Peer, RealClock,
         Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject, Stream,
         StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId,
@@ -544,7 +544,7 @@ struct HeaderSyncBackgroundTasks {
 #[derive(Clone, Debug)]
 pub struct ZakuraHeaderSyncDriverStartup {
     /// Durable state frontiers loaded at node startup.
-    pub frontiers: HeaderSyncFrontiers,
+    pub frontiers: FullStateFrontiers,
     /// Durable best header tip loaded from state.
     pub best_header_tip: Option<(block::Height, block::Hash)>,
     /// Hash of `frontiers.verified_block_tip`.
@@ -3025,7 +3025,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     )?;
     let anchor = config.zakura.header_sync.anchor(&config.network)?;
     let frontiers = header_sync_driver_startup.as_ref().map_or(
-        HeaderSyncFrontiers {
+        FullStateFrontiers {
             finalized_height: anchor.0,
             verified_block_tip: anchor.0,
             verified_block_hash: anchor.1,
@@ -5640,7 +5640,7 @@ mod tests {
         let mut startup = HeaderSyncStartup::new(
             network,
             anchor,
-            HeaderSyncFrontiers {
+            FullStateFrontiers {
                 finalized_height: anchor.0,
                 verified_block_tip: anchor.0,
                 verified_block_hash: anchor.1,

@@ -12,7 +12,7 @@ use crate::zakura::{
 
 /// Cached full-state frontiers used by header sync and block sync.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct HeaderSyncFrontiers {
+pub struct FullStateFrontiers {
     /// Shared finalized height.
     pub finalized_height: block::Height,
     /// Highest verified block-body height.
@@ -29,7 +29,7 @@ pub struct HeaderSyncStartup {
     /// Trusted anchor height and hash.
     pub anchor: (block::Height, block::Hash),
     /// Cached full-state frontiers at startup.
-    pub frontiers: HeaderSyncFrontiers,
+    pub frontiers: FullStateFrontiers,
     /// Durable best header tip loaded at startup.
     pub best_header_tip: Option<(block::Height, block::Hash)>,
     /// Shared sync frontier updates.
@@ -55,7 +55,7 @@ impl HeaderSyncStartup {
     pub fn new(
         network: Network,
         anchor: (block::Height, block::Hash),
-        frontiers: HeaderSyncFrontiers,
+        frontiers: FullStateFrontiers,
         best_header_tip: Option<(block::Height, block::Hash)>,
         config: ZakuraHeaderSyncConfig,
         max_frame_bytes: u32,
@@ -183,7 +183,7 @@ pub enum HeaderSyncEvent {
         msg: HeaderSyncMessage,
     },
     /// Full-state frontiers changed.
-    StateFrontiersChanged(HeaderSyncFrontiers),
+    StateFrontiersChanged(FullStateFrontiers),
     /// State returned the selected-path locator for an advertised target.
     HeaderLocatorReady {
         /// Peer whose target requested the locator.

@@ -15,6 +15,9 @@ mod retention;
 mod transition;
 mod validation;
 
+#[cfg(any(test, feature = "fuzz-impl"))]
+mod fuzz;
+
 pub use config::{
     CheckpointSet, EngineConfig, EngineConfigError, EngineLimits, EngineMode,
     SettledUpgradeManifest, SettledUpgradePin, TrustedAnchor, MAX_CANDIDATE_TIPS_V1,
@@ -24,6 +27,8 @@ pub use error::{Attribution, ErrorCategory, ErrorSubject, HeaderChainError, Rule
 pub use frontier::{
     ChainScore, Frontier, FrontierSet, SuffixWork, WorkCoordinate, WorkCoordinateError,
 };
+#[cfg(any(test, feature = "fuzz-impl"))]
+pub use fuzz::{replay_fork_transition_bytes, ForkReplaySummary};
 pub use graph::{GraphError, InsertResult, MemHeaderStore};
 pub use ids::{
     BranchId, CounterExhausted, EvidenceId, FinalityEpoch, HeaderGeneration, HeaderId,

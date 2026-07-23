@@ -84,6 +84,12 @@ impl TransitionPlan {
     pub(crate) const fn projected(&self) -> &MemHeaderStore {
         &self.projected
     }
+
+    /// Return the verified projected graph to the isolated structured fuzzer.
+    #[cfg(any(test, feature = "fuzz-impl"))]
+    pub fn fuzz_projected(&self) -> &MemHeaderStore {
+        &self.projected
+    }
 }
 
 /// Typed failure produced before any durable mutation is attempted.

@@ -10,11 +10,19 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 zakura-chain = { path = "../../zakura-chain" }
+zakura-header-chain = { path = "../../zakura-header-chain", features = ["fuzz-impl"] }
 zakura-network = { path = "../../zakura-network" }
 
 [[bin]]
 name = "header_codec"
 path = "fuzz_targets/header_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fork_transitions"
+path = "fuzz_targets/fork_transitions.rs"
 test = false
 doc = false
 bench = false

@@ -87,22 +87,34 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-DAG-02"
 name = "Fork-aware indexes"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::HeaderChainStore"
+tests = ["DG-04::fork_indexes_selection_and_inherited_reason_sets_are_exact", "DG-04::startup_repairs_every_reconstructible_index_atomically_before_publication", "DG-04::every_named_invariant_category_rejects_its_projected_corruption"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-DAG-03"
 name = "Bounded orphan staging"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::PeerWorkQueue"
+tests = ["DG-06::aggregate_staged_header_cap_spans_all_peers_and_releases_on_retirement", "DG-06::aggregate_staging_overflow_retires_work_without_peer_punishment", "PW-03::requester_stages_all_pages_before_one_exact_admission"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-FRONTIER-01"
 name = "Shared finalized ancestry"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::verify_plan"
+tests = ["DG-02::aud_11_invalidating_only_verified_path_keeps_independent_header_best", "DG-02::every_named_invariant_category_rejects_its_projected_corruption", "AUD-15::every_changed_frontier_accepts_an_exact_parent_next_child"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-FRONTIER-02"
 name = "Independent frontier selection"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::apply_transition"
+tests = ["DG-02::body_availability_does_not_override_header_work_or_mark_other_bodies", "DG-02::aud_11_invalidating_only_verified_path_keeps_independent_header_best", "DG-07::aud_13_finalization_and_replacement_match_complete_serial_histories"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-FRONTIER-03"
@@ -123,12 +135,18 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-GEN-01"
 name = "State-version advancement"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::derive_plan"
+tests = ["IN-05::structured_replay_is_bounded_and_deterministic", "IN-05::fork_transition_regression_corpus_replays_green", "IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-GEN-02"
 name = "Frontier-generation advancement"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_header_chain::derive_plan"
+tests = ["IN-05::structured_replay_is_bounded_and_deterministic", "IN-05::fork_transition_regression_corpus_replays_green", "DG-07::aud_13_finalization_and_replacement_match_complete_serial_histories"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-GEN-03"

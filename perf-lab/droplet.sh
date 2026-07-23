@@ -214,24 +214,46 @@ PYBSK
   bash -n ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh \
     || echo "WARN: bsknob patch broke harness syntax" >&2
 fi
-# B-16: three mid-stream HTTP/2 INTERNAL_ERROR download deaths in two days;
-# force HTTP/1.1 on the snapshot curl and give the primary source two tries
-# (the pipeline streams into tar, so resume is impossible — a retry is a
-# full re-download, but a cheap one vs a dead bench).
+# B-16 v2: mid-stream download deaths are a CDN long-single-stream problem
+# (4 in two days across BOTH http/2 and http/1.1; origin file verified intact
+# via range probes). Fix: resume-to-file fetch, curl -C - in a retry loop,
+# makes progress monotonic; the tarball then streams into the same
+# sha256/zstd/tar tail and is deleted as it goes. Transiently needs ~30G more
+# disk than the pure-streaming original, so the free-space gate rises 45→75.
 if ! grep -q "perf-lab B-16" ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh; then
   python3 - ${CTL_CLONE_REMOTE}/scripts/checkpoint-sync-bench.sh <<'PYB16'
+# Heredoc-safe by construction: heredoc-special characters (dollar,
+# backslash, backtick) and the quote chars never appear in string literals;
+# placeholders &D &B &S &Q substitute them via chr() (trace_dir lesson).
 import sys
+def T(s):
+    return (s.replace("&D", chr(36)).replace("&B", chr(92))
+             .replace("&S", chr(39)).replace("&Q", chr(34)))
 path = sys.argv[1]
 s = open(path).read()
-old_curl = 'curl -fL --retry 3 --retry-delay 5 --connect-timeout 30'
-assert s.count(old_curl) >= 1, "curl anchor"
-s = s.replace(old_curl, 'curl -fL --http1.1 --retry 3 --retry-delay 5 --connect-timeout 30', 1)
-d = chr(36)
-old_srcs = 'for url in ' + chr(34) + d + 'SNAPSHOT_URL' + chr(34) + ' ' + chr(34) + d + 'SNAPSHOT_MIRROR' + chr(34) + '; do'
+old_gate = T("(( avail_gib >= 45 )) || die &Qneed >=45GiB free at &DBENCH_HOME, have &D{avail_gib}GiB&Q")
+assert old_gate in s, "gate anchor"
+s = s.replace(old_gate, T("(( avail_gib >= 75 )) || die &Qneed >=75GiB free at &DBENCH_HOME, have &D{avail_gib}GiB&Q  # perf-lab B-16: +30G transient tarball"), 1)
+old_srcs = T("for url in &Q&DSNAPSHOT_URL&Q &Q&DSNAPSHOT_MIRROR&Q; do")
 assert old_srcs in s, "source-loop anchor"
-new_srcs = ('for url in ' + chr(34) + d + 'SNAPSHOT_URL' + chr(34) + ' ' + chr(34) + d + 'SNAPSHOT_URL' + chr(34)
-            + ' ' + chr(34) + d + 'SNAPSHOT_MIRROR' + chr(34) + '; do  # perf-lab B-16: primary gets two tries')
-s = s.replace(old_srcs, new_srcs, 1)
+s = s.replace(old_srcs, T("for url in &Q&DSNAPSHOT_URL&Q &Q&DSNAPSHOT_URL&Q &Q&DSNAPSHOT_MIRROR&Q; do  # perf-lab B-16: primary gets two tries"), 1)
+old_curl = T("""    if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 &Q&Durl&Q &B
+         | tee >(sha256sum | awk &S{print &D1}&S > &Q&Dsumf&Q) &B""")
+assert old_curl in s, "curl-producer anchor"
+new_curl = T("""    # perf-lab B-16: resume-to-file fetch (see droplet.sh for rationale)
+    dlf=&Q&DBENCH_HOME/snapshots/dl.tar.zst&Q; mkdir -p &Q&D{dlf%/*}&Q; rm -f &Q&Ddlf&Q
+    want=&D(curl -sIL --http1.1 &Q&Durl&Q | tr -d &Q&Br&Q | awk &Stolower(&D1)==&Qcontent-length:&Q{cl=&D2} END{print cl}&S)
+    okdl=0
+    for _ in &D(seq 1 30); do
+      [[ -n &Q&Dwant&Q && &Q&D(stat -c%s &Q&Ddlf&Q 2>/dev/null || echo 0)&Q == &Q&Dwant&Q ]] && { okdl=1; break; }
+      curl -fsSL --http1.1 -C - --retry 5 --retry-delay 5 --connect-timeout 30 -o &Q&Ddlf&Q &Q&Durl&Q && { okdl=1; break; }
+      log &Qresume-fetch interrupted at &D(stat -c%s &Q&Ddlf&Q 2>/dev/null || echo 0) bytes; resuming&Q
+      sleep 5
+    done
+    if (( ! okdl )); then log &Qsource failed; cleaning and trying next&Q; rm -rf &Q&Dtmp&Q; mkdir -p &Q&Dtmp&Q; continue; fi
+    if { cat &Q&Ddlf&Q && rm -f &Q&Ddlf&Q; } &B
+         | tee >(sha256sum | awk &S{print &D1}&S > &Q&Dsumf&Q) &B""")
+s = s.replace(old_curl, new_curl, 1)
 open(path, "w").write(s)
 print("B-16 patch applied")
 PYB16

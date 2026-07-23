@@ -382,3 +382,14 @@ This file is the sole reporting channel (design D5). Entry template:
   needed for perf-lab-s3's lifetime.
 - settle1 relaunched (build + two k=1 legs only, ~45 min). Chain unchanged:
   settle1 → exp002-k8-c confirmation → two-leg WIN test.
+
+### B-16 v2 baked (2026-07-23 ~03:25Z)
+
+- prepare_remote's B-16 patch upgraded from protocol-tweak to resume-to-file
+  fetch (the mechanism that actually rescued tonight): curl -C - retry loop
+  (30 tries, size-verified against Content-Length), tarball streams into the
+  unchanged sha256/zstd/tar tail and is deleted as it streams; free-space
+  gate 45→75GiB for the transient. Verified offline against pristine
+  origin/main (anchors, syntax, idempotency, gate message intact). NOT
+  applied to s3 mid-run (rewriting a running script corrupts it; s3's master
+  is cached so it never downloads again). Future droplets get it at provision.

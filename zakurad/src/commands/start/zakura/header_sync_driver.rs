@@ -279,6 +279,44 @@ fn header_root_authentication_failed(
     HeaderSyncEvent::HeaderRootAuthenticationFailed { operation, kind }
 }
 
+/// Convert a finished root-auth JoinSet entry into the reactor settlement event.
+///
+/// A panicked (non-cancelled) task must still settle the reactor's pending
+/// `AuthenticateRoots` op; otherwise both admission gates stay blocked forever.
+fn settle_root_auth_task_join(
+    joined: Option<Result<HeaderSyncEvent, tokio::task::JoinError>>,
+    in_flight: &mut Option<HeaderSyncOperationIdentity>,
+) -> Option<HeaderSyncEvent> {
+    match joined {
+        Some(Ok(event)) => {
+            let _ = in_flight.take();
+            Some(event)
+        }
+        Some(Err(error)) if !error.is_cancelled() => {
+            let Some(operation) = in_flight.take() else {
+                warn!(
+                    ?error,
+                    "header-root authentication task failed without a tracked operation"
+                );
+                return None;
+            };
+            warn!(
+                ?error,
+                ?operation,
+                "header-root authentication task failed; synthesizing local failure"
+            );
+            Some(header_root_authentication_failed(
+                operation,
+                HeaderRootAuthenticationFailureKind::Local,
+            ))
+        }
+        Some(Err(_)) | None => {
+            let _ = in_flight.take();
+            None
+        }
+    }
+}
+
 fn header_root_authentication_failure_kind(
     error: &(dyn std::error::Error + Send + Sync + 'static),
 ) -> HeaderRootAuthenticationFailureKind {
@@ -418,6 +456,85 @@ mod operation_identity_tests {
             header_root_authentication_failure_kind(&local),
             HeaderRootAuthenticationFailureKind::Local
         );
+    }
+
+    #[tokio::test]
+    async fn panicked_root_auth_join_synthesizes_local_failure() {
+        let operation = {
+            let mut operation = operation();
+            operation.op_kind = HeaderSyncOperationKind::AuthenticateRoots;
+            operation
+        };
+        let mut in_flight = Some(operation.clone());
+        let panic_join = tokio::spawn(async {
+            panic!("simulated root-auth task panic");
+        })
+        .await
+        .expect_err("join must surface the panic");
+
+        let event = settle_root_auth_task_join(Some(Err(panic_join)), &mut in_flight);
+        assert!(
+            matches!(
+                event,
+                Some(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+                    operation: ref echoed,
+                    kind: HeaderRootAuthenticationFailureKind::Local,
+                }) if *echoed == operation
+            ),
+            "unexpected settlement event: {event:?}"
+        );
+        assert!(
+            in_flight.is_none(),
+            "panic settlement must clear the tracked operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_root_auth_join_does_not_synthesize_failure() {
+        let operation = {
+            let mut operation = operation();
+            operation.op_kind = HeaderSyncOperationKind::AuthenticateRoots;
+            operation
+        };
+        let mut in_flight = Some(operation);
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+        let cancelled_join = handle
+            .await
+            .expect_err("aborted join must surface cancellation");
+        assert!(cancelled_join.is_cancelled());
+
+        let event = settle_root_auth_task_join(Some(Err(cancelled_join)), &mut in_flight);
+        assert!(event.is_none(), "cancelled joins must not settle as Local");
+        assert!(
+            in_flight.is_none(),
+            "cancelled joins still clear the tracked operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_root_auth_join_forwards_event_and_clears_tracker() {
+        let operation = {
+            let mut operation = operation();
+            operation.op_kind = HeaderSyncOperationKind::AuthenticateRoots;
+            operation
+        };
+        let mut in_flight = Some(operation.clone());
+        let completed = header_root_authentication_completed(operation.clone());
+
+        let event = settle_root_auth_task_join(Some(Ok(completed)), &mut in_flight);
+        assert!(
+            matches!(
+                event,
+                Some(HeaderSyncEvent::HeaderRootAuthenticationCompleted {
+                    operation: ref echoed,
+                }) if *echoed == operation
+            ),
+            "unexpected settlement event: {event:?}"
+        );
+        assert!(in_flight.is_none());
     }
 
     #[tokio::test]
@@ -682,6 +799,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
 {
     pin!(shutdown);
     let mut root_auth_tasks = JoinSet::new();
+    let mut in_flight_root_auth = None;
     loop {
         let action = select! {
             _ = &mut shutdown => {
@@ -690,14 +808,10 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 return;
             },
             completed = root_auth_tasks.join_next(), if !root_auth_tasks.is_empty() => {
-                match completed {
-                    Some(Ok(event)) => {
-                        let _ = handles.header_sync.send(event).await;
-                    }
-                    Some(Err(error)) if !error.is_cancelled() => {
-                        warn!(?error, "header-root authentication task failed");
-                    }
-                    Some(Err(_)) | None => {}
+                if let Some(event) =
+                    settle_root_auth_task_join(completed, &mut in_flight_root_auth)
+                {
+                    let _ = handles.header_sync.send(event).await;
                 }
                 continue;
             },
@@ -1331,6 +1445,11 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     roots: roots.unwrap_or_default(),
                 };
                 let state = state.clone();
+                debug_assert!(
+                    in_flight_root_auth.is_none(),
+                    "at most one root-auth task is admitted"
+                );
+                in_flight_root_auth = Some(operation.clone());
                 root_auth_tasks.spawn(async move {
                     match tokio::time::timeout(
                         ROOT_AUTH_STATE_TIMEOUT,

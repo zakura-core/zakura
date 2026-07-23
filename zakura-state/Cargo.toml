@@ -35,6 +35,7 @@ indexer = []
 commit-metrics = []
 
 # Test-only features
+header-fuzz = []
 proptest-impl = [
     "proptest",
     "proptest-derive",

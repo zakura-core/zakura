@@ -111,6 +111,8 @@ pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
     MAX_ON_DISK_HEIGHT,
 };
+#[cfg(any(test, feature = "header-fuzz"))]
+pub use header_chain::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub use vct::{
     generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
     GeneratorError, NextVctBlock,

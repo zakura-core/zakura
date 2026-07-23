@@ -52,7 +52,11 @@ use super::{
 const METADATA_KEY: &[u8] = b"";
 const RETAINED_PATH_LEASE_IDLE: Duration = Duration::from_secs(30);
 
+#[cfg(any(test, feature = "header-fuzz"))]
+mod fuzz;
 pub(in crate::service) mod migration;
+#[cfg(any(test, feature = "header-fuzz"))]
+pub use fuzz::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 
 pub(crate) fn select_vct_aux_delivery(deliveries: Vec<AuxDelivery>) -> Option<AuxDelivery> {
     deliveries

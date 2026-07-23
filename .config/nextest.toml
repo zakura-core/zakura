@@ -116,7 +116,7 @@ default-filter = 'package(zakura-network) and test(~zakura::testkit::blocksync_f
 [profile.zakura-header-fuzz-regressions]
 fail-fast = true
 failure-output = "immediate"
-default-filter = '(package(zakura-network) and (test(~header_codec_regression_corpus_replays_green) or test(~header_pursuit_regression_corpus_replays_green))) or (package(zakura-header-chain) and (test(~checked_in_transition_seed_corpus_replays_green) or test(~fork_transition_regression_corpus_replays_green)))'
+default-filter = '(package(zakura-network) and (test(~header_codec_regression_corpus_replays_green) or test(~header_pursuit_regression_corpus_replays_green))) or (package(zakura-header-chain) and (test(~checked_in_transition_seed_corpus_replays_green) or test(~fork_transition_regression_corpus_replays_green))) or (package(zakura-state) and test(~recovery_rows_regression_corpus_replays_green))'
 
 
 [profile.sync-checkpoints-local]

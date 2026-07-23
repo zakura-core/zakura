@@ -33,3 +33,9 @@ outcome predicates, and completion ownership gate against an independent
 bounded model. Checked-in seeds cover exact completion, wrong targets, wrong
 ancestry, explicit outcomes, stale generations, and the 17th-pursuit capacity
 boundary.
+
+`recovery_rows` snapshots all twelve header-engine column families as a raw
+logical dump, applies at most 64 bounded row/key/value mutations, and installs
+the dump in one RocksDB batch. Startup must either perform only a named
+source-derived repair and reopen cleanly at the authenticated frontier, or fail
+without changing any logical row and before constructing a publisher.

@@ -536,11 +536,23 @@ fn apply_event<S: StoreRead>(
                     }
                 }
             }
+            let batch_headers: HashMap<_, _> = event
+                .batch
+                .headers()
+                .iter()
+                .map(|header| (header.hash, header.height))
+                .collect();
+            let mut delivery_ids = HashSet::new();
             for delivery in &event.aux {
-                if delivery.owner != event.owner
+                let expected_height = batch_headers.get(&delivery.header_hash).copied();
+                if !delivery_ids.insert(delivery.delivery_id)
+                    || delivery.owner != event.owner
                     || delivery.source != event.source
                     || delivery.authentication != crate::AuxAuthentication::Unauthenticated
-                    || graph.node(delivery.header_hash).is_none()
+                    || expected_height.is_none()
+                    || delivery
+                        .tree_aux
+                        .is_some_and(|aux| Some(aux.height) != expected_height)
                 {
                     return Err(TransitionFailure::InvalidEvidence(
                         "auxiliary delivery does not match the admitted target",
@@ -2730,6 +2742,116 @@ mod tests {
             repaired.change_set.aux_changes,
             vec![crate::AuxDelta::Put(Box::new(delivery))]
         );
+    }
+
+    #[test]
+    fn auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral() {
+        let (store, config) = TestStore::new(EngineMode::Integrated);
+        let clock = ManualClock(Utc::now());
+        let without_aux = insertion(&store, 2, EvidenceId::from_digest([0x70; 32]));
+        let TransitionEvent::InsertHeaders(insert) = &without_aux.event else {
+            panic!("the fixture constructs a header insertion");
+        };
+        let prepared = insert.batch.headers()[0].clone();
+        let delivery = crate::AuxDelivery {
+            delivery_id: EvidenceId::from_digest([0x71; 32]),
+            header_hash: prepared.hash,
+            source: insert.source,
+            owner: insert.owner,
+            body_size: crate::BodySizeHint::Unknown,
+            tree_aux: Some(crate::TreeAuxRecordV1 {
+                height: prepared.height,
+                sapling_root: zakura_chain::sapling::tree::Root::default(),
+                orchard_root: zakura_chain::orchard::tree::Root::default(),
+                ironwood_root: zakura_chain::ironwood::tree::Root::default(),
+                sapling_tx_count: 1,
+                orchard_tx_count: 2,
+                ironwood_tx_count: 3,
+                auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0x72; 32]),
+            }),
+            authentication: crate::AuxAuthentication::Unauthenticated,
+        };
+        let without_plan =
+            apply_transition(&store, without_aux.clone(), &context(&config, &clock, None))
+                .expect("the control target inserts without advisory metadata");
+        let mut with_aux = without_aux.clone();
+        let TransitionEvent::InsertHeaders(insert) = &mut with_aux.event else {
+            unreachable!("the cloned fixture remains a header insertion")
+        };
+        insert.aux.push(delivery);
+        let with_plan = apply_transition(&store, with_aux, &context(&config, &clock, None))
+            .expect("one exact hash-scoped auxiliary delivery is admitted");
+
+        assert_eq!(
+            with_plan.change_set.metadata,
+            without_plan.change_set.metadata
+        );
+        assert_eq!(
+            with_plan.change_set.selected_projection,
+            without_plan.change_set.selected_projection
+        );
+        assert_eq!(
+            with_plan.change_set.verified_projection,
+            without_plan.change_set.verified_projection
+        );
+        assert_eq!(
+            with_plan.change_set.eligibility_changes,
+            without_plan.change_set.eligibility_changes
+        );
+        assert_eq!(
+            with_plan.change_set.aux_changes,
+            vec![crate::AuxDelta::Put(Box::new(delivery))]
+        );
+
+        let mut unrelated = delivery;
+        unrelated.header_hash = store.metadata.frontiers.finalized.hash;
+        unrelated.tree_aux = None;
+        let mut wrong_height = delivery;
+        wrong_height
+            .tree_aux
+            .as_mut()
+            .expect("the fixture has tree auxiliary data")
+            .height = prepared
+            .height
+            .next()
+            .expect("the bounded fixture height advances");
+        let mut wrong_owner = delivery;
+        wrong_owner.owner.session_id = wrong_owner.owner.session_id.saturating_add(1);
+        let mut wrong_source = delivery;
+        wrong_source.source = SourceId::from_digest([0x73; 32]);
+        let mut preauthenticated = delivery;
+        preauthenticated.authentication = crate::AuxAuthentication::Authenticated {
+            evidence: EvidenceId::from_digest([0x74; 32]),
+            boundary_hash: block::Hash([0x75; 32]),
+        };
+        for (label, deliveries) in [
+            ("header outside the admitted batch", vec![unrelated]),
+            ("tree-aux height mismatch", vec![wrong_height]),
+            ("duplicate delivery identity", vec![delivery, delivery]),
+            ("different work owner", vec![wrong_owner]),
+            ("different source", vec![wrong_source]),
+            ("premature authentication", vec![preauthenticated]),
+        ] {
+            let mut request = without_aux.clone();
+            let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
+                unreachable!("the cloned fixture remains a header insertion")
+            };
+            insert.aux = deliveries;
+            assert!(
+                matches!(
+                    apply_transition(&store, request, &context(&config, &clock, None)),
+                    Err(TransitionFailure::InvalidEvidence(
+                        "auxiliary delivery does not match the admitted target"
+                    ))
+                ),
+                "{label}"
+            );
+            assert_eq!(
+                store.snapshot(),
+                without_plan.before,
+                "{label} changed the source snapshot"
+            );
+        }
     }
 
     #[test]

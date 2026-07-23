@@ -243,6 +243,12 @@ impl HighestCompletedCheckpointTracker {
         }
     }
 
+    /// Test-only: clear published progress the same way reconstruction failure does.
+    #[cfg(test)]
+    pub(crate) fn clear_published_for_test(&mut self) {
+        self.replace_state(TrackerState::default());
+    }
+
     /// Returns a sender clone that keeps subscriptions open without retaining the tracker.
     pub(crate) fn keepalive_sender(&self) -> watch::Sender<Option<HighestCompletedCheckpoint>> {
         self.sender.clone()

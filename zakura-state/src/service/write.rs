@@ -26,8 +26,8 @@ use crate::{
         check,
         finalized_state::{
             AuthenticateHeaderRootsError, AuthenticatedHeaderRoots, FinalizedState,
-            HeaderRootAuthState, HighestCompletedCheckpoint, HighestCompletedCheckpointTracker,
-            ZakuraDb,
+            HeaderRootAuthFrontierError, HeaderRootAuthState, HighestCompletedCheckpoint,
+            HighestCompletedCheckpointTracker, ZakuraDb,
         },
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
@@ -211,6 +211,20 @@ fn commit_header_range(
         })
 }
 
+/// Returns the completed checkpoint required to form or advance header-root auth state.
+///
+/// A durable frontier without a completed checkpoint is reachable after
+/// [`HighestCompletedCheckpointTracker::rebind_from_db`] clears published progress on
+/// reconstruction failure while the frontier row remains. Callers must treat that as a
+/// local Frontier error (or skip publish) rather than panicking the write worker.
+fn completed_checkpoint_for_auth_frontier(
+    completed_checkpoint: &HighestCompletedCheckpointTracker,
+) -> Result<HighestCompletedCheckpoint, HeaderRootAuthFrontierError> {
+    completed_checkpoint
+        .current()
+        .ok_or(HeaderRootAuthFrontierError::MissingCompletedCheckpoint)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn authenticate_header_roots(
     finalized_state: &FinalizedState,
@@ -224,9 +238,7 @@ fn authenticate_header_roots(
     rsp_tx: oneshot::Sender<Result<AuthenticatedHeaderRoots, AuthenticateHeaderRootsError>>,
 ) {
     respond_if_requested(rsp_tx, || {
-        let completed_checkpoint = completed_checkpoint
-            .current()
-            .expect("a durable authentication frontier implies a completed genesis checkpoint");
+        let completed_checkpoint = completed_checkpoint_for_auth_frontier(completed_checkpoint)?;
         let result = finalized_state.db.authenticate_header_roots(
             completed_checkpoint,
             expected_state,
@@ -254,17 +266,22 @@ fn respond_if_requested<T, E>(
 }
 
 fn publish_header_root_auth_state(
-    finalized_state: &FinalizedState,
+    db: &ZakuraDb,
     completed_checkpoint: &HighestCompletedCheckpointTracker,
     sender: &watch::Sender<Option<HeaderRootAuthState>>,
 ) {
-    match finalized_state.db.load_header_root_auth_frontier() {
-        Ok(Some(frontier)) => {
-            let completed_checkpoint = completed_checkpoint
-                .current()
-                .expect("a durable authentication frontier implies a completed genesis checkpoint");
-            let _ = sender.send(Some(frontier.state(completed_checkpoint)));
-        }
+    match db.load_header_root_auth_frontier() {
+        Ok(Some(frontier)) => match completed_checkpoint_for_auth_frontier(completed_checkpoint) {
+            Ok(completed_checkpoint) => {
+                let _ = sender.send(Some(frontier.state(completed_checkpoint)));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "skipping header-root auth state publish: durable frontier without a completed checkpoint"
+                );
+            }
+        },
         Ok(None) => {
             let _ = sender.send(None);
         }
@@ -407,10 +424,19 @@ impl BlockWriteSender {
             .db
             .validate_header_root_auth_state()
             .expect("authenticated header-root state was validated during database startup")
-            .map(|frontier| {
-                frontier.state(highest_completed_checkpoint.current().expect(
-                    "a durable authentication frontier implies a completed genesis checkpoint",
-                ))
+            .and_then(|frontier| {
+                match completed_checkpoint_for_auth_frontier(&highest_completed_checkpoint) {
+                    Ok(completed_checkpoint) => Some(frontier.state(completed_checkpoint)),
+                    Err(error) => {
+                        // `HighestCompletedCheckpointTracker::open` clears progress on
+                        // reconstruction failure while a durable frontier may remain.
+                        tracing::warn!(
+                            ?error,
+                            "durable header-root authentication frontier exists without a completed checkpoint; publishing no auth state"
+                        );
+                        None
+                    }
+                }
             });
         let (header_root_auth_sender, header_root_auth_receiver) =
             watch::channel(initial_header_root_auth_state);
@@ -514,7 +540,7 @@ impl WriteBlockWorkerTask {
                     );
                     if result.is_ok() {
                         publish_header_root_auth_state(
-                            finalized_state,
+                            &finalized_state.db,
                             highest_completed_checkpoint,
                             header_root_auth_sender,
                         );
@@ -660,7 +686,7 @@ impl WriteBlockWorkerTask {
                     match highest_completed_checkpoint.rebind_from_db(&finalized_state.db) {
                         Ok(()) => {
                             publish_header_root_auth_state(
-                                finalized_state,
+                                &finalized_state.db,
                                 highest_completed_checkpoint,
                                 header_root_auth_sender,
                             );
@@ -758,7 +784,7 @@ impl WriteBlockWorkerTask {
                     );
                     if result.is_ok() {
                         publish_header_root_auth_state(
-                            finalized_state,
+                            &finalized_state.db,
                             highest_completed_checkpoint,
                             header_root_auth_sender,
                         );
@@ -880,7 +906,7 @@ impl WriteBlockWorkerTask {
                 &child_block,
             ) {
                 publish_header_root_auth_state(
-                    finalized_state,
+                    &finalized_state.db,
                     highest_completed_checkpoint,
                     header_root_auth_sender,
                 );
@@ -923,7 +949,7 @@ impl WriteBlockWorkerTask {
                     .into();
                 match highest_completed_checkpoint.rebind_from_db(&finalized_state.db) {
                     Ok(()) => publish_header_root_auth_state(
-                        finalized_state,
+                        &finalized_state.db,
                         highest_completed_checkpoint,
                         header_root_auth_sender,
                     ),
@@ -1007,18 +1033,23 @@ mod tests {
     };
 
     use zakura_chain::{
-        parameters::Network, serialization::ZcashDeserializeInto, value_balance::ValueBalance,
+        block::Height, history_tree::HistoryTree, parameters::Network,
+        serialization::ZcashDeserializeInto, value_balance::ValueBalance,
     };
 
     use crate::{
         arbitrary::Prepare,
         service::{
             finalized_state::{
-                DiskWriteBatch, FinalizedState, HighestCompletedCheckpointTracker, WriteDisk,
+                AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, DiskWriteBatch,
+                FinalizedState, HeaderRootAuthFrontierError, HeaderRootAuthState,
+                HighestCompletedCheckpointTracker, WriteDisk,
             },
             non_finalized_state::NonFinalizedState,
             write::{
-                respond_if_requested, seed_zakura_header_from_committed_block,
+                authenticate_header_roots, completed_checkpoint_for_auth_frontier,
+                publish_header_root_auth_state, respond_if_requested,
+                seed_zakura_header_from_committed_block,
                 should_seed_zakura_header_from_non_finalized_commit,
             },
         },
@@ -1038,6 +1069,148 @@ mod tests {
         });
 
         assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn missing_completed_checkpoint_is_a_local_frontier_error() {
+        let _init_guard = zakura_test::init();
+
+        let finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &Network::Mainnet,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        )
+        .expect("opening an ephemeral database should succeed");
+        let (completed_checkpoint, _receiver) =
+            HighestCompletedCheckpointTracker::open(&finalized_state.db);
+
+        assert!(completed_checkpoint.current().is_none());
+        assert!(matches!(
+            completed_checkpoint_for_auth_frontier(&completed_checkpoint),
+            Err(HeaderRootAuthFrontierError::MissingCompletedCheckpoint)
+        ));
+
+        let expected_state = HeaderRootAuthState {
+            authenticated_height: Height::MIN,
+            authenticated_hash: Network::Mainnet.genesis_hash(),
+            completed_checkpoint_height: Height::MIN,
+            completed_checkpoint_hash: Network::Mainnet.genesis_hash(),
+        };
+        let (header_root_auth_sender, mut header_root_auth_receiver) =
+            tokio::sync::watch::channel(Some(expected_state));
+        let _ = header_root_auth_receiver.borrow_and_update();
+
+        let (rsp_tx, rsp_rx) = tokio::sync::oneshot::channel();
+        authenticate_header_roots(
+            &finalized_state,
+            &completed_checkpoint,
+            &header_root_auth_sender,
+            expected_state,
+            Network::Mainnet.genesis_hash(),
+            Height::MIN,
+            Vec::new(),
+            Vec::new(),
+            rsp_tx,
+        );
+
+        let error = rsp_rx
+            .blocking_recv()
+            .expect("write path answers the oneshot")
+            .expect_err("missing completed checkpoint is an authentication error");
+        assert!(matches!(
+            error,
+            AuthenticateHeaderRootsError::Frontier(
+                HeaderRootAuthFrontierError::MissingCompletedCheckpoint
+            )
+        ));
+        assert_eq!(error.outcome(), AuthenticateHeaderRootsOutcome::Local);
+        assert!(!header_root_auth_receiver
+            .has_changed()
+            .expect("sender open"));
+    }
+
+    #[test]
+    fn publish_skips_when_durable_frontier_lacks_completed_checkpoint() {
+        let _init_guard = zakura_test::init();
+
+        let finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &Network::Mainnet,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        )
+        .expect("opening an ephemeral database should succeed");
+        let genesis = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
+            .expect("mainnet genesis block deserializes");
+
+        let hash_by_height = finalized_state
+            .db
+            .db()
+            .cf_handle("hash_by_height")
+            .expect("hash_by_height column family exists");
+        let height_by_hash = finalized_state
+            .db
+            .db()
+            .cf_handle("height_by_hash")
+            .expect("height_by_hash column family exists");
+        let block_header_by_height = finalized_state
+            .db
+            .db()
+            .cf_handle("block_header_by_height")
+            .expect("block_header_by_height column family exists");
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_insert(&hash_by_height, Height::MIN, genesis.hash());
+        batch.zs_insert(&height_by_hash, genesis.hash(), Height::MIN);
+        batch.zs_insert(&block_header_by_height, Height::MIN, &genesis.header);
+        finalized_state
+            .db
+            .write_batch(batch)
+            .expect("genesis tip rows write");
+
+        let mut batch = DiskWriteBatch::new();
+        batch
+            .rebase_header_root_auth_frontier(
+                &finalized_state.db,
+                Height::MIN,
+                genesis.hash(),
+                &HistoryTree::default(),
+            )
+            .expect("genesis frontier is coherent");
+        finalized_state
+            .db
+            .write_batch(batch)
+            .expect("genesis frontier writes");
+
+        let (mut completed_checkpoint, _receiver) =
+            HighestCompletedCheckpointTracker::open(&finalized_state.db);
+        assert!(
+            completed_checkpoint.current().is_some(),
+            "body tip at genesis completes the genesis checkpoint"
+        );
+        // Simulate rebind_from_db fail-closed clear while the frontier remains durable.
+        completed_checkpoint.clear_published_for_test();
+        assert!(completed_checkpoint.current().is_none());
+        assert!(finalized_state
+            .db
+            .load_header_root_auth_frontier()
+            .expect("frontier loads after clear")
+            .is_some());
+
+        let prior = HeaderRootAuthState {
+            authenticated_height: Height::MIN,
+            authenticated_hash: genesis.hash(),
+            completed_checkpoint_height: Height::MIN,
+            completed_checkpoint_hash: genesis.hash(),
+        };
+        let (sender, mut receiver) = tokio::sync::watch::channel(Some(prior));
+        let _ = receiver.borrow_and_update();
+
+        publish_header_root_auth_state(&finalized_state.db, &completed_checkpoint, &sender);
+
+        assert!(!receiver.has_changed().expect("sender open"));
+        assert_eq!(*receiver.borrow(), Some(prior));
     }
 
     #[test]

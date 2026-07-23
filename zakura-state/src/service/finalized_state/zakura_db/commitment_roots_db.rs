@@ -255,6 +255,12 @@ pub enum HeaderRootAuthFrontierError {
     /// A non-empty database has no durable authentication frontier.
     #[error("missing header-root authentication frontier for non-empty finalized state")]
     MissingFrontier,
+    /// A durable authentication frontier exists without a completed checkpoint.
+    ///
+    /// Reachable after `HighestCompletedCheckpointTracker::rebind_from_db` clears
+    /// published progress on reconstruction failure while the frontier row remains.
+    #[error("durable header-root authentication frontier exists without a completed checkpoint")]
+    MissingCompletedCheckpoint,
     /// Header or root state exists without a finalized tip.
     #[error(
         "header-root authentication state exists without a finalized tip \

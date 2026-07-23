@@ -1828,6 +1828,7 @@ fn block_sync_misbehavior_label(reason: BlockSyncMisbehavior) -> &'static str {
         BlockSyncMisbehavior::UnsolicitedBlock => "unsolicited_block",
         BlockSyncMisbehavior::GetBlocksTooLong => "get_blocks_too_long",
         BlockSyncMisbehavior::GetBlocksSpam => "get_blocks_spam",
+        BlockSyncMisbehavior::BodyPayloadMismatch(_) => "body_payload_mismatch",
         BlockSyncMisbehavior::InvalidBlock => "invalid_block",
         BlockSyncMisbehavior::SizeMismatch => "size_mismatch",
         BlockSyncMisbehavior::InvalidStatus => "invalid_status",

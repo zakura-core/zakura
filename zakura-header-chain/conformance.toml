@@ -514,7 +514,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-INT-02"
 name = "Branch-aware resets"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::service::write::classify_verified_change"
+tests = ["IN-01::same_lower_forward_resets_use_identical_branch_path", "AUD-04::consecutive_resets_use_exact_branch_identity"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-INT-03"

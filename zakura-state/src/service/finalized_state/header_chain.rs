@@ -380,6 +380,32 @@ impl RetainedPathLeaseRegistry {
 }
 
 impl HeaderChainReader {
+    fn coherent_selected_node(
+        &self,
+        height: block::Height,
+    ) -> Result<Option<HeaderNode>, StoreError> {
+        let Some(hash) = self.store.selected_hash(height)? else {
+            let snapshot = self.store.snapshot()?;
+            if height >= snapshot.frontiers.finalized.height
+                && height <= snapshot.frontiers.header_best.height
+            {
+                return Err(StoreError::Incoherent(
+                    "selected projection has a gap within its published bounds",
+                ));
+            }
+            return Ok(None);
+        };
+        let node = self.store.node(hash)?.ok_or(StoreError::Incoherent(
+            "selected projection references a missing node",
+        ))?;
+        if node.height != height {
+            return Err(StoreError::Incoherent(
+                "selected projection node height disagrees with its index",
+            ));
+        }
+        Ok(Some(node))
+    }
+
     fn coherent_aux_deliveries(
         &self,
         node: &HeaderNode,
@@ -424,21 +450,10 @@ impl HeaderChainReader {
             let Some(height) = start + i64::from(offset) else {
                 break;
             };
-            let Some(hash) = self.store.selected_hash(height)? else {
+            let Some(node) = self.coherent_selected_node(height)? else {
                 break;
             };
-            let Some(node) = self.store.node(hash)? else {
-                return Err(StoreError::Incoherent(
-                    "selected auxiliary root header is not retained",
-                )
-                .into());
-            };
-            if node.height != height {
-                return Err(StoreError::Incoherent(
-                    "selected auxiliary root header height disagrees with its index",
-                )
-                .into());
-            }
+            let hash = node.hash;
             let Some(delivery) = self.selected_aux_delivery(&node)? else {
                 break;
             };
@@ -501,8 +516,8 @@ impl HeaderChainReader {
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        self.store
-            .selected_hash(height)
+        self.coherent_selected_node(height)
+            .map(|node| node.map(|node| node.hash))
             .map_err(HeaderChainStoreError::Store)
     }
 
@@ -511,21 +526,30 @@ impl HeaderChainReader {
         height: block::Height,
         hash: block::Hash,
     ) -> Result<Option<HeaderNode>, HeaderChainStoreError> {
-        let Ok(successor_height) = height.next() else {
-            return Ok(None);
-        };
         let _writer = self
             .store
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let Some(successor_hash) = self.store.selected_hash(successor_height)? else {
+        if self
+            .coherent_selected_node(height)?
+            .is_none_or(|node| node.hash != hash)
+        {
+            return Ok(None);
+        }
+        let Ok(successor_height) = height.next() else {
             return Ok(None);
         };
-        let Some(successor) = self.store.node(successor_hash)? else {
+        let Some(successor) = self.coherent_selected_node(successor_height)? else {
             return Ok(None);
         };
-        Ok((successor.parent_hash == hash).then_some(successor))
+        if successor.parent_hash != hash {
+            return Err(StoreError::Incoherent(
+                "selected successor does not extend its selected predecessor",
+            )
+            .into());
+        }
+        Ok(Some(successor))
     }
 
     /// Read one exact selected header and its optional direct successor without
@@ -540,29 +564,17 @@ impl HeaderChainReader {
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        if self.store.selected_hash(height)? != Some(hash) {
+        let Some(current) = self.coherent_selected_node(height)? else {
             return Ok(None);
-        }
-        let current = self.store.node(hash)?.ok_or(StoreError::Incoherent(
-            "selected auxiliary header is not retained",
-        ))?;
-        if current.height != height {
-            return Err(StoreError::Incoherent(
-                "selected auxiliary header height disagrees with its index",
-            )
-            .into());
+        };
+        if current.hash != hash {
+            return Ok(None);
         }
         let current_deliveries = self.coherent_aux_deliveries(&current)?;
         let successor = match height.next() {
-            Ok(successor_height) => match self.store.selected_hash(successor_height)? {
-                Some(successor_hash) => {
-                    let successor =
-                        self.store
-                            .node(successor_hash)?
-                            .ok_or(StoreError::Incoherent(
-                                "selected auxiliary successor is not retained",
-                            ))?;
-                    if successor.height != successor_height || successor.parent_hash != hash {
+            Ok(successor_height) => match self.coherent_selected_node(successor_height)? {
+                Some(successor) => {
+                    if successor.parent_hash != hash {
                         return Err(StoreError::Incoherent(
                             "selected auxiliary successor does not extend the requested header",
                         )
@@ -596,8 +608,11 @@ impl HeaderChainReader {
             .store
             .snapshot()
             .map_err(HeaderChainStoreError::Store)?;
-        HeaderLocator::for_selected_path(&snapshot, |height| self.store.selected_hash(height))
-            .map_err(HeaderChainStoreError::Store)
+        HeaderLocator::for_selected_path(&snapshot, |height| {
+            self.coherent_selected_node(height)
+                .map(|node| node.map(|node| node.hash))
+        })
+        .map_err(HeaderChainStoreError::Store)
     }
 
     /// Resolve an exact, still-current VCT repair owner to one selected header request.
@@ -621,25 +636,21 @@ impl HeaderChainReader {
         {
             return Ok(None);
         }
-        let Some(target_hash) = self.store.selected_hash(height)? else {
+        let Some(target) = self.coherent_selected_node(height)? else {
             return Err(StoreError::Incoherent(
                 "VCT repair height is absent from the selected projection",
             )
             .into());
         };
-        let target = self.store.node(target_hash)?.ok_or(StoreError::Incoherent(
-            "selected VCT repair header is not retained",
-        ))?;
-        if target.height != height {
-            return Err(StoreError::Incoherent(
-                "selected VCT repair header height disagrees with its index",
-            )
-            .into());
-        }
+        let target_hash = target.hash;
         let parent_height = block::Height(height.0.checked_sub(1).ok_or(
             StoreError::Incoherent("non-finalized VCT repair header has no predecessor height"),
         )?);
-        if self.store.selected_hash(parent_height)? != Some(target.parent_hash) {
+        if self
+            .coherent_selected_node(parent_height)?
+            .map(|node| node.hash)
+            != Some(target.parent_hash)
+        {
             return Err(StoreError::Incoherent(
                 "selected VCT repair header does not extend its selected predecessor",
             )

@@ -27,7 +27,8 @@ use super::{
                 constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
                 Config,
             },
-            DiskDb, STATE_COLUMN_FAMILIES_IN_CODE,
+            disk_format::{header_chain::HeaderHeightKey, IntoDisk},
+            DiskDb, DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE,
         },
         HeaderChainRuntime, HeaderChainStore, HEADER_AUX_DELIVERY, HEADER_CANDIDATE, HEADER_CHILD,
         HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
@@ -222,6 +223,115 @@ impl Harness {
 
     pub fn rejections(&self) -> usize {
         self.rejections
+    }
+
+    pub fn trunk_frontier(&self, height: u32) -> Frontier {
+        let header = self.universe.trunk_at(height);
+        Frontier::new(header.height, header.hash)
+    }
+
+    pub fn corrupt_selected_hash(&self, height: block::Height, hash: block::Hash) {
+        let mut batch = DiskWriteBatch::new();
+        self.runtime()
+            .store
+            .put_raw(
+                &mut batch,
+                HEADER_SELECTED,
+                HeaderHeightKey(height).as_bytes(),
+                hash.0,
+            )
+            .expect("the selected projection family is open");
+        self.runtime()
+            .store
+            .db
+            .write(batch)
+            .expect("the selected projection corruption is installed");
+    }
+
+    pub fn delete_selected_hash(&self, height: block::Height) {
+        let mut batch = DiskWriteBatch::new();
+        self.runtime()
+            .store
+            .delete_raw(
+                &mut batch,
+                HEADER_SELECTED,
+                HeaderHeightKey(height).as_bytes(),
+            )
+            .expect("the selected projection family is open");
+        self.runtime()
+            .store
+            .db
+            .write(batch)
+            .expect("the selected projection deletion is installed");
+    }
+
+    pub fn delete_node(&self, hash: block::Hash) {
+        let mut batch = DiskWriteBatch::new();
+        self.runtime()
+            .store
+            .delete_raw(&mut batch, HEADER_NODE_BY_HASH, hash.0)
+            .expect("the node family is open");
+        self.runtime()
+            .store
+            .db
+            .write(batch)
+            .expect("the node deletion is installed");
+    }
+
+    pub fn replace_node_value(&self, target: block::Hash, donor: block::Hash) {
+        let family = self
+            .runtime()
+            .store
+            .cf(HEADER_NODE_BY_HASH)
+            .expect("the node family is open");
+        let donor_value = self
+            .runtime()
+            .store
+            .db
+            .raw_get_cf(&family, &donor.0)
+            .expect("the donor node read succeeds")
+            .expect("the donor node is retained");
+        let mut batch = DiskWriteBatch::new();
+        self.runtime()
+            .store
+            .put_raw(&mut batch, HEADER_NODE_BY_HASH, target.0, donor_value)
+            .expect("the node family is open");
+        self.runtime()
+            .store
+            .db
+            .write(batch)
+            .expect("the foreign node value is installed");
+    }
+
+    pub fn assert_selected_hash_fails_closed(&self, height: block::Height) {
+        assert!(
+            self.runtime().reader().selected_hash(height).is_err(),
+            "a selected projection/node disagreement must be a local incoherence error"
+        );
+    }
+
+    pub fn assert_selected_locator_fails_closed(&self) {
+        assert!(
+            self.runtime().reader().selected_locator().is_err(),
+            "a corrupt selected projection must not produce a locator"
+        );
+    }
+
+    pub fn assert_selected_successor_fails_closed(&self, parent: Frontier) {
+        assert!(
+            self.runtime()
+                .reader()
+                .selected_successor(parent.height, parent.hash)
+                .is_err(),
+            "a selected successor index whose node is missing must fail closed"
+        );
+    }
+
+    pub fn assert_validation_context_fails_closed(&self, hash: block::Hash) {
+        assert!(
+            self.runtime().reader().validation_context(hash).is_err(),
+            "a foreign node value must not enter a validation lease"
+        );
     }
 
     fn run(&mut self, operation: &Op) {

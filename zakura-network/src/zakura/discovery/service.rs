@@ -174,7 +174,16 @@ enum DiscoverySessionState {
 struct DiscoverySessionRecord {
     session_id: u64,
     state: DiscoverySessionState,
+    /// Consecutive sessions on this connection that ended without a successful
+    /// exchange. Reaching `MAX_DISCOVERY_SESSION_FAILURES` retires the record so
+    /// the transport stops reopening a stream the peer keeps breaking.
+    failed_attempts: u32,
 }
+
+/// Consecutive failed sessions on one `(peer, connection)` before discovery
+/// retires it. Generous: an honest peer completes the exchange on the first
+/// session, and a fresh connection always starts a fresh record.
+const MAX_DISCOVERY_SESSION_FAILURES: u32 = 3;
 
 type SessionStateMap = HashMap<(ZakuraPeerId, ZakuraConnId), DiscoverySessionRecord>;
 
@@ -195,6 +204,59 @@ fn retire_discovery_session(
     }
     record.state = DiscoverySessionState::Retired;
     true
+}
+
+/// Charge one failed session to the owning record; retires it at the failure
+/// bound. Session-scoped like `retire_discovery_session` so a stale task cannot
+/// charge a newer session admitted on the same connection. Returns whether the
+/// record was retired by this failure.
+fn record_discovery_session_failure(
+    session_states: &StdMutex<SessionStateMap>,
+    peer: &ZakuraPeerId,
+    conn_id: ZakuraConnId,
+    session_id: u64,
+) -> bool {
+    let mut session_states = session_states
+        .lock()
+        .expect("discovery session-state mutex is never poisoned");
+    let Some(record) = session_states.get_mut(&(peer.clone(), conn_id)) else {
+        return false;
+    };
+    if record.session_id != session_id || record.state != DiscoverySessionState::Active {
+        return false;
+    }
+    record.failed_attempts = record.failed_attempts.saturating_add(1);
+    if record.failed_attempts >= MAX_DISCOVERY_SESSION_FAILURES {
+        record.state = DiscoverySessionState::Retired;
+        tracing::info!(
+            ?peer,
+            conn_id,
+            attempts = record.failed_attempts,
+            "retiring Zakura discovery sessions on this connection after repeated failed exchanges"
+        );
+        return true;
+    }
+    false
+}
+
+/// Reset the owning record's failure count after a successful exchange, so the
+/// intended shared-connection refresh loop never accumulates failures.
+fn record_discovery_session_success(
+    session_states: &StdMutex<SessionStateMap>,
+    peer: &ZakuraPeerId,
+    conn_id: ZakuraConnId,
+    session_id: u64,
+) {
+    let mut session_states = session_states
+        .lock()
+        .expect("discovery session-state mutex is never poisoned");
+    let Some(record) = session_states.get_mut(&(peer.clone(), conn_id)) else {
+        return;
+    };
+    if record.session_id != session_id {
+        return;
+    }
+    record.failed_attempts = 0;
 }
 
 impl DiscoveryService {
@@ -322,16 +384,30 @@ impl Service for DiscoveryService {
         );
         let discovery_session = DiscoveryPeerSession::new(&session, peer.direction);
         let conn_id = peer.conn_id;
-        self.session_states
-            .lock()
-            .expect("discovery session-state mutex is never poisoned")
-            .insert(
+        {
+            let mut session_states = self
+                .session_states
+                .lock()
+                .expect("discovery session-state mutex is never poisoned");
+            let previous = session_states.get(&(peer.id.clone(), conn_id));
+            if previous.is_some_and(|record| record.state == DiscoverySessionState::Retired) {
+                // A retired record must not be resurrected by a new stream on the
+                // same connection — the remote initiates streams on inbound
+                // connections and could otherwise churn sessions at its own pace.
+                return;
+            }
+            // Preserve the failure count across reopens so consecutive broken
+            // sessions on this connection stay bounded.
+            let failed_attempts = previous.map_or(0, |record| record.failed_attempts);
+            session_states.insert(
                 (peer.id.clone(), conn_id),
                 DiscoverySessionRecord {
                     session_id,
                     state: DiscoverySessionState::Active,
+                    failed_attempts,
                 },
             );
+        }
         let service_cancel = discovery_session.cancel_token();
         let connection_cancel = peer.cancel_token();
         let close_cause = peer.close_cause();
@@ -379,6 +455,14 @@ impl Service for DiscoveryService {
                         direction = ?discovery_session.direction(),
                         ?decision,
                         "locally parking Zakura discovery service session"
+                    );
+                    // A parked session ends without an exchange; charge it so
+                    // reopen-then-park cycles stay bounded on this connection.
+                    record_discovery_session_failure(
+                        &session_states,
+                        discovery_session.peer_id(),
+                        conn_id,
+                        session_id,
                     );
                     service_cancel.cancel();
                     return;
@@ -514,6 +598,14 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         },
         async move {
             let exchanged = source.run_initial_exchange().await;
+            if exchanged {
+                record_discovery_session_success(&session_states, &peer_id, conn_id, session_id);
+            } else {
+                // The stream broke before the exchange completed; charge the
+                // session so an attacker cannot get endless reopens by breaking
+                // the stream pre-exchange.
+                record_discovery_session_failure(&session_states, &peer_id, conn_id, session_id);
+            }
             let mut other_service_owner =
                 exchanged && peer_has_other_service_owner(&connection_owners, &peer_id, conn_id);
             while other_service_owner && source.refresh_after_interval().await.is_ok() {
@@ -2185,6 +2277,7 @@ mod tests {
             DiscoverySessionRecord {
                 session_id: 1,
                 state: DiscoverySessionState::Active,
+                failed_attempts: 0,
             },
         )]));
 
@@ -2209,6 +2302,7 @@ mod tests {
             DiscoverySessionRecord {
                 session_id: 1,
                 state: DiscoverySessionState::Active,
+                failed_attempts: 0,
             },
         )]));
 
@@ -2222,6 +2316,7 @@ mod tests {
                 DiscoverySessionRecord {
                     session_id: 2,
                     state: DiscoverySessionState::Active,
+                    failed_attempts: 0,
                 },
             );
 
@@ -2247,5 +2342,233 @@ mod tests {
                 .map(|record| record.state),
             Some(DiscoverySessionState::Retired),
         );
+    }
+
+    fn record_for(
+        states: &StdMutex<SessionStateMap>,
+        peer: &ZakuraPeerId,
+        conn_id: ZakuraConnId,
+    ) -> DiscoverySessionRecord {
+        *states
+            .lock()
+            .expect("test session-state mutex is never poisoned")
+            .get(&(peer.clone(), conn_id))
+            .expect("test session record exists")
+    }
+
+    #[test]
+    fn failed_sessions_retire_discovery_after_bounded_attempts() {
+        let peer = ZakuraPeerId::new(vec![73; 32]).expect("test peer id is within bounds");
+        let conn_id = 9;
+        let states = StdMutex::new(HashMap::from([(
+            (peer.clone(), conn_id),
+            DiscoverySessionRecord {
+                session_id: 1,
+                state: DiscoverySessionState::Active,
+                failed_attempts: 0,
+            },
+        )]));
+
+        for attempt in 1..MAX_DISCOVERY_SESSION_FAILURES {
+            assert!(
+                !record_discovery_session_failure(&states, &peer, conn_id, 1),
+                "attempt {attempt} must not yet retire the record"
+            );
+            let record = record_for(&states, &peer, conn_id);
+            assert_eq!(record.state, DiscoverySessionState::Active);
+            assert_eq!(record.failed_attempts, attempt);
+        }
+
+        assert!(
+            record_discovery_session_failure(&states, &peer, conn_id, 1),
+            "the failure bound must retire the record"
+        );
+        assert_eq!(
+            record_for(&states, &peer, conn_id).state,
+            DiscoverySessionState::Retired,
+        );
+    }
+
+    #[test]
+    fn successful_exchange_resets_discovery_failure_count() {
+        let peer = ZakuraPeerId::new(vec![74; 32]).expect("test peer id is within bounds");
+        let conn_id = 9;
+        let states = StdMutex::new(HashMap::from([(
+            (peer.clone(), conn_id),
+            DiscoverySessionRecord {
+                session_id: 1,
+                state: DiscoverySessionState::Active,
+                failed_attempts: 0,
+            },
+        )]));
+
+        for _ in 1..MAX_DISCOVERY_SESSION_FAILURES {
+            assert!(!record_discovery_session_failure(
+                &states, &peer, conn_id, 1
+            ));
+        }
+        record_discovery_session_success(&states, &peer, conn_id, 1);
+        assert_eq!(record_for(&states, &peer, conn_id).failed_attempts, 0);
+
+        for _ in 1..MAX_DISCOVERY_SESSION_FAILURES {
+            assert!(
+                !record_discovery_session_failure(&states, &peer, conn_id, 1),
+                "the reset counter must grant a full fresh failure budget"
+            );
+        }
+        assert_eq!(
+            record_for(&states, &peer, conn_id).state,
+            DiscoverySessionState::Active,
+        );
+    }
+
+    #[test]
+    fn stale_session_failure_cannot_charge_a_newer_session() {
+        let peer = ZakuraPeerId::new(vec![75; 32]).expect("test peer id is within bounds");
+        let conn_id = 9;
+        let states = StdMutex::new(HashMap::from([(
+            (peer.clone(), conn_id),
+            DiscoverySessionRecord {
+                session_id: 2,
+                state: DiscoverySessionState::Active,
+                failed_attempts: 0,
+            },
+        )]));
+
+        assert!(
+            !record_discovery_session_failure(&states, &peer, conn_id, 1),
+            "session 1's failure must not charge session 2's slot"
+        );
+        assert_eq!(record_for(&states, &peer, conn_id).failed_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn add_peer_refuses_a_retired_discovery_record() -> Result<(), crate::BoxError> {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: SecretKey::from_bytes(&[48u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let service = DiscoveryService::new(handle.clone());
+        let peer_secret = SecretKey::from_bytes(&[49u8; 32]);
+        let peer_id = ZakuraPeerId::new(peer_secret.public().as_bytes().to_vec())?;
+        connected_tx.send_replace(vec![peer_id.clone()]);
+
+        service
+            .session_states
+            .lock()
+            .expect("discovery session-state mutex is never poisoned")
+            .insert(
+                (peer_id.clone(), 0),
+                DiscoverySessionRecord {
+                    session_id: 7,
+                    state: DiscoverySessionState::Retired,
+                    failed_attempts: MAX_DISCOVERY_SESSION_FAILURES,
+                },
+            );
+
+        let connection_cancel = CancellationToken::new();
+        let (_peer_send, service_recv) = framed_channel(16);
+        let (service_send, _peer_recv) = framed_channel(16);
+        let streams = HashMap::from([(ZAKURA_STREAM_DISCOVERY, (service_recv, service_send))]);
+        service.add_peer(Peer::new(
+            peer_id.clone(),
+            None,
+            ZAKURA_CAP_DISCOVERY,
+            streams,
+            connection_cancel.clone(),
+        ));
+
+        // Asserted synchronously (current-thread runtime): a refused add_peer
+        // must not have replaced the retired record or spawned an exchange.
+        let record = record_for(&service.session_states, &peer_id, 0);
+        assert_eq!(
+            record.session_id, 7,
+            "a retired record must not be resurrected by a new stream"
+        );
+        assert_eq!(record.state, DiscoverySessionState::Retired);
+        assert!(matches!(
+            service.ordered_session_demand(
+                0,
+                &peer_id,
+                ZAKURA_CAP_DISCOVERY,
+                ServicePeerDirection::Inbound,
+            ),
+            OrderedSessionDemand::Retire,
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_peer_preserves_failure_count_across_reopens() -> Result<(), crate::BoxError> {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: SecretKey::from_bytes(&[50u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let service = DiscoveryService::new(handle.clone());
+        let peer_secret = SecretKey::from_bytes(&[51u8; 32]);
+        let peer_id = ZakuraPeerId::new(peer_secret.public().as_bytes().to_vec())?;
+        connected_tx.send_replace(vec![peer_id.clone()]);
+
+        service
+            .session_states
+            .lock()
+            .expect("discovery session-state mutex is never poisoned")
+            .insert(
+                (peer_id.clone(), 0),
+                DiscoverySessionRecord {
+                    session_id: 7,
+                    state: DiscoverySessionState::Active,
+                    failed_attempts: MAX_DISCOVERY_SESSION_FAILURES - 1,
+                },
+            );
+
+        let connection_cancel = CancellationToken::new();
+        let (_peer_send, service_recv) = framed_channel(16);
+        let (service_send, _peer_recv) = framed_channel(16);
+        let streams = HashMap::from([(ZAKURA_STREAM_DISCOVERY, (service_recv, service_send))]);
+        service.add_peer(Peer::new(
+            peer_id.clone(),
+            None,
+            ZAKURA_CAP_DISCOVERY,
+            streams,
+            connection_cancel.clone(),
+        ));
+
+        let record = record_for(&service.session_states, &peer_id, 0);
+        assert_ne!(
+            record.session_id, 7,
+            "a live reopen must install the new stream session"
+        );
+        assert_eq!(record.state, DiscoverySessionState::Active);
+        assert_eq!(
+            record.failed_attempts,
+            MAX_DISCOVERY_SESSION_FAILURES - 1,
+            "consecutive failures must stay counted across reopens"
+        );
+        Ok(())
     }
 }

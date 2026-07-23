@@ -161,13 +161,8 @@ fn best_chain_wins_for_network(network: Network) -> Result<()> {
     let expected_hash = block2.hash();
 
     let mut state = NonFinalizedState::new(&network);
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
 
     state.commit_new_chain(block2.prepare(), &finalized_state)?;
     state.commit_new_chain(child.prepare(), &finalized_state)?;
@@ -199,13 +194,8 @@ fn finalize_pops_from_best_chain_for_network(network: Network) -> Result<()> {
     let child = block1.make_fake_child().set_work(1);
 
     let mut state = NonFinalizedState::new(&network);
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
 
     let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
     finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -294,13 +284,8 @@ fn invalidate_block_removes_block_and_descendants_from_chain_for_network(
     let block3 = block2.make_fake_child().set_work(1);
 
     let mut state = NonFinalizedState::new(&network);
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
 
     let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
     finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -381,13 +366,8 @@ fn invalidate_block_removes_block_and_descendants_from_chain_for_network(
 /// regression tests below.
 fn new_invalidate_test_state(network: &Network) -> (NonFinalizedState, FinalizedState) {
     let state = NonFinalizedState::new(network);
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral finalized state succeeds");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), network)
+        .expect("opening an ephemeral finalized state succeeds");
     finalized_state.set_finalized_value_pool(ValueBalance::<NonNegative>::fake_populated_pool());
     (state, finalized_state)
 }
@@ -633,13 +613,8 @@ fn invalidate_root_block_removes_entire_chain_for_network(network: Network) -> R
     let block3 = block2.make_fake_child().set_work(1);
 
     let mut state = NonFinalizedState::new(&network);
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
 
     let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
     finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -702,13 +677,8 @@ fn reconsider_block_inserts_block_and_descendants_into_chain_for_network(
     let block3 = block2.make_fake_child().set_work(1);
 
     let mut state = NonFinalizedState::new(&network);
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
 
     let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
     finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -801,13 +771,8 @@ fn commit_block_extending_best_chain_doesnt_drop_worst_chains_for_network(
     let child2 = block2.make_fake_child().set_work(1);
 
     let mut state = NonFinalizedState::new(&network);
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
 
     let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
     finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -846,13 +811,8 @@ fn shorter_chain_can_be_best_chain_for_network(network: Network) -> Result<()> {
     let short_chain_block = block1.make_fake_child().set_work(3);
 
     let mut state = NonFinalizedState::new(&network);
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
 
     let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
     finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -892,13 +852,8 @@ fn longer_chain_with_more_work_wins_for_network(network: Network) -> Result<()> 
     let short_chain_block = block1.make_fake_child().set_work(3);
 
     let mut state = NonFinalizedState::new(&network);
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
 
     let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
     finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -937,13 +892,8 @@ fn equal_length_goes_to_more_work_for_network(network: Network) -> Result<()> {
     let expected_hash = more_work_child.hash();
 
     let mut state = NonFinalizedState::new(&network);
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
 
     let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
     finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -986,13 +936,8 @@ fn history_tree_is_updated_for_network_upgrade(
     );
 
     let mut state = NonFinalizedState::new(&network);
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
 
     state
         .commit_new_chain(prev_block.clone().prepare(), &finalized_state)
@@ -1087,13 +1032,8 @@ fn commitment_is_validated_for_network_upgrade(network: Network, network_upgrade
     );
 
     let mut state = NonFinalizedState::new(&network);
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
 
     state
         .commit_new_chain(prev_block.clone().prepare(), &finalized_state)
@@ -1154,13 +1094,8 @@ fn commitment_is_validated_for_network_upgrade(network: Network, network_upgrade
 async fn non_finalized_state_writes_blocks_to_and_restores_blocks_from_backup_cache() {
     let network = Network::Mainnet;
 
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
 
     let backup_dir_path = tempfile::Builder::new()
         .prefix("zebra-non-finalized-state-backup-cache")

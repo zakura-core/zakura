@@ -70,13 +70,8 @@ fn height(n: usize) -> Height {
 /// Syncs a fresh finalized state at `config` by committing `blocks` in order, then drops it so the
 /// database lock is released for the rollback utility to reopen.
 fn sync_to(config: &Config, network: &Network, blocks: &[SemanticallyVerifiedBlock]) {
-    let mut state = FinalizedState::new(
-        config,
-        network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let mut state =
+        FinalizedState::new(config, network).expect("opening an ephemeral database should succeed");
 
     for block in blocks {
         let checkpoint_verified = CheckpointVerifiedBlock::from(block.block.clone());
@@ -88,13 +83,7 @@ fn sync_to(config: &Config, network: &Network, blocks: &[SemanticallyVerifiedBlo
 
 /// Reopens the finalized state at `config` for read queries.
 fn reopen(config: &Config, network: &Network) -> FinalizedState {
-    FinalizedState::new(
-        config,
-        network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed")
+    FinalizedState::new(config, network).expect("opening an ephemeral database should succeed")
 }
 
 /// Opens the database at `config` directly, skipping format upgrades and their validation. The

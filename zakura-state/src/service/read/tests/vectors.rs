@@ -562,13 +562,8 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
 
     // Create state with a finalized and non-finalized component
     let mut non_finalized_state = NonFinalizedState::new(&network);
-    let finalized_state = FinalizedState::new(
-        &Config::ephemeral(),
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .expect("opening an ephemeral database should succeed");
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
 
     let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
     finalized_state.set_finalized_value_pool(fake_value_pool);

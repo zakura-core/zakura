@@ -91,7 +91,6 @@
 //!
 //! ### Experimental
 //!
-//! * `elasticsearch`: save block data into an Elasticsearch database.
 //! * `internal-miner`: enable experimental support for mining inside Zakura, without an external
 //!   mining pool. This feature is only supported on testnet. Use a GPU or ASIC on mainnet for
 //!   efficient mining.

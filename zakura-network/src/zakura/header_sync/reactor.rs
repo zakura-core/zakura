@@ -2147,6 +2147,108 @@ mod tests {
         }
     }
 
+    #[test]
+    fn aud_14_reactor_restart_drops_old_preparation_and_admission_completions() {
+        let shutdown = CancellationToken::new();
+        let mut old_startup = startup(shutdown);
+        let anchor = zakura_header_chain::Frontier::new(old_startup.anchor.0, old_startup.anchor.1);
+        let initial = committed_snapshot(anchor);
+        let (_old_snapshots_tx, old_snapshots_rx) = watch::channel(Some(initial.clone()));
+        old_startup.committed_snapshots = Some(old_snapshots_rx);
+        let (_old_handle, _old_actions, mut old_reactor) =
+            build_header_sync_reactor(old_startup).expect("the pre-crash reactor builds");
+        let peer = peer();
+        let (source, owner, old_range) =
+            seed_applying_request(&mut old_reactor, &initial, peer.clone());
+        old_reactor
+            .peer_work_queue
+            .active_mut(&peer)
+            .expect("the pre-crash work remains active")
+            .phase = HeaderTargetPhase::Preparing;
+        drop(old_reactor);
+
+        let shutdown = CancellationToken::new();
+        let mut same_startup = startup(shutdown);
+        let (_same_snapshots_tx, same_snapshots_rx) = watch::channel(Some(initial.clone()));
+        same_startup.committed_snapshots = Some(same_snapshots_rx);
+        let (same_handle, mut same_actions, mut same_reactor) =
+            build_header_sync_reactor(same_startup).expect("the same-snapshot restart builds");
+        let same_tip = same_handle.best_header_tip();
+        let same_candidates = same_handle.candidate_state();
+        same_reactor.handle_event(HeaderSyncEvent::HeaderTargetPrepared {
+            peer: peer.clone(),
+            source,
+            owner,
+            result: HeaderTargetPreparationResult::LocalFailure,
+        });
+        assert_eq!(same_handle.best_header_tip(), same_tip);
+        assert_eq!(same_handle.candidate_state(), same_candidates);
+        assert!(same_reactor.peer_work_queue.active(&peer).is_none());
+        assert!(same_reactor.pending_owners.is_empty());
+        assert!(!same_reactor.coverage.covers_tip(
+            owner.header_generation,
+            old_range.branch,
+            old_range.end
+        ));
+        assert!(matches!(
+            same_actions.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let replacement =
+            zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0xc2; 32]));
+        let mut committed = initial;
+        committed.state_version =
+            zakura_header_chain::StateVersion::new(committed.state_version.get().saturating_add(1));
+        committed.header_generation = committed
+            .header_generation
+            .checked_next()
+            .expect("the bounded fixture generation advances");
+        committed.frontiers.header_best = replacement;
+        committed.header_best_score = zakura_header_chain::ChainScore::new(
+            zakura_header_chain::SuffixWork::zero(),
+            replacement.hash,
+        );
+
+        let shutdown = CancellationToken::new();
+        let mut committed_startup = startup(shutdown);
+        let (_committed_snapshots_tx, committed_snapshots_rx) =
+            watch::channel(Some(committed.clone()));
+        committed_startup.committed_snapshots = Some(committed_snapshots_rx);
+        let (committed_handle, mut committed_actions, mut committed_reactor) =
+            build_header_sync_reactor(committed_startup)
+                .expect("the post-commit reactor restart builds");
+        let committed_tip = committed_handle.best_header_tip();
+        let committed_candidates = committed_handle.candidate_state();
+        assert_eq!(committed_tip, (replacement.height, replacement.hash));
+        committed_reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
+            peer: peer.clone(),
+            source,
+            owner,
+            result: HeaderTargetAdmissionResult::Applied,
+        });
+        committed_reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
+            peer: peer.clone(),
+            source,
+            owner,
+            result: HeaderTargetAdmissionResult::LocalFailure,
+        });
+        assert_eq!(committed_reactor.committed_snapshot, Some(committed));
+        assert_eq!(committed_handle.best_header_tip(), committed_tip);
+        assert_eq!(committed_handle.candidate_state(), committed_candidates);
+        assert!(committed_reactor.peer_work_queue.active(&peer).is_none());
+        assert!(committed_reactor.pending_owners.is_empty());
+        assert!(!committed_reactor.coverage.covers_tip(
+            owner.header_generation,
+            old_range.branch,
+            old_range.end
+        ));
+        assert!(matches!(
+            committed_actions.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
     #[tokio::test]
     async fn initial_committed_snapshot_overrides_legacy_startup_frontiers() {
         let shutdown = CancellationToken::new();

@@ -340,6 +340,19 @@ impl Request {
     pub fn is_mempool(&self) -> bool {
         matches!(self, Request::Mempool { .. })
     }
+
+    /// Returns the block verifier batch flush key, if this is a block request.
+    fn block_verifier_batch_flush_key(&self) -> Option<primitives::BlockVerifierBatchFlushKey> {
+        match self {
+            Request::Block {
+                known_outpoint_hashes,
+                ..
+            } => Some(primitives::block_verifier_batch_flush_key(
+                known_outpoint_hashes,
+            )),
+            Request::Mempool { .. } => None,
+        }
+    }
 }
 
 impl Response {
@@ -621,9 +634,11 @@ where
                 async_checks.push(check_anchors_and_revealed_nullifiers_query);
             }
 
+            let block_batch_flush_key = req.block_verifier_batch_flush_key();
+
             tracing::trace!(?tx_id, "awaiting async checks...");
 
-            async_checks.check().await?;
+            async_checks.check(block_batch_flush_key).await?;
 
             tracing::trace!(?tx_id, "finished async checks");
 
@@ -1355,15 +1370,44 @@ impl AsyncChecks {
     ///
     /// If any of the checks fail, this method immediately returns the error and cancels all other
     /// checks by dropping them.
-    async fn check(mut self) -> Result<(), BoxError> {
+    async fn check(
+        mut self,
+        block_batch_flush_key: Option<primitives::BlockVerifierBatchFlushKey>,
+    ) -> Result<(), BoxError> {
+        let mut needs_block_batch_flush = block_batch_flush_key.is_some();
+        let mut block_batch_flush = match block_batch_flush_key {
+            Some(key) => async move {
+                tokio::task::yield_now().await;
+                primitives::start_block_transaction_async_checks(key).await;
+            }
+            .boxed(),
+            None => futures::future::pending().boxed(),
+        };
+
         // Wait for all asynchronous checks to complete
         // successfully, or fail verification if they error.
-        while let Some(check) = self.0.next().await {
-            tracing::trace!(?check, remaining = self.0.len());
-            check?;
-        }
+        loop {
+            tokio::select! {
+                biased;
 
-        Ok(())
+                check = self.0.next() => {
+                    let Some(check) = check else {
+                        if needs_block_batch_flush {
+                            block_batch_flush.await;
+                        }
+
+                        return Ok(());
+                    };
+
+                    tracing::trace!(?check, remaining = self.0.len());
+                    check?;
+                }
+
+                () = &mut block_batch_flush, if needs_block_batch_flush => {
+                    needs_block_batch_flush = false;
+                }
+            }
+        }
     }
 }
 

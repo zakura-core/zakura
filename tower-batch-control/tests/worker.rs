@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use tokio_test::{assert_pending, assert_ready, assert_ready_err, task};
+use tokio_test::{assert_pending, assert_ready, assert_ready_err, assert_ready_ok, task};
 use tower::{Service, ServiceExt};
 use tower_batch_control::{error, Batch};
 use tower_test::mock;
@@ -118,4 +118,24 @@ async fn wakes_pending_waiters_on_failure() {
         err.is::<error::ServiceError>(),
         "ready 2 should fail with a ServiceError, got: {err:?}"
     );
+}
+
+#[tokio::test]
+async fn explicit_flush_waits_for_queue_capacity() {
+    let _init_guard = zakura_test::init();
+
+    let (service, mut handle) = mock::pair::<_, ()>();
+    let (mut service, worker) = Batch::pair(service, 1, 1, Duration::from_secs(1000));
+    let mut worker = task::spawn(worker.run());
+
+    service.ready().await.unwrap();
+    let _response = service.call(());
+
+    let mut flush_service = service.clone();
+    let mut flush = task::spawn(async move { flush_service.flush().await });
+    assert_pending!(flush.poll(), "the queued item holds the only permit");
+
+    handle.allow(2);
+    assert_pending!(worker.poll());
+    assert_ready_ok!(flush.poll());
 }

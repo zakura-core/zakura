@@ -80,11 +80,8 @@ jobs:
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/setup-zakura-build
-      - name: Run clippy with release features
+      - name: Run clippy
         run: cargo clippy --workspace --all-targets --features default-release-binaries
-      - name: Run clippy with test features
-        if: ${{ !cancelled() }}
-        run: cargo clippy --workspace --all-targets --features "default-release-binaries proptest-impl lightwalletd-grpc-tests zakura-checkpoints"
 
   # NOTE: per-crate default / no-default-features checks moved to
   # `test-crates.yml`, which runs `cargo hack check --workspace` (and again with

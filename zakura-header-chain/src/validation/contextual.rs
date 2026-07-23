@@ -462,7 +462,7 @@ pub fn validate_contextual_difficulty_and_time(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zakura_chain::parameters::testnet::RegtestParameters;
+    use zakura_chain::parameters::testnet::{Parameters, RegtestParameters};
 
     fn compact_half_limit(network: &Network) -> CompactDifficulty {
         (network.target_difficulty_limit() / U256::from(2_u8)).to_compact()
@@ -722,5 +722,57 @@ mod tests {
             ),
             Err(ContextualValidationError::TimeTooEarly { .. })
         ));
+    }
+
+    #[test]
+    fn custom_mtp_and_max_time_use_local_parameters_with_pow_on_or_off() {
+        let base = DateTime::from_timestamp(1_700_000_000, 0).expect("test timestamp is in range");
+        let activation = block::Height(10);
+
+        for disable_pow in [false, true] {
+            let network = Parameters::build()
+                .with_network_name(if disable_pow {
+                    "CustomTimePowOff"
+                } else {
+                    "CustomTimePowOn"
+                })
+                .expect("the custom network name is valid")
+                .with_disable_pow(disable_pow)
+                .with_max_block_time_start_height(activation)
+                .to_network()
+                .expect("the custom-network parameters are valid");
+            let context = [(network.target_difficulty_limit().to_compact(), base)];
+
+            assert!(matches!(
+                validate_with_expected_target(&network, block::Height(9), base, &context),
+                Err(ContextualValidationError::TimeTooEarly { .. })
+            ));
+            assert!(
+                validate_with_expected_target(
+                    &network,
+                    block::Height(9),
+                    base + Duration::minutes(90) + Duration::seconds(1),
+                    &context,
+                )
+                .is_ok(),
+                "the local maximum-time rule is not active before its configured height"
+            );
+            assert!(matches!(
+                validate_with_expected_target(
+                    &network,
+                    activation,
+                    base + Duration::minutes(90) + Duration::seconds(1),
+                    &context,
+                ),
+                Err(ContextualValidationError::TimeTooLate { .. })
+            ));
+        }
+
+        let regtest = Network::new_regtest(RegtestParameters::default());
+        assert!(
+            !regtest.is_max_block_time_enforced(block::Height(1))
+                && regtest.is_max_block_time_enforced(block::Height(2)),
+            "Regtest must use its local policy rather than public Testnet height 653,606"
+        );
     }
 }

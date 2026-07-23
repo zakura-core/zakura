@@ -741,6 +741,30 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
     );
 }
 
+#[test]
+fn max_block_time_start_height_serialization_roundtrip() {
+    let _init_guard = zakura_test::init();
+    let start_height = Height(42);
+    let mut config = Config {
+        network: testnet::Parameters::build()
+            .with_max_block_time_start_height(start_height)
+            .to_network()
+            .expect("failed to build configured network"),
+        initial_testnet_peers: [].into(),
+        ..Config::for_test(P2pStack::Dual)
+    };
+    config.zakura.apply_network_defaults(&config.network);
+
+    let serialized = toml::to_string(&config).expect("the custom network serializes");
+    let deserialized: Config =
+        toml::from_str(&serialized).expect("the custom network deserializes");
+    assert_eq!(config, deserialized);
+    assert!(!deserialized.network.is_max_block_time_enforced(Height(41)));
+    assert!(deserialized
+        .network
+        .is_max_block_time_enforced(start_height));
+}
+
 /// With no `zakura_node_secret_key` and a writable identity directory, the
 /// generated Zakura iroh identity must be persisted on first use and reused on
 /// every later startup, so the node's `NodeId` is stable across restarts.

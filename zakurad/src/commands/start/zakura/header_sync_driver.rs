@@ -5,7 +5,7 @@ use std::{
 };
 
 use color_eyre::eyre::{eyre, Report};
-use tokio::{pin, select, sync::mpsc};
+use tokio::{pin, select, sync::mpsc, task::JoinSet};
 use tower::{Service, ServiceExt};
 use tracing::{debug, warn};
 
@@ -15,10 +15,12 @@ use zakura_chain::{
     parallel::commitment_aux::BlockCommitmentRoots,
 };
 use zakura_network::zakura::{
-    commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange, HeaderSyncAction,
+    commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange,
+    HeaderRootAuthState, HeaderRootAuthenticationFailureKind, HeaderSyncAction,
     HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncOperationIdentity,
     ZakuraEndpoint, ZakuraHeaderSyncDriverStartup, ZakuraTrace, DEFAULT_HS_RANGE,
 };
+use zakura_state::MappedRequest;
 
 #[cfg(test)]
 use zakura_network::zakura::{BlockSyncEvent, BlockSyncHandle};
@@ -28,10 +30,17 @@ use super::{
     insert_cs_height, insert_cs_peer, insert_cs_str, insert_cs_u64, verified_block_tip_from_state,
 };
 
+const ROOT_AUTH_STATE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_ROOT_AUTH_STATE_TASKS: usize = 1;
+
 pub(crate) async fn zakura_header_sync_driver_startup(
     read_state: zakura_state::ReadStateService,
     network: &zakura_chain::parameters::Network,
 ) -> Result<ZakuraHeaderSyncDriverStartup, Report> {
+    let header_root_auth = read_state
+        .subscribe_header_root_auth()
+        .borrow()
+        .map(header_root_auth_state);
     let best_header_tip = match read_state
         .clone()
         .oneshot(zakura_state::ReadRequest::BestHeaderTip)
@@ -66,12 +75,7 @@ pub(crate) async fn zakura_header_sync_driver_startup(
     let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
     let verified_block_tip =
         verified_block_tip_from_state(finalized_tip, verified_block_tip, empty_state_tip);
-    let best_header_tip = root_covered_best_header_tip_or_verified(
-        read_state,
-        best_header_tip.unwrap_or(empty_state_tip),
-        verified_block_tip,
-    )
-    .await?;
+    let best_header_tip = best_header_tip.unwrap_or(empty_state_tip);
 
     Ok(ZakuraHeaderSyncDriverStartup {
         frontiers: HeaderSyncFrontiers {
@@ -81,101 +85,73 @@ pub(crate) async fn zakura_header_sync_driver_startup(
         },
         best_header_tip: Some(best_header_tip),
         verified_block_tip_hash: verified_block_tip.1,
+        header_root_auth,
     })
 }
 
-async fn root_covered_best_header_tip_or_verified<ReadState>(
-    read_state: ReadState,
-    best_header_tip: (block::Height, block::Hash),
-    verified_block_tip: (block::Height, block::Hash),
-) -> Result<(block::Height, block::Hash), Report>
-where
-    ReadState: Service<
-            zakura_state::ReadRequest,
-            Response = zakura_state::ReadResponse,
-            Error = zakura_state::BoxError,
-        > + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
-{
-    if best_header_tip.0 <= verified_block_tip.0 {
-        return Ok(best_header_tip);
-    }
-
-    let Ok(start_height) = verified_block_tip.0.next() else {
-        return Ok(verified_block_tip);
-    };
-    let best_header_height = best_header_tip.0;
-    let verified_block_height = verified_block_tip.0;
-    let count = best_header_height
-        .0
-        .checked_sub(verified_block_height.0)
-        .ok_or_else(|| eyre!("best header tip is unexpectedly below verified block tip"))?;
-    let roots = match read_state
-        .oneshot(zakura_state::ReadRequest::BlockRoots {
-            start_height,
-            count,
-        })
-        .await
-        .map_err(|error| eyre!("{error}"))?
-    {
-        zakura_state::ReadResponse::BlockRoots(roots) => roots,
-        response => Err(eyre!("unexpected BlockRoots response: {response:?}"))?,
-    };
-
-    if block_roots_cover_range(start_height, count, &roots) {
-        Ok(best_header_tip)
-    } else {
-        Ok(verified_block_tip)
+fn header_root_auth_state(state: zakura_state::HeaderRootAuthState) -> HeaderRootAuthState {
+    HeaderRootAuthState {
+        authenticated_height: state.authenticated_height,
+        authenticated_hash: state.authenticated_hash,
+        completed_checkpoint_height: state.completed_checkpoint_height,
+        completed_checkpoint_hash: state.completed_checkpoint_hash,
     }
 }
 
-pub(crate) async fn root_covered_query_best_header_tip<ReadState>(
-    read_state: ReadState,
-    best_header_tip: (block::Height, block::Hash),
-) -> Result<(block::Height, block::Hash), Report>
-where
-    ReadState: Service<
-            zakura_state::ReadRequest,
-            Response = zakura_state::ReadResponse,
-            Error = zakura_state::BoxError,
-        > + Clone
-        + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
-{
-    let verified_block_tip = match read_state
-        .clone()
-        .oneshot(zakura_state::ReadRequest::Tip)
-        .await
-        .map_err(|error| eyre!("{error}"))?
-    {
-        zakura_state::ReadResponse::Tip(Some(tip)) => tip,
-        zakura_state::ReadResponse::Tip(None) => return Ok(best_header_tip),
-        response => Err(eyre!("unexpected Tip response: {response:?}"))?,
-    };
-
-    root_covered_best_header_tip_or_verified(read_state, best_header_tip, verified_block_tip).await
+fn state_header_root_auth_state(state: HeaderRootAuthState) -> zakura_state::HeaderRootAuthState {
+    zakura_state::HeaderRootAuthState {
+        authenticated_height: state.authenticated_height,
+        authenticated_hash: state.authenticated_hash,
+        completed_checkpoint_height: state.completed_checkpoint_height,
+        completed_checkpoint_hash: state.completed_checkpoint_hash,
+    }
 }
 
-pub(crate) fn block_roots_cover_range(
-    start_height: block::Height,
-    count: u32,
-    roots: &[BlockCommitmentRoots],
-) -> bool {
-    if roots.len() != usize::try_from(count).unwrap_or(usize::MAX) {
-        return false;
-    }
-
-    roots.iter().enumerate().all(|(offset, roots)| {
-        let Ok(offset) = u32::try_from(offset) else {
-            return false;
-        };
-        start_height
-            .0
-            .checked_add(offset)
-            .is_some_and(|height| roots.height == block::Height(height))
+pub(crate) async fn drive_header_root_auth_updates(
+    read_state: zakura_state::ReadStateService,
+    header_sync: zakura_network::zakura::HeaderSyncHandle,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
+    let updates = read_state.subscribe_header_root_auth();
+    drive_header_root_auth_watch_updates(updates, shutdown, move |state| {
+        let header_sync = header_sync.clone();
+        async move {
+            header_sync
+                .send(HeaderSyncEvent::HeaderRootAuthStateChanged(state))
+                .await
+                .is_ok()
+        }
     })
+    .await;
+}
+
+async fn drive_header_root_auth_watch_updates<Deliver, Delivery>(
+    mut updates: tokio::sync::watch::Receiver<Option<zakura_state::HeaderRootAuthState>>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    mut deliver: Deliver,
+) where
+    Deliver: FnMut(Option<HeaderRootAuthState>) -> Delivery,
+    Delivery: Future<Output = bool>,
+{
+    pin!(shutdown);
+    let initial = updates.borrow_and_update().map(header_root_auth_state);
+    if !deliver(initial).await {
+        return;
+    }
+    loop {
+        select! {
+            _ = &mut shutdown => return,
+            changed = updates.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let state = updates.borrow_and_update().map(header_root_auth_state);
+                if !deliver(state).await {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn header_range_committed(
@@ -193,6 +169,106 @@ fn header_range_commit_failed(
     kind: HeaderSyncCommitFailureKind,
 ) -> HeaderSyncEvent {
     HeaderSyncEvent::HeaderRangeOperationFailed { operation, kind }
+}
+
+fn header_root_authentication_completed(operation: HeaderSyncOperationIdentity) -> HeaderSyncEvent {
+    HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation }
+}
+
+fn header_root_authentication_failed(
+    operation: HeaderSyncOperationIdentity,
+    kind: HeaderRootAuthenticationFailureKind,
+) -> HeaderSyncEvent {
+    HeaderSyncEvent::HeaderRootAuthenticationFailed { operation, kind }
+}
+
+/// Convert a finished root-auth JoinSet entry into the reactor settlement event.
+///
+/// A panicked (non-cancelled) task must still settle the reactor's pending
+/// `AuthenticateRoots` op; otherwise both admission gates stay blocked forever.
+fn settle_root_auth_task_join(
+    joined: Option<Result<HeaderSyncEvent, tokio::task::JoinError>>,
+    in_flight: &mut Option<HeaderSyncOperationIdentity>,
+) -> Option<HeaderSyncEvent> {
+    match joined {
+        Some(Ok(event)) => {
+            let _ = in_flight.take();
+            Some(event)
+        }
+        Some(Err(error)) if !error.is_cancelled() => {
+            let Some(operation) = in_flight.take() else {
+                warn!(
+                    ?error,
+                    "header-root authentication task failed without a tracked operation"
+                );
+                return None;
+            };
+            warn!(
+                ?error,
+                ?operation,
+                "header-root authentication task failed; synthesizing local failure"
+            );
+            Some(header_root_authentication_failed(
+                operation,
+                HeaderRootAuthenticationFailureKind::Local,
+            ))
+        }
+        Some(Err(_)) | None => {
+            let _ = in_flight.take();
+            None
+        }
+    }
+}
+
+/// Failure kind when a new root-auth action arrives while the driver's JoinSet
+/// slot is still occupied.
+///
+/// This is a local capacity condition: the frontier did not move and no watch
+/// publish is implied. Settling as [`HeaderRootAuthenticationFailureKind::Stale`]
+/// would park the reactor on `root_auth_waiting_for_watch` until an unrelated
+/// commit happens to publish.
+fn root_auth_slot_occupied_failure_kind() -> HeaderRootAuthenticationFailureKind {
+    HeaderRootAuthenticationFailureKind::Local
+}
+
+fn header_root_authentication_failure_kind(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> HeaderRootAuthenticationFailureKind {
+    // Walk the source chain: Tower/state layers may wrap the typed auth error in another
+    // `Error`. A top-level-only downcast would mis-classify every forgery as Local and
+    // silently disable peer scoring while all piecewise tests stay green.
+    let mut current: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(auth_error) =
+            current.downcast_ref::<zakura_state::AuthenticateHeaderRootsError>()
+        {
+            return match auth_error {
+                zakura_state::AuthenticateHeaderRootsError::NonCanonicalHeader { height } => {
+                    HeaderRootAuthenticationFailureKind::CanonicalMismatch { height: *height }
+                }
+                zakura_state::AuthenticateHeaderRootsError::Verification { .. } => {
+                    HeaderRootAuthenticationFailureKind::InvalidPeerRange
+                }
+                zakura_state::AuthenticateHeaderRootsError::StaleState { .. }
+                | zakura_state::AuthenticateHeaderRootsError::AnchorMismatch { .. }
+                | zakura_state::AuthenticateHeaderRootsError::StartMismatch { .. }
+                | zakura_state::AuthenticateHeaderRootsError::WitnessAboveCompletedCheckpoint {
+                    ..
+                } => HeaderRootAuthenticationFailureKind::Stale,
+                zakura_state::AuthenticateHeaderRootsError::CountMismatch { .. }
+                | zakura_state::AuthenticateHeaderRootsError::MissingSuccessorWitness { .. }
+                | zakura_state::AuthenticateHeaderRootsError::NonContiguous { .. }
+                | zakura_state::AuthenticateHeaderRootsError::HeightOverflow
+                | zakura_state::AuthenticateHeaderRootsError::Frontier(_) => {
+                    HeaderRootAuthenticationFailureKind::Local
+                }
+            };
+        }
+        match current.source() {
+            Some(source) => current = source,
+            None => return HeaderRootAuthenticationFailureKind::Local,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +313,216 @@ mod operation_identity_tests {
                 } if echoed == operation && echoed_kind == kind
             ));
         }
+    }
+
+    #[test]
+    fn root_auth_events_echo_exact_operation_identity() {
+        let mut operation = operation();
+        operation.op_kind = HeaderSyncOperationKind::AuthenticateRoots;
+
+        assert!(matches!(
+            header_root_authentication_completed(operation.clone()),
+            HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation: echoed }
+                if echoed == operation
+        ));
+        for kind in [
+            HeaderRootAuthenticationFailureKind::Stale,
+            HeaderRootAuthenticationFailureKind::InvalidPeerRange,
+            HeaderRootAuthenticationFailureKind::Local,
+        ] {
+            assert!(matches!(
+                header_root_authentication_failed(operation.clone(), kind),
+                HeaderSyncEvent::HeaderRootAuthenticationFailed {
+                    operation: echoed,
+                    kind: echoed_kind,
+                } if echoed == operation && echoed_kind == kind
+            ));
+        }
+    }
+
+    #[test]
+    fn root_auth_slot_occupied_settles_as_local_not_stale() {
+        // Stale parks the reactor waiting for a frontier watch update. Slot
+        // occupancy does not imply a frontier move, so the backstop must be
+        // Local (reactor retries with delay) instead.
+        assert_eq!(
+            root_auth_slot_occupied_failure_kind(),
+            HeaderRootAuthenticationFailureKind::Local
+        );
+        assert_ne!(
+            root_auth_slot_occupied_failure_kind(),
+            HeaderRootAuthenticationFailureKind::Stale
+        );
+    }
+
+    #[test]
+    fn root_auth_error_classes_preserve_peer_attribution_policy() {
+        let state = zakura_state::HeaderRootAuthState {
+            authenticated_height: block::Height(1),
+            authenticated_hash: block::Hash([1; 32]),
+            completed_checkpoint_height: block::Height(3),
+            completed_checkpoint_hash: block::Hash([3; 32]),
+        };
+        let stale = zakura_state::AuthenticateHeaderRootsError::StaleState {
+            expected: state,
+            current: state,
+        };
+        let invalid = zakura_state::AuthenticateHeaderRootsError::CountMismatch {
+            headers: 2,
+            roots: 1,
+        };
+        let canonical_mismatch = zakura_state::AuthenticateHeaderRootsError::NonCanonicalHeader {
+            height: block::Height(2),
+        };
+        // Cryptographic forgery is the peer-scoring path: Verification must map to
+        // InvalidPeerRange or the reactor will endlessly retry a poisoned payload.
+        let verification = zakura_state::AuthenticateHeaderRootsError::Verification {
+            height: block::Height(1),
+            source: zakura_chain::parallel::commitment_aux_verify::SuppliedRootsError::MissingHistoryTreeRoot,
+        };
+        let local = std::io::Error::other("local state service failure");
+
+        assert_eq!(
+            header_root_authentication_failure_kind(&stale),
+            HeaderRootAuthenticationFailureKind::Stale
+        );
+        assert_eq!(
+            header_root_authentication_failure_kind(&invalid),
+            HeaderRootAuthenticationFailureKind::Local
+        );
+        assert_eq!(
+            header_root_authentication_failure_kind(&canonical_mismatch),
+            HeaderRootAuthenticationFailureKind::CanonicalMismatch {
+                height: block::Height(2)
+            }
+        );
+        assert_eq!(
+            header_root_authentication_failure_kind(&verification),
+            HeaderRootAuthenticationFailureKind::InvalidPeerRange
+        );
+        assert_eq!(
+            header_root_authentication_failure_kind(&local),
+            HeaderRootAuthenticationFailureKind::Local
+        );
+
+        // A wrapping layer must not demote Verification to Local.
+        #[derive(Debug, thiserror::Error)]
+        #[error("wrapped authenticate-header-roots failure")]
+        struct WrappedAuthError(#[source] zakura_state::AuthenticateHeaderRootsError);
+        let wrapped = WrappedAuthError(zakura_state::AuthenticateHeaderRootsError::Verification {
+            height: block::Height(1),
+            source: zakura_chain::parallel::commitment_aux_verify::SuppliedRootsError::MissingHistoryTreeRoot,
+        });
+        assert_eq!(
+            header_root_authentication_failure_kind(&wrapped),
+            HeaderRootAuthenticationFailureKind::InvalidPeerRange
+        );
+    }
+
+    #[tokio::test]
+    async fn panicked_root_auth_join_synthesizes_local_failure() {
+        let operation = {
+            let mut operation = operation();
+            operation.op_kind = HeaderSyncOperationKind::AuthenticateRoots;
+            operation
+        };
+        let mut in_flight = Some(operation.clone());
+        let panic_join = tokio::spawn(async {
+            panic!("simulated root-auth task panic");
+        })
+        .await
+        .expect_err("join must surface the panic");
+
+        let event = settle_root_auth_task_join(Some(Err(panic_join)), &mut in_flight);
+        assert!(
+            matches!(
+                event,
+                Some(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+                    operation: ref echoed,
+                    kind: HeaderRootAuthenticationFailureKind::Local,
+                }) if *echoed == operation
+            ),
+            "unexpected settlement event: {event:?}"
+        );
+        assert!(
+            in_flight.is_none(),
+            "panic settlement must clear the tracked operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_root_auth_join_does_not_synthesize_failure() {
+        let operation = {
+            let mut operation = operation();
+            operation.op_kind = HeaderSyncOperationKind::AuthenticateRoots;
+            operation
+        };
+        let mut in_flight = Some(operation);
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+        let cancelled_join = handle
+            .await
+            .expect_err("aborted join must surface cancellation");
+        assert!(cancelled_join.is_cancelled());
+
+        let event = settle_root_auth_task_join(Some(Err(cancelled_join)), &mut in_flight);
+        assert!(event.is_none(), "cancelled joins must not settle as Local");
+        assert!(
+            in_flight.is_none(),
+            "cancelled joins still clear the tracked operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_root_auth_join_forwards_event_and_clears_tracker() {
+        let operation = {
+            let mut operation = operation();
+            operation.op_kind = HeaderSyncOperationKind::AuthenticateRoots;
+            operation
+        };
+        let mut in_flight = Some(operation.clone());
+        let completed = header_root_authentication_completed(operation.clone());
+
+        let event = settle_root_auth_task_join(Some(Ok(completed)), &mut in_flight);
+        assert!(
+            matches!(
+                event,
+                Some(HeaderSyncEvent::HeaderRootAuthenticationCompleted {
+                    operation: ref echoed,
+                }) if *echoed == operation
+            ),
+            "unexpected settlement event: {event:?}"
+        );
+        assert!(in_flight.is_none());
+    }
+
+    #[tokio::test]
+    async fn root_auth_watch_emits_initial_value_before_waiting() {
+        let state = zakura_state::HeaderRootAuthState {
+            authenticated_height: block::Height(7),
+            authenticated_hash: block::Hash([7; 32]),
+            completed_checkpoint_height: block::Height(9),
+            completed_checkpoint_hash: block::Hash([9; 32]),
+        };
+        let (_sender, receiver) = tokio::sync::watch::channel(Some(state));
+        let (delivered_tx, mut delivered_rx) = mpsc::channel(1);
+        let task = tokio::spawn(drive_header_root_auth_watch_updates(
+            receiver,
+            std::future::pending(),
+            move |state| {
+                let delivered_tx = delivered_tx.clone();
+                async move { delivered_tx.send(state).await.is_ok() }
+            },
+        ));
+
+        let delivered = tokio::time::timeout(Duration::from_secs(1), delivered_rx.recv())
+            .await
+            .expect("initial watch value is delivered without a change")
+            .expect("delivery channel stays open");
+        assert_eq!(delivered, Some(header_root_auth_state(state)));
+        task.abort();
     }
 }
 
@@ -473,11 +759,27 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
     BlockVerifier::Future: Send + 'static,
 {
     pin!(shutdown);
+    let mut root_auth_tasks = JoinSet::new();
+    let mut in_flight_root_auth = None;
     loop {
         let action = select! {
-            _ = &mut shutdown => return,
+            _ = &mut shutdown => {
+                root_auth_tasks.abort_all();
+                while root_auth_tasks.join_next().await.is_some() {}
+                return;
+            },
+            completed = root_auth_tasks.join_next(), if !root_auth_tasks.is_empty() => {
+                if let Some(event) =
+                    settle_root_auth_task_join(completed, &mut in_flight_root_auth)
+                {
+                    let _ = handles.header_sync.send(event).await;
+                }
+                continue;
+            },
             action = actions.recv() => {
                 let Some(action) = action else {
+                    root_auth_tasks.abort_all();
+                    while root_auth_tasks.join_next().await.is_some() {}
                     return;
                 };
                 action
@@ -988,13 +1290,6 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             tip_hash,
                             count,
                         );
-                        publish_header_frontier(
-                            &handles.endpoint,
-                            tip_height,
-                            tip_hash,
-                            FrontierChange::HeaderAdvanced,
-                            &trace,
-                        );
                     }
                     Ok(response) => {
                         emit_commit_state(
@@ -1080,6 +1375,97 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     }
                 }
             }
+            HeaderSyncAction::AuthenticateHeaderRoots {
+                operation,
+                expected_state,
+                anchor,
+                payload,
+            } => {
+                if root_auth_tasks.len() >= MAX_ROOT_AUTH_STATE_TASKS {
+                    if handles
+                        .header_sync
+                        .send(header_root_authentication_failed(
+                            operation,
+                            root_auth_slot_occupied_failure_kind(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                let peer = operation.wire_request.peer.clone();
+                let start = payload.range().start();
+                let (_range, headers, _body_sizes, roots) = payload.into_parts();
+                let request = zakura_state::AuthenticateHeaderRootsRequest {
+                    expected_state: state_header_root_auth_state(expected_state),
+                    anchor,
+                    start,
+                    headers,
+                    roots: roots.unwrap_or_default(),
+                };
+                let state = state.clone();
+                debug_assert!(
+                    in_flight_root_auth.is_none(),
+                    "at most one root-auth task is admitted"
+                );
+                in_flight_root_auth = Some(operation.clone());
+                root_auth_tasks.spawn(async move {
+                    match tokio::time::timeout(
+                        ROOT_AUTH_STATE_TIMEOUT,
+                        state.oneshot(request.map_request()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(zakura_state::Response::AuthenticatedHeaderRoots(_))) => {
+                            header_root_authentication_completed(operation)
+                        }
+                        Ok(Ok(response)) => {
+                            warn!(
+                                ?peer,
+                                ?response,
+                                "unexpected AuthenticateHeaderRoots response"
+                            );
+                            header_root_authentication_failed(
+                                operation,
+                                HeaderRootAuthenticationFailureKind::Local,
+                            )
+                        }
+                        Ok(Err(error)) => {
+                            let kind = header_root_authentication_failure_kind(error.as_ref());
+                            if kind == HeaderRootAuthenticationFailureKind::Local {
+                                warn!(
+                                    ?peer,
+                                    ?start,
+                                    ?error,
+                                    "local header-root authentication failure"
+                                );
+                            } else {
+                                debug!(
+                                    ?peer,
+                                    ?start,
+                                    ?kind,
+                                    ?error,
+                                    "header-root authentication rejected"
+                                );
+                            }
+                            header_root_authentication_failed(operation, kind)
+                        }
+                        Err(_) => {
+                            warn!(
+                                ?peer,
+                                ?start,
+                                "header-root authentication state request timed out"
+                            );
+                            header_root_authentication_failed(
+                                operation,
+                                HeaderRootAuthenticationFailureKind::Local,
+                            )
+                        }
+                    }
+                });
+            }
             HeaderSyncAction::QueryBestHeaderTip => {
                 emit_commit_state(
                     &trace,
@@ -1089,37 +1475,12 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
                     },
                 );
-                let started = Instant::now();
                 match read_state
                     .clone()
                     .oneshot(zakura_state::ReadRequest::BestHeaderTip)
                     .await
                 {
-                    Ok(zakura_state::ReadResponse::BestHeaderTip(Some(best_header_tip))) => {
-                        let (tip_height, tip_hash) = match root_covered_query_best_header_tip(
-                            read_state.clone(),
-                            best_header_tip,
-                        )
-                        .await
-                        {
-                            Ok(tip) => tip,
-                            Err(error) => {
-                                trace_state_read_error(
-                                    &trace,
-                                    "query_best_header_tip_roots",
-                                    None,
-                                    best_header_tip.0,
-                                    1,
-                                    &format!("{error}"),
-                                    started,
-                                );
-                                warn!(
-                                    ?error,
-                                    "failed to apply Zakura root coverage to best header tip"
-                                );
-                                continue;
-                            }
-                        };
+                    Ok(zakura_state::ReadResponse::BestHeaderTip(Some((tip_height, tip_hash)))) => {
                         emit_commit_state(
                             &trace,
                             cs_trace::STATE_READ_SUCCESS,
@@ -1137,13 +1498,6 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 tip_hash,
                             })
                             .await;
-                        publish_header_frontier(
-                            &handles.endpoint,
-                            tip_height,
-                            tip_hash,
-                            FrontierChange::HeaderAdvanced,
-                            &trace,
-                        );
                     }
                     Ok(zakura_state::ReadResponse::BestHeaderTip(None)) => {}
                     Ok(response) => {
@@ -1811,6 +2165,18 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
                 operation, payload, ..
             } => {
                 insert_cs_str(row, cs_trace::ACTION, "commit_header_range");
+                insert_cs_peer(row, cs_trace::PEER, &operation.wire_request.peer);
+                insert_cs_height(row, cs_trace::RANGE_START, payload.range().start());
+                insert_cs_u64(
+                    row,
+                    cs_trace::RANGE_COUNT,
+                    u64::from(payload.range().count()),
+                );
+            }
+            HeaderSyncAction::AuthenticateHeaderRoots {
+                operation, payload, ..
+            } => {
+                insert_cs_str(row, cs_trace::ACTION, "authenticate_header_roots");
                 insert_cs_peer(row, cs_trace::PEER, &operation.wire_request.peer);
                 insert_cs_height(row, cs_trace::RANGE_START, payload.range().start());
                 insert_cs_u64(

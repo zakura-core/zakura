@@ -417,6 +417,17 @@ pub(crate) async fn drive_header_sync_actions(
                     "suppressing Zakura header range commit until state driver is wired"
                 );
             }
+            HeaderSyncAction::AuthenticateHeaderRoots {
+                operation, payload, ..
+            } => {
+                let peer = &operation.wire_request.peer;
+                tracing::debug!(
+                    ?peer,
+                    start_height = ?payload.range().start(),
+                    count = payload.range().count(),
+                    "suppressing header-root authentication until state driver is wired"
+                );
+            }
             HeaderSyncAction::QueryBestHeaderTip
             | HeaderSyncAction::QueryMissingBlockBodies { .. }
             | HeaderSyncAction::BodyGaps { .. }

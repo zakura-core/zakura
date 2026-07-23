@@ -47,8 +47,9 @@ pub use error::{
     StoreIncoherentError, ValidateContextError,
 };
 pub use request::{
-    CheckpointVerifiedBlock, CommitSemanticallyVerifiedBlockRequest, HashOrHeight, MappedRequest,
-    ReadRequest, Request, SemanticallyVerifiedBlock,
+    AuthenticateHeaderRootsRequest, CheckpointVerifiedBlock,
+    CommitSemanticallyVerifiedBlockRequest, HashOrHeight, MappedRequest, ReadRequest, Request,
+    SemanticallyVerifiedBlock,
 };
 
 #[cfg(feature = "indexer")]
@@ -76,7 +77,9 @@ pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch}
 pub use service::finalized_state::{
     generate_mainnet_from_archive, produce_final_frontiers_bytes,
     produce_settled_final_frontiers_bytes, validate_final_frontiers_bytes,
+    AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,
     FinalFrontiersGenerationError, FinalFrontiersValidationError, GeneratorError,
+    HeaderRootAuthState,
 };
 pub use service::finalized_state::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,

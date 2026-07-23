@@ -22,9 +22,15 @@ use crate::{
 /// One entry per height; each root is the note-commitment treestate root as of
 /// end-of-block-`height`. `orchard_root` is the empty/default root below NU5.
 ///
-/// This payload carries no trust: a recipient re-verifies every root against its own
-/// checkpoint-committed block headers before accepting it, so
-/// a forwarding/serving node is exactly as trustworthy as an originating one.
+/// This payload carries no trust. Authentication is per field and network-upgrade epoch:
+///
+/// - each note-commitment root is either pinned to its pre-activation value or folded into
+///   the applicable ZIP-221 history leaf;
+/// - Sapling, Orchard, and Ironwood transaction counts are pinned to zero before activation and
+///   folded into their applicable history leaves afterward (Sapling counts enter the V1 leaf at
+///   Heartwood; below Heartwood they are body-verified-only and cleared on promotion);
+/// - the auth-data root is body-verified-only below NU5 (cleared on promotion) and committed by
+///   the current header from NU5 onward.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockCommitmentRoots {
     /// The block height these roots are for.
@@ -44,16 +50,17 @@ pub struct BlockCommitmentRoots {
     ///
     /// The per-block shielded transaction counts are the *only* ZIP-221 history-leaf inputs
     /// the header and roots don't already provide (everything else — hash, time,
-    /// difficulty/work, height — is header-derived). They are carried so a recipient can
-    /// rebuild the MMR leaf and verify each root against its checkpoint-committed header
-    /// commitment during header sync, without the block body. Like the roots they carry no
-    /// trust: a wrong count changes the leaf and fails the header commitment check.
+    /// difficulty/work, height — is header-derived). From Heartwood onward a wrong count
+    /// changes the leaf and fails the header commitment check. Below Sapling the count is
+    /// pinned to zero; between Sapling and Heartwood ZIP-221 does not exist yet, so the field
+    /// is body-verified-only and cleared to zero when the row is promoted.
     pub sapling_tx: u64,
     /// Number of this block's transactions carrying Orchard shielded data
-    /// (`Block::orchard_transactions_count`); the Orchard V2 leaf count input (NU5+).
+    /// (`Block::orchard_transactions_count`); pinned to zero below NU5 and authenticated by
+    /// the Orchard V2 leaf from NU5 onward.
     pub orchard_tx: u64,
     /// Number of this block's transactions carrying Ironwood shielded data; the Ironwood
-    /// V3 leaf count input (NU6.3+).
+    /// pinned to zero below NU6.3 and authenticated by the V3 leaf from NU6.3 onward.
     pub ironwood_tx: u64,
     /// The authorizing-data root (ZIP-244 `hashAuthDataRoot`) of *this* block's own
     /// transactions. Serialized last.
@@ -61,11 +68,9 @@ pub struct BlockCommitmentRoots {
     /// Carried so a recipient can authenticate the *predecessor's* note-commitment
     /// roots against this block's NU5+ header commitment
     /// (`hashBlockCommitments = BLAKE2b(chainHistoryRoot ‖ authDataRoot ‖ 0)`) without
-    /// downloading this block's body. Like the other roots it carries no trust: it is
-    /// only the co-input to a hash check against a checkpoint-committed header, so a
-    /// wrong value fails verification rather than being accepted. Default/zero below
-    /// NU5, where the header commits the chain-history root directly and this field is
-    /// unused.
+    /// downloading this block's body. A wrong value fails verification against the current
+    /// header from NU5 onward. Below NU5 the header commits the chain-history root directly,
+    /// so this field is body-verified-only and cleared to the all-zero root on promotion.
     pub auth_data_root: AuthDataRoot,
 }
 

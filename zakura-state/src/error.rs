@@ -495,6 +495,13 @@ pub enum CommitHeaderRangeError {
     #[error("header store incoherent while validating range: {0}")]
     StoreIncoherent(#[from] StoreIncoherentError),
 
+    /// The durable authenticated-root frontier could not be safely rebased.
+    #[error("header-root authentication frontier is incoherent: {reason}")]
+    HeaderRootAuthFrontier {
+        /// The local frontier coherence failure.
+        reason: String,
+    },
+
     /// Contextual header validation failed.
     #[error("could not contextually validate header")]
     ValidateContextError(#[from] Box<ValidateContextError>),
@@ -589,6 +596,9 @@ pub enum ReconsiderError {
 pub enum ValidateContextError {
     #[error(transparent)]
     MissingSproutTipTree(#[from] MissingSproutTipTree),
+
+    #[error("header-root authentication frontier is incoherent: {reason}")]
+    HeaderRootAuthFrontier { reason: String },
 
     #[error("block hash {block_hash} was previously invalidated")]
     #[non_exhaustive]

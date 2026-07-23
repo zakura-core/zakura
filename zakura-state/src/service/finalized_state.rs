@@ -22,6 +22,7 @@ use std::{
     },
 };
 
+use tokio::sync::oneshot;
 use zakura_chain::{
     block, ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
@@ -114,7 +115,12 @@ pub use vct::{
     generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
     GeneratorError, NextVctBlock,
 };
-pub use zakura_db::commitment_roots_db::COMMITMENT_ROOTS_BY_HEIGHT;
+#[allow(unused_imports)]
+pub use zakura_db::commitment_roots_db::{
+    AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,
+    HeaderRootAuthFrontier, HeaderRootAuthFrontierError, HeaderRootAuthState,
+    COMMITMENT_ROOTS_BY_HEIGHT, HEADER_ROOT_AUTH_FRONTIER,
+};
 pub use zakura_db::highest_completed_checkpoint::*;
 pub use zakura_db::ZakuraDb;
 
@@ -179,6 +185,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     BLOCK_INFO,
     // Verified-commitment-trees serving index
     COMMITMENT_ROOTS_BY_HEIGHT,
+    HEADER_ROOT_AUTH_FRONTIER,
     // Storage policy
     PRUNING_METADATA,
     VCT_SYNC_METADATA,
@@ -558,7 +565,11 @@ impl FinalizedState {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         next_vct_block: Option<NextVctBlock>,
     ) -> Result<
-        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (
+            CheckpointVerifiedBlock,
+            NoteCommitmentTrees,
+            oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
+        ),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
     > {
         let (checkpoint_verified, rsp_tx) = ordered_block;
@@ -587,9 +598,11 @@ impl FinalizedState {
         };
 
         match result {
-            Ok((hash, note_commitment_trees)) => {
-                let _ = rsp_tx.send(Ok(hash));
-                Ok((checkpoint_verified, note_commitment_trees))
+            // Leave the oneshot pending until the write loop publishes auth state and
+            // the chain tip. Callers that await the commit response then wait for a tip
+            // change must not resume between the DB commit and those notifications.
+            Ok((_hash, note_commitment_trees)) => {
+                Ok((checkpoint_verified, note_commitment_trees, rsp_tx))
             }
             Err(error) => Err(((checkpoint_verified, rsp_tx), error)),
         }

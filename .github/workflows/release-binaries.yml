@@ -15,6 +15,10 @@
 # docs/security-hotfix-release.md — builds and assembles a complete release
 # in that repo without publishing anything.
 #
+# The canonical repository uses Depot builders by default. Set the repository
+# variable RELEASE_BUILD_BACKEND to github for an immediate Buildx fallback.
+# Other repositories default to GitHub unless they opt into Depot explicitly.
+#
 # The tag must match the `zakura` package version: release binaries are built
 # in Docker without `.git`, so `zakurad --version` reports CARGO_PKG_VERSION,
 # and a tag pushed without bumping the package version ships binaries that
@@ -42,12 +46,50 @@ on:
         required: false
         type: boolean
         default: false
+      dry_run:
+        description: "Build and validate without uploading or publishing outputs"
+        required: false
+        type: boolean
+        default: false
+      build_backend:
+        description: "Docker build backend override (defaults by repository)"
+        required: false
+        type: string
+        default: ""
+      depot_project_id:
+        description: "Depot project override used when build_backend is depot"
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       release_tag:
         description: "Release tag to build and publish assets for (for example v0.0.1-alpha.1)"
         required: false
         type: string
+      checkout_ref:
+        description: "Exact commit to build in dry-run mode (defaults to the dispatched ref)"
+        required: false
+        type: string
+      dry_run:
+        description: "Build and validate without uploading or publishing outputs"
+        required: false
+        type: boolean
+        default: false
+      build_backend:
+        description: "Docker build backend (auto uses the repository default)"
+        required: false
+        type: choice
+        options:
+          - auto
+          - github
+          - depot
+        default: auto
+      depot_project_id:
+        description: "Depot project override (leave empty for repository default)"
+        required: false
+        type: string
+        default: ""
       publish_assets_to_release:
         description: "Upload zakurad assets to the GitHub release tag (use to repair an existing release)"
         required: false
@@ -75,6 +117,8 @@ jobs:
       release_tag: ${{ steps.resolve.outputs.release_tag }}
       checkout_ref: ${{ steps.resolve.outputs.checkout_ref }}
       assets_published: ${{ steps.resolve.outputs.assets_published }}
+      build_backend: ${{ steps.resolve.outputs.build_backend }}
+      depot_project_id: ${{ steps.resolve.outputs.depot_project_id }}
     steps:
       - name: Resolve release tag
         id: resolve
@@ -83,6 +127,12 @@ jobs:
           REF_TYPE: ${{ github.ref_type }}
           INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
           INPUT_CHECKOUT_REF: ${{ inputs.checkout_ref }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_BUILD_BACKEND: ${{ inputs.build_backend }}
+          INPUT_DEPOT_PROJECT_ID: ${{ inputs.depot_project_id }}
+          DEFAULT_BUILD_BACKEND: ${{ vars.RELEASE_BUILD_BACKEND || (github.repository == 'zakura-core/zakura' && 'depot' || 'github') }}
+          DEFAULT_DEPOT_PROJECT_ID: ${{ vars.DEPOT_PROJECT_ID || (github.repository == 'zakura-core/zakura' && 'gjcfbjk8wc' || '') }}
+          STAGE_RELEASE_ASSETS: ${{ inputs.stage_release_assets }}
           GITHUB_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
           REPOSITORY: ${{ github.repository }}
@@ -96,7 +146,13 @@ jobs:
             release_tag="$INPUT_RELEASE_TAG"
             # Reusable staging builds pin the validated commit before its tag
             # exists. workflow_dispatch repairs still build from the tag.
-            if [ -n "$INPUT_CHECKOUT_REF" ]; then
+            if [ "$DRY_RUN" = "true" ]; then
+              checkout_ref="${INPUT_CHECKOUT_REF:-$GITHUB_SHA}"
+            elif [ -n "$INPUT_CHECKOUT_REF" ]; then
+              if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$STAGE_RELEASE_ASSETS" != "true" ]; then
+                echo "workflow_dispatch checkout_ref requires dry_run." >&2
+                exit 1
+              fi
               checkout_ref="$INPUT_CHECKOUT_REF"
             elif [ -n "$release_tag" ]; then
               checkout_ref="$release_tag"
@@ -110,8 +166,25 @@ jobs:
             exit 1
           fi
 
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
-          echo "checkout_ref=$checkout_ref" >> "$GITHUB_OUTPUT"
+          if [ -n "$INPUT_BUILD_BACKEND" ] && [ "$INPUT_BUILD_BACKEND" != "auto" ]; then
+            build_backend="$INPUT_BUILD_BACKEND"
+          else
+            build_backend="$DEFAULT_BUILD_BACKEND"
+          fi
+          depot_project_id="${INPUT_DEPOT_PROJECT_ID:-$DEFAULT_DEPOT_PROJECT_ID}"
+          case "$build_backend" in
+            github) ;;
+            depot)
+              if [ -z "$depot_project_id" ]; then
+                echo "A Depot project ID is required for the Depot backend." >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "Unknown build backend: ${build_backend}" >&2
+              exit 1
+              ;;
+          esac
 
           assets_published=false
           # A tag created by create-release.yml already has its complete asset
@@ -145,7 +218,13 @@ jobs:
               fi
             done
           fi
-          echo "assets_published=$assets_published" >> "$GITHUB_OUTPUT"
+          {
+            echo "release_tag=$release_tag"
+            echo "checkout_ref=$checkout_ref"
+            echo "build_backend=$build_backend"
+            echo "depot_project_id=$depot_project_id"
+            echo "assets_published=$assets_published"
+          } >> "$GITHUB_OUTPUT"
 
   check-release-version:
     name: Check release tag matches package version
@@ -189,6 +268,9 @@ jobs:
 
   build-zakurad-assets:
     name: Build zakurad assets (${{ matrix.name }})
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ${{ matrix.runner }}
     needs: [resolve-release, check-release-version]
     if: needs.resolve-release.outputs.assets_published != 'true'
@@ -197,11 +279,11 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            runner: ${{ vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
+            runner: ${{ needs.resolve-release.outputs.build_backend == 'depot' && 'ubuntu-latest' || vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
             platform: linux/amd64
             target_triple: x86_64-unknown-linux-gnu
           - name: linux-aarch64
-            runner: ${{ vars.DOCKER_BUILD_RUNNER_ARM64 || 'ubuntu-24.04-arm' }}
+            runner: ${{ needs.resolve-release.outputs.build_backend == 'depot' && 'ubuntu-24.04-arm' || vars.DOCKER_BUILD_RUNNER_ARM64 || 'ubuntu-24.04-arm' }}
             platform: linux/arm64
             target_triple: aarch64-unknown-linux-gnu
     steps:
@@ -211,10 +293,18 @@ jobs:
           ref: ${{ needs.resolve-release.outputs.checkout_ref }}
 
       - name: Set up Docker Buildx
+        if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c #v4.0.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
+
+      - name: Set up Depot Buildx
+        if: ${{ needs.resolve-release.outputs.build_backend == 'depot' }}
+        uses: depot/use-action@9bda29f1fc3163c06fc15f375887a341096a5639 # v1
+        with:
+          project: ${{ needs.resolve-release.outputs.depot_project_id }}
+          version: 2.101.75
 
       - name: Build release binary
         env:
@@ -295,6 +385,7 @@ jobs:
           EOF
 
       - name: Upload matrix artifacts
+        if: ${{ !inputs.dry_run }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
         with:
           name: zakurad-assets-${{ matrix.name }}
@@ -310,10 +401,13 @@ jobs:
       attestations: write
     if: >-
       ${{
-        inputs.stage_release_assets
-        || (
-          needs.resolve-release.outputs.assets_published != 'true'
-          && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_assets_to_release)
+        !inputs.dry_run
+        && (
+          inputs.stage_release_assets
+          || (
+            needs.resolve-release.outputs.assets_published != 'true'
+            && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_assets_to_release)
+          )
         )
       }}
     steps:
@@ -462,6 +556,9 @@ jobs:
 
   build:
     name: Build Release Docker (${{ matrix.name }})
+    permissions:
+      contents: read
+      id-token: write
     needs: [resolve-release, check-release-version]
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -469,11 +566,11 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            runner: ${{ vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
+            runner: ${{ needs.resolve-release.outputs.build_backend == 'depot' && 'ubuntu-latest' || vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
             platform: linux/amd64
             docker_tag_suffix: amd64
           - name: linux-aarch64
-            runner: ${{ vars.DOCKER_BUILD_RUNNER_ARM64 || 'ubuntu-24.04-arm' }}
+            runner: ${{ needs.resolve-release.outputs.build_backend == 'depot' && 'ubuntu-24.04-arm' || vars.DOCKER_BUILD_RUNNER_ARM64 || 'ubuntu-24.04-arm' }}
             platform: linux/arm64
             docker_tag_suffix: arm64
     steps:
@@ -483,10 +580,18 @@ jobs:
           ref: ${{ needs.resolve-release.outputs.checkout_ref }}
 
       - name: Set up Docker Buildx
+        if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c #v4.0.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
+
+      - name: Set up Depot Buildx
+        if: ${{ needs.resolve-release.outputs.build_backend == 'depot' }}
+        uses: depot/use-action@9bda29f1fc3163c06fc15f375887a341096a5639 # v1
+        with:
+          project: ${{ needs.resolve-release.outputs.depot_project_id }}
+          version: 2.101.75
 
       # Repo guard: only the canonical repository publishes to Docker Hub.
       # Any other clone (for example a private staging repo rehearsing a
@@ -494,7 +599,8 @@ jobs:
       # publish-safe by construction.
       - name: Login to DockerHub
         if: >-
-          ${{ github.repository == 'zakura-core/zakura'
+          ${{ !inputs.dry_run
+            && github.repository == 'zakura-core/zakura'
             && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker_to_dockerhub) }}
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 #v4.4.0
         with:
@@ -503,7 +609,8 @@ jobs:
 
       - name: Build runtime image
         if: >-
-          ${{ github.repository != 'zakura-core/zakura'
+          ${{ inputs.dry_run
+            || github.repository != 'zakura-core/zakura'
             || (!startsWith(github.ref, 'refs/tags/v') && !inputs.publish_docker_to_dockerhub) }}
         env:
           FEATURES: ${{ vars.RUST_PROD_FEATURES || 'default-release-binaries' }}
@@ -527,7 +634,8 @@ jobs:
 
       - name: Build and push runtime image
         if: >-
-          ${{ github.repository == 'zakura-core/zakura'
+          ${{ !inputs.dry_run
+            && github.repository == 'zakura-core/zakura'
             && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker_to_dockerhub) }}
         env:
           FEATURES: ${{ vars.RUST_PROD_FEATURES || 'default-release-binaries' }}
@@ -553,6 +661,7 @@ jobs:
     # Repo guard: publishing only happens from the canonical repository.
     if: >-
       ${{ github.repository == 'zakura-core/zakura'
+        && !inputs.dry_run
         && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker_to_dockerhub) }}
     runs-on: ubuntu-latest
     needs: [resolve-release, build]
@@ -593,6 +702,9 @@ jobs:
 
   build-zcashd-compat:
     name: Build Release Docker zcashd Compat (${{ matrix.name }})
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ${{ matrix.runner }}
     needs: [resolve-release, resolve-zcashd-compat-manifest, check-release-version]
     strategy:
@@ -600,7 +712,7 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            runner: ${{ vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
+            runner: ${{ needs.resolve-release.outputs.build_backend == 'depot' && 'ubuntu-latest' || vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
             platform: linux/amd64
             docker_tag_suffix: amd64
     steps:
@@ -610,10 +722,18 @@ jobs:
           ref: ${{ needs.resolve-release.outputs.checkout_ref }}
 
       - name: Set up Docker Buildx
+        if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c #v4.0.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
+
+      - name: Set up Depot Buildx
+        if: ${{ needs.resolve-release.outputs.build_backend == 'depot' }}
+        uses: depot/use-action@9bda29f1fc3163c06fc15f375887a341096a5639 # v1
+        with:
+          project: ${{ needs.resolve-release.outputs.depot_project_id }}
+          version: 2.101.75
 
       # Repo guard: only the canonical repository publishes to Docker Hub.
       # Any other clone (for example a private staging repo rehearsing a
@@ -621,7 +741,8 @@ jobs:
       # publish-safe by construction.
       - name: Login to DockerHub
         if: >-
-          ${{ github.repository == 'zakura-core/zakura'
+          ${{ !inputs.dry_run
+            && github.repository == 'zakura-core/zakura'
             && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker_to_dockerhub) }}
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 #v4.4.0
         with:
@@ -639,7 +760,8 @@ jobs:
 
       - name: Build zcashd compat runtime image
         if: >-
-          ${{ github.repository != 'zakura-core/zakura'
+          ${{ inputs.dry_run
+            || github.repository != 'zakura-core/zakura'
             || (!startsWith(github.ref, 'refs/tags/v') && !inputs.publish_docker_to_dockerhub) }}
         env:
           FEATURES: ${{ vars.RUST_PROD_FEATURES || 'default-release-binaries' }}
@@ -664,7 +786,8 @@ jobs:
 
       - name: Build and push zcashd compat runtime image
         if: >-
-          ${{ github.repository == 'zakura-core/zakura'
+          ${{ !inputs.dry_run
+            && github.repository == 'zakura-core/zakura'
             && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker_to_dockerhub) }}
         env:
           FEATURES: ${{ vars.RUST_PROD_FEATURES || 'default-release-binaries' }}
@@ -691,6 +814,7 @@ jobs:
     # Repo guard: publishing only happens from the canonical repository.
     if: >-
       ${{ github.repository == 'zakura-core/zakura'
+        && !inputs.dry_run
         && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker_to_dockerhub) }}
     runs-on: ubuntu-latest
     needs: [resolve-release, resolve-zcashd-compat-manifest, build-zcashd-compat]

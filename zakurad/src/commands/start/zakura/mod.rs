@@ -133,14 +133,15 @@ pub(crate) use block_sync_driver::{
 pub(crate) use frontier::{query_block_sync_frontiers, verified_block_tip_from_state};
 #[cfg(test)]
 pub(crate) use header_sync_driver::{
-    block_roots_cover_range, block_sync_chain_tip_event, body_sizes_for_served_header_range,
+    block_sync_chain_tip_event, body_sizes_for_served_header_range,
     chain_tip_mirror_frontier_change, header_range_commit_error_label,
     header_range_commit_failure_kind, notify_block_sync_header_tip,
-    root_covered_query_best_header_tip, tree_aux_roots_for_served_header_range,
+    tree_aux_roots_for_served_header_range,
 };
 pub(crate) use header_sync_driver::{
-    drive_vct_root_repairs, drive_zakura_header_sync_actions, mirror_zakura_full_block_commits,
-    zakura_header_sync_driver_startup, ZakuraHeaderSyncDriverHandles,
+    drive_header_root_auth_updates, drive_vct_root_repairs, drive_zakura_header_sync_actions,
+    mirror_zakura_full_block_commits, zakura_header_sync_driver_startup,
+    ZakuraHeaderSyncDriverHandles,
 };
 pub(crate) use throughput_probe::{BlocksyncThroughputProbe, BlocksyncThroughputSummary};
 

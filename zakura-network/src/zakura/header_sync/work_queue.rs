@@ -47,24 +47,34 @@ pub(super) struct CoveredRange {
 #[derive(Clone, Debug)]
 pub(super) struct HeaderWorkQueue {
     pub(super) forward: VecDeque<RangeRequest>,
+    pub(super) authenticate_roots: VecDeque<RangeRequest>,
     pub(super) active: HashMap<RangeRequest, HeaderWorkState>,
     pending_starts: HashSet<(RangePriority, block::Height)>,
     active_starts: HashSet<(RangePriority, block::Height)>,
     pub(super) retry_avoidance:
         HashMap<ZakuraPeerId, HashMap<(block::Height, RangePriority), Instant>>,
+    delayed_retries: HashMap<(block::Height, RangePriority), DelayedRetry>,
     pub(super) covered: Vec<CoveredRange>,
     pub(super) epoch: u64,
     pub(super) oldest_missing_since: Option<Instant>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct DelayedRetry {
+    until: Option<Instant>,
+    attempts: u32,
 }
 
 impl HeaderWorkQueue {
     pub(super) fn new() -> Self {
         Self {
             forward: VecDeque::new(),
+            authenticate_roots: VecDeque::new(),
             active: HashMap::new(),
             pending_starts: HashSet::new(),
             active_starts: HashSet::new(),
             retry_avoidance: HashMap::new(),
+            delayed_retries: HashMap::new(),
             covered: Vec::new(),
             epoch: 0,
             oldest_missing_since: None,
@@ -75,7 +85,7 @@ impl HeaderWorkQueue {
         self.ensure(range, RangePriority::Forward);
     }
 
-    pub(super) fn ensure(&mut self, range: RangeRequest, priority: RangePriority) {
+    pub(super) fn ensure(&mut self, range: RangeRequest, priority: RangePriority) -> bool {
         if self.is_covered(range)
             || self
                 .active_starts
@@ -84,30 +94,53 @@ impl HeaderWorkQueue {
                 .pending_starts
                 .contains(&(priority, range.start_height()))
         {
-            return;
+            return false;
         }
         let queue = match priority {
             RangePriority::Forward => &mut self.forward,
-            RangePriority::Repair => return,
+            RangePriority::AuthenticateRoots => &mut self.authenticate_roots,
+            RangePriority::Repair => return false,
         };
         queue.push_back(range);
         self.pending_starts.insert((priority, range.start_height()));
         self.oldest_missing_since.get_or_insert_with(Instant::now);
         metrics::counter!("sync.header.work.added", "lane" => priority.label()).increment(1);
+        true
     }
 
     pub(super) fn next_for_peer(
         &mut self,
         peer_id: &ZakuraPeerId,
         peer: &PeerHeaderState,
+        allow_root_auth: bool,
     ) -> Option<RangeRequest> {
         let now = Instant::now();
         self.retry_avoidance.retain(|_, ranges| {
             ranges.retain(|_, until| *until > now);
             !ranges.is_empty()
         });
-        let range =
-            Self::pop_assignable(&mut self.forward, &self.retry_avoidance, peer_id, peer, now);
+        let range = allow_root_auth
+            .then(|| {
+                Self::pop_assignable(
+                    &mut self.authenticate_roots,
+                    &self.retry_avoidance,
+                    &self.delayed_retries,
+                    peer_id,
+                    peer,
+                    now,
+                )
+            })
+            .flatten()
+            .or_else(|| {
+                Self::pop_assignable(
+                    &mut self.forward,
+                    &self.retry_avoidance,
+                    &self.delayed_retries,
+                    peer_id,
+                    peer,
+                    now,
+                )
+            });
         if let Some(range) = range {
             self.pending_starts
                 .remove(&(range.priority, range.start_height()));
@@ -115,15 +148,19 @@ impl HeaderWorkQueue {
         range
     }
 
-    pub(super) fn pop_assignable(
+    fn pop_assignable(
         queue: &mut VecDeque<RangeRequest>,
         retry_avoidance: &HashMap<ZakuraPeerId, HashMap<(block::Height, RangePriority), Instant>>,
+        delayed_retries: &HashMap<(block::Height, RangePriority), DelayedRetry>,
         peer_id: &ZakuraPeerId,
         peer: &PeerHeaderState,
         now: Instant,
     ) -> Option<RangeRequest> {
         let index = queue.iter().position(|range| {
             range.end_height() <= peer.advertised_tip
+                && delayed_retries
+                    .get(&(range.start_height(), range.priority))
+                    .is_none_or(|retry| retry.until.is_none_or(|until| until <= now))
                 && retry_avoidance
                     .get(peer_id)
                     .and_then(|ranges| ranges.get(&(range.start_height(), range.priority)))
@@ -167,6 +204,19 @@ impl HeaderWorkQueue {
         );
     }
 
+    pub(super) fn mark_authenticating(
+        &mut self,
+        operation: HeaderSyncOperationIdentity,
+        range: RangeRequest,
+    ) {
+        self.active
+            .insert(range, HeaderWorkState::Committing { operation });
+        self.pending_starts
+            .remove(&(range.priority, range.start_height()));
+        self.active_starts
+            .insert((range.priority, range.start_height()));
+    }
+
     pub(super) fn narrow_queued_range(&mut self, original: RangeRequest, narrowed: RangeRequest) {
         if original == narrowed {
             return;
@@ -190,6 +240,7 @@ impl HeaderWorkQueue {
         }
         let queue = match range.priority {
             RangePriority::Forward => &mut self.forward,
+            RangePriority::AuthenticateRoots => &mut self.authenticate_roots,
             RangePriority::Repair => return,
         };
         if self
@@ -208,6 +259,39 @@ impl HeaderWorkQueue {
             Instant::now() + HEADER_SYNC_RETRY_AVOIDANCE,
         );
         self.retry(range);
+    }
+
+    pub(super) fn retry_delayed(&mut self, range: RangeRequest) {
+        let key = (range.start_height(), range.priority);
+        let attempts = self
+            .delayed_retries
+            .get(&key)
+            .map_or(1, |retry| retry.attempts.saturating_add(1));
+        let delay_seconds = 1u64
+            .checked_shl(attempts.saturating_sub(1).min(5))
+            .unwrap_or(32)
+            .min(30);
+        self.delayed_retries.insert(
+            key,
+            DelayedRetry {
+                until: Some(Instant::now() + Duration::from_secs(delay_seconds)),
+                attempts,
+            },
+        );
+        self.retry(range);
+    }
+
+    pub(super) fn retire_operation(
+        &mut self,
+        operation: &HeaderSyncOperationIdentity,
+        range: RangeRequest,
+    ) {
+        if matches!(
+            self.active.get(&range),
+            Some(HeaderWorkState::Committing { operation: active }) if active == operation
+        ) {
+            self.clear_assignment(range);
+        }
     }
 
     pub(super) fn forget_peer(&mut self, peer: &ZakuraPeerId) {
@@ -268,6 +352,7 @@ impl HeaderWorkQueue {
     ) {
         let queue = match priority {
             RangePriority::Forward => &mut self.forward,
+            RangePriority::AuthenticateRoots => &mut self.authenticate_roots,
             RangePriority::Repair => return,
         };
         if let Some(range) = queue
@@ -289,6 +374,71 @@ impl HeaderWorkQueue {
         metrics::counter!("sync.header.work.reset").increment(1);
     }
 
+    pub(super) fn clear_root_auth(&mut self) {
+        self.authenticate_roots.clear();
+        self.active
+            .retain(|range, _| range.priority != RangePriority::AuthenticateRoots);
+        self.delayed_retries
+            .retain(|(_, priority), _| *priority != RangePriority::AuthenticateRoots);
+        self.rebuild_start_indexes();
+    }
+
+    /// Drop pending/active root-auth ranges whose start is strictly below `start`.
+    ///
+    /// Used when the authenticated tip advances so consumed or behind-tip batches
+    /// leave the schedule. Non-root-auth active work is untouched.
+    pub(super) fn prune_root_auth_before(&mut self, start: block::Height) {
+        self.authenticate_roots
+            .retain(|range| range.start_height() >= start);
+        self.active.retain(|range, _| {
+            range.priority != RangePriority::AuthenticateRoots || range.start_height() >= start
+        });
+        self.rebuild_start_indexes();
+    }
+
+    /// Drop pending/active root-auth ranges (and delayed retries) that start above `start`.
+    ///
+    /// Used when a short or geometry-changing response invalidates speculative
+    /// future batches while keeping the current batch. Non-root-auth active work
+    /// is untouched.
+    pub(super) fn discard_root_auth_after(&mut self, start: block::Height) {
+        self.authenticate_roots
+            .retain(|range| range.start_height() <= start);
+        self.active.retain(|range, _| {
+            range.priority != RangePriority::AuthenticateRoots || range.start_height() <= start
+        });
+        self.delayed_retries.retain(|(height, priority), _| {
+            *priority != RangePriority::AuthenticateRoots || *height <= start
+        });
+        self.rebuild_start_indexes();
+    }
+
+    /// Drop queued or active fallback work whose range starts at `start`.
+    ///
+    /// A newly retained committed-forward payload for the same frontier is the
+    /// preferred source. Any late fallback response becomes stale rather than
+    /// starting duplicate authentication.
+    pub(super) fn discard_root_auth_at(&mut self, start: block::Height) {
+        self.authenticate_roots
+            .retain(|range| range.start_height() != start);
+        self.active.retain(|range, state| {
+            range.priority != RangePriority::AuthenticateRoots
+                || range.start_height() != start
+                || matches!(state, HeaderWorkState::Committing { .. })
+        });
+        self.delayed_retries
+            .remove(&(start, RangePriority::AuthenticateRoots));
+        self.rebuild_start_indexes();
+    }
+
+    /// True when `range` is actively owned by `peer` in the `InFlight` state.
+    pub(super) fn is_in_flight_for(&self, range: RangeRequest, peer: &ZakuraPeerId) -> bool {
+        matches!(
+            self.active.get(&range),
+            Some(HeaderWorkState::InFlight { peer: owner }) if owner == peer
+        )
+    }
+
     pub(super) fn mark_height_covered(&mut self, height: block::Height) {
         self.mark_covered_interval(CoveredRange {
             start: height,
@@ -303,6 +453,9 @@ impl HeaderWorkQueue {
     }
 
     pub(super) fn is_covered(&self, range: RangeRequest) -> bool {
+        if range.priority == RangePriority::AuthenticateRoots {
+            return false;
+        }
         let end = range.end_height();
         self.covered
             .iter()
@@ -339,6 +492,9 @@ impl HeaderWorkQueue {
     pub(super) fn prune_covered(&mut self) {
         let covered = self.covered.clone();
         let is_covered = |range: &RangeRequest| {
+            if range.priority == RangePriority::AuthenticateRoots {
+                return false;
+            }
             let end = range.end_height();
             covered
                 .iter()
@@ -355,24 +511,59 @@ impl HeaderWorkQueue {
     }
 
     pub(super) fn pending_len(&self) -> usize {
-        self.forward.len()
+        self.forward
+            .len()
+            .saturating_add(self.authenticate_roots.len())
     }
 
     pub(super) fn resident_heights(&self) -> u64 {
         self.forward
             .iter()
+            .chain(self.authenticate_roots.iter())
             .chain(self.active.keys())
             .map(|range| u64::from(range.count()))
             .sum()
     }
 
+    pub(super) fn resident_heights_for(&self, priority: RangePriority) -> u64 {
+        self.forward
+            .iter()
+            .chain(self.authenticate_roots.iter())
+            .chain(self.active.keys())
+            .filter(|range| range.priority == priority)
+            .map(|range| u64::from(range.count()))
+            .sum()
+    }
+
+    pub(super) fn active_count_for(
+        &self,
+        priority: RangePriority,
+        predicate: impl Fn(&HeaderWorkState) -> bool,
+    ) -> usize {
+        self.active
+            .iter()
+            .filter(|(range, state)| range.priority == priority && predicate(state))
+            .count()
+    }
+
     pub(super) fn highest_end(&self, priority: RangePriority) -> Option<block::Height> {
         self.forward
             .iter()
+            .chain(self.authenticate_roots.iter())
             .chain(self.active.keys())
             .filter(|range| range.priority == priority)
             .map(|range| range.end_height())
             .max()
+    }
+
+    #[cfg(test)]
+    pub(super) fn range_count(&self, priority: RangePriority) -> usize {
+        self.forward
+            .iter()
+            .chain(self.authenticate_roots.iter())
+            .chain(self.active.keys())
+            .filter(|range| range.priority == priority)
+            .count()
     }
 
     pub(super) fn next_retry_deadline(&mut self) -> Option<Instant> {
@@ -381,15 +572,32 @@ impl HeaderWorkQueue {
             ranges.retain(|_, until| *until > now);
             !ranges.is_empty()
         });
+        let due_delayed_retry = self
+            .delayed_retries
+            .values_mut()
+            .fold(false, |any_due, retry| {
+                let is_due = retry.until.is_some_and(|until| until <= now);
+                if is_due {
+                    retry.until = None;
+                }
+                any_due || is_due
+            });
         self.retry_avoidance
             .values()
             .flat_map(HashMap::values)
             .copied()
+            .chain(
+                self.delayed_retries
+                    .values()
+                    .filter_map(|retry| retry.until)
+                    .filter(|until| *until > now),
+            )
+            .chain(due_delayed_retry.then_some(now))
             .min()
     }
 
     pub(super) fn has_pending(&self) -> bool {
-        !self.forward.is_empty()
+        !self.forward.is_empty() || !self.authenticate_roots.is_empty()
     }
 
     pub(super) fn peer_retry_avoided(
@@ -400,12 +608,15 @@ impl HeaderWorkQueue {
         let Some(avoided) = self.retry_avoidance.get(peer) else {
             return false;
         };
-        self.forward.iter().any(|range| {
-            range.end_height() <= advertised_tip
-                && avoided
-                    .get(&(range.start_height(), range.priority))
-                    .is_some_and(|until| *until > Instant::now())
-        })
+        self.forward
+            .iter()
+            .chain(self.authenticate_roots.iter())
+            .any(|range| {
+                range.end_height() <= advertised_tip
+                    && avoided
+                        .get(&(range.start_height(), range.priority))
+                        .is_some_and(|until| *until > Instant::now())
+            })
     }
 
     #[cfg(test)]
@@ -427,6 +638,7 @@ impl HeaderWorkQueue {
     pub(super) fn oldest_missing_height(&self) -> Option<block::Height> {
         self.forward
             .iter()
+            .chain(self.authenticate_roots.iter())
             .chain(self.active.keys())
             .map(|range| range.start_height())
             .min()
@@ -437,6 +649,7 @@ impl HeaderWorkQueue {
         self.pending_starts.extend(
             self.forward
                 .iter()
+                .chain(self.authenticate_roots.iter())
                 .map(|range| (range.priority, range.start_height())),
         );
         self.active_starts.clear();
@@ -544,7 +757,7 @@ mod tests {
         assert_eq!(queue.pending_len(), 1);
 
         let claimed = queue
-            .next_for_peer(&peer, &state)
+            .next_for_peer(&peer, &state, true)
             .expect("peer can claim the pending range");
         queue.mark_assigned(peer.clone(), claimed);
         queue.ensure_forward(RangeRequest {
@@ -561,7 +774,47 @@ mod tests {
         queue.retry(range);
         queue.retry(range);
         assert_eq!(queue.pending_len(), 1);
-        assert_eq!(queue.next_for_peer(&peer, &state), Some(range));
+        assert_eq!(queue.next_for_peer(&peer, &state, true), Some(range));
+    }
+
+    #[test]
+    fn short_root_auth_response_discards_incompatible_future_geometry() {
+        let mut queue = HeaderWorkQueue::new();
+        let current = range(1, 4, RangePriority::AuthenticateRoots);
+        let future = range(4, 4, RangePriority::AuthenticateRoots);
+        let later = range(7, 4, RangePriority::AuthenticateRoots);
+        let (peer, _) = peer_state(12, 20);
+        queue.ensure(current, RangePriority::AuthenticateRoots);
+        queue.ensure(future, RangePriority::AuthenticateRoots);
+        queue.mark_assigned(peer, later);
+
+        queue.discard_root_auth_after(current.start_height());
+
+        assert_eq!(
+            queue.authenticate_roots.iter().copied().collect::<Vec<_>>(),
+            vec![current]
+        );
+        assert!(queue.state(future).is_none());
+        assert!(queue.state(later).is_none());
+        assert_eq!(queue.range_count(RangePriority::AuthenticateRoots), 1);
+    }
+
+    #[test]
+    fn advancing_root_frontier_prunes_only_consumed_ranges() {
+        let mut queue = HeaderWorkQueue::new();
+        let consumed = range(1, 3, RangePriority::AuthenticateRoots);
+        let next = range(3, 3, RangePriority::AuthenticateRoots);
+        let future = range(5, 3, RangePriority::AuthenticateRoots);
+        queue.ensure(consumed, RangePriority::AuthenticateRoots);
+        queue.ensure(next, RangePriority::AuthenticateRoots);
+        queue.ensure(future, RangePriority::AuthenticateRoots);
+
+        queue.prune_root_auth_before(block::Height(3));
+
+        assert_eq!(
+            queue.authenticate_roots.iter().copied().collect::<Vec<_>>(),
+            vec![next, future]
+        );
     }
 
     #[test]
@@ -630,7 +883,7 @@ mod tests {
         queue.ensure_forward(range);
 
         let claimed = queue
-            .next_for_peer(&peer, &state)
+            .next_for_peer(&peer, &state, true)
             .expect("maximum-height work is assignable without overflow");
         queue.mark_assigned(peer.clone(), claimed);
         assert_eq!(claimed.end_height(), block::Height(u32::MAX));
@@ -666,14 +919,78 @@ mod tests {
 
         queue.ensure_forward(range);
         let claimed = queue
-            .next_for_peer(&failed_peer, &failed_state)
+            .next_for_peer(&failed_peer, &failed_state, true)
             .expect("failed peer initially claims the range");
         queue.mark_assigned(failed_peer.clone(), claimed);
         queue.retry_avoiding(failed_peer.clone(), range);
 
         assert!(queue.peer_retry_avoided(&failed_peer, failed_state.advertised_tip));
-        assert_eq!(queue.next_for_peer(&failed_peer, &failed_state), None);
-        assert_eq!(queue.next_for_peer(&other_peer, &other_state), Some(range));
+        assert_eq!(queue.next_for_peer(&failed_peer, &failed_state, true), None);
+        assert_eq!(
+            queue.next_for_peer(&other_peer, &other_state, true),
+            Some(range)
+        );
+    }
+
+    #[test]
+    fn root_auth_ineligible_peer_can_take_forward_work() {
+        let mut queue = HeaderWorkQueue::new();
+        let auth = range(1, 2, RangePriority::AuthenticateRoots);
+        let forward = range(3, 1, RangePriority::Forward);
+        let (peer, mut state) = peer_state(8, 10);
+        state.max_headers_per_response = 1;
+        queue.ensure(auth, RangePriority::AuthenticateRoots);
+        queue.ensure_forward(forward);
+
+        let effective = clamp_header_sync_request_count(
+            2,
+            state.max_headers_per_response,
+            &Network::Mainnet,
+            LOCAL_MAX_MESSAGE_BYTES,
+            true,
+        );
+        assert_eq!(effective, 1);
+        assert_eq!(
+            queue.next_for_peer(&peer, &state, effective >= 2),
+            Some(forward)
+        );
+        assert_eq!(queue.authenticate_roots.front(), Some(&auth));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_root_retry_does_not_block_forward_work() {
+        let mut queue = HeaderWorkQueue::new();
+        let auth = range(1, 2, RangePriority::AuthenticateRoots);
+        let forward = range(3, 1, RangePriority::Forward);
+        let (peer, state) = peer_state(9, 10);
+        queue.ensure_forward(forward);
+        queue.retry_delayed(auth);
+
+        assert_eq!(
+            queue.next_for_peer(&peer, &state, true),
+            Some(forward),
+            "forward work remains eligible while root auth backs off"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(queue.next_for_peer(&peer, &state, true), Some(auth));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn due_delayed_retry_produces_one_immediate_maintenance_deadline() {
+        let mut queue = HeaderWorkQueue::new();
+        queue.retry_delayed(range(1, 2, RangePriority::AuthenticateRoots));
+        let future_deadline = queue
+            .next_retry_deadline()
+            .expect("delayed retry arms maintenance");
+        assert!(future_deadline > Instant::now());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(queue.next_retry_deadline(), Some(Instant::now()));
+        assert_eq!(
+            queue.next_retry_deadline(),
+            None,
+            "due retry is made eligible without a past deadline busy loop"
+        );
     }
 
     #[test]

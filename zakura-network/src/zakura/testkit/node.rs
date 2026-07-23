@@ -15,11 +15,11 @@ use crate::{
     zakura::{
         discovery::build_discovery_handle, service_registry, spawn_block_sync_reactor,
         spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
-        BlockSyncStartup, DiscoveryService, HeaderSyncAction, HeaderSyncFrontiers,
-        HeaderSyncHandle, HeaderSyncStartup, Service, ZakuraBlockSyncConfig, ZakuraDiscoveryHandle,
-        ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
-        ZakuraPeerId, ZakuraProtocolHandler, ZakuraServiceId, ZakuraSupervisorHandle, ZakuraTrace,
-        P2P_V2_ALPN,
+        BlockSyncStartup, DiscoveryService, HeaderRootAuthState, HeaderSyncAction,
+        HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncStartup, Service, ZakuraBlockSyncConfig,
+        ZakuraDiscoveryHandle, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig,
+        ZakuraLocalLimits, ZakuraPeerId, ZakuraProtocolHandler, ZakuraServiceId,
+        ZakuraSupervisorHandle, ZakuraTrace, P2P_V2_ALPN,
     },
     BoxError, Config,
 };
@@ -236,6 +236,7 @@ struct TestHeaderSyncStartup {
     frontiers: HeaderSyncFrontiers,
     best_header_tip: Option<(block::Height, block::Hash)>,
     verified_block_tip_hash: block::Hash,
+    header_root_auth: Option<HeaderRootAuthState>,
 }
 
 impl fmt::Debug for ZakuraTestNodeBuilder {
@@ -365,7 +366,16 @@ impl ZakuraTestNodeBuilder {
             frontiers,
             best_header_tip,
             verified_block_tip_hash: anchor.1,
+            header_root_auth: None,
         });
+        self
+    }
+
+    /// Supply compact durable header-root authentication progress to the test reactor.
+    pub fn header_root_auth_state(mut self, state: HeaderRootAuthState) -> Self {
+        if let Some(header_sync) = self.header_sync.as_mut() {
+            header_sync.header_root_auth = Some(state);
+        }
         self
     }
 
@@ -441,6 +451,7 @@ impl ZakuraTestNodeBuilder {
                 frontiers,
                 best_header_tip,
                 verified_block_tip_hash,
+                header_root_auth,
             } = header_sync;
             let mut startup = HeaderSyncStartup::new(
                 network,
@@ -454,6 +465,7 @@ impl ZakuraTestNodeBuilder {
                 startup.request_timeout = request_timeout;
             }
             startup.range_state_actions_enabled = true;
+            startup.header_root_auth = header_root_auth;
             startup.inbound_new_block_acceptance_enabled = true;
             startup.status_refresh_interval = Duration::from_millis(200);
             let shutdown = CancellationToken::new();
@@ -672,16 +684,26 @@ mod tests {
         // the per-IP cap of 1 must turn away a second distinct identity from
         // 127.0.0.1. Before the fix, peer1 was charged to the decoy IP, leaving
         // the loopback bucket empty and wrongly admitting peer2.
-        let excess = node
-            .connect_native_to_addr(
-                ipv4_loopback_addr(&peer2.node_addr().await),
-                TEST_NET_TIMEOUT,
-            )
-            .await;
+        let peer2_addr = ipv4_loopback_addr(&peer2.node_addr().await);
+        let excess = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::zakura::handler::serve_native_dial_connection(
+                &node.endpoint(),
+                peer2_addr,
+                node.limits(),
+            ),
+        )
+        .await
+        .expect("the rejected one-shot dial must finish promptly");
         assert!(
-            excess.is_err(),
+            excess.is_ok(),
             "second same-loopback identity must be rejected by the per-IP cap, proving the \
              first dial was charged to the confirmed path and not the advertised decoy",
+        );
+        assert_eq!(
+            node.supervisor().registered_ids().await.len(),
+            1,
+            "the rejected peer must not be registered",
         );
 
         node.shutdown().await;

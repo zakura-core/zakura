@@ -99,8 +99,8 @@ use zakura_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 use zakura_state::StorageMode;
 
 use zakura::{
-    drive_block_sync_actions, drive_vct_root_repairs, drive_zakura_header_sync_actions,
-    mirror_zakura_full_block_commits, query_block_sync_frontiers,
+    drive_block_sync_actions, drive_header_root_auth_updates, drive_vct_root_repairs,
+    drive_zakura_header_sync_actions, mirror_zakura_full_block_commits, query_block_sync_frontiers,
     zakura_header_sync_driver_startup, BlocksyncThroughputProbe, BlocksyncThroughputSummary,
     ZakuraHeaderSyncDriverHandles,
 };
@@ -520,6 +520,16 @@ impl StartCmd {
                     .in_current_span(),
                 );
                 endpoint.push_header_sync_task(vct_repair_task).await;
+
+                let root_auth_task = tokio::spawn(
+                    drive_header_root_auth_updates(
+                        read_only_state_service.clone(),
+                        header_sync.clone(),
+                        shutdown.clone().cancelled_owned(),
+                    )
+                    .in_current_span(),
+                );
+                endpoint.push_header_sync_task(root_auth_task).await;
 
                 if let (Some(block_sync), Some(block_actions)) = (
                     endpoint.block_sync(),
@@ -1564,17 +1574,17 @@ mod zakura_header_sync_driver_tests {
 
     use super::zakura::{
         abandoned_block_apply_finished_event, apply_block_sync_body, block_apply_class,
-        block_roots_cover_range, block_sync_chain_tip_event, block_sync_missing_body_window,
+        block_sync_chain_tip_event, block_sync_missing_body_window,
         block_sync_needed_blocks_from_state, block_verify_error_is_duplicate,
         body_sizes_for_served_header_range, chain_tip_mirror_frontier_change,
         coalesce_ready_needed_block_queries, coalesce_stale_needed_block_queries,
         commit_block_sync_body, drive_block_sync_actions, drive_zakura_header_sync_actions,
         header_range_commit_error_label, header_range_commit_failure_kind,
         notify_block_sync_header_tip, query_block_sync_frontiers, query_block_sync_needed_blocks,
-        root_covered_query_best_header_tip, tree_aux_roots_for_served_header_range,
-        verified_block_tip_from_state, BlockApplyClass, BlocksyncThroughputProbe,
-        ZakuraHeaderSyncDriverHandles, ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL,
-        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+        tree_aux_roots_for_served_header_range, verified_block_tip_from_state, BlockApplyClass,
+        BlocksyncThroughputProbe, ZakuraHeaderSyncDriverHandles,
+        ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL, ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+        ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
     };
 
     fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
@@ -1914,54 +1924,6 @@ mod zakura_header_sync_driver_tests {
                 .expect("complete roots match the served header range"),
             complete_roots.to_vec(),
             "complete root coverage is attached to the served header range"
-        );
-    }
-
-    #[test]
-    fn startup_root_backfill_gate_requires_complete_root_coverage() {
-        let start = block::Height(10);
-        let complete_roots = [
-            root_at(block::Height(10)),
-            root_at(block::Height(11)),
-            root_at(block::Height(12)),
-        ];
-        assert!(block_roots_cover_range(start, 3, &complete_roots));
-        assert!(!block_roots_cover_range(start, 3, &complete_roots[..2]));
-
-        let roots_with_gap = [
-            root_at(block::Height(10)),
-            root_at(block::Height(12)),
-            root_at(block::Height(13)),
-        ];
-        assert!(!block_roots_cover_range(start, 3, &roots_with_gap));
-    }
-
-    #[tokio::test]
-    async fn query_best_header_tip_is_capped_when_roots_are_missing() {
-        let verified_tip = (block::Height(0), block::Hash([0; 32]));
-        let durable_header_tip = (block::Height(2), block::Hash([2; 32]));
-        let read_state = service_fn(move |request: zakura_state::ReadRequest| async move {
-            match request {
-                zakura_state::ReadRequest::Tip => Ok::<_, zakura_state::BoxError>(
-                    zakura_state::ReadResponse::Tip(Some(verified_tip)),
-                ),
-                zakura_state::ReadRequest::BlockRoots {
-                    start_height,
-                    count,
-                } => {
-                    assert_eq!(start_height, block::Height(1));
-                    assert_eq!(count, 2);
-                    Ok(zakura_state::ReadResponse::BlockRoots(Vec::new()))
-                }
-                request => panic!("unexpected read request: {request:?}"),
-            }
-        });
-
-        assert_eq!(
-            root_covered_query_best_header_tip(read_state, durable_header_tip)
-                .await
-                .expect("capped query succeeds"),
-            verified_tip
         );
     }
 
@@ -2306,6 +2268,7 @@ mod zakura_header_sync_driver_tests {
             ..zakura_network::Config::for_test(P2pStack::Dual)
         };
         config.zakura.listen_addr = None;
+        let durable_header_tip = (block::Height(5), block::Hash([4; 32]));
         let endpoint = zakura_network::zakura::spawn_zakura_endpoint_with_header_sync_driver(
             &config,
             |_supervisor, _trace| Arc::new(NoopZakuraService) as Arc<dyn ZakuraService>,
@@ -2315,8 +2278,14 @@ mod zakura_header_sync_driver_tests {
                     verified_block_tip: block::Height(0),
                     verified_block_hash: genesis_hash,
                 },
-                best_header_tip: Some((block::Height(0), genesis_hash)),
+                best_header_tip: Some(durable_header_tip),
                 verified_block_tip_hash: genesis_hash,
+                header_root_auth: Some(zakura_network::zakura::HeaderRootAuthState {
+                    authenticated_height: block::Height(0),
+                    authenticated_hash: genesis_hash,
+                    completed_checkpoint_height: durable_header_tip.0,
+                    completed_checkpoint_hash: durable_header_tip.1,
+                }),
             }),
         )
         .await
@@ -2328,6 +2297,13 @@ mod zakura_header_sync_driver_tests {
             .expect("driver startup initializes exchange");
         assert_eq!(initial.frontier.verified_body.height, block::Height(0));
         assert_eq!(initial.frontier.best_header.height, block::Height(0));
+        assert_eq!(
+            endpoint
+                .header_sync()
+                .expect("driver startup starts header sync")
+                .best_header_tip(),
+            durable_header_tip,
+        );
 
         let (action_tx, action_rx) = mpsc::channel(4);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -2425,6 +2401,7 @@ mod zakura_header_sync_driver_tests {
                 },
                 best_header_tip: Some((block::Height(0), genesis_hash)),
                 verified_block_tip_hash: genesis_hash,
+                header_root_auth: None,
             }),
         )
         .await

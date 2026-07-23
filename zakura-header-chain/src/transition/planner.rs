@@ -677,6 +677,30 @@ fn apply_event<S: StoreRead>(
                 BodyValidationState::Unavailable(event.availability),
             )?;
         }
+        TransitionEvent::OperatorBodyRetry(event) => {
+            if event.hash != graph.select_header_best()?.0.hash
+                || event.availability.attempts != 0
+                || event.availability.suppliers == 0
+                || event.availability.alarmed
+                || event.availability.started_at != event.availability.next_probe_at
+            {
+                return Err(TransitionFailure::InvalidEvidence(
+                    "operator body retry has an invalid fresh episode",
+                ));
+            }
+            if !matches!(
+                graph.node(event.hash).map(|node| &node.body),
+                Some(BodyValidationState::Unavailable(summary)) if summary.alarmed
+            ) {
+                return Err(TransitionFailure::InvalidEvidence(
+                    "operator body retry requires the selected persistent alarm",
+                ));
+            }
+            graph.set_body_state(
+                event.hash,
+                BodyValidationState::Unavailable(event.availability),
+            )?;
+        }
         TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(event)) => {
             graph.set_consensus_body_invalid(event.hash, event.evidence, event.rule.clone())?;
         }
@@ -2485,6 +2509,17 @@ mod tests {
             BodyValidationState::Unavailable(fresh)
         );
         assert_eq!(
+            plan.projected
+                .node(selected.hash)
+                .expect("the selected node remains retained")
+                .eligibility,
+            store
+                .graph
+                .node(selected.hash)
+                .expect("the selected fixture node exists")
+                .eligibility
+        );
+        assert_eq!(
             plan.change_set.metadata.alarms.header_best_body_unavailable,
             None
         );
@@ -2572,6 +2607,160 @@ mod tests {
             }),
             Err(TransitionFailure::InvalidEvidence(
                 "body supplier discovery does not add an eligible supplier"
+            ))
+        ));
+    }
+
+    #[test]
+    fn operator_body_retry_restarts_the_selected_alarm_with_the_same_suppliers() {
+        let (mut store, config) = TestStore::new(EngineMode::Integrated);
+        let now = Utc::now();
+        let clock = ManualClock(now);
+        let selected = store.metadata.frontiers.header_best;
+        let old = crate::BodyUnavailableSummary {
+            started_at: now - chrono::Duration::minutes(12),
+            attempts: 10,
+            suppliers: 2,
+            supplier_set_digest: [0x31; 32],
+            alarmed: true,
+            next_probe_at: now + chrono::Duration::minutes(8),
+        };
+        store
+            .graph
+            .set_body_state(selected.hash, BodyValidationState::Unavailable(old))
+            .expect("the selected fixture body exists");
+        store.metadata.alarms.header_best_body_unavailable = Some(old);
+        let fresh = crate::BodyUnavailableSummary {
+            started_at: now,
+            attempts: 0,
+            suppliers: old.suppliers,
+            supplier_set_digest: old.supplier_set_digest,
+            alarmed: false,
+            next_probe_at: now,
+        };
+        let request = TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::OperatorBodyRetry(crate::OperatorBodyRetry {
+                hash: selected.hash,
+                evidence: EvidenceId::from_digest([0xc3; 32]),
+                availability: fresh,
+            }),
+        };
+
+        let plan = apply_transition(&store, request.clone(), &context(&config, &clock, None))
+            .expect("an authenticated operator can restart the same supplier set");
+        assert_eq!(plan.change_set.metadata.frontiers, store.metadata.frontiers);
+        assert_eq!(
+            plan.change_set.metadata.header_generation,
+            store.metadata.header_generation
+        );
+        assert_eq!(
+            plan.change_set.metadata.verified_generation,
+            store.metadata.verified_generation
+        );
+        assert_eq!(
+            plan.projected
+                .node(selected.hash)
+                .expect("the selected node remains retained")
+                .body,
+            BodyValidationState::Unavailable(fresh)
+        );
+        assert_eq!(
+            plan.change_set.metadata.alarms.header_best_body_unavailable,
+            None
+        );
+        store.commit(&plan);
+        let replay = apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: store.metadata.state_version,
+                ..request
+            },
+            &context(&config, &clock, None),
+        )
+        .expect("the exact operator evidence replays idempotently");
+        assert!(replay.is_no_change());
+    }
+
+    #[test]
+    fn operator_body_retry_rejects_stale_or_malformed_requests() {
+        let (mut store, config) = TestStore::new(EngineMode::Integrated);
+        let now = Utc::now();
+        let clock = ManualClock(now);
+        let selected = store.metadata.frontiers.header_best;
+        let old = crate::BodyUnavailableSummary {
+            attempts: 10,
+            suppliers: 2,
+            supplier_set_digest: [0x41; 32],
+            alarmed: true,
+            ..Default::default()
+        };
+        store
+            .graph
+            .set_body_state(selected.hash, BodyValidationState::Unavailable(old))
+            .expect("the selected fixture body exists");
+        store.metadata.alarms.header_best_body_unavailable = Some(old);
+        let fresh = crate::BodyUnavailableSummary {
+            started_at: now,
+            attempts: 0,
+            suppliers: 2,
+            supplier_set_digest: old.supplier_set_digest,
+            alarmed: false,
+            next_probe_at: now,
+        };
+        let apply = |hash, availability| {
+            apply_transition(
+                &store,
+                TransitionRequest {
+                    expected_version: store.metadata.state_version,
+                    event: TransitionEvent::OperatorBodyRetry(crate::OperatorBodyRetry {
+                        hash,
+                        evidence: EvidenceId::from_digest([0xc4; 32]),
+                        availability,
+                    }),
+                },
+                &context(&config, &clock, None),
+            )
+        };
+
+        assert!(matches!(
+            apply(block::Hash([0x42; 32]), fresh),
+            Err(TransitionFailure::InvalidEvidence(
+                "operator body retry has an invalid fresh episode"
+            ))
+        ));
+        assert!(matches!(
+            apply(
+                selected.hash,
+                crate::BodyUnavailableSummary {
+                    attempts: 1,
+                    ..fresh
+                }
+            ),
+            Err(TransitionFailure::InvalidEvidence(
+                "operator body retry has an invalid fresh episode"
+            ))
+        ));
+        store
+            .graph
+            .set_body_state(selected.hash, BodyValidationState::Unknown)
+            .expect("the selected fixture body exists");
+        let non_alarmed = apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: store.metadata.state_version,
+                event: TransitionEvent::OperatorBodyRetry(crate::OperatorBodyRetry {
+                    hash: selected.hash,
+                    evidence: EvidenceId::from_digest([0xc4; 32]),
+                    availability: fresh,
+                }),
+            },
+            &context(&config, &clock, None),
+        );
+        assert!(matches!(
+            non_alarmed,
+            Err(TransitionFailure::InvalidEvidence(
+                "operator body retry requires the selected persistent alarm"
             ))
         ));
     }

@@ -372,6 +372,20 @@ impl HeaderChainWriter {
         )
     }
 
+    fn retry_body_availability(
+        &self,
+        expected_version: StateVersion,
+        retry: zakura_header_chain::OperatorBodyRetry,
+    ) -> Result<ApplyResult, HeaderChainStoreError> {
+        self.runtime.apply(
+            TransitionRequest {
+                expected_version,
+                event: TransitionEvent::OperatorBodyRetry(retry),
+            },
+            &self.context(),
+        )
+    }
+
     fn reject_vct_aux(
         &self,
         window: &VctAuxWindow,
@@ -919,6 +933,12 @@ pub enum NonFinalizedWriteMessage {
     RestartHeaderChainBodyAvailability {
         expected_version: StateVersion,
         discovery: zakura_header_chain::BodySupplierDiscovered,
+        rsp_tx: oneshot::Sender<Result<ApplyResult, HeaderChainStoreError>>,
+    },
+    /// An authenticated operator request restarts one persistent alarm.
+    RetryHeaderChainBodyAvailability {
+        expected_version: StateVersion,
+        retry: zakura_header_chain::OperatorBodyRetry,
         rsp_tx: oneshot::Sender<Result<ApplyResult, HeaderChainStoreError>>,
     },
     /// A newly downloaded and semantically verified block prepared for
@@ -1483,6 +1503,18 @@ impl WriteBlockWorkerTask {
                         .and_then(|writer| {
                             writer.restart_body_availability(expected_version, discovery)
                         });
+                    let _ = rsp_tx.send(result);
+                    None
+                }
+                NonFinalizedWriteMessage::RetryHeaderChainBodyAvailability {
+                    expected_version,
+                    retry,
+                    rsp_tx,
+                } => {
+                    let result = header_chain
+                        .as_ref()
+                        .ok_or(HeaderChainStoreError::Uninitialized)
+                        .and_then(|writer| writer.retry_body_availability(expected_version, retry));
                     let _ = rsp_tx.send(result);
                     None
                 }

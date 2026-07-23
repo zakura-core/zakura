@@ -357,6 +357,40 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     Err(_) => warn!("timed out restarting header-chain body availability"),
                 }
             }
+            BlockSyncAction::RetryBodyAvailability {
+                expected_version,
+                retry,
+            } => {
+                let Some(writer) = header_chain_write.as_ref() else {
+                    debug!(
+                        ?retry,
+                        "header-chain operator body retry is not wired in this harness"
+                    );
+                    continue;
+                };
+                match tokio::time::timeout(
+                    ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+                    writer.clone().oneshot(
+                        zakura_state::Request::RetryHeaderChainBodyAvailability {
+                            expected_version,
+                            retry,
+                        },
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(zakura_state::Response::HeaderChainBodyAvailabilityRetried(_))) => {}
+                    Ok(Ok(response)) => warn!(
+                        ?response,
+                        "unexpected header-chain operator body retry response"
+                    ),
+                    Ok(Err(error)) => debug!(
+                        ?error,
+                        "header-chain operator body retry was stale or unavailable"
+                    ),
+                    Err(_) => warn!("timed out retrying header-chain body availability"),
+                }
+            }
             BlockSyncAction::Misbehavior { peer, reason } => {
                 // Record-only: peer scoring no longer drives disconnects.
                 debug!(?peer, ?reason, "recorded Zakura block-sync peer violation");
@@ -1913,6 +1947,9 @@ fn trace_block_driver_action(trace: &ZakuraTrace, action: &BlockSyncAction) {
             }
             BlockSyncAction::RestartBodyAvailability { .. } => {
                 insert_cs_str(row, cs_trace::ACTION, "restart_body_availability");
+            }
+            BlockSyncAction::RetryBodyAvailability { .. } => {
+                insert_cs_str(row, cs_trace::ACTION, "retry_body_availability");
             }
         },
     );

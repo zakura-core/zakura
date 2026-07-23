@@ -192,6 +192,14 @@ impl BlockSyncHandle {
             .map_err(|error| mpsc::error::SendError(error.0))
     }
 
+    /// Request a fresh body-availability episode for one exact persistent alarm.
+    pub fn retry_body_availability(
+        &self,
+        hash: block::Hash,
+    ) -> Result<(), mpsc::error::SendError<BlockSyncEvent>> {
+        self.send_control(BlockSyncEvent::RetryBodyAvailability { hash })
+    }
+
     /// Send a peer lifecycle event without sharing the bounded wire-event queue.
     pub fn send_lifecycle(
         &self,

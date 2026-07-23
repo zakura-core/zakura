@@ -452,6 +452,17 @@ pub struct BodySupplierDiscovered {
     pub availability: BodyUnavailableSummary,
 }
 
+/// Authenticated operator request to restart one persistent body retry episode.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct OperatorBodyRetry {
+    /// Exact selected header whose retry episode restarts.
+    pub hash: block::Hash,
+    /// Stable identity of the authenticated operator request.
+    pub evidence: EvidenceId,
+    /// Fresh zero-attempt episode summary.
+    pub availability: BodyUnavailableSummary,
+}
+
 /// Full-state acceptance of one exact body/header pair.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedBodyEvidence {
@@ -631,6 +642,8 @@ pub enum TransitionEvent {
     BodyEvidence(BodyEvidence),
     /// A newly eligible supplier restarted body acquisition.
     BodySupplierDiscovered(BodySupplierDiscovered),
+    /// An authenticated operator restarted body acquisition.
+    OperatorBodyRetry(OperatorBodyRetry),
     /// Reversible operator invalidation.
     OperatorInvalidate(OperatorInvalidate),
     /// Reason-scoped operator reconsideration.
@@ -677,6 +690,7 @@ impl TransitionEvent {
             | Self::AuxEvidence(_) => EventAdmission::IntegratedFullState,
             Self::Recover(_) => EventAdmission::StartupOnly,
             Self::InsertHeaders(_)
+            | Self::OperatorBodyRetry(_)
             | Self::OperatorInvalidate(_)
             | Self::OperatorReconsider(_)
             | Self::AdvanceLocalCheckpoint(_)
@@ -701,6 +715,7 @@ impl TransitionEvent {
             Self::BodyEvidence(BodyEvidence::Transient(event)) => Some(event.evidence),
             Self::BodyEvidence(BodyEvidence::Verified(event)) => Some(event.evidence),
             Self::BodySupplierDiscovered(event) => Some(event.evidence),
+            Self::OperatorBodyRetry(event) => Some(event.evidence),
             Self::OperatorInvalidate(event) => Some(event.evidence),
             Self::OperatorReconsider(event) => Some(event.evidence),
             Self::FullStateFinalized(event) => Some(event.full_state_transition_id),
@@ -1029,6 +1044,7 @@ mod tests {
             "VerifiedChainChanged(VerifiedChainChanged)",
             "BodyEvidence(BodyEvidence)",
             "BodySupplierDiscovered(BodySupplierDiscovered)",
+            "OperatorBodyRetry(OperatorBodyRetry)",
             "OperatorInvalidate(OperatorInvalidate)",
             "OperatorReconsider(OperatorReconsider)",
             "FullStateFinalized(FullStateFinalized)",

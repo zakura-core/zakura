@@ -192,6 +192,44 @@ fn test_frontier(height: u32) -> Frontier {
     Frontier::new(block::Height(height), block::Hash([hash_byte; 32]))
 }
 
+fn alarmed_committed_snapshot(
+    header: zakura_header_chain::Frontier,
+) -> zakura_header_chain::EngineSnapshot {
+    let now = chrono::Utc::now();
+    let verified = zakura_header_chain::Frontier::new(
+        block::Height(header.height.0.saturating_sub(1)),
+        block::Hash([0x50; 32]),
+    );
+    let alarm = zakura_header_chain::BodyUnavailableSummary {
+        started_at: now - chrono::Duration::minutes(12),
+        attempts: 10,
+        suppliers: 1,
+        supplier_set_digest: [0x51; 32],
+        alarmed: true,
+        next_probe_at: now + chrono::Duration::minutes(10),
+    };
+    zakura_header_chain::EngineSnapshot {
+        mode: zakura_header_chain::EngineMode::Integrated,
+        state_version: zakura_header_chain::StateVersion::new(7),
+        header_generation: zakura_header_chain::HeaderGeneration::new(8),
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(9),
+        frontiers: zakura_header_chain::FrontierSet {
+            finalized: verified,
+            header_best: header,
+            verified_best: verified,
+        },
+        header_best_score: zakura_header_chain::ChainScore::new(
+            zakura_header_chain::SuffixWork::zero(),
+            header.hash,
+        ),
+        oldest_retained_height: verified.height,
+        alarms: zakura_header_chain::AlarmSet {
+            header_best_body_unavailable: Some(alarm),
+            ..Default::default()
+        },
+    }
+}
+
 fn test_frontier_update(
     finalized: u32,
     verified_body: u32,
@@ -247,6 +285,125 @@ async fn next_action(actions: &mut mpsc::Receiver<BlockSyncAction>) -> BlockSync
         .await
         .expect("block-sync action should arrive")
         .expect("block-sync action channel should stay open")
+}
+
+#[tokio::test]
+async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
+    let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x52; 32]));
+    let snapshot = alarmed_committed_snapshot(header);
+    let scope = zakura_header_chain::WorkScope::for_body_work(&snapshot);
+    let (snapshot_tx, snapshot_rx) = watch::channel(Some(snapshot));
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
+    startup.frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(9),
+        verified_block_tip: block::Height(9),
+        verified_block_hash: block::Hash([0x50; 32]),
+    };
+    startup.best_header_tip = (header.height, header.hash);
+    startup.committed_snapshots = Some(snapshot_rx);
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+
+    handle
+        .retry_body_availability(block::Hash([0x53; 32]))
+        .expect("the stale operator command queues");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), actions.recv())
+            .await
+            .is_err(),
+        "a stale hash must not dispatch a retry"
+    );
+    handle
+        .retry_body_availability(header.hash)
+        .expect("the no-supplier operator command queues");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), actions.recv())
+            .await
+            .is_err(),
+        "an episode with no eligible supplier must not be restarted"
+    );
+
+    let wiring = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the spawned reactor exposes its shared test wiring");
+    let supplier = peer(0x54);
+    let generation =
+        wiring
+            .registry
+            .admit(&supplier, ServicePeerDirection::Outbound, &wiring.config);
+    wiring.registry.upsert_status(
+        &supplier,
+        generation,
+        BlockSyncStatus {
+            servable_low: header.height,
+            servable_high: header.height,
+            ..BlockSyncStatus::default()
+        },
+    );
+    handle
+        .retry_body_availability(header.hash)
+        .expect("the operator retry queues");
+    handle
+        .retry_body_availability(header.hash)
+        .expect("the duplicate operator retry queues");
+
+    let BlockSyncAction::RetryBodyAvailability {
+        expected_version,
+        retry,
+    } = next_action(&mut actions).await
+    else {
+        panic!("the exact operator command must dispatch a retry action");
+    };
+    assert_eq!(expected_version, zakura_header_chain::StateVersion::new(7));
+    assert_eq!(retry.hash, header.hash);
+    assert_eq!(retry.availability.attempts, 0);
+    assert_eq!(retry.availability.suppliers, 1);
+    assert!(!retry.availability.alarmed);
+    assert_eq!(
+        retry.availability.started_at,
+        retry.availability.next_probe_at
+    );
+    assert!(
+        wiring
+            .registry
+            .is_body_retry_avoided(&supplier, scope, header.hash, Instant::now()),
+        "dispatch must not reopen live admission before the durable alarm-clear snapshot"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), actions.recv())
+            .await
+            .is_err(),
+        "duplicate commands against one durable snapshot must be coalesced"
+    );
+
+    let mut cleared = alarmed_committed_snapshot(header);
+    cleared.state_version = zakura_header_chain::StateVersion::new(8);
+    cleared.alarms.header_best_body_unavailable = None;
+    snapshot_tx
+        .send(Some(cleared))
+        .expect("the durable alarm-clear snapshot publishes");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while wiring
+            .registry
+            .is_body_retry_avoided(&supplier, scope, header.hash, Instant::now())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the committed alarm-clear edge reopens live admission");
+    handle
+        .retry_body_availability(header.hash)
+        .expect("the already-cleared operator command queues");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), actions.recv())
+            .await
+            .is_err(),
+        "an already-cleared alarm must not start another episode"
+    );
+
+    drop(snapshot_tx);
+    reactor_task.abort();
 }
 
 async fn wait_for_query_needed_blocks(
@@ -8966,7 +9123,8 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             BlockSyncAction::QueryBlocksByHeightRange { .. } => {}
             BlockSyncAction::RecordBodyUnavailable { .. }
-            | BlockSyncAction::RestartBodyAvailability { .. } => {}
+            | BlockSyncAction::RestartBodyAvailability { .. }
+            | BlockSyncAction::RetryBodyAvailability { .. } => {}
         }
     }
 
@@ -9078,7 +9236,8 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
             BlockSyncAction::QueryNeededBlocks { .. }
             | BlockSyncAction::QueryBlocksByHeightRange { .. }
             | BlockSyncAction::RecordBodyUnavailable { .. }
-            | BlockSyncAction::RestartBodyAvailability { .. } => {}
+            | BlockSyncAction::RestartBodyAvailability { .. }
+            | BlockSyncAction::RetryBodyAvailability { .. } => {}
         }
     }
 

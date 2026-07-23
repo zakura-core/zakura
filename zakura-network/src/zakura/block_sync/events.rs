@@ -25,6 +25,11 @@ pub enum BlockSyncEvent {
     PeerConnected(BlockSyncPeerSession),
     /// A peer disconnected; all of its outstanding work is dropped.
     PeerDisconnected(ZakuraPeerId),
+    /// An authenticated local operator requested a fresh retry of one persistent alarm.
+    RetryBodyAvailability {
+        /// Exact alarmed selected header; stale requests fail closed.
+        hash: block::Hash,
+    },
     /// Header sync advanced the committed header target.
     HeaderTipChanged {
         /// Current best header height.
@@ -280,6 +285,13 @@ pub enum BlockSyncAction {
         /// Authenticated supplier-set evidence and fresh summary.
         discovery: zakura_header_chain::BodySupplierDiscovered,
     },
+    /// Persist a fresh episode after an authenticated operator request.
+    RetryBodyAvailability {
+        /// Durable version whose selected alarm is being retried.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Authenticated operator evidence and fresh summary.
+        retry: zakura_header_chain::OperatorBodyRetry,
+    },
     /// Report peer misbehavior to the supervisor.
     Misbehavior {
         /// Misbehaving peer.
@@ -298,6 +310,7 @@ impl BlockSyncAction {
             Self::SubmitBlock { .. } => "submit_block",
             Self::RecordBodyUnavailable { .. } => "record_body_unavailable",
             Self::RestartBodyAvailability { .. } => "restart_body_availability",
+            Self::RetryBodyAvailability { .. } => "retry_body_availability",
             Self::Misbehavior { .. } => "misbehavior",
         }
     }

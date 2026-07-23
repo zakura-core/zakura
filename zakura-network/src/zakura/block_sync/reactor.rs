@@ -211,6 +211,7 @@ pub fn spawn_block_sync_reactor(
         request_floor: startup.frontiers.verified_block_tip,
         pending_needed_query: None,
         pending_body_supplier_restart: None,
+        pending_operator_body_retry: None,
         next_needed_query_id: NonZeroU64::new(1),
         last_reset_epoch: 0,
         last_reaction_epoch: 0,
@@ -296,6 +297,8 @@ pub(super) struct BlockSyncReactor {
     /// Supplier-set restart submitted against the current durable version.
     pending_body_supplier_restart:
         Option<(zakura_header_chain::StateVersion, block::Hash, [u8; 32])>,
+    /// Operator retry submitted against the current durable version.
+    pending_operator_body_retry: Option<(zakura_header_chain::StateVersion, block::Hash, [u8; 32])>,
     /// Next reactor-local identity assigned to a body-work state query. `None`
     /// means the identifier space is exhausted and scheduling fails closed.
     next_needed_query_id: Option<NonZeroU64>,
@@ -380,6 +383,7 @@ impl BlockSyncReactor {
                             .as_ref()
                             .and_then(|snapshots| snapshots.borrow().clone());
                         self.pending_body_supplier_restart = None;
+                        self.pending_operator_body_retry = None;
                         synchronize_persisted_body_alarm(
                             &self.registry,
                             self.committed_snapshot.as_ref(),
@@ -580,6 +584,7 @@ impl BlockSyncReactor {
         match event {
             BlockSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
             BlockSyncEvent::PeerDisconnected(peer) => self.handle_peer_disconnected(peer),
+            BlockSyncEvent::RetryBodyAvailability { hash } => self.retry_body_availability(hash),
             BlockSyncEvent::HeaderTipChanged { height, hash } => {
                 self.handle_header_tip_changed(height, hash).await
             }
@@ -1252,6 +1257,70 @@ impl BlockSyncReactor {
             return;
         }
         self.pending_body_supplier_restart =
+            Some((snapshot.state_version, header.hash, supplier_set_digest));
+    }
+
+    fn retry_body_availability(&mut self, hash: block::Hash) {
+        let Some(snapshot) = self.committed_snapshot.as_ref() else {
+            return;
+        };
+        let header = snapshot.frontiers.header_best;
+        if header.hash != hash
+            || !snapshot
+                .alarms
+                .header_best_body_unavailable
+                .is_some_and(|summary| summary.alarmed)
+        {
+            return;
+        }
+        let eligible_sources = self.registry.eligible_sources(header.height);
+        let suppliers = u32::try_from(eligible_sources.len()).unwrap_or(u32::MAX);
+        if suppliers == 0 {
+            return;
+        }
+        let supplier_set_digest =
+            zakura_header_chain::BodyUnavailableSummary::supplier_set_digest(&eligible_sources);
+        if self.pending_operator_body_retry
+            == Some((snapshot.state_version, header.hash, supplier_set_digest))
+        {
+            return;
+        }
+
+        let now = chrono::Utc::now();
+        let availability = zakura_header_chain::BodyUnavailableSummary {
+            started_at: now,
+            attempts: 0,
+            suppliers,
+            supplier_set_digest,
+            alarmed: false,
+            next_probe_at: now,
+        };
+        let mut hasher = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(b"ZkBodyOperator1_")
+            .to_state();
+        hasher.update(&snapshot.state_version.get().to_le_bytes());
+        hasher.update(&header.height.0.to_le_bytes());
+        hasher.update(&header.hash.0);
+        hasher.update(&supplier_set_digest);
+        let retry = zakura_header_chain::OperatorBodyRetry {
+            hash: header.hash,
+            evidence: zakura_header_chain::EvidenceId::from_digest(
+                hasher
+                    .finalize()
+                    .as_bytes()
+                    .try_into()
+                    .expect("the configured operator-retry digest is exactly 32 bytes"),
+            ),
+            availability,
+        };
+        if !self.dispatch_action(BlockSyncAction::RetryBodyAvailability {
+            expected_version: snapshot.state_version,
+            retry,
+        }) {
+            return;
+        }
+        self.pending_operator_body_retry =
             Some((snapshot.state_version, header.hash, supplier_set_digest));
     }
 
@@ -2684,6 +2753,10 @@ impl BlockSyncReactor {
                 bs_insert_str(row, bs_trace::KIND, "peer_disconnected");
                 bs_insert_peer(row, bs_trace::PEER, peer);
             }
+            BlockSyncEvent::RetryBodyAvailability { hash } => {
+                bs_insert_str(row, bs_trace::KIND, "retry_body_availability");
+                bs_insert_hash(row, bs_trace::HASH, *hash);
+            }
             BlockSyncEvent::HeaderTipChanged { height, hash } => {
                 bs_insert_str(row, bs_trace::KIND, "header_tip_changed");
                 bs_insert_height(row, bs_trace::HEIGHT, *height);
@@ -2793,6 +2866,9 @@ impl BlockSyncReactor {
             }
             BlockSyncAction::RestartBodyAvailability { .. } => {
                 bs_insert_str(row, bs_trace::KIND, "restart_body_availability");
+            }
+            BlockSyncAction::RetryBodyAvailability { .. } => {
+                bs_insert_str(row, bs_trace::KIND, "retry_body_availability");
             }
             BlockSyncAction::Misbehavior { peer, reason } => {
                 bs_insert_str(row, bs_trace::KIND, "misbehavior");

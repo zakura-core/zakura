@@ -171,7 +171,16 @@ checks and why.
 
 ## Publish
 
-After the release PR is merged and explicit confirmation is given:
+After the release PR is merged and explicit confirmation is given, run the
+T-0 orchestrator — it preflights competing release trains, dispatches,
+watches to the approval gate, and verifies the published release; it is
+resumable and re-runs skip completed steps:
+
+```bash
+./scripts/release-t0.sh publish --tag <tag> --mode main --head-sha <merged-commit>
+```
+
+Raw dispatch fallback:
 
 ```bash
 gh workflow run create-release.yml \
@@ -203,6 +212,8 @@ still has the previous package version.
 - Install the exact version from crates.io and run `zakurad --version`.
 - Replace the boilerplate GitHub release body with concrete notes from the final
   changelog or approved release-note draft.
+- Promote stable releases with `./scripts/release-t0.sh promote --tag <tag>`
+  after signing; it refuses unsigned releases and release candidates.
 - Keep release candidates marked as pre-releases.
 
 ## Review output

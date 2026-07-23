@@ -2033,6 +2033,65 @@ async fn build_extend_rejects_oversized_response_before_state_queries(
 }
 
 #[tokio::test]
+async fn build_extend_rejects_locator_echo_before_state_queries() -> Result<(), crate::BoxError> {
+    let (
+        _chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        mut state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let tip = block::Hash::from([0x20; 32]);
+    let expected_next = block::Hash::from([0x21; 32]);
+    let unknown = block::Hash::from([0x22; 32]);
+    let trailing = block::Hash::from([0x23; 32]);
+    let tips = HashSet::from([sync::CheckedTip { tip, expected_next }]);
+    let extend_handle = tokio::spawn(TestChainSync::build_extend(
+        Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT),
+        state_service.clone(),
+        tips,
+    ));
+
+    peer_set
+        .expect_request(zn::Request::FindBlocks {
+            known_blocks: vec![tip],
+            stop: None,
+        })
+        .await
+        .respond(zn::Response::BlockHashes(vec![
+            expected_next,
+            unknown,
+            tip,
+            trailing,
+        ]));
+
+    for _ in 0..(sync::FANOUT - 1) {
+        peer_set
+            .expect_request(zn::Request::FindBlocks {
+                known_blocks: vec![tip],
+                stop: None,
+            })
+            .await
+            .respond(Err(zn::BoxError::from("synthetic test locator echo error")));
+    }
+
+    let (download_set, prospective_tips, discovered) = extend_handle
+        .await
+        .expect("build_extend task should not panic")?;
+    assert!(download_set.is_empty());
+    assert!(prospective_tips.is_empty());
+    assert_eq!(discovered, 0);
+
+    peer_set.expect_no_requests().await;
+    block_verifier_router.expect_no_requests().await;
+    state_service.expect_no_requests().await;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn build_extend_ignores_known_trailing_find_blocks_hash() -> Result<(), crate::BoxError> {
     let (
         _chain_sync,

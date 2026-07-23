@@ -1614,6 +1614,14 @@ where
             return Ok(None);
         }
 
+        if unknown_hashes.contains(&locator) {
+            debug!(
+                ?locator,
+                "discarding FindBlocks extension response with locator hash in advertised suffix"
+            );
+            return Ok(None);
+        }
+
         for &hash in unknown_hashes {
             if Self::state_contains_service(state, hash).await? {
                 debug!(

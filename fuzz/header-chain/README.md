@@ -65,9 +65,10 @@ different exact branch before release and requires all nine downstream-effect
 sentinels to remain zero. State dispatch and result hold/release operations
 place a second barrier after the modeled database call; a late success from the
 retired branch must likewise have no coverage, publication, or scheduling
-effect. Advisory mutations exercise incomparable work, extreme
-height/retention claims, and pure-requester caps without changing local
-authority.
+effect. Success and local-failure results are distinct so a late failure can
+also be required to have no retry, repair, attribution, or scoring effect.
+Advisory mutations exercise incomparable work, extreme height/retention claims,
+and pure-requester caps without changing local authority.
 
 `recovery_rows` snapshots all twelve header-engine column families as a raw
 logical dump, applies at most 64 bounded row/key/value mutations, and installs

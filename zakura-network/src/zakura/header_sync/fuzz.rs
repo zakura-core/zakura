@@ -67,6 +67,10 @@ pub struct HeaderPursuitReplaySummary {
     pub released_state_results: usize,
     /// Released state results rejected after retirement or scope change.
     pub stale_state_results: usize,
+    /// Held state results representing local admission failure.
+    pub held_state_failures: usize,
+    /// Released state results representing local admission failure.
+    pub released_state_failures: usize,
     /// Downstream effects admitted by current completions; stale scenarios require all zero.
     pub completion_effects: NoEffectsProbe,
 }
@@ -93,11 +97,17 @@ struct HeldCompletion {
     owner: WorkOwner,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum HeldStateResult {
+    Applied(HeldCompletion),
+    LocalFailure(HeldCompletion),
+}
+
 struct PursuitHarness {
     queue: PeerWorkQueue,
     model: HashMap<u8, ModelWork>,
     held: HashMap<u8, HeldCompletion>,
-    held_state: HashMap<u8, HeldCompletion>,
+    held_state: HashMap<u8, HeldStateResult>,
     pending: PendingOwners,
     snapshot: EngineSnapshot,
     observed_at: Instant,
@@ -153,7 +163,8 @@ impl PursuitHarness {
             12 => self.dispatch_state(peer_key, marker, flags),
             13 => self.hold_state_result(peer_key, marker, flags),
             14 => self.release_state_result(marker),
-            _ => unreachable!("the opcode is reduced modulo fifteen"),
+            15 => self.hold_state_failure(peer_key, marker, flags),
+            _ => unreachable!("the opcode is reduced modulo sixteen"),
         }
         self.assert_matches_model();
         assert_eq!(
@@ -618,6 +629,14 @@ impl PursuitHarness {
     }
 
     fn hold_state_result(&mut self, peer_key: u8, marker: u8, flags: u8) {
+        self.hold_state_completion(peer_key, marker, flags, false);
+    }
+
+    fn hold_state_failure(&mut self, peer_key: u8, marker: u8, flags: u8) {
+        self.hold_state_completion(peer_key, marker, flags, true);
+    }
+
+    fn hold_state_completion(&mut self, peer_key: u8, marker: u8, flags: u8, failure: bool) {
         let supplied_session = session(flags);
         let supplied_target = target(marker);
         let slot = (flags >> 2).saturating_add(32);
@@ -635,24 +654,37 @@ impl PursuitHarness {
         if session_id != supplied_session
             || target != supplied_target
             || self.held_state.contains_key(&slot)
-            || self
-                .held_state
-                .values()
-                .any(|completion| completion.owner == owner)
+            || self.held_state.values().any(|result| match result {
+                HeldStateResult::Applied(completion)
+                | HeldStateResult::LocalFailure(completion) => completion.owner == owner,
+            })
         {
             self.summary.refused_operations += 1;
             return;
         }
-        self.held_state
-            .insert(slot, HeldCompletion { peer_key, owner });
+        let completion = HeldCompletion { peer_key, owner };
+        let result = if failure {
+            self.summary.held_state_failures += 1;
+            HeldStateResult::LocalFailure(completion)
+        } else {
+            HeldStateResult::Applied(completion)
+        };
+        self.held_state.insert(slot, result);
         self.summary.held_state_results += 1;
     }
 
     fn release_state_result(&mut self, marker: u8) {
         let slot = marker % 64;
-        let Some(completion) = self.held_state.remove(&slot) else {
+        let Some(result) = self.held_state.remove(&slot) else {
             self.summary.refused_operations += 1;
             return;
+        };
+        let (completion, applied) = match result {
+            HeldStateResult::Applied(completion) => (completion, true),
+            HeldStateResult::LocalFailure(completion) => {
+                self.summary.released_state_failures += 1;
+                (completion, false)
+            }
         };
         self.summary.released_state_results += 1;
         let decision = CompletionGate::check(
@@ -661,9 +693,9 @@ impl PursuitHarness {
             source(completion.peer_key),
             &completion.owner,
         );
-        if decision == CompletionDecision::Current {
+        if decision == CompletionDecision::Current && applied {
             self.record_completion_effects();
-        } else {
+        } else if decision != CompletionDecision::Current {
             self.summary.refused_operations += 1;
             self.summary.stale_state_results += 1;
         }
@@ -788,10 +820,10 @@ fn hash(marker: u8) -> block::Hash {
 
 fn decode_opcode(byte: u8) -> u8 {
     match byte {
-        0..=14 => byte,
+        0..=15 => byte,
         56..=63 => byte - 56,
-        72..=78 => byte - 64,
-        _ => byte % 15,
+        72..=79 => byte - 64,
+        _ => byte % 16,
     }
 }
 
@@ -952,6 +984,15 @@ mod tests {
                     assert_eq!(first.stale_state_results, 1);
                     assert_eq!(first.completion_effects, NoEffectsProbe::default());
                 }
+                "aud_07_late_state_failure" => {
+                    assert_eq!(first.state_submissions, 1);
+                    assert_eq!(first.held_state_results, 1);
+                    assert_eq!(first.held_state_failures, 1);
+                    assert_eq!(first.released_state_results, 1);
+                    assert_eq!(first.released_state_failures, 1);
+                    assert_eq!(first.stale_state_results, 1);
+                    assert_eq!(first.completion_effects, NoEffectsProbe::default());
+                }
                 "disconnected_held_completion" => {
                     assert_eq!(first.state_submissions, 0);
                     assert_eq!(first.held_completions, 1);
@@ -1093,6 +1134,41 @@ mod tests {
         assert_eq!(summary.state_submissions, 1);
         assert_eq!(summary.held_state_results, 1);
         assert_eq!(summary.released_state_results, 1);
+        assert_eq!(summary.stale_state_results, 1);
+        assert_eq!(summary.completion_effects, NoEffectsProbe::default());
+        assert_eq!(summary.peer_punishments, 0);
+    }
+
+    #[test]
+    fn aud_07_late_state_failure_cannot_retry_repair_or_score() {
+        let held_failure = [
+            0, 0, 42, 0, // advertise session 1, target 42
+            1, 0, 42, 0, // start exact request
+            2, 0, 42, 0, // bind authenticated ancestry
+            3, 0, 42, 0, // prepare the complete target
+            12, 0, 42, 0, // dispatch the state write
+            15, 0, 42, 0, // hold its local failure in slot 32
+        ];
+        let mut current = held_failure.to_vec();
+        current.extend([
+            14, 0, 32, 0, // release the current local failure
+        ]);
+        let current = replay_header_pursuit_bytes(&current);
+        assert_eq!(current.released_state_failures, 1);
+        assert_eq!(current.stale_state_results, 0);
+        assert_eq!(current.completion_effects, NoEffectsProbe::default());
+
+        let mut input = held_failure.to_vec();
+        input.extend([
+            11, 0, 55, 0, // observe reconciled branch B and retire A
+            14, 0, 32, 0, // release A's old state failure
+        ]);
+        let summary = replay_header_pursuit_bytes(&input);
+        assert_eq!(summary.state_submissions, 1);
+        assert_eq!(summary.held_state_results, 1);
+        assert_eq!(summary.held_state_failures, 1);
+        assert_eq!(summary.released_state_results, 1);
+        assert_eq!(summary.released_state_failures, 1);
         assert_eq!(summary.stale_state_results, 1);
         assert_eq!(summary.completion_effects, NoEffectsProbe::default());
         assert_eq!(summary.peer_punishments, 0);

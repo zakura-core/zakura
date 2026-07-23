@@ -2014,6 +2014,99 @@ mod tests {
     }
 
     #[test]
+    fn full_commit_ensures_exact_node_body_and_independent_selection() {
+        use zakura_chain::work::difficulty::{ExpandedDifficulty, U256};
+
+        let (mut store, config) = TestStore::new(EngineMode::Integrated);
+        let clock = ManualClock(Utc::now());
+        let authority = Authority;
+        let anchor = store.graph.finalized();
+        let easy = store
+            .graph
+            .node(anchor.hash)
+            .expect("the anchor exists")
+            .header
+            .difficulty_threshold;
+        let easy_target: U256 = easy
+            .to_expanded()
+            .expect("the fixture target expands")
+            .into();
+        let hard = ExpandedDifficulty::from(easy_target >> 3).into();
+        let header_best = insert_verified_branch(&mut store.graph, anchor, 1, hard, 0x58);
+        store
+            .graph
+            .set_body_state(header_best.hash, BodyValidationState::Unknown)
+            .expect("the harder competitor remains header-only");
+        synchronize_fixture(&mut store, anchor);
+        assert_eq!(store.metadata.frontiers.header_best, header_best);
+        assert_eq!(store.metadata.frontiers.verified_best, anchor);
+
+        let mut accepted_header = *regtest_genesis_block().header;
+        accepted_header.previous_block_hash = anchor.hash;
+        accepted_header.difficulty_threshold = easy;
+        accepted_header.nonce.0[0] = 0x59;
+        let accepted_header = Arc::new(accepted_header);
+        let accepted = Frontier::new(
+            anchor
+                .height
+                .next()
+                .expect("the fixture anchor has a next height"),
+            accepted_header.hash(),
+        );
+        assert!(
+            store.graph.node(accepted.hash).is_none(),
+            "the full-state header is deliberately absent from the DAG"
+        );
+        let evidence = EvidenceId::from_digest([0x5a; 32]);
+        let before = store.snapshot();
+        let plan = apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+                    full_state_transition_id: evidence,
+                    old_tip: anchor,
+                    new_path: vec![crate::VerifiedHeaderRef {
+                        height: accepted.height,
+                        hash: accepted.hash,
+                        header: accepted_header,
+                    }],
+                    cause: crate::VerifiedChangeCause::Grow,
+                }),
+            },
+            &context(&config, &clock, Some(&authority)),
+        )
+        .expect("the exact full-state growth produces one coherent header transition");
+
+        let accepted_node = plan
+            .projected
+            .node(accepted.hash)
+            .expect("the full-state header is inserted into the projected DAG");
+        assert_eq!(accepted_node.parent_hash, anchor.hash);
+        assert_eq!(
+            accepted_node.body,
+            BodyValidationState::Verified { evidence }
+        );
+        assert_eq!(plan.change_set.metadata.frontiers.verified_best, accepted);
+        assert_eq!(
+            plan.change_set.metadata.frontiers.header_best, header_best,
+            "full-state selection does not override the independently harder header path"
+        );
+        assert_eq!(
+            plan.change_set.metadata.verified_generation,
+            before
+                .verified_generation
+                .checked_next()
+                .expect("the fixture generation can advance")
+        );
+        assert_eq!(
+            plan.change_set.metadata.header_generation,
+            before.header_generation
+        );
+        verify_plan(&store, &plan).expect("the full-state integration plan is coherent");
+    }
+
+    #[test]
     fn aud_13_finalization_and_replacement_match_complete_serial_histories() {
         use zakura_chain::work::difficulty::{ExpandedDifficulty, U256};
 

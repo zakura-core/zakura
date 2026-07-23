@@ -560,8 +560,10 @@ pub enum HeaderSyncCommitFailureKind {
 pub enum HeaderRootAuthenticationFailureKind {
     /// The compact state snapshot raced newer durable progress; retry without blame.
     Stale,
-    /// A supplied header no longer matches canonical storage; invalidate retained
-    /// coverage at and above this height without blaming its peer.
+    /// A supplied header no longer matches canonical storage.
+    ///
+    /// Retained coverage is invalidated at and above this height without peer
+    /// blame. Fresh fallback responses are attributed to their supplying peer.
     CanonicalMismatch {
         /// First height that differed from canonical storage.
         height: block::Height,

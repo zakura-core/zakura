@@ -2711,6 +2711,65 @@ async fn committed_forward_payload_authenticates_without_fallback_request() {
     fixture.task.abort();
 }
 
+async fn reactor_with_pending_fallback_root_authentication(
+    additional_peer: Option<ZakuraPeerId>,
+) -> (ReactorFixture, HeaderSyncOperationIdentity, ZakuraPeerId) {
+    let header_1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let header_2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    let header_2_hash = block::Hash::from(header_2.as_ref());
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, checkpoint_hash) =
+        checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some((block::Height(2), header_2_hash)));
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(3),
+        completed_checkpoint_hash: checkpoint_hash,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let source_peer = peer(238);
+
+    connect_peer(&fixture, source_peer.clone()).await;
+    advertise_tip(
+        &fixture,
+        source_peer.clone(),
+        anchor.0,
+        block::Height(2),
+        2,
+        1,
+    )
+    .await;
+    let (requested_peer, request_id, start, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, source_peer);
+    assert_eq!((start, count), (block::Height(1), 2));
+    send_headers(
+        &fixture,
+        &source_peer,
+        request_id,
+        headers_message_from(block::Height(1), vec![header_1, header_2]),
+    )
+    .await;
+
+    let operation = loop {
+        if let HeaderSyncAction::AuthenticateHeaderRoots { operation, .. } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            break operation;
+        }
+    };
+
+    if let Some(peer_id) = additional_peer {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(&fixture, peer_id, anchor.0, block::Height(2), 2, 1).await;
+    }
+
+    (fixture, operation, source_peer)
+}
+
 async fn reactor_with_pending_retained_root_authentication(
     additional_peer: Option<ZakuraPeerId>,
 ) -> (
@@ -2920,6 +2979,51 @@ async fn stale_root_auth_failure_reschedules_when_watch_already_advanced() {
             }
             HeaderSyncAction::Misbehavior { .. } => {
                 panic!("stale root authentication failure must not score a peer")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fallback_canonical_mismatch_scores_and_retries_avoiding_peer() {
+    let retry_peer = peer(242);
+    let (mut fixture, operation, source_peer) =
+        reactor_with_pending_fallback_root_authentication(Some(retry_peer.clone())).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+            operation,
+            kind: HeaderRootAuthenticationFailureKind::CanonicalMismatch {
+                height: block::Height(1),
+            },
+        })
+        .await
+        .unwrap();
+
+    let mut scored = false;
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, source_peer);
+                assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+                scored = true;
+            }
+            HeaderSyncAction::SendMessage {
+                peer,
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                        want_tree_aux_roots: true,
+                    },
+                ..
+            } => {
+                assert!(scored, "canonical mismatch is scored before retrying");
+                assert_eq!(peer, retry_peer);
+                assert_eq!((start_height, count), (block::Height(1), 2));
+                break;
             }
             _ => {}
         }

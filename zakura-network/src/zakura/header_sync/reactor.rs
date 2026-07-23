@@ -1387,13 +1387,22 @@ impl HeaderSyncReactor {
                 }
             }
             HeaderRootAuthenticationFailureKind::CanonicalMismatch { height } => {
-                self.state.drop_retained_from(height, "canonical_mismatch");
-                self.state.schedule.retry(pending.range);
-                metrics::counter!(
-                    "sync.header.root_auth.fallback.requested",
-                    "reason" => "missing"
-                )
-                .increment(1);
+                match pending.root_auth.map(|auth| auth.source) {
+                    Some(RootAuthSource::Retained(_)) => {
+                        self.state.drop_retained_from(height, "canonical_mismatch");
+                        self.state.schedule.retry(pending.range);
+                        metrics::counter!(
+                            "sync.header.root_auth.fallback.requested",
+                            "reason" => "missing"
+                        )
+                        .increment(1);
+                    }
+                    Some(RootAuthSource::Fallback) | None => {
+                        self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
+                            .await;
+                        self.state.schedule.retry_avoiding(peer, pending.range);
+                    }
+                }
             }
             HeaderRootAuthenticationFailureKind::Local => {
                 tracing::warn!(

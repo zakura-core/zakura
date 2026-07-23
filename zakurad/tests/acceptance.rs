@@ -1657,30 +1657,27 @@ async fn tracing_endpoint() -> Result<()> {
     Ok(())
 }
 
-/// Test that the JSON-RPC endpoint responds to a request,
-/// when configured with a single thread.
+/// Test the JSON-RPC endpoint with single- and multi-threaded configurations.
+///
+/// The multi-threaded node also checks zcashd-compatible content types, avoiding
+/// a third node startup for those requests.
 #[tokio::test]
-async fn rpc_endpoint_single_thread() -> Result<()> {
-    rpc_endpoint(false).await
-}
+async fn rpc_endpoints() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    if zakura_test::net::zebra_skip_network_tests() {
+        return Ok(());
+    }
 
-/// Test that the JSON-RPC endpoint responds to a request,
-/// when configured with multiple threads.
-#[tokio::test]
-async fn rpc_endpoint_parallel_threads() -> Result<()> {
-    rpc_endpoint(true).await
+    tokio::try_join!(rpc_endpoint(false, false), rpc_endpoint(true, true))?;
+
+    Ok(())
 }
 
 /// Test that the JSON-RPC endpoint responds to a request.
 ///
 /// Set `parallel_cpu_threads` to true to auto-configure based on the number of CPU cores.
 #[tracing::instrument]
-async fn rpc_endpoint(parallel_cpu_threads: bool) -> Result<()> {
-    let _init_guard = zakura_test::init();
-    if zakura_test::net::zebra_skip_network_tests() {
-        return Ok(());
-    }
-
+async fn rpc_endpoint(parallel_cpu_threads: bool, check_content_types: bool) -> Result<()> {
     // Write a configuration that has RPC listen_addr set
     // [Note on port conflict](#Note on port conflict)
     let mut config = os_assigned_rpc_port_config(parallel_cpu_threads, &Mainnet)?;
@@ -1712,6 +1709,10 @@ async fn rpc_endpoint(parallel_cpu_threads: bool) -> Result<()> {
     let subversion = parsed["result"]["subversion"].as_str().unwrap();
     assert!(subversion.contains("Zakura"), "Got {subversion}");
 
+    if check_content_types {
+        check_rpc_endpoint_content_types(&client).await?;
+    }
+
     child.kill(false)?;
 
     let output = child.wait_with_output()?;
@@ -1730,25 +1731,7 @@ async fn rpc_endpoint(parallel_cpu_threads: bool) -> Result<()> {
 /// This test ensures that the curl examples of zcashd rpc methods will also work in Zebra.
 ///
 /// https://zcash.github.io/rpc/getblockchaininfo.html
-#[tokio::test]
-async fn rpc_endpoint_client_content_type() -> Result<()> {
-    let _init_guard = zakura_test::init();
-    if zakura_test::net::zebra_skip_network_tests() {
-        return Ok(());
-    }
-
-    // Let the OS assign the RPC port to avoid races with parallel tests.
-    let mut config = os_assigned_rpc_port_config(true, &Mainnet)?;
-
-    let dir = testdir()?.with_config(&mut config)?;
-    let mut child = dir.spawn_child(args!["start"])?;
-
-    // Wait until port is open.
-    let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
-
-    // Create an http client
-    let client = RpcRequestClient::new(rpc_address);
-
+async fn check_rpc_endpoint_content_types(client: &RpcRequestClient) -> Result<()> {
     // Call to `getinfo` RPC method with a no content type.
     let res = client
         .call_with_no_content_type("getinfo", "[]".to_string())

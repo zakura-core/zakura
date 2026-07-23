@@ -17,17 +17,17 @@ use zakura_chain::{
 };
 
 use crate::{
-    apply_transition, AlarmSet, AuxDelivery, AuxDelta, BodyEvidence, BodyRuleId,
-    BodyUnavailableSummary, BranchId, ChainScore, CheckpointSet, Clock, ConsensusBodyInvalid,
-    EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, EvidenceId, FinalityEpoch,
-    FinalityRecord, Frontier, FrontierSet, FullStateEvidenceAuthority, FullStateFinalized,
-    HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode, HeaderValidationState,
-    InsertHeaders, MemHeaderStore, OperatorInvalidate, OperatorInvalidationId, OperatorReconsider,
-    PreparedHeader, PreparedHeaderBatch, ProjectionDelta, SourceId, StateVersion, StoreError,
-    StoreRead, SuffixWork, TargetCompletion, TransientBodyFailure, TransientBodyFailureKind,
-    TransitionContext, TransitionFailure, TransitionPlan, TransitionRequest, TrustedAnchor,
-    ValidationLease, VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause,
-    VerifiedGeneration, VerifiedHeaderRef, WorkOwner,
+    apply_transition, AlarmSet, AuxDelivery, AuxDelta, BodyCommitmentKind, BodyEvidence,
+    BodyPayloadMismatch, BodyRuleId, BodyUnavailableSummary, BranchId, ChainScore, CheckpointSet,
+    Clock, ConsensusBodyInvalid, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot,
+    EvidenceId, FinalityEpoch, FinalityRecord, Frontier, FrontierSet, FullStateEvidenceAuthority,
+    FullStateFinalized, HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode,
+    HeaderValidationState, InsertHeaders, MemHeaderStore, OperatorInvalidate,
+    OperatorInvalidationId, OperatorReconsider, PreparedHeader, PreparedHeaderBatch,
+    ProjectionDelta, SourceId, StateVersion, StoreError, StoreRead, SuffixWork, TargetCompletion,
+    TransientBodyFailure, TransientBodyFailureKind, TransitionContext, TransitionFailure,
+    TransitionPlan, TransitionRequest, TrustedAnchor, ValidationLease, VerifiedBodyEvidence,
+    VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef, WorkOwner,
 };
 
 /// Deterministic summary of one bounded structured-operation replay.
@@ -39,6 +39,8 @@ pub struct ForkReplaySummary {
     pub commits: u16,
     /// Expected stale or invalid operations with no durable effect.
     pub refused: u16,
+    /// Valid idempotent or informational operations with no durable effect.
+    pub no_effects: u16,
     /// Final authoritative snapshot.
     pub snapshot: EngineSnapshot,
     /// Stable digest of operation outcomes and snapshots.
@@ -398,6 +400,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
     let mut store = FuzzStore::new(mode);
     let mut commits = 0u16;
     let mut refused = 0u16;
+    let mut no_effects = 0u16;
     let mut transcript = Sha256::new();
     let clock = ManualClock::new();
     let authority = FuzzAuthority;
@@ -548,6 +551,18 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
             }
             12 => store.verify_selected_path(operation, branch),
             13 => store.finalize_verified(operation, branch),
+            14 => TransitionRequest {
+                expected_version: store.metadata.state_version,
+                event: crate::TransitionEvent::BodyEvidence(BodyEvidence::PayloadMismatch(
+                    BodyPayloadMismatch {
+                        evidence: evidence(operation, branch),
+                        requested: store.metadata.frontiers.header_best.hash,
+                        delivered: store.metadata.frontiers.finalized.hash,
+                        kind: BodyCommitmentKind::HeaderHash,
+                        source: SourceId::from_digest([branch; 32]),
+                    },
+                )),
+            },
             _ => {
                 // Explicit stale/no-op references are part of the operation language.
                 refused = refused.saturating_add(1);
@@ -578,7 +593,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                     eligibility_changed,
                 );
                 if no_change {
-                    refused = refused.saturating_add(1);
+                    no_effects = no_effects.saturating_add(1);
                 } else {
                     commits = commits.saturating_add(1);
                 }
@@ -603,6 +618,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         operations: u16::try_from(bounded.len()).expect("the operation cap fits in u16"),
         commits,
         refused,
+        no_effects,
         snapshot: store.snapshot(),
         replay_digest: transcript.finalize().into(),
         retained_digest: retained_digest(&store),
@@ -878,6 +894,15 @@ mod tests {
             block::Height(3),
             "transient body availability must not change header eligibility"
         );
+        let before_mismatch = replay_fork_transition_bytes(&[10]);
+        let body_mismatch = replay_fork_transition_bytes(&[10, 112]);
+        assert_eq!(body_mismatch.commits, 1);
+        assert_eq!(body_mismatch.no_effects, 1);
+        assert_eq!(body_mismatch.snapshot, before_mismatch.snapshot);
+        assert_eq!(
+            body_mismatch.retained_digest,
+            before_mismatch.retained_digest
+        );
 
         let deferred = replay_fork_transition_bytes(&[80]);
         assert_eq!(
@@ -949,6 +974,10 @@ mod tests {
             (
                 "verified_finality",
                 include_bytes!("../../fuzz/header-chain/corpus/fork_transitions/verified_finality"),
+            ),
+            (
+                "body_mismatch",
+                include_bytes!("../../fuzz/header-chain/corpus/fork_transitions/body_mismatch"),
             ),
         ];
         for (name, bytes) in corpus {

@@ -346,6 +346,12 @@ impl HeaderSyncCore {
             .completed_checkpoint_height
             .min(self.best_header_tip)
             .min(startup.network.checkpoint_list().max_height());
+        // Auth can catch the completed-checkpoint tip (or tip can lag), so the
+        // next height is past every fallback bound. An inverted range has no
+        // hole to fill and must not be passed to `BTreeMap::range`.
+        if start > end {
+            return end;
+        }
         if let Some((&retained_start, _)) = self.retained_roots.range(start..=end).next() {
             end = retained_start;
         }

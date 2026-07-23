@@ -733,6 +733,32 @@ fn root_auth_does_not_schedule_without_checkpoint_covered_witness() {
 }
 
 #[test]
+fn root_auth_refresh_survives_authenticated_at_completed_checkpoint_tip() {
+    // Regtest e2e failure: after the final checkpoint commit, auth and completed
+    // heights are equal, so fallback start is past end. Refresh must not panic
+    // on an inverted retained-roots range query.
+    let network = Network::Mainnet;
+    let tip = (block::Height(160), block::Hash([160; 32]));
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some(tip));
+    startup.config.max_headers_per_response = 3;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: tip.0,
+        authenticated_hash: tip.1,
+        completed_checkpoint_height: tip.0,
+        completed_checkpoint_hash: tip.1,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
+    let auth = startup
+        .header_root_auth
+        .expect("test authentication state exists");
+
+    assert_eq!(state.root_auth_hole_heights(&startup, auth), 0);
+    state.refresh_root_auth_range(&startup);
+    assert!(state.schedule.authenticate_roots.is_empty());
+}
+
+#[test]
 fn clamped_root_auth_request_never_enqueues_non_overlapping_suffix() {
     let auth = RangeRequest {
         range: CheckedHeaderRange::from_count(block::Height(1), 5).expect("test range is bounded"),

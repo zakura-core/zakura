@@ -546,7 +546,10 @@ networks = ["mainnet", "testnet", "custom"]
 [[rule]]
 id = "LC-BODY-02"
 name = "Consensus-invalid body feedback"
-status = "unimplemented"
+status = "implemented"
+owner = "zakura_state::service::write::HeaderChainWriter::record_body_invalid"
+tests = ["IN-02::in_02_consensus_invalid_persists_and_scores_only_its_exact_supplier", "IN-02::in_02_header_valid_body_invalid_reselects_after_exact_authenticated_evidence", "IN-02::reactor_scores_exact_supplier_for_commitment_matching_consensus_invalidity", "IN-02::body_apply_evidence_is_canonical_or_attempt_scoped_by_outcome_kind", "DF-02::df_02_full_state_failures_have_exact_intentional_difference_types", "AUD-03::body_evidence_matrix_preserves_typed_effect_boundaries", "AUD-14::aud_14_body_conclusions_reopen_complete_before_or_after"]
+networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-BODY-03"

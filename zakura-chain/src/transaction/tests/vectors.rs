@@ -88,6 +88,10 @@ fn mock_pre_v5_output_list(output: transparent::Output, index: usize) -> Vec<tra
     std::iter::repeat_n(output, index + 1).collect()
 }
 
+fn deserialize_zip244_v5_test_vector(bytes: &[u8]) -> Result<Transaction, SerializationError> {
+    crate::transaction::serialize::deserialize_zip244_v5_test_vector(bytes)
+}
+
 #[test]
 fn transactionhash_struct_from_str_roundtrip() {
     let _init_guard = zakura_test::init();
@@ -677,7 +681,7 @@ fn zip244_round_trip() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     for test in zip0244::TEST_VECTORS.iter() {
-        let tx = test.tx.zcash_deserialize_into::<Transaction>()?;
+        let tx = deserialize_zip244_v5_test_vector(&test.tx)?;
         let reencoded = tx.zcash_serialize_to_vec()?;
 
         assert_eq!(test.tx, reencoded);
@@ -696,7 +700,7 @@ fn zip244_txid() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     for test in zip0244::TEST_VECTORS.iter() {
-        let txid = TxIdBuilder::new(&test.tx.zcash_deserialize_into::<Transaction>()?)
+        let txid = TxIdBuilder::new(&deserialize_zip244_v5_test_vector(&test.tx)?)
             .txid()
             .expect("txid");
 
@@ -711,7 +715,7 @@ fn zip244_auth_digest() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     for test in zip0244::TEST_VECTORS.iter() {
-        let transaction = test.tx.zcash_deserialize_into::<Transaction>()?;
+        let transaction = deserialize_zip244_v5_test_vector(&test.tx)?;
         let auth_digest = transaction.auth_digest();
         assert_eq!(
             auth_digest
@@ -802,8 +806,7 @@ fn assert_native_zip244_matches_test_vector(
     expected_auth_digest: [u8; 32],
     vector_name: &str,
 ) -> Result<()> {
-    let tx = tx_bytes
-        .zcash_deserialize_into::<Transaction>()
+    let tx = deserialize_zip244_v5_test_vector(tx_bytes)
         .wrap_err_with(|| format!("failed to deserialize {vector_name}"))?;
 
     let (txid, auth_digest) = crate::transaction::zip244::txid_and_auth_digest(&tx)
@@ -1255,7 +1258,7 @@ fn zip244_sighash() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     for (i, test) in zip0244::TEST_VECTORS.iter().enumerate() {
-        let transaction = test.tx.zcash_deserialize_into::<Transaction>()?;
+        let transaction = deserialize_zip244_v5_test_vector(&test.tx)?;
 
         let all_previous_outputs: Arc<Vec<_>> = Arc::new(
             test.amounts
@@ -1460,7 +1463,7 @@ fn script_code_commitment_is_version_specific() -> Result<()> {
         .iter()
         .find(|test| test.transparent_input.is_some())
         .expect("ZIP-244 vectors include a transparent sighash");
-    let v5_transaction = v5_test.tx.zcash_deserialize_into::<Transaction>()?;
+    let v5_transaction = deserialize_zip244_v5_test_vector(&v5_test.tx)?;
     let v5_previous_outputs = Arc::new(
         v5_test
             .amounts
@@ -2055,7 +2058,71 @@ fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
 }
 
 #[test]
-fn v6_padded_orchard_proof_is_rejected_by_librustzcash_conversion() {
+fn v5_orchard_proof_size_is_always_enforced_during_deserialization() {
+    let _init_guard = zakura_test::init();
+
+    let orchard_shielded_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+
+    let make_tx = |network_upgrade, orchard_shielded_data| Transaction::V5 {
+        network_upgrade,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(orchard_shielded_data),
+    };
+
+    let network_upgrades = [
+        NetworkUpgrade::Nu5,
+        NetworkUpgrade::Nu6,
+        NetworkUpgrade::Nu6_1,
+        NetworkUpgrade::Nu6_2,
+        NetworkUpgrade::Nu6_3,
+    ];
+    for network_upgrade in network_upgrades {
+        let canonical_tx = make_tx(network_upgrade, orchard_shielded_data.clone());
+        canonical_tx
+            .to_librustzcash(network_upgrade)
+            .expect("librustzcash accepts a canonical V5 Orchard proof");
+        let canonical_bytes = canonical_tx.zcash_serialize_to_vec().expect("serialize");
+        Transaction::zcash_deserialize(&canonical_bytes[..])
+            .expect("V5 transaction with a canonical Orchard proof round-trips");
+    }
+
+    let mut short = orchard_shielded_data.clone();
+    short
+        .proof
+        .0
+        .pop()
+        .expect("real Orchard proof is not empty");
+    let mut padded = orchard_shielded_data.clone();
+    padded.proof.0.push(0);
+
+    for noncanonical in [short, padded] {
+        for network_upgrade in network_upgrades {
+            let tx = make_tx(network_upgrade, noncanonical.clone());
+            let librustzcash_result = tx.to_librustzcash(network_upgrade);
+            if network_upgrade < NetworkUpgrade::Nu6_2 {
+                librustzcash_result
+                    .expect("librustzcash keeps pre-NU6.2 V5 proof sizes unenforced");
+            } else {
+                librustzcash_result.expect_err("librustzcash enforces V5 proof sizes from NU6.2");
+            }
+
+            let bytes = tx.zcash_serialize_to_vec().expect("serialize");
+            let error = Transaction::zcash_deserialize(&bytes[..])
+                .expect_err("V5 Orchard proof size is always enforced during parsing");
+            assert_noncanonical_orchard_protocol_proof_size(error);
+        }
+    }
+}
+
+#[test]
+fn v6_noncanonical_orchard_proof_is_rejected_during_deserialization() {
     let _init_guard = zakura_test::init();
 
     let orchard_shielded_data = Network::iter()
@@ -2074,47 +2141,41 @@ fn v6_padded_orchard_proof_is_rejected_by_librustzcash_conversion() {
         ironwood_shielded_data: None,
     };
 
-    // Control: the same tx with a canonical proof round-trips and converts
-    // cleanly, so any conversion failure below is attributable to the padding,
-    // not the test vector.
     let canonical_bytes = make_tx(orchard_shielded_data.clone())
         .zcash_serialize_to_vec()
         .expect("serialize");
     let canonical_tx = Transaction::zcash_deserialize(&canonical_bytes[..])
-        .expect("v6 tx with a canonical Orchard proof round-trips");
+        .expect("V6 transaction with a canonical Orchard proof round-trips");
     canonical_tx
         .to_librustzcash(NetworkUpgrade::Nu6_3)
-        .expect("v6 tx with a canonical Orchard proof converts to librustzcash");
+        .expect("librustzcash accepts a canonical V6 Orchard proof");
 
-    // The `librustzcash` conversion is deferred out of deserialization to
-    // consensus verification, so a padded (non-canonical) Orchard proof now
-    // deserializes successfully instead of being rejected at parse time.
+    let mut short = orchard_shielded_data.clone();
+    short
+        .proof
+        .0
+        .pop()
+        .expect("real Orchard proof is not empty");
     let mut padded = orchard_shielded_data;
     padded.proof.0.push(0);
-    let padded_bytes = make_tx(padded).zcash_serialize_to_vec().expect("serialize");
-    let padded_tx = Transaction::zcash_deserialize(&padded_bytes[..])
-        .expect("padded Orchard proof deserializes once librustzcash validation is deferred");
 
-    // The deferred conversion that consensus verification relies on still
-    // rejects the padded proof, so the malformed transaction cannot be verified.
-    padded_tx
-        .to_librustzcash(NetworkUpgrade::Nu6_3)
-        .expect_err("v6 transaction with a padded Orchard proof must fail librustzcash conversion");
+    for noncanonical in [short, padded] {
+        let tx = make_tx(noncanonical);
+        tx.to_librustzcash(NetworkUpgrade::Nu6_3)
+            .expect_err("librustzcash enforces V6 Orchard proof sizes");
+        let bytes = tx.zcash_serialize_to_vec().expect("serialize");
+        let error = Transaction::zcash_deserialize(&bytes[..])
+            .expect_err("V6 Orchard proof size must be canonical");
+        assert_noncanonical_orchard_protocol_proof_size(error);
+    }
 }
 
-/// Companion to `v6_padded_orchard_proof_is_rejected_by_librustzcash_conversion`
-/// covering the Ironwood bundle, the other net-new V6 shielded pool. Ironwood
-/// reuses Orchard's variable-length Halo2 proof encoding, so the same
-/// non-canonical padding must be rejected. This guards the deferred-validation
-/// boundary for Ironwood: Zebra's parser is more permissive than `librustzcash`,
-/// so malformed Ironwood proofs must still be caught by the conversion consensus
-/// relies on rather than slipping through.
 #[test]
-fn v6_padded_ironwood_proof_is_rejected_by_librustzcash_conversion() {
+fn v6_noncanonical_ironwood_proof_is_rejected_during_deserialization() {
     let _init_guard = zakura_test::init();
 
     // Ironwood shielded data has the same shape as Orchard, so a real Orchard
-    // bundle is a valid Ironwood bundle for encoding/conversion purposes.
+    // bundle is a valid Ironwood bundle for encoding purposes.
     let ironwood_shielded_data = Network::iter()
         .flat_map(|network| v5_transactions(network.block_iter()))
         .find_map(|transaction| transaction.orchard_shielded_data().cloned())
@@ -2131,31 +2192,40 @@ fn v6_padded_ironwood_proof_is_rejected_by_librustzcash_conversion() {
         ironwood_shielded_data: Some(ironwood_shielded_data),
     };
 
-    // Control: the same tx with a canonical proof round-trips and converts
-    // cleanly, so any conversion failure below is attributable to the padding,
-    // not the bundle.
     let canonical_bytes = make_tx(ironwood_shielded_data.clone())
         .zcash_serialize_to_vec()
         .expect("serialize");
     let canonical_tx = Transaction::zcash_deserialize(&canonical_bytes[..])
-        .expect("v6 tx with a canonical Ironwood proof round-trips");
+        .expect("V6 transaction with a canonical Ironwood proof round-trips");
     canonical_tx
         .to_librustzcash(NetworkUpgrade::Nu6_3)
-        .expect("v6 tx with a canonical Ironwood proof converts to librustzcash");
+        .expect("librustzcash accepts a canonical V6 Ironwood proof");
 
-    // The padded (non-canonical) Ironwood proof deserializes successfully once
-    // librustzcash validation is deferred to consensus verification.
+    let mut short = ironwood_shielded_data.clone();
+    short
+        .proof
+        .0
+        .pop()
+        .expect("real Ironwood-shaped proof is not empty");
     let mut padded = ironwood_shielded_data;
     padded.proof.0.push(0);
-    let padded_bytes = make_tx(padded).zcash_serialize_to_vec().expect("serialize");
-    let padded_tx = Transaction::zcash_deserialize(&padded_bytes[..])
-        .expect("padded Ironwood proof deserializes once librustzcash validation is deferred");
 
-    // The deferred conversion that consensus verification relies on still
-    // rejects the padded proof, so the malformed transaction cannot be verified.
-    padded_tx.to_librustzcash(NetworkUpgrade::Nu6_3).expect_err(
-        "v6 transaction with a padded Ironwood proof must fail librustzcash conversion",
-    );
+    for noncanonical in [short, padded] {
+        let tx = make_tx(noncanonical);
+        tx.to_librustzcash(NetworkUpgrade::Nu6_3)
+            .expect_err("librustzcash enforces V6 Ironwood proof sizes");
+        let bytes = tx.zcash_serialize_to_vec().expect("serialize");
+        let error = Transaction::zcash_deserialize(&bytes[..])
+            .expect_err("V6 Ironwood proof size must be canonical");
+        assert_noncanonical_orchard_protocol_proof_size(error);
+    }
+}
+
+fn assert_noncanonical_orchard_protocol_proof_size(error: SerializationError) {
+    assert!(matches!(
+        error,
+        SerializationError::Parse("non-canonical Orchard-protocol proof size")
+    ));
 }
 
 /// Regression test for the Orchard `rk` identity-point DoS vulnerability.
@@ -2219,8 +2289,11 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
         flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
         value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
         shared_anchor: tree::Root::default(),
-        // An empty proof is accepted at deserialization time.
-        proof: Halo2Proof(vec![]),
+        // Keep the proof canonical so only the identity `rk` causes rejection.
+        proof: Halo2Proof(vec![
+            0;
+            crate::orchard::shielded_data::expected_proof_size(1)
+        ]),
         actions: at_least_one![AuthorizedAction {
             action,
             spend_auth_sig: Signature::from([0u8; 64]),

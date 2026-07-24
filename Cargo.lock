@@ -9100,6 +9100,7 @@ dependencies = [
  "metrics",
  "mset",
  "once_cell",
+ "orchard",
  "proptest",
  "proptest-derive",
  "rand 0.8.6",

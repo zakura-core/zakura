@@ -29,6 +29,12 @@ use crate::sapling;
 const ALLOW_CROSS_ADDRESS_BIT: bool = true;
 const ORCHARD_SPEND_OUTPUT_FLAG_BITS: u8 = 0b0000_0011;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ProofSizeEnforcement {
+    Unenforced,
+    Strict,
+}
+
 fn orchard_allowed_flag_bits(allow_cross_address_bit: bool) -> u8 {
     if allow_cross_address_bit {
         ORCHARD_SPEND_OUTPUT_FLAG_BITS | orchard::Flags::ENABLE_CROSS_ADDRESS.bits()
@@ -485,6 +491,7 @@ fn serialize_orchard_flags<W: io::Write>(
 fn deserialize_orchard_shielded_data_with_flags<R: io::Read>(
     mut reader: R,
     allow_cross_address_bit: bool,
+    proof_size_enforcement: ProofSizeEnforcement,
 ) -> Result<Option<orchard::ShieldedData>, SerializationError> {
     // Denoted as `nActionsOrchard` and `vActionsOrchard` in the spec.
     let actions: Vec<orchard::Action> = (&mut reader).zcash_deserialize_into()?;
@@ -520,6 +527,14 @@ fn deserialize_orchard_shielded_data_with_flags<R: io::Read>(
     // Consensus: type is `ZKAction.Proof`, i.e. a byte sequence.
     // https://zips.z.cash/protocol/protocol.pdf#halo2encoding
     let proof: Halo2Proof = (&mut reader).zcash_deserialize_into()?;
+
+    if proof_size_enforcement == ProofSizeEnforcement::Strict
+        && proof.0.len() != orchard::shielded_data::expected_proof_size(actions.len())
+    {
+        return Err(SerializationError::Parse(
+            "non-canonical Orchard-protocol proof size",
+        ));
+    }
 
     // Denoted as `vSpendAuthSigsOrchard` in the spec.
     // Consensus: this validates the `spendAuthSig` elements, whose type is
@@ -571,7 +586,11 @@ impl ZcashDeserialize for Option<orchard::ShieldedData> {
     /// Deserializes Orchard shielded data using the pre-Ironwood Orchard flag
     /// rules, where the cross-address bit is reserved.
     fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
-        deserialize_orchard_shielded_data_with_flags(reader, !ALLOW_CROSS_ADDRESS_BIT)
+        deserialize_orchard_shielded_data_with_flags(
+            reader,
+            !ALLOW_CROSS_ADDRESS_BIT,
+            ProofSizeEnforcement::Unenforced,
+        )
     }
 }
 
@@ -876,9 +895,12 @@ impl ZcashSerialize for Transaction {
     }
 }
 
-impl ZcashDeserialize for Transaction {
+impl Transaction {
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_with_v5_proof_size_enforcement<R: io::Read>(
+        reader: R,
+        v5_proof_size_enforcement: ProofSizeEnforcement,
+    ) -> Result<Transaction, SerializationError> {
         // # Consensus
         //
         // > [Pre-Sapling] The encoded size of the transaction MUST be less than or
@@ -1149,6 +1171,7 @@ impl ZcashDeserialize for Transaction {
                 let orchard_shielded_data = deserialize_orchard_shielded_data_with_flags(
                     &mut limited_reader,
                     !ALLOW_CROSS_ADDRESS_BIT,
+                    v5_proof_size_enforcement,
                 )?;
 
                 Ok(Transaction::V5 {
@@ -1209,6 +1232,7 @@ impl ZcashDeserialize for Transaction {
                 let orchard_shielded_data = deserialize_orchard_shielded_data_with_flags(
                     &mut limited_reader,
                     !ALLOW_CROSS_ADDRESS_BIT,
+                    ProofSizeEnforcement::Strict,
                 )?;
 
                 // A bundle of fields denoted in the spec as `nActionsIronwood`,
@@ -1218,6 +1242,7 @@ impl ZcashDeserialize for Transaction {
                 let ironwood_shielded_data = deserialize_orchard_shielded_data_with_flags(
                     &mut limited_reader,
                     ALLOW_CROSS_ADDRESS_BIT,
+                    ProofSizeEnforcement::Strict,
                 )?;
 
                 Ok(Transaction::V6 {
@@ -1234,6 +1259,25 @@ impl ZcashDeserialize for Transaction {
             (_, _) => Err(SerializationError::Parse("bad tx header")),
         }
     }
+}
+
+impl ZcashDeserialize for Transaction {
+    fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
+        Self::zcash_deserialize_with_v5_proof_size_enforcement(reader, ProofSizeEnforcement::Strict)
+    }
+}
+
+#[cfg(test)]
+pub(super) fn deserialize_zip244_v5_test_vector<R: io::Read>(
+    reader: R,
+) -> Result<Transaction, SerializationError> {
+    // The official ZIP-244 vectors contain synthetic, noncanonical Orchard
+    // proofs. Their expected digests commit to those exact bytes, so digest
+    // tests need a non-production decoder that preserves them.
+    Transaction::zcash_deserialize_with_v5_proof_size_enforcement(
+        reader,
+        ProofSizeEnforcement::Unenforced,
+    )
 }
 
 impl<T> ZcashDeserialize for Arc<T>

@@ -74,7 +74,7 @@ type DiscoveredPeer = (PeerSocketAddr, peer::Client);
 const MISBEHAVIOR_BATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Batches peer misbehavior reports before forwarding them to the address book updater.
-pub(crate) async fn batch_misbehavior_reports(
+async fn batch_misbehavior_reports(
     mut misbehavior_rx: mpsc::Receiver<(PeerSocketAddr, u32)>,
     address_book_updater: mpsc::Sender<MetaAddrChange>,
 ) {

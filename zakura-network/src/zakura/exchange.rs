@@ -429,6 +429,9 @@ pub fn apply_frontier_update(
             frontier.finalized =
                 higher_frontier(current.frontier.finalized, requested.frontier.finalized);
             frontier.verified_body = requested.frontier.verified_body;
+            if frontier == current.frontier {
+                return None;
+            }
         }
         FrontierChange::HeaderAdvanced => {
             if requested.frontier.best_header.height <= current.frontier.best_header.height {
@@ -654,6 +657,47 @@ mod tests {
         assert_eq!(updated.frontier.finalized, frontier(5, 5));
         assert_eq!(updated.frontier.verified_body, frontier(6, 6));
         assert_eq!(updated.frontier.best_header, frontier(10, 10));
+    }
+
+    #[test]
+    fn reset_that_moves_nothing_is_ignored() {
+        let current = update(
+            frontier(5, 5),
+            frontier(8, 8),
+            frontier(10, 10),
+            FrontierChange::Snapshot,
+        );
+        let requested = update(
+            frontier(5, 5),
+            frontier(8, 8),
+            frontier(2, 2),
+            FrontierChange::VerifiedReset,
+        );
+
+        assert!(
+            apply_frontier_update(current, requested).is_none(),
+            "a reset that leaves every frontier where it was must not wake subscribers"
+        );
+    }
+
+    #[test]
+    fn reset_to_the_same_height_on_another_chain_is_accepted() {
+        let current = update(
+            frontier(5, 5),
+            frontier(8, 8),
+            frontier(10, 10),
+            FrontierChange::Snapshot,
+        );
+        let requested = update(
+            frontier(5, 5),
+            frontier(8, 9),
+            frontier(10, 10),
+            FrontierChange::VerifiedReset,
+        );
+
+        let updated = apply_frontier_update(current, requested).expect("a same-height reorg moves");
+
+        assert_eq!(updated.frontier.verified_body, frontier(8, 9));
     }
 
     #[test]

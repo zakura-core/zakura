@@ -19,9 +19,10 @@ use crate::zakura::{
     framed_channel,
     testkit::{TraceCapture, TraceValue},
     trace::{header_sync_trace as hs_trace, HEADER_SYNC_TABLE},
-    FramedSend, HeaderSyncServiceSummary, OrderedSessionDemand, Peer, Service,
-    ServicePeerDirection, ServicePeerLimits, ServicePeerSnapshot, ZakuraConnId,
-    ZakuraHeaderSyncCandidateState, ZAKURA_CAP_HEADER_SYNC,
+    ChainFrontier, FramedSend, Frontier, FrontierChange, FrontierUpdate, HeaderSyncServiceSummary,
+    OrderedSessionDemand, Peer, Service, ServicePeerDirection, ServicePeerLimits,
+    ServicePeerSnapshot, ZakuraConnId, ZakuraHeaderSyncCandidateState, ZakuraSyncExchange,
+    ZAKURA_CAP_HEADER_SYNC,
 };
 use chrono::Duration;
 use metrics::{
@@ -9845,6 +9846,150 @@ async fn forward_link_wedge_reloads_the_durable_tip_without_banning() {
         }
     }
     panic!("after re-anchor, header sync did not emit the reanchor action and request forward from the verified tip");
+}
+
+/// Drain reactor actions until the reactor stays quiet for `quiet` milliseconds,
+/// returning everything it emitted.
+async fn drain_actions_while_busy(
+    actions: &mut mpsc::Receiver<HeaderSyncAction>,
+    quiet: u64,
+) -> Vec<HeaderSyncAction> {
+    let mut drained = Vec::new();
+    while let Ok(Some(action)) =
+        tokio::time::timeout(std::time::Duration::from_millis(quiet), actions.recv()).await
+    {
+        drained.push(action);
+    }
+    drained
+}
+
+/// A durable reanchor that resolves to the anchor header sync already holds must
+/// leave forward work alone.
+///
+/// Continuous sync livelocked here: every verified-body reset queried the durable
+/// header tip, state answered with the unchanged tip, and the reanchor cancelled
+/// every outstanding forward range before any of them could commit. Over one
+/// 53-second window that cost 1,609 `GetHeaders` and zero committed ranges.
+#[tokio::test(flavor = "current_thread")]
+async fn no_op_durable_reanchor_keeps_outstanding_forward_work() {
+    let headers = [
+        mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        mainnet_header(&BLOCK_MAINNET_2_BYTES),
+        mainnet_header(&BLOCK_MAINNET_3_BYTES),
+    ];
+    let anchor = (block::Height(0), Network::Mainnet.genesis_hash());
+    let committed = (block::Height(3), block::Hash::from(headers[2].as_ref()));
+    let (network, _) = checkpoint_testnet_with_hash(committed.0, committed.1);
+    let mut fixture = spawn_test_reactor(startup_for(network, anchor, Some(anchor)));
+    let peer_id = peer(151);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id.clone(), anchor.0, committed.0, 3, 1).await;
+    let (_, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((start, count), (block::Height(1), 3));
+
+    // The durable header tip read answers with the anchor already in use.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: anchor.0,
+            tip_hash: anchor.1,
+            reanchor_from: Some(0),
+        })
+        .await
+        .unwrap();
+
+    // The peer answers the range that was already in flight when the reanchor ran.
+    send_headers(
+        &fixture,
+        &peer_id,
+        request_id,
+        finalized_headers_message(headers.to_vec()),
+    )
+    .await;
+
+    let mut requeued = false;
+    let mut committed_range = false;
+    for action in drain_actions_while_busy(&mut fixture.actions, 300).await {
+        match action {
+            HeaderSyncAction::CommitHeaderRange { .. } => committed_range = true,
+            HeaderSyncAction::SendMessage {
+                msg: HeaderSyncMessage::GetHeaders { start_height, .. },
+                ..
+            } if start_height == start => requeued = true,
+            _ => {}
+        }
+    }
+
+    assert!(
+        !requeued,
+        "a reanchor to the unchanged anchor re-requested a forward range that was already in flight"
+    );
+    assert!(
+        committed_range,
+        "a reanchor to the unchanged anchor discarded an in-flight forward range, so its response never committed"
+    );
+}
+
+/// A verified-body reset that moves nothing must not ask for a durable reanchor.
+///
+/// The state emits `TipAction::Reset` far more often than the verified tip
+/// actually moves; 191 of the 213 resets in the failing run changed no frontier
+/// at all. Each one still drove a full durable-tip query.
+#[tokio::test(flavor = "current_thread")]
+async fn unchanged_verified_reset_does_not_query_a_durable_reanchor() {
+    let network = regtest_network();
+    let anchor = (block::Height(0), network.genesis_hash());
+    let frontier = ChainFrontier {
+        finalized: Frontier::new(anchor.0, anchor.1),
+        verified_body: Frontier::new(anchor.0, anchor.1),
+        best_header: Frontier::new(anchor.0, anchor.1),
+    };
+    let exchange = ZakuraSyncExchange::new(
+        FrontierUpdate {
+            frontier,
+            change: FrontierChange::Snapshot,
+        },
+        ZakuraTrace::noop(),
+    );
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.frontier_updates = Some(exchange.subscribe_frontier());
+    let mut fixture = spawn_test_reactor(startup);
+
+    // Let the startup queries settle before measuring.
+    let _ = drain_actions_while_busy(&mut fixture.actions, 200).await;
+
+    // The chain-tip mirror republishes the same frontier on every state
+    // `TipAction::Reset`, which the state emits far more often than the verified
+    // tip actually moves.
+    for _ in 0..4 {
+        exchange.publish_frontier(
+            FrontierUpdate {
+                frontier,
+                change: FrontierChange::VerifiedReset,
+            },
+            "test_chain_tip_mirror",
+        );
+        tokio::task::yield_now().await;
+    }
+
+    let reanchor_queries = drain_actions_while_busy(&mut fixture.actions, 300)
+        .await
+        .into_iter()
+        .filter(|action| {
+            matches!(
+                action,
+                HeaderSyncAction::QueryBestHeaderTip {
+                    reanchor_from: Some(_)
+                }
+            )
+        })
+        .count();
+
+    assert_eq!(
+        reanchor_queries, 0,
+        "verified-body resets that moved nothing asked state to reanchor the header tip"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

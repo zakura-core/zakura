@@ -7,6 +7,7 @@ use std::{
 };
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
+use group::{Group, GroupEncoding};
 use halo2::pasta::pallas;
 use reddsa::{orchard::Binding, orchard::SpendAuth, Signature};
 
@@ -127,13 +128,38 @@ impl ShieldedData {
     /// the balancing value.
     ///
     /// <https://zips.z.cash/protocol/protocol.pdf#orchardbalance>
-    pub fn binding_verification_key(&self) -> reddsa::VerificationKeyBytes<Binding> {
-        let cv: ValueCommitment = self.actions().map(|action| action.cv).sum();
-        let cv_balance: ValueCommitment =
-            ValueCommitment::new(pallas::Scalar::zero(), self.value_balance);
+    /// Returns `None` when any action's `cv` bytes are not a canonical Pallas
+    /// point: deserialization defers that check (see [`ValueCommitment`]), so
+    /// the sum of commitment points only exists for valid encodings. The
+    /// semantic verifier rejects such transactions via
+    /// [`Transaction::orchard_point_encodings_are_valid`] before verifying the
+    /// binding signature.
+    ///
+    /// [`Transaction::orchard_point_encodings_are_valid`]: crate::transaction::Transaction::orchard_point_encodings_are_valid
+    pub fn binding_verification_key(&self) -> Option<reddsa::VerificationKeyBytes<Binding>> {
+        let mut cv: pallas::Point = pallas::Point::identity();
+        for action in self.actions() {
+            cv += pallas::Point::from(action.cv.commitment()?);
+        }
+        let cv_balance: pallas::Point =
+            ValueCommitment::commit_point(pallas::Scalar::zero(), self.value_balance);
 
-        let key_bytes: [u8; 32] = (cv - cv_balance).into();
-        key_bytes.into()
+        let key_bytes: [u8; 32] = pallas::Affine::from(cv - cv_balance).to_bytes();
+        Some(key_bytes.into())
+    }
+
+    /// Returns true if every `cv` in this shielded data is a canonical Pallas
+    /// point encoding and every `ephemeral_key` is a canonical encoding of a
+    /// non-identity Pallas point.
+    ///
+    /// These are the point checks deferred from deserialization, run by the
+    /// semantic verifier (not the checkpoint verifier) on untrusted
+    /// transactions; see [`ValueCommitment`] and
+    /// [`super::keys::EphemeralPublicKey`].
+    pub fn point_encodings_are_valid(&self) -> bool {
+        self.actions().all(|action| {
+            action.cv.commitment().is_some() && action.ephemeral_key.decompress().is_some()
+        })
     }
 
     /// Provide access to the `value_balance` field of the shielded data.

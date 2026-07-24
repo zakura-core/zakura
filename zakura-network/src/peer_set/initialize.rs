@@ -62,6 +62,50 @@ mod recent_by_ip;
 /// - tower::Discover interprets an error as stream termination
 type DiscoveredPeer = (PeerSocketAddr, peer::Client);
 
+/// How often accumulated peer misbehavior reports are sent to the address book.
+///
+/// Batching caps address book queue and mutex pressure at one flush per
+/// interval, no matter how fast peers send invalid blocks or transactions.
+/// One second keeps ban-threshold score application prompt; do not remove the
+/// batching to make bans immediate.
+const MISBEHAVIOR_BATCH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Batches peer misbehavior reports before forwarding them to the address book updater.
+pub(crate) async fn batch_misbehavior_reports(
+    mut misbehavior_rx: mpsc::Receiver<(PeerSocketAddr, u32)>,
+    address_book_updater: mpsc::Sender<MetaAddrChange>,
+) {
+    let mut misbehaviors: HashMap<PeerSocketAddr, u32> = HashMap::new();
+    // Coalesce repeated reports so invalid blocks or transactions cannot turn
+    // every report into address book queue and mutex pressure.
+    let mut flush_timer = IntervalStream::new(tokio::time::interval_at(
+        Instant::now() + MISBEHAVIOR_BATCH_INTERVAL,
+        MISBEHAVIOR_BATCH_INTERVAL,
+    ));
+
+    loop {
+        tokio::select! {
+            msg = misbehavior_rx.recv() => match msg {
+                Some((peer_addr, score_increment)) => *misbehaviors
+                    .entry(peer_addr)
+                    .or_default()
+                    += score_increment,
+                None => break,
+            },
+
+            _ = flush_timer.next() => {
+                for (addr, score_increment) in misbehaviors.drain() {
+                    let _ = address_book_updater
+                        .send(MetaAddr::new_misbehavior(addr, score_increment))
+                        .await;
+                }
+            },
+        };
+    }
+
+    tracing::warn!("exiting misbehavior update batch task");
+}
+
 /// Initialize a peer set, using a network `config`, `inbound_service`,
 /// and `latest_chain_tip`.
 ///
@@ -172,7 +216,7 @@ where
     let (address_book, bans, address_book_updater, address_metrics, address_book_updater_guard) =
         AddressBookUpdater::spawn(&config, listen_addr, advertised_services);
 
-    let (misbehavior_tx, mut misbehavior_rx) = mpsc::channel(
+    let (misbehavior_tx, misbehavior_rx) = mpsc::channel(
         // Leave enough room for a misbehaviour update on every peer connection
         // before the channel is drained.
         config
@@ -180,38 +224,8 @@ where
             .max(MIN_CHANNEL_SIZE),
     );
 
-    let misbehaviour_updater = address_book_updater.clone();
     tokio::spawn(
-        async move {
-            let mut misbehaviors: HashMap<PeerSocketAddr, u32> = HashMap::new();
-            // Batch misbehaviour updates so peers can't keep the address book mutex locked
-            // by repeatedly sending invalid blocks or transactions.
-            let mut flush_timer =
-                IntervalStream::new(tokio::time::interval(Duration::from_secs(30)));
-
-            loop {
-                tokio::select! {
-                    msg = misbehavior_rx.recv() => match msg {
-                        Some((peer_addr, score_increment)) => *misbehaviors
-                            .entry(peer_addr)
-                            .or_default()
-                            += score_increment,
-                        None => break,
-                    },
-
-                    _ = flush_timer.next() => {
-                        for (addr, score_increment) in misbehaviors.drain() {
-                            let _ = misbehaviour_updater
-                                .send(MetaAddr::new_misbehavior(addr, score_increment))
-                                .await;
-                        }
-                    },
-                };
-            }
-
-            tracing::warn!("exiting misbehavior update batch task");
-        }
-        .in_current_span(),
+        batch_misbehavior_reports(misbehavior_rx, address_book_updater.clone()).in_current_span(),
     );
 
     // Create a broadcast channel for peer inventory advertisements.

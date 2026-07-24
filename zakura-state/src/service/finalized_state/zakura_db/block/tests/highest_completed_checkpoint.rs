@@ -92,6 +92,41 @@ fn advances_after_disk_commit_and_reconstructs_after_restart() {
 }
 
 #[test]
+fn reconstructs_after_restart_before_post_write_tracker_update() {
+    let _init_guard = zakura_test::init();
+    let cache_dir = tempfile::tempdir().expect("temporary state directory is created");
+    let (genesis, headers, network) = checkpoint_chain(&[2]);
+    let config = persistent_config(cache_dir.path());
+    let mut state = state_with_genesis_config(&network, genesis.clone(), config.clone());
+    let (tracker, receiver) = HighestCompletedCheckpointTracker::open(&state);
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch(&state, genesis.hash(), &headers, &[0, 0])
+        .expect("checkpoint bracket is valid");
+    let proposal = tracker
+        .propose_after_headers(&state, genesis.hash(), &headers)
+        .expect("checkpoint proposal is valid");
+    let checkpoint_two = checkpoint(Height(2), block::Hash::from(headers[1].as_ref()));
+    assert_eq!(proposal.current(), Some(checkpoint_two));
+
+    state
+        .write_batch(batch)
+        .expect("checkpoint bracket writes durably");
+
+    // Model the process losing its in-memory state after RocksDB commits but
+    // before the write worker calls `commit_success` to publish the proposal.
+    drop(tracker);
+    drop(receiver);
+    state.shutdown(true);
+    drop(state);
+
+    let reopened = persistent_state(&config, &network);
+    let (tracker, receiver) = HighestCompletedCheckpointTracker::open(&reopened);
+    assert_eq!(tracker.current(), Some(checkpoint_two));
+    assert_eq!(*receiver.borrow(), Some(checkpoint_two));
+}
+
+#[test]
 fn reconstructs_header_completed_frontier_above_body_tip() {
     let _init_guard = zakura_test::init();
     let (genesis, headers, network) = checkpoint_chain(&[2, 5]);

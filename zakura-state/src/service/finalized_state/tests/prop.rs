@@ -1845,12 +1845,29 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 vct_fast_sync: false,
                 ..fast_config
             };
-            let mut manual = FinalizedState::new(&manual_config, &network).expect("opening an ephemeral database should succeed");
-            for i in (handoff_index + 1)..=post_handoff_tip {
+            {
+                let mut manual = FinalizedState::new(&manual_config, &network).expect("opening an ephemeral database should succeed");
+                let i = handoff_index + 1;
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 manual
-                    .commit_finalized_direct(cv.into(), None, None, "vct switch manual suffix")
-                    .expect("manual suffix commits after fast handoff");
+                    .commit_finalized_direct(
+                        cv.into(),
+                        None,
+                        None,
+                        "vct switch first manual block",
+                    )
+                    .expect("first manual block commits after fast handoff");
+            }
+
+            // Restart after the first body-derived post-handoff tree write.
+            // Reopening proves the handoff and first semantic block did not
+            // create duplicate note-commitment trees.
+            let mut manual = FinalizedState::new(&manual_config, &network).expect("database reopens after the first post-handoff block");
+            for i in (handoff_index + 2)..=post_handoff_tip {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                manual
+                    .commit_finalized_direct(cv.into(), None, None, "vct switch resumed manual suffix")
+                    .expect("manual suffix resumes after restart");
             }
             let manual_tip = manual.db.note_commitment_trees_for_tip().unwrap();
             prop_assert_eq!(manual.db.vct_anchor_digest(), golden_anchors, "fast-to-manual anchors match legacy");

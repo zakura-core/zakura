@@ -1776,6 +1776,72 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_roots_survive_restart_before_watch_publication() {
+        let cache = tempfile::tempdir().expect("temporary cache directory is created");
+        let config = Config {
+            cache_dir: cache.path().to_owned(),
+            ephemeral: false,
+            ..Config::default()
+        };
+        let (mut db, block, successor, current) = two_block_checkpoint_fixture_with_config(&config);
+        let network = db.network();
+        let completed = HighestCompletedCheckpoint {
+            height: current.completed_checkpoint_height,
+            hash: current.completed_checkpoint_hash,
+        };
+        let roots = roots_from_block(&block);
+
+        let authenticated = db
+            .authenticate_header_roots(
+                completed,
+                current,
+                current.authenticated_hash,
+                Height(1),
+                &[block.header.clone(), successor.header.clone()],
+                &[roots.clone(), roots_from_block(&successor)],
+            )
+            .expect("valid roots authenticate durably");
+
+        // Model the process losing its in-memory state after the atomic
+        // roots/frontier batch commits but before the write worker publishes
+        // the returned state.
+        db.shutdown(true);
+        drop(db);
+
+        let reopened = ZakuraDb::new(
+            &config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &network,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+        .expect("database reopens after root authentication");
+        let (tracker, _receiver) = HighestCompletedCheckpointTracker::open(&reopened);
+        let restored = reopened
+            .validate_header_root_auth_state()
+            .expect("authenticated state remains coherent")
+            .expect("authenticated frontier remains present")
+            .state(
+                tracker
+                    .current()
+                    .expect("checkpoint progress reconstructs from durable headers"),
+            );
+
+        assert_eq!(restored, authenticated.state);
+        assert_eq!(
+            reopened.commitment_roots(Height(1)),
+            Some(normalize_unauthenticated_commitment_fields(
+                &reopened.network(),
+                roots
+            ))
+        );
+    }
+
+    #[test]
     fn body_frontier_advance_moves_forward_and_preserves_newer_authentication() {
         let (db, block, _successor, current) = two_block_checkpoint_fixture();
         let mut batch = DiskWriteBatch::new();

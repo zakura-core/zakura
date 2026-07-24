@@ -26,7 +26,7 @@ use crate::common::regtest::MiningRpcMethods;
 
 const OVERSIZED_TRANSACTION_LIMIT: u64 = 1;
 const OVERSIZED_REJECTION_METRIC: &str = "mempool_rejected_transactions_total";
-const PEER_MISBEHAVIOR_FLUSH_WAIT: Duration = Duration::from_secs(40);
+const PEER_MISBEHAVIOR_FLUSH_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
 struct FundRawTransactionResponse {
@@ -305,7 +305,7 @@ pub async fn oversized_transparent_tx_rejected() -> Result<()> {
         "oversized peer transaction must not enter Zakura's mempool"
     );
 
-    // Mempool misbehavior updates are applied to the address book in 30-second batches.
+    // Misbehavior reports are applied to the address book in one-second batches.
     sleep(PEER_MISBEHAVIOR_FLUSH_WAIT).await;
     assert_eq!(
         peer_connection_identity(&single_zcashd_peer(&setup).await?)?,

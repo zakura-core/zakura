@@ -40,8 +40,8 @@ use crate::{
     peer_cache_updater::update_peer_cache_once,
     peer_set::{
         initialize::{
-            accept_inbound_connections, add_initial_peers, crawl_and_dial, open_listener,
-            DiscoveredPeer,
+            accept_inbound_connections, add_initial_peers, batch_misbehavior_reports,
+            crawl_and_dial, open_listener, DiscoveredPeer, MISBEHAVIOR_BATCH_INTERVAL,
         },
         set::MorePeers,
         ActiveConnectionCounter, CandidateSet, ConnectionTracker,
@@ -70,6 +70,56 @@ const ZCASHD_COMPAT_LISTENER_TEST_DURATION: Duration = Duration::from_millis(500
 
 /// The amount of time to make the inbound connection acceptor wait between peer connections.
 const MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS: Duration = Duration::from_millis(25);
+
+/// Misbehavior reports are coalesced per peer and flushed after one second.
+#[tokio::test(start_paused = true)]
+async fn misbehavior_reports_are_batched_for_one_second() {
+    let peer_addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let (misbehavior_tx, misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let (address_book_updater, mut address_book_updates) = tokio::sync::mpsc::channel(1);
+    let batcher = tokio::spawn(batch_misbehavior_reports(
+        misbehavior_rx,
+        address_book_updater,
+    ));
+
+    misbehavior_tx
+        .send((peer_addr, 40))
+        .await
+        .expect("misbehavior batcher is running");
+    misbehavior_tx
+        .send((peer_addr, 60))
+        .await
+        .expect("misbehavior batcher is running");
+    // The third send can complete only after the first two reports have been
+    // received from this capacity-one channel.
+    misbehavior_tx
+        .send((peer_addr, 0))
+        .await
+        .expect("misbehavior batcher is running");
+
+    tokio::time::advance(MISBEHAVIOR_BATCH_INTERVAL - Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        address_book_updates.try_recv().is_err(),
+        "misbehavior reports must remain batched before the interval elapses"
+    );
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let update = address_book_updates
+        .recv()
+        .await
+        .expect("misbehavior batcher should flush an address book update");
+    assert_eq!(update.addr(), peer_addr);
+    assert_eq!(
+        update.misbehavior_score(),
+        constants::MAX_PEER_MISBEHAVIOR_SCORE
+    );
+
+    drop(misbehavior_tx);
+    batcher
+        .await
+        .expect("misbehavior batcher task should not panic");
+}
 
 /// Test that zakura-network discovers dynamic bind-to-all-interfaces listener ports,
 /// and sends them to the `AddressBook`.

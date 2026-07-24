@@ -83,7 +83,10 @@ fn address_book(c: &mut Criterion) {
         let mut insert_check = address_book.clone();
         let insert_change = MetaAddr::new_initial_peer(new_addr);
         assert!(insert_check.update(insert_change).is_some());
-        assert_eq!(insert_check.len(), size);
+        assert_eq!(
+            insert_check.len(),
+            (size + 1).min(MAX_ADDRS_IN_ADDRESS_BOOK)
+        );
 
         let mut ban_check = address_book.clone();
         let ban_change = MetaAddr::new_misbehavior(existing_addr, MAX_PEER_MISBEHAVIOR_SCORE);
@@ -131,20 +134,16 @@ fn address_book(c: &mut Criterion) {
             },
         );
 
-        group.bench_with_input(
-            BenchmarkId::new("insert_and_evict", size),
-            &size,
-            |b, _size| {
-                b.iter_batched_ref(
-                    || address_book.clone(),
-                    |address_book| {
-                        let change = MetaAddr::new_initial_peer(black_box(new_addr));
-                        black_box(address_book.update(change))
-                    },
-                    BatchSize::PerIteration,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("insert_peer", size), &size, |b, _size| {
+            b.iter_batched_ref(
+                || address_book.clone(),
+                |address_book| {
+                    let change = MetaAddr::new_initial_peer(black_box(new_addr));
+                    black_box(address_book.update(change))
+                },
+                BatchSize::PerIteration,
+            );
+        });
 
         group.bench_with_input(
             BenchmarkId::new("ban_ip_with_16_addresses", size),

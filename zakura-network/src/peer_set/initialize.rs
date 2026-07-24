@@ -712,6 +712,9 @@ pub(crate) async fn open_listener(config: &Config) -> (TcpListener, SocketAddr) 
     (listener, local_addr)
 }
 
+const MAX_INBOUND_ACCEPT_BURST: u32 = 16;
+const MIN_INBOUND_ACCEPT_BURST_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Listens for peer connections on `addr`, then sets up each connection as a
 /// Zcash peer.
 ///
@@ -720,6 +723,10 @@ pub(crate) async fn open_listener(config: &Config) -> (TcpListener, SocketAddr) 
 ///
 /// Limits the number of active inbound connections based on `config`,
 /// and waits `min_inbound_peer_connection_interval` between connections.
+///
+/// A bounded accept burst drains connections that are already queued by the
+/// kernel. Without it, the normal one-second handshake pacing can keep a full
+/// listen backlog from ever reaching a configured local sidecar connection.
 #[instrument(skip(config, listener, handshaker, peerset_tx), fields(listener_addr = ?listener.local_addr()))]
 async fn accept_inbound_connections<S>(
     config: Config,
@@ -760,18 +767,25 @@ where
     // Keeping an unresolved future in the pool means the stream never terminates.
     handshakes.push(future::pending().boxed());
 
+    let mut prefetched_inbound = None;
+    let mut accept_burst_len = 0u32;
+
     loop {
         // Check for panics in finished tasks, before accepting new connections
-        let inbound_result = tokio::select! {
-            biased;
-            next_handshake_res = handshakes.next() => match next_handshake_res {
-                // The task has already sent the peer change to the peer set.
-                Some(()) => continue,
-                None => unreachable!("handshakes never terminates, because it contains a future that never resolves"),
-            },
+        let inbound_result = if let Some(inbound_result) = prefetched_inbound.take() {
+            inbound_result
+        } else {
+            tokio::select! {
+                biased;
+                next_handshake_res = handshakes.next() => match next_handshake_res {
+                    // The task has already sent the peer change to the peer set.
+                    Some(()) => continue,
+                    None => unreachable!("handshakes never terminates, because it contains a future that never resolves"),
+                },
 
-            // This future must wait until new connections are available: it can't have a timeout.
-            inbound_result = listener.accept() => inbound_result,
+                // This future must wait until new connections are available: it can't have a timeout.
+                inbound_result = listener.accept() => inbound_result,
+            }
         };
 
         if let Ok((tcp_stream, addr)) = inbound_result {
@@ -846,16 +860,29 @@ where
 
             handshakes.push(handshake_task);
 
-            // Rate-limit inbound connection handshakes.
-            // But sleep longer after a successful connection,
-            // so we can clear out failed connections at a higher rate.
-            //
-            // If there is a flood of connections,
-            // this stops Zebra overloading the network with handshake data.
-            //
-            // Zebra can't control how many queued connections are waiting,
-            // but most OSes also limit the number of queued inbound connections on a listener port.
-            tokio::time::sleep(min_inbound_peer_connection_interval).await;
+            // Poll once to detect and retain a connection already queued by the kernel.
+            // Keeping that result lets us drain a bounded burst without racing or losing it.
+            let accept_ready = if let Some(inbound_result) = listener.accept().now_or_never() {
+                prefetched_inbound = Some(inbound_result);
+                accept_burst_len += 1;
+                true
+            } else {
+                accept_burst_len = 0;
+                false
+            };
+
+            // Configured sidecars skip pacing so a drained backlog connection can
+            // complete handshake promptly.
+            if !is_zcashd_compat_peer {
+                if accept_ready && accept_burst_len < MAX_INBOUND_ACCEPT_BURST {
+                    tokio::time::sleep(MIN_INBOUND_ACCEPT_BURST_INTERVAL).await;
+                } else {
+                    accept_burst_len = 0;
+                    // Rate-limit successful public handshakes when no backlog is
+                    // visible, and after each bounded drain burst.
+                    tokio::time::sleep(min_inbound_peer_connection_interval).await;
+                }
+            }
         } else {
             // Allow invalid connections to be cleared quickly,
             // but still put a limit on our CPU and network usage from failed connections.

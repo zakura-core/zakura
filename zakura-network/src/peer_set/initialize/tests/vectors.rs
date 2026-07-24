@@ -1091,6 +1091,160 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
     std::mem::drop(second_connection);
 }
 
+/// Test configured zcashd-compat reconnects bypass the normal
+/// successful-handshake delay.
+#[tokio::test]
+async fn listener_zcashd_compat_accept_bypasses_success_delay() {
+    let _init_guard = zakura_test::init();
+
+    if zakura_test::net::zebra_skip_network_tests() {
+        return;
+    }
+
+    let zcashd_compat_ip = Ipv4Addr::LOCALHOST;
+    let (handshake_finished_tx, mut handshake_finished_rx) = tokio::sync::mpsc::unbounded_channel();
+    let success_disconnect_inbound_handshaker =
+        service_fn(move |req: HandshakeRequest<TcpStream>| {
+            let handshake_finished_tx = handshake_finished_tx.clone();
+            async move {
+                let HandshakeRequest {
+                    data_stream: tcp_stream,
+                    connected_addr,
+                    connection_tracker,
+                } = req;
+                let (fake_client, _harness) = ClientTestHarness::build()
+                    .with_connected_addr(connected_addr)
+                    .finish();
+                handshake_finished_tx
+                    .send(())
+                    .expect("test receiver should remain open");
+                std::mem::drop(connection_tracker);
+                std::mem::drop(tcp_stream);
+
+                Ok(fake_client)
+            }
+        });
+
+    let mut config = Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        peerset_initial_target_size: 2,
+        max_connections_per_ip: usize::MAX,
+        ..Config::default()
+    };
+    let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
+    config.listen_addr = listen_addr;
+    let (peerset_tx, _peerset_rx) = mpsc::channel::<DiscoveredPeer>(2);
+
+    // Queue two sidecar connections before starting the accept loop. The first
+    // handshake must not impose the normal one-second delay on the reconnect.
+    let first_connection = connect_from(zcashd_compat_ip, listen_addr).await;
+    let second_connection = connect_from(zcashd_compat_ip, listen_addr).await;
+
+    let listen_task_handle = tokio::spawn(accept_inbound_connections(
+        config,
+        tcp_listener,
+        Duration::from_secs(1),
+        success_disconnect_inbound_handshaker,
+        peerset_tx,
+        BannedIps::default(),
+        vec![zcashd_compat_ip.into()],
+    ));
+
+    tokio::time::timeout(Duration::from_millis(250), async {
+        for _ in 0..2 {
+            handshake_finished_rx
+                .recv()
+                .await
+                .expect("listener should finish both sidecar handshakes");
+        }
+    })
+    .await
+    .expect("configured sidecar reconnect should bypass the one-second delay");
+
+    listen_task_handle.abort();
+    tokio::task::yield_now().await;
+    assert_listener_task_cancelled(listen_task_handle);
+    std::mem::drop(first_connection);
+    std::mem::drop(second_connection);
+}
+
+/// Test a queued burst of successful public handshakes is drained using short
+/// pacing instead of applying the full success delay to every connection.
+#[tokio::test]
+async fn listener_drains_ready_accept_burst_with_short_pacing() {
+    let _init_guard = zakura_test::init();
+
+    if zakura_test::net::zebra_skip_network_tests() {
+        return;
+    }
+
+    const BURST_CONNECTIONS: usize = 8;
+
+    let (handshake_finished_tx, mut handshake_finished_rx) = tokio::sync::mpsc::unbounded_channel();
+    let success_disconnect_inbound_handshaker =
+        service_fn(move |req: HandshakeRequest<TcpStream>| {
+            let handshake_finished_tx = handshake_finished_tx.clone();
+            async move {
+                let HandshakeRequest {
+                    data_stream: tcp_stream,
+                    connected_addr,
+                    connection_tracker,
+                } = req;
+                let (fake_client, _harness) = ClientTestHarness::build()
+                    .with_connected_addr(connected_addr)
+                    .finish();
+                handshake_finished_tx
+                    .send(())
+                    .expect("test receiver should remain open");
+                std::mem::drop(connection_tracker);
+                std::mem::drop(tcp_stream);
+
+                Ok(fake_client)
+            }
+        });
+
+    let mut config = Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        peerset_initial_target_size: BURST_CONNECTIONS,
+        max_connections_per_ip: usize::MAX,
+        ..Config::default()
+    };
+    let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
+    config.listen_addr = listen_addr;
+    let (peerset_tx, _peerset_rx) = mpsc::channel::<DiscoveredPeer>(BURST_CONNECTIONS);
+
+    let mut public_connections = Vec::new();
+    for _ in 0..BURST_CONNECTIONS {
+        public_connections.push(connect_from(Ipv4Addr::LOCALHOST, listen_addr).await);
+    }
+
+    let listen_task_handle = tokio::spawn(accept_inbound_connections(
+        config,
+        tcp_listener,
+        Duration::from_secs(1),
+        success_disconnect_inbound_handshaker,
+        peerset_tx,
+        BannedIps::default(),
+        Vec::new(),
+    ));
+
+    tokio::time::timeout(Duration::from_millis(1_500), async {
+        for _ in 0..BURST_CONNECTIONS {
+            handshake_finished_rx
+                .recv()
+                .await
+                .expect("listener should finish every queued handshake");
+        }
+    })
+    .await
+    .expect("ready accept burst should not incur one full delay per connection");
+
+    listen_task_handle.abort();
+    tokio::task::yield_now().await;
+    assert_listener_task_cancelled(listen_task_handle);
+    std::mem::drop(public_connections);
+}
+
 /// Test bans are applied before the zcashd-compat reserved slot.
 #[tokio::test]
 async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {

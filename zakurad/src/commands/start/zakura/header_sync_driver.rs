@@ -1818,6 +1818,10 @@ pub(crate) fn header_range_commit_failure_kind(
         // store's own linkage check failing means the local anchor/response pairing
         // went wrong, not that the peer misbehaved.
         | zakura_state::CommitHeaderRangeError::UnlinkedRange { .. }
+        // The requested anchor is chosen from our own published header frontier.
+        // If state cannot resolve it, our local frontier and durable header view
+        // disagree; the peer did not choose that anchor.
+        | zakura_state::CommitHeaderRangeError::UnknownAnchor { .. }
         // Store incoherence is by definition a local storage fault: the range was
         // rejected because our own header rows failed a linkage/bijection check
         // while reading validation context, not because the peer's range was shown
@@ -1832,7 +1836,6 @@ pub(crate) fn header_range_commit_failure_kind(
         | zakura_state::CommitHeaderRangeError::BodySizeCountMismatch { .. }
         | zakura_state::CommitHeaderRangeError::TreeAuxRootCountMismatch { .. }
         | zakura_state::CommitHeaderRangeError::TreeAuxRootHeightMismatch { .. }
-        | zakura_state::CommitHeaderRangeError::UnknownAnchor { .. }
         | zakura_state::CommitHeaderRangeError::HeightOverflow
         | zakura_state::CommitHeaderRangeError::ImmutableConflict { .. }
         | zakura_state::CommitHeaderRangeError::ReorgTooDeep { .. }
@@ -2070,6 +2073,25 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
                         insert_cs_str(row, cs_trace::RESULT, "found");
                     },
                 );
+                if !durable_header_matches(read_state.clone(), height, hash).await {
+                    debug!(
+                        ?height,
+                        ?hash,
+                        "not advancing Zakura header sync to a full block until its header is durable"
+                    );
+                    emit_commit_state(
+                        &trace,
+                        cs_trace::STATE_READ_SUCCESS,
+                        "chain_tip_mirror",
+                        |row| {
+                            insert_cs_str(row, cs_trace::ACTION, "durable_tip_header");
+                            insert_cs_height(row, cs_trace::HEIGHT, height);
+                            insert_cs_hash(row, cs_trace::HASH, hash);
+                            insert_cs_str(row, cs_trace::RESULT, "missing");
+                        },
+                    );
+                    continue;
+                }
                 let _ = header_sync
                     .send(HeaderSyncEvent::FullBlockCommitted { height, hash })
                     .await;
@@ -2126,6 +2148,56 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
                 );
                 warn!(?error, "failed to mirror Zakura full-block commit")
             }
+        }
+    }
+}
+
+pub(crate) async fn durable_header_matches<ReadState>(
+    read_state: ReadState,
+    height: block::Height,
+    hash: block::Hash,
+) -> bool
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    match read_state
+        .oneshot(zakura_state::ReadRequest::HeadersByHeightRange {
+            start: height,
+            count: 1,
+        })
+        .await
+    {
+        Ok(zakura_state::ReadResponse::Headers(headers)) => {
+            headers
+                .first()
+                .is_some_and(|(stored_height, stored_hash, _)| {
+                    *stored_height == height && *stored_hash == hash
+                })
+        }
+        Ok(response) => {
+            warn!(
+                ?height,
+                ?hash,
+                ?response,
+                "unexpected durable header lookup response"
+            );
+            false
+        }
+        Err(error) => {
+            warn!(
+                ?height,
+                ?hash,
+                ?error,
+                "failed to confirm that a full block header is durable"
+            );
+            false
         }
     }
 }

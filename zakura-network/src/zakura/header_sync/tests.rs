@@ -4385,6 +4385,28 @@ async fn reactor_starts_from_storage_frontiers_and_publishes_watch() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn reactor_starts_from_durable_header_tip_when_verified_body_is_ahead() {
+    let network = regtest_network();
+    let durable = (block::Height(4), block::Hash([4; 32]));
+    let startup = HeaderSyncStartup::new(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        HeaderSyncFrontiers {
+            finalized_height: block::Height(2),
+            verified_block_tip: block::Height(5),
+            verified_block_hash: block::Hash([5; 32]),
+        },
+        Some(durable),
+        ZakuraHeaderSyncConfig::default(),
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+    let fixture = spawn_test_reactor(startup);
+
+    assert_eq!(fixture.handle.best_header_tip(), durable);
+    assert_eq!(*fixture.handle.subscribe_tip().borrow(), durable);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn restart_rebuilds_schedule_from_durable_best_tip_and_peer_status() {
     let network = regtest_network();
     let best = (block::Height(4), block::Hash([4; 32]));

@@ -64,17 +64,11 @@ impl HeaderSyncCore {
                 verified_block_tip: startup.frontiers.verified_block_tip,
             });
         }
-        let (best_header_tip, best_header_hash) = startup
-            .best_header_tip
-            .filter(|(height, hash)| {
-                *height > startup.frontiers.verified_block_tip
-                    || (*height == startup.frontiers.verified_block_tip
-                        && *hash == startup.frontiers.verified_block_hash)
-            })
-            .unwrap_or((
-                startup.frontiers.verified_block_tip,
-                startup.frontiers.verified_block_hash,
-            ));
+        // Header range commits can only anchor to the durable header view. In
+        // particular, a restored non-finalized body tip can be ahead of that
+        // view, so using the verified-body frontier here would make the first
+        // post-restart range fail with `UnknownAnchor`.
+        let (best_header_tip, best_header_hash) = startup.best_header_tip.unwrap_or(startup.anchor);
         let body_sync_target =
             startup
                 .header_root_auth

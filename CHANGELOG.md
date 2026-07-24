@@ -43,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Re-admit deferred or ended ordered service streams on existing healthy
+  connections. Block sync resumes after no-progress cooldowns when body work
+  exists, header sync wakes when advisory backoff expires, retry scheduling is
+  bounded, and negotiated streams respect aggregate inbound queue limits
+  ([#166](https://github.com/zakura-core/zakura/pull/166)).
 - Treat IPv4 and IPv4-mapped IPv6 peer addresses as the same address when
   enforcing bans, inbound rate limits, and per-IP connection limits, preventing
   peers from bypassing them through the alternate representation

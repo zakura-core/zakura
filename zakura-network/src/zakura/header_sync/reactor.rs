@@ -46,12 +46,14 @@ pub fn spawn_header_sync_reactor(
         admitted_node_ids: Vec::new(),
         backed_off_node_ids: Vec::new(),
     });
+    let (backoff_deadlines_tx, backoff_deadlines_rx) = watch::channel(Vec::new());
     let handle = HeaderSyncHandle {
         events: events_tx,
         lifecycle: lifecycle_tx,
         tip: tip_rx,
         peers: peers_rx,
         candidates: candidates_rx,
+        backoff_deadlines: backoff_deadlines_rx,
     };
     let reactor = HeaderSyncReactor {
         startup,
@@ -68,6 +70,7 @@ pub fn spawn_header_sync_reactor(
         tip: tip_tx,
         peers: peers_tx,
         candidates: candidates_tx,
+        backoff_deadlines: backoff_deadlines_tx,
         root_auth_trace_snapshot: None,
     };
     let task = tokio::spawn(reactor.run());
@@ -91,6 +94,7 @@ pub(super) struct HeaderSyncReactor {
     tip: watch::Sender<(block::Height, block::Hash)>,
     peers: watch::Sender<ServicePeerSnapshot>,
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
+    backoff_deadlines: watch::Sender<Vec<(NodeId, std::time::Instant)>>,
     root_auth_trace_snapshot: Option<RootAuthTraceSnapshot>,
 }
 
@@ -245,6 +249,7 @@ impl HeaderSyncReactor {
         metrics::counter!("sync.header.reactor.event_started", "kind" => "tick").increment(1);
         self.handle_timeouts().await;
         self.refresh_statuses();
+        self.publish_candidate_state();
         self.publish_connectivity_metrics();
         metrics::counter!("sync.header.reactor.event_finished", "kind" => "tick").increment(1);
     }
@@ -646,24 +651,49 @@ impl HeaderSyncReactor {
         admitted_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         admitted_node_ids.dedup();
 
-        let mut backed_off_node_ids: Vec<_> = self
+        let mut backed_off_until: Vec<_> = self
             .state
             .advisory
             .iter()
             .filter_map(|(peer, advisory)| {
-                advisory
-                    .is_backed_off(now)
-                    .then(|| node_id_from_header_peer_id(peer))
-                    .flatten()
+                if !advisory.is_backed_off(now) {
+                    return None;
+                }
+                let until = advisory.backoff_until?;
+                Some((node_id_from_header_peer_id(peer)?, until.into_std()))
             })
             .collect();
-        backed_off_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-        backed_off_node_ids.dedup();
+        backed_off_until.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        backed_off_until.dedup_by_key(|(node_id, _)| *node_id);
+        let backed_off_node_ids: Vec<_> = backed_off_until
+            .iter()
+            .map(|(node_id, _)| *node_id)
+            .collect();
 
-        let _ = self.candidates.send(ZakuraHeaderSyncCandidateState {
+        // The real per-peer expiries ride a separate internal channel so the
+        // ordered-session demand can wake at the reactor's deadline instead of
+        // inventing one at sampling time.
+        self.backoff_deadlines.send_if_modified(|current| {
+            if *current == backed_off_until {
+                return false;
+            }
+
+            *current = backed_off_until;
+            true
+        });
+
+        let candidate_state = ZakuraHeaderSyncCandidateState {
             target_height: header_sync_candidate_target(self.state.best_header_tip),
             admitted_node_ids,
             backed_off_node_ids,
+        };
+        self.candidates.send_if_modified(|current| {
+            if *current == candidate_state {
+                return false;
+            }
+
+            *current = candidate_state;
+            true
         });
     }
 
@@ -2736,6 +2766,12 @@ impl HeaderSyncReactor {
 
         if let Some(retry) = self.state.schedule.next_retry_deadline() {
             deadline = deadline.min(retry);
+        }
+        for advisory in self.state.advisory.values() {
+            deadline = deadline.min(advisory.observed_at + HEADER_SYNC_ADVISORY_TTL);
+            if let Some(backoff_until) = advisory.backoff_until {
+                deadline = deadline.min(backoff_until);
+            }
         }
         for peer in self.state.peers.values() {
             if let Some(request_deadline) = peer

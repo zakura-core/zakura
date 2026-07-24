@@ -47,6 +47,7 @@ async fn run_checked(
         final_active_pipeline_decoded_attributed_memory_bytes =
             report.final_active_pipeline_decoded_attributed_memory_bytes,
         protocol_rejects = report.protocol_rejects,
+        session_parks = report.session_parks,
         floor_bypass_requests = report.floor_bypass_requests,
         total_requests = report.total_requests,
         max_requests_without_block_progress = report.max_requests_without_block_progress,
@@ -118,8 +119,8 @@ async fn fuzz_steady_bytes_unit() {
 /// carriers, in the single-block-per-request production regime. The floor must ride the
 /// carriers (the slow peer's higher RTprop defers it off the floor on the normal take
 /// path) while the slow peer is **kept, not reaped** — it serves a body roughly every
-/// 0.5 s, well inside the liveness window, so disconnecting it would throw away real
-/// bandwidth for no floor benefit. Asserts convergence and zero reaper disconnects; the
+/// 0.5 s, well inside the liveness window, so parking it would throw away real
+/// bandwidth for no floor benefit. Asserts convergence and zero liveness parks; the
 /// floor-HoL p99 itself is the live-trace metric.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_one_slow_peer_hol() {
@@ -154,8 +155,9 @@ async fn fuzz_one_slow_peer_hol() {
 
     // Directive #1: a peer delivering at a slow-but-steady cadence is never kicked.
     assert_eq!(
-        report.protocol_rejects, 0,
-        "the slow-but-progressing peer must not be reaped (it serves ~every 0.5 s)",
+        (report.protocol_rejects, report.session_parks),
+        (0, 0),
+        "the slow-but-progressing peer must not be rejected or parked (it serves ~every 0.5 s)",
     );
 }
 
@@ -314,8 +316,8 @@ async fn fuzz_reliability_discounts_dropping_carrier() {
 }
 
 /// Fully silent carrier: one peer accepts status and `GetBlocks` but never sends any
-/// block-sync response. The node must cap requests to that peer, disconnect it via
-/// no-progress liveness, then finish through a healthy peer.
+/// block-sync response. The node must cap requests to that peer, park its block-sync
+/// session via no-progress liveness, then finish through a healthy peer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_silent_peer_request_cap() {
     let blocks = 96;
@@ -349,8 +351,12 @@ async fn fuzz_silent_peer_request_cap() {
     let (_, report) = run_checked("fuzz_silent_peer_request_cap", scenario, 32).await;
 
     assert!(
-        report.protocol_rejects >= 1,
-        "the fully silent peer must be disconnected by no-progress liveness",
+        report.session_parks >= 1,
+        "the fully silent peer's block-sync session must be parked by no-progress liveness",
+    );
+    assert_eq!(
+        report.protocol_rejects, 0,
+        "no-progress liveness is not a protocol reject",
     );
     assert_eq!(
         report.max_unproven_requests_without_block_progress,
@@ -373,11 +379,11 @@ fn degrade_config() -> ZakuraBlockSyncConfig {
     }
 }
 
-/// Requirement — a peer that WEDGES after making progress is disconnected. The carrier
+/// Requirement — a peer that WEDGES after making progress is locally parked. The carrier
 /// serves normally at first (proving progress, so its no-progress cap opens to the
 /// larger proven budget), then goes silent mid-run. The failure mechanism must still
 /// seal it (reliability ramps toward zero → zero cwnd, no new work) and the liveness
-/// timer must then disconnect it — its early progress must not buy it immunity. A second
+/// timer must then park it — its early progress must not buy it immunity. A second
 /// peer, connecting after the wedge, finishes the sync, proving the wedge did not stall
 /// the chain.
 ///
@@ -385,7 +391,7 @@ fn degrade_config() -> ZakuraBlockSyncConfig {
 /// start, never proving progress): here the peer is *proven* when it wedges, the harder
 /// case the ramp-to-zero seal exists for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fuzz_peer_wedges_after_progress_is_disconnected() {
+async fn fuzz_peer_wedges_after_progress_is_parked() {
     let blocks = 400;
     // A carrier that serves at a finite rate (so it only gets partway through the chain),
     // then wedges (drops everything) 250 ms in — long enough to deliver a run of bodies
@@ -403,7 +409,7 @@ async fn fuzz_peer_wedges_after_progress_is_disconnected() {
         },
     );
     // A healthy peer that joins only after the wedge has been detected and the waverer
-    // disconnected (liveness = request_timeout × 4 = 400 ms, so ~650 ms after the ~250 ms
+    // parked (liveness = request_timeout × 4 = 400 ms, so ~650 ms after the ~250 ms
     // last body), then finishes the remaining heights.
     let mut healthy = PeerSpec::fast(2, target(blocks));
     healthy.connect_at = Duration::from_millis(1_200);
@@ -416,24 +422,23 @@ async fn fuzz_peer_wedges_after_progress_is_disconnected() {
     );
     scenario.target_block_bytes = Some(16 * 1024);
     scenario.deadline = Duration::from_secs(20);
-    let (_, report) = run_checked(
-        "fuzz_peer_wedges_after_progress_is_disconnected",
-        scenario,
-        32,
-    )
-    .await;
+    let (_, report) = run_checked("fuzz_peer_wedges_after_progress_is_parked", scenario, 32).await;
 
-    // The wedged (but previously-progressing) peer must be disconnected by liveness.
+    // The wedged (but previously-progressing) peer must be parked by liveness.
     assert!(
-        report.protocol_rejects >= 1,
-        "a peer that wedges after making progress must be disconnected, got {} rejects",
-        report.protocol_rejects,
+        report.session_parks >= 1,
+        "a peer that wedges after making progress must be parked, got {} parks",
+        report.session_parks,
+    );
+    assert_eq!(
+        report.protocol_rejects, 0,
+        "a no-progress wedge is not a protocol reject",
     );
     // It was *proven* when it wedged: its no-progress streak was allowed past the single
     // initial probe (the proven cap), distinguishing this from the never-proved case.
     assert!(
         report.max_requests_without_block_progress >= 2,
-        "the disconnected peer should have been proven (streak past the initial probe), got {}",
+        "the parked peer should have been proven (streak past the initial probe), got {}",
         report.max_requests_without_block_progress,
     );
     // The reliability seal engaged (the discount folded the drops in on the way down).
@@ -445,28 +450,28 @@ async fn fuzz_peer_wedges_after_progress_is_disconnected() {
 }
 
 /// Requirement — a peer that WEDGES by *no longer reading our stream* (not merely going
-/// silent) must still be disconnected at the liveness deadline. When a peer stops draining
+/// silent) must still be parked at the liveness deadline. When a peer stops draining
 /// our bounded outbound queue, `outbound_capacity()` falls to zero and stays there. The old
-/// liveness escape (`Disconnect if outbound_capacity() == 0 → extend`) treated that as our
+/// liveness escape (`Park if outbound_capacity() == 0 → extend`) treated that as our
 /// own write congestion and extended the deadline *every* time, indefinitely — so a wedged
 /// peer survived until the ~180 s transport idle timeout while we kept queuing requests it
 /// never read. The bounded grace fixes this: once our outbound has been continuously full
-/// for `request_timeout`, the peer is disconnected at the liveness deadline regardless.
+/// for `request_timeout`, the block-sync session is parked at the liveness deadline.
 ///
-/// This is the distinct counterpart to `fuzz_peer_wedges_after_progress_is_disconnected`
+/// This is the distinct counterpart to `fuzz_peer_wedges_after_progress_is_parked`
 /// (which uses `GoSilent`: the peer keeps *reading* and so never fills our outbound, taking
-/// the normal disconnect arm). Here the peer stops reading, so the run exercises the escape
+/// the normal park arm). Here the peer stops reading, so the run exercises the escape
 /// arm specifically. A small transport queue depth makes the outbound fill quickly (the
 /// default 1024 is too large for the node to ever fill given the no-progress cap — which is
 /// exactly why this bug was invisible to the earlier tests).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fuzz_peer_that_stops_reading_is_disconnected() {
+async fn fuzz_peer_that_stops_reading_is_parked() {
     let blocks = 400;
     // A proven carrier that serves at a finite rate, then stops reading our stream entirely
     // 250 ms in — a truly stuck connection. By then it has delivered a run of bodies, so it
     // is *proven* (its no-progress cap is the larger proven budget), the harder case. It is
     // the only peer: the chain cannot complete once it wedges, and it is not meant to — the
-    // property under test is the disconnect. `fuzz_peer_wedges_after_progress_is_disconnected`
+    // property under test is the park. `fuzz_peer_wedges_after_progress_is_parked`
     // (a `GoSilent` peer that keeps reading) already covers a healthy peer finishing the
     // chain after a wedge.
     let wedger = PeerSpec::with_serve(
@@ -493,9 +498,9 @@ async fn fuzz_peer_that_stops_reading_is_disconnected() {
     scenario.deadline = Duration::from_secs(5);
 
     // Run WITHOUT the reach-the-target assertion (a lone wedged peer cannot finish the chain);
-    // assert the disconnect directly from the report.
+    // assert the park directly from the report.
     let (mut capture, trace) =
-        run_trace("fuzz_peer_that_stops_reading_is_disconnected").expect("trace capture opens");
+        run_trace("fuzz_peer_that_stops_reading_is_parked").expect("trace capture opens");
     let _outcome = run_scenario(&scenario, trace)
         .await
         .expect("scenario runs without harness error");
@@ -506,20 +511,24 @@ async fn fuzz_peer_that_stops_reading_is_disconnected() {
     let report = invariant_report(&reader);
     capture.finish().await.expect("capture discards cleanly");
 
-    // The wedged, non-reading peer must be disconnected — even though our outbound to it is
+    // The wedged, non-reading peer must be parked — even though our outbound to it is
     // full (its stream unread). With the old unbounded escape this is 0 (extend forever until
     // the ~180 s transport idle timeout): the teeth of the fix.
     assert!(
-        report.protocol_rejects >= 1,
-        "a peer that stops reading our stream must still be disconnected at the liveness \
-         deadline, got {} rejects",
-        report.protocol_rejects,
+        report.session_parks >= 1,
+        "a peer that stops reading our stream must still be parked at the liveness \
+         deadline, got {} parks",
+        report.session_parks,
+    );
+    assert_eq!(
+        report.protocol_rejects, 0,
+        "a non-reading peer's no-progress park is not a protocol reject",
     );
     // It was proven when it wedged (streak past the single initial probe), so this is the
     // harder proven-peer case, not the never-proved one.
     assert!(
         report.max_requests_without_block_progress >= 2,
-        "the disconnected peer should have been proven, got {}",
+        "the parked peer should have been proven, got {}",
         report.max_requests_without_block_progress,
     );
 }
@@ -528,7 +537,7 @@ async fn fuzz_peer_that_stops_reading_is_disconnected() {
 /// not kicked; its params just adapt. A single full-range carrier serves fast, then
 /// drops to a low finite bandwidth behind a high base RTT partway through. Because it is
 /// the *only* peer, the run reaches the target **iff** the node keeps it: a wrongful
-/// disconnect (mistaking slow-but-delivering for wedged) would stall the sync. The
+/// park (mistaking slow-but-delivering for wedged) would stall the sync. The
 /// windowed-estimator freshness fix is what keeps its now-slow deliveries inside the
 /// (bandwidth-aware) request deadline instead of timing out on a stale-fast estimate and
 /// collapsing its reliability.
@@ -573,10 +582,11 @@ async fn fuzz_peer_slows_radically_is_kept() {
     let (_, report) = run_checked("fuzz_peer_slows_radically_is_kept", scenario, 32).await;
 
     // The lone slow-but-delivering peer must be kept: reaching the target (asserted in
-    // `run_checked`) already proves it, and there must be zero disconnects.
+    // `run_checked`) already proves it, and there must be zero parks.
     assert_eq!(
-        report.protocol_rejects, 0,
-        "a peer that only slowed down (still delivering) must not be disconnected",
+        (report.protocol_rejects, report.session_parks),
+        (0, 0),
+        "a peer that only slowed down (still delivering) must not be rejected or parked",
     );
     // It kept delivering, so it was never sealed off like a dropper: its reliability
     // recovers to a healthy settled band (late bodies credit back transition timeouts),

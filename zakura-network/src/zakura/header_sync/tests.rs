@@ -8,8 +8,8 @@ use super::{
     state::{
         BufferedHeaderRange, HeaderSyncCore, OutstandingPhase, OutstandingRange, PendingOperation,
         PendingRootAuth, RangePriority, RangePurpose, RangeRequest, RootAuthSource, VctRootRepair,
-        RETAINED_ROOT_LOCAL_MAX_ATTEMPTS, ROOT_AUTH_MIN_BODY_LEAD, VCT_ROOT_REPAIR_BACKOFFS,
-        VCT_ROOT_REPAIR_MAX_WALL_TIME,
+        HEADER_SYNC_ADVISORY_BACKOFF, RETAINED_ROOT_LOCAL_MAX_ATTEMPTS, ROOT_AUTH_MIN_BODY_LEAD,
+        VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME,
     },
     validation::*,
     wire::*,
@@ -19,8 +19,9 @@ use crate::zakura::{
     framed_channel,
     testkit::{TraceCapture, TraceValue},
     trace::{header_sync_trace as hs_trace, HEADER_SYNC_TABLE},
-    FramedSend, HeaderSyncServiceSummary, Peer, Service, ServicePeerDirection, ServicePeerLimits,
-    ServicePeerSnapshot, ZakuraConnId, ZakuraHeaderSyncCandidateState, ZAKURA_CAP_HEADER_SYNC,
+    FramedSend, HeaderSyncServiceSummary, OrderedSessionDemand, Peer, Service,
+    ServicePeerDirection, ServicePeerLimits, ServicePeerSnapshot, ZakuraConnId,
+    ZakuraHeaderSyncCandidateState, ZAKURA_CAP_HEADER_SYNC,
 };
 use chrono::Duration;
 use metrics::{
@@ -2147,6 +2148,87 @@ async fn advisory_summary_status_mismatch_uses_status_without_misbehavior_and_ba
     assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn advisory_backoff_expiry_reopens_demand_without_an_unrelated_event() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let (peer_id, peer_node_id) = node_peer();
+    let mut candidates = fixture.handle.subscribe_candidate_state();
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::AdvisoryHeaderSummary {
+            peer: peer_id.clone(),
+            summary: advisory_header_summary(block::Height(10), 1),
+        })
+        .await
+        .unwrap();
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(1),
+        1,
+        1,
+    )
+    .await;
+
+    let (requested_peer, request_id, _, _) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, peer_id);
+    send_headers(&fixture, &peer_id, request_id, headers_message(Vec::new())).await;
+    while !candidates
+        .borrow_and_update()
+        .backed_off_node_ids
+        .contains(&peer_node_id)
+    {
+        candidates
+            .changed()
+            .await
+            .expect("the header-sync reactor keeps candidate state open");
+    }
+
+    let service = HeaderSyncService::new(fixture.handle.clone());
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer_id,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::RetryAt(_)
+    ));
+
+    tokio::time::advance(HEADER_SYNC_ADVISORY_BACKOFF).await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while candidates
+            .borrow_and_update()
+            .backed_off_node_ids
+            .contains(&peer_node_id)
+        {
+            candidates
+                .changed()
+                .await
+                .expect("the header-sync reactor keeps candidate state open");
+        }
+    })
+    .await
+    .expect("the advisory deadline publishes candidate expiry");
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer_id,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::OpenNow
+    ));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn advisory_backoff_is_pruned_on_peer_disconnected() {
     let network = regtest_network();
@@ -3376,6 +3458,8 @@ fn test_header_sync_handle() -> (HeaderSyncHandle, mpsc::UnboundedReceiver<Heade
     let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
     let (_candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
     (
         HeaderSyncHandle {
             events,
@@ -3383,9 +3467,300 @@ fn test_header_sync_handle() -> (HeaderSyncHandle, mpsc::UnboundedReceiver<Heade
             tip,
             peers,
             candidates,
+            backoff_deadlines,
         },
         lifecycle_rx,
     )
+}
+
+#[test]
+fn ordered_session_demand_bounds_advisory_backoff_and_waits_for_slots() {
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+        backoff_deadlines,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer, node_id) = node_peer();
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        backed_off_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+
+    let before = std::time::Instant::now();
+    let demand = service.ordered_session_demand(
+        1,
+        &peer,
+        ZAKURA_CAP_HEADER_SYNC,
+        ServicePeerDirection::Outbound,
+    );
+    let OrderedSessionDemand::RetryAt(retry_at) = demand else {
+        panic!("an advisory-backed-off candidate must use a bounded retry");
+    };
+    let after = std::time::Instant::now();
+    assert!(retry_at >= before + HEADER_SYNC_ADVISORY_BACKOFF);
+    assert!(retry_at <= after + HEADER_SYNC_ADVISORY_BACKOFF);
+
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState::default());
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::OpenNow
+    ));
+
+    peers_tx.send_replace(ServicePeerSnapshot {
+        outbound_slots_free: 0,
+        ..ServicePeerSnapshot::default()
+    });
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::WaitForChange(_)
+    ));
+}
+
+#[test]
+fn advisory_backoff_retry_targets_the_real_deadline() {
+    // The reactor owns the real `backoff_until`, and the transport never
+    // shortens a pending demand wait; a deadline invented at sampling time
+    // would overshoot by up to a full backoff period.
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+        backoff_deadlines,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer, node_id) = node_peer();
+
+    let before = std::time::Instant::now();
+    let deadline = before + std::time::Duration::from_secs(10);
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        backed_off_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+    backoff_deadlines_tx.send_replace(vec![(node_id, deadline)]);
+
+    let demand = service.ordered_session_demand(
+        1,
+        &peer,
+        ZAKURA_CAP_HEADER_SYNC,
+        ServicePeerDirection::Outbound,
+    );
+    let OrderedSessionDemand::RetryAt(retry_at) = demand else {
+        panic!("an advisory-backed-off candidate must use a bounded retry");
+    };
+    assert_eq!(
+        retry_at, deadline,
+        "the retry must target the reactor's published backoff expiry"
+    );
+}
+
+#[test]
+fn expired_advisory_backoff_opens_even_with_stale_candidate_state() {
+    // The reactor clears an expired backoff only on its next republish; time
+    // is authoritative, so a passed deadline must not keep gating reopens.
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+        backoff_deadlines,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer, node_id) = node_peer();
+
+    let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        backed_off_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+    backoff_deadlines_tx.send_replace(vec![(node_id, expired)]);
+
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::OpenNow
+    ));
+}
+
+#[tokio::test]
+async fn transient_session_exit_keeps_connection_ownership_across_reopen_gap() {
+    // Discovery samples `owns_connection_for_peer` to decide whether a finished
+    // exchange may close the connection. A header-sync stream that exits while
+    // the connection stays up leaves a reopen-backoff gap with no active
+    // session; the connection must stay owned across that gap, and the claim
+    // must release as soon as this service would no longer re-admit the peer.
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+        backoff_deadlines,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer_id, node_id) = node_peer();
+    let conn_id = 3;
+    let (peer, peer_send) =
+        header_sync_peer_with_conn(peer_id.clone(), conn_id, CancellationToken::new());
+
+    service.add_peer(peer);
+    match lifecycle_rx.recv().await {
+        Some(HeaderSyncEvent::PeerConnected(session)) if session.peer_id() == &peer_id => {}
+        event => panic!("expected header-sync peer connection, got {event:?}"),
+    }
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        admitted_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+    assert!(service.owns_connection_for_peer(&peer_id, conn_id));
+
+    // The peer's inbound stream ends while the connection stays up; the pipe
+    // exits, the reactor drops the peer from its admitted set, and the
+    // transport backs off before offering a replacement stream.
+    drop(peer_send);
+    match tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle_rx.recv()).await {
+        Ok(Some(HeaderSyncEvent::PeerDisconnected(disconnected))) if disconnected == peer_id => {}
+        event => panic!("expected header-sync peer disconnection, got {event:?}"),
+    }
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState::default());
+    assert!(
+        service.owns_connection_for_peer(&peer_id, conn_id),
+        "the reopen gap must keep the connection owned while the peer would be re-admitted"
+    );
+
+    // An advisory backoff means the peer would not be re-admitted, so the gap
+    // claim stops holding the connection open — and revives when it clears.
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        backed_off_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+    assert!(
+        !service.owns_connection_for_peer(&peer_id, conn_id),
+        "a claim for a peer that would not be re-admitted must not own the connection"
+    );
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState::default());
+    assert!(service.owns_connection_for_peer(&peer_id, conn_id));
+
+    // Closing the peer's own connection releases the claim for good.
+    service.remove_peer(&peer_id, conn_id);
+    assert!(!service.owns_connection_for_peer(&peer_id, conn_id));
+}
+
+#[tokio::test]
+async fn transient_session_exit_survives_stale_reactor_snapshot() {
+    // The reactor processes a session's `PeerDisconnected` asynchronously:
+    // right after the service-side teardown records a gap claim, the published
+    // slot snapshot can still count the just-exited session in the last free
+    // slot. While the reactor also still lists the node as admitted, that
+    // "occupied" slot is the session's own, so the claim must keep the
+    // connection owned instead of letting discovery close it mid-gap.
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+        backoff_deadlines,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer_id, node_id) = node_peer();
+    let conn_id = 4;
+    let (peer, peer_send) =
+        header_sync_peer_with_conn(peer_id.clone(), conn_id, CancellationToken::new());
+
+    service.add_peer(peer);
+    match lifecycle_rx.recv().await {
+        Some(HeaderSyncEvent::PeerConnected(session)) if session.peer_id() == &peer_id => {}
+        event => panic!("expected header-sync peer connection, got {event:?}"),
+    }
+    // The reactor's published view: this node admitted, and its session
+    // occupying the last outbound slot.
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        admitted_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+    peers_tx.send_replace(ServicePeerSnapshot {
+        outbound_slots_free: 0,
+        ..ServicePeerSnapshot::default()
+    });
+    assert!(service.owns_connection_for_peer(&peer_id, conn_id));
+
+    // The session exits while the reactor's snapshot is still stale: slots
+    // read full and the node still reads admitted.
+    drop(peer_send);
+    match tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle_rx.recv()).await {
+        Ok(Some(HeaderSyncEvent::PeerDisconnected(disconnected))) if disconnected == peer_id => {}
+        event => panic!("expected header-sync peer disconnection, got {event:?}"),
+    }
+    assert!(
+        service.owns_connection_for_peer(&peer_id, conn_id),
+        "a stale full-slots snapshot that still lists this node must not release the gap claim"
+    );
+
+    // Once the reactor catches up it publishes both watches together. If the
+    // node is gone from the admitted set while slots stay full, the slot is
+    // genuinely taken by someone else and the claim stops holding the
+    // connection.
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState::default());
+    assert!(
+        !service.owns_connection_for_peer(&peer_id, conn_id),
+        "full slots occupied by other sessions must release the gap claim"
+    );
 }
 
 fn header_sync_peer_with_conn(

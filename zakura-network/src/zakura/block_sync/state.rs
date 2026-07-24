@@ -200,6 +200,41 @@ impl BlockSyncHandle {
         *self.peers.borrow()
     }
 
+    /// Subscribe to block-sync peer slot snapshots.
+    pub fn subscribe_peer_snapshot(&self) -> watch::Receiver<ServicePeerSnapshot> {
+        self.peers.clone()
+    }
+
+    /// Park `peer` for `cooldown`, exactly as the no-progress liveness deadline
+    /// does when it evicts an unproductive block-sync peer.
+    #[cfg(test)]
+    pub(crate) fn park_peer_for_test(&self, peer: &ZakuraPeerId, cooldown: std::time::Duration) {
+        let wiring = self
+            .routine_wiring
+            .as_ref()
+            .expect("a handle from spawn_block_sync_reactor always carries routine wiring");
+        wiring
+            .registry
+            .park_peer_until(peer, std::time::Instant::now() + cooldown);
+    }
+
+    /// Park this connection's session exactly as its no-progress routine does.
+    #[cfg(test)]
+    pub(crate) fn park_session_for_test(
+        &self,
+        peer: &ZakuraPeerId,
+        conn_id: crate::zakura::ZakuraConnId,
+        cooldown: std::time::Duration,
+    ) {
+        let wiring = self
+            .routine_wiring
+            .as_ref()
+            .expect("a handle from spawn_block_sync_reactor always carries routine wiring");
+        wiring
+            .registry
+            .park_session_for_test(peer, conn_id, std::time::Instant::now() + cooldown);
+    }
+
     /// Subscribe to local block-sync status advertisements.
     pub fn subscribe_status(&self) -> watch::Receiver<BlockSyncStatus> {
         self.status.clone()
@@ -333,7 +368,7 @@ pub(super) struct DownloadWindow {
 pub(super) enum LivenessOutcome {
     Ok,
     Disarm,
-    Disconnect,
+    Park,
 }
 
 impl DownloadWindow {
@@ -702,7 +737,7 @@ impl DownloadWindow {
         self.clear_liveness_if_idle();
     }
 
-    /// Push the block-liveness deadline out by `timeout` when a would-be disconnect is
+    /// Push the block-liveness deadline out by `timeout` when a would-be park is
     /// attributable to *local* outbound backpressure, not the peer: while our outbound queue
     /// is full the routine stops draining inbound, so a useful body may be sitting unread.
     /// Avoids punishing the peer for our own write-side congestion.
@@ -723,7 +758,7 @@ impl DownloadWindow {
                 LivenessOutcome::Disarm
             }
             Some(deadline) if now < deadline => LivenessOutcome::Ok,
-            Some(_) => LivenessOutcome::Disconnect,
+            Some(_) => LivenessOutcome::Park,
         }
     }
 

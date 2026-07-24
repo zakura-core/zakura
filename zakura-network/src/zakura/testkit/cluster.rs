@@ -144,7 +144,9 @@ fn contains_peer(peers: &[ZakuraPeerId], expected: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{trace_reader::TraceValue, HostilePeer, WaitError, TEST_NET_TIMEOUT};
+    use super::super::{
+        trace_reader::TraceValue, HostilePeer, LocalEndpointFactory, WaitError, TEST_NET_TIMEOUT,
+    };
     use super::*;
     use crate::{
         zakura::trace::{block_sync_trace as bs_trace, header_sync_trace as hs_trace},
@@ -158,12 +160,13 @@ mod tests {
             HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMessage, HeaderSyncMisbehavior,
             HeaderSyncOperationIdentity, HeaderSyncPeerSession, HeaderSyncRequestId,
             HeaderSyncStartup, HeaderSyncStatus, HeaderSyncWireRequestIdentity, LegacyGossipFrame,
-            LegacyGossipSink, LegacyRequestFrame, Peer, Service, ServicePeerLimits, Stream,
-            ZakuraBlockSyncConfig, ZakuraConnId, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
-            ZakuraTrace, MAX_BS_RESPONSE_BYTES, MSG_RESPONSE_TRANSACTION_IDS, ZAKURA_CAP_DISCOVERY,
-            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-            ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
-            ZAKURA_STREAM_LEGACY_REQUESTS,
+            LegacyGossipSink, LegacyRequestFrame, Peer, Service, ServicePeerLimits, Services,
+            Stream, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraHandshakeConfig,
+            ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraNodeRecord, ZakuraNodeRecordBody,
+            ZakuraServiceId, ZakuraTrace, MAX_BS_RESPONSE_BYTES, MSG_RESPONSE_TRANSACTION_IDS,
+            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
+            ZAKURA_STREAM_HEADER_SYNC, ZAKURA_STREAM_LEGACY_REQUESTS,
         },
         BoxError, Config, Request, Response,
     };
@@ -2160,6 +2163,81 @@ mod tests {
         }
     }
 
+    async fn complete_hostile_discovery_exchange(
+        peer: &HostilePeer,
+        seed: u64,
+    ) -> Result<(), BoxError> {
+        let mut saw_hello = false;
+        let mut saw_get_peers = false;
+        let mut saw_get_services = false;
+        for _ in 0..8 {
+            if saw_hello && saw_get_peers && saw_get_services {
+                break;
+            }
+            let frame = tokio::time::timeout(
+                Duration::from_secs(2),
+                peer.recv_ordered_frame(ZAKURA_STREAM_DISCOVERY),
+            )
+            .await??;
+            match DiscoveryMessage::decode(&frame.payload)? {
+                DiscoveryMessage::Hello { .. } => saw_hello = true,
+                DiscoveryMessage::GetPeers { .. } => saw_get_peers = true,
+                DiscoveryMessage::GetServices(_) => saw_get_services = true,
+                DiscoveryMessage::Peers { .. } | DiscoveryMessage::Services(_) => {}
+            }
+        }
+        assert!(
+            saw_hello && saw_get_peers && saw_get_services,
+            "victim sends its complete initial discovery exchange"
+        );
+
+        let secret_key = LocalEndpointFactory::secret_key(seed);
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let record = ZakuraNodeRecord::sign(
+            ZakuraNodeRecordBody {
+                node_id: secret_key.public(),
+                direct_addrs: Vec::new(),
+                services: vec![
+                    ZakuraServiceId::discovery(),
+                    ZakuraServiceId::legacy_gossip(),
+                ],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                sequence: 1,
+                expires_at_unix_secs: now.saturating_add(60),
+            },
+            &secret_key,
+        )?;
+        for message in [
+            DiscoveryMessage::Hello { record },
+            DiscoveryMessage::Peers {
+                records: Vec::new(),
+            },
+            DiscoveryMessage::Services(Services {
+                node_id: secret_key.public(),
+                expires_at_unix_secs: now.saturating_add(60),
+                summaries: Vec::new(),
+            }),
+        ] {
+            peer.send_raw_frame(
+                ZAKURA_STREAM_DISCOVERY,
+                Frame {
+                    message_type: 1,
+                    flags: 0,
+                    payload: message.encode()?,
+                },
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn recorder_transport_survives_malformed_header_sync_frame() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
@@ -2378,6 +2456,7 @@ mod tests {
             victim.discovery().peer_snapshot().inbound_peers == 1
         })
         .await?;
+        complete_hostile_discovery_exchange(&peer, 33602).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(
             contains_peer(&registered.borrow(), peer_id.as_bytes()),
@@ -2836,9 +2915,34 @@ mod tests {
         limits.max_pending_handshakes = 4;
         limits.max_open_streams = 16;
         limits.max_inbound_queue_depth = 1;
-        let victim = ZakuraTestNode::builder(18).limits(limits).spawn().await?;
+        let anchor = (block::Height(0), mainnet_genesis_hash());
+        let header_sync_config = ZakuraHeaderSyncConfig {
+            peer_limits: ServicePeerLimits {
+                max_inbound_peers: 0,
+                ..ServicePeerLimits::default()
+            },
+            ..ZakuraHeaderSyncConfig::default()
+        };
+        let victim = ZakuraTestNode::builder(18)
+            .limits(limits)
+            .header_sync_driver(
+                e2e_network([]),
+                anchor,
+                HeaderSyncFrontiers {
+                    finalized_height: anchor.0,
+                    verified_block_tip: anchor.0,
+                    verified_block_hash: anchor.1,
+                },
+                Some(anchor),
+            )
+            .header_sync_config(header_sync_config)
+            .spawn()
+            .await?;
         let peer_set = victim.supervisor().subscribe();
 
+        // The peer negotiates legacy gossip and header sync, but only gossip
+        // initially has demand because header sync has no inbound slots. The
+        // aggregate queue limit must still reserve one entry for both kinds.
         let first = HostilePeer::connect_native(&victim, 19).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(

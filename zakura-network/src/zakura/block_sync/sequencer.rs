@@ -467,18 +467,6 @@ impl Sequencer {
         {
             return None;
         }
-        // A height that is already tracked as submitted (or still has an
-        // in-flight apply token) being prepared again means the earlier attempt
-        // was rolled back or the body was re-accepted — both are duplicate
-        // SubmitBlock sources worth watching in production.
-        if self.submitted_applies.contains_key(&height)
-            || self
-                .in_flight_submissions
-                .values()
-                .any(|submission| submission.height == height)
-        {
-            metrics::counter!("sync.block.submit.resubmit").increment(1);
-        }
         let token = self.next_apply_token();
         let (
             hash,

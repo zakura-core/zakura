@@ -1201,23 +1201,12 @@ where
             // for them rewinds progress behind the already-verified checkpoint and
             // leaves a permanent queue gap for the next range.
             if let Err(error) = &result {
-                if error.is_duplicate_request() {
-                    metrics::counter!(
-                        "checkpoint.progress.reset_skipped",
-                        "reason" => "duplicate_request"
+                if !error.is_duplicate_request()
+                    && !matches!(
+                        error,
+                        VerifyCheckpointError::ShuttingDown | VerifyCheckpointError::Dropped
                     )
-                    .increment(1);
-                } else if matches!(
-                    error,
-                    VerifyCheckpointError::ShuttingDown | VerifyCheckpointError::Dropped
-                ) {
-                    metrics::counter!(
-                        "checkpoint.progress.reset_skipped",
-                        "reason" => "shutdown"
-                    )
-                    .increment(1);
-                } else {
-                    metrics::counter!("checkpoint.progress.reset").increment(1);
+                {
                     let tip = match state_service
                         .oneshot(zs::Request::Tip)
                         .await

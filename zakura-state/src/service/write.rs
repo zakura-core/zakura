@@ -704,11 +704,11 @@ impl WriteBlockWorkerTask {
                     let _ = rsp_tx.send(Ok(tip_hash));
                 }
                 Err((ordered_block, error)) => {
-                    // Retryable VCT root stalls (an absent/evicted root, or one not yet
+                    // Retryable VCT root stalls (an absent or rejected root, or one not yet
                     // verifiable for lack of a stored successor header) park-and-retry the same
-                    // block in place rather than resetting the queue. An absent root can only
-                    // be filled by a re-delivery of its header range (roots are not
-                    // individually re-requested), so it polls slowly; an await-successor
+                    // block in place rather than resetting the queue. An absent root is only
+                    // filled when the root-authentication lane (or its bounded repair path)
+                    // stores a verifiable row, so it polls slowly; an await-successor
                     // stall just waits for the next header to be stored, so it polls faster.
                     if let Some(height) = error.vct_retryable_height() {
                         let root_unavailable = error.vct_supplied_root_unavailable_height();

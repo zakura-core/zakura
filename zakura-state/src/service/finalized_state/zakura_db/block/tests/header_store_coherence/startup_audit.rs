@@ -394,7 +394,7 @@ fn startup_removes_stale_rows_at_committed_heights() {
 }
 
 /// If the finalized tip index is missing, the audit cannot distinguish
-/// committed root history from provisional header-sync roots. Preserve the
+/// committed root history from header-ahead authenticated roots. Preserve the
 /// roots rather than deleting history that header sync cannot restore.
 #[test]
 fn startup_purges_authenticated_state_when_tip_is_missing() {

@@ -176,10 +176,10 @@ impl VctWriteManager {
 
         // Escalate a stall that persists on the same height past the warn
         // threshold: a transient wait resolves in a few polls and stays
-        // quiet, but a height stuck longer means no root the frozen frontier
-        // requires is available — roots are not individually re-requested, so
-        // the node will not advance (it will not, by design, recompute against
-        // the stale frontier). Surface it loudly.
+        // quiet, but a height stuck longer means the bounded repair request
+        // above has not produced a verifiable root either, and the node will
+        // not advance (it will not, by design, recompute against the stale
+        // frontier). Surface it loudly.
         let new_stall = match self.stall {
             Some((stuck, _)) if stuck == height => false,
             _ => {

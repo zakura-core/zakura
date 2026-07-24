@@ -715,7 +715,7 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
             }
 
             // Punch a hole: drop a post-NU5 height's root from the fixture, simulating a
-            // peer that omitted it (or a root evicted after failing verification). Earlier
+            // peer that omitted it (or a height authentication has not reached). Earlier
             // fast blocks freeze the frontier, so this height has no real frontier to
             // recompute against.
             let hole = (nu5 + 1) as usize;
@@ -995,13 +995,13 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
             // Defense in depth: a witness that does not link to the block being committed
             // (here, the block itself — its parent is the previous height) must be ignored
             // and deferred exactly like a missing successor. It must *not* be treated as a
-            // verification failure: that would evict the correct root and, because the write
+            // verification failure: that would reject the correct root and, because the write
             // loop's parked retry is taken before the look-ahead, wedge the retry loop.
             let cv = CheckpointVerifiedBlock::from(target_block.clone());
             let forged_witness = next_vct_block(target_block.clone());
             let error = fast
                 .commit_finalized_direct(cv.into(), None, forged_witness, "vct defer tip forged witness")
-                .expect_err("a non-linking witness must defer, not commit or evict");
+                .expect_err("a non-linking witness must defer, not commit or reject");
             prop_assert!(
                 format!("{error:?}").contains("VctSuppliedRootAwaitingSuccessor"),
                 "a non-linking witness defers with the await-successor error, got: {error:?}"
@@ -1034,7 +1034,7 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
 
             // Once a successor is buffered, the very same height commits and the tip advances:
             // the deferral was a wait, not a permanent stall — and the root survived the
-            // forged-witness attempt (it was never evicted).
+            // forged-witness attempt (it was never rejected).
             let cv = CheckpointVerifiedBlock::from(target_block);
             let next = next_vct_block(target_successor);
             fast.commit_finalized_direct(cv.into(), None, next, "vct defer tip with successor")
@@ -1065,9 +1065,9 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
     Ok(())
 }
 
-/// A wrong peer-supplied root must be recoverable at the same height: the committer rejects and
-/// evicts the bad cached value, leaves the database parked below the height, then commits the
-/// same block once the `tree_aux` driver refills that height with a verifiable root.
+/// A wrong peer-supplied root must be recoverable at the same height: the committer rejects,
+/// leaves the database parked below the height, then commits the same block once the stored
+/// row at that height is replaced with a verifiable root.
 #[test]
 #[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and inserts roots by height
 fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
@@ -1166,11 +1166,11 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
                 "the rejected root left the database parked below the target"
             );
 
-            // Simulate the `tree_aux` driver refilling the evicted height from another peer:
+            // Simulate the root lane replacing the rejected row from another peer:
             // header sync persists the replacement through the same database write path.
             fast.db
                 .insert_zakura_header_commitment_roots([correct_target_root])
-                .expect("refilling the evicted height succeeds");
+                .expect("replacing the rejected row succeeds");
 
             let cv = CheckpointVerifiedBlock::from(blocks[target].block.clone());
             fast.commit_finalized_direct(cv.into(), None, next, "vct refilled target")
@@ -1286,7 +1286,7 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
             }
 
             // Session 2 (restart): reopen the same database, then punch a hole at the next
-            // height (a peer that omitted it, or a root evicted after failing verification).
+            // height (a peer that omitted it, or a height authentication has not reached).
             // Skip the constructor-time interrupted-fast-sync resume guard: this configured
             // network has no embedded frontiers, so `from_config` yields no source, but the
             // test attaches a fixture source below the way a real (Mainnet) node's configured
@@ -2108,7 +2108,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
                 "the cache-empty rejected body must leave finalized state untouched",
             );
 
-            // Rejecting either form of the invalid body must not evict the
+            // Rejecting either form of the invalid body must not disturb the
             // authenticated VCT roots. A subsequently downloaded honest body
             // with the same hash can therefore commit and let checkpoint sync
             // continue.
@@ -2389,8 +2389,8 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
 }
 
 /// Verified-commitment-trees consumer half of the peer source: a
-/// [`commitment_aux::PeerSource`] whose database is **filled incrementally** (as header
-/// sync persists provisional root ranges when they arrive from peers) drives the fast
+/// [`commitment_aux::PeerSource`] whose database is **filled incrementally** (as the
+/// root-authentication lane promotes root ranges ahead of body sync) drives the fast
 /// path to byte-identical consensus state. Same harness as the DB-produced round-trip,
 /// but the produced roots are written into `commitment_roots_by_height` in two chunks
 /// via [`ZakuraDb::insert_zakura_header_commitment_roots`] — proving the DB-backed,

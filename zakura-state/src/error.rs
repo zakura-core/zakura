@@ -181,7 +181,7 @@ impl CommitBlockError {
         }
     }
 
-    /// Returns the height for any retryable VCT root stall (absent/evicted root, or one
+    /// Returns the height for any retryable VCT root stall (absent or rejected root, or one
     /// not yet verifiable for lack of a stored successor header). See
     /// [`ValidateContextError::vct_retryable_height`].
     pub fn vct_retryable_height(&self) -> Option<block::Height> {
@@ -270,7 +270,7 @@ impl CommitCheckpointVerifiedError {
         self.0.vct_supplied_root_unavailable_height()
     }
 
-    /// Returns the height for any retryable VCT root stall (absent/evicted root, or one
+    /// Returns the height for any retryable VCT root stall (absent or rejected root, or one
     /// not yet verifiable for lack of a stored successor header). See
     /// [`ValidateContextError::vct_retryable_height`].
     pub fn vct_retryable_height(&self) -> Option<block::Height> {
@@ -881,9 +881,9 @@ impl ValidateContextError {
     /// Returns the missing VCT supplied-root height for retryable root stalls.
     ///
     /// This is the subset of [`Self::vct_retryable_height`] where the supplied root itself is
-    /// missing: it was never delivered with its header range, or was evicted after failing
-    /// verification. It can only be filled by a later re-delivery of that header range (for
-    /// example another fanout peer's response); roots are not individually re-requested. An
+    /// unusable: authentication has not stored a row for it yet, or the stored row failed
+    /// body-time verification and the commit refuses to use it. The stall clears when the
+    /// root-authentication lane (or its bounded repair path) stores a verifiable row. An
     /// await-successor stall ([`Self::vct_retryable_height`] but not this) already has its root
     /// and only waits for the next header to be stored.
     pub fn vct_supplied_root_unavailable_height(&self) -> Option<block::Height> {
@@ -893,7 +893,7 @@ impl ValidateContextError {
         }
     }
 
-    /// Returns the height for any retryable VCT root stall: either an absent/evicted supplied
+    /// Returns the height for any retryable VCT root stall: either an absent or rejected supplied
     /// root ([`Self::VctSuppliedRootUnavailable`]) or one not yet verifiable because no successor
     /// is buffered to confirm it ([`Self::VctSuppliedRootAwaitingSuccessor`]). The write loop
     /// parks and retries the same block for both; the former polls slower because nothing is

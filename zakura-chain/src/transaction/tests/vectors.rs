@@ -2182,7 +2182,7 @@ fn v6_padded_ironwood_proof_is_rejected_by_librustzcash_conversion() {
 /// pattern.
 #[test]
 fn orchard_rk_identity_point_rejected_during_deserialization() {
-    use group::prime::PrimeCurveAffine;
+    use group::{prime::PrimeCurveAffine, GroupEncoding};
     use reddsa::Signature;
 
     use crate::{
@@ -2203,14 +2203,14 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
     // Other fields use the Pallas generator or the identity as appropriate.
     let action = Action {
         // cv can be any valid Pallas point; identity is accepted here.
-        cv: ValueCommitment(pallas::Affine::identity()),
+        cv: ValueCommitment(pallas::Affine::identity().to_bytes()),
         nullifier: Nullifier(pallas::Base::zero()),
         // rk = identity point — this is the vulnerability trigger.
         rk: [0u8; 32].into(),
         // cm_x is the x-coordinate of the note commitment.
         cm_x: NoteCommitment(pallas::Affine::identity()).extract_x(),
         // ephemeral_key must be non-identity; use the generator.
-        ephemeral_key: EphemeralPublicKey(pallas::Affine::generator()),
+        ephemeral_key: EphemeralPublicKey(pallas::Affine::generator().to_bytes()),
         enc_ciphertext: EncryptedNote([0u8; 580]),
         out_ciphertext: WrappedNoteKey([0u8; 80]),
     };

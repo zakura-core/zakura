@@ -214,6 +214,28 @@ pub fn sapling_point_encodings_are_valid(tx: &Transaction) -> Result<(), Transac
     Ok(())
 }
 
+/// Checks that every Orchard `cv` is a canonical Pallas point encoding and
+/// every Orchard `ephemeral_key` is a canonical encoding of a non-identity
+/// Pallas point.
+///
+/// > Elements of an Action description MUST be canonical encodings of the
+/// > types given above.
+///
+/// <https://zips.z.cash/protocol/protocol.pdf#actiondesc>
+///
+/// Deserialization stores Orchard cv and epk as raw bytes and defers their
+/// decompression checks to keep Pallas square roots off the checkpoint-sync hot
+/// path (see the sibling [`sapling_point_encodings_are_valid`]). The semantic
+/// and mempool paths enforce them here; `SmallOrder` is reused as the error for
+/// consistency with the Sapling check.
+pub fn orchard_point_encodings_are_valid(tx: &Transaction) -> Result<(), TransactionError> {
+    if !tx.orchard_point_encodings_are_valid() {
+        return Err(TransactionError::SmallOrder);
+    }
+
+    Ok(())
+}
+
 /// Checks that shielded proof sizes are canonical when the proof-size rule is active.
 pub fn shielded_proof_size_is_canonical(
     tx: &Transaction,

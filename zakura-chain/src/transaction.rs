@@ -1225,6 +1225,20 @@ impl Transaction {
 
     // orchard
 
+    /// Returns true if every Orchard value commitment in this transaction is a
+    /// canonical Pallas point encoding and every Orchard ephemeral public key
+    /// is a canonical encoding of a non-identity Pallas point (or the
+    /// transaction has no Orchard data).
+    ///
+    /// These points are stored as raw bytes with their decompression checks
+    /// deferred from deserialization, to keep Pallas square roots off the
+    /// checkpoint-sync hot path. The semantic verifier calls this on untrusted
+    /// transactions; the checkpoint verifier trusts block hashes and skips it.
+    pub fn orchard_point_encodings_are_valid(&self) -> bool {
+        self.orchard_shielded_data()
+            .is_none_or(|shielded_data| shielded_data.point_encodings_are_valid())
+    }
+
     /// Access the [`orchard::ShieldedData`] in this transaction,
     /// regardless of version.
     pub fn orchard_shielded_data(&self) -> Option<&orchard::ShieldedData> {

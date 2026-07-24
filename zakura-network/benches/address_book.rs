@@ -76,6 +76,28 @@ fn address_book(c: &mut Criterion) {
         let existing_addr = peer_addr(SAME_IP_ADDRESS_COUNT - 1);
         let new_addr = unique_ip_addr(size);
 
+        let mut ban_check = address_book.clone();
+        let ban_change = MetaAddr::new_misbehavior(existing_addr, MAX_PEER_MISBEHAVIOR_SCORE);
+        assert!(ban_check.update(ban_change).is_none());
+        assert_eq!(ban_check.len(), size - SAME_IP_ADDRESS_COUNT);
+        assert!(ban_check.bans().contains(existing_addr.ip()));
+
+        group.bench_with_input(
+            BenchmarkId::new("clone_and_drop", size),
+            &size,
+            |b, _size| {
+                b.iter(|| black_box(address_book.clone()));
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("iterate_in_priority_order", size),
+            &size,
+            |b, _size| {
+                b.iter(|| black_box(address_book.peers().count()));
+            },
+        );
+
         group.bench_with_input(
             BenchmarkId::new("lookup_existing", size),
             &size,
@@ -89,9 +111,9 @@ fn address_book(c: &mut Criterion) {
             BenchmarkId::new("update_existing", size),
             &size,
             |b, _size| {
-                b.iter_batched(
+                b.iter_batched_ref(
                     || address_book.clone(),
-                    |mut address_book| {
+                    |address_book| {
                         let change = MetaAddr::new_responded(black_box(existing_addr), None);
                         black_box(address_book.update(change))
                     },
@@ -104,9 +126,9 @@ fn address_book(c: &mut Criterion) {
             BenchmarkId::new("insert_and_evict", size),
             &size,
             |b, _size| {
-                b.iter_batched(
+                b.iter_batched_ref(
                     || address_book.clone(),
-                    |mut address_book| {
+                    |address_book| {
                         let change = MetaAddr::new_initial_peer(black_box(new_addr));
                         black_box(address_book.update(change))
                     },
@@ -119,9 +141,9 @@ fn address_book(c: &mut Criterion) {
             BenchmarkId::new("ban_ip_with_16_addresses", size),
             &size,
             |b, _size| {
-                b.iter_batched(
+                b.iter_batched_ref(
                     || address_book.clone(),
-                    |mut address_book| {
+                    |address_book| {
                         let change = MetaAddr::new_misbehavior(
                             black_box(existing_addr),
                             MAX_PEER_MISBEHAVIOR_SCORE,

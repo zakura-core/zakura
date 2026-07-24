@@ -2715,7 +2715,8 @@ impl HeaderSyncReactor {
 
         self.state.stale_anchor.reset();
         self.state.schedule.clear_forward();
-        self.state.clear_retained_roots("verified_tip_reanchor");
+        self.state
+            .clear_unowned_retained_roots("verified_tip_reanchor");
         self.state
             .buffered
             .retain(|(priority, _), _| *priority != RangePriority::Forward);

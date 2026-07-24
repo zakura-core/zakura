@@ -656,7 +656,7 @@ fn root_auth_miss_prefetches_bounded_overlapping_ranges() {
 }
 
 #[test]
-fn root_auth_frontier_advance_refills_released_fallback_capacity() {
+fn partial_root_auth_frontier_advance_rebases_fallback_at_exact_frontier() {
     let network = Network::Mainnet;
     let anchor = (block::Height(0), network.genesis_hash());
     let mut startup = startup_for(
@@ -691,10 +691,6 @@ fn root_auth_frontier_advance_refills_released_fallback_capacity() {
     };
     state.header_root_auth = Some(advanced);
     state.prune_root_auth_pipeline(advanced, true);
-    let pruned_resident = state
-        .schedule
-        .resident_heights_for(RangePriority::AuthenticateRoots);
-    assert!(pruned_resident < initial_resident);
 
     state.refresh_root_auth_range(&startup);
     assert_eq!(
@@ -709,6 +705,21 @@ fn root_auth_frontier_advance_refills_released_fallback_capacity() {
             .highest_end(RangePriority::AuthenticateRoots)
             .expect("refilled fallback window has a high end")
             > initial_end
+    );
+    let first = state
+        .schedule
+        .authenticate_roots
+        .front()
+        .expect("fallback is rebuilt from the new authentication frontier");
+    assert_eq!(first.start_height(), block::Height(4));
+    assert_eq!(first.anchor_hash, Some(advanced.authenticated_hash));
+    assert!(
+        !state
+            .schedule
+            .authenticate_roots
+            .iter()
+            .any(|range| range.start_height() == block::Height(5)),
+        "speculative ranges above the old partial-advance gap must be discarded"
     );
 }
 
@@ -3185,6 +3196,60 @@ async fn local_root_auth_failure_retries_retained_payload_without_scoring() {
                     },
                 ..
             } => panic!("retained local failure must not immediately fall back to the network"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_reanchor_preserves_inflight_retained_root_authentication() {
+    let (mut fixture, operation, _auth, source_peer) =
+        reactor_with_pending_retained_root_authentication(None).await;
+    let durable_tip = (
+        block::Height(3),
+        block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref()),
+    );
+
+    // The retained authentication was dispatched after committing the first
+    // forward range, which advanced the frontier generation from zero to one.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: durable_tip.0,
+            tip_hash: durable_tip.1,
+            reanchor_from: Some(1),
+        })
+        .await
+        .unwrap();
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+            operation,
+            kind: HeaderRootAuthenticationFailureKind::Local,
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::AuthenticateHeaderRoots { operation, .. } => {
+                assert_eq!(operation.wire_request.peer, source_peer);
+                break;
+            }
+            HeaderSyncAction::SendMessage {
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height: block::Height(1),
+                        want_tree_aux_roots: true,
+                        ..
+                    },
+                ..
+            } => {
+                panic!("reanchor scheduled duplicate fallback over in-flight retained auth")
+            }
+            HeaderSyncAction::Misbehavior { .. } => {
+                panic!("local retained authentication failure must not score a peer")
+            }
             _ => {}
         }
     }

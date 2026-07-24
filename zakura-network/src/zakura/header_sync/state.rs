@@ -250,6 +250,7 @@ impl HeaderSyncCore {
             return;
         };
         if self.root_auth_coverage_expected_from_forward(start)
+            || self.root_auth_operation_pending_at(start)
             || self.retained_roots.contains_key(&start)
         {
             return;
@@ -266,6 +267,15 @@ impl HeaderSyncCore {
             return;
         }
 
+        let mut batch_start = self
+            .schedule
+            .retain_contiguous_root_auth_from(start)
+            .unwrap_or(start);
+        self.buffered.retain(|(priority, buffered_start), _| {
+            *priority != RangePriority::AuthenticateRoots
+                || self.schedule.has_root_auth_start(*buffered_start)
+        });
+
         let resident_cap = u64::from(batch_count.saturating_mul(HEADER_SYNC_MAX_RESIDENT_BATCHES));
         let available = resident_cap.saturating_sub(
             self.schedule
@@ -278,11 +288,6 @@ impl HeaderSyncCore {
             return;
         }
 
-        let mut batch_start = self
-            .schedule
-            .highest_end(RangePriority::AuthenticateRoots)
-            .unwrap_or(start)
-            .max(start);
         let mut added = 0u64;
         while batch_start < end && remaining >= 2 {
             let count = count_between(batch_start, end)
@@ -379,6 +384,12 @@ impl HeaderSyncCore {
             })
     }
 
+    fn root_auth_operation_pending_at(&self, start: block::Height) -> bool {
+        self.pending_operations
+            .values()
+            .any(|pending| pending.root_auth.is_some() && pending.range.start_height() == start)
+    }
+
     pub(super) fn admit_retained_root_payload(
         &mut self,
         wire_request: HeaderSyncWireRequestIdentity,
@@ -470,6 +481,28 @@ impl HeaderSyncCore {
     pub(super) fn clear_retained_roots(&mut self, reason: &'static str) {
         let dropped = self.retained_roots.len();
         self.retained_roots.clear();
+        if dropped > 0 {
+            metrics::counter!(
+                "sync.header.root_auth.retain.dropped",
+                "reason" => reason
+            )
+            .increment(dropped as u64);
+        }
+    }
+
+    pub(super) fn clear_unowned_retained_roots(&mut self, reason: &'static str) {
+        let owned_starts: HashSet<_> = self
+            .pending_operations
+            .values()
+            .filter_map(|pending| match pending.root_auth.map(|auth| auth.source) {
+                Some(RootAuthSource::Retained(start)) => Some(start),
+                Some(RootAuthSource::Fallback) | None => None,
+            })
+            .collect();
+        let before = self.retained_roots.len();
+        self.retained_roots
+            .retain(|start, _| owned_starts.contains(start));
+        let dropped = before.saturating_sub(self.retained_roots.len());
         if dropped > 0 {
             metrics::counter!(
                 "sync.header.root_auth.retain.dropped",

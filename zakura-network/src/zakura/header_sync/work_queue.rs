@@ -390,7 +390,75 @@ impl HeaderWorkQueue {
             .retain(|range, _| range.priority != RangePriority::AuthenticateRoots);
         self.delayed_retries
             .retain(|(_, priority), _| *priority != RangePriority::AuthenticateRoots);
+        self.retry_avoidance.retain(|_, ranges| {
+            ranges.retain(|(_, priority), _| *priority != RangePriority::AuthenticateRoots);
+            !ranges.is_empty()
+        });
         self.rebuild_start_indexes();
+    }
+
+    /// Keep only the root-authentication chain that starts at `start`.
+    ///
+    /// Each root-authentication range repeats its predecessor's terminal header
+    /// as a successor witness, so a usable speculative chain has each next
+    /// range start at the previous range's end. Ranges above a gap cannot
+    /// authenticate the current frontier and must not consume resident capacity.
+    pub(super) fn retain_contiguous_root_auth_from(
+        &mut self,
+        start: block::Height,
+    ) -> Option<block::Height> {
+        let mut kept_starts = HashSet::new();
+        let mut next_start = start;
+
+        loop {
+            let next_range = self
+                .authenticate_roots
+                .iter()
+                .chain(self.active.keys())
+                .find(|range| {
+                    range.priority == RangePriority::AuthenticateRoots
+                        && range.start_height() == next_start
+                })
+                .copied();
+            let Some(next_range) = next_range else {
+                break;
+            };
+            if !kept_starts.insert(next_start) {
+                break;
+            }
+            let next_end = next_range.end_height();
+            if next_end <= next_start {
+                break;
+            }
+            next_start = next_end;
+        }
+
+        self.authenticate_roots
+            .retain(|range| kept_starts.contains(&range.start_height()));
+        self.active.retain(|range, _| {
+            range.priority != RangePriority::AuthenticateRoots
+                || kept_starts.contains(&range.start_height())
+        });
+        self.delayed_retries.retain(|(height, priority), _| {
+            *priority != RangePriority::AuthenticateRoots || kept_starts.contains(height)
+        });
+        self.retry_avoidance.retain(|_, ranges| {
+            ranges.retain(|(height, priority), _| {
+                *priority != RangePriority::AuthenticateRoots || kept_starts.contains(height)
+            });
+            !ranges.is_empty()
+        });
+        self.rebuild_start_indexes();
+
+        (!kept_starts.is_empty()).then_some(next_start)
+    }
+
+    pub(super) fn has_root_auth_start(&self, start: block::Height) -> bool {
+        self.pending_starts
+            .contains(&(RangePriority::AuthenticateRoots, start))
+            || self
+                .active_starts
+                .contains(&(RangePriority::AuthenticateRoots, start))
     }
 
     /// Drop pending/active root-auth ranges whose start is strictly below `start`.
@@ -817,6 +885,36 @@ mod tests {
             queue.authenticate_roots.iter().copied().collect::<Vec<_>>(),
             vec![next, future]
         );
+    }
+
+    #[test]
+    fn root_auth_contiguity_prunes_ranges_above_a_frontier_gap() {
+        let mut queue = HeaderWorkQueue::new();
+        let first = range(1, 3, RangePriority::AuthenticateRoots);
+        let next = range(3, 3, RangePriority::AuthenticateRoots);
+        let orphan = range(8, 3, RangePriority::AuthenticateRoots);
+        let forward = range(1, 3, RangePriority::Forward);
+        queue.ensure(first, RangePriority::AuthenticateRoots);
+        queue.ensure(next, RangePriority::AuthenticateRoots);
+        queue.ensure(orphan, RangePriority::AuthenticateRoots);
+        queue.ensure_forward(forward);
+
+        assert_eq!(
+            queue.retain_contiguous_root_auth_from(block::Height(1)),
+            Some(block::Height(5))
+        );
+        assert_eq!(
+            queue.authenticate_roots.iter().copied().collect::<Vec<_>>(),
+            vec![first, next]
+        );
+        assert!(queue.forward.contains(&forward));
+
+        assert_eq!(
+            queue.retain_contiguous_root_auth_from(block::Height(2)),
+            None
+        );
+        assert!(queue.authenticate_roots.is_empty());
+        assert!(queue.forward.contains(&forward));
     }
 
     #[test]

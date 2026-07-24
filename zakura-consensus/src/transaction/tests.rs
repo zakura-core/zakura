@@ -16,7 +16,8 @@ use futures::{FutureExt, TryFutureExt};
 use halo2::pasta::{group::ff::PrimeField, pallas};
 use tokio::time::timeout;
 use tower::{buffer::Buffer, service_fn, Service, ServiceExt};
-use tower_batch_control::BatchControl;
+use tower_batch_control::{Batch, BatchControl};
+use tower_fallback::Fallback;
 
 use zakura_chain::{
     amount::{Amount, NegativeAllowed, NonNegative},
@@ -3055,6 +3056,24 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
             })
             .expect("test vectors include a V4 transaction with Sapling spends");
 
+        let (valid_bundle_one, valid_bundle_two, valid_sighash) = {
+            let sighasher = transaction
+                .sighasher(
+                    NetworkUpgrade::current(&network, height),
+                    Arc::new(Vec::new()),
+                )
+                .expect("test fixture has no transparent inputs");
+            let valid_bundle_one = sighasher
+                .sapling_bundle()
+                .expect("test fixture has Sapling shielded data");
+            let valid_bundle_two = sighasher
+                .sapling_bundle()
+                .expect("test fixture has Sapling shielded data");
+            let valid_sighash = sighasher.sighash(HashType::ALL, None);
+
+            (valid_bundle_one, valid_bundle_two, valid_sighash)
+        };
+
         modify_first_sapling_spend_proof(
             Arc::get_mut(&mut transaction).expect("transaction only has one active reference"),
             SaplingProofModification::Corrupt,
@@ -3072,10 +3091,14 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
         let single_bundle = sighasher
             .sapling_bundle()
             .expect("test fixture has Sapling shielded data");
+        let fallback_bundle = sighasher
+            .sapling_bundle()
+            .expect("test fixture has Sapling shielded data");
         let synchronous_check_bundle = sighasher
             .sapling_bundle()
             .expect("test fixture has Sapling shielded data");
         let sighash = sighasher.sighash(HashType::ALL, None);
+        drop(sighasher);
 
         let mut verifier = sapling_crypto::BatchValidator::default();
         assert!(
@@ -3101,6 +3124,112 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
         .await;
         assert_sapling_verification_error(
             single_result.expect_err("corrupted Sapling proof must be rejected"),
+        );
+
+        let invalid_item = crate::primitives::sapling::Item::new(fallback_bundle, sighash);
+        let items = vec![
+            crate::primitives::sapling::Item::new(valid_bundle_one, valid_sighash),
+            invalid_item.clone(),
+            crate::primitives::sapling::Item::new(valid_bundle_two, valid_sighash),
+        ];
+        let expected_results: Vec<_> = futures::future::join_all(
+            items
+                .iter()
+                .cloned()
+                .map(crate::primitives::sapling::verify_single),
+        )
+        .await
+        .into_iter()
+        .map(|result| result.is_ok())
+        .collect();
+        assert_eq!(
+            expected_results,
+            [true, false, true],
+            "the fixture must contain valid neighbors around one invalid proof"
+        );
+
+        let mut verifier = Fallback::new(
+            Batch::new(
+                crate::primitives::sapling::Verifier::default(),
+                100,
+                1,
+                std::time::Duration::from_secs(1000),
+            ),
+            service_fn(crate::primitives::sapling::verify_single),
+        );
+        verifier
+            .ready()
+            .await
+            .expect("test verifier must become ready");
+        let invalid_singleton = verifier.call(invalid_item);
+        let mut primary = verifier.primary().clone();
+        assert!(
+            primary
+                .try_flush()
+                .expect("explicit Sapling singleton flush must not fail"),
+            "explicit Sapling singleton flush must be queued"
+        );
+        assert!(
+            timeout(test_timeout(), invalid_singleton)
+                .await
+                .expect("explicitly flushed Sapling singleton must complete")
+                .is_err(),
+            "an explicitly flushed invalid Sapling singleton must be rejected"
+        );
+
+        let mut batch_results = Vec::new();
+        for item in items {
+            verifier
+                .ready()
+                .await
+                .expect("test verifier must become ready");
+            batch_results.push(verifier.call(item));
+        }
+
+        assert!(
+            primary
+                .try_flush()
+                .expect("explicit Sapling test flush must not fail"),
+            "explicit Sapling test flush must be queued"
+        );
+
+        let actual_results: Vec<_> =
+            timeout(test_timeout(), futures::future::join_all(batch_results))
+                .await
+                .expect("explicitly flushed Sapling verification must complete")
+                .into_iter()
+                .map(|result| result.is_ok())
+                .collect();
+        assert_eq!(
+            actual_results, expected_results,
+            "explicit Sapling batch flush plus fallback must match single verification"
+        );
+
+        let known_outpoint_hashes = Arc::new(HashSet::new());
+        let _block_batch_flush =
+            crate::primitives::register_block_verifier_batch_flush(&known_outpoint_hashes, 1);
+        let transaction_hash = transaction.hash();
+        let transaction_verifier = Verifier::new_for_tests(
+            &network,
+            service_fn(|_| async { unreachable!("fixture has no transparent inputs") }),
+        );
+        let block_transaction_result = timeout(
+            test_timeout(),
+            transaction_verifier.oneshot(Request::Block {
+                transaction_hash,
+                transaction,
+                known_utxos: Arc::new(HashMap::new()),
+                known_outpoint_hashes,
+                height,
+                time: DateTime::<Utc>::MAX_UTC,
+            }),
+        )
+        .await
+        .expect("block-boundary-flushed transaction verification must complete");
+        assert_eq!(
+            block_transaction_result,
+            Err(TransactionError::SaplingVerificationFailed),
+            "the block-boundary flush path must reject an invalid Sapling proof"
         );
     });
 }

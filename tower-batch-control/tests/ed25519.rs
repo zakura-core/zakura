@@ -25,6 +25,9 @@ use tower_fallback::Fallback;
 /// A boxed [`std::error::Error`].
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// Keeps partial batches pending unless a test explicitly releases them.
+const LONG_BATCH_LATENCY: Duration = Duration::from_secs(1000);
+
 /// The type of the batch verifier.
 type BatchVerifier = batch::Verifier;
 
@@ -187,6 +190,19 @@ async fn spawn_fifo<
 
 // =============== testing code ========
 
+fn signed_item(is_valid: bool) -> Item {
+    let sk = SigningKey::new(thread_rng());
+    let vk_bytes = VerificationKeyBytes::from(&sk);
+    let msg = b"BatchVerifyTest";
+    let sig = if is_valid {
+        sk.sign(&msg[..])
+    } else {
+        sk.sign(b"badmsg")
+    };
+
+    (vk_bytes, sig, msg).into()
+}
+
 async fn sign_and_verify<V>(
     mut verifier: V,
     n: usize,
@@ -273,6 +289,39 @@ async fn sign_and_verify_after_try_flush(
     Ok(())
 }
 
+async fn explicit_flush_fallback_matches_single(
+    n: usize,
+    bad_index: usize,
+) -> Result<(), BoxError> {
+    let mut verifier = Fallback::new(
+        Batch::new(Verifier::default(), 100, 1, LONG_BATCH_LATENCY),
+        tower::service_fn(|item: Item| async move { item.verify_single().map_err(BoxError::from) }),
+    );
+    let mut expected_results = Vec::new();
+    let mut batch_results = FuturesOrdered::new();
+
+    for i in 0..n {
+        let item = signed_item(i != bad_index);
+        expected_results.push(item.clone().verify_single().is_ok());
+
+        verifier.ready().await?;
+        batch_results.push_back(verifier.call(item));
+    }
+
+    let mut primary = verifier.primary().clone();
+    if !primary.try_flush()? {
+        return Err("try_flush should queue a flush on a quiet batch".into());
+    }
+
+    let actual_results: Vec<_> = batch_results.map(|result| result.is_ok()).collect().await;
+    assert_eq!(
+        actual_results, expected_results,
+        "explicit batch flush plus fallback must match single verification"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn batch_flushes_on_max_items_weight() -> Result<(), Report> {
     use tokio::time::timeout;
@@ -282,7 +331,7 @@ async fn batch_flushes_on_max_items_weight() -> Result<(), Report> {
     // flushing is happening based on hitting max_items.
     //
     // Create our own verifier, so we don't shut down a shared verifier used by other tests.
-    let verifier = Batch::new(Verifier::default(), 10, 5, Duration::from_secs(1000));
+    let verifier = Batch::new(Verifier::default(), 10, 5, LONG_BATCH_LATENCY);
     timeout(Duration::from_secs(1), sign_and_verify(verifier, 100, None))
         .await
         .map_err(|e| eyre!(e))?
@@ -316,7 +365,7 @@ async fn batch_flushes_on_explicit_flush() -> Result<(), Report> {
 
     // Use a very high max_items and long max_latency. Without the explicit
     // flush, this verification would wait for the latency timer.
-    let verifier = Batch::new(Verifier::default(), 100, 10, Duration::from_secs(1000));
+    let verifier = Batch::new(Verifier::default(), 100, 10, LONG_BATCH_LATENCY);
     timeout(
         Duration::from_secs(1),
         sign_and_verify_after_explicit_flush(verifier, 10),
@@ -333,7 +382,7 @@ async fn batch_flush_on_empty_batch_is_noop() -> Result<(), Report> {
     use tokio::time::timeout;
     let _init_guard = zakura_test::init();
 
-    let mut verifier = Batch::new(Verifier::default(), 100, 10, Duration::from_secs(1000));
+    let mut verifier = Batch::new(Verifier::default(), 100, 10, LONG_BATCH_LATENCY);
     verifier.flush().await.map_err(|e| eyre!(e))?;
 
     timeout(
@@ -354,7 +403,7 @@ async fn batch_flushes_on_try_flush() -> Result<(), Report> {
 
     // Use a very high max_items and long max_latency. Without the non-blocking
     // flush, this verification would wait for the latency timer.
-    let verifier = Batch::new(Verifier::default(), 100, 10, Duration::from_secs(1000));
+    let verifier = Batch::new(Verifier::default(), 100, 10, LONG_BATCH_LATENCY);
     timeout(
         Duration::from_secs(1),
         sign_and_verify_after_try_flush(verifier, 10),
@@ -371,7 +420,7 @@ async fn batch_flush_uses_existing_readiness_permit() -> Result<(), Report> {
     use tokio::time::timeout;
     let _init_guard = zakura_test::init();
 
-    let mut verifier = Batch::new(Verifier::default(), 1, 1, Duration::from_secs(1000));
+    let mut verifier = Batch::new(Verifier::default(), 1, 1, LONG_BATCH_LATENCY);
     verifier.ready().await.map_err(|e| eyre!(e))?;
     timeout(Duration::from_secs(1), verifier.flush())
         .await
@@ -394,6 +443,141 @@ async fn fallback_verification() -> Result<(), Report> {
     sign_and_verify(verifier, 100, Some(39))
         .await
         .map_err(|e| eyre!(e))?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_flush_fallback_matches_single_verification() -> Result<(), Report> {
+    use tokio::time::timeout;
+    let _init_guard = zakura_test::init();
+
+    timeout(Duration::from_secs(5), async {
+        // Cover an invalid singleton, then every invalid position in a mixed
+        // batch. These batches are below the size threshold and have a long
+        // latency, so only the explicit flush can drive them to completion.
+        for (n, bad_index) in [(1, 0), (3, 0), (3, 1), (3, 2)] {
+            explicit_flush_fallback_matches_single(n, bad_index).await?;
+        }
+
+        Ok::<_, BoxError>(())
+    })
+    .await
+    .map_err(|error| eyre!(error))?
+    .map_err(|error| eyre!(error))?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_flush_isolates_interleaved_request_groups() -> Result<(), Report> {
+    use tokio::time::timeout;
+    let _init_guard = zakura_test::init();
+
+    let verifier = Fallback::new(
+        Batch::new(Verifier::default(), 100, 1, LONG_BATCH_LATENCY),
+        tower::service_fn(|item: Item| async move { item.verify_single().map_err(BoxError::from) }),
+    );
+    let mut block_a = verifier.clone();
+    let mut block_b = verifier.clone();
+
+    block_a.ready().await.map_err(|error| eyre!(error))?;
+    let valid_a1 = block_a.call(signed_item(true));
+    block_b.ready().await.map_err(|error| eyre!(error))?;
+    let invalid_b = block_b.call(signed_item(false));
+    block_a.ready().await.map_err(|error| eyre!(error))?;
+    let valid_a2 = block_a.call(signed_item(true));
+
+    let mut primary = verifier.primary().clone();
+    assert!(
+        primary.try_flush().map_err(|error| eyre!(error))?,
+        "the shared batch must have capacity for an explicit flush"
+    );
+
+    let (valid_a1, invalid_b, valid_a2) = timeout(
+        Duration::from_secs(5),
+        futures::future::join3(valid_a1, invalid_b, valid_a2),
+    )
+    .await
+    .map_err(|error| eyre!(error))?;
+
+    valid_a1.map_err(|error| eyre!(error))?;
+    assert!(
+        invalid_b.is_err(),
+        "an invalid request from another group must not inherit a valid result"
+    );
+    valid_a2.map_err(|error| eyre!(error))?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn saturated_try_flush_still_rejects_after_latency() -> Result<(), Report> {
+    use tokio::time::timeout;
+    let _init_guard = zakura_test::init();
+
+    let (batch, worker) = Batch::pair(Verifier::default(), 2, 1, Duration::from_millis(10));
+    let mut verifier = Fallback::new(
+        batch.clone(),
+        tower::service_fn(|item: Item| async move { item.verify_single().map_err(BoxError::from) }),
+    );
+
+    verifier.ready().await.map_err(|error| eyre!(error))?;
+    let invalid_result = verifier.call(signed_item(false));
+
+    // Hold the remaining queue permit so the best-effort flush is skipped.
+    let mut reservation = batch.clone();
+    reservation.ready().await.map_err(|error| eyre!(error))?;
+    let mut primary = batch.clone();
+    assert!(
+        !primary.try_flush().map_err(|error| eyre!(error))?,
+        "try_flush must report the saturated queue"
+    );
+
+    drop(reservation);
+    tokio::spawn(worker.run());
+
+    let invalid_result = timeout(Duration::from_secs(5), invalid_result)
+        .await
+        .map_err(|error| eyre!(error))?;
+    assert!(
+        invalid_result.is_err(),
+        "the latency fallback must reject an invalid signature"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_flush_still_rejects_via_single_fallback() -> Result<(), Report> {
+    use tokio::time::timeout;
+    let _init_guard = zakura_test::init();
+
+    let (batch, worker) = Batch::pair(Verifier::default(), 100, 1, LONG_BATCH_LATENCY);
+    let mut verifier = Fallback::new(
+        batch.clone(),
+        tower::service_fn(|item: Item| async move { item.verify_single().map_err(BoxError::from) }),
+    );
+
+    verifier.ready().await.map_err(|error| eyre!(error))?;
+    let invalid_result = verifier.call(signed_item(false));
+
+    // Dropping the worker fails the queued batch request and closes the flush
+    // channel. Fallback must still verify the item singly and reject it.
+    drop(worker);
+    let mut primary = batch.clone();
+    assert!(
+        primary.try_flush().is_err(),
+        "flushing a closed worker must fail"
+    );
+
+    let invalid_result = timeout(Duration::from_secs(5), invalid_result)
+        .await
+        .map_err(|error| eyre!(error))?;
+    assert!(
+        invalid_result.is_err(),
+        "a failed flush must not turn an invalid signature into success"
+    );
 
     Ok(())
 }

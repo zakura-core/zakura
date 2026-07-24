@@ -245,4 +245,47 @@ mod tests {
         assert!(!block_verifier_batch_flush_ready(key));
         assert!(block_verifier_batch_flush_ready(key));
     }
+
+    #[test]
+    fn interleaved_block_flush_registrations_are_isolated() {
+        let block_a_context = Arc::new(());
+        let block_b_context = Arc::new(());
+        let block_a_key = block_verifier_batch_flush_key(&block_a_context);
+        let block_b_key = block_verifier_batch_flush_key(&block_b_context);
+        let _block_a_guard = register_block_verifier_batch_flush(&block_a_context, 2);
+        let _block_b_guard = register_block_verifier_batch_flush(&block_b_context, 3);
+
+        assert!(!block_verifier_batch_flush_ready(block_a_key));
+        assert!(!block_verifier_batch_flush_ready(block_b_key));
+        assert!(block_verifier_batch_flush_ready(block_a_key));
+        assert!(!block_verifier_batch_flush_ready(block_a_key));
+        assert!(!block_verifier_batch_flush_ready(block_b_key));
+        assert!(block_verifier_batch_flush_ready(block_b_key));
+        assert!(!block_verifier_batch_flush_ready(block_b_key));
+    }
+
+    #[test]
+    fn cancelled_block_flush_ignores_late_transaction_boundaries() {
+        let cancelled_context = Arc::new(());
+        let cancelled_key = block_verifier_batch_flush_key(&cancelled_context);
+        let cancelled_guard = register_block_verifier_batch_flush(&cancelled_context, 2);
+
+        assert!(!block_verifier_batch_flush_ready(cancelled_key));
+        drop(cancelled_guard);
+
+        assert!(
+            !block_verifier_batch_flush_ready(cancelled_key),
+            "a late boundary from a cancelled block must not queue a flush"
+        );
+
+        let active_context = Arc::new(());
+        let active_key = block_verifier_batch_flush_key(&active_context);
+        let _active_guard = register_block_verifier_batch_flush(&active_context, 1);
+
+        assert!(block_verifier_batch_flush_ready(active_key));
+        assert!(
+            !block_verifier_batch_flush_ready(cancelled_key),
+            "a cancelled block must not advance another registration"
+        );
+    }
 }

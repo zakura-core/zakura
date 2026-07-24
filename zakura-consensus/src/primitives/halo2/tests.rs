@@ -13,9 +13,13 @@
 //!     matching circuit era's key (pre-NU6.2 insecure, NU6.2-until-NU6.3 fixed, or
 //!     NU6.3-onward).
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
+use futures::future::join_all;
 use orchard::bundle::{Authorized, Bundle};
+use tower::{Service, ServiceExt};
+use tower_batch_control::Batch;
+use tower_fallback::Fallback;
 use zakura_chain::{
     block::Block,
     parameters::NetworkUpgrade,
@@ -26,9 +30,14 @@ use zakura_chain::{
 use zcash_protocol::value::ZatBalance;
 
 use super::{
-    lazy_verifier_for, Item, VERIFIER_NU6_2, VERIFIER_NU6_3_ONWARD, VERIFIER_PRE_NU6_2,
-    VERIFYING_KEY_NU6_2, VERIFYING_KEY_PRE_NU6_2,
+    lazy_verifier_for, Item, ItemVerifyingKey, OrchardFallback, Verifier, VerifierService,
+    VERIFIER_NU6_2, VERIFIER_NU6_3_ONWARD, VERIFIER_PRE_NU6_2, VERIFYING_KEY_NU6_2,
+    VERIFYING_KEY_NU6_3_ONWARD, VERIFYING_KEY_PRE_NU6_2,
 };
+
+const EXPLICIT_FLUSH_TEST_MAX_BATCH_WEIGHT: usize = 10_000;
+const EXPLICIT_FLUSH_TEST_LATENCY: Duration = Duration::from_secs(1000);
+const EXPLICIT_FLUSH_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Returns one real pre-NU6.2 Orchard bundle and its sighash, extracted from the mainnet test
 /// blocks.
@@ -62,6 +71,54 @@ fn pre_nu6_2_bundle_and_sighash() -> (Bundle<Authorized, ZatBalance>, SigHash) {
     }
 
     panic!("mainnet test blocks must contain a transparent-input-free Orchard transaction");
+}
+
+fn explicit_flush_verifier(vk: &'static ItemVerifyingKey) -> VerifierService {
+    Fallback::new(
+        Batch::new(
+            Verifier::new(vk),
+            EXPLICIT_FLUSH_TEST_MAX_BATCH_WEIGHT,
+            1,
+            EXPLICIT_FLUSH_TEST_LATENCY,
+        ),
+        OrchardFallback { vk },
+    )
+}
+
+async fn assert_explicit_flush_matches_single(vk: &'static ItemVerifyingKey, items: Vec<Item>) {
+    let expected_results: Vec<_> = items
+        .iter()
+        .cloned()
+        .map(|item| item.verify_single(vk))
+        .collect();
+    let mut verifier = explicit_flush_verifier(vk);
+    let mut batch_results = Vec::new();
+
+    for item in items {
+        verifier
+            .ready()
+            .await
+            .expect("test verifier must become ready");
+        batch_results.push(verifier.call(item));
+    }
+
+    let mut primary = verifier.primary().clone();
+    assert!(
+        primary
+            .try_flush()
+            .expect("explicit test flush must not fail"),
+        "explicit test flush must be queued"
+    );
+
+    let actual_results: Vec<_> = join_all(batch_results)
+        .await
+        .into_iter()
+        .map(|result| result.is_ok())
+        .collect();
+    assert_eq!(
+        actual_results, expected_results,
+        "explicit batch flush plus fallback must match single verification"
+    );
 }
 
 /// A real pre-NU6.2 Orchard proof verifies under the pre-NU6.2 key and is rejected by the
@@ -139,4 +196,46 @@ fn verifier_routes_each_network_upgrade_to_the_correct_key() {
         std::ptr::eq(lazy_verifier_for(NetworkUpgrade::Nu6_3), nu6_3_onward),
         "a v5 Orchard bundle at NU6.3 must use the same key as v6 Orchard and Ironwood"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_flush_fallback_matches_single_for_mixed_pre_nu6_2_proofs() {
+    let _init_guard = zakura_test::init();
+    let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+    let mut invalid_sighash = sighash;
+    invalid_sighash.0[0] ^= 1;
+
+    tokio::time::timeout(
+        EXPLICIT_FLUSH_TEST_TIMEOUT,
+        assert_explicit_flush_matches_single(
+            &VERIFYING_KEY_PRE_NU6_2,
+            vec![
+                Item::new(bundle.clone(), sighash),
+                Item::new(bundle.clone(), invalid_sighash),
+                Item::new(bundle, sighash),
+            ],
+        ),
+    )
+    .await
+    .expect("explicitly flushed Orchard verification must complete");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_flush_rejects_single_proof_under_each_wrong_era_key() {
+    let _init_guard = zakura_test::init();
+    let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+
+    for vk in [&*VERIFYING_KEY_NU6_2, &*VERIFYING_KEY_NU6_3_ONWARD] {
+        assert!(
+            !Item::new(bundle.clone(), sighash).verify_single(vk),
+            "the historical proof must be invalid under the wrong era key"
+        );
+
+        tokio::time::timeout(
+            EXPLICIT_FLUSH_TEST_TIMEOUT,
+            assert_explicit_flush_matches_single(vk, vec![Item::new(bundle.clone(), sighash)]),
+        )
+        .await
+        .expect("explicitly flushed Orchard verification must complete");
+    }
 }

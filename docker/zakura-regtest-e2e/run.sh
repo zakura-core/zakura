@@ -511,14 +511,6 @@ reset_node2_from_scratch() {
   local label="$1"
   docker compose -f "${COMPOSE_FILE}" stop zakura-node-2 \
     || fail "could not stop node2 for ${label}"
-  # Ephemeral state is already gone with the stopped container. Also drop the
-  # pre-reset JSONL traces: the next process reuses the same bind-mounted
-  # trace_dir but rebases its monotonic clock to ~0, and leaving the old
-  # lagging snapshots in place makes the oracle correlate across process
-  # lifetimes. Restart-matrix preserves mid-run evidence by skipping this.
-  if [[ "${ZAKURA_E2E_RESTART_MATRIX}" != "1" ]]; then
-    find "${ZAKURA_E2E_TRACE_DIR}/node2" -type f -name '*.jsonl' -exec sh -c ': > "$1"' _ {} \;
-  fi
   if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
     docker compose -f "${COMPOSE_FILE}" rm -f zakura-node-2 \
       || fail "could not remove node2 container for ${label}"

@@ -88,7 +88,7 @@ fn address_book(c: &mut Criterion) {
             (size + 1).min(MAX_ADDRS_IN_ADDRESS_BOOK)
         );
 
-        let mut ban_check = address_book.clone();
+        let mut ban_check = address_book.clone_with_fresh_bans_for_benchmark();
         let ban_change = MetaAddr::new_misbehavior(existing_addr, MAX_PEER_MISBEHAVIOR_SCORE);
         assert!(ban_check.update(ban_change).is_none());
         assert_eq!(ban_check.len(), size - SAME_IP_ADDRESS_COUNT);
@@ -150,7 +150,7 @@ fn address_book(c: &mut Criterion) {
             &size,
             |b, _size| {
                 b.iter_batched_ref(
-                    || address_book.clone(),
+                    || address_book.clone_with_fresh_bans_for_benchmark(),
                     |address_book| {
                         let change = MetaAddr::new_misbehavior(
                             black_box(existing_addr),

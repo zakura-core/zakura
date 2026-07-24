@@ -893,6 +893,15 @@ impl AddressBook {
         self.bans_by_ip.clone()
     }
 
+    /// Clones this address book with an independent, empty ban list.
+    #[cfg(feature = "internal-bench")]
+    #[doc(hidden)]
+    pub fn clone_with_fresh_bans_for_benchmark(&self) -> Self {
+        let mut address_book = self.clone();
+        address_book.bans_by_ip = BannedIps::default();
+        address_book
+    }
+
     /// Returns the number of entries in this address book.
     pub fn len(&self) -> usize {
         self.peers.len()

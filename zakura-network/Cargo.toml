@@ -122,3 +122,4 @@ harness = false
 [[bench]]
 name = "address_book"
 harness = false
+required-features = ["internal-bench"]

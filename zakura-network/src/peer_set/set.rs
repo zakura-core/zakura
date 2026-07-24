@@ -722,6 +722,33 @@ where
             .count()
     }
 
+    /// Disconnects every ready or busy peer whose canonical IP is banned.
+    fn disconnect_from_banned_peers(&mut self) {
+        let banned_peers: Vec<_> = self
+            .ready_services
+            .keys()
+            .chain(self.cancel_handles.keys())
+            .filter(|addr| self.bans.contains(addr.ip()))
+            .copied()
+            .collect();
+
+        for peer in banned_peers {
+            warn!(
+                peer = %peer.addr_label(self.expose_peer_addresses),
+                "peer ip is banned, disconnecting peer"
+            );
+            self.remove(&peer);
+        }
+
+        if let Some((_request, _sender, remaining_peers)) = &mut self.queued_broadcast_all {
+            remaining_peers.retain(|addr| !self.bans.contains(addr.ip()));
+        }
+
+        if let Some((_request, remaining_peers)) = &mut self.queued_sidecar_block_gossip {
+            remaining_peers.retain(|addr| !self.bans.contains(addr.ip()));
+        }
+    }
+
     /// Returns `true` if Zebra is already connected to the IP and port in `addr`.
     fn has_peer_with_addr(&self, addr: PeerSocketAddr) -> bool {
         self.ready_services.contains_key(&addr) || self.cancel_handles.contains_key(&addr)
@@ -771,6 +798,15 @@ where
                         peer = %key.addr_label(self.expose_peer_addresses),
                         "got Change::Insert from Discover"
                     );
+
+                    if self.bans.contains(key.ip()) {
+                        warn!(
+                            peer = %key.addr_label(self.expose_peer_addresses),
+                            "discovered peer ip is banned, dropping service"
+                        );
+                        std::mem::drop(svc);
+                        continue;
+                    }
 
                     // # Security
                     //
@@ -1643,6 +1679,12 @@ where
         // task. If there are no ready peers, and no new peers, network requests will pause until:
         // - an unready peer becomes ready, or
         // - a new peer arrives.
+
+        // Register before checking the persistent ban state. A ban inserted
+        // before registration is found by the scan, while one inserted after
+        // registration wakes this task for another scan.
+        self.bans.register_waker(cx.waker());
+        self.disconnect_from_banned_peers();
 
         // Drain stall events first, so disconnects free up slots that
         // `poll_discover` can fill in the same poll cycle.

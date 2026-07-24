@@ -4,12 +4,15 @@
 use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet, VecDeque},
+    fmt,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex, RwLock},
+    task::Waker,
     time::Instant,
 };
 
 use chrono::Utc;
+use futures::task::AtomicWaker;
 use ordered_map::OrderedMap;
 use tokio::sync::watch;
 use tracing::Span;
@@ -28,9 +31,16 @@ use crate::{
 mod tests;
 
 /// Read-only access to currently banned peer IP addresses.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct BannedIps {
-    inner: Arc<RwLock<BanList>>,
+    inner: Arc<BannedIpsInner>,
+}
+
+/// Shared ban state and the peer set's ban-change notification.
+#[derive(Default)]
+struct BannedIpsInner {
+    bans: RwLock<BanList>,
+    peer_set_waker: AtomicWaker,
 }
 
 /// A bounded FIFO list of banned peer IP addresses.
@@ -45,11 +55,13 @@ struct BanList {
 
 impl BanList {
     /// Inserts `ip`, evicting the oldest IP when the list exceeds its bound.
-    fn insert(&mut self, ip: IpAddr) {
+    ///
+    /// Returns `true` if the list changed.
+    fn insert(&mut self, ip: IpAddr) -> bool {
         let ip = canonical_ip(ip);
 
         if !self.ips.insert(ip) {
-            return;
+            return false;
         }
 
         self.insertion_order.push_back(ip);
@@ -62,6 +74,24 @@ impl BanList {
 
             self.ips.remove(&oldest);
         }
+
+        true
+    }
+}
+
+impl fmt::Debug for BannedIps {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BannedIps")
+            .field(
+                "bans",
+                &self
+                    .inner
+                    .bans
+                    .read()
+                    .expect("ban list lock should not be poisoned"),
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -71,19 +101,38 @@ impl BannedIps {
         let ip = canonical_ip(ip);
 
         self.inner
+            .bans
             .read()
             .expect("ban list lock should not be poisoned")
             .ips
             .contains(&ip)
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_banned_ip(ip: IpAddr) -> Self {
-        let bans = Self::default();
-        bans.inner
+    /// Inserts a banned IP and wakes the peer set after releasing the write lock.
+    pub(crate) fn insert(&self, ip: IpAddr) -> bool {
+        let inserted = self
+            .inner
+            .bans
             .write()
             .expect("ban list lock should not be poisoned")
             .insert(ip);
+
+        if inserted {
+            self.inner.peer_set_waker.wake();
+        }
+
+        inserted
+    }
+
+    /// Registers the peer set task for notification when a new IP is banned.
+    pub(crate) fn register_waker(&self, waker: &Waker) {
+        self.inner.peer_set_waker.register(waker);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_banned_ip(ip: IpAddr) -> Self {
+        let bans = Self::default();
+        bans.insert(ip);
         bans
     }
 }
@@ -539,15 +588,7 @@ impl AddressBook {
             if updated.misbehavior() >= constants::MAX_PEER_MISBEHAVIOR_SCORE {
                 // Ban and skip outbound connections with excessively misbehaving peers.
                 let banned_ip = updated.addr.ip();
-                {
-                    let mut bans_by_ip = self
-                        .bans_by_ip
-                        .inner
-                        .write()
-                        .expect("ban list lock should not be poisoned");
-
-                    bans_by_ip.insert(banned_ip);
-                }
+                self.bans_by_ip.insert(banned_ip);
 
                 // `most_recent_by_ip` is only populated when
                 // `max_connections_per_ip == 1`. The ban path runs for any

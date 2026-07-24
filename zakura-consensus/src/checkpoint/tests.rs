@@ -971,9 +971,8 @@ async fn newer_request_must_not_rewind_verified_checkpoint_progress() -> Result<
     )
     .await
     .expect("superseded verify should not time out");
-    let superseded_err = superseded_result.expect_err(
-        "replaced in-queue duplicate must fail the older request with NewerRequest",
-    );
+    let superseded_err = superseded_result
+        .expect_err("replaced in-queue duplicate must fail the older request with NewerRequest");
     assert!(
         superseded_err.is_duplicate_request(),
         "expected NewerRequest-classified duplicate, got {superseded_err:?}"

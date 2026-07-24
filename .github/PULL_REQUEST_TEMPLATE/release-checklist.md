@@ -101,6 +101,14 @@ This check runs automatically on pull requests with the `A-release` label. It mu
 
 # Update Versions and End of Support
 
+> **Automation**: the
+> [Prepare release PR workflow](https://github.com/zakura-core/zakura/actions/workflows/prepare-release-pr.yml)
+> performs the mechanical steps in this section (crate and zakura version
+> bumps, lockfile, stored config, changelog assembly, end-of-support floor)
+> and opens a draft PR. The judgment items remain manual either way: review
+> the chosen bump levels, curate the assembled changelog, and set the
+> authoritative end-of-support height below.
+
 ## Update Zakura Version
 
 Zakura follows [semantic versioning](https://semver.org). Semantic versions look like: MAJOR.MINOR.PATCH[-TAG.PRE-RELEASE]

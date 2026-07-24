@@ -1590,13 +1590,7 @@ async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Re
     let network = Network::Mainnet;
     let winning_block = Arc::new(network.test_block(653599, 583999).unwrap());
     let config = Config::ephemeral();
-    let finalized_state = FinalizedState::new(
-        &config,
-        &network,
-        #[cfg(feature = "elasticsearch")]
-        false,
-    )
-    .unwrap();
+    let finalized_state = FinalizedState::new(&config, &network).unwrap();
     let mut stale_block = winning_block.clone();
     // Production inserts blocks only after semantic verification. This state-layer
     // regression bypasses that boundary and mutates the nonce only to give the
@@ -1612,6 +1606,11 @@ async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Re
     let winning_height = winning_block.coinbase_height().unwrap();
     assert_ne!(stale_hash, winning_block.hash());
     assert_ne!(stale_child_hash, winning_child_hash);
+    let mut stale_tip_state = NonFinalizedState::new(&network);
+    stale_tip_state
+        .commit_new_chain(stale_block.clone().prepare(), &finalized_state)
+        .unwrap();
+
     let mut stale_state = NonFinalizedState::new(&network);
     stale_state
         .commit_new_chain(stale_block.prepare(), &finalized_state)
@@ -1631,7 +1630,7 @@ async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Re
             .and_then(|chain| chain.hash_by_height(winning_height.next().unwrap())),
         Some(stale_child_hash)
     );
-    let (_stale_sender, stale_receiver) = tokio::sync::watch::channel(stale_state);
+    let (stale_sender, stale_receiver) = tokio::sync::watch::channel(stale_state);
     let (_checkpoint_sender, checkpoint_receiver) = tokio::sync::watch::channel(None);
     let (_repair_sender, repair_receiver) =
         tokio::sync::watch::channel(VctRootRepairStatus::default());
@@ -1714,6 +1713,7 @@ async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Re
     assert_eq!(next_block_hash, Some(winning_child_hash));
 
     let response = read_state
+        .clone()
         .oneshot(ReadRequest::BlockHeader(winning_height.into()))
         .await
         .unwrap();
@@ -1730,10 +1730,28 @@ async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Re
     assert_eq!(hash, stale_hash);
     assert_eq!(block::Hash::from(header.as_ref()), stale_hash);
     assert_eq!(next_block_hash, Some(stale_child_hash));
+    stale_sender.send_replace(stale_tip_state);
+    let response = read_state
+        .oneshot(ReadRequest::BlockHeader(stale_hash.into()))
+        .await
+        .unwrap();
+    let ReadResponse::BlockHeader {
+        header,
+        hash,
+        height,
+        next_block_hash,
+    } = response
+    else {
+        unreachable!();
+    };
+    assert_eq!(height, winning_height);
+    assert_eq!(hash, stale_hash);
+    assert_eq!(block::Hash::from(header.as_ref()), stale_hash);
+    assert_eq!(next_block_hash, None);
     Ok(())
 }
 
-/// The finalized tip can have a known child in the retained non-finalized chain.
+/// A best-chain successor can cross either finalized/non-finalized state boundary.
 #[tokio::test(flavor = "multi_thread")]
 async fn block_header_lookup_preserves_finalized_boundary_successor() -> Result<()> {
     use crate::{
@@ -1755,12 +1773,17 @@ async fn block_header_lookup_preserves_finalized_boundary_successor() -> Result<
 
     let config = Config::ephemeral();
     let finalized_state = FinalizedState::new(&config, &network).unwrap();
+    let mut retained_tip_state = NonFinalizedState::new(&network);
+    retained_tip_state
+        .commit_new_chain(parent.clone().prepare(), &finalized_state)
+        .unwrap();
+
     let mut retained_state = NonFinalizedState::new(&network);
     retained_state
         .commit_new_chain(parent.clone().prepare(), &finalized_state)
         .unwrap();
     retained_state
-        .commit_block(child.prepare(), &finalized_state)
+        .commit_block(child.clone().prepare(), &finalized_state)
         .unwrap();
     drop(retained_state.finalize());
     assert!(retained_state
@@ -1775,7 +1798,7 @@ async fn block_header_lookup_preserves_finalized_boundary_successor() -> Result<
         Some(child_hash)
     );
 
-    let (_retained_sender, retained_receiver) = tokio::sync::watch::channel(retained_state);
+    let (retained_sender, retained_receiver) = tokio::sync::watch::channel(retained_state);
     let (_checkpoint_sender, checkpoint_receiver) = tokio::sync::watch::channel(None);
     let (_repair_sender, repair_receiver) =
         tokio::sync::watch::channel(VctRootRepairStatus::default());
@@ -1828,6 +1851,40 @@ async fn block_header_lookup_preserves_finalized_boundary_successor() -> Result<
         assert_eq!(block::Hash::from(header.as_ref()), parent_hash);
         assert_eq!(next_block_hash, Some(child_hash));
     }
+
+    retained_sender.send_replace(retained_tip_state);
+    let child_finalized = FinalizedBlock::from_checkpoint_verified(
+        CheckpointVerifiedBlock::from(child),
+        Treestate::default(),
+    );
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_block_header_and_transaction_data_batch(
+            &finalized_state.db,
+            &child_finalized,
+            false,
+            None,
+        )
+        .unwrap();
+    finalized_state.db.write_batch(batch).unwrap();
+
+    let response = read_state
+        .oneshot(ReadRequest::BlockHeader(parent_hash.into()))
+        .await
+        .unwrap();
+    let ReadResponse::BlockHeader {
+        header,
+        hash,
+        height,
+        next_block_hash,
+    } = response
+    else {
+        unreachable!();
+    };
+    assert_eq!(height, parent_height);
+    assert_eq!(hash, parent_hash);
+    assert_eq!(block::Hash::from(header.as_ref()), parent_hash);
+    assert_eq!(next_block_hash, Some(child_hash));
 
     Ok(())
 }

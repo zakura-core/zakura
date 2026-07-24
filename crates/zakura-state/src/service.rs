@@ -1897,10 +1897,19 @@ impl Service<ReadRequest> for ReadStateService {
                                 contextual.block.header.clone(),
                                 contextual.hash,
                                 height,
-                                height
-                                    .next()
-                                    .ok()
-                                    .and_then(|next_height| chain.hash_by_height(next_height)),
+                                height.next().ok().and_then(|next_height| {
+                                    chain.hash_by_height(next_height).or_else(|| {
+                                        state
+                                            .db
+                                            .block_header(next_height.into())
+                                            .filter(|next_header| {
+                                                next_header.previous_block_hash == contextual.hash
+                                            })
+                                            .map(|next_header| {
+                                                block::Hash::from(next_header.as_ref())
+                                            })
+                                    })
+                                }),
                             )
                         })
                     })

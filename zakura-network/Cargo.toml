@@ -118,3 +118,7 @@ harness = false
 [[bench]]
 name = "zakura_loadgen"
 harness = false
+
+[[bench]]
+name = "address_book"
+harness = false

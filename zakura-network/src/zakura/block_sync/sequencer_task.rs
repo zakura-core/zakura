@@ -595,15 +595,23 @@ impl SequencerTask {
             None
         };
 
-        if matches!(result, BlockApplyResult::Duplicate) && self.sequencer.verified_tip() < height {
-            // Stale duplicate for a height we have not verified to: the reactor
-            // needs the serving/query tail only when the accepted local frontier
-            // actually advanced serving. The body stays attached until a later
-            // frontier update removes it, but the driver has released its decoded
-            // copy, so release the token-aware decode-window charge now.
-            self.sequencer
-                .finish_attached_submission(token, height, hash);
-            return accepted_local_frontier.is_some();
+        if matches!(result, BlockApplyResult::Duplicate) {
+            metrics::counter!("sync.block.apply.duplicate").increment(1);
+            if self.sequencer.verified_tip() < height {
+                // Stale duplicate for a height we have not verified to: the reactor
+                // needs the serving/query tail only when the accepted local frontier
+                // actually advanced serving. The body stays attached until a later
+                // frontier update removes it, but the driver has released its decoded
+                // copy, so release the token-aware decode-window charge now.
+                //
+                // A high rate of tip-behind duplicates usually means SubmitBlock was
+                // retried while an earlier attempt was still in the checkpoint queue
+                // (`NewerRequest`) — investigate block-sync resubmit behaviour.
+                metrics::counter!("sync.block.apply.duplicate_before_tip").increment(1);
+                self.sequencer
+                    .finish_attached_submission(token, height, hash);
+                return accepted_local_frontier.is_some();
+            }
         }
         let applying = self
             .sequencer
@@ -704,6 +712,7 @@ impl SequencerTask {
                 .record(send_started.elapsed().as_secs_f64());
             if !sent {
                 self.sequencer.unsubmit(item.height, item.token);
+                metrics::counter!("sync.block.submit.unsubmit").increment(1);
                 if !self.actions.is_closed() {
                     let now = time::Instant::now();
                     self.submission_retry_started_at.get_or_insert(now);

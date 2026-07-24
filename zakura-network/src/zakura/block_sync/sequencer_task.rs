@@ -473,12 +473,11 @@ impl SequencerTask {
         );
 
         // State can report a forward `Reset` while checkpoint commits advance
-        // under already-submitted or still-downloading successor bodies. Treat
-        // that as verified growth once it is inside our submitted/downloaded
-        // floor, or when we already have successor work in flight. Keep fork
-        // resets destructive when they are not anchored by active successor
-        // work.
-        if frontiers.verified_block_tip > self.sequencer.verified_tip()
+        // under active successor bodies. Preserve them only when the caller knows
+        // their anchor is unchanged; header reanchors can carry coalesced body
+        // growth while those successors belong to the old fork.
+        if preserve_active_successors
+            && frontiers.verified_block_tip > self.sequencer.verified_tip()
             && (frontiers.verified_block_tip <= self.sequencer.floor()
                 || self.has_active_successor_after(
                     frontiers.verified_block_tip,

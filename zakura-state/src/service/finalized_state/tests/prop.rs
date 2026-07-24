@@ -1703,7 +1703,18 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
-    proptest!(ProptestConfig::with_cases(1),
+    // Keep this regression seed isolated because the default source-level
+    // persistence file is replayed by every property in this module.
+    let mut proptest_config = ProptestConfig::with_cases(1);
+    proptest_config.failure_persistence = Some(Box::new(
+        proptest::test_runner::FileFailurePersistence::Direct(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/proptest-regressions/service/finalized_state/tests/",
+            "vct_mode_switches_continue_from_safe_boundaries.txt",
+        )),
+    ));
+
+    proptest!(proptest_config,
         |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
             let blocks: Vec<_> = chain.iter().collect();
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
@@ -1758,8 +1769,10 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             let fast_config = Config {
                 cache_dir: fast_to_manual_dir.path().to_path_buf(),
                 ephemeral: false,
+                vct_fast_sync: true,
                 ..Config::default()
             };
+            let restart_index = seed + 1;
             {
                 let mut fast = FinalizedState::new(&fast_config, &network).expect("opening an ephemeral database should succeed");
                 enable_vct_test_fixture_source_with_handoff(
@@ -1771,13 +1784,10 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                     handoff_trees.sprout.clone(),
                     handoff_trees.ironwood.clone(),
                 );
-                // Match the writer service by carrying the frozen in-memory
-                // frontier through an uninterrupted fast-sync sequence.
                 let mut prev_note_commitment_trees = None;
-                for i in 0..=handoff_index {
+                for i in 0..=restart_index {
                     let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                    let next = (i < handoff_index)
-                        .then(|| vct_successor_header(blocks[i + 1].block.clone()));
+                    let next = Some(vct_successor_header(blocks[i + 1].block.clone()));
                     let (_, note_commitment_trees) = fast
                         .commit_finalized_direct(
                             cv.into(),
@@ -1786,6 +1796,46 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                             "vct switch fast prefix",
                         )
                         .expect("verified fast prefix commits");
+                    prev_note_commitment_trees = Some(note_commitment_trees);
+                }
+            }
+
+            // Restart inside the absent band, losing the frozen in-memory
+            // frontiers before reaching the handoff. The synthetic network has
+            // no embedded VCT source, so bypass the production resume guard
+            // long enough to inject the test fixture.
+            {
+                let mut fast = FinalizedState::new_with_debug_and_storage_validation(
+                    &fast_config,
+                    &network,
+                    false,
+                    false,
+                    true,
+                    false,
+                )
+                .expect("reopening the fast-sync database should succeed");
+                enable_vct_test_fixture_source_with_handoff(
+                    &mut fast,
+                    fixture.clone(),
+                    handoff,
+                    handoff_trees.sapling.clone(),
+                    handoff_trees.orchard.clone(),
+                    handoff_trees.sprout.clone(),
+                    handoff_trees.ironwood.clone(),
+                );
+                let mut prev_note_commitment_trees = None;
+                for i in (restart_index + 1)..=handoff_index {
+                    let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                    let next = (i < handoff_index)
+                        .then(|| vct_successor_header(blocks[i + 1].block.clone()));
+                    let (_, note_commitment_trees) = fast
+                        .commit_finalized_direct(
+                            cv.into(),
+                            prev_note_commitment_trees.take(),
+                            next,
+                            "vct switch fast prefix after restart",
+                        )
+                        .expect("verified fast prefix commits after restart");
                     prev_note_commitment_trees = Some(note_commitment_trees);
                 }
                 prop_assert_eq!(fast.vct_fast_synced_below(), Some(handoff), "fast sync reached the handoff before the switch");

@@ -21,7 +21,7 @@ use crate::{
     arbitrary::Prepare,
     config::StorageMode,
     service::{
-        finalized_state::{FinalizedState, HighestCompletedCheckpoint},
+        finalized_state::{FinalizedState, HeaderRootAuthState, HighestCompletedCheckpoint},
         non_finalized_state::NonFinalizedState,
         BestChainReadViewCapturePhase, BestChainReadViewTestHook, ReadStateService,
         VctRootRepairStatus,
@@ -61,6 +61,8 @@ fn read_service(
     let (_checkpoint_sender, checkpoint_receiver) =
         watch::channel(None::<HighestCompletedCheckpoint>);
     let (_repair_sender, repair_receiver) = watch::channel(VctRootRepairStatus::default());
+    let (_header_root_auth_sender, header_root_auth_receiver) =
+        watch::channel(None::<HeaderRootAuthState>);
 
     let read_state = ReadStateService::new(
         finalized,
@@ -69,6 +71,7 @@ fn read_service(
         checkpoint_receiver,
         None,
         repair_receiver,
+        header_root_auth_receiver,
     );
 
     (read_state, non_finalized_sender)

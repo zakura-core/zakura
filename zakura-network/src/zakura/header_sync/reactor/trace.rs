@@ -620,7 +620,7 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
                 Some(commit_failure_reason_label(*kind)),
             );
         }
-        HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation } => {
+        HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation, .. } => {
             insert_optional_str(
                 row,
                 hs_trace::KIND,

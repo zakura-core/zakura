@@ -1015,7 +1015,9 @@ pub enum Request {
     /// Authenticate aligned roots for canonical stored headers and durably promote them.
     ///
     /// The range must start immediately after `expected_state`'s authenticated
-    /// height and include at least one root plus its successor header witness.
+    /// height. Normal advancement includes at least one root plus its successor
+    /// header witness; an explicitly scheduled missing-witness recovery contains
+    /// exactly the terminal witness record.
     AuthenticateHeaderRoots {
         /// Exact compact state snapshot on which the caller built this request.
         expected_state: crate::HeaderRootAuthState,
@@ -1852,6 +1854,7 @@ mod header_root_auth_tests {
             authenticated_hash: block::Hash([1; 32]),
             completed_checkpoint_height: block::Height(20),
             completed_checkpoint_hash: block::Hash([2; 32]),
+            header_witness: None,
         };
         let request = AuthenticateHeaderRootsRequest {
             expected_state: state,
@@ -1874,7 +1877,9 @@ mod header_root_auth_tests {
 
         let success = crate::AuthenticatedHeaderRoots {
             state,
-            authenticated: block::Height(11)..=block::Height(19),
+            update: crate::HeaderRootAuthUpdate::Advanced {
+                authenticated: block::Height(11)..=block::Height(19),
+            },
         };
         assert_eq!(
             AuthenticateHeaderRootsRequest::map_response(Response::AuthenticatedHeaderRoots(

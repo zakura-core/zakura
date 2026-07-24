@@ -266,7 +266,7 @@ impl HeaderSyncCore {
             startup.max_frame_bytes,
             true,
         );
-        if batch_count < 2 {
+        if batch_count == 0 {
             return;
         }
 
@@ -275,6 +275,37 @@ impl HeaderSyncCore {
             self.schedule
                 .resident_heights_for(RangePriority::AuthenticateRoots),
         );
+        if end == start {
+            if auth.header_witness.is_some()
+                || self.verified_block_tip >= auth.authenticated_height
+                || available == 0
+            {
+                return;
+            }
+            let range = CheckedHeaderRange::from_count(start, 1)
+                .expect("one-record witness recovery has checked geometry");
+            if self.schedule.ensure(
+                RangeRequest {
+                    range,
+                    anchor_hash: Some(auth.authenticated_hash),
+                    finalized: true,
+                    want_tree_aux_roots: true,
+                    priority: RangePriority::AuthenticateRoots,
+                },
+                RangePriority::AuthenticateRoots,
+            ) {
+                metrics::counter!("sync.header.root_auth.retain.miss").increment(1);
+                metrics::counter!(
+                    "sync.header.root_auth.fallback.requested",
+                    "reason" => "missing_witness"
+                )
+                .increment(1);
+            }
+            return;
+        }
+        if batch_count < 2 {
+            return;
+        }
         let Ok(mut remaining) = u32::try_from(available) else {
             return;
         };
@@ -336,6 +367,25 @@ impl HeaderSyncCore {
         self.root_auth_fallback_end(startup, auth, start)
             .0
             .saturating_sub(start.0)
+    }
+
+    pub(super) fn suppress_unneeded_witness_recovery(&mut self) {
+        let Some(auth) = self.header_root_auth else {
+            return;
+        };
+        let Some(start) = next_height(auth.authenticated_height) else {
+            return;
+        };
+        if auth.header_witness.is_none() && self.verified_block_tip < auth.authenticated_height {
+            return;
+        }
+        self.schedule.discard_witness_recovery_at(start);
+        self.buffered
+            .retain(|(priority, buffered_start), buffered| {
+                *priority != RangePriority::AuthenticateRoots
+                    || *buffered_start != start
+                    || buffered.range.count() != 1
+            });
     }
 
     fn root_auth_fallback_end(

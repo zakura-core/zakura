@@ -15,6 +15,15 @@ pub struct HeaderSyncFrontiers {
     pub verified_block_hash: block::Hash,
 }
 
+/// Compact identity for a retained terminal header witness.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderWitnessState {
+    /// Witness header height.
+    pub height: block::Height,
+    /// Canonical witness header hash.
+    pub hash: block::Hash,
+}
+
 /// Compact durable header-root authentication progress supplied by state.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct HeaderRootAuthState {
@@ -26,6 +35,23 @@ pub struct HeaderRootAuthState {
     pub completed_checkpoint_height: block::Height,
     /// Canonical configured hash at `completed_checkpoint_height`.
     pub completed_checkpoint_hash: block::Hash,
+    /// Retained terminal header witness, when present and canonical.
+    pub header_witness: Option<HeaderWitnessState>,
+}
+
+/// Durable change reported by a successful root-authentication operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeaderRootAuthUpdate {
+    /// The root frontier advanced over this inclusive range.
+    Advanced {
+        /// Newly authenticated root heights.
+        authenticated: std::ops::RangeInclusive<block::Height>,
+    },
+    /// The root frontier retained its height and recovered its terminal witness.
+    WitnessRecovered {
+        /// Recovered canonical witness identity.
+        witness: HeaderWitnessState,
+    },
 }
 
 /// Startup inputs for the dependency-neutral header-sync reactor.
@@ -335,6 +361,8 @@ pub enum HeaderSyncEvent {
     HeaderRootAuthenticationCompleted {
         /// Exact root-authentication operation that completed.
         operation: HeaderSyncOperationIdentity,
+        /// Exact durable authentication change returned by state.
+        update: HeaderRootAuthUpdate,
     },
     /// State rejected an exact root-authentication operation.
     HeaderRootAuthenticationFailed {

@@ -84,6 +84,7 @@ mod tests {
             authenticated_hash: block::Hash([authenticated_hash; 32]),
             completed_checkpoint_height: block::Height(completed_checkpoint_height),
             completed_checkpoint_hash: block::Hash([completed_checkpoint_hash; 32]),
+            header_witness: None,
         }
     }
 
@@ -123,5 +124,20 @@ mod tests {
             Some(previous),
             Some(auth(1, 1, 4, 9))
         ));
+    }
+
+    #[test]
+    fn stale_successor_witness_degradation_keeps_the_frontier_compatible() {
+        let mut previous = auth(4, 4, 5, 5);
+        previous.header_witness = Some(crate::zakura::HeaderWitnessState {
+            height: block::Height(5),
+            hash: block::Hash([5; 32]),
+        });
+        let next = HeaderRootAuthState {
+            header_witness: None,
+            ..previous
+        };
+
+        assert!(root_auth_pipeline_compatible(Some(previous), Some(next)));
     }
 }

@@ -51,6 +51,15 @@ const FRONTIER_PREFIX_BYTES: usize = 1 + 4 + 32;
 const WITNESS_FIXED_BYTES: usize = 4 + 32 + 32;
 const AUTH_FRONTIER_KEY: &[u8] = &[];
 
+/// Compact identity for the retained terminal header witness.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderWitnessState {
+    /// The witness header's height.
+    pub height: Height,
+    /// The canonical witness header hash.
+    pub hash: block::Hash,
+}
+
 /// Compact header-root authentication progress published to header sync.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct HeaderRootAuthState {
@@ -62,6 +71,23 @@ pub struct HeaderRootAuthState {
     pub completed_checkpoint_height: Height,
     /// The configured checkpoint hash at `completed_checkpoint_height`.
     pub completed_checkpoint_hash: block::Hash,
+    /// The retained terminal header witness, when it is canonical and valid.
+    pub header_witness: Option<HeaderWitnessState>,
+}
+
+/// The durable change made by successful supplied-root authentication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeaderRootAuthUpdate {
+    /// The authenticated root frontier advanced over this inclusive range.
+    Advanced {
+        /// Newly authenticated root heights.
+        authenticated: RangeInclusive<Height>,
+    },
+    /// A missing terminal witness was recovered without advancing the frontier.
+    WitnessRecovered {
+        /// The recovered canonical witness.
+        witness: HeaderWitnessState,
+    },
 }
 
 /// A successful supplied-root authentication.
@@ -69,8 +95,8 @@ pub struct HeaderRootAuthState {
 pub struct AuthenticatedHeaderRoots {
     /// Authentication progress after the durable write.
     pub state: HeaderRootAuthState,
-    /// Newly authenticated root heights.
-    pub authenticated: RangeInclusive<Height>,
+    /// The durable authentication change.
+    pub update: HeaderRootAuthUpdate,
 }
 
 /// Stable classification for supplied-root authentication outcomes.
@@ -119,11 +145,27 @@ pub enum AuthenticateHeaderRootsError {
         /// Number of root records.
         roots: usize,
     },
-    /// At least one confirmed root and a final header witness are required.
-    #[error("header-root authentication requires at least two aligned items, got {items}")]
+    /// At least a final header witness record is required.
+    #[error("header-root authentication requires at least one aligned item, got {items}")]
     MissingHeaderWitness {
         /// Number of supplied items.
         items: usize,
+    },
+    /// The one-item recovery is unnecessary because a valid witness is already retained.
+    #[error("header-root witness recovery is unnecessary: retained witness {witness:?}")]
+    WitnessAlreadyPresent {
+        /// The currently retained canonical witness.
+        witness: HeaderWitnessState,
+    },
+    /// The finalized body tip has caught the authenticated frontier.
+    #[error(
+        "header-root witness recovery is unnecessary at frontier {authenticated_height:?}: finalized body tip is {finalized_body_tip:?}"
+    )]
+    WitnessNotNeeded {
+        /// Current authenticated frontier height.
+        authenticated_height: Height,
+        /// Current finalized body tip.
+        finalized_body_tip: Height,
     },
     /// A root record is not at its required contiguous height.
     #[error("header-root item is at {actual:?}, expected {expected:?}")]
@@ -174,7 +216,9 @@ impl AuthenticateHeaderRootsError {
             | Self::AnchorMismatch { .. }
             | Self::StartMismatch { .. }
             | Self::NonCanonicalHeader { .. }
-            | Self::WitnessAboveCompletedCheckpoint { .. } => AuthenticateHeaderRootsOutcome::Stale,
+            | Self::WitnessAboveCompletedCheckpoint { .. }
+            | Self::WitnessAlreadyPresent { .. }
+            | Self::WitnessNotNeeded { .. } => AuthenticateHeaderRootsOutcome::Stale,
             Self::CountMismatch { .. }
             | Self::MissingHeaderWitness { .. }
             | Self::NonContiguous { .. }
@@ -217,6 +261,10 @@ impl HeaderRootAuthFrontier {
             authenticated_hash: self.confirmed_hash,
             completed_checkpoint_height: completed_checkpoint.height,
             completed_checkpoint_hash: completed_checkpoint.hash,
+            header_witness: self.header_witness.map(|witness| HeaderWitnessState {
+                height: witness.height(),
+                hash: witness.hash(),
+            }),
         }
     }
 }
@@ -771,6 +819,33 @@ impl ZakuraDb {
         Ok(frontier)
     }
 
+    /// Atomically restores a missing terminal witness without changing the root frontier.
+    fn write_recovered_header_witness(
+        &self,
+        frontier: HeaderRootAuthFrontier,
+        verified: VerifiedHeaderCommitmentRoots,
+    ) -> Result<HeaderRootAuthFrontier, HeaderRootAuthFrontierError> {
+        if !verified.confirmed_roots().is_empty()
+            || !verified.confirmed_hashes().is_empty()
+            || verified.history_tree() != &frontier.history_tree
+        {
+            return Err(HeaderRootAuthFrontierError::InvalidEncoding);
+        }
+        let witness = verified
+            .header_witness()
+            .ok_or(HeaderRootAuthFrontierError::InvalidEncoding)?;
+        validate_header_witness(self, frontier.confirmed_height, witness)?;
+
+        let recovered = HeaderRootAuthFrontier {
+            header_witness: Some(witness),
+            ..frontier
+        };
+        let mut batch = DiskWriteBatch::new();
+        batch.set_header_root_auth_frontier(self, &recovered);
+        self.write_batch(batch)?;
+        Ok(recovered)
+    }
+
     /// Validates supplied roots against the exact durable frontier and atomically promotes them.
     pub(crate) fn authenticate_header_roots(
         &self,
@@ -790,6 +865,7 @@ impl ZakuraDb {
         // to bound the witness, while only the durable root frontier is compare-and-swapped.
         if expected_state.authenticated_height != current.authenticated_height
             || expected_state.authenticated_hash != current.authenticated_hash
+            || expected_state.header_witness != current.header_witness
         {
             return Err(AuthenticateHeaderRootsError::StaleState {
                 expected: expected_state,
@@ -818,7 +894,7 @@ impl ZakuraDb {
                 roots: roots.len(),
             });
         }
-        if headers.len() < 2 {
+        if headers.is_empty() {
             return Err(AuthenticateHeaderRootsError::MissingHeaderWitness {
                 items: headers.len(),
             });
@@ -842,10 +918,9 @@ impl ZakuraDb {
                 .map_err(|_| AuthenticateHeaderRootsError::HeightOverflow)?;
         }
 
-        let confirmed_height = roots[roots.len() - 2].height;
         let witness_height = roots
             .last()
-            .expect("root delivery has at least two items")
+            .expect("non-empty root delivery has a terminal witness")
             .height;
         if witness_height > current.completed_checkpoint_height {
             return Err(
@@ -854,6 +929,18 @@ impl ZakuraDb {
                     completed_checkpoint_height: current.completed_checkpoint_height,
                 },
             );
+        }
+        if headers.len() == 1 {
+            if let Some(witness) = current.header_witness {
+                return Err(AuthenticateHeaderRootsError::WitnessAlreadyPresent { witness });
+            }
+            let finalized_body_tip = self.tip().map_or(Height::MIN, |(height, _)| height);
+            if current.authenticated_height <= finalized_body_tip {
+                return Err(AuthenticateHeaderRootsError::WitnessNotNeeded {
+                    authenticated_height: current.authenticated_height,
+                    finalized_body_tip,
+                });
+            }
         }
 
         let verified = verify_supplied_roots_from_parts(
@@ -867,13 +954,28 @@ impl ZakuraDb {
         .map_err(
             |(height, source)| AuthenticateHeaderRootsError::Verification { height, source },
         )?;
+
+        if headers.len() == 1 {
+            let state = self
+                .write_recovered_header_witness(frontier, verified)?
+                .state(completed_checkpoint);
+            let witness = state
+                .header_witness
+                .expect("successful witness recovery writes the verified witness");
+            return Ok(AuthenticatedHeaderRoots {
+                state,
+                update: HeaderRootAuthUpdate::WitnessRecovered { witness },
+            });
+        }
+
+        let confirmed_height = roots[roots.len() - 2].height;
         let authenticated = start..=confirmed_height;
         let state = self
             .write_verified_header_commitment_roots(verified)?
             .state(completed_checkpoint);
         Ok(AuthenticatedHeaderRoots {
             state,
-            authenticated,
+            update: HeaderRootAuthUpdate::Advanced { authenticated },
         })
     }
 
@@ -1928,7 +2030,12 @@ mod tests {
                 &supplied,
             )
             .expect("valid one-lag delivery authenticates");
-        assert_eq!(result.authenticated, start..=start);
+        assert_eq!(
+            result.update,
+            HeaderRootAuthUpdate::Advanced {
+                authenticated: start..=start
+            }
+        );
         assert_eq!(result.state.authenticated_height, start);
         assert_eq!(
             db.commitment_roots(start),
@@ -1988,12 +2095,20 @@ mod tests {
     }
 
     #[test]
-    fn header_witness_upgrade_recovers_an_affected_frontier() {
+    fn marker_upgrade_preserves_affected_frontier_then_runtime_recovers_witness() {
+        use crate::constants::{state_database_format_version_in_code, STATE_DATABASE_KIND};
         use crate::service::finalized_state::disk_format::upgrade::{
-            header_witness, DiskFormatUpgrade,
+            no_migration::NoMigration, DiskFormatUpgrade,
         };
+        use semver::Version;
 
-        let (db, block, successor, current) = two_block_checkpoint_fixture();
+        let cache = tempfile::tempdir().expect("temporary cache directory is created");
+        let config = Config {
+            cache_dir: cache.path().to_owned(),
+            ephemeral: false,
+            ..Config::default()
+        };
+        let (mut db, block, successor, current) = two_block_checkpoint_fixture_with_config(&config);
         let completed = HighestCompletedCheckpoint {
             height: current.completed_checkpoint_height,
             hash: current.completed_checkpoint_hash,
@@ -2023,29 +2138,86 @@ mod tests {
             "the 28.0.2-style frontier has discarded its terminal witness"
         );
 
+        db.update_format_version_on_disk(&Version::new(28, 0, 2))
+            .expect("the affected database version marker writes");
         let (_cancel_sender, cancel_receiver) = crossbeam_channel::bounded(1);
-        DiskFormatUpgrade::run(&header_witness::Upgrade, Height::MIN, &db, &cancel_receiver)
-            .expect("header-witness recovery is not cancelled");
+        let upgrade = NoMigration::new(
+            "retain terminal header witnesses in the authenticated frontier",
+            Version::new(28, 0, 3),
+        );
+        DiskFormatUpgrade::run(&upgrade, Height::MIN, &db, &cancel_receiver)
+            .expect("the marker-only upgrade completes");
+        db.update_format_version_on_disk(&state_database_format_version_in_code())
+            .expect("startup marks the marker-only upgrade complete");
+        assert_eq!(
+            db.format_version_on_disk()
+                .expect("upgraded database version is readable"),
+            Some(state_database_format_version_in_code())
+        );
 
-        let rebased = db
+        let affected = db
             .validate_header_root_auth_state()
-            .expect("rebased state validates")
+            .expect("affected state validates")
             .expect("body tip has a frontier");
-        assert_eq!(rebased.confirmed_height(), Height::MIN);
-        assert_eq!(db.commitment_roots(Height(1)), None);
+        assert_eq!(affected.confirmed_height(), Height(1));
+        assert_eq!(
+            db.commitment_roots(Height(1)),
+            Some(normalize_unauthenticated_commitment_fields(
+                &db.network(),
+                roots.clone()
+            ))
+        );
         assert_eq!(db.header_hash(Height(1)), Some(block.hash()));
         assert_eq!(db.header_hash(Height(2)), Some(successor.hash()));
 
-        let rebased_state = rebased.state(completed);
-        db.authenticate_header_roots(
-            completed,
-            rebased_state,
-            rebased_state.authenticated_hash,
-            Height(1),
-            &[block.header.clone(), successor.header.clone()],
-            &[roots.clone(), successor_roots.clone()],
-        )
-        .expect("normal root authentication refetches the missing witness");
+        let affected_state = affected.state(completed);
+        let frontier_before = db
+            .header_root_auth_frontier_cf()
+            .zs_get(&RawBytes::new_raw_bytes(AUTH_FRONTIER_KEY.to_vec()))
+            .expect("affected frontier row exists");
+        let mut stale_state = affected_state;
+        stale_state.authenticated_hash.0[0] ^= 1;
+        assert!(matches!(
+            db.authenticate_header_roots(
+                completed,
+                stale_state,
+                affected_state.authenticated_hash,
+                Height(2),
+                &[successor.header.clone()],
+                &[successor_roots.clone()],
+            ),
+            Err(AuthenticateHeaderRootsError::StaleState { .. })
+        ));
+        let mut noncanonical_header = *successor.header;
+        noncanonical_header.nonce[0] ^= 1;
+        assert!(matches!(
+            db.authenticate_header_roots(
+                completed,
+                affected_state,
+                affected_state.authenticated_hash,
+                Height(2),
+                &[Arc::new(noncanonical_header)],
+                &[successor_roots.clone()],
+            ),
+            Err(AuthenticateHeaderRootsError::NonCanonicalHeader { height: Height(2) })
+        ));
+        assert_eq!(
+            db.header_root_auth_frontier_cf()
+                .zs_get(&RawBytes::new_raw_bytes(AUTH_FRONTIER_KEY.to_vec())),
+            Some(frontier_before),
+            "stale and noncanonical recovery attempts do not rewrite the frontier"
+        );
+
+        let recovered = db
+            .authenticate_header_roots(
+                completed,
+                affected_state,
+                affected_state.authenticated_hash,
+                Height(2),
+                &[successor.header.clone()],
+                &[successor_roots.clone()],
+            )
+            .expect("one-record authentication recovers the missing witness");
 
         assert_eq!(
             db.commitment_roots(Height(1)),
@@ -2056,9 +2228,109 @@ mod tests {
         );
         assert_eq!(db.commitment_roots(Height(2)), None);
         assert_eq!(
+            recovered.update,
+            HeaderRootAuthUpdate::WitnessRecovered {
+                witness: HeaderWitnessState {
+                    height: Height(2),
+                    hash: successor.hash(),
+                }
+            }
+        );
+        assert_eq!(
             db.header_witness_auth_data_root(Height(2), successor.hash()),
             Some(successor_roots.auth_data_root)
         );
+        assert!(matches!(
+            db.authenticate_header_roots(
+                completed,
+                recovered.state,
+                recovered.state.authenticated_hash,
+                Height(2),
+                &[successor.header.clone()],
+                &[successor_roots],
+            ),
+            Err(AuthenticateHeaderRootsError::WitnessAlreadyPresent { .. })
+        ));
+
+        let network = db.network();
+        db.shutdown(true);
+        drop(db);
+        let reopened = ZakuraDb::new(
+            &config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &network,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+        .expect("the recovered database reopens");
+        assert!(reopened.commitment_roots(Height(1)).is_some());
+        assert_eq!(reopened.commitment_roots(Height(2)), None);
+        assert_eq!(
+            reopened.header_witness_auth_data_root(Height(2), successor.hash()),
+            Some(roots_from_block(&successor).auth_data_root)
+        );
+    }
+
+    #[test]
+    fn terminal_witness_recovery_is_suppressed_after_body_catches_frontier() {
+        let (db, block, successor, current) = two_block_checkpoint_fixture();
+        let completed = HighestCompletedCheckpoint {
+            height: current.completed_checkpoint_height,
+            hash: current.completed_checkpoint_hash,
+        };
+        let roots = roots_from_block(&block);
+        let successor_roots = roots_from_block(&successor);
+        db.authenticate_header_roots(
+            completed,
+            current,
+            current.authenticated_hash,
+            Height(1),
+            &[block.header.clone(), successor.header.clone()],
+            &[roots, successor_roots.clone()],
+        )
+        .expect("fixture roots authenticate");
+        let mut affected_batch = DiskWriteBatch::new();
+        affected_batch
+            .rebase_header_root_auth_frontier(&db, Height(1), block.hash(), &HistoryTree::default())
+            .expect("affected frontier is coherent");
+        let hash_by_height = db.db.cf_handle("hash_by_height").unwrap();
+        let height_by_hash = db.db.cf_handle("height_by_hash").unwrap();
+        let block_header_by_height = db.db.cf_handle("block_header_by_height").unwrap();
+        affected_batch.zs_insert(&hash_by_height, Height(1), block.hash());
+        affected_batch.zs_insert(&height_by_hash, block.hash(), Height(1));
+        affected_batch.zs_insert(&block_header_by_height, Height(1), &block.header);
+        db.write_batch(affected_batch)
+            .expect("caught-up body fixture writes");
+
+        let affected = db
+            .load_header_root_auth_frontier()
+            .expect("affected frontier loads")
+            .expect("affected frontier exists")
+            .state(completed);
+        assert!(matches!(
+            db.authenticate_header_roots(
+                completed,
+                affected,
+                affected.authenticated_hash,
+                Height(2),
+                &[successor.header.clone()],
+                &[successor_roots],
+            ),
+            Err(AuthenticateHeaderRootsError::WitnessNotNeeded {
+                authenticated_height: Height(1),
+                finalized_body_tip: Height(1),
+            })
+        ));
+        assert_eq!(
+            db.header_witness_auth_data_root(Height(2), successor.hash()),
+            None
+        );
+        assert!(db.commitment_roots(Height(1)).is_some());
+        assert_eq!(db.commitment_roots(Height(2)), None);
     }
 
     #[test]
@@ -2263,7 +2535,12 @@ mod tests {
             )
             .expect("new checkpoint coverage preserves the same authentication base");
 
-        assert_eq!(result.authenticated, Height(1)..=Height(1));
+        assert_eq!(
+            result.update,
+            HeaderRootAuthUpdate::Advanced {
+                authenticated: Height(1)..=Height(1)
+            }
+        );
         assert_eq!(result.state.authenticated_height, Height(1));
         assert_eq!(
             db.commitment_roots(Height(1)),

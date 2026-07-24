@@ -566,6 +566,7 @@ fn root_auth_ranges_overlap_once_and_stay_checkpoint_covered() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(6),
         completed_checkpoint_hash: block::Hash([6; 32]),
+        header_witness: None,
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
 
@@ -622,6 +623,7 @@ fn root_auth_miss_prefetches_bounded_overlapping_ranges() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(10),
         completed_checkpoint_hash: block::Hash([10; 32]),
+        header_witness: None,
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
 
@@ -669,6 +671,7 @@ fn root_auth_frontier_advance_refills_released_fallback_capacity() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(100),
         completed_checkpoint_hash: block::Hash([100; 32]),
+        header_witness: None,
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
 
@@ -712,7 +715,7 @@ fn root_auth_frontier_advance_refills_released_fallback_capacity() {
 }
 
 #[test]
-fn root_auth_does_not_schedule_without_checkpoint_covered_witness() {
+fn root_auth_schedules_exact_terminal_witness_recovery() {
     let network = Network::Mainnet;
     let anchor = (block::Height(0), network.genesis_hash());
     let mut startup = startup_for(
@@ -725,12 +728,111 @@ fn root_auth_does_not_schedule_without_checkpoint_covered_witness() {
         authenticated_hash: block::Hash([4; 32]),
         completed_checkpoint_height: block::Height(5),
         completed_checkpoint_hash: block::Hash([5; 32]),
+        header_witness: None,
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
 
     state.refresh_root_auth_range(&startup);
 
+    let recovery = state
+        .schedule
+        .authenticate_roots
+        .front()
+        .expect("missing terminal witness schedules recovery");
+    assert_eq!(recovery.start_height(), block::Height(5));
+    assert_eq!(recovery.end_height(), block::Height(5));
+    assert_eq!(recovery.count(), 1);
+}
+
+#[test]
+fn root_auth_does_not_repeat_or_fetch_unneeded_terminal_witness() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let best = (block::Height(5), block::Hash([5; 32]));
+    let mut startup = startup_for(network, anchor, Some(best));
+    let auth = HeaderRootAuthState {
+        authenticated_height: block::Height(4),
+        authenticated_hash: block::Hash([4; 32]),
+        completed_checkpoint_height: best.0,
+        completed_checkpoint_hash: best.1,
+        header_witness: Some(HeaderWitnessState {
+            height: best.0,
+            hash: best.1,
+        }),
+    };
+    startup.header_root_auth = Some(auth);
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
+    state.refresh_root_auth_range(&startup);
     assert!(state.schedule.authenticate_roots.is_empty());
+
+    state.header_root_auth = Some(HeaderRootAuthState {
+        header_witness: None,
+        ..auth
+    });
+    state.verified_block_tip = auth.authenticated_height;
+    state.refresh_root_auth_range(&startup);
+    assert!(
+        state.schedule.authenticate_roots.is_empty(),
+        "a caught-up body tip no longer needs the witness"
+    );
+
+    state.verified_block_tip = block::Height(3);
+    state.refresh_root_auth_range(&startup);
+    assert_eq!(
+        state
+            .schedule
+            .authenticate_roots
+            .front()
+            .expect("a successor reorg makes witness recovery eligible again")
+            .count(),
+        1
+    );
+    state.verified_block_tip = auth.authenticated_height;
+    state.suppress_unneeded_witness_recovery();
+    assert!(
+        state.schedule.authenticate_roots.is_empty(),
+        "body catch-up retires an already scheduled recovery"
+    );
+}
+
+#[test]
+fn witness_recovery_completion_waits_for_whichever_signal_arrives_second() {
+    let witness = HeaderWitnessState {
+        height: block::Height(5),
+        hash: block::Hash([5; 32]),
+    };
+    let update = HeaderRootAuthUpdate::WitnessRecovered { witness };
+    let range = RangeRequest {
+        range: CheckedHeaderRange::from_count(witness.height, 1)
+            .expect("one-record recovery range is valid"),
+        anchor_hash: Some(block::Hash([4; 32])),
+        finalized: true,
+        want_tree_aux_roots: true,
+        priority: RangePriority::AuthenticateRoots,
+    };
+    let without_witness = HeaderRootAuthState {
+        authenticated_height: block::Height(4),
+        authenticated_hash: block::Hash([4; 32]),
+        completed_checkpoint_height: witness.height,
+        completed_checkpoint_hash: witness.hash,
+        header_witness: None,
+    };
+
+    assert!(root_auth_update_matches_request(&update, range));
+    assert!(
+        !root_auth_update_is_visible(Some(without_witness), &update),
+        "response-first completion waits for the witness watch update"
+    );
+    assert!(
+        root_auth_update_is_visible(
+            Some(HeaderRootAuthState {
+                header_witness: Some(witness),
+                ..without_witness
+            }),
+            &update,
+        ),
+        "watch-first completion is visible when the response arrives"
+    );
 }
 
 #[test]
@@ -748,6 +850,7 @@ fn root_auth_refresh_survives_authenticated_at_completed_checkpoint_tip() {
         authenticated_hash: tip.1,
         completed_checkpoint_height: tip.0,
         completed_checkpoint_hash: tip.1,
+        header_witness: None,
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
     let auth = startup
@@ -801,6 +904,7 @@ fn retained_response_requires_exact_current_frontier_and_covered_witness() {
         authenticated_hash: Network::Mainnet.genesis_hash(),
         completed_checkpoint_height: block::Height(2),
         completed_checkpoint_hash: block::Hash([2; 32]),
+        header_witness: None,
     };
 
     let retained = retained_root_auth_range(auth, &payload, block::Height(2))
@@ -845,6 +949,7 @@ fn retained_payload_waits_for_checkpoint_and_suppresses_fallback() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(1),
         completed_checkpoint_hash: block::Hash([1; 32]),
+        header_witness: None,
     };
     startup.header_root_auth = Some(auth);
     let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
@@ -896,6 +1001,7 @@ fn root_auth_fallback_stops_at_first_retained_start() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(4),
         completed_checkpoint_hash: block::Hash([4; 32]),
+        header_witness: None,
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
     let payload = HeaderRangePayload::new(
@@ -957,6 +1063,7 @@ async fn body_target_waits_for_authenticated_lead() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: best.0,
         completed_checkpoint_hash: best.1,
+        header_witness: None,
     });
     let mut fixture = spawn_test_reactor(startup);
 
@@ -968,6 +1075,7 @@ async fn body_target_waits_for_authenticated_lead() {
                 authenticated_hash: block::Hash([3; 32]),
                 completed_checkpoint_height: best.0,
                 completed_checkpoint_hash: best.1,
+                header_witness: None,
             },
         )))
         .await
@@ -985,6 +1093,7 @@ async fn body_target_waits_for_authenticated_lead() {
                 authenticated_hash: block::Hash([4; 32]),
                 completed_checkpoint_height: best.0,
                 completed_checkpoint_hash: best.1,
+                header_witness: None,
             },
         )))
         .await
@@ -1013,6 +1122,7 @@ async fn verified_full_block_advances_header_tip_without_auth_lead() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: best.0,
         completed_checkpoint_hash: best.1,
+        header_witness: None,
     });
     let mut fixture = spawn_test_reactor(startup);
 
@@ -1053,6 +1163,7 @@ async fn root_auth_state_trace_records_exact_hole_height() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: best.0,
         completed_checkpoint_hash: best.1,
+        header_witness: None,
     };
     let mut capture =
         TraceCapture::for_test("root_auth_state_trace_records_exact_hole_height").unwrap();
@@ -1095,6 +1206,7 @@ fn retained_admission_keeps_farthest_same_start_payload() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(6),
         completed_checkpoint_hash: block::Hash([6; 32]),
+        header_witness: None,
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
     let wire_request = |request_id| HeaderSyncWireRequestIdentity {
@@ -1159,6 +1271,7 @@ fn retained_admission_supersedes_queued_fallback() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(2),
         completed_checkpoint_hash: block::Hash([2; 32]),
+        header_witness: None,
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
     state.refresh_root_auth_range(&startup);
@@ -1199,6 +1312,7 @@ fn retained_store_does_not_pressure_evict_long_lead() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(40),
         completed_checkpoint_hash: block::Hash([40; 32]),
+        header_witness: None,
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
 
@@ -1271,6 +1385,7 @@ fn retained_admission_requires_live_auth_state() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(6),
         completed_checkpoint_hash: block::Hash([6; 32]),
+        header_witness: None,
     });
     assert!(state.admit_retained_root_payload(wire_request, payload));
     assert_eq!(state.retained_roots.len(), 1);
@@ -1290,6 +1405,7 @@ fn retained_local_retry_window_starts_on_failure_and_can_fallback_after_exhausti
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(2),
         completed_checkpoint_hash: block::Hash([2; 32]),
+        header_witness: None,
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
     let wire_request = HeaderSyncWireRequestIdentity {
@@ -1446,6 +1562,7 @@ fn stale_root_auth_waits_for_watch_before_rescheduling() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(3),
         completed_checkpoint_hash: block::Hash([3; 32]),
+        header_witness: None,
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
     state.root_auth_waiting_for_watch = true;
@@ -1468,6 +1585,7 @@ fn session_retirement_cleans_auth_and_retained_payloads() {
         authenticated_hash: network.genesis_hash(),
         completed_checkpoint_height: block::Height(6),
         completed_checkpoint_hash: block::Hash([6; 32]),
+        header_witness: None,
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
     let peer = peer(212);
@@ -1520,6 +1638,7 @@ fn session_retirement_cleans_auth_and_retained_payloads() {
                     authenticated_hash: network.genesis_hash(),
                     completed_checkpoint_height: block::Height(0),
                     completed_checkpoint_hash: network.genesis_hash(),
+                    header_witness: None,
                 },
             }),
             completion_observed: false,
@@ -1642,6 +1761,7 @@ fn clear_inflight_root_auth_completes_on_advancement() {
                     authenticated_hash: network.genesis_hash(),
                     completed_checkpoint_height: block::Height(0),
                     completed_checkpoint_hash: network.genesis_hash(),
+                    header_witness: None,
                 },
             }),
             completion_observed: false,
@@ -1709,6 +1829,7 @@ fn completed_inflight_root_auth_waits_for_driver_completion() {
                     authenticated_hash: network.genesis_hash(),
                     completed_checkpoint_height: block::Height(0),
                     completed_checkpoint_hash: network.genesis_hash(),
+                    header_witness: None,
                 },
             }),
             completion_observed: false,
@@ -1774,6 +1895,7 @@ fn clear_inflight_root_auth_retires_without_requeue_on_rebase() {
                     authenticated_hash: network.genesis_hash(),
                     completed_checkpoint_height: block::Height(0),
                     completed_checkpoint_hash: network.genesis_hash(),
+                    header_witness: None,
                 },
             }),
             completion_observed: false,
@@ -1877,6 +1999,7 @@ fn prune_root_auth_pipeline_keeps_in_window_work() {
             authenticated_hash: block::Hash([2; 32]),
             completed_checkpoint_height: block::Height(4),
             completed_checkpoint_hash: block::Hash([4; 32]),
+            header_witness: None,
         },
         true,
     );
@@ -2530,6 +2653,7 @@ async fn rooted_forward_requests_overlap_once_through_handoff() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: anchor.0,
         completed_checkpoint_hash: anchor.1,
+        header_witness: None,
     });
     let mut fixture = spawn_test_reactor(startup);
     let peer_id = peer(214);
@@ -2587,6 +2711,7 @@ fn rooted_forward_overlap_advances_past_intermediate_checkpoint() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: checkpoint.0,
         completed_checkpoint_hash: checkpoint.1,
+        header_witness: None,
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
     let peer_id = peer(236);
@@ -2681,6 +2806,7 @@ fn refresh_forward_range_skips_one_height_retained_overlap_at_scheduled_tip() {
         authenticated_hash: tip.1,
         completed_checkpoint_height: tip.0,
         completed_checkpoint_hash: tip.1,
+        header_witness: None,
     });
     let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
     state.schedule.ensure_forward(RangeRequest {
@@ -2740,6 +2866,7 @@ async fn committed_forward_payload_authenticates_without_fallback_request() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(3),
         completed_checkpoint_hash: checkpoint_hash,
+        header_witness: None,
     });
     let mut fixture = spawn_test_reactor(startup);
     let peer_id = peer(234);
@@ -2810,6 +2937,7 @@ async fn reactor_with_pending_fallback_root_authentication(
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(3),
         completed_checkpoint_hash: checkpoint_hash,
+        header_witness: None,
     });
     let mut fixture = spawn_test_reactor(startup);
     let source_peer = peer(238);
@@ -2852,6 +2980,104 @@ async fn reactor_with_pending_fallback_root_authentication(
     (fixture, operation, source_peer)
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_witness_recovery_requests_and_accepts_exactly_one_record() {
+    let header_1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let header_2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    let header_1_hash = block::Hash::from(header_1.as_ref());
+    let header_2_hash = block::Hash::from(header_2.as_ref());
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, checkpoint_hash) =
+        checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some((block::Height(2), header_2_hash)));
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(1),
+        authenticated_hash: header_1_hash,
+        completed_checkpoint_height: block::Height(3),
+        completed_checkpoint_hash: checkpoint_hash,
+        header_witness: None,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let source_peer = peer(252);
+
+    connect_peer(&fixture, source_peer.clone()).await;
+    advertise_tip(
+        &fixture,
+        source_peer.clone(),
+        anchor.0,
+        block::Height(2),
+        2,
+        1,
+    )
+    .await;
+    let (requested_peer, request_id, start, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, source_peer);
+    assert_eq!((start, count), (block::Height(2), 1));
+    send_headers(
+        &fixture,
+        &source_peer,
+        request_id,
+        headers_message_from(block::Height(2), vec![header_2]),
+    )
+    .await;
+
+    let action = next_non_query_action(&mut fixture.actions).await;
+    assert!(matches!(
+        action,
+        HeaderSyncAction::AuthenticateHeaderRoots { payload, .. }
+            if payload.range().start() == block::Height(2)
+                && payload.range().end() == block::Height(2)
+    ));
+    fixture.task.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn normal_root_auth_request_rejects_a_one_record_short_response() {
+    let header_1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let header_2_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_2_BYTES).as_ref());
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, checkpoint_hash) =
+        checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some((block::Height(2), header_2_hash)));
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(3),
+        completed_checkpoint_hash: checkpoint_hash,
+        header_witness: None,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let source_peer = peer(253);
+
+    connect_peer(&fixture, source_peer.clone()).await;
+    advertise_tip(
+        &fixture,
+        source_peer.clone(),
+        anchor.0,
+        block::Height(2),
+        2,
+        1,
+    )
+    .await;
+    let (_, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((start, count), (block::Height(1), 2));
+    send_headers(
+        &fixture,
+        &source_peer,
+        request_id,
+        headers_message_from(block::Height(1), vec![header_1]),
+    )
+    .await;
+
+    assert_no_root_authentication(&mut fixture.actions).await;
+    fixture.task.abort();
+}
+
 async fn reactor_with_pending_retained_root_authentication(
     additional_peer: Option<ZakuraPeerId>,
 ) -> (
@@ -2872,6 +3098,7 @@ async fn reactor_with_pending_retained_root_authentication(
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(3),
         completed_checkpoint_hash: checkpoint_hash,
+        header_witness: None,
     };
     let mut startup = startup_for(network, anchor, Some(anchor));
     startup.config.max_headers_per_response = 2;
@@ -3210,6 +3437,7 @@ async fn reactor_with_two_retained_root_batches(
         authenticated_hash: anchor.1,
         completed_checkpoint_height: block::Height(3),
         completed_checkpoint_hash: header_3_hash,
+        header_witness: None,
     });
     let mut fixture = spawn_test_reactor(startup);
     let peer_id = peer(238);
@@ -3362,6 +3590,10 @@ async fn root_auth_watch_waits_for_driver_completion_before_admitting_next_batch
                 completed_checkpoint_hash: block::Hash::from(
                     mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref(),
                 ),
+                header_witness: Some(HeaderWitnessState {
+                    height: block::Height(2),
+                    hash: block::Hash::from(mainnet_header(&BLOCK_MAINNET_2_BYTES).as_ref()),
+                }),
             },
         )))
         .await
@@ -3373,6 +3605,9 @@ async fn root_auth_watch_waits_for_driver_completion_before_admitting_next_batch
         .handle
         .send(HeaderSyncEvent::HeaderRootAuthenticationCompleted {
             operation: first_auth,
+            update: HeaderRootAuthUpdate::Advanced {
+                authenticated: block::Height(1)..=block::Height(1),
+            },
         })
         .await
         .unwrap();
@@ -3388,6 +3623,9 @@ async fn root_auth_completion_waits_for_watch_before_admitting_next_batch() {
         .handle
         .send(HeaderSyncEvent::HeaderRootAuthenticationCompleted {
             operation: first_auth,
+            update: HeaderRootAuthUpdate::Advanced {
+                authenticated: block::Height(1)..=block::Height(1),
+            },
         })
         .await
         .unwrap();
@@ -3404,6 +3642,10 @@ async fn root_auth_completion_waits_for_watch_before_admitting_next_batch() {
                 completed_checkpoint_hash: block::Hash::from(
                     mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref(),
                 ),
+                header_witness: Some(HeaderWitnessState {
+                    height: block::Height(2),
+                    hash: block::Hash::from(mainnet_header(&BLOCK_MAINNET_2_BYTES).as_ref()),
+                }),
             },
         )))
         .await
@@ -4436,6 +4678,7 @@ async fn restart_prefetch_keeps_forward_tip_extension_active() {
         authenticated_hash: anchor.1,
         completed_checkpoint_height: best.0,
         completed_checkpoint_hash: best.1,
+        header_witness: None,
     });
     let mut fixture = spawn_test_reactor(startup);
     let peer_id = peer(42);
@@ -4754,6 +4997,7 @@ async fn vct_repair_does_not_starve_root_auth_on_other_peer() {
         authenticated_hash: Network::Mainnet.genesis_hash(),
         completed_checkpoint_height: best.0,
         completed_checkpoint_hash: best.1,
+        header_witness: None,
     });
     let mut fixture = spawn_test_reactor(startup);
     let repair_peer = peer(107);
@@ -5609,6 +5853,7 @@ async fn forward_ranges_below_checkpoint_handoff_request_tree_aux_roots() {
         authenticated_hash: first_checkpoint_hash,
         completed_checkpoint_height: first_checkpoint,
         completed_checkpoint_hash: first_checkpoint_hash,
+        header_witness: None,
     });
     startup.trace = ZakuraTrace::new(capture.tracer(), "01");
     let mut fixture = spawn_test_reactor(startup);
@@ -5683,6 +5928,7 @@ async fn forward_ranges_above_handoff_still_request_tree_aux_roots() {
         authenticated_hash: checkpoint.1,
         completed_checkpoint_height: checkpoint.0,
         completed_checkpoint_hash: checkpoint.1,
+        header_witness: None,
     });
     let mut fixture = spawn_test_reactor(startup);
     let peer_id = peer(235);

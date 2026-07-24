@@ -79,7 +79,7 @@ pub use service::finalized_state::{
     produce_settled_final_frontiers_bytes, validate_final_frontiers_bytes,
     AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,
     FinalFrontiersGenerationError, FinalFrontiersValidationError, GeneratorError,
-    HeaderRootAuthState,
+    HeaderRootAuthState, HeaderRootAuthUpdate, HeaderWitnessState,
 };
 pub use service::finalized_state::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,

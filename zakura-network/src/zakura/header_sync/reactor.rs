@@ -141,6 +141,35 @@ pub(super) fn clamped_request_suffix(
     })
 }
 
+pub(super) fn root_auth_update_matches_request(
+    update: &HeaderRootAuthUpdate,
+    range: RangeRequest,
+) -> bool {
+    match update {
+        HeaderRootAuthUpdate::Advanced { authenticated } => {
+            range.count() >= 2
+                && *authenticated.start() == range.start_height()
+                && authenticated.end().0.checked_add(1).map(block::Height)
+                    == Some(range.end_height())
+        }
+        HeaderRootAuthUpdate::WitnessRecovered { witness } => {
+            range.count() == 1 && witness.height == range.start_height()
+        }
+    }
+}
+
+pub(super) fn root_auth_update_is_visible(
+    state: Option<HeaderRootAuthState>,
+    update: &HeaderRootAuthUpdate,
+) -> bool {
+    state.is_some_and(|auth| match update {
+        HeaderRootAuthUpdate::Advanced { authenticated } => {
+            auth.authenticated_height >= *authenticated.end()
+        }
+        HeaderRootAuthUpdate::WitnessRecovered { witness } => auth.header_witness == Some(*witness),
+    })
+}
+
 pub(super) fn complete_request_publication(
     peer: &mut PeerHeaderState,
     request_id: HeaderSyncRequestId,
@@ -484,8 +513,8 @@ impl HeaderSyncReactor {
                 self.handle_header_range_commit_failed(operation, kind)
                     .await;
             }
-            HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation } => {
-                self.handle_header_root_authentication_completed(operation)
+            HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation, update } => {
+                self.handle_header_root_authentication_completed(operation, update)
                     .await;
             }
             HeaderSyncEvent::HeaderRootAuthenticationFailed { operation, kind } => {
@@ -1040,6 +1069,7 @@ impl HeaderSyncReactor {
         if self.state.best_header_tip <= self.state.verified_block_tip {
             self.state.stale_anchor.reset();
         }
+        self.state.suppress_unneeded_witness_recovery();
         self.refresh_body_sync_target();
         self.schedule().await;
     }
@@ -1267,18 +1297,21 @@ impl HeaderSyncReactor {
         // same height.
         let pipeline_compatible = root_auth_pipeline_compatible(self.state.header_root_auth, state);
 
-        // If the authenticated height has advanced, complete the in-flight operations.
+        // Height advancement and missing-to-present witness recovery are both durable progress.
         let auth_advanced = transition
             .is_some_and(|(old, new)| new.authenticated_height > old.authenticated_height);
+        let witness_recovered = transition
+            .is_some_and(|(old, new)| old.header_witness.is_none() && new.header_witness.is_some());
         self.state.header_root_auth = state;
         self.state.root_auth_waiting_for_watch = false;
+        self.state.suppress_unneeded_witness_recovery();
 
         if pipeline_compatible {
             // State publishes this watch update before the driver receives the
             // authentication response. Only release operations whose driver
             // completion has also arrived, so the next serial state operation
             // cannot race the still-occupied driver slot.
-            if auth_advanced {
+            if auth_advanced || witness_recovered {
                 self.state.clear_completed_inflight_root_auth();
             }
             let auth = state.expect("a compatible authentication update has a state");
@@ -1298,6 +1331,7 @@ impl HeaderSyncReactor {
     async fn handle_header_root_authentication_completed(
         &mut self,
         operation: HeaderSyncOperationIdentity,
+        update: HeaderRootAuthUpdate,
     ) {
         if operation.op_kind != HeaderSyncOperationKind::AuthenticateRoots {
             metrics::counter!("sync.header.session.stale_completion").increment(1);
@@ -1319,19 +1353,14 @@ impl HeaderSyncReactor {
             metrics::counter!("sync.header.session.stale_completion").increment(1);
             return;
         }
+        let update_matches_request = root_auth_update_matches_request(&update, pending.range);
+        if !update_matches_request {
+            metrics::counter!("sync.header.session.stale_completion").increment(1);
+            return;
+        }
         pending.completion_observed = true;
-        let confirmed_height = block::Height(
-            pending
-                .range
-                .end_height()
-                .0
-                .checked_sub(1)
-                .expect("root authentication ranges contain a successor witness"),
-        );
-        let watch_already_advanced = self
-            .state
-            .header_root_auth
-            .is_some_and(|auth| auth.authenticated_height >= confirmed_height);
+        let watch_already_advanced =
+            root_auth_update_is_visible(self.state.header_root_auth, &update);
         metrics::counter!("sync.header.root_auth.completed").increment(1);
         if watch_already_advanced {
             self.state.clear_completed_inflight_root_auth();
@@ -1412,7 +1441,12 @@ impl HeaderSyncReactor {
                 // already been applied. Otherwise the lane waits forever for a
                 // notification that already fired.
                 let expected = pending.root_auth.map(|auth| auth.expected);
-                if self.state.header_root_auth == expected {
+                let recovery_still_needed = pending.range.count() != 1
+                    || self.state.header_root_auth.is_some_and(|auth| {
+                        auth.header_witness.is_none()
+                            && self.state.verified_block_tip < auth.authenticated_height
+                    });
+                if self.state.header_root_auth == expected && recovery_still_needed {
                     self.state.root_auth_waiting_for_watch = true;
                 }
             }
@@ -2082,7 +2116,8 @@ impl HeaderSyncReactor {
                 self.schedule().await;
                 return;
             }
-            if payload.range().count() < 2 {
+            let explicitly_requested_recovery = outstanding.range_request.count() == 1;
+            if payload.range().count() < 2 && !explicitly_requested_recovery {
                 self.state
                     .schedule
                     .retry_avoiding(peer, outstanding.range_request);
@@ -2813,6 +2848,7 @@ impl HeaderSyncReactor {
             return;
         }
 
+        self.state.suppress_unneeded_witness_recovery();
         self.try_start_retained_root_authentication();
         self.state.refresh_root_auth_range(&self.startup);
         self.state.refresh_forward_range(&self.startup);

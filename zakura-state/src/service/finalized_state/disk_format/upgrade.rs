@@ -35,7 +35,6 @@ pub(crate) mod block_info_and_address_received;
 pub(crate) mod cache_genesis_roots;
 pub(crate) mod fix_tree_key_type;
 pub(crate) mod header_root_auth_frontier;
-pub(crate) mod header_witness;
 pub(crate) mod no_migration;
 pub(crate) mod prune_trees;
 pub(crate) mod repair_vct_sprout_history;
@@ -129,7 +128,10 @@ fn format_upgrades(
         Box::new(add_ironwood_tree::Upgrade),
         Box::new(repair_vct_sprout_history::Upgrade::new(prepared_vct_repair)),
         Box::new(header_root_auth_frontier::Upgrade),
-        Box::new(header_witness::Upgrade),
+        Box::new(no_migration::NoMigration::new(
+            "retain terminal header witnesses in the authenticated frontier",
+            Version::new(28, 0, 3),
+        )),
     ] as [Box<dyn DiskFormatUpgrade>; 12])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
@@ -1082,7 +1084,7 @@ fn fast_sync_metadata_cf_upgrade_is_no_migration() {
 }
 
 #[test]
-fn vct_format_changes_include_root_auth_metadata_migrations() {
+fn vct_format_changes_include_root_auth_metadata_updates() {
     use crate::constants::state_database_format_version_in_code;
 
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0)), None).collect();
@@ -1093,8 +1095,8 @@ fn vct_format_changes_include_root_auth_metadata_migrations() {
     assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
     assert_eq!(upgrades[3].version(), Version::new(28, 0, 3));
     assert!(
-        upgrades[3].needs_migration(),
-        "28.0.3 must repair databases that already discarded their terminal header witness"
+        !upgrades[3].needs_migration(),
+        "28.0.3 recovery is performed at runtime without rebasing authenticated roots"
     );
     assert_eq!(
         upgrades.last().expect("repair is registered").version(),

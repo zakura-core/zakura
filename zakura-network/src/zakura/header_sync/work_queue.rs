@@ -431,6 +431,32 @@ impl HeaderWorkQueue {
         self.rebuild_start_indexes();
     }
 
+    /// Drop an exact one-record terminal-witness recovery at `start`.
+    pub(super) fn discard_witness_recovery_at(&mut self, start: block::Height) {
+        let had_recovery = self
+            .authenticate_roots
+            .iter()
+            .any(|range| range.start_height() == start && range.count() == 1)
+            || self.active.keys().any(|range| {
+                range.priority == RangePriority::AuthenticateRoots
+                    && range.start_height() == start
+                    && range.count() == 1
+            });
+        self.authenticate_roots
+            .retain(|range| range.start_height() != start || range.count() != 1);
+        self.active.retain(|range, state| {
+            range.priority != RangePriority::AuthenticateRoots
+                || range.start_height() != start
+                || range.count() != 1
+                || matches!(state, HeaderWorkState::Committing { .. })
+        });
+        if had_recovery {
+            self.delayed_retries
+                .remove(&(start, RangePriority::AuthenticateRoots));
+        }
+        self.rebuild_start_indexes();
+    }
+
     /// True when `range` is actively owned by `peer` in the `InFlight` state.
     pub(super) fn is_in_flight_for(&self, range: RangeRequest, peer: &ZakuraPeerId) -> bool {
         matches!(

@@ -2285,6 +2285,7 @@ mod zakura_header_sync_driver_tests {
                     authenticated_hash: genesis_hash,
                     completed_checkpoint_height: durable_header_tip.0,
                     completed_checkpoint_hash: durable_header_tip.1,
+                    header_witness: None,
                 }),
             }),
         )

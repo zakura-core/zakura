@@ -16,9 +16,10 @@ use zakura_chain::{
 };
 use zakura_network::zakura::{
     commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange,
-    HeaderRootAuthState, HeaderRootAuthenticationFailureKind, HeaderSyncAction,
-    HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncOperationIdentity,
-    ZakuraEndpoint, ZakuraHeaderSyncDriverStartup, ZakuraTrace, DEFAULT_HS_RANGE,
+    HeaderRootAuthState, HeaderRootAuthUpdate, HeaderRootAuthenticationFailureKind,
+    HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers,
+    HeaderSyncOperationIdentity, HeaderWitnessState, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup,
+    ZakuraTrace, DEFAULT_HS_RANGE,
 };
 use zakura_state::MappedRequest;
 
@@ -95,6 +96,14 @@ fn header_root_auth_state(state: zakura_state::HeaderRootAuthState) -> HeaderRoo
         authenticated_hash: state.authenticated_hash,
         completed_checkpoint_height: state.completed_checkpoint_height,
         completed_checkpoint_hash: state.completed_checkpoint_hash,
+        header_witness: state.header_witness.map(header_witness_state),
+    }
+}
+
+fn header_witness_state(state: zakura_state::HeaderWitnessState) -> HeaderWitnessState {
+    HeaderWitnessState {
+        height: state.height,
+        hash: state.hash,
     }
 }
 
@@ -104,6 +113,25 @@ fn state_header_root_auth_state(state: HeaderRootAuthState) -> zakura_state::Hea
         authenticated_hash: state.authenticated_hash,
         completed_checkpoint_height: state.completed_checkpoint_height,
         completed_checkpoint_hash: state.completed_checkpoint_hash,
+        header_witness: state
+            .header_witness
+            .map(|witness| zakura_state::HeaderWitnessState {
+                height: witness.height,
+                hash: witness.hash,
+            }),
+    }
+}
+
+fn header_root_auth_update(update: zakura_state::HeaderRootAuthUpdate) -> HeaderRootAuthUpdate {
+    match update {
+        zakura_state::HeaderRootAuthUpdate::Advanced { authenticated } => {
+            HeaderRootAuthUpdate::Advanced { authenticated }
+        }
+        zakura_state::HeaderRootAuthUpdate::WitnessRecovered { witness } => {
+            HeaderRootAuthUpdate::WitnessRecovered {
+                witness: header_witness_state(witness),
+            }
+        }
     }
 }
 
@@ -171,8 +199,11 @@ fn header_range_commit_failed(
     HeaderSyncEvent::HeaderRangeOperationFailed { operation, kind }
 }
 
-fn header_root_authentication_completed(operation: HeaderSyncOperationIdentity) -> HeaderSyncEvent {
-    HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation }
+fn header_root_authentication_completed(
+    operation: HeaderSyncOperationIdentity,
+    update: HeaderRootAuthUpdate,
+) -> HeaderSyncEvent {
+    HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation, update }
 }
 
 fn header_root_authentication_failed(
@@ -254,7 +285,11 @@ fn header_root_authentication_failure_kind(
                 | zakura_state::AuthenticateHeaderRootsError::StartMismatch { .. }
                 | zakura_state::AuthenticateHeaderRootsError::WitnessAboveCompletedCheckpoint {
                     ..
-                } => HeaderRootAuthenticationFailureKind::Stale,
+                }
+                | zakura_state::AuthenticateHeaderRootsError::WitnessAlreadyPresent { .. }
+                | zakura_state::AuthenticateHeaderRootsError::WitnessNotNeeded { .. } => {
+                    HeaderRootAuthenticationFailureKind::Stale
+                }
                 zakura_state::AuthenticateHeaderRootsError::CountMismatch { .. }
                 | zakura_state::AuthenticateHeaderRootsError::MissingHeaderWitness { .. }
                 | zakura_state::AuthenticateHeaderRootsError::NonContiguous { .. }
@@ -321,8 +356,16 @@ mod operation_identity_tests {
         operation.op_kind = HeaderSyncOperationKind::AuthenticateRoots;
 
         assert!(matches!(
-            header_root_authentication_completed(operation.clone()),
-            HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation: echoed }
+            header_root_authentication_completed(
+                operation.clone(),
+                HeaderRootAuthUpdate::WitnessRecovered {
+                    witness: HeaderWitnessState {
+                        height: block::Height(2),
+                        hash: block::Hash([2; 32]),
+                    },
+                },
+            ),
+            HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation: echoed, .. }
                 if echoed == operation
         ));
         for kind in [
@@ -362,6 +405,7 @@ mod operation_identity_tests {
             authenticated_hash: block::Hash([1; 32]),
             completed_checkpoint_height: block::Height(3),
             completed_checkpoint_hash: block::Hash([3; 32]),
+            header_witness: None,
         };
         let stale = zakura_state::AuthenticateHeaderRootsError::StaleState {
             expected: state,
@@ -483,7 +527,15 @@ mod operation_identity_tests {
             operation
         };
         let mut in_flight = Some(operation.clone());
-        let completed = header_root_authentication_completed(operation.clone());
+        let completed = header_root_authentication_completed(
+            operation.clone(),
+            HeaderRootAuthUpdate::WitnessRecovered {
+                witness: HeaderWitnessState {
+                    height: block::Height(2),
+                    hash: block::Hash([2; 32]),
+                },
+            },
+        );
 
         let event = settle_root_auth_task_join(Some(Ok(completed)), &mut in_flight);
         assert!(
@@ -491,6 +543,7 @@ mod operation_identity_tests {
                 event,
                 Some(HeaderSyncEvent::HeaderRootAuthenticationCompleted {
                     operation: ref echoed,
+                    ..
                 }) if *echoed == operation
             ),
             "unexpected settlement event: {event:?}"
@@ -505,6 +558,7 @@ mod operation_identity_tests {
             authenticated_hash: block::Hash([7; 32]),
             completed_checkpoint_height: block::Height(9),
             completed_checkpoint_hash: block::Hash([9; 32]),
+            header_witness: None,
         };
         let (_sender, receiver) = tokio::sync::watch::channel(Some(state));
         let (delivered_tx, mut delivered_rx) = mpsc::channel(1);
@@ -1418,8 +1472,11 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     )
                     .await
                     {
-                        Ok(Ok(zakura_state::Response::AuthenticatedHeaderRoots(_))) => {
-                            header_root_authentication_completed(operation)
+                        Ok(Ok(zakura_state::Response::AuthenticatedHeaderRoots(success))) => {
+                            header_root_authentication_completed(
+                                operation,
+                                header_root_auth_update(success.update),
+                            )
                         }
                         Ok(Ok(response)) => {
                             warn!(

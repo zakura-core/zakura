@@ -155,18 +155,19 @@ mod tests {
             spawn_header_sync_reactor, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,
             BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage,
             BlockSyncStatus, DiscoveryMessage, Frame, FramedRecv, FramedSend, HeaderRangeEntry,
-            HeaderRootAuthState, HeaderRootAuthenticationFailureKind, HeaderSyncAction,
-            HeaderSyncCommitFailureKind, HeaderSyncDecodeContext, HeaderSyncEvent,
-            HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMessage, HeaderSyncMisbehavior,
-            HeaderSyncOperationIdentity, HeaderSyncPeerSession, HeaderSyncRequestId,
-            HeaderSyncStartup, HeaderSyncStatus, HeaderSyncWireRequestIdentity, LegacyGossipFrame,
-            LegacyGossipSink, LegacyRequestFrame, Peer, Service, ServicePeerLimits, Services,
-            Stream, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraHandshakeConfig,
-            ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraNodeRecord, ZakuraNodeRecordBody,
-            ZakuraServiceId, ZakuraTrace, MAX_BS_RESPONSE_BYTES, MSG_RESPONSE_TRANSACTION_IDS,
-            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
-            ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
-            ZAKURA_STREAM_HEADER_SYNC, ZAKURA_STREAM_LEGACY_REQUESTS,
+            HeaderRootAuthState, HeaderRootAuthUpdate, HeaderRootAuthenticationFailureKind,
+            HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncDecodeContext,
+            HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMessage,
+            HeaderSyncMisbehavior, HeaderSyncOperationIdentity, HeaderSyncPeerSession,
+            HeaderSyncRequestId, HeaderSyncStartup, HeaderSyncStatus,
+            HeaderSyncWireRequestIdentity, LegacyGossipFrame, LegacyGossipSink, LegacyRequestFrame,
+            Peer, Service, ServicePeerLimits, Services, Stream, ZakuraBlockSyncConfig,
+            ZakuraConnId, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
+            ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId, ZakuraTrace,
+            MAX_BS_RESPONSE_BYTES, MSG_RESPONSE_TRANSACTION_IDS, ZAKURA_CAP_DISCOVERY,
+            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
+            ZAKURA_STREAM_LEGACY_REQUESTS,
         },
         BoxError, Config, Request, Response,
     };
@@ -1106,7 +1107,12 @@ mod tests {
                         .expect("authenticated entry is present before its witness");
                     let _ = local
                         .handle
-                        .send(HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation })
+                        .send(HeaderSyncEvent::HeaderRootAuthenticationCompleted {
+                            operation,
+                            update: HeaderRootAuthUpdate::Advanced {
+                                authenticated: payload.range().start()..=authenticated_height,
+                            },
+                        })
                         .await;
                     let _ = local
                         .handle

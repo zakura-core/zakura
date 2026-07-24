@@ -1094,6 +1094,7 @@ mod tests {
             authenticated_hash: Network::Mainnet.genesis_hash(),
             completed_checkpoint_height: Height::MIN,
             completed_checkpoint_hash: Network::Mainnet.genesis_hash(),
+            header_witness: None,
         };
         let (header_root_auth_sender, mut header_root_auth_receiver) =
             tokio::sync::watch::channel(Some(expected_state));
@@ -1196,6 +1197,7 @@ mod tests {
             authenticated_hash: genesis.hash(),
             completed_checkpoint_height: Height::MIN,
             completed_checkpoint_hash: genesis.hash(),
+            header_witness: None,
         };
         let (sender, mut receiver) = tokio::sync::watch::channel(Some(prior));
         let _ = receiver.borrow_and_update();

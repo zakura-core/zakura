@@ -44,7 +44,7 @@ jobs:
           persist-credentials: false
 
       - name: Restore lychee cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: .lycheecache
           key: cache-lychee-${{ github.sha }}
@@ -57,12 +57,19 @@ jobs:
             --verbose
             --no-progress
             --cache
-            --max-cache-age 1d
+            --max-cache-age 2d
             --config .lychee.toml
             "**/*.md"
           fail: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Save lychee cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: .lycheecache
+          key: cache-lychee-${{ github.sha }}
 
   spell-check:
     name: spell-check

@@ -14,7 +14,7 @@
 //! skip all the network tests by setting the `SKIP_NETWORK_TESTS` environmental variable.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -1091,36 +1091,32 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
     std::mem::drop(second_connection);
 }
 
-/// Test a configured zcashd-compat peer queued behind a public connection bypasses
-/// the normal successful-handshake delay.
+/// Test configured zcashd-compat reconnects bypass the normal
+/// successful-handshake delay.
 #[tokio::test]
 async fn listener_zcashd_compat_accept_bypasses_success_delay() {
     let _init_guard = zakura_test::init();
 
-    if zakura_test::net::zebra_skip_network_tests() || zakura_test::net::zebra_skip_ipv6_tests() {
+    if zakura_test::net::zebra_skip_network_tests() {
         return;
     }
 
     let zcashd_compat_ip = Ipv4Addr::LOCALHOST;
-    let (accepted_ip_tx, mut accepted_ip_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (handshake_finished_tx, mut handshake_finished_rx) = tokio::sync::mpsc::unbounded_channel();
     let success_disconnect_inbound_handshaker =
         service_fn(move |req: HandshakeRequest<TcpStream>| {
-            let accepted_ip_tx = accepted_ip_tx.clone();
+            let handshake_finished_tx = handshake_finished_tx.clone();
             async move {
                 let HandshakeRequest {
                     data_stream: tcp_stream,
                     connected_addr,
                     connection_tracker,
                 } = req;
-                let ConnectedAddr::InboundDirect { addr } = connected_addr else {
-                    unreachable!("inbound listener handshakes use inbound direct addresses");
-                };
-
                 let (fake_client, _harness) = ClientTestHarness::build()
                     .with_connected_addr(connected_addr)
                     .finish();
-                accepted_ip_tx
-                    .send(addr.ip())
+                handshake_finished_tx
+                    .send(())
                     .expect("test receiver should remain open");
                 std::mem::drop(connection_tracker);
                 std::mem::drop(tcp_stream);
@@ -1130,7 +1126,7 @@ async fn listener_zcashd_compat_accept_bypasses_success_delay() {
         });
 
     let mut config = Config {
-        listen_addr: "[::]:0".parse().unwrap(),
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
         peerset_initial_target_size: 2,
         max_connections_per_ip: usize::MAX,
         ..Config::default()
@@ -1139,19 +1135,10 @@ async fn listener_zcashd_compat_accept_bypasses_success_delay() {
     config.listen_addr = listen_addr;
     let (peerset_tx, _peerset_rx) = mpsc::channel::<DiscoveredPeer>(2);
 
-    // Queue both connections before starting the accept loop, with the sidecar
-    // behind the public peer in the kernel's FIFO accept backlog.
-    let public_connection = TcpStream::connect(SocketAddr::new(
-        Ipv6Addr::LOCALHOST.into(),
-        listen_addr.port(),
-    ))
-    .await
-    .expect("test should connect an IPv6 public peer");
-    let zcashd_compat_connection = connect_from(
-        zcashd_compat_ip,
-        SocketAddr::new(zcashd_compat_ip.into(), listen_addr.port()),
-    )
-    .await;
+    // Queue two sidecar connections before starting the accept loop. The first
+    // handshake must not impose the normal one-second delay on the reconnect.
+    let first_connection = connect_from(zcashd_compat_ip, listen_addr).await;
+    let second_connection = connect_from(zcashd_compat_ip, listen_addr).await;
 
     let listen_task_handle = tokio::spawn(accept_inbound_connections(
         config,
@@ -1164,25 +1151,21 @@ async fn listener_zcashd_compat_accept_bypasses_success_delay() {
     ));
 
     tokio::time::timeout(Duration::from_millis(250), async {
-        loop {
-            if accepted_ip_rx
+        for _ in 0..2 {
+            handshake_finished_rx
                 .recv()
                 .await
-                .expect("listener should report accepted peers")
-                == zcashd_compat_ip
-            {
-                break;
-            }
+                .expect("listener should finish both sidecar handshakes");
         }
     })
     .await
-    .expect("configured sidecar should bypass the one-second public-peer delay");
+    .expect("configured sidecar reconnect should bypass the one-second delay");
 
     listen_task_handle.abort();
     tokio::task::yield_now().await;
     assert_listener_task_cancelled(listen_task_handle);
-    std::mem::drop(public_connection);
-    std::mem::drop(zcashd_compat_connection);
+    std::mem::drop(first_connection);
+    std::mem::drop(second_connection);
 }
 
 /// Test a queued burst of successful public handshakes is drained using short

@@ -81,17 +81,14 @@ impl BanList {
 
 impl fmt::Debug for BannedIps {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("BannedIps")
-            .field(
-                "bans",
-                &self
-                    .inner
-                    .bans
-                    .read()
-                    .expect("ban list lock should not be poisoned"),
-            )
-            .finish_non_exhaustive()
+        let mut debug = formatter.debug_struct("BannedIps");
+
+        match self.inner.bans.read() {
+            Ok(bans) => debug.field("bans", &*bans),
+            Err(_) => debug.field("bans", &"<poisoned>"),
+        };
+
+        debug.finish_non_exhaustive()
     }
 }
 

@@ -1575,7 +1575,7 @@ fn read_only_open_with_ephemeral_config_returns_error() {
 }
 
 /// A delayed read can retain a pre-reorg chain after the winning fork has finalized.
-/// A hash lookup must not mix the finalized header with the stale fork's successor.
+/// A lookup must resolve the header and successor from one source.
 #[tokio::test(flavor = "multi_thread")]
 async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Result<()> {
     use crate::{
@@ -1607,8 +1607,11 @@ async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Re
     let stale_hash = stale_block.hash();
     let stale_child = stale_block.make_fake_child();
     let stale_child_hash = stale_child.hash();
+    let winning_child = winning_block.make_fake_child();
+    let winning_child_hash = winning_child.hash();
     let winning_height = winning_block.coinbase_height().unwrap();
     assert_ne!(stale_hash, winning_block.hash());
+    assert_ne!(stale_child_hash, winning_child_hash);
     let mut stale_state = NonFinalizedState::new(&network);
     stale_state
         .commit_new_chain(stale_block.prepare(), &finalized_state)
@@ -1644,6 +1647,10 @@ async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Re
         CheckpointVerifiedBlock::from(winning_block.clone()),
         Treestate::default(),
     );
+    let winning_child_finalized = FinalizedBlock::from_checkpoint_verified(
+        CheckpointVerifiedBlock::from(winning_child),
+        Treestate::default(),
+    );
     // Use the production finalization sub-batch to stage every database row this
     // handler reads. Ancestor and tip metadata are irrelevant to this request.
     let mut batch = DiskWriteBatch::new();
@@ -1651,6 +1658,14 @@ async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Re
         .prepare_block_header_and_transaction_data_batch(
             &finalized_state.db,
             &winning_finalized,
+            false,
+            None,
+        )
+        .unwrap();
+    batch
+        .prepare_block_header_and_transaction_data_batch(
+            &finalized_state.db,
+            &winning_child_finalized,
             false,
             None,
         )
@@ -1673,7 +1688,7 @@ async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Re
     assert_eq!(height, winning_height);
     assert_eq!(hash, winning_block.hash());
     assert_eq!(block::Hash::from(header.as_ref()), winning_block.hash());
-    assert_eq!(next_block_hash, None);
+    assert_eq!(next_block_hash, Some(winning_child_hash));
 
     let response = read_state
         .oneshot(ReadRequest::BlockHeader(winning_height.into()))

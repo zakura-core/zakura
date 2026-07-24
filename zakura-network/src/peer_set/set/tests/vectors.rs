@@ -5,6 +5,11 @@ use std::{
     collections::HashSet,
     iter,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    task::{Context, Wake, Waker},
     time::Duration,
 };
 
@@ -28,6 +33,39 @@ use crate::{
 };
 
 use super::{PeerSetBuilder, PeerVersions};
+
+#[derive(Default)]
+struct WakeCounter(AtomicUsize);
+
+impl Wake for WakeCounter {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn mock_discovery_for_addresses(
+    addresses: Vec<PeerSocketAddr>,
+) -> (
+    impl futures::Stream<Item = Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>>,
+    Vec<ClientTestHarness>,
+) {
+    let version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
+    let mut handles = Vec::with_capacity(addresses.len());
+    let changes = addresses
+        .into_iter()
+        .map(|addr| {
+            let (client, handle) = ClientTestHarness::build().with_version(version).finish();
+            handles.push(handle);
+            Ok::<_, BoxError>(Change::Insert(addr, client.into()))
+        })
+        .collect::<Vec<_>>();
+
+    (stream::iter(changes).chain(stream::pending()), handles)
+}
 
 #[test]
 fn peer_set_ready_single_connection() {
@@ -339,6 +377,128 @@ fn broadcast_all_queued_removes_banned_peers() {
         } else {
             assert!(receiver.try_recv().is_ok());
         }
+    });
+}
+
+#[test]
+fn ban_change_wakes_and_disconnects_every_connection_for_ip() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let banned_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+    let banned_addr: PeerSocketAddr = SocketAddr::new(banned_ip, 1).into();
+    let mapped_banned_addr: PeerSocketAddr =
+        SocketAddr::new(IpAddr::V6(Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped()), 2).into();
+    let unrelated_addr: PeerSocketAddr =
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 3).into();
+    let (discovered_peers, _handles) =
+        mock_discovery_for_addresses(vec![banned_addr, mapped_banned_addr, unrelated_addr]);
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    let bans = BannedIps::default();
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .max_conns_per_ip(max(2, DEFAULT_MAX_CONNS_PER_IP))
+            .build();
+        peer_set.bans = bans.clone();
+
+        {
+            let ready = peer_set.ready().await.expect("peer set is always ready");
+            assert_eq!(ready.ready_services.len(), 3);
+        }
+
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(wake_counter.clone());
+        let mut context = Context::from_waker(&waker);
+        let _ = Service::poll_ready(&mut peer_set, &mut context);
+        let wake_count_before_ban = wake_counter.0.load(Ordering::SeqCst);
+
+        let mut busy_service = peer_set
+            .take_ready_service(&mapped_banned_addr)
+            .expect("mapped banned peer is ready");
+        let in_flight_response = busy_service.call(Request::Peers);
+        peer_set.push_unready(mapped_banned_addr, busy_service);
+
+        let (broadcast_sender, _broadcast_receiver) = tokio::sync::mpsc::channel(1);
+        peer_set.queued_broadcast_all = Some((
+            Request::Peers,
+            broadcast_sender,
+            HashSet::from([banned_addr, mapped_banned_addr]),
+        ));
+        peer_set.queued_sidecar_block_gossip = Some((
+            Request::AdvertiseBlock(block::Hash([7; 32]), None),
+            HashSet::from([banned_addr, mapped_banned_addr]),
+        ));
+
+        assert!(bans.insert(banned_ip));
+        assert!(
+            wake_counter.0.load(Ordering::SeqCst) > wake_count_before_ban,
+            "inserting a new ban must wake the registered peer set"
+        );
+
+        let _ = Service::poll_ready(&mut peer_set, &mut context);
+
+        assert!(!peer_set.ready_services.contains_key(&banned_addr));
+        assert!(!peer_set.ready_services.contains_key(&mapped_banned_addr));
+        assert!(!peer_set.cancel_handles.contains_key(&mapped_banned_addr));
+        assert!(
+            peer_set.unready_services.is_empty(),
+            "the canceled in-flight service must be polled and dropped"
+        );
+        assert_eq!(peer_set.num_peers_with_ip(banned_ip), 0);
+        assert!(
+            peer_set.ready_services.contains_key(&unrelated_addr),
+            "a ban must preserve peers with unrelated canonical IPs"
+        );
+        std::mem::drop(in_flight_response);
+        assert!(
+            peer_set
+                .queued_broadcast_all
+                .as_ref()
+                .is_none_or(|(_, _, peers)| peers.is_empty()),
+            "banned peers must be removed from queued broadcasts"
+        );
+        assert!(
+            peer_set
+                .queued_sidecar_block_gossip
+                .as_ref()
+                .is_none_or(|(_, peers)| peers.is_empty()),
+            "banned peers must be removed from queued sidecar gossip"
+        );
+    });
+}
+
+#[test]
+fn ban_before_waker_registration_rejects_discovered_peer() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let banned_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+    let mapped_banned_addr: PeerSocketAddr =
+        SocketAddr::new(IpAddr::V6(Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped()), 1).into();
+    let (discovered_peers, _handles) = mock_discovery_for_addresses(vec![mapped_banned_addr]);
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    let bans = BannedIps::with_banned_ip(banned_ip);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+        peer_set.bans = bans;
+
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(wake_counter);
+        let mut context = Context::from_waker(&waker);
+        let _ = Service::poll_ready(&mut peer_set, &mut context);
+
+        assert!(!peer_set.ready_services.contains_key(&mapped_banned_addr));
+        assert!(!peer_set.cancel_handles.contains_key(&mapped_banned_addr));
+        assert_eq!(peer_set.num_peers_with_ip(banned_ip), 0);
     });
 }
 

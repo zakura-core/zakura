@@ -1,7 +1,7 @@
 //! State-owned access to the commitment-root index.
 //!
 //! This module is the lifecycle boundary for commitment-root rows. It keeps
-//! disk-row conversion, contiguous reads, and the distinct body, legacy
+//! disk-row conversion, contiguous reads, and the distinct body, authenticated
 //! header, reorganization, rollback, and repair write policies in one place.
 
 use std::{
@@ -591,7 +591,6 @@ impl ZakuraDb {
     /// Atomically promotes successfully verified roots and advances their durable frontier.
     ///
     /// Body-derived rows retain precedence if full blocks already own any promoted height.
-    #[allow(dead_code)] // Called by the production authentication lane added in Phase 3.
     pub(crate) fn write_verified_header_commitment_roots(
         &self,
         verified: VerifiedHeaderCommitmentRoots,
@@ -793,41 +792,12 @@ impl ZakuraDb {
         Ok(())
     }
 
-    pub(crate) fn prepare_legacy_header_root_auth_frontier_from_body_tip(
-        &self,
-        batch: &mut DiskWriteBatch,
-    ) -> Result<(), HeaderRootAuthFrontierError> {
-        let Some((confirmed_height, confirmed_hash)) = self.tip() else {
-            return Ok(());
-        };
-        let history_tree = (*self.try_history_tree()?).clone();
-        validate_history_tree_height(self, confirmed_height, &history_tree)?;
-        batch.set_header_root_auth_frontier(
-            self,
-            &HeaderRootAuthFrontier {
-                confirmed_height,
-                confirmed_hash,
-                history_tree,
-            },
-        );
-        Ok(())
-    }
-
     /// Returns the contiguous stored prefix of `range`.
     ///
-    /// The read stops at the first missing height.
+    /// The read stops at the first missing height. Every returned row is
+    /// authoritative: authenticated by the header-root lane or derived from a
+    /// committed body (the index stores no per-row provenance).
     pub fn commitment_roots_by_height_range(
-        &self,
-        range: RangeInclusive<Height>,
-    ) -> Vec<BlockCommitmentRoots> {
-        self.contiguous_commitment_roots(range)
-    }
-
-    /// Returns legacy header-sync roots for the contiguous stored prefix of `range`.
-    ///
-    /// The index currently contains both body-derived and legacy header-supplied
-    /// rows, so this compatibility name does not imply per-row provenance.
-    pub fn zakura_header_commitment_roots_by_height_range(
         &self,
         range: impl RangeBounds<Height>,
     ) -> Vec<BlockCommitmentRoots> {
@@ -864,7 +834,7 @@ impl ZakuraDb {
     ) -> Result<(), rocksdb::Error> {
         let mut batch = DiskWriteBatch::new();
         for roots in roots {
-            batch.insert_legacy_header_commitment_roots(self, &roots);
+            batch.insert_unauthenticated_commitment_roots_for_test(self, &roots);
         }
         self.write_batch(batch)
     }
@@ -907,7 +877,6 @@ impl DiskWriteBatch {
             .zs_insert(&roots.height, &disk_row(roots));
     }
 
-    #[allow(dead_code)] // Called through the Phase 1 promotion boundary above.
     fn insert_verified_header_commitment_roots(
         &mut self,
         db: &ZakuraDb,
@@ -1020,12 +989,12 @@ impl DiskWriteBatch {
         let _ = writer;
     }
 
-    /// Inserts a raw legacy header-supplied row unless a committed body owns the height.
+    /// Inserts a raw fixture row unless a committed body owns the height.
     ///
-    /// "Legacy" identifies the temporary pre-authentication behavior where header sync persists
-    /// peer-supplied roots directly. The verified-root persistence boundary will replace this path.
+    /// Test-only: production writes go through the sealed verified-root boundary
+    /// ([`ZakuraDb::write_verified_header_commitment_roots`]) or the body-commit path.
     #[cfg(any(test, feature = "proptest-impl"))]
-    pub(super) fn insert_legacy_header_commitment_roots(
+    pub(super) fn insert_unauthenticated_commitment_roots_for_test(
         &mut self,
         db: &ZakuraDb,
         roots: &BlockCommitmentRoots,
@@ -1040,15 +1009,22 @@ impl DiskWriteBatch {
             .zs_insert(&roots.height, &disk_row(roots));
     }
 
-    /// Deletes one legacy header-supplied row.
-    pub(super) fn delete_legacy_header_commitment_root(&mut self, db: &ZakuraDb, height: Height) {
+    /// Deletes the header-supplied row superseded by a committed body.
+    ///
+    /// Only body commit calls this, and the same batch writes the authoritative
+    /// body-derived replacement row, so the index never loses contiguity.
+    pub(super) fn delete_superseded_header_commitment_root(
+        &mut self,
+        db: &ZakuraDb,
+        height: Height,
+    ) {
         let _ = db
             .commitment_roots_cf()
             .with_batch_for_writing(self)
             .zs_delete(&height);
     }
 
-    /// Deletes the inclusive legacy-header suffix displaced by a header reorganization.
+    /// Deletes the inclusive header-supplied suffix displaced by a header reorganization.
     pub(super) fn delete_header_reorg_commitment_roots(
         &mut self,
         db: &ZakuraDb,

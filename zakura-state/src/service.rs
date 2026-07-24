@@ -1742,7 +1742,7 @@ where
                 _ => None,
             }
         } else {
-            db.zakura_header_commitment_roots_by_height_range(height..=height)
+            db.commitment_roots_by_height_range(height..=height)
                 .into_iter()
                 .next()
         };

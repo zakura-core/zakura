@@ -1580,7 +1580,7 @@ impl DiskWriteBatch {
             store_raw_transactions,
             precomputed_raw_txs,
         )?;
-        self.delete_legacy_header_commitment_root(zakura_db, finalized.height);
+        self.delete_superseded_header_commitment_root(zakura_db, finalized.height);
 
         // The consensus rules are silent on shielded transactions in the genesis block,
         // because there aren't any in the mainnet or testnet genesis blocks.
@@ -1989,7 +1989,7 @@ impl DiskWriteBatch {
         self.zs_delete(&zakura_hash_by_height, height);
         self.zs_delete(&zakura_header_by_height, height);
         self.zs_delete(&zakura_body_size_by_height, height);
-        self.delete_legacy_header_commitment_root(zakura_db, height);
+        self.delete_superseded_header_commitment_root(zakura_db, height);
 
         Ok(())
     }

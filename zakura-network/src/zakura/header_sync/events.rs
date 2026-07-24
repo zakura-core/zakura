@@ -296,7 +296,7 @@ pub enum HeaderSyncEvent {
     HeaderRootAuthStateChanged(Option<HeaderRootAuthState>),
     /// State needs a bounded re-delivery of VCT supplied roots for a covered height.
     VctRootRepairRequested {
-        /// Height whose supplied root is missing or was evicted after rejection.
+        /// Height whose supplied root is missing or failed body-time verification.
         height: block::Height,
         /// State repair generation.
         generation: u64,

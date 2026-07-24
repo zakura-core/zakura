@@ -1,6 +1,6 @@
 # Header-sync VCT root authentication
 
-Status: in-progress
+Status: implemented (PRs #346, #351, #352; Phase 7 cleanup landed separately)
 
 ## 1. Summary
 
@@ -1231,8 +1231,12 @@ unrestored retained store.
 
 ### Phase 6: integrate VCT consumption
 
-Not yet implemented; planned as a follow-up to
-[PR #352](https://github.com/zakura-core/zakura/pull/352).
+Implemented in
+[PR #352](https://github.com/zakura-core/zakura/pull/352), not as a separate
+follow-up: `PeerSource` reads the authoritative index (which after Phase 1 can
+only contain authenticated or body-derived rows), body-time checks and bounded
+repair were retained, and the embedded final frontier is verified against this
+block's authenticated roots at the handoff.
 
 1. Make `PeerSource` read only authenticated roots.
 2. Retain body-time checks as defense in depth.
@@ -1242,8 +1246,16 @@ Not yet implemented; planned as a follow-up to
 
 ### Phase 7: remove obsolete provisional behavior
 
-Not yet implemented; planned as a follow-up to
-[PR #352](https://github.com/zakura-core/zakura/pull/352).
+Partially delivered by [PR #352](https://github.com/zakura-core/zakura/pull/352)
+(no code path reads or invalidates unauthenticated rows); the remainder landed
+as a dedicated cleanup: provisional/legacy root terminology was renamed, the
+inert `CommitmentRootSource::invalidate` seam was removed (a body-time rejection
+parks the commit and requests bounded repair; it never deletes an authenticated
+row), and the main VCT design document was updated to the authenticated-root
+behavior. The body-commit root-row delete was kept and renamed
+(`delete_superseded_header_commitment_root`): it is the Section 13.1
+body-replacement write, not the obsolete invalidation — the same batch writes
+the body-derived replacement row, so the index never loses contiguity.
 
 1. Remove provisional-root terminology and reads.
 2. Remove body-commit invalidation of unauthenticated database rows.

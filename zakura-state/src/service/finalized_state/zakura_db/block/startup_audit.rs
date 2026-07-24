@@ -225,11 +225,13 @@ impl ZakuraDb {
         // The roots column family also holds verified rows at committed
         // heights (written by body commits, kept through pruning); those are
         // not zakura frontier rows and are never audited or repaired. Only
-        // rows above the finalized tip are provisional header-sync data.
-        let provisional_roots_start =
+        // rows above the finalized tip are header-sync data: authenticated
+        // header-supplied roots the repair truncates so the root lane
+        // re-fetches and re-authenticates them.
+        let header_ahead_roots_start =
             finalized_tip.and_then(|(tip_height, _)| tip_height.next().ok());
-        let provisional_roots_empty = !audit_commitment_roots
-            || match (finalized_tip, provisional_roots_start) {
+        let header_ahead_roots_empty = !audit_commitment_roots
+            || match (finalized_tip, header_ahead_roots_start) {
                 // The finalized tip is at the maximum height: no frontier can
                 // exist above it.
                 (Some(_), None) => true,
@@ -245,7 +247,7 @@ impl ZakuraDb {
             && self.db.zs_is_empty(&hash_cf)
             && self.db.zs_is_empty(&height_by_hash_cf)
             && self.db.zs_is_empty(&body_size_cf)
-            && provisional_roots_empty
+            && header_ahead_roots_empty
         {
             // Log the pass so operators can verify the audit ran on this boot.
             tracing::info!(
@@ -425,7 +427,7 @@ impl ZakuraDb {
         // If the finalized tip is missing, roots rows are not auditable: they
         // might be committed history whose tip index was damaged.
         let root_audit_start = audit_commitment_roots
-            .then_some(match (finalized_tip, provisional_roots_start) {
+            .then_some(match (finalized_tip, header_ahead_roots_start) {
                 (Some(_), None) => None,
                 (Some(_), Some(start)) => Some(start),
                 (None, _) => None,

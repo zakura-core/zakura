@@ -380,15 +380,6 @@ pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// Every source carries one: the fast path only runs on networks with an embedded
     /// handoff frontier, and test fixtures construct one explicitly.
     fn final_frontiers(&self) -> &FinalFrontiers;
-
-    /// Discard the supplied root for `height` so a later [`vct_root`](Self::vct_root)
-    /// returns `None` for it.
-    ///
-    /// Called by the committer when a supplied root fails body verification.
-    ///
-    /// Authenticated rows are durable state and must not be deleted individually,
-    /// because that would create a gap below the persisted frontier.
-    fn invalidate(&self, _height: block::Height) {}
 }
 
 /// Test-only local source over a height-keyed roots map.
@@ -472,7 +463,7 @@ impl CommitmentRootSource for PeerSource {
         ironwood::tree::Root,
     )> {
         self.db
-            .zakura_header_commitment_roots_by_height_range(height..=height)
+            .commitment_roots_by_height_range(height..=height)
             .into_iter()
             .next()
             .map(|roots| (roots.sapling_root, roots.orchard_root, roots.ironwood_root))
@@ -1447,7 +1438,9 @@ mod tests {
         );
     }
 
-    /// Body mismatch invalidation must not create a gap below the durable frontier.
+    /// A peer source exposes no way to delete a stored row: a body-time rejection
+    /// cannot create a gap below the durable frontier, and repeated reads of the
+    /// same height stay stable.
     #[test]
     fn peer_source_keeps_authenticated_roots_on_body_mismatch() {
         let db = ephemeral_mainnet_db();
@@ -1483,8 +1476,6 @@ mod tests {
             "an absent height has no root"
         );
 
-        source.invalidate(block::Height(42));
-
         assert_eq!(
             source.vct_root(block::Height(42)),
             Some((
@@ -1492,7 +1483,7 @@ mod tests {
                 orchard::tree::NoteCommitmentTree::default().root(),
                 ironwood::tree::NoteCommitmentTree::default().root(),
             )),
-            "body mismatch must not delete one authenticated row below the frontier"
+            "a re-read returns the same authenticated row below the frontier"
         );
     }
 }

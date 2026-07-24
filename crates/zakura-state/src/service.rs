@@ -1908,10 +1908,17 @@ impl Service<ReadRequest> for ReadStateService {
                         let height = hash_or_height.height_or_else(|hash| state.db.height(hash))?;
                         let hash = hash_or_height.hash_or_else(|height| state.db.hash(height))?;
                         let header = state.db.block_header(height.into())?;
-                        let next_block_hash = height
-                            .next()
-                            .ok()
-                            .and_then(|next_height| state.db.hash(next_height));
+                        let next_block_hash = height.next().ok().and_then(|next_height| {
+                            state.db.hash(next_height).or_else(|| {
+                                best_chain
+                                    .as_ref()
+                                    .and_then(|chain| chain.block(next_height.into()))
+                                    .filter(|next_block| {
+                                        next_block.block.header.previous_block_hash == hash
+                                    })
+                                    .map(|next_block| next_block.hash)
+                            })
+                        });
 
                         Some((header, hash, height, next_block_hash))
                     })

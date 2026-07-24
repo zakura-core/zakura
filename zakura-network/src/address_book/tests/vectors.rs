@@ -98,6 +98,7 @@ fn misbehavior_ban_does_not_panic_with_max_connections_per_ip_above_one() {
         PeerServices::NODE_NETWORK,
         DateTime32::MIN.saturating_add(Duration32::from_seconds(2)),
     ));
+    address_book.peers.assert_consistent();
 
     assert!(address_book.get(banned_addr).is_some());
     assert!(address_book.get(other_port_same_ip).is_some());
@@ -108,6 +109,7 @@ fn misbehavior_ban_does_not_panic_with_max_connections_per_ip_above_one() {
         addr: banned_addr,
         score_increment: MAX_PEER_MISBEHAVIOR_SCORE,
     });
+    address_book.peers.assert_consistent();
 
     assert!(
         bans.contains(banned_addr.ip()),

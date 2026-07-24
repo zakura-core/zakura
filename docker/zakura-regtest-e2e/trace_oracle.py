@@ -449,9 +449,10 @@ def check_frontiers(node: NodeTrace) -> list[Failure]:
 
 def check_block_sync_activity(node: NodeTrace, options: OracleOptions) -> list[Failure]:
     failures: list[Failure] = []
-    states = node.events("block_sync", BLOCK_SYNC_STATE)
+    block_sync_rows = node.table("block_sync")
+    states = [row for row in block_sync_rows if row.event == BLOCK_SYNC_STATE]
     real_activity = sorted(
-        [row for row in node.table("block_sync") if row.event in BODY_PROGRESS_EVENTS]
+        [row for row in block_sync_rows if row.event in BODY_PROGRESS_EVENTS]
         + [row for row in node.table("commit_state") if commit_state_row_is_body_progress(row)],
         key=sort_key,
     )
@@ -469,9 +470,24 @@ def check_block_sync_activity(node: NodeTrace, options: OracleOptions) -> list[F
             if best is None or verified is None or best <= verified:
                 continue
 
-            has_real_activity = has_near_activity(state, real_activity, options)
+            # The e2e from-scratch reset stops node2 and appends a new process's
+            # traces into the same JSONL files with timestamps restarting at ~0.
+            # A lagging snapshot written just before that kill must not be judged
+            # against the next process. End-of-trace lag with no restart still
+            # fails: the run finished while the body tip was behind.
+            if process_restarted_after(block_sync_rows, state):
+                continue
+
+            same_process_activity = rows_before_process_restart(
+                block_sync_rows, state, real_activity
+            )
+            same_process_queries = rows_before_process_restart(
+                block_sync_rows, state, query_rows
+            )
+
+            has_real_activity = has_near_activity(state, same_process_activity, options)
             if not has_real_activity:
-                recent_query_count = len(rows_near(state, query_rows, options))
+                recent_query_count = len(rows_near(state, same_process_queries, options))
                 invariant = (
                     "lagging_body_sync_not_query_spin"
                     if recent_query_count > 0
@@ -486,13 +502,18 @@ def check_block_sync_activity(node: NodeTrace, options: OracleOptions) -> list[F
                             "best_header_tip": best,
                             "verified_block_tip": verified,
                             "recent_query_needed_blocks": recent_query_count,
-                            "nearby_real_activity": [compact_row(row) for row in rows_near(state, real_activity, options)[-5:]],
+                            "nearby_real_activity": [
+                                compact_row(row)
+                                for row in rows_near(state, same_process_activity, options)[-5:]
+                            ],
                         },
                     )
                 )
                 break
 
-            if body_sync_has_pinned_queue(state) and not has_forward_activity(state, real_activity, options):
+            if body_sync_has_pinned_queue(state) and not has_forward_activity(
+                state, same_process_activity, options
+            ):
                 failures.append(
                     failure(
                         node,
@@ -581,6 +602,113 @@ def body_sync_has_pinned_queue(state: TraceRow) -> bool:
     )
 
 
+def is_process_timestamp_restart(previous_ts: int, ts: int) -> bool:
+    """Detect a zakurad restart that rebased the monotonic trace clock.
+
+    Small out-of-order writes are ignored; only a large backwards jump that also
+    lands well below the previous high-water mark counts as a new process epoch.
+    """
+    return ts + 1_000_000 < previous_ts and ts < previous_ts // 2
+
+
+def same_process_extends_past(table_rows: list[TraceRow], row: TraceRow, micros: int) -> bool:
+    """True when the process that wrote `row` kept tracing for at least `micros`."""
+    if row.ts is None:
+        return True
+
+    target = row.ts + micros
+    seen_row = False
+    last_ts = row.ts
+    for candidate in table_rows:
+        if not seen_row:
+            if candidate.table == row.table and candidate.index == row.index:
+                seen_row = True
+            continue
+
+        ts = candidate.ts
+        if ts is None:
+            continue
+        if is_process_timestamp_restart(last_ts, ts):
+            return False
+        last_ts = max(last_ts, ts)
+        if last_ts >= target:
+            return True
+
+    return last_ts >= target
+
+
+def process_restarted_after(table_rows: list[TraceRow], row: TraceRow) -> bool:
+    """True when a later append in `table_rows` rebases the monotonic clock."""
+    if row.ts is None:
+        return False
+
+    seen_row = False
+    last_ts = row.ts
+    for candidate in table_rows:
+        if not seen_row:
+            if candidate.table == row.table and candidate.index == row.index:
+                seen_row = True
+            continue
+
+        ts = candidate.ts
+        if ts is None:
+            continue
+        if is_process_timestamp_restart(last_ts, ts):
+            return True
+        last_ts = max(last_ts, ts)
+
+    return False
+
+
+def rows_before_process_restart(
+    table_rows: list[TraceRow],
+    anchor: TraceRow,
+    candidates: list[TraceRow],
+) -> list[TraceRow]:
+    """Keep activity that belongs to the same process lifetime as `anchor`.
+
+    Append order defines process epochs. Rows after a timestamp restart in
+    `table_rows` are from a later process and must not heal (or falsely condemn)
+    an earlier lagging snapshot.
+    """
+    if anchor.ts is None:
+        return candidates
+
+    restart_index: int | None = None
+    seen_anchor = False
+    last_ts = anchor.ts
+    for row in table_rows:
+        if not seen_anchor:
+            if row.table == anchor.table and row.index == anchor.index:
+                seen_anchor = True
+            continue
+        ts = row.ts
+        if ts is None:
+            continue
+        if is_process_timestamp_restart(last_ts, ts):
+            restart_index = row.index
+            break
+        last_ts = max(last_ts, ts)
+
+    if restart_index is None:
+        return candidates
+
+    filtered: list[TraceRow] = []
+    for candidate in candidates:
+        if candidate.table == anchor.table and candidate.index >= restart_index:
+            continue
+        # Cross-table rows from a restarted process begin near ts=0.
+        ts = candidate.ts
+        if (
+            candidate.table != anchor.table
+            and ts is not None
+            and is_process_timestamp_restart(last_ts, ts)
+        ):
+            continue
+        filtered.append(candidate)
+    return filtered
+
+
 def check_header_recovery(node: NodeTrace, options: OracleOptions) -> list[Failure]:
     failures: list[Failure] = []
     recoveries = [
@@ -646,10 +774,13 @@ def header_reject_has_recovery(rejected: TraceRow, recoveries: list[TraceRow], o
 
 
 def trace_extends_past(node: NodeTrace, row: TraceRow, micros: int) -> bool:
-    if row.ts is None:
-        return True
-    latest_ts = max((candidate.ts for candidate in node.rows if candidate.ts is not None), default=row.ts)
-    return latest_ts - row.ts >= micros
+    """True when the same process that wrote `row` kept tracing for `micros`.
+
+    Global max-timestamp is not enough: the e2e reset appends a new process into
+    the same JSONL files with a restarted clock, which can look like the old
+    process "continued" when it did not.
+    """
+    return same_process_extends_past(node.table(row.table), row, micros)
 
 
 def check_checkpoint_to_full_handoff(nodes: list[NodeTrace], options: OracleOptions) -> list[Failure]:
@@ -1302,6 +1433,58 @@ def run_self_test() -> None:
             f.invariant == "block_sync_queue_lag_makes_progress"
             for f in run_oracle(root / "queued_lag", OracleOptions(persistent_lag_micros=1_000_000))
         )
+
+        # Pre-reset lag followed by a from-scratch restart that rebases the
+        # monotonic clock must not be judged against the next process.
+        restarted_lag = root / "restarted_lag" / "node2"
+        write_jsonl(
+            restarted_lag / "block_sync.jsonl",
+            [
+                {
+                    "ts": 48_000_000,
+                    "event": BLOCK_SYNC_STATE,
+                    "verified_block_tip": 76,
+                    "best_header_tip": 163,
+                    "budget_reserved": 0,
+                    "reorder": 0,
+                    "applying": 0,
+                    "outstanding": 0,
+                    "needed_count": 87,
+                    "queue_len": 1,
+                    "assigned_len": 0,
+                },
+                # New process after e2e reset: timestamps restart near zero and
+                # the catch-up eventually reaches tip with a clean final state.
+                {
+                    "ts": 1_000,
+                    "event": BLOCK_SYNC_STATE,
+                    "verified_block_tip": 0,
+                    "best_header_tip": 0,
+                    "budget_reserved": 0,
+                    "reorder": 0,
+                    "applying": 0,
+                    "outstanding": 0,
+                },
+                {"ts": 2_000_000, "event": BLOCK_GET_BLOCKS_SENT, "range_start": 1, "range_count": 1},
+                {"ts": 3_000_000, "event": BLOCK_BODY_RECEIVED, "height": 1},
+                {
+                    "ts": 56_000_000,
+                    "event": BLOCK_SYNC_STATE,
+                    "verified_block_tip": 163,
+                    "best_header_tip": 163,
+                    "budget_reserved": 0,
+                    "reorder": 0,
+                    "applying": 0,
+                    "outstanding": 0,
+                    "needed_count": 0,
+                    "queue_len": 0,
+                    "assigned_len": 0,
+                },
+            ],
+        )
+        assert not run_oracle(
+            root / "restarted_lag", OracleOptions(persistent_lag_micros=1_000_000)
+        ), "pre-reset lag truncated by process restart must not fail the oracle"
 
         latency_trend = root / "latency_trend" / "node1"
         write_jsonl(

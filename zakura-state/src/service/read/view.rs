@@ -22,6 +22,22 @@ impl<'a> BestChainReadView<'a> {
         best_chain: Option<Arc<Chain>>,
         finalized: ZakuraDbSnapshot<'a>,
     ) -> Self {
+        // A read-only secondary can advance its finalized snapshot before it
+        // publishes the corresponding non-finalized state. Once finalized
+        // storage reaches or passes the captured chain tip, it supersedes the
+        // entire stale overlay. Keeping that overlay could resurrect outputs
+        // already spent in the newer finalized view.
+        let best_chain = match best_chain {
+            Some(chain)
+                if finalized.tip().is_some_and(|(finalized_height, _)| {
+                    finalized_height >= chain.non_finalized_tip().0
+                }) =>
+            {
+                None
+            }
+            best_chain => best_chain,
+        };
+
         Self {
             best_chain,
             finalized,

@@ -551,6 +551,65 @@ async fn coherent_view_survives_non_finalized_to_finalized_transition() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coherent_view_uses_newer_finalized_tip_during_read_only_catch_up() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let blocks = continuous_mainnet_blocks();
+    let mut finalized = finalized_state();
+    commit_finalized(&mut finalized, blocks[0].clone());
+    let stale_tip = non_finalized_child(&blocks[0]);
+    let finalized_tip = non_finalized_child(&stale_tip);
+
+    let mut non_finalized = NonFinalizedState::new(&Mainnet);
+    non_finalized.commit_new_chain(stale_tip.clone().prepare(), &finalized)?;
+    let (read_state, _non_finalized_sender) = read_service(&finalized, non_finalized);
+
+    commit_finalized(&mut finalized, stale_tip);
+    commit_finalized(&mut finalized, finalized_tip.clone());
+
+    let output = query_unspent_output(read_state, outpoint(&finalized_tip)).await;
+
+    assert_eq!(output.tip_hash, finalized_tip.hash());
+    assert_eq!(
+        output.transaction.tx.hash(),
+        finalized_tip.transactions[0].hash()
+    );
+    assert_eq!(output.transaction.confirmations, 1);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coherent_view_does_not_resurrect_output_spent_after_stale_chain_tip() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let blocks = continuous_mainnet_blocks();
+    let mut finalized = finalized_state();
+    commit_finalized(&mut finalized, blocks[0].clone());
+    let (created_block, queried_outpoint, replacement_output) =
+        with_zero_value_transparent_output(non_finalized_child(&blocks[0]), 0x52);
+
+    let mut non_finalized = NonFinalizedState::new(&Mainnet);
+    non_finalized.commit_new_chain(created_block.clone().prepare(), &finalized)?;
+    let (read_state, _non_finalized_sender) = read_service(&finalized, non_finalized);
+
+    commit_finalized(&mut finalized, created_block.clone());
+    let spending_block = with_transparent_spend(
+        non_finalized_child(&created_block),
+        queried_outpoint,
+        replacement_output,
+    );
+    commit_finalized(&mut finalized, spending_block);
+
+    let response = read_state
+        .oneshot(ReadRequest::BestChainUnspentOutput(queried_outpoint))
+        .await
+        .expect("coherent state request succeeds");
+
+    assert_eq!(response, ReadResponse::BestChainUnspentOutput(None));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coherent_view_preserves_empty_state_error() {
     let _init_guard = zakura_test::init();
     let finalized = finalized_state();

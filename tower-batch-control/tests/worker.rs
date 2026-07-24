@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use tokio_test::{assert_pending, assert_ready, assert_ready_err, assert_ready_ok, task};
+use tokio_test::{assert_pending, assert_ready, assert_ready_err, task};
 use tower::{Service, ServiceExt};
 use tower_batch_control::{error, Batch, BatchControl, RequestWeight};
 use tower_test::mock;
@@ -121,26 +121,6 @@ async fn wakes_pending_waiters_on_failure() {
 }
 
 #[tokio::test]
-async fn explicit_flush_waits_for_queue_capacity() {
-    let _init_guard = zakura_test::init();
-
-    let (service, mut handle) = mock::pair::<_, ()>();
-    let (mut service, worker) = Batch::pair(service, 1, 1, Duration::from_secs(1000));
-    let mut worker = task::spawn(worker.run());
-
-    service.ready().await.unwrap();
-    let _response = service.call(());
-
-    let mut flush_service = service.clone();
-    let mut flush = task::spawn(async move { flush_service.flush().await });
-    assert_pending!(flush.poll(), "the queued item holds the only permit");
-
-    handle.allow(2);
-    assert_pending!(worker.poll());
-    assert_ready_ok!(flush.poll());
-}
-
-#[tokio::test]
 async fn try_flush_skips_when_queue_saturated() {
     let _init_guard = zakura_test::init();
 
@@ -162,7 +142,7 @@ async fn try_flush_skips_when_queue_saturated() {
 }
 
 #[tokio::test]
-async fn explicit_flush_completes_zero_weight_items() {
+async fn try_flush_completes_zero_weight_items() {
     use tokio::time::timeout;
     let _init_guard = zakura_test::init();
 
@@ -184,10 +164,10 @@ async fn explicit_flush_completes_zero_weight_items() {
     let response = service.call(ZeroWeight);
 
     let mut flush_service = service.clone();
-    timeout(Duration::from_secs(5), flush_service.flush())
-        .await
-        .expect("flush should not time out")
-        .expect("flush should queue");
+    assert!(
+        flush_service.try_flush().expect("flush should not fail"),
+        "flush should queue"
+    );
 
     // The worker must forward the zero-weight item and then the flush command:
     // without the weight floor, the empty-batch guard skips this flush and the

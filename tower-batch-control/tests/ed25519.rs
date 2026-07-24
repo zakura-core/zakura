@@ -239,30 +239,6 @@ where
     Ok(())
 }
 
-async fn sign_and_verify_after_explicit_flush(
-    mut verifier: Batch<Verifier, Item>,
-    n: usize,
-) -> Result<(), BoxError> {
-    let mut results = FuturesOrdered::new();
-    for _ in 0..n {
-        let sk = SigningKey::new(thread_rng());
-        let vk_bytes = VerificationKeyBytes::from(&sk);
-        let msg = b"BatchVerifyTest";
-        let sig = sk.sign(&msg[..]);
-
-        verifier.ready().await?;
-        results.push_back(verifier.call((vk_bytes, sig, msg).into()));
-    }
-
-    verifier.flush().await?;
-
-    while let Some(result) = results.next().await {
-        result?;
-    }
-
-    Ok(())
-}
-
 async fn sign_and_verify_after_try_flush(
     mut verifier: Batch<Verifier, Item>,
     n: usize,
@@ -359,35 +335,19 @@ async fn batch_flushes_on_max_latency() -> Result<(), Report> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn batch_flushes_on_explicit_flush() -> Result<(), Report> {
-    use tokio::time::timeout;
-    let _init_guard = zakura_test::init();
-
-    // Use a very high max_items and long max_latency. Without the explicit
-    // flush, this verification would wait for the latency timer.
-    let verifier = Batch::new(Verifier::default(), 100, 10, LONG_BATCH_LATENCY);
-    timeout(
-        Duration::from_secs(1),
-        sign_and_verify_after_explicit_flush(verifier, 10),
-    )
-    .await
-    .map_err(|e| eyre!(e))?
-    .map_err(|e| eyre!(e))?;
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn batch_flush_on_empty_batch_is_noop() -> Result<(), Report> {
+async fn try_flush_on_empty_batch_is_noop() -> Result<(), Report> {
     use tokio::time::timeout;
     let _init_guard = zakura_test::init();
 
     let mut verifier = Batch::new(Verifier::default(), 100, 10, LONG_BATCH_LATENCY);
-    verifier.flush().await.map_err(|e| eyre!(e))?;
+    assert!(
+        verifier.try_flush().map_err(|error| eyre!(error))?,
+        "an empty batch flush must be queued"
+    );
 
     timeout(
         Duration::from_secs(1),
-        sign_and_verify_after_explicit_flush(verifier, 10),
+        sign_and_verify_after_try_flush(verifier, 10),
     )
     .await
     .map_err(|e| eyre!(e))?
@@ -416,16 +376,15 @@ async fn batch_flushes_on_try_flush() -> Result<(), Report> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn batch_flush_uses_existing_readiness_permit() -> Result<(), Report> {
-    use tokio::time::timeout;
+async fn batch_try_flush_uses_existing_readiness_permit() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
     let mut verifier = Batch::new(Verifier::default(), 1, 1, LONG_BATCH_LATENCY);
     verifier.ready().await.map_err(|e| eyre!(e))?;
-    timeout(Duration::from_secs(1), verifier.flush())
-        .await
-        .map_err(|e| eyre!(e))?
-        .map_err(|e| eyre!(e))?;
+    assert!(
+        verifier.try_flush().map_err(|error| eyre!(error))?,
+        "try_flush must reuse an existing readiness permit"
+    );
 
     Ok(())
 }

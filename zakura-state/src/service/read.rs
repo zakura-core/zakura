@@ -19,6 +19,9 @@ pub mod block;
 pub mod difficulty;
 pub mod find;
 pub mod tree;
+mod view;
+
+pub(super) use view::BestChainReadView;
 
 #[cfg(test)]
 mod tests;

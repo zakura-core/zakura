@@ -3279,6 +3279,46 @@ async fn rpc_addnode() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rpc_gettxout_empty_state() {
+    let _init_guard = zakura_test::init();
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (state, read_state, tip, _) = zakura_state::init_test_services(&Mainnet).await;
+    let (block_verifier_router, _, _, _) = zakura_consensus::router::init_test(
+        zakura_consensus::Config::default(),
+        &Mainnet,
+        state.clone(),
+    )
+    .await;
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        state,
+        Buffer::new(read_state, 1),
+        block_verifier_router,
+        MockSyncStatus::default(),
+        tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let missing_txid = zakura_chain::transaction::Hash([0; 32]).encode_hex::<String>();
+    let error = rpc
+        .get_tx_out(missing_txid, 0, Some(false))
+        .await
+        .expect_err("gettxout on an empty state remains an RPC error");
+
+    assert_eq!(error.message(), "No blocks in state");
+    mempool.expect_no_requests().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_gettxout() {
     let _init_guard = zakura_test::init();
 
@@ -3315,9 +3355,16 @@ async fn rpc_gettxout() {
 
     // TODO: Create a mempool test
 
+    let expected_best_block = blocks
+        .last()
+        .expect("test chain has a tip")
+        .hash()
+        .to_string();
+
     // Build a state test for all transactions
     let run_test_case = |_block_idx: usize, _block: Arc<Block>, tx: Arc<Transaction>| {
         let read_state = read_state.clone();
+        let expected_best_block = expected_best_block.clone();
         let txid = tx.hash();
         let hex_txid = txid.encode_hex::<String>();
 
@@ -3328,6 +3375,9 @@ async fn rpc_gettxout() {
             let get_tx_output = response.expect("We should have a GetTxOut struct");
 
             let output_object = get_tx_output.0.unwrap();
+            assert_eq!(output_object.best_block(), &expected_best_block);
+            assert_eq!(output_object.version(), tx.version());
+            assert_eq!(output_object.coinbase(), tx.is_coinbase());
             assert_eq!(
                 output_object.value(),
                 crate::methods::types::zec::Zec::from(tx.outputs()[0].value()).lossy_zec()

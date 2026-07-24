@@ -60,7 +60,10 @@ pub(crate) const PARALLEL_BLOCK_READ_THRESHOLD: usize = 16;
 pub mod prune;
 pub mod rollback;
 pub mod shielded;
+mod snapshot;
 pub mod transparent;
+
+pub(in crate::service) use snapshot::ZakuraDbSnapshot;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 // TODO: when the database is split out of zakura-state, always expose these methods.

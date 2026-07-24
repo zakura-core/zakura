@@ -192,8 +192,16 @@ impl CommitBlockError {
     }
 
     /// Returns a suggested misbehaviour score increment for a certain error.
+    ///
+    /// Callers must only apply this score when the failure is attributable to
+    /// the peer supplying a fully verified block. Checkpoint commit failures
+    /// can depend on auxiliary roots from another peer and must remain
+    /// unscored by checkpoint verification.
     pub fn misbehavior_score(&self) -> u32 {
-        0
+        match self {
+            CommitBlockError::ValidateContextError(error) => error.misbehavior_score(),
+            _ => 0,
+        }
     }
 }
 
@@ -608,6 +616,9 @@ pub enum ValidateContextError {
     #[non_exhaustive]
     NotReadyToBeCommitted,
 
+    #[error("block descends from invalid ancestor {0}")]
+    InvalidAncestorBlock(block::Hash),
+
     #[error(
         "verified-commitment-trees fast path has no valid supplied root for height \
          {height:?}: the note-commitment frontier is frozen, so this block cannot be \
@@ -878,6 +889,48 @@ pub enum ValidateContextError {
 }
 
 impl ValidateContextError {
+    // Keep this match exhaustive so new contextual errors must make an explicit
+    // peer-attribution decision.
+    fn misbehavior_score(&self) -> u32 {
+        match self {
+            ValidateContextError::NonSequentialBlock { .. }
+            | ValidateContextError::TimeTooEarly { .. }
+            | ValidateContextError::TimeTooLate { .. }
+            | ValidateContextError::InvalidDifficultyThreshold { .. }
+            | ValidateContextError::DuplicateTransparentSpend { .. }
+            | ValidateContextError::MissingTransparentOutput { .. }
+            | ValidateContextError::EarlyTransparentSpend { .. }
+            | ValidateContextError::UnshieldedTransparentCoinbaseSpend { .. }
+            | ValidateContextError::ImmatureTransparentCoinbaseSpend { .. }
+            | ValidateContextError::DuplicateSproutNullifier { .. }
+            | ValidateContextError::DuplicateSaplingNullifier { .. }
+            | ValidateContextError::DuplicateOrchardNullifier { .. }
+            | ValidateContextError::DuplicateIronwoodNullifier { .. }
+            | ValidateContextError::NegativeRemainingTransactionValue { .. }
+            | ValidateContextError::CalculateRemainingTransactionValue { .. }
+            | ValidateContextError::CalculateTransactionValueBalances { .. }
+            | ValidateContextError::CalculateBlockChainValueChange { .. }
+            | ValidateContextError::AddValuePool { .. }
+            | ValidateContextError::InvalidBlockCommitment(_)
+            | ValidateContextError::UnknownSproutAnchor { .. }
+            | ValidateContextError::UnknownSaplingAnchor { .. }
+            | ValidateContextError::UnknownOrchardAnchor { .. }
+            | ValidateContextError::UnknownIronwoodAnchor { .. } => 100,
+
+            ValidateContextError::MissingSproutTipTree(_)
+            | ValidateContextError::BlockPreviouslyInvalidated { .. }
+            | ValidateContextError::NotReadyToBeCommitted
+            | ValidateContextError::InvalidAncestorBlock(_)
+            | ValidateContextError::VctSuppliedRootUnavailable { .. }
+            | ValidateContextError::VctSuppliedRootAwaitingSuccessor { .. }
+            | ValidateContextError::VctBlockAuthDataRootMismatch { .. }
+            | ValidateContextError::VctSproutHandoffRootMismatch { .. }
+            | ValidateContextError::OrphanedBlock { .. }
+            | ValidateContextError::NoteCommitmentTreeError(_)
+            | ValidateContextError::HistoryTreeError(_) => 0,
+        }
+    }
+
     /// Returns the missing VCT supplied-root height for retryable root stalls.
     ///
     /// This is the subset of [`Self::vct_retryable_height`] where the supplied root itself is
@@ -949,17 +1002,163 @@ impl DuplicateNullifierError for orchard::Nullifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zakura_chain::block::Height;
+    use zakura_chain::{
+        block::{CommitmentError, Height},
+        parameters::Network,
+        work::difficulty::{ParameterDifficulty, INVALID_COMPACT_DIFFICULTY},
+    };
 
     #[test]
     fn commit_block_error_misbehavior_scores() {
-        let context_err = CommitBlockError::ValidateContextError(Box::new(
+        let block_time = DateTime::from_timestamp(1_000_000, 0)
+            .expect("test timestamp is in the supported range");
+        let height = Height(5);
+        let transaction_hash = transaction::Hash([2; 32]);
+        let outpoint = transparent::OutPoint {
+            hash: transaction_hash,
+            index: 0,
+        };
+        let amount_error = amount::Error::Constraint {
+            value: -1,
+            range: 0..=1,
+        };
+        let value_balance_error = ValueBalanceError::Transparent(amount_error.clone());
+        let orchard_nullifier = orchard::Nullifier::try_from([0; 32])
+            .expect("zero is a canonical Orchard nullifier encoding");
+        let peer_faults = [
             ValidateContextError::NonSequentialBlock {
-                candidate_height: Height(5),
+                candidate_height: height,
                 parent_height: Height(3),
             },
+            ValidateContextError::TimeTooEarly {
+                candidate_time: block_time,
+                median_time_past: block_time,
+            },
+            ValidateContextError::TimeTooLate {
+                candidate_time: block_time,
+                block_time_max: block_time,
+            },
+            ValidateContextError::InvalidDifficultyThreshold {
+                difficulty_threshold: INVALID_COMPACT_DIFFICULTY,
+                expected_difficulty: Network::Mainnet.target_difficulty_limit().to_compact(),
+            },
+            ValidateContextError::DuplicateTransparentSpend {
+                outpoint,
+                location: "test chain",
+            },
+            ValidateContextError::MissingTransparentOutput {
+                outpoint,
+                location: "test chain",
+            },
+            ValidateContextError::EarlyTransparentSpend { outpoint },
+            ValidateContextError::UnshieldedTransparentCoinbaseSpend { outpoint },
+            ValidateContextError::ImmatureTransparentCoinbaseSpend {
+                outpoint,
+                spend_height: height,
+                min_spend_height: Height(100),
+                created_height: Height(1),
+            },
+            ValidateContextError::DuplicateSproutNullifier {
+                nullifier: sprout::Nullifier::from([0; 32]),
+                in_finalized_state: false,
+            },
+            ValidateContextError::DuplicateSaplingNullifier {
+                nullifier: sapling::Nullifier::from([0; 32]),
+                in_finalized_state: false,
+            },
+            ValidateContextError::DuplicateOrchardNullifier {
+                nullifier: orchard_nullifier,
+                in_finalized_state: false,
+            },
+            ValidateContextError::DuplicateIronwoodNullifier {
+                nullifier: orchard_nullifier,
+                in_finalized_state: false,
+            },
+            ValidateContextError::NegativeRemainingTransactionValue {
+                amount_error: amount_error.clone(),
+                height,
+                tx_index_in_block: 1,
+                transaction_hash,
+            },
+            ValidateContextError::CalculateRemainingTransactionValue {
+                amount_error,
+                height,
+                tx_index_in_block: 1,
+                transaction_hash,
+            },
+            ValidateContextError::CalculateTransactionValueBalances {
+                value_balance_error: value_balance_error.clone(),
+                height,
+                tx_index_in_block: 1,
+                transaction_hash,
+            },
+            ValidateContextError::CalculateBlockChainValueChange {
+                value_balance_error: value_balance_error.clone(),
+                height,
+                block_hash: block::Hash([3; 32]),
+                transaction_count: 2,
+                spent_utxo_count: 1,
+            },
+            ValidateContextError::AddValuePool {
+                value_balance_error,
+                chain_value_pools: Box::new(ValueBalance::<NonNegative>::zero()),
+                block_value_pool_change: Box::new(ValueBalance::<NegativeAllowed>::zero()),
+                height: Some(height),
+            },
+            ValidateContextError::InvalidBlockCommitment(
+                CommitmentError::InvalidChainHistoryActivationReserved { actual: [1; 32] },
+            ),
+            ValidateContextError::UnknownSproutAnchor {
+                anchor: sprout::tree::Root::default(),
+                height: Some(height),
+                tx_index_in_block: Some(1),
+                transaction_hash,
+            },
+            ValidateContextError::UnknownSaplingAnchor {
+                anchor: sapling::tree::Root::default(),
+                height: Some(height),
+                tx_index_in_block: Some(1),
+                transaction_hash,
+            },
+            ValidateContextError::UnknownOrchardAnchor {
+                anchor: orchard::tree::Root::default(),
+                height: Some(height),
+                tx_index_in_block: Some(1),
+                transaction_hash,
+            },
+            ValidateContextError::UnknownIronwoodAnchor {
+                anchor: ironwood::tree::Root::default(),
+                height: Some(height),
+                tx_index_in_block: Some(1),
+                transaction_hash,
+            },
+        ];
+
+        for error in peer_faults {
+            let commit_error = CommitBlockError::ValidateContextError(Box::new(error));
+            assert_eq!(
+                commit_error.misbehavior_score(),
+                100,
+                "direct contextual consensus failure must be scored: {commit_error:?}"
+            );
+        }
+
+        let transient_context_error = CommitBlockError::ValidateContextError(Box::new(
+            ValidateContextError::NotReadyToBeCommitted,
         ));
-        assert_eq!(context_err.misbehavior_score(), 0);
+        assert_eq!(transient_context_error.misbehavior_score(), 0);
+
+        let invalid_ancestor_error = CommitBlockError::ValidateContextError(Box::new(
+            ValidateContextError::InvalidAncestorBlock(block::Hash([1; 32])),
+        ));
+        assert_eq!(invalid_ancestor_error.misbehavior_score(), 0);
+
+        let stale_fork_error =
+            CommitBlockError::ValidateContextError(Box::new(ValidateContextError::OrphanedBlock {
+                candidate_height: Height(3),
+                finalized_tip_height: height,
+            }));
+        assert_eq!(stale_fork_error.misbehavior_score(), 0);
 
         let dup_err = CommitBlockError::Duplicate {
             hash_or_height: None,

@@ -1360,24 +1360,20 @@ fn startup_rejects_anchor_above_verified_block_tip() {
 }
 
 #[test]
-fn startup_uses_verified_block_tip_when_stored_header_tip_is_stale() {
+fn startup_uses_stored_header_tip_when_verified_body_is_ahead() {
     let network = regtest_network();
-    let verified_tip = block::Height(5);
-    let verified_hash = block::Hash([5; 32]);
+    let durable_tip = (block::Height(3), block::Hash([3; 32]));
     let mut startup = startup_for(
         network.clone(),
         (block::Height(0), network.genesis_hash()),
-        Some((block::Height(3), block::Hash([3; 32]))),
+        Some(durable_tip),
     );
-    startup.frontiers.verified_block_tip = verified_tip;
-    startup.frontiers.verified_block_hash = verified_hash;
+    startup.frontiers.verified_block_tip = block::Height(5);
+    startup.frontiers.verified_block_hash = block::Hash([5; 32]);
 
     let state = HeaderSyncCore::new(&startup).expect("forward-only startup is coherent");
 
-    assert_eq!(
-        (state.best_header_tip, state.best_header_hash),
-        (verified_tip, verified_hash)
-    );
+    assert_eq!((state.best_header_tip, state.best_header_hash), durable_tip);
 }
 
 #[test]
@@ -4382,28 +4378,6 @@ async fn reactor_starts_from_storage_frontiers_and_publishes_watch() {
 
     assert_eq!(fixture.handle.best_header_tip(), best);
     assert_eq!(*fixture.handle.subscribe_tip().borrow(), best);
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn reactor_starts_from_durable_header_tip_when_verified_body_is_ahead() {
-    let network = regtest_network();
-    let durable = (block::Height(4), block::Hash([4; 32]));
-    let startup = HeaderSyncStartup::new(
-        network.clone(),
-        (block::Height(0), network.genesis_hash()),
-        HeaderSyncFrontiers {
-            finalized_height: block::Height(2),
-            verified_block_tip: block::Height(5),
-            verified_block_hash: block::Hash([5; 32]),
-        },
-        Some(durable),
-        ZakuraHeaderSyncConfig::default(),
-        LOCAL_MAX_MESSAGE_BYTES,
-    );
-    let fixture = spawn_test_reactor(startup);
-
-    assert_eq!(fixture.handle.best_header_tip(), durable);
-    assert_eq!(*fixture.handle.subscribe_tip().borrow(), durable);
 }
 
 #[tokio::test(flavor = "current_thread")]

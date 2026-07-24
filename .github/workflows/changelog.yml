@@ -54,5 +54,6 @@ jobs:
         if: github.event_name != 'pull_request'
         run: ./scripts/changelog.py check
 
-      - name: Run changelog tool tests
-        run: python3 -m unittest discover -s scripts/tests -p 'test_changelog.py'
+      - name: Run scripts/tests unit tests
+        # covers the changelog tool and the bench digest helper (both stdlib-only)
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'

@@ -56,6 +56,7 @@ Deploys are manual, SSH-based, and run from self-hosted deployer runners; there 
 - **`zakura-pr-node-bake.yml`** — weekly bake of the golden PR-node droplet image (build deps, warm cargo cache) and per-network chain-state volume snapshots.
 - **`zakura-pr-node-reaper.yml`** — hourly TTL cleanup backstop for PR-node droplets, volumes, images, and snapshots.
 - **`checkpoint-sync-bench.yml`** — manual checkpoint-zone sync benchmark on the `zakura-bench` self-hosted runner, with a persistent metrics dashboard. See the workflow header for one-time runner setup.
+- **`zakura-perf-bench.yml`** — CPU-profiled mainnet sync bench on ephemeral droplets: boots one droplet per ref from the baked PR-node image with a `sandblast` state-volume clone, syncs forward while capturing a sampled flamegraph, JSONL traces, a bottleneck verdict, and block-latency digests; an optional baseline ref runs in parallel on an identical droplet with an A/B compare (speedup, CPU self-share diff, differential flamegraph). Weekly scheduled runs keep profiled baselines of `main` in checkpoint and semantic verify modes (see `docs/cpu-profiling.md`).
 
 These workflows use the helper scripts in `.github/workflows/scripts/` (`pr-node-bake.sh`, `pr-node-run.sh`, `pr-node-monitor.py`).
 

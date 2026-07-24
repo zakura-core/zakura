@@ -570,7 +570,7 @@ where
 
             tracing::trace!(?tx_id, "got state UTXOs");
 
-            let mut async_checks = match tx.as_ref() {
+            let async_checks = match tx.as_ref() {
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
                     tracing::debug!(?tx, "got transaction with wrong version");
                     return Err(TransactionError::WrongVersion);
@@ -604,21 +604,19 @@ where
             };
 
             if let Some(unmined_tx) = mempool_transaction {
-                let check_anchors_and_revealed_nullifiers_query = state
+                // Await this contextual check before polling `async_checks`, because dropping an
+                // async verifier future does not cancel Rayon work it has already queued.
+                let response = state
                     .clone()
                     .oneshot(zs::Request::CheckBestChainTipNullifiersAndAnchors(
                         unmined_tx,
                     ))
-                    .map(|res| {
-                        assert!(
-                            res? == zs::Response::ValidBestChainTipNullifiersAndAnchors,
-                            "unexpected response to CheckBestChainTipNullifiersAndAnchors request"
-                        );
-                        Ok(())
-                    }
-                    );
+                    .await?;
 
-                async_checks.push(check_anchors_and_revealed_nullifiers_query);
+                assert!(
+                    response == zs::Response::ValidBestChainTipNullifiersAndAnchors,
+                    "unexpected response to CheckBestChainTipNullifiersAndAnchors request"
+                );
             }
 
             tracing::trace!(?tx_id, "awaiting async checks...");

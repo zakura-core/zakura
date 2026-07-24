@@ -108,12 +108,8 @@ impl AddressBookIndex {
         self.by_addr.get(addr).copied()
     }
 
-    fn insert(&mut self, addr: PeerSocketAddr, meta_addr: MetaAddr) -> Option<MetaAddr> {
-        assert_eq!(
-            addr, meta_addr.addr,
-            "address book key must match its peer metadata"
-        );
-
+    fn insert(&mut self, meta_addr: MetaAddr) {
+        let addr = meta_addr.addr;
         let previous = self.by_addr.insert(addr, meta_addr);
         if let Some(previous) = previous {
             assert!(
@@ -131,8 +127,6 @@ impl AddressBookIndex {
             self.by_priority.insert(meta_addr),
             "new peer metadata must be unique in the priority index"
         );
-
-        previous
     }
 
     fn remove(&mut self, addr: &PeerSocketAddr) -> Option<MetaAddr> {
@@ -144,10 +138,9 @@ impl AddressBookIndex {
         );
 
         let remove_ip = {
-            let same_ip_addrs = self
-                .by_ip
-                .get_mut(&addr.ip())
-                .expect("removed peer IP must exist in the IP index");
+            let Some(same_ip_addrs) = self.by_ip.get_mut(&addr.ip()) else {
+                panic!("removed peer IP must exist in the IP index");
+            };
             assert!(
                 same_ip_addrs.remove(addr),
                 "removed peer must exist in the IP index"
@@ -161,26 +154,22 @@ impl AddressBookIndex {
         Some(removed)
     }
 
-    fn remove_ip(&mut self, ip: IpAddr) -> Vec<MetaAddr> {
+    fn remove_ip(&mut self, ip: IpAddr) {
         let ip = canonical_ip(ip);
         let Some(addrs) = self.by_ip.remove(&ip) else {
-            return Vec::new();
+            return;
         };
 
-        addrs
-            .into_iter()
-            .map(|addr| {
-                let removed = self
-                    .by_addr
-                    .remove(&addr)
-                    .expect("IP index peer must exist in the address index");
-                assert!(
-                    self.by_priority.remove(&removed),
-                    "IP index peer must exist in the priority index"
-                );
-                removed
-            })
-            .collect()
+        for addr in addrs {
+            let removed = self
+                .by_addr
+                .remove(&addr)
+                .expect("IP index peer must exist in the address index");
+            assert!(
+                self.by_priority.remove(&removed),
+                "IP index peer must exist in the priority index"
+            );
+        }
     }
 
     fn ordered_values(&self) -> impl DoubleEndedIterator<Item = &MetaAddr> {
@@ -192,7 +181,7 @@ impl AddressBookIndex {
         assert_eq!(self.by_addr.len(), self.by_priority.len());
         assert_eq!(
             self.by_addr.len(),
-            self.by_ip.values().map(HashSet::len).sum()
+            self.by_ip.values().map(HashSet::len).sum::<usize>()
         );
 
         for (addr, meta_addr) in &self.by_addr {
@@ -437,7 +426,7 @@ impl AddressBook {
 
         for (socket_addr, meta_addr) in addrs {
             // overwrite any duplicate addresses
-            new_book.peers.insert(socket_addr, meta_addr);
+            new_book.peers.insert(meta_addr);
             // Add the address to `most_recent_by_ip` if it has responded
             if new_book.should_update_most_recent_by_ip(meta_addr) {
                 new_book
@@ -513,7 +502,7 @@ impl AddressBook {
         // to replace any self-connection failures. The address book and change
         // constructors make sure that the SocketAddr is canonical.
         let local_listener = self.local_listener_meta_addr(now);
-        peers.insert(local_listener.addr, local_listener);
+        peers.insert(local_listener);
 
         // Then sanitize and shuffle
         let mut peers: Vec<MetaAddr> = peers
@@ -709,7 +698,7 @@ impl AddressBook {
                 return None;
             }
 
-            self.peers.insert(updated.addr, updated);
+            self.peers.insert(updated);
 
             // Add the address to `most_recent_by_ip` if it sent the most recent
             // response Zebra has received from this IP.

@@ -1192,21 +1192,29 @@ where
             } else {
                 result.expect("commit_checkpoint_verified should not panic")
             };
-            if result.is_err() {
-                // If there was an error committing the block, then this verifier
-                // will be out of sync with the state. In that case, reset
-                // its progress back to the state tip.
-                let tip = match state_service
-                    .oneshot(zs::Request::Tip)
-                    .await
-                    .map_err(VerifyCheckpointError::Tip)?
+            // Only reset on real commit/state desyncs. Duplicate / NewerRequest
+            // failures are expected when sync resubmits in-queue bodies; resetting
+            // for them rewinds progress behind the already-verified checkpoint and
+            // leaves a permanent queue gap for the next range.
+            if let Err(error) = &result {
+                if !error.is_duplicate_request()
+                    && !matches!(
+                        error,
+                        VerifyCheckpointError::ShuttingDown | VerifyCheckpointError::Dropped
+                    )
                 {
-                    zs::Response::Tip(tip) => tip,
-                    _ => unreachable!("wrong response for Tip"),
-                };
-                // Ignore errors since send() can fail only when the verifier
-                // is being dropped, and then it doesn't matter anymore.
-                let _ = reset_sender.send(tip);
+                    let tip = match state_service
+                        .oneshot(zs::Request::Tip)
+                        .await
+                        .map_err(VerifyCheckpointError::Tip)?
+                    {
+                        zs::Response::Tip(tip) => tip,
+                        _ => unreachable!("wrong response for Tip"),
+                    };
+                    // Ignore errors since send() can fail only when the verifier
+                    // is being dropped, and then it doesn't matter anymore.
+                    let _ = reset_sender.send(tip);
+                }
             }
             result
         }

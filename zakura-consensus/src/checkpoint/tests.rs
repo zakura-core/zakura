@@ -870,6 +870,162 @@ async fn hard_coded_mainnet() -> Result<(), Report> {
     Ok(())
 }
 
+/// Regression: a superseded in-queue duplicate (`NewerRequest`) must not rewind
+/// checkpoint progress after the current range has already verified.
+///
+/// Production failure mode (temp-zakura-sync-test-1 @ 494086):
+/// block sync resubmits bodies still sitting in the checkpoint queue. The older
+/// request fails with `NewerRequest`, and today's error path treats that as a
+/// state desync and `reset_progress`es to the live tip. Those resets sit on the
+/// verifier's `mpsc` and are applied on a later `call()`, after
+/// `PreviousCheckpoint` has already advanced — opening a permanent queue gap so
+/// the next checkpoint range never verifies.
+///
+/// Expected correct behavior: after range `(3, 6]` verifies, a late
+/// `NewerRequest` must leave progress at `PreviousCheckpoint(6)` so `(6, 10]`
+/// can still complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn newer_request_must_not_rewind_verified_checkpoint_progress() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    let blockchain: Vec<_> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .iter()
+        .map(|(height, bytes)| {
+            let block = Arc::<Block>::zcash_deserialize(*bytes).expect("block deserializes");
+            let hash = block.hash();
+            let coinbase_height = block.coinbase_height().expect("coinbase height");
+            assert_eq!(*height, coinbase_height.0);
+            (block, coinbase_height, hash)
+        })
+        .collect();
+    assert!(
+        blockchain.len() > 10,
+        "continuous mainnet vectors must cover heights 0..=10"
+    );
+
+    // Three checkpoint gaps: (.., 3], (3, 6], (6, 10].
+    let checkpoint_list: BTreeMap<block::Height, block::Hash> = [0usize, 3, 6, 10]
+        .into_iter()
+        .map(|index| {
+            let (_block, height, hash) = &blockchain[index];
+            (*height, *hash)
+        })
+        .collect();
+
+    let state_service = zakura_state::init_test(&Mainnet).await;
+    let mut checkpoint_verifier =
+        CheckpointVerifier::from_list(checkpoint_list, &Mainnet, None, state_service)
+            .map_err(|e| eyre!(e))?;
+
+    // Verify through the first post-genesis checkpoint and wait for commits so
+    // the state tip sits at height 3 before the buggy reset path runs.
+    let mut first_range = FuturesUnordered::new();
+    for (block, _height, _hash) in &blockchain[..=3] {
+        let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
+        first_range.push(ready.call(block.clone()));
+    }
+    timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), async {
+        while let Some(result) = first_range.next().await {
+            result.map_err(|e| eyre!(e))?;
+        }
+        Ok::<_, Report>(())
+    })
+    .await
+    .expect("first-range verify should not time out")?;
+    assert_eq!(
+        checkpoint_verifier.previous_checkpoint_height(),
+        PreviousCheckpoint(block::Height(3))
+    );
+
+    let block4 = blockchain[4].0.clone();
+    let block5 = blockchain[5].0.clone();
+    let block6 = blockchain[6].0.clone();
+
+    // Keep the first height-4 future pending so we can drive its NewerRequest
+    // error (and the resulting reset) after the range has verified.
+    let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
+    let superseded_height_4 = ready.call(block4.clone());
+
+    let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
+    let height_5 = ready.call(block5);
+
+    // Resubmit height 4 while it is still queued: replaces the older request
+    // with NewerRequest on the superseded oneshot.
+    let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
+    let replacement_height_4 = ready.call(block4);
+
+    // Completing the continuous chain verifies (3, 6] and advances progress.
+    let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
+    let height_6 = ready.call(block6);
+    assert_eq!(
+        checkpoint_verifier.previous_checkpoint_height(),
+        PreviousCheckpoint(block::Height(6)),
+        "range (3, 6] should verify before the superseded future is polled"
+    );
+
+    // Drive the superseded future now. Current code sends reset_progress(tip)
+    // for NewerRequest even though the range already verified.
+    let superseded_result = timeout(
+        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+        superseded_height_4,
+    )
+    .await
+    .expect("superseded verify should not time out");
+    let superseded_err = superseded_result.expect_err(
+        "replaced in-queue duplicate must fail the older request with NewerRequest",
+    );
+    assert!(
+        superseded_err.is_duplicate_request(),
+        "expected NewerRequest-classified duplicate, got {superseded_err:?}"
+    );
+
+    // The next call applies any queued reset. Correct behavior keeps progress
+    // at PreviousCheckpoint(6) so the following range can still form.
+    let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
+    let height_7 = ready.call(blockchain[7].0.clone());
+
+    assert_eq!(
+        checkpoint_verifier.previous_checkpoint_height(),
+        PreviousCheckpoint(block::Height(6)),
+        "NewerRequest must not rewind progress below the already-verified checkpoint"
+    );
+
+    // Finish the final range; this is what production could no longer do after
+    // the rewind left a permanent queue gap.
+    let mut final_range = FuturesUnordered::new();
+    final_range.push(height_7);
+    for (block, _height, _hash) in &blockchain[8..=10] {
+        let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
+        final_range.push(ready.call(block.clone()));
+    }
+    // The replacement height-4 / 5 / 6 commits from the prior range should also
+    // succeed; poll them alongside the final range.
+    final_range.push(replacement_height_4);
+    final_range.push(height_5);
+    final_range.push(height_6);
+
+    timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), async {
+        while let Some(result) = final_range.next().await {
+            result.map_err(|e| eyre!(e))?;
+        }
+        Ok::<_, Report>(())
+    })
+    .await
+    .expect("post-checkpoint verifies should not time out")?;
+
+    assert_eq!(
+        checkpoint_verifier.previous_checkpoint_height(),
+        FinalCheckpoint,
+        "final checkpoint range must still be reachable after a NewerRequest"
+    );
+    assert_eq!(
+        checkpoint_verifier.target_checkpoint_height(),
+        FinishedVerifying
+    );
+
+    Ok(())
+}
+
 /// Duplicate block errors must stay classified as duplicate requests after the
 /// state wraps them, so they don't restart the syncer during checkpoint sync.
 #[test]

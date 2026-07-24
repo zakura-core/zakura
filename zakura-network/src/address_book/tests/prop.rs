@@ -38,6 +38,7 @@ proptest! {
             Span::none(),
             addresses
         );
+        address_book.peers.assert_consistent();
 
         // Only recently reachable are sanitized
         let sanitized = address_book.sanitized(chrono_now);
@@ -77,6 +78,7 @@ proptest! {
             Span::none(),
             addresses
         );
+        address_book.peers.assert_consistent();
 
         for peer in address_book.reconnection_peers(instant_now, chrono_now) {
             prop_assert!(peer.is_probably_reachable(chrono_now), "peer: {:?}", peer);
@@ -120,6 +122,7 @@ proptest! {
         for (_addr, changes) in addr_changes_lists.iter() {
             for change in changes {
                 address_book.update(*change);
+                address_book.peers.assert_consistent();
 
                 prop_assert!(
                     address_book.len() <= addr_limit,
@@ -144,6 +147,7 @@ proptest! {
             for (_addr, changes) in addr_changes_lists.iter() {
                 if let Some(change) = changes.get(index) {
                     address_book.update(*change);
+                    address_book.peers.assert_consistent();
 
                     prop_assert!(
                         address_book.len() <= addr_limit,

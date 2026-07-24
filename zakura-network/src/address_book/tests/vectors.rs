@@ -82,7 +82,7 @@ fn misbehavior_ban_does_not_panic_with_max_connections_per_ip_above_one() {
         AddressBook::new("0.0.0.0:0".parse().unwrap(), &Mainnet, 2, Span::current());
 
     // Seed two entries on the soon-to-be-banned IP plus an unrelated entry,
-    // so the ban path's `by_addr` cleanup loop has visible work to do.
+    // so the ban path's per-IP cleanup has visible work to do.
     address_book.update(gossiped_change(
         banned_addr,
         PeerServices::NODE_NETWORK,
@@ -116,6 +116,10 @@ fn misbehavior_ban_does_not_panic_with_max_connections_per_ip_above_one() {
     assert!(
         address_book.get(banned_addr).is_none(),
         "primary banned address should be removed from the address book"
+    );
+    assert!(
+        address_book.get(other_port_same_ip).is_none(),
+        "all addresses on the banned IP should be removed from the address book"
     );
     assert!(
         address_book.get(unrelated_addr).is_some(),

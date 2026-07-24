@@ -76,6 +76,15 @@ fn address_book(c: &mut Criterion) {
         let existing_addr = peer_addr(SAME_IP_ADDRESS_COUNT - 1);
         let new_addr = unique_ip_addr(size);
 
+        let mut update_check = address_book.clone();
+        let update_change = MetaAddr::new_misbehavior(existing_addr, 1);
+        assert!(update_check.update(update_change).is_some());
+
+        let mut insert_check = address_book.clone();
+        let insert_change = MetaAddr::new_initial_peer(new_addr);
+        assert!(insert_check.update(insert_change).is_some());
+        assert_eq!(insert_check.len(), size);
+
         let mut ban_check = address_book.clone();
         let ban_change = MetaAddr::new_misbehavior(existing_addr, MAX_PEER_MISBEHAVIOR_SCORE);
         assert!(ban_check.update(ban_change).is_none());
@@ -114,7 +123,7 @@ fn address_book(c: &mut Criterion) {
                 b.iter_batched_ref(
                     || address_book.clone(),
                     |address_book| {
-                        let change = MetaAddr::new_responded(black_box(existing_addr), None);
+                        let change = MetaAddr::new_misbehavior(black_box(existing_addr), 1);
                         black_box(address_book.update(change))
                     },
                     BatchSize::PerIteration,

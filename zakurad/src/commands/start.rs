@@ -1579,7 +1579,7 @@ mod zakura_header_sync_driver_tests {
         body_sizes_for_served_header_range, chain_tip_mirror_frontier_change,
         coalesce_ready_needed_block_queries, coalesce_stale_needed_block_queries,
         commit_block_sync_body, drive_block_sync_actions, drive_zakura_header_sync_actions,
-        header_range_commit_error_label, header_range_commit_failure_kind,
+        durable_header_matches, header_range_commit_error_label, header_range_commit_failure_kind,
         notify_block_sync_header_tip, query_block_sync_frontiers, query_block_sync_needed_blocks,
         tree_aux_roots_for_served_header_range, verified_block_tip_from_state, BlockApplyClass,
         BlocksyncThroughputProbe, ZakuraHeaderSyncDriverHandles,
@@ -1791,6 +1791,51 @@ mod zakura_header_sync_driver_tests {
             header_range_commit_failure_kind(&error),
             HeaderSyncCommitFailureKind::Local
         );
+    }
+
+    #[test]
+    fn unknown_anchor_is_local_header_sync_commit_failure() {
+        let error = zakura_state::CommitHeaderRangeError::UnknownAnchor {
+            anchor: block::Hash([0; 32]),
+        };
+
+        assert_eq!(
+            header_range_commit_failure_kind(&error),
+            HeaderSyncCommitFailureKind::Local
+        );
+    }
+
+    #[tokio::test]
+    async fn full_block_notification_requires_a_durable_header_anchor() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let height = block
+            .coinbase_height()
+            .expect("the mainnet block fixture has a height");
+        let hash = block.hash();
+
+        let missing = service_fn(|request: zakura_state::ReadRequest| async move {
+            assert!(matches!(
+                request,
+                zakura_state::ReadRequest::HeadersByHeightRange { count: 1, .. }
+            ));
+            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::Headers(Vec::new()))
+        });
+        assert!(!durable_header_matches(missing, height, hash).await);
+
+        let header = block.header.clone();
+        let durable = service_fn(move |request: zakura_state::ReadRequest| {
+            let header = header.clone();
+            async move {
+                assert!(matches!(
+                    request,
+                    zakura_state::ReadRequest::HeadersByHeightRange { count: 1, .. }
+                ));
+                Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::Headers(vec![(
+                    height, hash, header,
+                )]))
+            }
+        });
+        assert!(durable_header_matches(durable, height, hash).await);
     }
 
     #[test]

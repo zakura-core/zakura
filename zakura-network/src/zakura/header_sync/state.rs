@@ -387,6 +387,13 @@ impl HeaderSyncCore {
                     || *buffered_start != start
                     || buffered.range.count() != 1
             });
+        // Recovery can succeed, then become obsolete when the body catches the
+        // frontier before the driver completion reaches the reactor. Once that
+        // completion is observed, release the operation even if the witness watch
+        // has already moved back to `None`.
+        self.clear_inflight_root_auth_where(true, |pending| {
+            pending.completion_observed && pending.range.count() == 1
+        });
     }
 
     fn root_auth_fallback_end(

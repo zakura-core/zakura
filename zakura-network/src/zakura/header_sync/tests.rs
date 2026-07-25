@@ -808,6 +808,74 @@ fn root_auth_does_not_repeat_or_fetch_unneeded_terminal_witness() {
 }
 
 #[test]
+fn unneeded_witness_recovery_settles_after_driver_completion() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let best = (block::Height(5), block::Hash([5; 32]));
+    let mut startup = startup_for(network, anchor, Some(best));
+    let auth = HeaderRootAuthState {
+        authenticated_height: block::Height(4),
+        authenticated_hash: block::Hash([4; 32]),
+        completed_checkpoint_height: best.0,
+        completed_checkpoint_hash: best.1,
+        header_witness: None,
+    };
+    startup.header_root_auth = Some(auth);
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
+    state.verified_block_tip = auth.authenticated_height;
+
+    let range = RangeRequest {
+        range: CheckedHeaderRange::from_count(best.0, 1)
+            .expect("one-record recovery range is valid"),
+        anchor_hash: Some(auth.authenticated_hash),
+        finalized: true,
+        want_tree_aux_roots: true,
+        priority: RangePriority::AuthenticateRoots,
+    };
+    let operation = HeaderSyncOperationIdentity {
+        wire_request: HeaderSyncWireRequestIdentity {
+            peer: peer(254),
+            session_id: 1,
+            request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+        },
+        op_kind: HeaderSyncOperationKind::AuthenticateRoots,
+    };
+    state.schedule.mark_authenticating(operation.clone(), range);
+    state.pending_operations.insert(
+        operation.clone(),
+        PendingOperation {
+            range,
+            purpose: RangePurpose::AuthenticateRoots,
+            retention_candidate: None,
+            root_auth: Some(PendingRootAuth {
+                source: RootAuthSource::Fallback,
+                expected: auth,
+            }),
+            completion_observed: false,
+        },
+    );
+
+    state.suppress_unneeded_witness_recovery();
+    assert!(
+        state.pending_operations.contains_key(&operation),
+        "body catch-up must not release the state operation before its driver completion"
+    );
+
+    state
+        .pending_operations
+        .get_mut(&operation)
+        .expect("recovery remains pending until driver completion")
+        .completion_observed = true;
+    state.suppress_unneeded_witness_recovery();
+
+    assert!(
+        !state.pending_operations.contains_key(&operation),
+        "an obsolete completed recovery must not block later root authentication"
+    );
+    assert!(state.schedule.state(range).is_none());
+}
+
+#[test]
 fn witness_recovery_completion_waits_for_whichever_signal_arrives_second() {
     let witness = HeaderWitnessState {
         height: block::Height(5),

@@ -45,7 +45,7 @@ Interpretation notes:
 
 ## Knobs
 
-Workflow inputs cover the common cases; the droplet-side script (`.github/workflows/scripts/perf-bench-run.sh`) documents the finer-grained profiling and live-head gate knobs.
+Workflow inputs cover the common cases; the droplet-side script (`.github/workflows/scripts/perf-bench-run.sh`) documents the finer-grained profiling and live-head gate knobs. The A/B summary table is rendered by `.github/workflows/scripts/perf-bench-compare.py`, which also decides whether the legs are comparable at all (a leg whose `zakurad` exited non-zero, or produced no readable `meta.json`, suppresses the comparison and the CPU diff).
 
 ## Local profiling recipes
 

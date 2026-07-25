@@ -105,7 +105,6 @@ runs:
       run: |
         set -euo pipefail
         VOLUME_ARGS=()
-        VOLUME_ID=""
         if [ -n "${VOL_SNAP_ID}" ]; then
           # A snapshot restore cannot shrink, so the clone takes the snapshot's
           # own minimum disk size.
@@ -114,6 +113,13 @@ runs:
             --region "${REGION}" --snapshot "${VOL_SNAP_ID}" --size "${SIZE}GiB" \
             --format ID --no-header)
           VOLUME_ARGS=(--volumes "${VOLUME_ID}")
+          # Publish the volume before creating the droplet: a droplet create
+          # that fails (no capacity, size smaller than the image disk) would
+          # otherwise strand a volume the caller's teardown never learns about.
+          {
+            echo "volume_id=${VOLUME_ID}"
+            echo "volume_name=${VOLUME_NAME}"
+          } >> "$GITHUB_OUTPUT"
         fi
         doctl compute droplet create "${NAME}" \
           --region "${REGION}" \
@@ -126,6 +132,4 @@ runs:
         {
           echo "id=$(awk '{print $1}' /tmp/droplet.txt)"
           echo "ip=$(awk '{print $2}' /tmp/droplet.txt)"
-          echo "volume_id=${VOLUME_ID}"
-          echo "volume_name=${VOLUME_ID:+${VOLUME_NAME}}"
         } >> "$GITHUB_OUTPUT"

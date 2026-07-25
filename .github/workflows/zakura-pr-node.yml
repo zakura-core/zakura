@@ -260,4 +260,7 @@ jobs:
           droplet_id: ${{ steps.droplet.outputs.id }}
           volume_ids: ${{ steps.droplet.outputs.volume_id }}
           # A droplet we can never SSH into is useless to keep for inspection.
-          enabled: ${{ (inputs.teardown_after_run || steps.sshwait.outcome == 'failure') && 'true' || 'false' }}
+          # string-compare the input: it is null under any non-dispatch trigger,
+          # and `null || ...` would quietly resolve to "keep" (this workflow's
+          # default) rather than to an explicit decision.
+          enabled: ${{ (format('{0}', inputs.teardown_after_run) == 'true' || steps.sshwait.outcome == 'failure') && 'true' || 'false' }}

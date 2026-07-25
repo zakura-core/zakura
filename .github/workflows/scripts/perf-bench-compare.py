@@ -18,11 +18,20 @@ import sys
 
 
 def load_meta(path: str) -> dict | None:
-    """Return a leg's meta.json, or None when the leg produced none."""
+    """Return a leg's meta.json, or None when there is no usable one.
+
+    The producer tolerates a failed meta write (perf-bench-run.sh logs a
+    warning and carries on), and json.dump truncates before it writes, so an
+    empty or half-written file is a real outcome -- treat it like an absent
+    one instead of failing the compare job with a traceback.
+    """
     try:
         with open(path, encoding="utf-8") as meta_file:
             return json.load(meta_file)
     except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as err:
+        print(f"{path}: unusable meta.json ({err})", file=sys.stderr)
         return None
 
 
@@ -39,7 +48,8 @@ def render(primary: dict | None, baseline: dict | None) -> tuple[str, bool]:
     if failed:
         return f"No comparison: zakurad failed in {', '.join(failed)}.", False
 
-    # A zero-throughput baseline is a broken run, not a division to report.
+    # A zero-throughput baseline has no meaningful ratio; report it as nan
+    # rather than crashing, and let the blocks/s column show what happened.
     speedup = primary["bps"] / baseline["bps"] if baseline["bps"] else float("nan")
     lines = [
         "## A/B result",
@@ -67,12 +77,15 @@ def main(argv: list[str]) -> int:
         return 2
 
     markdown, comparable = render(load_meta(argv[1]), load_meta(argv[2]))
-    print(markdown)
 
+    # Flag first: if printing the summary fails, the caller must still see a
+    # decision rather than silently skipping the CPU diff.
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         with open(github_output, "a", encoding="utf-8") as out:
             out.write(f"compare={'true' if comparable else 'false'}\n")
+
+    print(markdown)
     return 0
 
 

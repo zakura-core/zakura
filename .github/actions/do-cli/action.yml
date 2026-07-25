@@ -10,7 +10,7 @@ inputs:
     required: false
     default: ""
   ssh_key_path:
-    description: "Where to write the SSH private key"
+    description: "Where to write the SSH private key. Calling workflows hardcode /tmp/do_ssh in their own scp/ssh steps, so overriding this means overriding do-wait-ssh and those steps too."
     required: false
     default: "/tmp/do_ssh"
   version:

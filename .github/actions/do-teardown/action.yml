@@ -29,7 +29,7 @@ runs:
       run: |
         set +e
         if [ "${ENABLED}" != "true" ]; then
-          echo "Teardown skipped; the reaper deletes these resources within 24h of creation."
+          echo "Teardown skipped; droplet ${DROPLET_ID:-none} and volumes ${VOLUME_IDS:-none} kept for inspection (the reaper deletes them within 24h of creation)."
           exit 0
         fi
         if [ -n "${DROPLET_ID}" ]; then
@@ -41,9 +41,12 @@ runs:
         # Volumes detach asynchronously after the droplet delete, so the first
         # few attempts are expected to fail while the detach settles.
         for VOL_ID in ${VOLUME_IDS}; do
+          DELETED=""
           for _ in $(seq 1 12); do
-            doctl compute volume delete "${VOL_ID}" -f && break
+            doctl compute volume delete "${VOL_ID}" -f && { DELETED=1; break; }
             sleep 10
           done
+          # Say so explicitly: this line is what a leak audit greps for.
+          [ -n "${DELETED}" ] || echo "volume ${VOL_ID} still attached; the reaper will remove it" >&2
         done
         true

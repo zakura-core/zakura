@@ -33,15 +33,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # Only for the local composite action below; the reap steps need no
+      # repository content.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # API-only job: no SSH key needed.
       - name: Install doctl
-        env:
-          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-        run: |
-          set -euo pipefail
-          DOCTL_VERSION=1.120.0
-          curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
-          sudo install /tmp/doctl /usr/local/bin/doctl
-          doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
+        uses: ./.github/actions/do-cli
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
       - name: Reap expired droplets
         env:

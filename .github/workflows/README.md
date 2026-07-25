@@ -58,7 +58,16 @@ Deploys are manual, SSH-based, and run from self-hosted deployer runners; there 
 - **`checkpoint-sync-bench.yml`** — manual fixed-height sync benchmark with checkpoint or semantic verification on the `zakura-bench` self-hosted runner, with a persistent metrics dashboard. See the workflow header for one-time runner setup.
 - **`zakura-perf-bench.yml`** — CPU profiles mainnet workloads on ephemeral droplets. Historical mode restores `sandblast` state for fixed-height throughput and optional parallel A/B; live-head mode uses the production default P2P stack, catches up from the baked pruned tip, and requires head health throughout one observational profile window. Both produce flamegraphs, CPU counters, metrics, available traces, and block-latency digests (see `docs/cpu-profiling.md`).
 
-These workflows use the helper scripts in `.github/workflows/scripts/` (`pr-node-bake.sh`, `pr-node-run.sh`, `pr-node-monitor.py`).
+These workflows use the helper scripts in `.github/workflows/scripts/` (`pr-node-bake.sh`, `pr-node-run.sh`, `pr-node-monitor.py`, `perf-bench-run.sh`, `perf-bench-compare.py`).
+
+Droplet lifecycle is shared, not copy-pasted, through the composite actions in `.github/actions/`:
+
+- **`do-cli`** — installs the pinned `doctl`, authenticates it for the rest of the job, and optionally writes the fleet SSH key to `/tmp/do_ssh`.
+- **`do-droplet`** — resolves the newest `zakura-pr-node-*` baked image (and optionally clones the newest `zakura-pr-state-<network>-*` volume snapshot), then creates the tagged droplet. Outputs `id`, `ip`, `image_id`, `volume_id`, `volume_name`.
+- **`do-wait-ssh`** — polls a new droplet until it accepts SSH. Give the step an `id` if teardown needs to distinguish "unreachable" from "ran".
+- **`do-teardown`** — best-effort delete of a droplet and its volumes, retrying the volumes while the detach settles. Never fails a job; `enabled: false` keeps the resources and says so.
+
+`zakura-pr-node-bake.yml` uses `do-cli`/`do-wait-ssh`/`do-teardown` but creates its droplet inline: it starts from a stock Ubuntu image (it is what produces the baked one) and attaches two blank volumes it later snapshots per network.
 
 ## Fork maintenance
 

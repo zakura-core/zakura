@@ -43,23 +43,15 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install doctl
-        env:
-          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-        run: |
-          set -euo pipefail
-          DOCTL_VERSION=1.120.0
-          curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
-          sudo install /tmp/doctl /usr/local/bin/doctl
-          doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
+      - name: Install doctl and the fleet SSH key
+        uses: ./.github/actions/do-cli
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
 
-      - name: Write SSH key
-        env:
-          DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
-        run: |
-          install -m 600 /dev/null /tmp/do_ssh
-          printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh
-
+      # Not the shared do-droplet action: the bake starts from a stock Ubuntu
+      # image (it is what produces the baked one) and attaches two blank
+      # volumes it later snapshots per network.
       - name: Create state volumes + bake droplet
         id: droplet
         env:
@@ -95,17 +87,9 @@ jobs:
           echo "ip=$(awk '{print $2}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Wait for SSH
-        env:
-          IP: ${{ steps.droplet.outputs.ip }}
-        run: |
-          set -euo pipefail
-          for _ in $(seq 1 30); do
-            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i /tmp/do_ssh "root@${IP}" true 2>/dev/null; then
-              echo "SSH up"; exit 0
-            fi
-            sleep 10
-          done
-          echo "SSH did not come up in time"; exit 1
+        uses: ./.github/actions/do-wait-ssh
+        with:
+          ip: ${{ steps.droplet.outputs.ip }}
 
       - name: Run bake script
         env:
@@ -177,28 +161,17 @@ jobs:
           done
           echo "image snapshot did not complete in time"; exit 1
 
-      - name: Cleanup droplet + volumes, prune old assets
+      - name: Cleanup droplet + volumes
         if: always()
-        env:
-          DROPLET_ID: ${{ steps.droplet.outputs.id }}
-          MAINNET_VOL_ID: ${{ steps.droplet.outputs.mainnet_vol_id }}
-          TESTNET_VOL_ID: ${{ steps.droplet.outputs.testnet_vol_id }}
+        uses: ./.github/actions/do-teardown
+        with:
+          droplet_id: ${{ steps.droplet.outputs.id }}
+          volume_ids: ${{ steps.droplet.outputs.mainnet_vol_id }} ${{ steps.droplet.outputs.testnet_vol_id }}
+
+      - name: Prune old images and volume snapshots
+        if: always()
         run: |
           set +e
-          if [ -n "${DROPLET_ID}" ]; then
-            for _ in 1 2 3; do
-              doctl compute droplet delete "${DROPLET_ID}" -f && break
-              sleep 5
-            done
-          fi
-          # Volumes detach asynchronously after the droplet delete.
-          for VOL_ID in "${MAINNET_VOL_ID}" "${TESTNET_VOL_ID}"; do
-            [ -z "${VOL_ID}" ] && continue
-            for _ in $(seq 1 12); do
-              doctl compute volume delete "${VOL_ID}" -f && break
-              sleep 10
-            done
-          done
           # Keep the newest 2 images and 2 volume snapshots per network so runs
           # never depend on the latest bake having succeeded.
           doctl compute image list-user --format ID,Name --no-header | \

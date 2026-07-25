@@ -13,6 +13,7 @@ on:
       - supply-chain/**
       - "scripts/**.sh"
       - ".github/workflows/scripts/**"
+      - ".github/actions/**"
       # ci-python-tests covers these suites, so changes to them must trigger it.
       - "deploy/**"
       - ".github/scripts/**"
@@ -29,6 +30,7 @@ on:
       - supply-chain/**
       - "scripts/**.sh"
       - ".github/workflows/scripts/**"
+      - ".github/actions/**"
       # ci-python-tests covers these suites, so changes to them must trigger it.
       - "deploy/**"
       - ".github/scripts/**"
@@ -176,6 +178,10 @@ jobs:
       - name: Mempool load harness tests
         if: ${{ !cancelled() }}
         run: python3 .github/workflows/scripts/test_mempool_load.py
+
+      - name: Perf-bench compare tests
+        if: ${{ !cancelled() }}
+        run: python3 .github/workflows/scripts/test_perf_bench_compare.py
 
       - name: Affected semver package tests
         if: ${{ !cancelled() }}

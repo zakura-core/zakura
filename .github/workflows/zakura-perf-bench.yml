@@ -149,87 +149,28 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install doctl
-        env:
-          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-        run: |
-          set -euo pipefail
-          DOCTL_VERSION=1.120.0
-          curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
-          sudo install /tmp/doctl /usr/local/bin/doctl
-          doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
-
-      - name: Write SSH key
-        env:
-          DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
-        run: |
-          install -m 600 /dev/null /tmp/do_ssh
-          printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh
-
-      - name: Pick baked image and state snapshot
-        id: baked
-        run: |
-          set -euo pipefail
-          IMAGE=$(doctl compute image list-user --format ID,Name --no-header | \
-            awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | tail -1 | awk '{print $2}')
-          if [ -z "${IMAGE}" ]; then
-            echo "no zakura-pr-node-* image found; run the 'PR node image bake' workflow first" >&2
-            exit 1
-          fi
-          echo "image_id=${IMAGE}" >> "$GITHUB_OUTPUT"
-          SNAP=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
-            awk -v pre="zakura-pr-state-mainnet-" 'index($2, pre) == 1 {print $2, $1}' | \
-            sort | tail -1 | awk '{print $2}')
-          if [ -z "${SNAP}" ]; then
-            echo "no zakura-pr-state-mainnet-* volume snapshot found; run the bake workflow first" >&2
-            exit 1
-          fi
-          echo "vol_snap_id=${SNAP}" >> "$GITHUB_OUTPUT"
+      - name: Install doctl and the fleet SSH key
+        uses: ./.github/actions/do-cli
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
 
       - name: Create droplet (+ state volume)
         id: droplet
-        env:
-          LEG: ${{ matrix.leg.leg }}
-          DROPLET_SIZE: ${{ inputs.droplet_size || 'c-16' }}
-          SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
-          IMAGE_ID: ${{ steps.baked.outputs.image_id }}
-          VOL_SNAP_ID: ${{ steps.baked.outputs.vol_snap_id }}
-        run: |
-          set -euo pipefail
-          VOLUME_NAME="zakura-pr-perf-vol-${GITHUB_RUN_ID}-${LEG}"
-          SIZE=$(doctl compute snapshot get "${VOL_SNAP_ID}" --format MinDiskSize --no-header)
-          VOLUME_ID=$(doctl compute volume create "${VOLUME_NAME}" \
-            --region nyc3 --snapshot "${VOL_SNAP_ID}" --size "${SIZE}GiB" \
-            --format ID --no-header)
-          NAME="zakura-perf-${LEG}-${GITHUB_RUN_ID}"
+        uses: ./.github/actions/do-droplet
+        with:
+          name: zakura-perf-${{ matrix.leg.leg }}-${{ github.run_id }}
+          size: ${{ inputs.droplet_size || 'c-16' }}
+          ssh_fingerprint: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
           # tagged zakura-pr-node so the hourly reaper covers failed teardowns
-          doctl compute droplet create "$NAME" \
-            --region nyc3 \
-            --size "${DROPLET_SIZE}" \
-            --image "${IMAGE_ID}" \
-            --ssh-keys "${SSH_FINGERPRINT}" \
-            --volumes "${VOLUME_ID}" \
-            --tag-name zakura-pr-node \
-            --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
-          {
-            echo "id=$(awk '{print $1}' /tmp/droplet.txt)"
-            echo "ip=$(awk '{print $2}' /tmp/droplet.txt)"
-            echo "volume_name=${VOLUME_NAME}"
-            echo "volume_id=${VOLUME_ID}"
-          } >> "$GITHUB_OUTPUT"
+          tag: zakura-pr-node
+          state_network: mainnet
+          volume_name: zakura-pr-perf-vol-${{ github.run_id }}-${{ matrix.leg.leg }}
 
       - name: Wait for SSH
-        env:
-          IP: ${{ steps.droplet.outputs.ip }}
-        run: |
-          set -euo pipefail
-          for _ in $(seq 1 30); do
-            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i /tmp/do_ssh "root@${IP}" true 2>/dev/null; then
-              echo "SSH up"; exit 0
-            fi
-            sleep 10
-          done
-          echo "SSH did not come up in time"; exit 1
+        uses: ./.github/actions/do-wait-ssh
+        with:
+          ip: ${{ steps.droplet.outputs.ip }}
 
       - name: Run the profiled bench leg
         env:
@@ -303,26 +244,14 @@ jobs:
           retention-days: 30
 
       - name: Teardown droplet + volume
-        if: always() && steps.droplet.outputs.id != ''
-        env:
-          DROPLET_ID: ${{ steps.droplet.outputs.id }}
-          VOLUME_ID: ${{ steps.droplet.outputs.volume_id }}
+        if: always()
+        uses: ./.github/actions/do-teardown
+        with:
+          droplet_id: ${{ steps.droplet.outputs.id }}
+          volume_ids: ${{ steps.droplet.outputs.volume_id }}
           # string-compare: on schedule/pull_request the input is null, and
           # GitHub's loose `null == false` coercion would skip teardown
-          TEARDOWN: ${{ format('{0}', inputs.teardown_after_run) == 'false' && 'false' || 'true' }}
-        run: |
-          set -euo pipefail
-          if [ "${TEARDOWN}" != "true" ]; then
-            echo "teardown_after_run=false; droplet ${DROPLET_ID} left up (reaper removes it within 24h)"
-            exit 0
-          fi
-          doctl compute droplet delete -f "${DROPLET_ID}" || true
-          # volume detach happens as part of droplet deletion; retry the delete
-          for _ in $(seq 1 10); do
-            if doctl compute volume delete -f "${VOLUME_ID}" 2>/dev/null; then exit 0; fi
-            sleep 6
-          done
-          echo "volume ${VOLUME_ID} still attached; the reaper will remove it" >&2
+          enabled: ${{ format('{0}', inputs.teardown_after_run) == 'false' && 'false' || 'true' }}
 
   compare:
     name: A/B compare
@@ -343,48 +272,37 @@ jobs:
           path: legs/
 
       - name: Compare legs
+        id: compare
+        run: |
+          set -euo pipefail
+          python3 .github/workflows/scripts/perf-bench-compare.py \
+            "legs/zakura-perf-bench-${GITHUB_RUN_ID}-primary/meta.json" \
+            "legs/zakura-perf-bench-${GITHUB_RUN_ID}-baseline/meta.json" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # Only when both legs ran zakurad to completion: a diff against a leg that
+      # died early describes the crash, not the change.
+      - name: Diff CPU profiles
+        if: steps.compare.outputs.compare == 'true'
         run: |
           set -euo pipefail
           P="legs/zakura-perf-bench-${GITHUB_RUN_ID}-primary"
           B="legs/zakura-perf-bench-${GITHUB_RUN_ID}-baseline"
-          [ -f "$P/meta.json" ] && [ -f "$B/meta.json" ] \
-            || { echo "one or both legs produced no meta.json; nothing to compare" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
-          FAILED_LEGS=$(python3 - "$P/meta.json" "$B/meta.json" <<'PY'
-          import json, sys
-          legs = (json.load(open(path)) for path in sys.argv[1:3])
-          print(", ".join(leg["leg"] for leg in legs if leg.get("node_exit_status", 0)))
-          PY
-          )
-          if [ -n "$FAILED_LEGS" ]; then
-            echo "No comparison: zakurad failed in ${FAILED_LEGS}." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          python3 - "$P/meta.json" "$B/meta.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
-          import json, sys
-          p, b = (json.load(open(a)) for a in sys.argv[1:3])
-          speedup = p["bps"] / b["bps"] if b["bps"] else float("nan")
-          print("## A/B result\n")
-          print("| leg | ref | blocks/s | post-commit blk/s | verdict |")
-          print("|---|---|---:|---:|---|")
-          for m in (b, p):
-              print(f"| {m['leg']} | `{m['sha'][:9]}` | {m['bps']} | {m['post_bps']} | {m.get('verdict') or 'n/a'} |")
-          print(f"\n**Speedup (primary vs baseline): {speedup:.2f}×** ({b['bps']} → {p['bps']} blocks/s, both legs on identical parallel droplets)")
-          PY
           mkdir -p compare-out
-          if [ -s "$P/profile.folded" ] && [ -s "$B/profile.folded" ]; then
-            python3 scripts/zakura-bench-digest.py diff \
-              --baseline "$B/profile.folded" --primary "$P/profile.folded" \
-              --title "primary vs baseline" | tee compare-out/profile-diff.md >> "$GITHUB_STEP_SUMMARY"
-            if cargo install inferno --locked >/dev/null 2>&1; then
-              export PATH="$HOME/.cargo/bin:$PATH"
-              inferno-diff-folded "$B/profile.folded" "$P/profile.folded" 2>/dev/null \
-                | inferno-flamegraph --title "CPU diff: baseline → primary" \
-                > compare-out/flamegraph-diff.svg 2>/dev/null \
-                || rm -f compare-out/flamegraph-diff.svg
-            fi
-          else
+          if [ ! -s "$P/profile.folded" ] || [ ! -s "$B/profile.folded" ]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "_(no CPU diff: one or both legs have no folded stacks)_" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 scripts/zakura-bench-digest.py diff \
+            --baseline "$B/profile.folded" --primary "$P/profile.folded" \
+            --title "primary vs baseline" | tee compare-out/profile-diff.md >> "$GITHUB_STEP_SUMMARY"
+          if cargo install inferno --locked >/dev/null 2>&1; then
+            export PATH="$HOME/.cargo/bin:$PATH"
+            inferno-diff-folded "$B/profile.folded" "$P/profile.folded" 2>/dev/null \
+              | inferno-flamegraph --title "CPU diff: baseline → primary" \
+              > compare-out/flamegraph-diff.svg 2>/dev/null \
+              || rm -f compare-out/flamegraph-diff.svg
           fi
 
       - name: Upload compare artifacts

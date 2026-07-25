@@ -1,0 +1,49 @@
+name: "Tear down a droplet"
+description: >-
+  Best-effort delete of a droplet and any volumes it used. Never fails the job:
+  whatever survives is swept by the hourly reaper.
+
+inputs:
+  droplet_id:
+    description: "Droplet to delete. Empty is a no-op (creation never got that far)."
+    required: false
+    default: ""
+  volume_ids:
+    description: "Whitespace-separated volume IDs to delete after the droplet"
+    required: false
+    default: ""
+  enabled:
+    description: "Anything other than 'true' keeps the resources for inspection and prints why"
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Teardown
+      shell: bash
+      env:
+        DROPLET_ID: ${{ inputs.droplet_id }}
+        VOLUME_IDS: ${{ inputs.volume_ids }}
+        ENABLED: ${{ inputs.enabled }}
+      run: |
+        set +e
+        if [ "${ENABLED}" != "true" ]; then
+          echo "Teardown skipped; the reaper deletes these resources within 24h of creation."
+          exit 0
+        fi
+        if [ -n "${DROPLET_ID}" ]; then
+          for _ in 1 2 3; do
+            doctl compute droplet delete "${DROPLET_ID}" -f && break
+            sleep 5
+          done
+        fi
+        # Volumes detach asynchronously after the droplet delete, so the first
+        # few attempts are expected to fail while the detach settles.
+        for VOL_ID in ${VOLUME_IDS}; do
+          for _ in $(seq 1 12); do
+            doctl compute volume delete "${VOL_ID}" -f && break
+            sleep 10
+          done
+        done
+        true

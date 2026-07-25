@@ -104,101 +104,29 @@ jobs:
             echo "slug=${SLUG}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Install doctl
-        env:
-          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-        run: |
-          set -euo pipefail
-          DOCTL_VERSION=1.120.0
-          curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
-          sudo install /tmp/doctl /usr/local/bin/doctl
-          doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
-
-      - name: Write SSH key
-        env:
-          DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
-        run: |
-          install -m 600 /dev/null /tmp/do_ssh
-          printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh
-
-      - name: Pick baked image and state snapshot
-        id: baked
-        env:
-          MODE: ${{ inputs.snapshot_mode }}
-          NETWORK: ${{ inputs.network }}
-        run: |
-          set -euo pipefail
-          IMAGE=$(doctl compute image list-user --format ID,Name --no-header | \
-            awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | tail -1 | awk '{print $2}')
-          if [ -z "${IMAGE}" ]; then
-            echo "no zakura-pr-node-* image found; run the 'PR node image bake' workflow first" >&2
-            exit 1
-          fi
-          echo "image_id=${IMAGE}" >> "$GITHUB_OUTPUT"
-          if [ "${MODE}" = "genesis" ]; then
-            echo "vol_snap_id=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          SNAP=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
-            awk -v pre="zakura-pr-state-${NETWORK}-" 'index($2, pre) == 1 {print $2, $1}' | \
-            sort | tail -1 | awk '{print $2}')
-          if [ -z "${SNAP}" ]; then
-            echo "no zakura-pr-state-${NETWORK}-* volume snapshot found; run the bake workflow first" >&2
-            exit 1
-          fi
-          echo "vol_snap_id=${SNAP}" >> "$GITHUB_OUTPUT"
+      - name: Install doctl and the fleet SSH key
+        uses: ./.github/actions/do-cli
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
 
       - name: Create droplet (+ state volume)
         id: droplet
-        env:
-          MODE: ${{ inputs.snapshot_mode }}
-          DROPLET_SIZE: ${{ inputs.droplet_size || 'c-8' }}
-          SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
-          IMAGE_ID: ${{ steps.baked.outputs.image_id }}
-          VOL_SNAP_ID: ${{ steps.baked.outputs.vol_snap_id }}
-          SLUG: ${{ steps.target.outputs.slug }}
-        run: |
-          set -euo pipefail
-          VOLUME_ARGS=()
-          VOLUME_NAME=""
-          VOLUME_ID=""
-          if [ "${MODE}" != "genesis" ]; then
-            VOLUME_NAME="zakura-pr-vol-${GITHUB_RUN_ID}"
-            SIZE=$(doctl compute snapshot get "${VOL_SNAP_ID}" --format MinDiskSize --no-header)
-            VOLUME_ID=$(doctl compute volume create "${VOLUME_NAME}" \
-              --region nyc3 --snapshot "${VOL_SNAP_ID}" --size "${SIZE}GiB" \
-              --format ID --no-header)
-            VOLUME_ARGS=(--volumes "${VOLUME_ID}")
-          fi
-          NAME="zakura-pr-${SLUG}-${GITHUB_RUN_ID}"
-          doctl compute droplet create "$NAME" \
-            --region nyc3 \
-            --size "${DROPLET_SIZE}" \
-            --image "${IMAGE_ID}" \
-            --ssh-keys "${SSH_FINGERPRINT}" \
-            "${VOLUME_ARGS[@]}" \
-            --tag-name zakura-pr-node \
-            --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
-          {
-            echo "id=$(awk '{print $1}' /tmp/droplet.txt)"
-            echo "ip=$(awk '{print $2}' /tmp/droplet.txt)"
-            echo "volume_name=${VOLUME_NAME}"
-            echo "volume_id=${VOLUME_ID}"
-          } >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/do-droplet
+        with:
+          name: zakura-pr-${{ steps.target.outputs.slug }}-${{ github.run_id }}
+          size: ${{ inputs.droplet_size || 'c-8' }}
+          ssh_fingerprint: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+          tag: zakura-pr-node
+          # genesis syncs from scratch, so it gets no state volume
+          state_network: ${{ inputs.snapshot_mode != 'genesis' && inputs.network || '' }}
+          volume_name: zakura-pr-vol-${{ github.run_id }}
 
       - name: Wait for SSH
         id: sshwait
-        env:
-          IP: ${{ steps.droplet.outputs.ip }}
-        run: |
-          set -euo pipefail
-          for _ in $(seq 1 30); do
-            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i /tmp/do_ssh "root@${IP}" true 2>/dev/null; then
-              echo "SSH up"; exit 0
-            fi
-            sleep 10
-          done
-          echo "SSH did not come up in time"; exit 1
+        uses: ./.github/actions/do-wait-ssh
+        with:
+          ip: ${{ steps.droplet.outputs.ip }}
 
       - name: Build, deploy, and monitor the node
         env:
@@ -327,29 +255,9 @@ jobs:
 
       - name: Teardown (immediate or on unreachable droplet)
         if: always()
-        env:
-          DROPLET_ID: ${{ steps.droplet.outputs.id }}
-          VOLUME_ID: ${{ steps.droplet.outputs.volume_id }}
-          TEARDOWN: ${{ inputs.teardown_after_run }}
-          SSH_FAILED: ${{ steps.sshwait.outcome == 'failure' }}
-        run: |
-          set +e
+        uses: ./.github/actions/do-teardown
+        with:
+          droplet_id: ${{ steps.droplet.outputs.id }}
+          volume_ids: ${{ steps.droplet.outputs.volume_id }}
           # A droplet we can never SSH into is useless to keep for inspection.
-          if [ "${TEARDOWN}" != "true" ] && [ "${SSH_FAILED}" != "true" ]; then
-            echo "Droplet kept for inspection; the reaper deletes it ~24h after creation."
-            exit 0
-          fi
-          if [ -n "${DROPLET_ID}" ]; then
-            for _ in 1 2 3; do
-              doctl compute droplet delete "${DROPLET_ID}" -f && break
-              sleep 5
-            done
-          fi
-          if [ -n "${VOLUME_ID}" ]; then
-            # The volume detaches asynchronously after the droplet delete.
-            for _ in $(seq 1 12); do
-              doctl compute volume delete "${VOLUME_ID}" -f && break
-              sleep 10
-            done
-          fi
-          true
+          enabled: ${{ (inputs.teardown_after_run || steps.sshwait.outcome == 'failure') && 'true' || 'false' }}

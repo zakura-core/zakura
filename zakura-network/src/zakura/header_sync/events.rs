@@ -316,6 +316,12 @@ pub enum HeaderSyncEvent {
         tip_height: block::Height,
         /// Durable best header tip hash.
         tip_hash: block::Hash,
+        /// Frontier generation captured by a retreat-capable query.
+        ///
+        /// `None` only advances the cached frontier. `Some(generation)` can
+        /// replace it with a lower durable tip while that generation is still
+        /// current.
+        reanchor_from: Option<u64>,
     },
     /// State successfully committed a header range.
     HeaderRangeOperationCompleted {
@@ -453,7 +459,11 @@ pub enum HeaderSyncAction {
         payload: HeaderRangePayload,
     },
     /// Ask state for the durable best header tip.
-    QueryBestHeaderTip,
+    QueryBestHeaderTip {
+        /// Frontier generation that permits a returned durable tip to retreat
+        /// the cached frontier while the generation is still current.
+        reanchor_from: Option<u64>,
+    },
     /// Ask state for a bounded contiguous range of headers.
     QueryHeadersByHeightRange {
         /// Peer that requested the range.
@@ -565,6 +575,11 @@ pub enum HeaderSyncMisbehavior {
 pub enum HeaderSyncCommitFailureKind {
     /// The supplied headers failed contextual validation or checkpoint consistency.
     InvalidPeerRange,
+    /// The locally selected anchor was absent from durable state.
+    ///
+    /// The reactor reloads the durable frontier and retries with backoff. This
+    /// condition is never attributed to the peer.
+    UnknownAnchor,
     /// Local storage/channel/resource failure; do not score the peer.
     Local,
 }

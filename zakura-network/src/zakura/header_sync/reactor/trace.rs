@@ -572,10 +572,13 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
         HeaderSyncEvent::BestHeaderTipLoaded {
             tip_height,
             tip_hash,
+            reanchor_from,
         } => {
             insert_optional_str(row, hs_trace::KIND, Some("best_header_tip_loaded"));
             insert_height(row, hs_trace::HEIGHT, *tip_height);
             insert_hash(row, hs_trace::HASH, *tip_hash);
+            insert_optional_u64(row, "reanchor_from", *reanchor_from);
+            insert_bool(row, "reanchor", reanchor_from.is_some());
         }
         HeaderSyncEvent::HeaderRangeOperationCompleted {
             operation,
@@ -780,8 +783,10 @@ fn trace_action_fields(row: &mut serde_json::Map<String, Value>, action: &Header
                 u64::from(payload.range().count()),
             );
         }
-        HeaderSyncAction::QueryBestHeaderTip => {
+        HeaderSyncAction::QueryBestHeaderTip { reanchor_from } => {
             insert_optional_str(row, hs_trace::KIND, Some("query_best_header_tip"));
+            insert_optional_u64(row, "reanchor_from", *reanchor_from);
+            insert_bool(row, "reanchor", reanchor_from.is_some());
         }
         HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
             insert_optional_str(row, hs_trace::KIND, Some("query_missing_block_bodies"));
@@ -991,6 +996,17 @@ pub(super) fn insert_u64(row: &mut serde_json::Map<String, Value>, key: &'static
     row.insert(key.to_string(), Value::Number(Number::from(value)));
 }
 
+fn insert_optional_u64(
+    row: &mut serde_json::Map<String, Value>,
+    key: &'static str,
+    value: Option<u64>,
+) {
+    row.insert(
+        key.to_string(),
+        value.map_or(Value::Null, |value| Value::Number(Number::from(value))),
+    );
+}
+
 fn insert_bool(row: &mut serde_json::Map<String, Value>, key: &'static str, value: bool) {
     row.insert(key.to_string(), Value::Bool(value));
 }
@@ -1026,6 +1042,7 @@ fn misbehavior_reason_label(reason: HeaderSyncMisbehavior) -> &'static str {
 pub(super) fn commit_failure_reason_label(kind: HeaderSyncCommitFailureKind) -> &'static str {
     match kind {
         HeaderSyncCommitFailureKind::InvalidPeerRange => "invalid_peer_range",
+        HeaderSyncCommitFailureKind::UnknownAnchor => "unknown_anchor",
         HeaderSyncCommitFailureKind::Local => "local",
     }
 }
@@ -1137,6 +1154,23 @@ mod tests {
     }
 
     #[test]
+    fn durable_tip_traces_record_the_optional_reanchor_generation() {
+        let event = event_row(&HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: block::Height(7),
+            tip_hash: block::Hash([7; 32]),
+            reanchor_from: Some(11),
+        });
+        assert_eq!(event["reanchor_from"].as_u64(), Some(11));
+        assert_eq!(event["reanchor"].as_bool(), Some(true));
+
+        let action = action_row(&HeaderSyncAction::QueryBestHeaderTip {
+            reanchor_from: None,
+        });
+        assert!(action["reanchor_from"].is_null());
+        assert_eq!(action["reanchor"].as_bool(), Some(false));
+    }
+
+    #[test]
     fn every_event_metric_label_matches_its_trace_kind() {
         let peer = peer(1);
         let block = block();
@@ -1245,6 +1279,7 @@ mod tests {
             HeaderSyncEvent::BestHeaderTipLoaded {
                 tip_height: block::Height(7),
                 tip_hash: block::Hash([7; 32]),
+                reanchor_from: None,
             },
             HeaderSyncEvent::HeaderRangeOperationCompleted {
                 operation: operation(peer.clone()),
@@ -1329,7 +1364,9 @@ mod tests {
                 "commit_header_range",
             ),
             (
-                HeaderSyncAction::QueryBestHeaderTip,
+                HeaderSyncAction::QueryBestHeaderTip {
+                    reanchor_from: None,
+                },
                 "query_best_header_tip",
             ),
             (

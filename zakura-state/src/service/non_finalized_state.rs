@@ -278,6 +278,11 @@ impl NonFinalizedState {
         self.insert_with(chain, |_ignored_chain| { /* no filter */ })
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_test_chain(&mut self, chain: Arc<Chain>) {
+        self.insert(chain);
+    }
+
     /// Finalize the lowest height block in the non-finalized portion of the best
     /// chain and update all side-chains to match.
     pub fn finalize(&mut self) -> FinalizableBlock {

@@ -541,8 +541,8 @@ where
     RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>,
 {
     let ready = read_state.ready().await.ok()?;
-    match ready.call(zs::ReadRequest::BestHeaderTip).await {
-        Ok(zs::ReadResponse::BestHeaderTip(tip)) => tip.map(|(height, _hash)| height),
+    match ready.call(zs::ReadRequest::BestDurableHeaderTip).await {
+        Ok(zs::ReadResponse::BestDurableHeaderTip(tip)) => tip.map(|(height, _hash)| height),
         _ => None,
     }
 }
@@ -1010,7 +1010,8 @@ where
     /// the watchdog never switches: it parks and warns (once per stall window) so a
     /// stalled, eclipsed, or peerless node is visible in the logs.
     ///
-    /// `read_state` answers [`ReadRequest::BestHeaderTip`](zs::ReadRequest::BestHeaderTip)
+    /// `read_state` answers
+    /// [`ReadRequest::BestDurableHeaderTip`](zs::ReadRequest::BestDurableHeaderTip)
     /// for the legacy-informed cross-check, which only probes legacy peers when
     /// the verified tip is frozen and the node looks caught up to its own header
     /// frontier.

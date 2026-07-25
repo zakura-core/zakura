@@ -1497,8 +1497,11 @@ pub enum ReadRequest {
         count: u32,
     },
 
-    /// Returns the highest header held on disk.
-    BestHeaderTip,
+    /// Returns the highest contiguous header held in the durable full-block/header database.
+    ///
+    /// This request never consults the in-memory non-finalized chain, so its
+    /// result is safe to use as a [`Request::CommitHeaderRange`] anchor.
+    BestDurableHeaderTip,
 
     /// Returns header-known, body-missing heights in `(verified_block_tip, best_header_tip]`.
     MissingBlockBodies {
@@ -1735,7 +1738,7 @@ impl ReadRequest {
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
             ReadRequest::HeadersByHeightRange { .. } => "headers_by_height_range",
             ReadRequest::BlockRoots { .. } => "block_roots",
-            ReadRequest::BestHeaderTip => "best_header_tip",
+            ReadRequest::BestDurableHeaderTip => "best_durable_header_tip",
             ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",
             ReadRequest::MissingBlockBodyMetadata { .. } => "missing_block_body_metadata",
             ReadRequest::BlockSizeHints { .. } => "block_size_hints",

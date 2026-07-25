@@ -2012,20 +2012,9 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::BlockRoots(roots))
             }
 
-            ReadRequest::BestHeaderTip => {
-                let best_disk_header_tip = state.db.best_header_tip();
-                let verified_block_tip = read::tip(state.latest_best_chain(), &state.db);
-
-                Ok(ReadResponse::BestHeaderTip(
-                    match (best_disk_header_tip, verified_block_tip) {
-                        (Some(header_tip), Some(block_tip)) if block_tip.0 > header_tip.0 => {
-                            Some(block_tip)
-                        }
-                        (Some(header_tip), _) => Some(header_tip),
-                        (None, block_tip) => block_tip,
-                    },
-                ))
-            }
+            ReadRequest::BestDurableHeaderTip => Ok(ReadResponse::BestDurableHeaderTip(
+                state.db.best_header_tip(),
+            )),
 
             ReadRequest::MissingBlockBodies { from, limit } => {
                 let verified_block_tip = read::tip_height(state.latest_best_chain(), &state.db);

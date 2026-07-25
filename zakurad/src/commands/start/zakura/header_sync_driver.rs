@@ -31,6 +31,7 @@ use super::{
 };
 
 const ROOT_AUTH_STATE_TIMEOUT: Duration = Duration::from_secs(30);
+const DURABLE_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ROOT_AUTH_STATE_TASKS: usize = 1;
 
 pub(crate) async fn zakura_header_sync_driver_startup(
@@ -41,15 +42,9 @@ pub(crate) async fn zakura_header_sync_driver_startup(
         .subscribe_header_root_auth()
         .borrow()
         .map(header_root_auth_state);
-    let best_header_tip = match read_state
-        .clone()
-        .oneshot(zakura_state::ReadRequest::BestHeaderTip)
+    let best_header_tip = best_durable_header_tip(read_state.clone())
         .await
-        .map_err(|error| eyre!("{error}"))?
-    {
-        zakura_state::ReadResponse::BestHeaderTip(tip) => tip,
-        response => Err(eyre!("unexpected BestHeaderTip response: {response:?}"))?,
-    };
+        .map_err(|error| eyre!("{error}"))?;
 
     let finalized_tip = match read_state
         .clone()
@@ -303,6 +298,7 @@ mod operation_identity_tests {
 
         for kind in [
             HeaderSyncCommitFailureKind::InvalidPeerRange,
+            HeaderSyncCommitFailureKind::UnknownAnchor,
             HeaderSyncCommitFailureKind::Local,
         ] {
             assert!(matches!(
@@ -868,7 +864,36 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             );
                             HeaderSyncEvent::NewBlockAcceptedNonBestChain { peer, height, hash }
                         };
-                        let _ = handles.header_sync.send(event).await;
+                        if handles.header_sync.send(event).await.is_err() {
+                            return;
+                        }
+                        if on_best_chain {
+                            match best_durable_header_tip(read_state.clone()).await {
+                                Ok(Some((tip_height, tip_hash))) => {
+                                    if handles
+                                        .header_sync
+                                        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+                                            tip_height,
+                                            tip_hash,
+                                            reanchor_from: None,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    warn!(
+                                        ?height,
+                                        ?hash,
+                                        ?error,
+                                        "failed to reload the durable header tip after NewBlock acceptance"
+                                    );
+                                }
+                            }
+                        }
                     }
                     Ok(committed_hash) => {
                         trace_header_commit_finish(
@@ -1466,7 +1491,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     }
                 });
             }
-            HeaderSyncAction::QueryBestHeaderTip => {
+            HeaderSyncAction::QueryBestHeaderTip { reanchor_from } => {
                 emit_commit_state(
                     &trace,
                     cs_trace::STATE_READ_START,
@@ -1475,12 +1500,8 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
                     },
                 );
-                match read_state
-                    .clone()
-                    .oneshot(zakura_state::ReadRequest::BestHeaderTip)
-                    .await
-                {
-                    Ok(zakura_state::ReadResponse::BestHeaderTip(Some((tip_height, tip_hash)))) => {
+                match best_durable_header_tip(read_state.clone()).await {
+                    Ok(Some((tip_height, tip_hash))) => {
                         emit_commit_state(
                             &trace,
                             cs_trace::STATE_READ_SUCCESS,
@@ -1496,22 +1517,11 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .send(HeaderSyncEvent::BestHeaderTipLoaded {
                                 tip_height,
                                 tip_hash,
+                                reanchor_from,
                             })
                             .await;
                     }
-                    Ok(zakura_state::ReadResponse::BestHeaderTip(None)) => {}
-                    Ok(response) => {
-                        trace_state_read_error(
-                            &trace,
-                            "query_best_header_tip",
-                            None,
-                            block::Height(0),
-                            0,
-                            "unexpected_response",
-                            Instant::now(),
-                        );
-                        warn!(?response, "unexpected BestHeaderTip response")
-                    }
+                    Ok(None) => {}
                     Err(error) => {
                         trace_state_read_error(
                             &trace,
@@ -1827,12 +1837,17 @@ pub(crate) fn header_range_commit_failure_kind(
         | zakura_state::CommitHeaderRangeError::CommitResponseDropped => {
             HeaderSyncCommitFailureKind::Local
         }
+        zakura_state::CommitHeaderRangeError::UnknownAnchor { .. } => {
+            // The requested anchor is chosen from our own published header
+            // frontier. If state cannot resolve it, our cached frontier and
+            // durable header view disagree; the peer did not choose that anchor.
+            HeaderSyncCommitFailureKind::UnknownAnchor
+        }
         zakura_state::CommitHeaderRangeError::EmptyRange
         | zakura_state::CommitHeaderRangeError::RangeTooLong { .. }
         | zakura_state::CommitHeaderRangeError::BodySizeCountMismatch { .. }
         | zakura_state::CommitHeaderRangeError::TreeAuxRootCountMismatch { .. }
         | zakura_state::CommitHeaderRangeError::TreeAuxRootHeightMismatch { .. }
-        | zakura_state::CommitHeaderRangeError::UnknownAnchor { .. }
         | zakura_state::CommitHeaderRangeError::HeightOverflow
         | zakura_state::CommitHeaderRangeError::ImmutableConflict { .. }
         | zakura_state::CommitHeaderRangeError::ReorgTooDeep { .. }
@@ -2070,9 +2085,13 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
                         insert_cs_str(row, cs_trace::RESULT, "found");
                     },
                 );
-                let _ = header_sync
+                if header_sync
                     .send(HeaderSyncEvent::FullBlockCommitted { height, hash })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
                 emit_commit_state(
                     &trace,
                     cs_trace::REACTOR_EVENT_SENT,
@@ -2083,6 +2102,36 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
                         insert_cs_hash(row, cs_trace::HASH, hash);
                     },
                 );
+                match best_durable_header_tip(read_state.clone()).await {
+                    Ok(Some((tip_height, tip_hash))) => {
+                        if header_sync
+                            .send(HeaderSyncEvent::BestHeaderTipLoaded {
+                                tip_height,
+                                tip_hash,
+                                reanchor_from: None,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        debug!(
+                            ?height,
+                            ?hash,
+                            "verified block advanced while the durable header store is empty"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            ?height,
+                            ?hash,
+                            ?error,
+                            "failed to reload the durable header tip after a full-block commit"
+                        );
+                    }
+                }
             }
             Ok(zakura_state::ReadResponse::Block(None)) => {
                 emit_commit_state(
@@ -2127,6 +2176,36 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
                 warn!(?error, "failed to mirror Zakura full-block commit")
             }
         }
+    }
+}
+
+pub(crate) async fn best_durable_header_tip<ReadState>(
+    read_state: ReadState,
+) -> Result<Option<(block::Height, block::Hash)>, Report>
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    match tokio::time::timeout(
+        DURABLE_HEADER_READ_TIMEOUT,
+        read_state.oneshot(zakura_state::ReadRequest::BestDurableHeaderTip),
+    )
+    .await
+    {
+        Ok(Ok(zakura_state::ReadResponse::BestDurableHeaderTip(tip))) => Ok(tip),
+        Ok(Ok(response)) => Err(eyre!(
+            "unexpected BestDurableHeaderTip response: {response:?}"
+        )),
+        Ok(Err(error)) => Err(eyre!("failed to read durable header tip: {error}")),
+        Err(_) => Err(eyre!(
+            "durable header tip read timed out after {DURABLE_HEADER_READ_TIMEOUT:?}"
+        )),
     }
 }
 
@@ -2185,7 +2264,7 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
                     u64::from(payload.range().count()),
                 );
             }
-            HeaderSyncAction::QueryBestHeaderTip => {
+            HeaderSyncAction::QueryBestHeaderTip { .. } => {
                 insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
             }
             HeaderSyncAction::QueryHeadersByHeightRange {
@@ -2358,6 +2437,7 @@ fn trace_state_read_error(
 fn commit_failure_result_label(kind: HeaderSyncCommitFailureKind) -> &'static str {
     match kind {
         HeaderSyncCommitFailureKind::InvalidPeerRange => "invalid_peer_range",
+        HeaderSyncCommitFailureKind::UnknownAnchor => "unknown_anchor",
         HeaderSyncCommitFailureKind::Local => "local_error",
     }
 }

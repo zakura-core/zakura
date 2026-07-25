@@ -11720,6 +11720,81 @@ async fn reactor_exchange_reanchor_requeries_while_downloads_in_flight() {
 }
 
 #[tokio::test]
+async fn reactor_exchange_reanchor_at_same_height_resets_in_flight_downloads() {
+    let blocks = mainnet_blocks_1_to_3();
+    let mut config = immediate_body_download_config();
+    config.max_inflight_block_bytes =
+        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
+    config.request_timeout = Duration::from_secs(300);
+
+    let initial = test_frontier_update(0, 0, 3, FrontierChange::Snapshot);
+    let (exchange, startup) = exchange_block_sync_startup(initial, config.clone());
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        68,
+        block::Height(3),
+        block::Hash([93; 32]),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(
+            blocks.iter().map(block_meta).collect(),
+        ))
+        .await
+        .expect("old-fork needed metadata queues");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 3)
+    );
+
+    let mut reanchored = test_frontier_update(0, 0, 3, FrontierChange::HeaderReanchored);
+    reanchored.frontier.best_header.hash = block::Hash([93; 32]);
+    exchange.publish_frontier(reanchored, "test");
+    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
+
+    let registry = handle
+        .routine_wiring
+        .as_ref()
+        .expect("spawned reactor provides routine wiring")
+        .registry
+        .clone();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if !(1..=3).any(|height| registry.has_outstanding_height(block::Height(height))) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("same-height reanchor clears stale peer ownership");
+
+    let new_fork_meta = (1..=3).map(|height| BlockSyncBlockMeta {
+        height: block::Height(height),
+        hash: block::Hash([90 + u8::try_from(height).expect("test height fits u8"); 32]),
+        size: BlockSizeEstimate::Advertised(10_000),
+    });
+    handle
+        .send(BlockSyncEvent::NeededBlocks(new_fork_meta.collect()))
+        .await
+        .expect("new-fork needed metadata queues after same-height reanchor");
+
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 3),
+        "same-height reanchor must release stale ownership and reschedule the range"
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
 async fn reactor_exchange_reanchor_releases_stale_submitted_bodies() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();

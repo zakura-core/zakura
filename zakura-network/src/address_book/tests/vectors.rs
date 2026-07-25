@@ -69,11 +69,10 @@ fn gossiped_change(
 /// Regression test for https://github.com/ZcashFoundation/zebra/issues/10580.
 ///
 /// Applying a ban-threshold misbehavior update with
-/// `max_connections_per_ip > 1` previously panicked because the ban branch
-/// unconditionally unwrapped `most_recent_by_ip`, which is only populated when
-/// `max_connections_per_ip == 1`.
+/// `max_connections_per_ip > 1` must remove every address for the banned IP,
+/// even when peer priority separates those addresses in `by_addr`.
 #[test]
-fn misbehavior_ban_does_not_panic_with_max_connections_per_ip_above_one() {
+fn misbehavior_ban_removes_all_addresses_for_ip() {
     let banned_addr: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
     let other_port_same_ip: crate::PeerSocketAddr = "127.0.0.1:8234".parse().unwrap();
     let unrelated_addr: crate::PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
@@ -101,8 +100,24 @@ fn misbehavior_ban_does_not_panic_with_max_connections_per_ip_above_one() {
     ));
     address_book.peers.assert_consistent();
 
+    // Put the banned and unrelated addresses in the Responded state, leaving
+    // the other same-IP address in the lower-priority gossiped state.
+    address_book.update(MetaAddr::new_reconnect(banned_addr));
+    address_book.update(MetaAddr::new_responded(banned_addr, None));
+    address_book.update(MetaAddr::new_reconnect(unrelated_addr));
+    address_book.update(MetaAddr::new_responded(unrelated_addr, None));
+
     assert!(address_book.get(banned_addr).is_some());
     assert!(address_book.get(other_port_same_ip).is_some());
+
+    let ordered_addrs: Vec<_> = address_book.peers().map(|peer| peer.addr()).collect();
+    let same_ip_positions: Vec<_> = ordered_addrs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, addr)| (addr.ip() == banned_addr.ip()).then_some(index))
+        .collect();
+    assert_eq!(same_ip_positions.len(), 2);
+    assert!(same_ip_positions[1] > same_ip_positions[0] + 1);
 
     let bans = address_book.bans();
     assert_eq!(address_metrics.borrow_and_update().num_addresses, 3);
@@ -123,7 +138,7 @@ fn misbehavior_ban_does_not_panic_with_max_connections_per_ip_above_one() {
     );
     assert!(
         address_book.get(other_port_same_ip).is_none(),
-        "all addresses on the banned IP should be removed from the address book"
+        "all addresses for the banned IP should be removed from the address book"
     );
     assert!(
         address_book.get(unrelated_addr).is_some(),

@@ -125,6 +125,7 @@ jobs:
               zakura-chain/src/parameters/* | \
               zakura-consensus/src/config.rs | \
               zakura-network/src/config.rs | zakura-network/src/config/* | \
+              zakura-network/src/zakura/handler.rs | \
               zakura-rpc/src/config.rs | zakura-rpc/src/config/* | \
               zakura-state/src/config.rs | \
               zakurad/tests/acceptance.rs | zakurad/tests/common/* | \

@@ -913,17 +913,17 @@ where
         self.select_p2c_peer_from_list(&self.ready_services.keys().copied().collect())
     }
 
-    /// Returns true if pruned peers are eligible for generic block downloads.
-    fn pruned_peers_are_block_download_eligible(&self) -> bool {
+    /// Returns true if pruned peers are eligible for generic block requests.
+    fn pruned_peers_are_block_request_eligible(&self) -> bool {
         self.minimum_peer_version
             .chain_tip()
             .estimate_distance_to_network_chain_tip(&self.network)
             .is_some_and(|(distance, _)| distance <= PRUNED_PEER_BLOCK_ROUTING_MAX_TIP_DISTANCE)
     }
 
-    /// Returns ready peers eligible for generic block downloads.
-    fn ready_generic_block_peers(&self) -> HashSet<D::Key> {
-        let include_pruned = self.pruned_peers_are_block_download_eligible();
+    /// Returns ready peers eligible for generic block requests.
+    fn ready_generic_block_request_peers(&self) -> HashSet<D::Key> {
+        let include_pruned = self.pruned_peers_are_block_request_eligible();
 
         self.ready_services
             .iter()
@@ -1049,8 +1049,8 @@ where
 
     /// Routes a request using P2C load-balancing.
     fn route_p2c(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        let peer = if matches!(&req, Request::BlocksByHash(_)) {
-            self.select_p2c_peer_from_list(&self.ready_generic_block_peers())
+        let peer = if matches!(&req, Request::BlocksByHash(_) | Request::FindBlocks { .. }) {
+            self.select_p2c_peer_from_list(&self.ready_generic_block_request_peers())
         } else {
             self.select_ready_p2c_peer()
         };
@@ -1207,7 +1207,7 @@ where
             .copied()
             .collect();
         let block_request = matches!(hash, InventoryHash::Block(_));
-        let include_pruned = !block_request || self.pruned_peers_are_block_download_eligible();
+        let include_pruned = !block_request || self.pruned_peers_are_block_request_eligible();
         let maybe_peer_list: HashSet<_> = self
             .ready_services
             .iter()

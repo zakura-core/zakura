@@ -16,14 +16,6 @@ inputs:
   tag:
     description: "Droplet tag. Must be one the reaper sweeps, and is applied at creation so a later failure cannot leak an untagged droplet."
     required: true
-  region:
-    description: "DigitalOcean region"
-    required: false
-    default: "nyc3"
-  image:
-    description: "Image ID or slug. Empty resolves the newest zakura-pr-node-* bake."
-    required: false
-    default: ""
   state_network:
     description: "Attach a clone of the newest zakura-pr-state-<network>-* snapshot (mainnet/testnet). Empty starts with no state volume."
     required: false
@@ -57,19 +49,16 @@ runs:
       id: image
       shell: bash
       env:
-        IMAGE: ${{ inputs.image }}
         STATE_NETWORK: ${{ inputs.state_network }}
         VOLUME_NAME: ${{ inputs.volume_name }}
       run: |
         set -euo pipefail
+        # Image names are timestamped, so the lexical max is the newest bake.
+        IMAGE=$(doctl compute image list-user --format ID,Name --no-header | \
+          awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | tail -1 | awk '{print $2}')
         if [ -z "${IMAGE}" ]; then
-          # Names are timestamped, so the lexical max is the newest bake.
-          IMAGE=$(doctl compute image list-user --format ID,Name --no-header | \
-            awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | tail -1 | awk '{print $2}')
-          if [ -z "${IMAGE}" ]; then
-            echo "no zakura-pr-node-* image found; run the 'PR node image bake' workflow first" >&2
-            exit 1
-          fi
+          echo "no zakura-pr-node-* image found; run the 'PR node image bake' workflow first" >&2
+          exit 1
         fi
         echo "image_id=${IMAGE}" >> "$GITHUB_OUTPUT"
 
@@ -95,7 +84,6 @@ runs:
       shell: bash
       env:
         NAME: ${{ inputs.name }}
-        REGION: ${{ inputs.region }}
         DROPLET_SIZE: ${{ inputs.size }}
         SSH_FINGERPRINT: ${{ inputs.ssh_fingerprint }}
         TAG: ${{ inputs.tag }}
@@ -104,13 +92,15 @@ runs:
         VOLUME_NAME: ${{ inputs.volume_name }}
       run: |
         set -euo pipefail
+        # nyc3 throughout: it must match the region the bake ran in, since the
+        # image and volume snapshots only exist there.
         VOLUME_ARGS=()
         if [ -n "${VOL_SNAP_ID}" ]; then
           # A snapshot restore cannot shrink, so the clone takes the snapshot's
           # own minimum disk size.
           SIZE=$(doctl compute snapshot get "${VOL_SNAP_ID}" --format MinDiskSize --no-header)
           VOLUME_ID=$(doctl compute volume create "${VOLUME_NAME}" \
-            --region "${REGION}" --snapshot "${VOL_SNAP_ID}" --size "${SIZE}GiB" \
+            --region nyc3 --snapshot "${VOL_SNAP_ID}" --size "${SIZE}GiB" \
             --format ID --no-header)
           VOLUME_ARGS=(--volumes "${VOLUME_ID}")
           # Publish the volume before creating the droplet: a droplet create
@@ -122,7 +112,7 @@ runs:
           } >> "$GITHUB_OUTPUT"
         fi
         doctl compute droplet create "${NAME}" \
-          --region "${REGION}" \
+          --region nyc3 \
           --size "${DROPLET_SIZE}" \
           --image "${IMAGE_ID}" \
           --ssh-keys "${SSH_FINGERPRINT}" \

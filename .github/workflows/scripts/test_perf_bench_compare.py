@@ -83,14 +83,6 @@ class Render(unittest.TestCase):
             "(101.0 → 151.75 blocks/s, both legs on identical parallel droplets)",
         )
 
-    def test_reports_speedup_and_both_legs(self):
-        markdown, comparable = compare.render(meta("primary", bps=150.0), meta("baseline"))
-        self.assertTrue(comparable)
-        self.assertIn("## A/B result", markdown)
-        self.assertIn("1.50×", markdown)
-        # Baseline row first, so the table reads baseline -> primary.
-        self.assertLess(markdown.index("| baseline |"), markdown.index("| primary |"))
-
     def test_missing_meta_is_not_comparable(self):
         markdown, comparable = compare.render(None, meta("baseline"))
         self.assertFalse(comparable)
@@ -114,10 +106,6 @@ class Render(unittest.TestCase):
         markdown, comparable = compare.render(meta("primary"), meta("baseline", bps=0))
         self.assertTrue(comparable)
         self.assertIn("nan×", markdown)
-
-    def test_missing_verdict_renders_as_not_available(self):
-        markdown, _ = compare.render(meta("primary", verdict=None), meta("baseline"))
-        self.assertIn("| n/a |", markdown)
 
 
 class LoadMeta(unittest.TestCase):

@@ -1,22 +1,10 @@
 name: "Wait for droplet SSH"
-description: "Poll a freshly created droplet until it accepts SSH, or fail."
+description: "Poll a freshly created droplet for up to 5 minutes until it accepts SSH, or fail."
 
 inputs:
   ip:
     description: "Droplet public IPv4"
     required: true
-  ssh_key_path:
-    description: "SSH private key written by the do-cli action"
-    required: false
-    default: "/tmp/do_ssh"
-  attempts:
-    description: "Number of connection attempts"
-    required: false
-    default: "30"
-  delay:
-    description: "Seconds between attempts"
-    required: false
-    default: "10"
 
 runs:
   using: composite
@@ -25,16 +13,13 @@ runs:
       shell: bash
       env:
         IP: ${{ inputs.ip }}
-        SSH_KEY_PATH: ${{ inputs.ssh_key_path }}
-        ATTEMPTS: ${{ inputs.attempts }}
-        DELAY: ${{ inputs.delay }}
       run: |
         set -euo pipefail
-        for _ in $(seq 1 "${ATTEMPTS}"); do
+        for _ in $(seq 1 30); do
           if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-               -o ConnectTimeout=5 -i "${SSH_KEY_PATH}" "root@${IP}" true 2>/dev/null; then
+               -o ConnectTimeout=5 -i /tmp/do_ssh "root@${IP}" true 2>/dev/null; then
             echo "SSH up"; exit 0
           fi
-          sleep "${DELAY}"
+          sleep 10
         done
         echo "SSH did not come up in time"; exit 1

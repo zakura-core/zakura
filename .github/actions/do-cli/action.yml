@@ -1,22 +1,14 @@
 name: "DigitalOcean CLI"
-description: "Install and authenticate doctl, and optionally write the fleet SSH key."
+description: "Install and authenticate doctl, and optionally write the fleet SSH key to /tmp/do_ssh."
 
 inputs:
   token:
     description: "DigitalOcean API token (secrets.DIGITALOCEAN_ACCESS_TOKEN)"
     required: true
   ssh_private_key:
-    description: "Optional SSH private key to write (secrets.DO_SSH_PRIVATE_KEY). Omit for API-only jobs like the reaper."
+    description: "Optional SSH private key (secrets.DO_SSH_PRIVATE_KEY). Omit for API-only jobs like the reaper."
     required: false
     default: ""
-  ssh_key_path:
-    description: "Where to write the SSH private key. Calling workflows hardcode /tmp/do_ssh in their own scp/ssh steps, so overriding this means overriding do-wait-ssh and those steps too."
-    required: false
-    default: "/tmp/do_ssh"
-  version:
-    description: "doctl release to install"
-    required: false
-    default: "1.120.0"
 
 runs:
   using: composite
@@ -28,20 +20,21 @@ runs:
       shell: bash
       env:
         DIGITALOCEAN_ACCESS_TOKEN: ${{ inputs.token }}
-        DOCTL_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
+        DOCTL_VERSION=1.120.0
         curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
         sudo install /tmp/doctl /usr/local/bin/doctl
         doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
 
+    # /tmp/do_ssh is hardcoded here and in do-wait-ssh because every calling
+    # workflow's own scp/ssh steps use that path too.
     - name: Write SSH key
       if: inputs.ssh_private_key != ''
       shell: bash
       env:
         DO_SSH_PRIVATE_KEY: ${{ inputs.ssh_private_key }}
-        SSH_KEY_PATH: ${{ inputs.ssh_key_path }}
       run: |
         set -euo pipefail
-        install -m 600 /dev/null "${SSH_KEY_PATH}"
-        printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > "${SSH_KEY_PATH}"
+        install -m 600 /dev/null /tmp/do_ssh
+        printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh

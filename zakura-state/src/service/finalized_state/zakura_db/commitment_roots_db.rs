@@ -2183,8 +2183,8 @@ mod tests {
                 stale_state,
                 affected_state.authenticated_hash,
                 Height(2),
-                &[successor.header.clone()],
-                &[successor_roots.clone()],
+                std::slice::from_ref(&successor.header),
+                std::slice::from_ref(&successor_roots),
             ),
             Err(AuthenticateHeaderRootsError::StaleState { .. })
         ));
@@ -2197,7 +2197,7 @@ mod tests {
                 affected_state.authenticated_hash,
                 Height(2),
                 &[Arc::new(noncanonical_header)],
-                &[successor_roots.clone()],
+                std::slice::from_ref(&successor_roots),
             ),
             Err(AuthenticateHeaderRootsError::NonCanonicalHeader { height: Height(2) })
         ));
@@ -2214,8 +2214,8 @@ mod tests {
                 affected_state,
                 affected_state.authenticated_hash,
                 Height(2),
-                &[successor.header.clone()],
-                &[successor_roots.clone()],
+                std::slice::from_ref(&successor.header),
+                std::slice::from_ref(&successor_roots),
             )
             .expect("one-record authentication recovers the missing witness");
 
@@ -2246,7 +2246,7 @@ mod tests {
                 recovered.state,
                 recovered.state.authenticated_hash,
                 Height(2),
-                &[successor.header.clone()],
+                std::slice::from_ref(&successor.header),
                 &[successor_roots],
             ),
             Err(AuthenticateHeaderRootsError::WitnessAlreadyPresent { .. })
@@ -2317,7 +2317,7 @@ mod tests {
                 affected,
                 affected.authenticated_hash,
                 Height(2),
-                &[successor.header.clone()],
+                std::slice::from_ref(&successor.header),
                 &[successor_roots],
             ),
             Err(AuthenticateHeaderRootsError::WitnessNotNeeded {

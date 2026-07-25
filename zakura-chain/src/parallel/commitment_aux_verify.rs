@@ -23,6 +23,10 @@ use crate::{
 pub struct VerifiedHeaderCommitmentRoots {
     confirmed_roots: Vec<BlockCommitmentRoots>,
     confirmed_hashes: Vec<block::Hash>,
+    /// The final supplied header, present for every non-empty verified delivery.
+    ///
+    /// It is retained as the successor witness for the confirmed roots, including for a
+    /// one-item delivery that only recovers a missing witness and confirms no new roots.
     header_witness: Option<HeaderWitness>,
     history_tree: HistoryTree,
 }

@@ -211,8 +211,8 @@ fn vct_header_witness_uses_stored_header_without_body() {
             affected,
             affected.authenticated_hash,
             Height(2),
-            &[block2.header.clone()],
-            &[block2_roots.clone()],
+            std::slice::from_ref(&block2.header),
+            std::slice::from_ref(&block2_roots),
         )
         .expect("the one-record delivery recovers the witness");
     assert_eq!(

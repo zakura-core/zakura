@@ -38,6 +38,7 @@ pub(super) struct HeaderSyncCore {
     pub(super) verified_block_hash: block::Hash,
     pub(super) best_header_tip: block::Height,
     pub(super) best_header_hash: block::Hash,
+    pub(super) frontier_generation: u64,
     pub(super) body_sync_target: (block::Height, block::Hash),
     pub(super) header_root_auth: Option<HeaderRootAuthState>,
     pub(super) root_auth_waiting_for_watch: bool,
@@ -64,17 +65,11 @@ impl HeaderSyncCore {
                 verified_block_tip: startup.frontiers.verified_block_tip,
             });
         }
-        let (best_header_tip, best_header_hash) = startup
-            .best_header_tip
-            .filter(|(height, hash)| {
-                *height > startup.frontiers.verified_block_tip
-                    || (*height == startup.frontiers.verified_block_tip
-                        && *hash == startup.frontiers.verified_block_hash)
-            })
-            .unwrap_or((
-                startup.frontiers.verified_block_tip,
-                startup.frontiers.verified_block_hash,
-            ));
+        // Header range commits can only anchor to the durable header view. In
+        // particular, a restored non-finalized body tip can be ahead of that
+        // view, so using the verified-body frontier here would make the first
+        // post-restart range fail with `UnknownAnchor`.
+        let (best_header_tip, best_header_hash) = startup.best_header_tip.unwrap_or(startup.anchor);
         let body_sync_target =
             startup
                 .header_root_auth
@@ -92,6 +87,7 @@ impl HeaderSyncCore {
             verified_block_hash: startup.frontiers.verified_block_hash,
             best_header_tip,
             best_header_hash,
+            frontier_generation: 0,
             body_sync_target,
             header_root_auth: startup.header_root_auth,
             root_auth_waiting_for_watch: false,
@@ -254,6 +250,7 @@ impl HeaderSyncCore {
             return;
         };
         if self.root_auth_coverage_expected_from_forward(start)
+            || self.root_auth_operation_pending_at(start)
             || self.retained_roots.contains_key(&start)
         {
             return;
@@ -269,6 +266,15 @@ impl HeaderSyncCore {
         if batch_count == 0 {
             return;
         }
+
+        let mut batch_start = self
+            .schedule
+            .retain_contiguous_root_auth_from(start)
+            .unwrap_or(start);
+        self.buffered.retain(|(priority, buffered_start), _| {
+            *priority != RangePriority::AuthenticateRoots
+                || self.schedule.has_root_auth_start(*buffered_start)
+        });
 
         let resident_cap = u64::from(batch_count.saturating_mul(HEADER_SYNC_MAX_RESIDENT_BATCHES));
         let available = resident_cap.saturating_sub(
@@ -313,11 +319,6 @@ impl HeaderSyncCore {
             return;
         }
 
-        let mut batch_start = self
-            .schedule
-            .highest_end(RangePriority::AuthenticateRoots)
-            .unwrap_or(start)
-            .max(start);
         let mut added = 0u64;
         while batch_start < end && remaining >= 2 {
             let count = count_between(batch_start, end)
@@ -433,6 +434,12 @@ impl HeaderSyncCore {
             })
     }
 
+    fn root_auth_operation_pending_at(&self, start: block::Height) -> bool {
+        self.pending_operations
+            .values()
+            .any(|pending| pending.root_auth.is_some() && pending.range.start_height() == start)
+    }
+
     pub(super) fn admit_retained_root_payload(
         &mut self,
         wire_request: HeaderSyncWireRequestIdentity,
@@ -524,6 +531,28 @@ impl HeaderSyncCore {
     pub(super) fn clear_retained_roots(&mut self, reason: &'static str) {
         let dropped = self.retained_roots.len();
         self.retained_roots.clear();
+        if dropped > 0 {
+            metrics::counter!(
+                "sync.header.root_auth.retain.dropped",
+                "reason" => reason
+            )
+            .increment(dropped as u64);
+        }
+    }
+
+    pub(super) fn clear_unowned_retained_roots(&mut self, reason: &'static str) {
+        let owned_starts: HashSet<_> = self
+            .pending_operations
+            .values()
+            .filter_map(|pending| match pending.root_auth.map(|auth| auth.source) {
+                Some(RootAuthSource::Retained(start)) => Some(start),
+                Some(RootAuthSource::Fallback) | None => None,
+            })
+            .collect();
+        let before = self.retained_roots.len();
+        self.retained_roots
+            .retain(|start, _| owned_starts.contains(start));
+        let dropped = before.saturating_sub(self.retained_roots.len());
         if dropped > 0 {
             metrics::counter!(
                 "sync.header.root_auth.retain.dropped",

@@ -370,7 +370,17 @@ impl HeaderWorkQueue {
         self.forward.clear();
         self.active
             .retain(|range, _| range.priority != RangePriority::Forward);
+        self.delayed_retries
+            .retain(|(_, priority), _| *priority != RangePriority::Forward);
+        self.retry_avoidance.retain(|_, ranges| {
+            ranges.retain(|(_, priority), _| *priority != RangePriority::Forward);
+            !ranges.is_empty()
+        });
+        self.covered.clear();
         self.rebuild_start_indexes();
+        if self.authenticate_roots.is_empty() && self.active.is_empty() {
+            self.oldest_missing_since = None;
+        }
         metrics::counter!("sync.header.work.reset").increment(1);
     }
 
@@ -380,7 +390,75 @@ impl HeaderWorkQueue {
             .retain(|range, _| range.priority != RangePriority::AuthenticateRoots);
         self.delayed_retries
             .retain(|(_, priority), _| *priority != RangePriority::AuthenticateRoots);
+        self.retry_avoidance.retain(|_, ranges| {
+            ranges.retain(|(_, priority), _| *priority != RangePriority::AuthenticateRoots);
+            !ranges.is_empty()
+        });
         self.rebuild_start_indexes();
+    }
+
+    /// Keep only the root-authentication chain that starts at `start`.
+    ///
+    /// Each root-authentication range repeats its predecessor's terminal header
+    /// as a successor witness, so a usable speculative chain has each next
+    /// range start at the previous range's end. Ranges above a gap cannot
+    /// authenticate the current frontier and must not consume resident capacity.
+    pub(super) fn retain_contiguous_root_auth_from(
+        &mut self,
+        start: block::Height,
+    ) -> Option<block::Height> {
+        let mut kept_starts = HashSet::new();
+        let mut next_start = start;
+
+        loop {
+            let next_range = self
+                .authenticate_roots
+                .iter()
+                .chain(self.active.keys())
+                .find(|range| {
+                    range.priority == RangePriority::AuthenticateRoots
+                        && range.start_height() == next_start
+                })
+                .copied();
+            let Some(next_range) = next_range else {
+                break;
+            };
+            if !kept_starts.insert(next_start) {
+                break;
+            }
+            let next_end = next_range.end_height();
+            if next_end <= next_start {
+                break;
+            }
+            next_start = next_end;
+        }
+
+        self.authenticate_roots
+            .retain(|range| kept_starts.contains(&range.start_height()));
+        self.active.retain(|range, _| {
+            range.priority != RangePriority::AuthenticateRoots
+                || kept_starts.contains(&range.start_height())
+        });
+        self.delayed_retries.retain(|(height, priority), _| {
+            *priority != RangePriority::AuthenticateRoots || kept_starts.contains(height)
+        });
+        self.retry_avoidance.retain(|_, ranges| {
+            ranges.retain(|(height, priority), _| {
+                *priority != RangePriority::AuthenticateRoots || kept_starts.contains(height)
+            });
+            !ranges.is_empty()
+        });
+        self.rebuild_start_indexes();
+
+        (!kept_starts.is_empty()).then_some(next_start)
+    }
+
+    pub(super) fn has_root_auth_start(&self, start: block::Height) -> bool {
+        self.pending_starts
+            .contains(&(RangePriority::AuthenticateRoots, start))
+            || self
+                .active_starts
+                .contains(&(RangePriority::AuthenticateRoots, start))
     }
 
     /// Drop pending/active root-auth ranges whose start is strictly below `start`.
@@ -463,14 +541,6 @@ impl HeaderWorkQueue {
             self.active.get(&range),
             Some(HeaderWorkState::InFlight { peer: owner }) if owner == peer
         )
-    }
-
-    pub(super) fn mark_height_covered(&mut self, height: block::Height) {
-        self.mark_covered_interval(CoveredRange {
-            start: height,
-            end: height,
-        });
-        self.prune_covered();
     }
 
     pub(super) fn mark_range_covered(&mut self, start: block::Height, end: block::Height) {
@@ -844,6 +914,36 @@ mod tests {
     }
 
     #[test]
+    fn root_auth_contiguity_prunes_ranges_above_a_frontier_gap() {
+        let mut queue = HeaderWorkQueue::new();
+        let first = range(1, 3, RangePriority::AuthenticateRoots);
+        let next = range(3, 3, RangePriority::AuthenticateRoots);
+        let orphan = range(8, 3, RangePriority::AuthenticateRoots);
+        let forward = range(1, 3, RangePriority::Forward);
+        queue.ensure(first, RangePriority::AuthenticateRoots);
+        queue.ensure(next, RangePriority::AuthenticateRoots);
+        queue.ensure(orphan, RangePriority::AuthenticateRoots);
+        queue.ensure_forward(forward);
+
+        assert_eq!(
+            queue.retain_contiguous_root_auth_from(block::Height(1)),
+            Some(block::Height(5))
+        );
+        assert_eq!(
+            queue.authenticate_roots.iter().copied().collect::<Vec<_>>(),
+            vec![first, next]
+        );
+        assert!(queue.forward.contains(&forward));
+
+        assert_eq!(
+            queue.retain_contiguous_root_auth_from(block::Height(2)),
+            None
+        );
+        assert!(queue.authenticate_roots.is_empty());
+        assert!(queue.forward.contains(&forward));
+    }
+
+    #[test]
     fn partial_forward_coverage_preserves_the_interior_suffix() {
         let mut queue = HeaderWorkQueue::new();
         let first = range(1, 2, RangePriority::Forward);
@@ -1035,7 +1135,7 @@ mod tests {
         queue.mark_committing(operation.clone(), committing);
 
         queue.mark_range_covered(block::Height(1), block::Height(2));
-        queue.mark_height_covered(block::Height(3));
+        queue.mark_range_covered(block::Height(3), block::Height(3));
 
         assert_eq!(
             queue.covered,
@@ -1053,6 +1153,67 @@ mod tests {
 
         queue.ensure_forward(pending);
         assert_eq!(queue.pending_len(), 0);
+    }
+
+    #[test]
+    fn clearing_forward_work_preserves_root_authentication_work() {
+        let mut queue = HeaderWorkQueue::new();
+        let owner = peer(15);
+        let forward_pending = range(1, 1, RangePriority::Forward);
+        let forward_active = range(2, 1, RangePriority::Forward);
+        let forward_delayed = range(3, 1, RangePriority::Forward);
+        let forward_avoided = range(4, 1, RangePriority::Forward);
+        let root_pending = range(10, 2, RangePriority::AuthenticateRoots);
+        let root_active = range(12, 2, RangePriority::AuthenticateRoots);
+        let root_delayed = range(14, 2, RangePriority::AuthenticateRoots);
+        let root_avoided = range(16, 2, RangePriority::AuthenticateRoots);
+
+        queue.ensure_forward(forward_pending);
+        queue.mark_assigned(owner.clone(), forward_active);
+        queue.retry_delayed(forward_delayed);
+        queue.retry_avoiding(owner.clone(), forward_avoided);
+        queue.mark_range_covered(block::Height(20), block::Height(22));
+
+        queue.ensure(root_pending, RangePriority::AuthenticateRoots);
+        queue.mark_assigned(owner.clone(), root_active);
+        queue.retry_delayed(root_delayed);
+        queue.retry_avoiding(owner.clone(), root_avoided);
+
+        queue.clear_forward();
+
+        assert!(queue.forward.is_empty());
+        assert!(queue
+            .active
+            .keys()
+            .all(|range| range.priority != RangePriority::Forward));
+        assert!(queue
+            .delayed_retries
+            .keys()
+            .all(|(_, priority)| *priority != RangePriority::Forward));
+        assert!(queue.retry_avoidance.values().all(|ranges| {
+            ranges
+                .keys()
+                .all(|(_, priority)| *priority != RangePriority::Forward)
+        }));
+        assert!(queue.covered.is_empty());
+
+        assert_eq!(
+            queue
+                .authenticate_roots
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from([root_pending, root_delayed, root_avoided])
+        );
+        assert!(matches!(
+            queue.state(root_active),
+            Some(HeaderWorkState::InFlight { peer }) if peer == &owner
+        ));
+        assert!(queue
+            .delayed_retries
+            .contains_key(&(root_delayed.start_height(), root_delayed.priority)));
+        assert!(queue.retry_avoidance[&owner]
+            .contains_key(&(root_avoided.start_height(), root_avoided.priority)));
     }
 
     #[test]

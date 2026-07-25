@@ -55,7 +55,8 @@ Deploys are manual, SSH-based, and run from self-hosted deployer runners; there 
 - **`zakura-pr-node.yml`** — ephemeral one-hour real-node test of a PR or ref: boots a droplet from the pre-baked image, attaches a chain-state snapshot clone (`tip`, `sandblast`, or `genesis`), builds the branch incrementally, runs it, and posts a metrics summary as a PR comment. The droplet stays up for SSH inspection until the reaper removes it.
 - **`zakura-pr-node-bake.yml`** — weekly bake of the golden PR-node droplet image (build deps, warm cargo cache) and per-network chain-state volume snapshots.
 - **`zakura-pr-node-reaper.yml`** — hourly TTL cleanup backstop for PR-node droplets, volumes, images, and snapshots.
-- **`checkpoint-sync-bench.yml`** — manual checkpoint-zone sync benchmark on the `zakura-bench` self-hosted runner, with a persistent metrics dashboard. See the workflow header for one-time runner setup.
+- **`checkpoint-sync-bench.yml`** — manual fixed-height sync benchmark with checkpoint or semantic verification on the `zakura-bench` self-hosted runner, with a persistent metrics dashboard. See the workflow header for one-time runner setup.
+- **`zakura-perf-bench.yml`** — CPU profiles mainnet workloads on ephemeral droplets. Historical mode restores `sandblast` state for fixed-height throughput and optional parallel A/B; live-head mode uses the production default P2P stack, catches up from the baked pruned tip, and requires head health throughout one observational profile window. Both produce flamegraphs, CPU counters, metrics, available traces, and block-latency digests (see `docs/cpu-profiling.md`).
 
 These workflows use the helper scripts in `.github/workflows/scripts/` (`pr-node-bake.sh`, `pr-node-run.sh`, `pr-node-monitor.py`).
 

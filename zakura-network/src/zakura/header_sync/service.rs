@@ -428,7 +428,7 @@ pub(crate) async fn drive_header_sync_actions(
                     "suppressing header-root authentication until state driver is wired"
                 );
             }
-            HeaderSyncAction::QueryBestHeaderTip
+            HeaderSyncAction::QueryBestHeaderTip { .. }
             | HeaderSyncAction::QueryMissingBlockBodies { .. }
             | HeaderSyncAction::BodyGaps { .. }
             | HeaderSyncAction::HeaderAdvanced { .. }

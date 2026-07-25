@@ -66,6 +66,14 @@ on:
       download_concurrency_limit:
         required: false
         default: "150"
+      verify_mode:
+        description: "Verification mode: checkpoint, or semantic (consensus.checkpoint_sync=false; full script+proof verification past the mandatory checkpoints)"
+        required: false
+        default: "checkpoint"
+      full_verify_concurrency_limit:
+        description: "Concurrent semantic block verifications (1 approximates near-tip block-at-a-time)"
+        required: false
+        default: "20"
       target_p2p_stack:
         description: "Target/primary P2P stack: legacy | zakura | dual"
         required: false
@@ -113,6 +121,8 @@ jobs:
           PEERSET_SIZE: ${{ inputs.peerset_size }}
           CKPT_LIMIT: ${{ inputs.checkpoint_verify_concurrency_limit }}
           DL_LIMIT: ${{ inputs.download_concurrency_limit }}
+          VERIFY_MODE: ${{ inputs.verify_mode }}
+          FULL_VERIFY_LIMIT: ${{ inputs.full_verify_concurrency_limit }}
           TARGET_P2P_STACK: ${{ inputs.target_p2p_stack }}
           BASELINE_P2P_STACK: ${{ inputs.baseline_p2p_stack }}
           SNAPSHOT_URL: ${{ vars.BENCH_SNAPSHOT_URL || 'https://zakura.valargroup.dev/mainnet/historical/zakura-mainnet-20260717T095333Z-1707210.tar.zst' }}

@@ -1361,6 +1361,117 @@ fn work_queue_extend_dedups_against_pending_in_flight_and_floor() {
 }
 
 #[test]
+fn work_queue_first_unclaimed_above_is_floor_anchored_not_frontier_anchored() {
+    // Nothing claimed: the cursor sits just above the floor.
+    let queue = work_queue_with(5, []);
+    assert_eq!(
+        queue.first_unclaimed_above(block::Height(5)),
+        Some(block::Height(6)),
+    );
+
+    // A gap-free claimed run: the cursor is the height after it, and stays there
+    // across the pending -> in_flight transition.
+    let queue = work_queue_with(
+        5,
+        (6..=9).map(|height| needed(height, BlockSizeEstimate::Advertised(100))),
+    );
+    assert_eq!(
+        queue.first_unclaimed_above(block::Height(5)),
+        Some(block::Height(10)),
+    );
+    queue.take_in_range(block::Height(6), block::Height(9), 4);
+    assert_eq!(
+        queue.first_unclaimed_above(block::Height(5)),
+        Some(block::Height(10)),
+    );
+
+    // A height dropped from the claimed set while higher heights stay claimed is
+    // what a destructive `reset_above` racing an unreceived request leaves behind.
+    // The cursor must fall back to it, not stay above the frontier.
+    queue.reset_above(block::Height(5));
+    queue.extend([
+        needed(6, BlockSizeEstimate::Advertised(100)),
+        needed(8, BlockSizeEstimate::Advertised(100)),
+        needed(9, BlockSizeEstimate::Advertised(100)),
+    ]);
+    assert_eq!(
+        queue.first_unclaimed_above(block::Height(5)),
+        Some(block::Height(7)),
+        "an interior hole is the cursor even though higher heights are claimed",
+    );
+
+    // Filling the hole restores the forward cursor.
+    queue.extend([needed(7, BlockSizeEstimate::Advertised(100))]);
+    assert_eq!(
+        queue.first_unclaimed_above(block::Height(5)),
+        Some(block::Height(10)),
+    );
+
+    // A claimed set disconnected from the floor is a hole at the floor itself.
+    let queue = work_queue_with(
+        5,
+        (100..=102).map(|height| needed(height, BlockSizeEstimate::Advertised(100))),
+    );
+    assert_eq!(
+        queue.first_unclaimed_above(block::Height(5)),
+        Some(block::Height(6)),
+    );
+
+    // A lagging caller mirror never rewinds the cursor below the queue's own floor.
+    assert_eq!(
+        queue.first_unclaimed_above(block::Height(1)),
+        Some(block::Height(6)),
+    );
+}
+
+#[test]
+fn work_queue_first_unclaimed_above_ignores_entries_retained_at_or_below_a_forward_reset() {
+    // A *forward* destructive reset pins the floor and pops only the `> floor`
+    // suffix, so the whole `(old_floor, new_floor]` prefix stays claimed at or
+    // below the new floor. Those entries must not count toward the contiguity
+    // check, or they inflate it until a sparse range above the floor reads as
+    // gap-free and the cursor skips the very holes it exists to find.
+    let queue = work_queue_with(
+        5,
+        (6..=20).map(|height| needed(height, BlockSizeEstimate::Advertised(100))),
+    );
+    queue.reset_above(block::Height(12));
+    queue.extend([
+        needed(15, BlockSizeEstimate::Advertised(100)),
+        needed(16, BlockSizeEstimate::Advertised(100)),
+    ]);
+    assert_eq!(
+        queue.first_unclaimed_above(block::Height(12)),
+        Some(block::Height(13)),
+        "13 is unclaimed; the retained 6..=12 prefix must not hide it",
+    );
+
+    // The same holds once the retained prefix is in flight rather than pending.
+    let queue = work_queue_with(
+        5,
+        (6..=20).map(|height| needed(height, BlockSizeEstimate::Advertised(100))),
+    );
+    queue.take_in_range(block::Height(6), block::Height(12), 7);
+    queue.reset_above(block::Height(12));
+    queue.extend([needed(15, BlockSizeEstimate::Advertised(100))]);
+    assert_eq!(
+        queue.first_unclaimed_above(block::Height(12)),
+        Some(block::Height(13)),
+    );
+
+    // With the hole filled, the fast path still reports the forward cursor even
+    // though the retained prefix is present.
+    queue.extend([
+        needed(13, BlockSizeEstimate::Advertised(100)),
+        needed(14, BlockSizeEstimate::Advertised(100)),
+    ]);
+    assert_eq!(
+        queue.first_unclaimed_above(block::Height(12)),
+        Some(block::Height(16)),
+    );
+}
+
+#[test]
 fn work_queue_take_respects_servable_range_contiguity_and_max() {
     // Heights 10,11,12 then a gap then 20,21.
     let queue = work_queue_with(
@@ -2527,6 +2638,72 @@ async fn reactor_suppresses_duplicate_needed_block_query_until_response() {
         .await
         .expect("header-tip event after response queues");
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(4)).await;
+
+    reactor_task.abort();
+}
+
+/// Regression: a body height that is missing from the WorkQueue while *higher*
+/// heights are claimed must still be re-offered by the producer.
+///
+/// Two production stalls reached exactly this state — a destructive
+/// `reset_above` racing an unreceived request, and a refill batch whose
+/// surviving heights advanced the claimed frontier past the one the
+/// `has_outstanding_request` filter dropped. With a `max_claimed() + 1` cursor
+/// the height is never queried again: the download floor pins one below it, the
+/// reorder buffer grows unbounded, and the node stops committing while still
+/// receiving blocks from a dozen servable peers.
+#[tokio::test]
+async fn reactor_requeries_a_height_stranded_below_higher_claimed_work() {
+    let config = immediate_body_download_config();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config,
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let best_hash = block::Hash([10; 32]);
+
+    handle
+        .send(BlockSyncEvent::HeaderTipChanged {
+            height: block::Height(10),
+            hash: best_hash,
+        })
+        .await
+        .expect("header-tip event queues");
+    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(10)).await;
+
+    // The response covers only 5..=8: heights 1..=4 are above the floor, still
+    // body-missing, and now sit below the claimed frontier.
+    handle
+        .send(BlockSyncEvent::NeededBlocks(
+            (5..=8)
+                .map(|height| BlockSyncBlockMeta {
+                    height: block::Height(height),
+                    hash: block::Hash([u8::try_from(height).expect("test height fits u8"); 32]),
+                    size: BlockSizeEstimate::Advertised(1_000),
+                })
+                .collect(),
+        ))
+        .await
+        .expect("needed-block response queues");
+
+    handle
+        .send(BlockSyncEvent::HeaderTipChanged {
+            height: block::Height(10),
+            hash: best_hash,
+        })
+        .await
+        .expect("header-tip event after response queues");
+
+    // Fails on the frontier-anchored cursor, which asks for height 9 and strands
+    // 1..=4 for the lifetime of the process.
+    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(10)).await;
 
     reactor_task.abort();
 }
@@ -11715,6 +11892,81 @@ async fn reactor_exchange_reanchor_requeries_while_downloads_in_flight() {
         "test",
     );
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_exchange_reanchor_at_same_height_resets_in_flight_downloads() {
+    let blocks = mainnet_blocks_1_to_3();
+    let mut config = immediate_body_download_config();
+    config.max_inflight_block_bytes =
+        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
+    config.request_timeout = Duration::from_secs(300);
+
+    let initial = test_frontier_update(0, 0, 3, FrontierChange::Snapshot);
+    let (exchange, startup) = exchange_block_sync_startup(initial, config.clone());
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        68,
+        block::Height(3),
+        block::Hash([93; 32]),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(
+            blocks.iter().map(block_meta).collect(),
+        ))
+        .await
+        .expect("old-fork needed metadata queues");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 3)
+    );
+
+    let mut reanchored = test_frontier_update(0, 0, 3, FrontierChange::HeaderReanchored);
+    reanchored.frontier.best_header.hash = block::Hash([93; 32]);
+    exchange.publish_frontier(reanchored, "test");
+    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
+
+    let registry = handle
+        .routine_wiring
+        .as_ref()
+        .expect("spawned reactor provides routine wiring")
+        .registry
+        .clone();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if !(1..=3).any(|height| registry.has_outstanding_height(block::Height(height))) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("same-height reanchor clears stale peer ownership");
+
+    let new_fork_meta = (1..=3).map(|height| BlockSyncBlockMeta {
+        height: block::Height(height),
+        hash: block::Hash([90 + u8::try_from(height).expect("test height fits u8"); 32]),
+        size: BlockSizeEstimate::Advertised(10_000),
+    });
+    handle
+        .send(BlockSyncEvent::NeededBlocks(new_fork_meta.collect()))
+        .await
+        .expect("new-fork needed metadata queues after same-height reanchor");
+
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 3),
+        "same-height reanchor must release stale ownership and reschedule the range"
+    );
 
     reactor_task.abort();
 }

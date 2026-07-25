@@ -1125,7 +1125,7 @@ mod tests {
                         )))
                         .await;
                 }
-                HeaderSyncAction::QueryBestHeaderTip => {
+                HeaderSyncAction::QueryBestHeaderTip { reanchor_from } => {
                     let (tip_height, tip_hash) = local
                         .store
                         .lock()
@@ -1136,6 +1136,7 @@ mod tests {
                         .send(HeaderSyncEvent::BestHeaderTipLoaded {
                             tip_height,
                             tip_hash,
+                            reanchor_from,
                         })
                         .await;
                 }
@@ -1634,7 +1635,7 @@ mod tests {
                             .send(HeaderSyncEvent::NewBlockDuplicate { peer, height, hash })
                             .await;
                     }
-                    HeaderSyncAction::QueryBestHeaderTip
+                    HeaderSyncAction::QueryBestHeaderTip { .. }
                     | HeaderSyncAction::QueryMissingBlockBodies { .. }
                     | HeaderSyncAction::BodyGaps { .. }
                     | HeaderSyncAction::HeaderAdvanced { .. }

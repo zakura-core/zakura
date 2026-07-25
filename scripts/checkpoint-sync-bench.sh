@@ -24,6 +24,11 @@
 #   FEED_PEER             single pinned peer ip:port           (default 167.99.162.47:8233)
 #   CKPT_LIMIT            checkpoint_verify_concurrency_limit  (default 1500)
 #   DL_LIMIT              download_concurrency_limit           (default 150)
+#   VERIFY_MODE           checkpoint | semantic                (default checkpoint)
+#                         semantic sets consensus.checkpoint_sync = false, so every
+#                         block past the mandatory checkpoints gets full script and
+#                         proof verification (the snapshot tip is past them)
+#   FULL_VERIFY_LIMIT     full_verify_concurrency_limit        (default 20)
 #   TARGET_P2P_STACK            legacy | zakura | dual
 #                               default: zakura
 #   BASELINE_P2P_STACK          same as TARGET_P2P_STACK for the baseline run (default: legacy)
@@ -63,6 +68,8 @@ WALL_CAP="${WALL_CAP:-2000}"
 FEED_PEER="${FEED_PEER-167.99.162.47:8233}"
 CKPT_LIMIT="${CKPT_LIMIT:-1500}"
 DL_LIMIT="${DL_LIMIT:-150}"
+VERIFY_MODE="${VERIFY_MODE:-checkpoint}"
+FULL_VERIFY_LIMIT="${FULL_VERIFY_LIMIT:-20}"
 PEERSET_SIZE="${PEERSET_SIZE:-1}"   # 1 = strict single pinned peer; raise to allow DNS-seeder fallback
 TARGET_P2P_STACK="${TARGET_P2P_STACK:-}"
 BASELINE_P2P_STACK="${BASELINE_P2P_STACK:-}"
@@ -103,6 +110,14 @@ die()  { log "FATAL: $*"; exit 1; }
 
 if ! [[ "$WALL_CAP" =~ ^[0-9]+$ ]]; then
   die "WALL_CAP must be a non-negative integer number of seconds, got '$WALL_CAP'"
+fi
+
+case "$VERIFY_MODE" in
+  checkpoint|semantic) ;;
+  *) die "invalid VERIFY_MODE '$VERIFY_MODE' (use checkpoint or semantic)" ;;
+esac
+if ! [[ "$FULL_VERIFY_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+  die "FULL_VERIFY_LIMIT must be a positive integer, got '$FULL_VERIFY_LIMIT'"
 fi
 
 normalize_bool() {
@@ -480,8 +495,13 @@ run_one() {
       echo '[sync]'
       echo "checkpoint_verify_concurrency_limit = $CKPT_LIMIT"
       echo "download_concurrency_limit = $DL_LIMIT"
-      echo 'full_verify_concurrency_limit = 20'
+      echo "full_verify_concurrency_limit = $FULL_VERIFY_LIMIT"
       echo ''
+      if [[ "$VERIFY_MODE" == "semantic" ]]; then
+        echo '[consensus]'
+        echo 'checkpoint_sync = false'
+        echo ''
+      fi
       echo '[metrics]'
       echo "endpoint_addr = \"127.0.0.1:$METRICS_PORT\""
       echo ''
@@ -491,7 +511,7 @@ run_one() {
   }
 
   local pid t0 mode="p2p_stack"
-  log "starting zakurad ($tag), p2p_stack=$p2p_stack, stop_height=$STOP_HEIGHT, peer=${FEED_PEER:-DNS-seeders}, peerset=$PEERSET_SIZE, cap=${WALL_CAP}s, metrics=:$METRICS_PORT, listen=:$LISTEN_PORT"
+  log "starting zakurad ($tag), p2p_stack=$p2p_stack, verify=$VERIFY_MODE, stop_height=$STOP_HEIGHT, peer=${FEED_PEER:-DNS-seeders}, peerset=$PEERSET_SIZE, cap=${WALL_CAP}s, metrics=:$METRICS_PORT, listen=:$LISTEN_PORT"
   write_config "$mode"
   "$zakurad" -c "$cfg" start >"$logf" 2>&1 &
   pid=$!; CUR_PID="$pid"; t0=$(date +%s); sleep 3
@@ -671,7 +691,12 @@ SUMMARY="${GITHUB_STEP_SUMMARY:-$OUT_DIR/summary.md}"
   echo ""
   echo "- binary source: $MODE \`$PRIMARY_SPEC\`"
   echo "- snapshot start height: **$START_HEIGHT**, stop height: **$STOP_HEIGHT**, feed: \`${FEED_PEER:-DNS seeders}\` (peerset=$PEERSET_SIZE)"
-  echo "- sync knobs: checkpoint_verify=$CKPT_LIMIT, download=$DL_LIMIT"
+  echo "- sync knobs: checkpoint_verify=$CKPT_LIMIT, download=$DL_LIMIT, full_verify=$FULL_VERIFY_LIMIT"
+  if [[ "$VERIFY_MODE" == "semantic" ]]; then
+    echo "- verify mode: **semantic** (consensus.checkpoint_sync = false; full script+proof verification past the mandatory checkpoints)"
+  else
+    echo "- verify mode: checkpoint"
+  fi
   if [[ -n "$GITHUB_RUN_URL" ]]; then
     echo "- GitHub run: [${GITHUB_RUN_ID:-open}]($GITHUB_RUN_URL)"
   fi

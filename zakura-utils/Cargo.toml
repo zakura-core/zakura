@@ -63,7 +63,7 @@ tracing-error = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 
-zakura-node-services = { path = "../zakura-node-services", version = "2.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "3.0.0" }
 zakura-chain = { path = "../zakura-chain", version = "3.0.0" }
 
 # These crates are needed for the zakura-checkpoints binary

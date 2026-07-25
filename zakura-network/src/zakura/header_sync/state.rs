@@ -38,6 +38,7 @@ pub(super) struct HeaderSyncCore {
     pub(super) verified_block_hash: block::Hash,
     pub(super) best_header_tip: block::Height,
     pub(super) best_header_hash: block::Hash,
+    pub(super) frontier_generation: u64,
     pub(super) body_sync_target: (block::Height, block::Hash),
     pub(super) header_root_auth: Option<HeaderRootAuthState>,
     pub(super) root_auth_waiting_for_watch: bool,
@@ -64,17 +65,11 @@ impl HeaderSyncCore {
                 verified_block_tip: startup.frontiers.verified_block_tip,
             });
         }
-        let (best_header_tip, best_header_hash) = startup
-            .best_header_tip
-            .filter(|(height, hash)| {
-                *height > startup.frontiers.verified_block_tip
-                    || (*height == startup.frontiers.verified_block_tip
-                        && *hash == startup.frontiers.verified_block_hash)
-            })
-            .unwrap_or((
-                startup.frontiers.verified_block_tip,
-                startup.frontiers.verified_block_hash,
-            ));
+        // Header range commits can only anchor to the durable header view. In
+        // particular, a restored non-finalized body tip can be ahead of that
+        // view, so using the verified-body frontier here would make the first
+        // post-restart range fail with `UnknownAnchor`.
+        let (best_header_tip, best_header_hash) = startup.best_header_tip.unwrap_or(startup.anchor);
         let body_sync_target =
             startup
                 .header_root_auth
@@ -92,6 +87,7 @@ impl HeaderSyncCore {
             verified_block_hash: startup.frontiers.verified_block_hash,
             best_header_tip,
             best_header_hash,
+            frontier_generation: 0,
             body_sync_target,
             header_root_auth: startup.header_root_auth,
             root_auth_waiting_for_watch: false,

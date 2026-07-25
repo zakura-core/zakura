@@ -1573,8 +1573,8 @@ mod zakura_header_sync_driver_tests {
     use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
 
     use super::zakura::{
-        abandoned_block_apply_finished_event, apply_block_sync_body, block_apply_class,
-        block_sync_chain_tip_event, block_sync_missing_body_window,
+        abandoned_block_apply_finished_event, apply_block_sync_body, best_durable_header_tip,
+        block_apply_class, block_sync_chain_tip_event, block_sync_missing_body_window,
         block_sync_needed_blocks_from_state, block_verify_error_is_duplicate,
         body_sizes_for_served_header_range, chain_tip_mirror_frontier_change,
         coalesce_ready_needed_block_queries, coalesce_stale_needed_block_queries,
@@ -1790,6 +1790,50 @@ mod zakura_header_sync_driver_tests {
         assert_eq!(
             header_range_commit_failure_kind(&error),
             HeaderSyncCommitFailureKind::Local
+        );
+    }
+
+    #[test]
+    fn unknown_anchor_is_local_header_sync_commit_failure() {
+        let error = zakura_state::CommitHeaderRangeError::UnknownAnchor {
+            anchor: block::Hash([0; 32]),
+        };
+
+        assert_eq!(
+            header_range_commit_failure_kind(&error),
+            HeaderSyncCommitFailureKind::UnknownAnchor
+        );
+    }
+
+    #[tokio::test]
+    async fn best_durable_header_tip_uses_the_explicit_durable_read() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let height = block
+            .coinbase_height()
+            .expect("the mainnet block fixture has a height");
+        let hash = block.hash();
+
+        let missing = service_fn(|request: zakura_state::ReadRequest| async move {
+            assert!(matches!(
+                request,
+                zakura_state::ReadRequest::BestDurableHeaderTip
+            ));
+            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::BestDurableHeaderTip(None))
+        });
+        assert_eq!(best_durable_header_tip(missing).await.unwrap(), None);
+
+        let durable = service_fn(move |request: zakura_state::ReadRequest| async move {
+            assert!(matches!(
+                request,
+                zakura_state::ReadRequest::BestDurableHeaderTip
+            ));
+            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::BestDurableHeaderTip(Some(
+                (height, hash),
+            )))
+        });
+        assert_eq!(
+            best_durable_header_tip(durable).await.unwrap(),
+            Some((height, hash))
         );
     }
 
@@ -2380,7 +2424,8 @@ mod zakura_header_sync_driver_tests {
 
     /// End-to-end driver + reactor: an accepted `NewBlock` that did not land on
     /// the best chain (state `Depth` = `None`) must not advance the header
-    /// frontier, while a best-chain accept (`Depth` = `Some`) must.
+    /// frontier, while a best-chain accept (`Depth` = `Some`) advances only
+    /// after the durable tip read confirms its header.
     #[tokio::test]
     async fn new_block_non_best_chain_accept_does_not_advance_header_frontier() {
         let network = zakura_chain::parameters::Network::Mainnet;
@@ -2435,6 +2480,12 @@ mod zakura_header_sync_driver_tests {
                 }
                 zakura_state::ReadRequest::Depth(hash) if hash == best_chain_hash => {
                     Ok(zakura_state::ReadResponse::Depth(Some(0)))
+                }
+                zakura_state::ReadRequest::BestDurableHeaderTip => {
+                    Ok(zakura_state::ReadResponse::BestDurableHeaderTip(Some((
+                        block::Height(1),
+                        best_chain_hash,
+                    ))))
                 }
                 request => panic!("unexpected read request: {request:?}"),
             }

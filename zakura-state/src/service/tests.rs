@@ -29,8 +29,12 @@ use crate::{
     arbitrary::Prepare,
     init_test,
     service::{
-        arbitrary::populated_state, chain_tip::TipAction, finalized_state::FinalizedState,
-        headers_by_height_range, non_finalized_state::Chain, read, StateService,
+        arbitrary::populated_state,
+        chain_tip::TipAction,
+        finalized_state::FinalizedState,
+        headers_by_height_range,
+        non_finalized_state::{Chain, NonFinalizedState},
+        read, StateService,
     },
     tests::{
         setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
@@ -718,9 +722,9 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
     assert_eq!(
         read_state
             .clone()
-            .oneshot(ReadRequest::BestHeaderTip)
+            .oneshot(ReadRequest::BestDurableHeaderTip)
             .await?,
-        ReadResponse::BestHeaderTip(Some((Height(2), block2_hash))),
+        ReadResponse::BestDurableHeaderTip(Some((Height(2), block2_hash))),
     );
     assert!(read::tree::history_tree(
         read_state.latest_best_chain(),
@@ -1040,11 +1044,20 @@ async fn commit_header_range_completes_while_in_finalized_write_phase(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<()> {
+async fn best_durable_header_tip_excludes_non_finalized_chain() -> Result<()> {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;
-    let (state_service, _read_state, _, _) =
-        StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
+    let cache_dir = tempfile::tempdir().expect("test cache directory is created");
+    let config = Config {
+        cache_dir: cache_dir.path().to_path_buf(),
+        ephemeral: false,
+        ..Config::default()
+    };
+    let mut finalized_state =
+        FinalizedState::new(&config, &network).expect("test database is created");
+    finalized_state.db.shutdown(true);
+    drop(finalized_state);
+    let (read_state, db, non_finalized_sender) = super::init_read_only(config, &network)?;
     let block1 = Arc::new(
         network
             .test_block(653599, 583999)
@@ -1066,22 +1079,43 @@ async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<
     );
     chain = chain.push(block1.clone().prepare().test_with_zero_spent_utxos())?;
     chain = chain.push(block2.clone().prepare().test_with_zero_spent_utxos())?;
+    let chain = Arc::new(chain);
+    let mut non_finalized = NonFinalizedState::new(&network);
+    non_finalized.insert_test_chain(chain.clone());
+    non_finalized_sender
+        .send(non_finalized)
+        .expect("read state keeps the non-finalized watch open");
 
     assert_eq!(
-        headers_by_height_range(
-            Some(Arc::new(chain)),
-            &state_service.read_service.db,
-            start,
-            2,
-        ),
+        headers_by_height_range(Some(chain), &db, start, 2,),
         vec![
             (start, block1_hash, block1.header.clone()),
             (start.next().unwrap(), block2_hash, block2.header.clone()),
         ],
     );
     assert_eq!(
-        headers_by_height_range(None::<Arc<Chain>>, &state_service.read_service.db, start, 2),
+        headers_by_height_range(None::<Arc<Chain>>, &db, start, 2),
         Vec::new(),
+    );
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::HeadersByHeightRange { start, count: 2 })
+            .await
+            .expect("composite header read succeeds"),
+        ReadResponse::Headers(vec![
+            (start, block1_hash, block1.header.clone()),
+            (start.next().unwrap(), block2_hash, block2.header.clone()),
+        ]),
+        "the composite serving view includes restored non-finalized bodies",
+    );
+    assert_eq!(
+        read_state
+            .oneshot(ReadRequest::BestDurableHeaderTip)
+            .await
+            .expect("durable tip read succeeds"),
+        ReadResponse::BestDurableHeaderTip(None),
+        "the durable tip must not be synthesized from the non-finalized body tip",
     );
 
     Ok(())

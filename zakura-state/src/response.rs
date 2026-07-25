@@ -459,8 +459,8 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::HeadersByHeightRange`].
     Headers(Vec<(block::Height, block::Hash, Arc<block::Header>)>),
 
-    /// Response to [`ReadRequest::BestHeaderTip`].
-    BestHeaderTip(Option<(block::Height, block::Hash)>),
+    /// Response to [`ReadRequest::BestDurableHeaderTip`].
+    BestDurableHeaderTip(Option<(block::Height, block::Hash)>),
 
     /// Response to [`ReadRequest::MissingBlockBodies`].
     MissingBlockBodies(Vec<block::Height>),
@@ -660,7 +660,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::AddressUtxos(_)
             | ReadResponse::ChainInfo(_)
             | ReadResponse::Headers(_)
-            | ReadResponse::BestHeaderTip(_)
+            | ReadResponse::BestDurableHeaderTip(_)
             | ReadResponse::MissingBlockBodies(_)
             | ReadResponse::MissingBlockBodyMetadata(_)
             | ReadResponse::BlockSizeHints(_)

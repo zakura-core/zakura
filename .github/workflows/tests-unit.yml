@@ -293,10 +293,7 @@ jobs:
           toolchain: stable
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
-          # This main-only debug build is the sole writer for the shared cache.
-          # If this job is removed or stops compiling, move cache ownership to
-          # network-dependent or a dedicated main-branch debug build job.
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-save-if: false
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
         with:
           tool: cargo-nextest
@@ -322,7 +319,10 @@ jobs:
           toolchain: stable
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
-          cache-save-if: false
+          # This main-only debug build is the sole writer for the shared cache.
+          # If this job is removed or stops compiling, move cache ownership to
+          # network-dependent or a dedicated main-branch debug build job.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
         with:
           tool: cargo-nextest

@@ -1304,10 +1304,14 @@ fn find_blocks_stall_not_tracked_for_zcashd_compat() {
     let sidecar_ip = Ipv4Addr::LOCALHOST;
     let sidecar_addr: PeerSocketAddr =
         SocketAddr::new(IpAddr::V6(sidecar_ip.to_ipv6_mapped()), 1).into();
-    let (sidecar, mut sidecar_handle) = ClientTestHarness::build()
+    let (mut sidecar, mut sidecar_handle) = ClientTestHarness::build()
         .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
         .with_connected_addr(ConnectedAddr::new_inbound_direct(sidecar_addr))
         .finish();
+    std::sync::Arc::get_mut(&mut sidecar.connection_info)
+        .expect("test harness has the only connection info reference")
+        .remote
+        .services = PeerServices::NODE_NETWORK;
     let discovered_peers = stream::iter([Ok::<_, BoxError>(Change::Insert(
         sidecar_addr,
         sidecar.into(),

@@ -31,7 +31,7 @@ use crate::{
     constants::DEFAULT_MAX_CONNS_PER_IP,
     peer::{ClientTestHarness, LoadTrackedClient, MinimumPeerVersion},
     peer_set::{set::MorePeers, InventoryChange, PeerSet},
-    protocol::external::types::Version,
+    protocol::external::types::{PeerServices, Version},
     AddressBook, BannedIps, Config, PeerSocketAddr,
 };
 
@@ -63,13 +63,31 @@ impl PeerVersions {
     ///
     /// The clients and the harnesses are collected into separate [`Vec`] lists and returned.
     pub fn mock_peers(&self) -> (Vec<LoadTrackedClient>, Vec<ClientTestHarness>) {
+        self.mock_peers_with_services(&vec![PeerServices::NODE_NETWORK; self.peer_versions.len()])
+    }
+
+    /// Convert arbitrary peer versions and service flags into mock peer services.
+    fn mock_peers_with_services(
+        &self,
+        peer_services: &[PeerServices],
+    ) -> (Vec<LoadTrackedClient>, Vec<ClientTestHarness>) {
+        assert_eq!(
+            self.peer_versions.len(),
+            peer_services.len(),
+            "each test peer must have service flags"
+        );
+
         let mut clients = Vec::with_capacity(self.peer_versions.len());
         let mut harnesses = Vec::with_capacity(self.peer_versions.len());
 
-        for peer_version in &self.peer_versions {
-            let (client, harness) = ClientTestHarness::build()
+        for (peer_version, peer_services) in self.peer_versions.iter().zip(peer_services) {
+            let (mut client, harness) = ClientTestHarness::build()
                 .with_version(*peer_version)
                 .finish();
+            Arc::get_mut(&mut client.connection_info)
+                .expect("test client has unique connection info")
+                .remote
+                .services = *peer_services;
 
             clients.push(client.into());
             harnesses.push(harness);
@@ -96,6 +114,29 @@ impl PeerVersions {
         Vec<ClientTestHarness>,
     ) {
         let (clients, harnesses) = self.mock_peers();
+        Self::peer_discovery(clients, harnesses)
+    }
+
+    /// Convert arbitrary peer versions and service flags into a discovery stream.
+    fn mock_peer_discovery_with_services(
+        &self,
+        peer_services: &[PeerServices],
+    ) -> (
+        impl Stream<Item = Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>>,
+        Vec<ClientTestHarness>,
+    ) {
+        let (clients, harnesses) = self.mock_peers_with_services(peer_services);
+        Self::peer_discovery(clients, harnesses)
+    }
+
+    /// Convert mock peer services into a discovery stream.
+    fn peer_discovery(
+        clients: Vec<LoadTrackedClient>,
+        harnesses: Vec<ClientTestHarness>,
+    ) -> (
+        impl Stream<Item = Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>>,
+        Vec<ClientTestHarness>,
+    ) {
         let fake_ports = 1_u16..;
 
         let discovered_peers_iterator = fake_ports.zip(clients).map(|(port, client)| {

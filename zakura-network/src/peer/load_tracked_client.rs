@@ -18,7 +18,10 @@ use tower::{
 use crate::{
     constants::{EWMA_DECAY_TIME_NANOS, EWMA_DEFAULT_RTT},
     peer::{Client, ConnectedAddr, ConnectionInfo},
-    protocol::external::{canonical_socket_addr, types::Version},
+    protocol::external::{
+        canonical_socket_addr,
+        types::{PeerServices, Version},
+    },
 };
 
 static NEXT_PEER_TRACE_ID: AtomicU64 = AtomicU64::new(1);
@@ -68,6 +71,14 @@ impl LoadTrackedClient {
     /// Retrieve the peer's self-reported chain height from its handshake.
     pub(crate) fn remote_start_height(&self) -> zakura_chain::block::Height {
         self.connection_info.remote.start_height
+    }
+
+    /// Returns true if the peer advertises full block serving support.
+    pub(crate) fn advertises_node_network(&self) -> bool {
+        self.connection_info
+            .remote
+            .services
+            .contains(PeerServices::NODE_NETWORK)
     }
 
     /// Retrieve a process-local identifier used to correlate peer trace events.

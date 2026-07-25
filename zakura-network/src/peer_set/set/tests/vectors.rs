@@ -23,11 +23,14 @@ use crate::{
         ClientRequest, ClientTestHarness, ConnectedAddr, LoadTrackedClient, MinimumPeerVersion,
     },
     peer_set::{inventory_registry::InventoryStatus, stall_tracker::FIND_RESPONSE_STALL_THRESHOLD},
-    protocol::external::{types::Version, InventoryHash},
+    protocol::external::{
+        types::{PeerServices, Version},
+        InventoryHash,
+    },
     BannedIps, BoxError, PeerSocketAddr, Request, Response, SharedPeerError,
 };
 
-use super::{PeerSetBuilder, PeerVersions};
+use super::{super::PRUNED_PEER_BLOCK_ROUTING_MAX_TIP_DISTANCE, PeerSetBuilder, PeerVersions};
 
 #[test]
 fn peer_set_ready_single_connection() {
@@ -786,6 +789,151 @@ fn peer_set_route_inv_advertised_registry_order(advertised_first: bool) {
                 .request()
                 .is_none(),
             "request routed to non-advertised peer",
+        );
+    });
+}
+
+/// Check that historical block downloads exclude pruned peers.
+#[test]
+fn historical_block_downloads_require_node_network() {
+    let test_hash = block::Hash([1; 32]);
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version, peer_version],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, mut handles) = peer_versions
+        .mock_peer_discovery_with_services(&[PeerServices::empty(), PeerServices::NODE_NETWORK]);
+    let (minimum_peer_version, best_tip) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    best_tip.send_best_tip_height(Some(block::Height(2_000_000)));
+    best_tip.send_estimated_distance_to_network_chain_tip(Some(
+        PRUNED_PEER_BLOCK_ROUTING_MAX_TIP_DISTANCE + 1,
+    ));
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .max_conns_per_ip(max(2, DEFAULT_MAX_CONNS_PER_IP))
+            .build();
+
+        let peer_ready = peer_set.ready().await.expect("peer set is ready");
+        let request = Request::BlocksByHash(iter::once(test_hash).collect());
+        let _response = peer_ready.call(request.clone());
+
+        assert!(
+            handles[0]
+                .try_to_receive_outbound_client_request()
+                .request()
+                .is_none(),
+            "historical block request routed to pruned peer"
+        );
+        assert_eq!(
+            handles[1]
+                .try_to_receive_outbound_client_request()
+                .request()
+                .expect("full node received historical block request")
+                .request,
+            request
+        );
+    });
+}
+
+/// Check that pruned peers handle generic block downloads near the network tip.
+#[test]
+fn near_tip_block_downloads_allow_pruned_peers() {
+    let test_hash = block::Hash([2; 32]);
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, mut handles) =
+        peer_versions.mock_peer_discovery_with_services(&[PeerServices::empty()]);
+    let (minimum_peer_version, best_tip) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    best_tip.send_best_tip_height(Some(block::Height(2_500_000)));
+    best_tip.send_estimated_distance_to_network_chain_tip(Some(
+        PRUNED_PEER_BLOCK_ROUTING_MAX_TIP_DISTANCE,
+    ));
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+
+        let peer_ready = peer_set.ready().await.expect("peer set is ready");
+        let request = Request::BlocksByHash(iter::once(test_hash).collect());
+        let _response = peer_ready.call(request.clone());
+
+        assert_eq!(
+            handles[0]
+                .try_to_receive_outbound_client_request()
+                .request()
+                .expect("pruned peer received near-tip block request")
+                .request,
+            request
+        );
+    });
+}
+
+/// Check that a pruned peer can serve a block it explicitly advertised.
+#[test]
+fn advertised_block_downloads_allow_pruned_peers() {
+    let test_hash = block::Hash([3; 32]);
+    let test_peer = "127.0.0.1:1".parse().expect("test peer address is valid");
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, mut handles) =
+        peer_versions.mock_peer_discovery_with_services(&[PeerServices::empty()]);
+    let (minimum_peer_version, best_tip) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    best_tip.send_best_tip_height(Some(block::Height(2_000_000)));
+    best_tip.send_estimated_distance_to_network_chain_tip(Some(
+        PRUNED_PEER_BLOCK_ROUTING_MAX_TIP_DISTANCE + 1,
+    ));
+
+    runtime.block_on(async move {
+        let (mut peer_set, mut peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+
+        peer_set_guard
+            .inventory_sender()
+            .as_mut()
+            .expect("inventory sender exists")
+            .send(InventoryStatus::new_available(
+                InventoryHash::Block(test_hash),
+                test_peer,
+            ))
+            .expect("inventory receiver exists");
+
+        let peer_ready = peer_set.ready().await.expect("peer set is ready");
+        let request = Request::BlocksByHash(iter::once(test_hash).collect());
+        let _response = peer_ready.call(request.clone());
+
+        assert_eq!(
+            handles[0]
+                .try_to_receive_outbound_client_request()
+                .request()
+                .expect("advertising pruned peer received block request")
+                .request,
+            request
         );
     });
 }

@@ -104,6 +104,8 @@ fn misbehavior_ban_does_not_panic_with_max_connections_per_ip_above_one() {
     assert!(address_book.get(other_port_same_ip).is_some());
 
     let bans = address_book.bans();
+    let mut address_metrics = address_book.address_metrics_watcher();
+    assert_eq!(address_metrics.borrow().num_addresses, 3);
 
     address_book.update(MetaAddrChange::UpdateMisbehavior {
         addr: banned_addr,
@@ -126,6 +128,15 @@ fn misbehavior_ban_does_not_panic_with_max_connections_per_ip_above_one() {
     assert!(
         address_book.get(unrelated_addr).is_some(),
         "unrelated IP entries should remain after banning a different IP"
+    );
+    assert!(
+        address_metrics.has_changed().unwrap(),
+        "the ban should publish updated address metrics"
+    );
+    assert_eq!(
+        address_metrics.borrow_and_update().num_addresses,
+        1,
+        "published metrics should exclude all addresses on the banned IP"
     );
 }
 

@@ -130,31 +130,39 @@ where
         .in_current_span();
 
         // TODO: Move this logic for selecting the first ready future and updating `chain_state` to its own method.
+        //
+        // Prefer mined-block completions and submissions when multiple
+        // branches are ready. The committed-tip path is a fallback, so
+        // selecting it first can duplicate a mined-block broadcast.
         let (((hash, height), log_msg, updated_chain_state), is_block_submission) =
             if let Some(mined_block_receiver) = mined_block_receiver.as_mut() {
                 tokio::select! {
-                    tip_change_close_to_network_tip = tip_change_close_to_network_tip_fut => {
-                        (tip_change_close_to_network_tip?, false)
+                    biased;
+
+                    Some(mark_hash) = mined_block_mark_receiver.recv() => {
+                        chain_state.mark_last_change_hash(mark_hash);
+                        continue;
                     },
 
                     Some(tip_change) = mined_block_receiver.recv() => {
                        ((tip_change, "sending mined block broadcast", chain_state), true)
                     },
 
-                    Some(mark_hash) = mined_block_mark_receiver.recv() => {
-                        chain_state.mark_last_change_hash(mark_hash);
-                        continue;
+                    tip_change_close_to_network_tip = tip_change_close_to_network_tip_fut => {
+                        (tip_change_close_to_network_tip?, false)
                     },
                 }
             } else {
                 tokio::select! {
-                    tip_change_close_to_network_tip = tip_change_close_to_network_tip_fut => {
-                        (tip_change_close_to_network_tip?, false)
-                    },
+                    biased;
 
                     Some(mark_hash) = mined_block_mark_receiver.recv() => {
                         chain_state.mark_last_change_hash(mark_hash);
                         continue;
+                    },
+
+                    tip_change_close_to_network_tip = tip_change_close_to_network_tip_fut => {
+                        (tip_change_close_to_network_tip?, false)
                     },
                 }
             };

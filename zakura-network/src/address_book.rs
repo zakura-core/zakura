@@ -292,6 +292,12 @@ pub struct AddressBook {
     /// A channel used to send the latest address book metrics.
     address_metrics_tx: watch::Sender<AddressMetrics>,
 
+    /// Whether the address book changed since metrics were last published.
+    address_metrics_dirty: bool,
+
+    #[cfg(test)]
+    address_metrics_update_count: usize,
+
     /// The last time we logged a message about the address metrics.
     last_address_log: Option<Instant>,
 }
@@ -358,6 +364,9 @@ impl AddressBook {
             span,
             expose_peer_addresses: false,
             address_metrics_tx,
+            address_metrics_dirty: false,
+            #[cfg(test)]
+            address_metrics_update_count: 0,
             last_address_log: None,
             most_recent_by_ip: should_limit_outbound_conns_per_ip.then(HashMap::new),
             bans_by_ip: Default::default(),
@@ -616,6 +625,13 @@ impl AddressBook {
     /// peers.
     #[allow(clippy::unwrap_in_result)]
     pub fn update(&mut self, change: MetaAddrChange) -> Option<MetaAddr> {
+        let updated = self.update_inner(change);
+        self.update_metrics_if_dirty();
+        updated
+    }
+
+    /// Apply `change` without immediately publishing address book metrics.
+    fn update_inner(&mut self, change: MetaAddrChange) -> Option<MetaAddr> {
         let addr_label = change.addr().addr_label(self.expose_peer_addresses);
 
         if self.bans_by_ip.contains(change.addr().ip()) {
@@ -669,6 +685,7 @@ impl AddressBook {
                 }
 
                 self.peers.remove_ip(banned_ip);
+                self.address_metrics_dirty = true;
 
                 warn!(
                     peer = %addr_label,
@@ -699,6 +716,7 @@ impl AddressBook {
             }
 
             self.peers.insert(updated);
+            self.address_metrics_dirty = true;
 
             // Add the address to `most_recent_by_ip` if it sent the most recent
             // response Zebra has received from this IP.
@@ -753,9 +771,6 @@ impl AddressBook {
             }
 
             assert!(self.len() <= self.addr_limit);
-
-            std::mem::drop(_guard);
-            self.update_metrics(instant_now, chrono_now);
         }
 
         updated
@@ -771,7 +786,6 @@ impl AddressBook {
     fn take(&mut self, removed_addr: PeerSocketAddr) -> Option<MetaAddr> {
         let _guard = self.span.enter();
 
-        let instant_now = Instant::now();
         let chrono_now = Utc::now();
 
         trace!(
@@ -781,6 +795,8 @@ impl AddressBook {
         );
 
         if let Some(entry) = self.peers.remove(&removed_addr) {
+            self.address_metrics_dirty = true;
+
             // Check if this surplus peer's addr matches that in `most_recent_by_ip`
             // for this the surplus peer's ip to remove it there as well.
             if self.should_remove_most_recent_by_ip(entry.addr) {
@@ -790,7 +806,7 @@ impl AddressBook {
             }
 
             std::mem::drop(_guard);
-            self.update_metrics(instant_now, chrono_now);
+            self.update_metrics_if_dirty();
             Some(entry)
         } else {
             None
@@ -953,9 +969,24 @@ impl AddressBook {
         }
     }
 
+    /// Publish metrics if the address book changed since the previous update.
+    fn update_metrics_if_dirty(&mut self) {
+        if !self.address_metrics_dirty {
+            return;
+        }
+
+        self.address_metrics_dirty = false;
+        self.update_metrics(Instant::now(), Utc::now());
+    }
+
     /// Update the metrics for this address book.
     fn update_metrics(&mut self, instant_now: Instant, chrono_now: chrono::DateTime<Utc>) {
         let _guard = self.span.enter();
+
+        #[cfg(test)]
+        {
+            self.address_metrics_update_count += 1;
+        }
 
         let m = self.address_metrics_internal(chrono_now);
 
@@ -1061,8 +1092,10 @@ impl Extend<MetaAddrChange> for AddressBook {
         T: IntoIterator<Item = MetaAddrChange>,
     {
         for change in iter.into_iter() {
-            self.update(change);
+            self.update_inner(change);
         }
+
+        self.update_metrics_if_dirty();
     }
 }
 
@@ -1087,6 +1120,9 @@ impl Clone for AddressBook {
             span: self.span.clone(),
             expose_peer_addresses: self.expose_peer_addresses,
             address_metrics_tx,
+            address_metrics_dirty: false,
+            #[cfg(test)]
+            address_metrics_update_count: 0,
             last_address_log: None,
             most_recent_by_ip: self.most_recent_by_ip.clone(),
             bans_by_ip: self.bans_by_ip.clone(),

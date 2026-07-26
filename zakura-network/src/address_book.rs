@@ -625,7 +625,7 @@ impl AddressBook {
     /// peers.
     pub fn update(&mut self, change: MetaAddrChange) -> Option<MetaAddr> {
         let updated = self.update_inner(change);
-        self.update_metrics_if_dirty();
+        self.publish_metrics();
         updated
     }
 
@@ -806,7 +806,7 @@ impl AddressBook {
             }
 
             std::mem::drop(_guard);
-            self.update_metrics_if_dirty();
+            self.publish_metrics();
             Some(entry)
         } else {
             None
@@ -970,7 +970,7 @@ impl AddressBook {
     }
 
     /// Publish metrics if the address book changed since the previous update.
-    fn update_metrics_if_dirty(&mut self) {
+    fn publish_metrics(&mut self) {
         if !self.address_metrics_dirty {
             return;
         }
@@ -1097,7 +1097,7 @@ impl Extend<MetaAddrChange> for AddressBook {
             self.update_inner(change);
         }
 
-        self.update_metrics_if_dirty();
+        self.publish_metrics();
     }
 }
 

@@ -80,6 +80,7 @@ fn misbehavior_ban_does_not_panic_with_max_connections_per_ip_above_one() {
 
     let mut address_book =
         AddressBook::new("0.0.0.0:0".parse().unwrap(), &Mainnet, 2, Span::current());
+    let mut address_metrics = address_book.address_metrics_watcher();
 
     // Seed two entries on the soon-to-be-banned IP plus an unrelated entry,
     // so the ban path's per-IP cleanup has visible work to do.
@@ -104,8 +105,7 @@ fn misbehavior_ban_does_not_panic_with_max_connections_per_ip_above_one() {
     assert!(address_book.get(other_port_same_ip).is_some());
 
     let bans = address_book.bans();
-    let mut address_metrics = address_book.address_metrics_watcher();
-    assert_eq!(address_metrics.borrow().num_addresses, 3);
+    assert_eq!(address_metrics.borrow_and_update().num_addresses, 3);
 
     address_book.update(MetaAddrChange::UpdateMisbehavior {
         addr: banned_addr,

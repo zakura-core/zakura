@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Simple Zakura fleet status dashboard.
+"""Zakura fleet dashboard and narrow public Ironwood status API.
 
 Reads a deploy/deployer nodes TOML, polls each node over SSH, and serves a small
 HTML dashboard showing the running commit, Zakura node ID, restart time, current
-height, latest block hash, and whether the node has advanced recently.
+height, latest block hash, and whether the node has advanced recently. It also
+serves a deliberately small public Ironwood status response for zakura.com.
 
 Only the Python stdlib is used.
 """
@@ -21,13 +22,37 @@ import threading
 import time
 import tomllib
 import urllib.parse
+from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-DEFAULT_UPGRADE_HEIGHT = 4_134_000
+IRONWOOD_ACTIVATION_HEIGHTS = {
+    "mainnet": 3_428_143,
+    "testnet": 4_134_000,
+}
+DEFAULT_UPGRADE_HEIGHT = IRONWOOD_ACTIVATION_HEIGHTS["testnet"]
 DEFAULT_TARGET_SPACING = 7.5
+RPC_CHAIN_NAMES = {
+    "mainnet": "main",
+    "testnet": "test",
+}
+PUBLIC_STATUS_MAX_AGE = 120.0
+PUBLIC_RATE_LIMIT = 120
+PUBLIC_RATE_WINDOW = 60.0
+PUBLIC_RATE_CLIENT_LIMIT = 4_096
+PUBLIC_SCHEMA_VERSION = 1
+PUBLIC_ERROR_MESSAGE = "A fresh Ironwood status is not available."
+PUBLIC_ORIGINS = {
+    "mainnet": frozenset({"https://zakura.com"}),
+    "testnet": frozenset({
+        "https://zakura.com",
+        "http://127.0.0.1:1111",
+        "http://localhost:1111",
+    }),
+}
 HEIGHT_HISTORY_WINDOW = 60 * 60
 MIN_OBSERVED_BLOCKS = 3
 MIN_OBSERVED_SECONDS = 120
@@ -282,6 +307,25 @@ def rpc_headers():
         headers["Authorization"] = f"Basic {token}"
     return headers
 
+def rpc_call(method):
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": "zakura-cluster-status",
+        "method": method,
+        "params": [],
+    }).encode()
+    request = urllib.request.Request(
+        rpc_url,
+        data=body,
+        headers=rpc_headers(),
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=6) as response:
+        payload = json.loads(response.read().decode())
+    if payload.get("error"):
+        raise RuntimeError(str(payload["error"]))
+    return payload.get("result")
+
 try:
     running = process_is_running(process_pattern)
     if running is not None:
@@ -389,50 +433,53 @@ except Exception as error:
     out["node_id_error"] = str(error)
 
 if rpc_url:
-    headers = rpc_headers()
     try:
-        height_body = json.dumps({
-            "jsonrpc": "2.0",
-            "id": "zakura-cluster-status",
-            "method": "getblockcount",
-            "params": [],
-        }).encode()
-        height_req = urllib.request.Request(
-            rpc_url,
-            data=height_body,
-            headers=headers,
-            method="POST",
-        )
-        with urllib.request.urlopen(height_req, timeout=6) as resp:
-            payload = json.loads(resp.read().decode())
-        if "error" in payload and payload["error"]:
-            out["rpc_error"] = payload["error"]
+        blockchain_info = rpc_call("getblockchaininfo")
+        if not isinstance(blockchain_info, dict):
+            raise RuntimeError("getblockchaininfo returned a non-object result")
+
+        out["height"] = blockchain_info.get("blocks")
+        out["block_hash"] = blockchain_info.get("bestblockhash")
+        out["rpc_chain"] = blockchain_info.get("chain")
+
+        value_pools = blockchain_info.get("valuePools")
+        if not isinstance(value_pools, list):
+            out["ironwood_pool_error"] = "valuePools is unavailable"
         else:
-            out["height"] = payload.get("result")
+            ironwood_pool = next(
+                (
+                    pool
+                    for pool in value_pools
+                    if isinstance(pool, dict) and pool.get("id") == "ironwood"
+                ),
+                None,
+            )
+            if (
+                ironwood_pool is None
+                or "chainValueZat" not in ironwood_pool
+            ):
+                out["ironwood_pool_error"] = "Ironwood value pool is unavailable"
+            else:
+                out["ironwood_chain_balance_zat"] = str(
+                    ironwood_pool["chainValueZat"]
+                )
     except Exception as error:
         out["rpc_error"] = str(error)
 
     try:
-        hash_body = json.dumps({
-            "jsonrpc": "2.0",
-            "id": "zakura-cluster-status",
-            "method": "getbestblockhash",
-            "params": [],
-        }).encode()
-        hash_req = urllib.request.Request(
-            rpc_url,
-            data=hash_body,
-            headers=headers,
-            method="POST",
+        info = rpc_call("getinfo")
+        if not isinstance(info, dict):
+            raise RuntimeError("getinfo returned a non-object result")
+
+        out["rpc_testnet"] = info.get("testnet")
+        out["client_name"] = (
+            "zcashd" if probe_kind == "zcashd" else "zakurad"
         )
-        with urllib.request.urlopen(hash_req, timeout=6) as resp:
-            payload = json.loads(resp.read().decode())
-        if "error" in payload and payload["error"]:
-            out["block_hash_error"] = payload["error"]
-        else:
-            out["block_hash"] = payload.get("result")
+        out["client_version"] = str(
+            info.get("build") or info.get("version") or ""
+        )
     except Exception as error:
-        out["block_hash_error"] = str(error)
+        out["rpc_metadata_error"] = str(error)
 else:
     out["rpc_error"] = "RPC disabled in deployer config"
 
@@ -472,6 +519,44 @@ def probe_node(node: Node) -> dict:
         return {"error": f"invalid probe output: {error}", "raw": proc.stdout.strip()}
 
 
+class RateLimiter:
+    """A small per-client fixed-window limiter for the public JSON endpoint."""
+
+    def __init__(
+        self,
+        limit: int = PUBLIC_RATE_LIMIT,
+        window: float = PUBLIC_RATE_WINDOW,
+    ):
+        self.limit = limit
+        self.window = window
+        self.lock = threading.Lock()
+        self.events: dict[str, deque[float]] = {}
+
+    def allow(self, client: str, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        cutoff = now - self.window
+        with self.lock:
+            if (
+                client not in self.events
+                and len(self.events) >= PUBLIC_RATE_CLIENT_LIMIT
+            ):
+                self.events = {
+                    key: events
+                    for key, events in self.events.items()
+                    if events and events[-1] > cutoff
+                }
+                if len(self.events) >= PUBLIC_RATE_CLIENT_LIMIT:
+                    return False
+
+            events = self.events.setdefault(client, deque())
+            while events and events[0] <= cutoff:
+                events.popleft()
+            if len(events) >= self.limit:
+                return False
+            events.append(now)
+            return True
+
+
 class ClusterCollector:
     def __init__(
         self,
@@ -480,12 +565,15 @@ class ClusterCollector:
         stale_after: float,
         upgrade_height: int,
         target_spacing: float,
+        network: str,
     ):
         self.nodes = nodes
         self.interval = interval
         self.stale_after = stale_after
         self.upgrade_height = upgrade_height
         self.target_spacing = target_spacing
+        self.network = network
+        self.ironwood_activation_height = IRONWOOD_ACTIVATION_HEIGHTS[network]
         self.lock = threading.Lock()
         self.last_height: dict[str, int | None] = {node.name: None for node in nodes}
         self.last_advanced_at: dict[str, float | None] = {node.name: None for node in nodes}
@@ -508,7 +596,6 @@ class ClusterCollector:
             time.sleep(self.interval)
 
     def poll_once(self) -> None:
-        now = time.time()
         rows = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(self.nodes))) as pool:
             futures = {pool.submit(probe_node, node): node for node in self.nodes}
@@ -518,9 +605,10 @@ class ClusterCollector:
                     probe = future.result()
                 except Exception as error:
                     probe = {"error": str(error)}
-                rows.append(self.row_for(node, probe, now))
+                rows.append(self.row_for(node, probe, time.time()))
 
         rows.sort(key=lambda row: row["name"])
+        now = time.time()
         with self.lock:
             self.rows = rows
             self.last_poll = now
@@ -607,6 +695,15 @@ class ClusterCollector:
             "last_seen_at": now,
             "last_advanced_at": last_advanced_at,
             "seconds_since_advanced": seconds_since_advanced,
+            "rpc_chain": probe.get("rpc_chain"),
+            "rpc_testnet": probe.get("rpc_testnet"),
+            "ironwood_chain_balance_zat": probe.get(
+                "ironwood_chain_balance_zat"
+            ),
+            "ironwood_pool_error": probe.get("ironwood_pool_error"),
+            "client_name": probe.get("client_name") or "",
+            "client_version": probe.get("client_version") or "",
+            "rpc_metadata_error": probe.get("rpc_metadata_error"),
         }
 
     def snapshot(self) -> dict:
@@ -624,6 +721,130 @@ class ClusterCollector:
             "upgrade": upgrade,
             "rows": rows,
         }
+
+    def ironwood_status(self, now: float | None = None) -> tuple[int, dict]:
+        now = time.time() if now is None else now
+        with self.lock:
+            rows = [dict(row) for row in self.rows]
+
+        candidates = []
+        rejected = set()
+        for row in rows:
+            candidate, error_code = self.public_candidate(row, now)
+            if candidate is not None:
+                candidates.append(candidate)
+            elif error_code is not None:
+                rejected.add(error_code)
+
+        if not candidates:
+            error_code = next(
+                (
+                    code
+                    for code in (
+                        "network_mismatch",
+                        "ironwood_pool_unavailable",
+                        "source_stale",
+                        "upstream_unavailable",
+                    )
+                    if code in rejected
+                ),
+                "upstream_unavailable",
+            )
+            return 503, public_error(self.network, error_code)
+
+        groups = defaultdict(list)
+        for candidate in candidates:
+            groups[(candidate["height"], candidate["block_hash"])].append(
+                candidate
+            )
+
+        _, agreed_sources = max(
+            groups.items(),
+            key=lambda item: (len(item[1]), item[0][0], item[0][1]),
+        )
+        source = min(
+            agreed_sources,
+            key=lambda candidate: (
+                candidate["client_name"] != "zakurad",
+                candidate["name"],
+            ),
+        )
+
+        tip_height = source["height"]
+        activated = tip_height >= self.ironwood_activation_height
+        blocks_since_activation = (
+            tip_height - self.ironwood_activation_height
+            if activated
+            else None
+        )
+        return 200, {
+            "schema_version": PUBLIC_SCHEMA_VERSION,
+            "network": self.network,
+            "activation_height": self.ironwood_activation_height,
+            "activated": activated,
+            "tip_height": tip_height,
+            "blocks_since_activation": blocks_since_activation,
+            "ironwood_chain_balance_zat": source["balance_zat"],
+            "updated_at": rfc3339_utc(source["observed_at"]),
+            "source": {
+                "client_name": source["client_name"],
+                "client_version": source["client_version"],
+            },
+        }
+
+    def public_candidate(
+        self,
+        row: dict,
+        now: float,
+    ) -> tuple[dict | None, str | None]:
+        observed_at = row.get("last_seen_at")
+        if not isinstance(observed_at, (int, float)):
+            return None, "upstream_unavailable"
+
+        expected_testnet = self.network == "testnet"
+        if (
+            row.get("rpc_chain") != RPC_CHAIN_NAMES[self.network]
+            or row.get("rpc_testnet") is not expected_testnet
+        ):
+            return None, "network_mismatch"
+
+        balance_zat = row.get("ironwood_chain_balance_zat")
+        if (
+            not isinstance(balance_zat, str)
+            or re.fullmatch(r"0|[1-9][0-9]*", balance_zat) is None
+        ):
+            return None, "ironwood_pool_unavailable"
+
+        if now - observed_at > PUBLIC_STATUS_MAX_AGE:
+            return None, "source_stale"
+
+        height = row.get("height")
+        block_hash = row.get("block_hash")
+        client_name = row.get("client_name")
+        client_version = row.get("client_version")
+        if (
+            not row.get("healthy")
+            or not isinstance(height, int)
+            or height < 0
+            or not isinstance(block_hash, str)
+            or not block_hash
+            or not isinstance(client_name, str)
+            or not client_name
+            or not isinstance(client_version, str)
+            or not client_version
+            or row.get("rpc_metadata_error")
+        ):
+            return None, "upstream_unavailable"
+
+        return {
+            "name": str(row.get("name") or ""),
+            "height": height,
+            "block_hash": block_hash,
+            "balance_zat": balance_zat,
+            "observed_at": float(observed_at),
+            "client_name": client_name,
+            "client_version": client_version,
+        }, None
 
     def upgrade_estimate(self, now: float) -> dict:
         # A non-positive upgrade height means there is no pending activation to
@@ -686,6 +907,25 @@ def coerce_int(value) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def public_error(network: str, code: str) -> dict:
+    return {
+        "schema_version": PUBLIC_SCHEMA_VERSION,
+        "network": network,
+        "error": {
+            "code": code,
+            "message": PUBLIC_ERROR_MESSAGE,
+        },
+    }
+
+
+def rfc3339_utc(timestamp: float) -> str:
+    return (
+        datetime.fromtimestamp(timestamp, timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
 
 
 PAGE = r"""<!doctype html>
@@ -1196,26 +1436,138 @@ setInterval(tick, 10000);
 
 
 COLLECTOR: ClusterCollector | None = None
+RATE_LIMITER = RateLimiter()
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:
         pass
 
-    def send_body(self, body: bytes, content_type: str) -> None:
-        self.send_response(200)
+    def send_body(
+        self,
+        status: int,
+        body: bytes,
+        content_type: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(body)
+        if body:
+            self.wfile.write(body)
+
+    def public_headers(self) -> dict[str, str]:
+        assert COLLECTOR is not None
+        headers = {
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Vary": "Origin",
+        }
+        origin = self.headers.get("Origin")
+        if origin in PUBLIC_ORIGINS[COLLECTOR.network]:
+            headers.update({
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Max-Age": "600",
+            })
+        return headers
+
+    def send_json(
+        self,
+        status: int,
+        payload: dict,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        body = json.dumps(payload, separators=(",", ":")).encode()
+        self.send_body(
+            status,
+            body,
+            "application/json; charset=utf-8",
+            headers,
+        )
+
+    def rate_limit_client(self) -> str:
+        peer = self.client_address[0]
+        try:
+            peer_address = ipaddress.ip_address(peer)
+        except ValueError:
+            return peer
+
+        forwarded_for = self.headers.get("X-Forwarded-For")
+        if peer_address.is_loopback and forwarded_for:
+            candidate = forwarded_for.rsplit(",", 1)[-1].strip()
+            try:
+                return str(ipaddress.ip_address(candidate))
+            except ValueError:
+                pass
+        return str(peer_address)
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/data":
             assert COLLECTOR is not None
             body = json.dumps(COLLECTOR.snapshot()).encode()
-            return self.send_body(body, "application/json")
-        return self.send_body(PAGE.encode(), "text/html; charset=utf-8")
+            return self.send_body(200, body, "application/json")
+        if parsed.path == "/ironwood-status.json":
+            assert COLLECTOR is not None
+            headers = self.public_headers()
+            if not RATE_LIMITER.allow(self.rate_limit_client()):
+                headers["Retry-After"] = str(int(PUBLIC_RATE_WINDOW))
+                return self.send_json(
+                    429,
+                    {
+                        "schema_version": PUBLIC_SCHEMA_VERSION,
+                        "network": COLLECTOR.network,
+                        "error": {
+                            "code": "rate_limited",
+                            "message": "Request rate limit exceeded.",
+                        },
+                    },
+                    headers,
+                )
+            status, payload = COLLECTOR.ironwood_status()
+            return self.send_json(status, payload, headers)
+        if parsed.path == "/healthz":
+            return self.send_body(
+                200,
+                b"ok\n",
+                "text/plain; charset=utf-8",
+                {
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+        if parsed.path == "/":
+            return self.send_body(
+                200,
+                PAGE.encode(),
+                "text/html; charset=utf-8",
+            )
+        return self.send_body(
+            404,
+            b"not found\n",
+            "text/plain; charset=utf-8",
+            {"X-Content-Type-Options": "nosniff"},
+        )
+
+    def do_OPTIONS(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/ironwood-status.json":
+            return self.send_body(
+                404,
+                b"not found\n",
+                "text/plain; charset=utf-8",
+                {"X-Content-Type-Options": "nosniff"},
+            )
+        return self.send_body(
+            204,
+            b"",
+            "application/json; charset=utf-8",
+            self.public_headers(),
+        )
 
 
 def main() -> None:
@@ -1226,6 +1578,12 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0", help="dashboard bind host")
     parser.add_argument("--port", type=int, default=8090, help="dashboard bind port")
     parser.add_argument("--interval", type=float, default=10.0, help="poll interval in seconds")
+    parser.add_argument(
+        "--network",
+        choices=sorted(IRONWOOD_ACTIVATION_HEIGHTS),
+        required=True,
+        help="network served by this dashboard",
+    )
     parser.add_argument(
         "--stale-after",
         type=float,
@@ -1253,6 +1611,7 @@ def main() -> None:
         args.stale_after,
         args.upgrade_height,
         args.target_spacing,
+        args.network,
     )
     threading.Thread(target=COLLECTOR.loop, daemon=True).start()
 

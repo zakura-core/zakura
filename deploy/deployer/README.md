@@ -123,6 +123,12 @@ ETA for Ironwood testnet activation height `4134000`. The ETA uses observed
 cluster block movement when enough samples are available, otherwise it falls back
 to `--target-spacing 7.5`.
 
+The same service exposes the narrow public website API at
+`/ironwood-status.json` and its liveness check at `/healthz`. The public response
+selects one healthy node from the highest agreed tip and contains only the
+network, Ironwood activation and balance data, observation time, and source
+client metadata. It never proxies caller-supplied RPC requests.
+
 The workflow also refreshes a static Zakura Ironwood testnet snapshots website on
 `zakura-testnet-1`:
 
@@ -156,6 +162,7 @@ python3 deploy/runner/zakura-cluster-status.py \
   --config deploy/deployer/nodes.toml \
   --host 0.0.0.0 \
   --port 8090 \
+  --network testnet \
   --upgrade-height 4134000 \
   --target-spacing 7.5
 ```
@@ -220,6 +227,7 @@ python3 deploy/runner/zakura-cluster-status.py \
   --config deploy/deployer/nodes.toml \
   --host 0.0.0.0 \
   --port 8090 \
+  --network mainnet \
   --upgrade-height 0
 ```
 

@@ -373,7 +373,7 @@ jobs:
           [Service]
           Type=simple
           WorkingDirectory=/opt/zakura-mainnet-dashboard
-          ExecStart=/usr/bin/python3 /opt/zakura-mainnet-dashboard/zakura-cluster-status.py --config /opt/zakura-mainnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --interval 10 --stale-after 300 --upgrade-height 0
+          ExecStart=/usr/bin/python3 /opt/zakura-mainnet-dashboard/zakura-cluster-status.py --config /opt/zakura-mainnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --network mainnet --interval 10 --stale-after 300 --upgrade-height 0
           Restart=always
           RestartSec=5
 

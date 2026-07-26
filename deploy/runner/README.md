@@ -4,6 +4,22 @@ This directory contains helper services and scripts that run on Zakura deploy or
 benchmark hosts. The deploy workflows copy the tracked service files here onto
 the self-hosted runners.
 
+## Cluster Status and Public Ironwood API
+
+`zakura-cluster-status.py` polls authenticated node RPC endpoints over SSH and
+serves both the existing fleet dashboard and a narrow public API:
+
+- `GET /ironwood-status.json` returns a fresh, verified website response.
+- `OPTIONS /ironwood-status.json` handles the allow-listed CORS preflight.
+- `GET /healthz` reports service liveness.
+- `GET /data` retains the existing fleet dashboard and watchdog response.
+
+The public Ironwood response is unavailable with HTTP `503` if the service
+cannot verify a matching network, Ironwood pool, tip, or source client, or if
+the most recent complete observation is more than 120 seconds old. The endpoint
+is rate-limited and permits cross-origin reads from `https://zakura.com`.
+Testnet additionally permits the two development origins on port `1111`.
+
 ## Fleet Slack Watchdog
 
 `zakura-cluster-watchdog.py` is a small stdlib-only Python service that polls the

@@ -72,8 +72,6 @@ const STALLED_SERVICE_REQUEST_DELAY: Duration = Duration::from_secs(30 * 60);
 fn oversized_find_blocks_response_is_rejected() {
     let hash = block::Hash([0; 32]);
 
-    // The guard is applied after ObtainTips/ExtendTips strip zcashd's extra
-    // trailing hash, so 500 remaining hashes are accepted and 501 are not.
     assert!(sync::has_valid_tips_response_hash_count(&vec![
         hash;
         sync::MAX_TIPS_RESPONSE_HASH_COUNT
@@ -83,13 +81,6 @@ fn oversized_find_blocks_response_is_rejected() {
         sync::MAX_TIPS_RESPONSE_HASH_COUNT
             + 1
     ]));
-
-    // A zcashd response with 500 chain hashes plus one appended hash must remain
-    // usable after the trailing hash is discarded.
-    let raw = vec![hash; sync::MAX_TIPS_RESPONSE_HASH_COUNT + 1];
-    let stripped = &raw[..raw.len() - 1];
-    assert_eq!(stripped.len(), sync::MAX_TIPS_RESPONSE_HASH_COUNT);
-    assert!(sync::has_valid_tips_response_hash_count(stripped));
 }
 
 /// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and blocks 3-4 using extend_tips.
@@ -127,10 +118,6 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
     let block4: Arc<Block> =
         zakura_test::vectors::BLOCK_MAINNET_4_BYTES.zcash_deserialize_into()?;
     let block4_hash = block4.hash();
-
-    let block5: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_5_BYTES.zcash_deserialize_into()?;
-    let block5_hash = block5.hash();
 
     // Start the syncer
     let chain_sync_task_handle = tokio::spawn(chain_sync_future);
@@ -186,7 +173,6 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
         .respond(zn::Response::BlockHashes(vec![
             block1_hash, // tip
             block2_hash, // expected_next
-            block3_hash, // (discarded - last hash, possibly incorrect)
         ]));
 
     // State is checked for each candidate hash before it is queued.
@@ -273,10 +259,9 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
         })
         .await
         .respond(zn::Response::BlockHashes(vec![
-            block2_hash, // tip (discarded - already fetched)
-            block3_hash, // expected_next
-            block4_hash,
-            block5_hash, // (discarded - last hash, possibly incorrect)
+            block2_hash, // expected_next (match anchor, already fetched)
+            block3_hash, // tip
+            block4_hash, // expected_next
         ]));
 
     for hash in [block3_hash, block4_hash] {
@@ -354,18 +339,15 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
 /// This scales the production failure at checkpoints 400 and 800 down to a four-block checkpoint
 /// range. Every peer response here is one a real peer would send:
 ///
-/// - the peer's tip is block 3, so `FindBlocks` from genesis answers `[1, 2, 3]`. `obtain_tips`
-///   discards the trailing hash for zcashd's quirk of appending an unrelated one, leaving blocks
-///   1-2 to download.
-/// - extending that tip answers `[2, 3]`, and the same trailing-hash rule discards block 3, so the
-///   response extends by nothing and the prospective tip set empties. The peer did extend the tip;
-///   the workaround is what drops the block, on the promise that a later fanout re-discovers it.
+/// - the peer initially has blocks 1-2, so `FindBlocks` from genesis answers `[1, 2]`.
+/// - extending that tip answers `[2]`, so the response extends by nothing and the prospective tip
+///   set empties.
 /// - blocks 1-2 are now parked in the checkpoint verifier, which cannot verify *any* block in a
 ///   range until the whole range up to checkpoint 4 has arrived. So they stay in flight forever.
 ///
 /// Discovering the rest of the range is the only way out, and only a fresh fanout can do it. The
 /// syncer must therefore keep discovering hashes while blocks are parked, rather than waiting for
-/// the download queue to drain first — that wait cannot terminate. The chain grows to block 5, a
+/// the download queue to drain first — that wait cannot terminate. The chain grows to block 4, a
 /// refreshed fanout picks up blocks 3-4, and the range verifies.
 ///
 /// Time is paused, so a syncer that instead waits out [`sync::BLOCK_VERIFY_TIMEOUT`] and restarts
@@ -389,7 +371,6 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
         zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?,
         zakura_test::vectors::BLOCK_MAINNET_3_BYTES.zcash_deserialize_into()?,
         zakura_test::vectors::BLOCK_MAINNET_4_BYTES.zcash_deserialize_into()?,
-        zakura_test::vectors::BLOCK_MAINNET_5_BYTES.zcash_deserialize_into()?,
     ];
     let hashes: Vec<_> = blocks.iter().map(|block| block.hash()).collect();
 
@@ -400,8 +381,7 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
         .await
         .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
 
-    // The peer's tip is block 3. The trailing hash is discarded, leaving blocks 1-2 to download,
-    // which is only half of the checkpoint range ending at block 4.
+    // The peer's tip is block 2, which is only half of the checkpoint range ending at block 4.
     state_service
         .expect_request(zs::Request::BlockLocator)
         .await
@@ -412,9 +392,7 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            hashes[1], hashes[2], hashes[3],
-        ]));
+        .respond(zn::Response::BlockHashes(vec![hashes[1], hashes[2]]));
     state_service
         .expect_request(zs::Request::KnownBlock(hashes[1]))
         .await
@@ -460,15 +438,14 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
     }
     assert!(expected_verifications.is_empty());
 
-    // The peer extends the tip with block 3, but the trailing-hash workaround discards it, so the
-    // response extends by nothing and the prospective tip set empties.
+    // The peer has not extended the tip, so the prospective tip set empties.
     peer_set
         .expect_request(zn::Request::FindBlocks {
             known_blocks: vec![hashes[1]],
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![hashes[2], hashes[3]]));
+        .respond(zn::Response::BlockHashes(vec![hashes[2]]));
     for _ in 0..(sync::FANOUT - 1) {
         peer_set
             .expect_request(zn::Request::FindBlocks {
@@ -495,7 +472,7 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
          verifier: waiting out BLOCK_VERIFY_TIMEOUT and restarting discards the partial range",
     );
 
-    // The chain has grown to block 5, so the refreshed fanout covers the rest of the range. Blocks
+    // The chain has grown to block 4, so the refreshed fanout covers the rest of the range. Blocks
     // 1-2 are still in flight, so they are re-dispatched as duplicates and not downloaded again.
     refreshed_locator.respond(zs::Response::BlockLocator(vec![hashes[0]]));
     peer_set
@@ -505,7 +482,7 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
         })
         .await
         .respond(zn::Response::BlockHashes(vec![
-            hashes[1], hashes[2], hashes[3], hashes[4], hashes[5],
+            hashes[1], hashes[2], hashes[3], hashes[4],
         ]));
     state_service
         .expect_request(zs::Request::KnownBlock(hashes[1]))
@@ -550,15 +527,14 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
     }
     assert!(expected_verifications.is_empty());
 
-    // Extending the refreshed tip discards block 5 by the same trailing-hash rule, so this response
-    // extends by nothing. The checkpoint range is already complete, so that no longer matters.
+    // Extending the refreshed tip finds no new blocks. The checkpoint range is already complete.
     peer_set
         .expect_request(zn::Request::FindBlocks {
             known_blocks: vec![hashes[3]],
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![hashes[4], hashes[5]]));
+        .respond(zn::Response::BlockHashes(vec![hashes[4]]));
     for _ in 0..(sync::FANOUT - 1) {
         peer_set
             .expect_request(zn::Request::FindBlocks {
@@ -590,12 +566,11 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
     Ok(())
 }
 
-/// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and blocks 3-4 using extend_tips,
-/// with unrelated trailing hashes that are discarded.
+/// Test that the syncer downloads a single newly advertised block from an extended tip.
 ///
 /// This test also makes sure that the syncer downloads blocks in order.
 #[tokio::test(start_paused = true)]
-async fn sync_blocks_trailing_hashes_ok() -> Result<(), crate::BoxError> {
+async fn sync_blocks_single_hash_extension_ok() -> Result<(), crate::BoxError> {
     // Get services
     let (
         chain_sync_future,
@@ -622,14 +597,6 @@ async fn sync_blocks_trailing_hashes_ok() -> Result<(), crate::BoxError> {
     let block3: Arc<Block> =
         zakura_test::vectors::BLOCK_MAINNET_3_BYTES.zcash_deserialize_into()?;
     let block3_hash = block3.hash();
-
-    let block4: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_4_BYTES.zcash_deserialize_into()?;
-    let block4_hash = block4.hash();
-
-    let block5: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_5_BYTES.zcash_deserialize_into()?;
-    let block5_hash = block5.hash();
 
     // Start the syncer
     let chain_sync_task_handle = tokio::spawn(chain_sync_future);
@@ -685,7 +652,6 @@ async fn sync_blocks_trailing_hashes_ok() -> Result<(), crate::BoxError> {
         .respond(zn::Response::BlockHashes(vec![
             block1_hash, // tip
             block2_hash, // expected_next
-            block3_hash, // (discarded - last hash, possibly incorrect)
         ]));
 
     // State is checked for each candidate hash before it is queued.
@@ -772,18 +738,14 @@ async fn sync_blocks_trailing_hashes_ok() -> Result<(), crate::BoxError> {
         })
         .await
         .respond(zn::Response::BlockHashes(vec![
-            block2_hash, // tip (discarded - already fetched)
-            block3_hash, // expected_next
-            block4_hash,
-            block5_hash, // (discarded - last hash, possibly incorrect)
+            block2_hash, // expected_next (match anchor, already fetched)
+            block3_hash, // single newly advertised hash
         ]));
 
-    for hash in [block3_hash, block4_hash] {
-        state_service
-            .expect_request(zs::Request::KnownBlock(hash))
-            .await
-            .respond(zs::Response::KnownBlock(None));
-    }
+    state_service
+        .expect_request(zs::Request::KnownBlock(block3_hash))
+        .await
+        .respond(zs::Response::KnownBlock(None));
 
     // Clear remaining block locator requests
     for _ in 0..(sync::FANOUT - 1) {
@@ -800,7 +762,7 @@ async fn sync_blocks_trailing_hashes_ok() -> Result<(), crate::BoxError> {
     block_verifier_router.expect_no_requests().await;
     state_service.expect_no_requests().await;
 
-    // Blocks 3 & 4 are fetched in order, then verified concurrently
+    // The single extension hash is fetched and verified.
     peer_set
         .expect_request(zn::Request::BlocksByHash(iter::once(block3_hash).collect()))
         .await
@@ -808,32 +770,10 @@ async fn sync_blocks_trailing_hashes_ok() -> Result<(), crate::BoxError> {
             block3.clone(),
             None,
         ))]));
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block4_hash).collect()))
+    block_verifier_router
+        .expect_request(zakura_consensus::Request::Commit(block3))
         .await
-        .respond(zn::Response::Blocks(vec![Available((
-            block4.clone(),
-            None,
-        ))]));
-
-    // We can't guarantee the verification request order
-    let mut remaining_blocks: HashMap<block::Hash, Arc<Block>> =
-        [(block3_hash, block3), (block4_hash, block4)]
-            .iter()
-            .cloned()
-            .collect();
-
-    for _ in 3..=4 {
-        block_verifier_router
-            .expect_request_that(|req| remaining_blocks.remove(&req.block().hash()).is_some())
-            .await
-            .respond_with(|req| req.block().hash());
-    }
-    assert_eq!(
-        remaining_blocks,
-        HashMap::new(),
-        "expected all non-tip blocks to be verified by extend tips"
-    );
+        .respond(block3_hash);
 
     // Check that nothing unexpected happened.
     block_verifier_router.expect_no_requests().await;
@@ -932,10 +872,6 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
         zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
     let block2_hash = block2.hash();
 
-    let block3: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_3_BYTES.zcash_deserialize_into()?;
-    let block3_hash = block3.hash();
-
     // Also get a block that is a long way away from genesis
     let block982k: Arc<Block> =
         zakura_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?;
@@ -996,7 +932,6 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
             block982k_hash,
             block1_hash, // tip
             block2_hash, // expected_next
-            block3_hash, // (discarded - last hash, possibly incorrect)
         ]));
 
     // State is checked for each candidate hash before it is queued.
@@ -1118,10 +1053,6 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         zakura_test::vectors::BLOCK_MAINNET_4_BYTES.zcash_deserialize_into()?;
     let block4_hash = block4.hash();
 
-    let block5: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_5_BYTES.zcash_deserialize_into()?;
-    let block5_hash = block5.hash();
-
     // Also get a block that is a long way away from genesis
     let block982k: Arc<Block> =
         zakura_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?;
@@ -1181,7 +1112,6 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         .respond(zn::Response::BlockHashes(vec![
             block1_hash, // tip
             block2_hash, // expected_next
-            block3_hash, // (discarded - last hash, possibly incorrect)
         ]));
 
     // State is checked for each candidate hash before it is queued.
@@ -1268,11 +1198,10 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         })
         .await
         .respond(zn::Response::BlockHashes(vec![
-            block2_hash, // tip (discarded - already fetched)
-            block3_hash, // expected_next
+            block2_hash, // expected_next (match anchor, already fetched)
+            block3_hash,
             block4_hash,
             block982k_hash,
-            block5_hash, // (discarded - last hash, possibly incorrect)
         ]));
 
     for hash in [block3_hash, block4_hash, block982k_hash] {
@@ -1749,8 +1678,8 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
         tips,
     ));
 
-    // One peer extends the tip. The response starts with the expected hash (the match anchor) and
-    // ends with a possibly-incorrect trailing hash that the syncer discards.
+    // One peer extends the tip. The response starts with the expected hash, which is the match
+    // anchor and is not downloaded.
     peer_set
         .expect_request(zn::Request::FindBlocks {
             known_blocks: vec![block1_hash],
@@ -1761,10 +1690,10 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
             block2_hash, // expected_next (match anchor, not downloaded)
             block3_hash,
             block4_hash,
-            block5_hash, // (discarded - last hash, possibly incorrect)
+            block5_hash,
         ]));
 
-    for hash in [block3_hash, block4_hash] {
+    for hash in [block3_hash, block4_hash, block5_hash] {
         state_service
             .expect_request(zs::Request::KnownBlock(hash))
             .await
@@ -1786,22 +1715,21 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
         .await
         .expect("build_extend task should not panic")?;
 
-    // Discovery: blocks 3 & 4 are queued for download, in response order. Block 2 is the match
-    // anchor and block 5 is the discarded trailing hash, so neither is downloaded.
+    // Discovery: blocks 3-5 are queued for download in response order. Block 2 is the match anchor.
     assert_eq!(
         download_set.into_iter().collect::<Vec<_>>(),
-        vec![block3_hash, block4_hash],
-        "build_extend should discover the inner hashes in response order",
+        vec![block3_hash, block4_hash, block5_hash],
+        "build_extend should discover every hash after the match anchor",
     );
     assert_eq!(
-        discovered, 2,
+        discovered, 3,
         "discovered count should match the download set length",
     );
 
-    // The new prospective tip extends from block3, expecting block4 next.
+    // The new prospective tip extends from block4, expecting block5 next.
     let expected_tip = sync::CheckedTip {
-        tip: block3_hash,
-        expected_next: block4_hash,
+        tip: block4_hash,
+        expected_next: block5_hash,
     };
     assert_eq!(
         prospective_tips,
@@ -1813,6 +1741,75 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
     // fan-out was sent — no `BlocksByHash`, no verifier requests.
     peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn obtain_tips_downloads_single_hash() -> Result<(), crate::BoxError> {
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        mut state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let locator = block::Hash::from([0x01; 32]);
+    let unknown = block::Hash::from([0x02; 32]);
+
+    let respond_to_requests = async {
+        state_service
+            .expect_request(zs::Request::BlockLocator)
+            .await
+            .respond(zs::Response::BlockLocator(vec![locator]));
+
+        peer_set
+            .expect_request(zn::Request::FindBlocks {
+                known_blocks: vec![locator],
+                stop: None,
+            })
+            .await
+            .respond(zn::Response::BlockHashes(vec![unknown]));
+
+        state_service
+            .expect_request(zs::Request::KnownBlock(unknown))
+            .await
+            .respond(zs::Response::KnownBlock(None));
+
+        for _ in 0..(sync::FANOUT - 1) {
+            peer_set
+                .expect_request(zn::Request::FindBlocks {
+                    known_blocks: vec![locator],
+                    stop: None,
+                })
+                .await
+                .respond(Err(zn::BoxError::from("synthetic test obtain tips error")));
+        }
+
+        state_service
+            .expect_request(zs::Request::KnownBlock(unknown))
+            .await
+            .respond(zs::Response::KnownBlock(None));
+
+        // End the background download without invoking the verifier.
+        peer_set
+            .expect_request(zn::Request::BlocksByHash(iter::once(unknown).collect()))
+            .await
+            .respond(zn::Response::Blocks(Vec::new()));
+
+        Ok::<_, crate::BoxError>(())
+    };
+
+    let (extra_hashes, responded) = futures::join!(chain_sync.obtain_tips(), respond_to_requests);
+    responded?;
+    assert!(extra_hashes?.is_empty());
+    assert!(chain_sync.prospective_tips.is_empty());
+
+    peer_set.expect_no_requests().await;
+    block_verifier_router.expect_no_requests().await;
+    state_service.expect_no_requests().await;
 
     Ok(())
 }
@@ -1949,7 +1946,11 @@ async fn build_extend_ignores_malformed_find_blocks_responses() -> Result<(), cr
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![random]));
+        .respond(zn::Response::BlockHashes(vec![
+            random,
+            expected_next,
+            unknown,
+        ]));
 
     let (download_set, prospective_tips, discovered) = extend_handle
         .await
@@ -1979,8 +1980,7 @@ async fn build_extend_rejects_oversized_response_before_state_queries(
 
     let tip = block::Hash::from([0x20; 32]);
     let expected_next = block::Hash::from([0x21; 32]);
-    let trailing = block::Hash::from([0x22; 32]);
-    let unknown_hashes = (0..=sync::MAX_TIPS_RESPONSE_HASH_COUNT).map(|index| {
+    let unknown_hashes = (0..sync::MAX_TIPS_RESPONSE_HASH_COUNT).map(|index| {
         let index = u64::try_from(index).expect("test hash count fits in u64");
         let mut bytes = [0; 32];
         bytes[..8].copy_from_slice(&index.to_le_bytes());
@@ -1988,7 +1988,6 @@ async fn build_extend_rejects_oversized_response_before_state_queries(
     });
     let response_hashes = std::iter::once(expected_next)
         .chain(unknown_hashes)
-        .chain(std::iter::once(trailing))
         .collect();
 
     let tips = HashSet::from([sync::CheckedTip { tip, expected_next }]);
@@ -2092,7 +2091,7 @@ async fn build_extend_rejects_locator_echo_before_state_queries() -> Result<(), 
 }
 
 #[tokio::test]
-async fn build_extend_ignores_known_trailing_find_blocks_hash() -> Result<(), crate::BoxError> {
+async fn build_extend_rejects_known_hash_in_advertised_suffix() -> Result<(), crate::BoxError> {
     let (
         _chain_sync,
         _sync_status,
@@ -2106,6 +2105,7 @@ async fn build_extend_ignores_known_trailing_find_blocks_hash() -> Result<(), cr
     let expected_next = block::Hash::from([0x21; 32]);
     let unknown_a = block::Hash::from([0x22; 32]);
     let unknown_b = block::Hash::from([0x23; 32]);
+    let known_suffix = block::Hash::from([0x24; 32]);
 
     let tips = HashSet::from([sync::CheckedTip { tip, expected_next }]);
     let extend_handle = tokio::spawn(TestChainSync::build_extend(
@@ -2124,7 +2124,7 @@ async fn build_extend_ignores_known_trailing_find_blocks_hash() -> Result<(), cr
             expected_next,
             unknown_a,
             unknown_b,
-            tip, // zcashd can append an unrelated known hash here.
+            known_suffix,
         ]));
 
     for hash in [unknown_a, unknown_b] {
@@ -2133,6 +2133,10 @@ async fn build_extend_ignores_known_trailing_find_blocks_hash() -> Result<(), cr
             .await
             .respond(zs::Response::KnownBlock(None));
     }
+    state_service
+        .expect_request(zs::Request::KnownBlock(known_suffix))
+        .await
+        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
 
     for _ in 0..(sync::FANOUT - 1) {
         peer_set
@@ -2148,19 +2152,9 @@ async fn build_extend_ignores_known_trailing_find_blocks_hash() -> Result<(), cr
         .await
         .expect("build_extend task should not panic")?;
 
-    assert_eq!(
-        download_set.into_iter().collect::<Vec<_>>(),
-        vec![unknown_a, unknown_b],
-        "build_extend should keep valid inner hashes and discard the trailing known hash",
-    );
-    assert_eq!(discovered, 2);
-    assert_eq!(
-        prospective_tips,
-        HashSet::from([sync::CheckedTip {
-            tip: unknown_a,
-            expected_next: unknown_b,
-        }]),
-    );
+    assert!(download_set.is_empty());
+    assert_eq!(discovered, 0);
+    assert!(prospective_tips.is_empty());
 
     peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;

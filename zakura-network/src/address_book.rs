@@ -623,7 +623,6 @@ impl AddressBook {
     /// As an exception, this function can ignore all changes for specific
     /// [`PeerSocketAddr`]s. Ignored addresses will never be used to connect to
     /// peers.
-    #[allow(clippy::unwrap_in_result)]
     pub fn update(&mut self, change: MetaAddrChange) -> Option<MetaAddr> {
         let updated = self.update_inner(change);
         self.update_metrics_if_dirty();
@@ -631,6 +630,7 @@ impl AddressBook {
     }
 
     /// Apply `change` without immediately publishing address book metrics.
+    #[allow(clippy::unwrap_in_result)]
     fn update_inner(&mut self, change: MetaAddrChange) -> Option<MetaAddr> {
         let addr_label = change.addr().addr_label(self.expose_peer_addresses);
 
@@ -1091,6 +1091,8 @@ impl Extend<MetaAddrChange> for AddressBook {
     where
         T: IntoIterator<Item = MetaAddrChange>,
     {
+        // Publish once after the full batch instead of scanning the address
+        // book after every accepted change.
         for change in iter.into_iter() {
             self.update_inner(change);
         }

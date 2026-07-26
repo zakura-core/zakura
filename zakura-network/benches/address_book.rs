@@ -10,7 +10,10 @@ use tracing::Span;
 
 use zakura_chain::parameters::Network::Mainnet;
 use zakura_network::{
-    constants::{DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE},
+    constants::{
+        DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_ADDRS_IN_MESSAGE,
+        MAX_PEER_MISBEHAVIOR_SCORE,
+    },
     types::MetaAddr,
     AddressBook, PeerSocketAddr,
 };
@@ -72,9 +75,15 @@ fn address_book(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     for size in [SMALL_ADDRESS_BOOK_SIZE, MAX_ADDRS_IN_ADDRESS_BOOK] {
+        group.throughput(Throughput::Elements(1));
+
         let address_book = populated_address_book(size);
         let existing_addr = peer_addr(SAME_IP_ADDRESS_COUNT - 1);
         let new_addr = unique_ip_addr(size);
+        let batch_size = size.min(MAX_ADDRS_IN_MESSAGE);
+        let batch_updates: Vec<_> = (0..batch_size)
+            .map(|index| MetaAddr::new_misbehavior(peer_addr(index), 1))
+            .collect();
 
         let mut update_check = address_book.clone();
         let update_change = MetaAddr::new_misbehavior(existing_addr, 1);
@@ -93,6 +102,10 @@ fn address_book(c: &mut Criterion) {
         assert!(ban_check.update(ban_change).is_none());
         assert_eq!(ban_check.len(), size - SAME_IP_ADDRESS_COUNT);
         assert!(ban_check.bans().contains(existing_addr.ip()));
+
+        let mut batch_check = address_book.clone();
+        batch_check.extend(batch_updates.iter().copied());
+        assert_eq!(batch_check.len(), size);
 
         group.bench_with_input(
             BenchmarkId::new("clone_and_drop", size),
@@ -162,6 +175,20 @@ fn address_book(c: &mut Criterion) {
                 );
             },
         );
+
+        group.throughput(Throughput::Elements(
+            u64::try_from(batch_size).expect("address batch size fits in u64"),
+        ));
+        group.bench_with_input(BenchmarkId::new("update_batch", size), &size, |b, _size| {
+            b.iter_batched_ref(
+                || address_book.clone(),
+                |address_book| {
+                    address_book.extend(batch_updates.iter().copied());
+                    black_box(address_book);
+                },
+                BatchSize::PerIteration,
+            );
+        });
     }
 
     group.finish();

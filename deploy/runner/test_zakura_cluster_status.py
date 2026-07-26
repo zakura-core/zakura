@@ -79,6 +79,11 @@ def public_row(
 
 
 class IronwoodStatusTests(unittest.TestCase):
+    def test_remote_probe_is_valid_python_and_uses_required_rpcs(self):
+        compile(status.REMOTE_PROBE, "<remote-probe>", "exec")
+        self.assertIn('rpc_call("getblockchaininfo")', status.REMOTE_PROBE)
+        self.assertIn('rpc_call("getinfo")', status.REMOTE_PROBE)
+
     def test_success_response_has_the_stable_public_shape(self):
         subject = collector()
         subject.rows = [public_row()]

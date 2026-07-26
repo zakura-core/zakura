@@ -212,8 +212,8 @@ impl BlockDownloadVerifyError {
         self.not_found_download().map(|(hash, _kind)| hash)
     }
 
-    /// Returns the missing block hash and the [`NotFoundKind`] for network `notfound` download
-    /// failures, or `None` for other errors.
+    /// Returns the missing block hash and the [`NotFoundKind`] for transient network download
+    /// failures that need another peer, or `None` for other errors.
     ///
     /// Uses the [`SharedPeerError`](zn::SharedPeerError) classification computed at construction
     /// rather than matching on `Debug` output, so a variant rename can't silently disable these

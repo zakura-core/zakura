@@ -28,6 +28,9 @@ pub enum NotFoundClass {
     /// [`PeerError::NotFoundResponse`] — a specific peer lacked the item; retry on another peer.
     Response,
     /// [`PeerError::NotFoundRegistry`] — no ready peer has it; needs fresh tips/peers.
+    ///
+    /// Also includes [`PeerError::NoReadyPeers`], which needs a peer to become ready or connect
+    /// before the request can be retried.
     Registry,
     /// Any other error (not a `notfound`-style failure).
     Other,
@@ -55,7 +58,7 @@ where
         let inner = PeerError::from(source);
         let class = match &inner {
             PeerError::NotFoundResponse(_) => NotFoundClass::Response,
-            PeerError::NotFoundRegistry(_) => NotFoundClass::Registry,
+            PeerError::NotFoundRegistry(_) | PeerError::NoReadyPeers => NotFoundClass::Registry,
             _ => NotFoundClass::Other,
         };
         Self(Arc::new(TracedError::from(inner)), class)
@@ -367,10 +370,11 @@ mod tests {
             SharedPeerError::from(PeerError::NotFoundRegistry(block_inv())).not_found_class(),
             Some(NotFoundClass::Registry),
         );
-        // An unrelated peer error is not a `notfound`-style failure.
+        // NoReadyPeers is also transient at the peer-set boundary, so the syncer uses the same
+        // backoff retry path as a registry miss instead of restarting the entire sync round.
         assert_eq!(
             SharedPeerError::from(PeerError::NoReadyPeers).not_found_class(),
-            None,
+            Some(NotFoundClass::Registry),
         );
     }
 }

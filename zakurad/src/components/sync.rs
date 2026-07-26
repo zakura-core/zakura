@@ -94,8 +94,8 @@ fn block_error_peer_label(error: &BlockDownloadVerifyError, expose_peer_addresse
 /// accountability in `zakura-network` disconnects such peers so this bound is rarely reached.
 const MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 8;
 
-/// Controls how many times the syncer retries a required block that the peer set reports as missing
-/// from *all* current peers (`NotFoundKind::Registry`) before giving up on the round.
+/// Controls how many times the syncer retries a required block that the peer set currently cannot
+/// route (`NotFoundKind::Registry`) before giving up on the round.
 ///
 /// Unlike a single-peer `notfound`, a registry-wide miss can't be resolved by routing to another
 /// currently-connected peer — it needs the peer crawler to find a peer that has the block, or the
@@ -105,7 +105,8 @@ const MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 8;
 /// temporarily unavailable. Only a genuinely stuck block (e.g. a bad tip) exhausts this and restarts.
 const MISSING_BLOCK_REGISTRY_RETRY_LIMIT: usize = 60;
 
-/// Backoff between retries of a block missing from all current peers (`NotFoundKind::Registry`).
+/// Backoff between retries of a block that the peer set currently cannot route
+/// (`NotFoundKind::Registry`).
 ///
 /// Long enough to avoid hot-looping on the synchronous `NotFoundRegistry` routing error and to let
 /// the peer crawler connect new peers / inventory marks expire, short enough that the pipeline
@@ -785,9 +786,9 @@ where
     /// `notfound` ([`NotFoundKind::Response`]). Bounded by [`MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT`].
     missing_block_retry_counts: HashMap<block::Hash, usize>,
 
-    /// Queue-level retry counts for block hashes missing from *all* current peers
-    /// ([`NotFoundKind::Registry`]). Kept separate from [`Self::missing_block_retry_counts`] so the
-    /// larger registry budget ([`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`]) isn't defeated by an
+    /// Queue-level retry counts for block hashes the peer set currently cannot route
+    /// ([`NotFoundKind::Registry`]). Kept separate from [`Self::missing_block_retry_counts`] so
+    /// the larger registry budget ([`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`]) isn't defeated by an
     /// occasional single-peer `notfound` for the same hash sharing the smaller budget's count.
     registry_miss_retry_counts: HashMap<block::Hash, usize>,
 
@@ -2156,14 +2157,14 @@ where
     /// rather than discarding the whole round. The requeues are bounded by
     /// [`MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT`].
     ///
-    /// A [`NotFoundKind::Registry`] miss means the peer set found that *every* ready peer is marked
-    /// missing the block, so it can't be served right now. Rather than blocking the loop on an inline
-    /// `sleep`, the hash is recorded in [`Self::registry_miss_retry`] with a backoff deadline; while
-    /// any such retry is pending, [`Self::sync_round`] gives it head-of-line priority by pausing new
-    /// speculative dispatch and re-dispatching the hash from its `select!` timer arm once the backoff
-    /// elapses. Bounded by [`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`]; only a block that stays missing
-    /// for the whole budget (e.g. a bad tip) falls through to [`Self::handle_block_response`] and
-    /// restarts the round to obtain fresh tips and peers.
+    /// A [`NotFoundKind::Registry`] miss means the peer set cannot route the block right now,
+    /// because every ready peer is marked missing it or no peer is ready. Rather than blocking the
+    /// loop on an inline `sleep`, the hash is recorded in [`Self::registry_miss_retry`] with a
+    /// backoff deadline; while any such retry is pending, [`Self::sync_round`] gives it head-of-line
+    /// priority by pausing new speculative dispatch and re-dispatching the hash from its `select!`
+    /// timer arm once the backoff elapses. Bounded by [`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`]; only a
+    /// block that stays unavailable for the whole budget (e.g. a bad tip) falls through to
+    /// [`Self::handle_block_response`] and restarts the round to obtain fresh tips and peers.
     async fn handle_block_response_with_missing_retry(
         &mut self,
         response: Result<(Height, block::Hash), BlockDownloadVerifyError>,

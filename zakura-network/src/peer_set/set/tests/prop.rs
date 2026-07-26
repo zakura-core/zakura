@@ -1,6 +1,9 @@
 //! Randomised property tests for the peer set.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
 use futures::{stream, FutureExt, StreamExt};
 use proptest::prelude::*;
@@ -20,7 +23,7 @@ use crate::{
         ReceiveRequestAttempt,
     },
     peer_set::PeerSet,
-    protocol::external::types::Version,
+    protocol::external::types::{PeerServices, Version},
     Config, PeerSocketAddr, Request,
 };
 
@@ -325,10 +328,14 @@ fn sidecar_peer_always_receives_block_gossip() {
                 IpAddr::V4(Ipv4Addr::new(10, 0, 0, index as u8))
             };
             let peer_address: PeerSocketAddr = SocketAddr::new(ip, index as u16 + 1).into();
-            let (client, harness) = ClientTestHarness::build()
+            let (mut client, harness) = ClientTestHarness::build()
                 .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
                 .with_connected_addr(ConnectedAddr::new_inbound_direct(peer_address))
                 .finish();
+            Arc::get_mut(&mut client.connection_info)
+                .expect("test client has unique connection info")
+                .remote
+                .services = PeerServices::NODE_NETWORK;
 
             handles.push(harness);
 

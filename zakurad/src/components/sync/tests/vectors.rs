@@ -2211,6 +2211,41 @@ async fn registry_miss_schedules_backoff_retry() {
     peer_set.expect_no_requests().await;
 }
 
+/// No ready peers uses the registry backoff instead of restarting or hot-looping.
+#[tokio::test]
+async fn no_ready_peers_schedules_backoff_retry() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let block_hash = block::Hash::from([0xAC; 32]);
+    let error = BlockDownloadVerifyError::DownloadFailed {
+        error: zn::SharedPeerError::from(zn::PeerError::NoReadyPeers).into(),
+        hash: block_hash,
+    };
+
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(error))
+        .await
+        .expect("no ready peers should keep the current sync round alive");
+
+    assert!(
+        chain_sync.registry_miss_retry.contains_key(&block_hash),
+        "the block should wait for a peer through the backoff retry queue"
+    );
+    assert_eq!(
+        chain_sync.registry_miss_retry_counts.get(&block_hash),
+        Some(&1),
+        "the retry should be scheduled once without a hot loop"
+    );
+    peer_set.expect_no_requests().await;
+}
+
 /// A registry miss past its retry budget restarts the round and clears its retry state.
 #[tokio::test]
 async fn registry_miss_restarts_after_retry_limit() {

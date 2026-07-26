@@ -162,10 +162,6 @@ pub struct CancelClientWork;
 
 type ResponseFuture = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send + 'static>>;
 
-/// Maximum distance from the estimated network tip where pruned peers are
-/// eligible for generic block downloads.
-const PRUNED_PEER_BLOCK_ROUTING_MAX_TIP_DISTANCE: zakura_chain::block::HeightDiff = 5_000;
-
 /// Classification of a `FindBlocks`/`FindHeaders` response, sent from a
 /// response-wrapping future to [`PeerSet::poll_ready`] via an mpsc channel so
 /// the stall tracker can be updated and the peer disconnected if needed.
@@ -531,6 +527,11 @@ where
         // TODO: drop peers that overload us with inbound messages and never become ready (#7822)
         let _poll_pending_or_ready: Poll<Option<()>> = self.poll_unready(cx)?;
 
+        // A pruned peer cannot serve the historical block bodies needed during initial sync.
+        // Disconnect it to free a connection slot, then ask the crawler to find an archive peer.
+        // Once we are at or near the tip, retain and route to pruned peers normally.
+        self.disconnect_from_pruned_peers_while_syncing();
+
         // Cleanup
 
         // Only checks the versions of ready peers, so it needs to run after `poll_unready()`.
@@ -811,6 +812,46 @@ where
         }
     }
 
+    /// Disconnects peers that cannot serve historical blocks while the node is syncing.
+    fn disconnect_from_pruned_peers_while_syncing(&mut self) {
+        if self
+            .minimum_peer_version
+            .chain_tip()
+            .is_at_or_near_network_tip(&self.network)
+        {
+            return;
+        }
+
+        let pruned_peers: Vec<_> = self
+            .ready_services
+            .iter()
+            .filter_map(|(key, service)| (!service.advertises_node_network()).then_some(*key))
+            .chain(self.unready_services.iter().filter_map(|unready| {
+                unready
+                    .key
+                    .as_ref()
+                    .zip(unready.service.as_ref())
+                    .and_then(|(key, service)| (!service.advertises_node_network()).then_some(*key))
+            }))
+            .collect();
+
+        if pruned_peers.is_empty() {
+            return;
+        }
+
+        for peer in &pruned_peers {
+            debug!(
+                peer = %peer.addr_label(self.expose_peer_addresses),
+                "disconnecting pruned peer while syncing historical blocks"
+            );
+            self.remove(peer);
+        }
+
+        metrics::counter!("pool.disconnected.pruned_while_syncing.count")
+            .increment(u64::try_from(pruned_peers.len()).unwrap_or(u64::MAX));
+        let _ = self.demand_signal.try_send(MorePeers);
+    }
+
     /// Takes a ready service by key.
     fn take_ready_service(&mut self, key: &D::Key) -> Option<D::Service> {
         if let Some(svc) = self.ready_services.remove(key) {
@@ -911,26 +952,6 @@ where
     /// Performs P2C on `self.ready_services` to randomly select a less-loaded ready service.
     fn select_ready_p2c_peer(&self) -> Option<D::Key> {
         self.select_p2c_peer_from_list(&self.ready_services.keys().copied().collect())
-    }
-
-    /// Returns true if pruned peers are eligible for generic block downloads.
-    fn pruned_peers_are_block_download_eligible(&self) -> bool {
-        self.minimum_peer_version
-            .chain_tip()
-            .estimate_distance_to_network_chain_tip(&self.network)
-            .is_some_and(|(distance, _)| distance <= PRUNED_PEER_BLOCK_ROUTING_MAX_TIP_DISTANCE)
-    }
-
-    /// Returns ready peers eligible for generic block downloads.
-    fn ready_generic_block_peers(&self) -> HashSet<D::Key> {
-        let include_pruned = self.pruned_peers_are_block_download_eligible();
-
-        self.ready_services
-            .iter()
-            .filter_map(|(key, service)| {
-                (include_pruned || service.advertises_node_network()).then_some(*key)
-            })
-            .collect()
     }
 
     /// Performs P2C on `ready_service_list` to randomly select a less-loaded ready service.
@@ -1049,13 +1070,7 @@ where
 
     /// Routes a request using P2C load-balancing.
     fn route_p2c(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        let peer = if matches!(&req, Request::BlocksByHash(_)) {
-            self.select_p2c_peer_from_list(&self.ready_generic_block_peers())
-        } else {
-            self.select_ready_p2c_peer()
-        };
-
-        if let Some(p2c_key) = peer {
+        if let Some(p2c_key) = self.select_ready_p2c_peer() {
             tracing::trace!(
                 peer = %p2c_key.addr_label(self.expose_peer_addresses),
                 "routing based on p2c"
@@ -1206,16 +1221,11 @@ where
             .missing_peers(hash)
             .copied()
             .collect();
-        let block_request = matches!(hash, InventoryHash::Block(_));
-        let include_pruned = !block_request || self.pruned_peers_are_block_download_eligible();
-        let maybe_peer_list: HashSet<_> = self
+        let maybe_peer_list = self
             .ready_services
-            .iter()
-            .filter_map(|(addr, service)| {
-                (!missing_peer_list.contains(addr)
-                    && (include_pruned || service.advertises_node_network()))
-                .then_some(*addr)
-            })
+            .keys()
+            .filter(|addr| !missing_peer_list.contains(addr))
+            .copied()
             .collect();
 
         // Security: choose a random, less-loaded peer that might have the inventory.
@@ -1257,30 +1267,6 @@ where
                 .boxed();
             }
             return fut.map_err(Into::into).boxed();
-        }
-
-        let has_eligible_peer = !block_request
-            || include_pruned
-            || self
-                .ready_services
-                .values()
-                .any(LoadTrackedClient::advertises_node_network);
-
-        if !has_eligible_peer {
-            metrics::counter!("pool.route_inv.no_eligible_block_peer.count").increment(1);
-            let _ = self.demand_signal.try_send(MorePeers);
-
-            tracing::debug!(
-                ?hash,
-                "no ready full block-serving peer for historical block request"
-            );
-
-            return async move {
-                tokio::task::yield_now().await;
-                Err(SharedPeerError::from(PeerError::NoReadyPeers))
-            }
-            .map_err(Into::into)
-            .boxed();
         }
 
         // Split the synthetic registry-miss by cause so a stall can be diagnosed (the two collapse

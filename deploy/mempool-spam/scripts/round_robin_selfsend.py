@@ -565,20 +565,25 @@ def main() -> int:
         run_error = str(exc)
         log_event({"event": "fatal", "error": run_error})
     finally:
-        if submitted_txids:
-            drain_transactions(nodes, submitted_txids, args.drain_minutes)
-        log_event({"event": "stop", "rounds": round_index, "error": run_error})
-        report = write_reports(load_events(RUN_LOG), output)
         try:
-            local_port = 18232 if NETWORK == "test" else 8232
-            start_zecd(f"zebra://127.0.0.1:{local_port}")
-            log_event(
-                {"event": "restored_upstream", "server": f"zebra://127.0.0.1:{local_port}"}
-            )
-        except Exception as exc:  # noqa: BLE001
-            restore_error = str(exc)
-            log_event({"event": "restore_failed", "error": restore_error})
-            stop_zecd()
+            if submitted_txids:
+                drain_transactions(nodes, submitted_txids, args.drain_minutes)
+            log_event({"event": "stop", "rounds": round_index, "error": run_error})
+        finally:
+            try:
+                local_port = 18232 if NETWORK == "test" else 8232
+                start_zecd(f"zebra://127.0.0.1:{local_port}")
+                log_event(
+                    {
+                        "event": "restored_upstream",
+                        "server": f"zebra://127.0.0.1:{local_port}",
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                restore_error = str(exc)
+                log_event({"event": "restore_failed", "error": restore_error})
+                stop_zecd()
+        report = write_reports(load_events(RUN_LOG), output)
 
     summary = report["summary"]
     failed_empty = (

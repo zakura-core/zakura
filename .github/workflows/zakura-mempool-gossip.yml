@@ -1,6 +1,13 @@
 name: Zakura mempool gossip
 
 on:
+  # Temporary branch-only trigger for validating this workflow before merge.
+  push:
+    branches:
+      - roman/mempool-gossip-ci
+    paths:
+      - .github/workflows/zakura-mempool-gossip.yml
+      - deploy/mempool-spam/**
   workflow_dispatch:
     inputs:
       environment:
@@ -23,7 +30,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: zakura-mempool-gossip-${{ inputs.environment }}
+  group: zakura-mempool-gossip-${{ github.event_name == 'push' && 'testnet' || inputs.environment || 'testnet' }}
   cancel-in-progress: false
 
 jobs:
@@ -38,9 +45,9 @@ jobs:
       - name: Validate inputs and environment
         id: target
         env:
-          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          TARGET_ENVIRONMENT: ${{ github.event_name == 'push' && 'testnet' || inputs.environment || 'testnet' }}
           DURATION_MINUTES: ${{ github.event_name == 'push' && '1' || inputs.duration_minutes || '10' }}
-          AMOUNT: ${{ inputs.amount }}
+          AMOUNT: ${{ github.event_name == 'push' && '0.0002' || inputs.amount || '0.0002' }}
         run: |
           set -euo pipefail
           if ! [[ "${DURATION_MINUTES}" =~ ^[0-9]+$ ]] ||
@@ -110,9 +117,9 @@ jobs:
         env:
           HOST: ${{ steps.target.outputs.host }}
           SPAM_ROOT: ${{ steps.target.outputs.spam_root }}
-          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          TARGET_ENVIRONMENT: ${{ github.event_name == 'push' && 'testnet' || inputs.environment || 'testnet' }}
           DURATION_MINUTES: ${{ github.event_name == 'push' && '1' || inputs.duration_minutes || '10' }}
-          AMOUNT: ${{ inputs.amount }}
+          AMOUNT: ${{ github.event_name == 'push' && '0.0002' || inputs.amount || '0.0002' }}
         run: |
           set -euo pipefail
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -195,7 +202,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
         with:
-          name: zakura-mempool-gossip-${{ inputs.environment }}-${{ github.run_id }}
+          name: zakura-mempool-gossip-${{ github.event_name == 'push' && 'testnet' || inputs.environment || 'testnet' }}-${{ github.run_id }}
           path: /tmp/mempool-spam-report/
           retention-days: 14
           if-no-files-found: ignore

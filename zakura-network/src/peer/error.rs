@@ -1,6 +1,6 @@
 //! Peer-related errors.
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use thiserror::Error;
 
@@ -18,7 +18,12 @@ use crate::{
 /// branch on the `notfound` kind without string-matching `Debug` output (which a variant rename
 /// would silently break, disabling the syncer's retry paths).
 #[derive(Debug, Clone)]
-pub struct SharedPeerError(Arc<TracedError<PeerError>>, NotFoundClass);
+pub struct SharedPeerError(
+    Arc<TracedError<PeerError>>,
+    NotFoundClass,
+    Option<Duration>,
+    bool,
+);
 
 /// Typed classification of `notfound`-style peer errors, computed when a [`SharedPeerError`] is
 /// constructed (the only construction path is the `From` impl below, so this stays in sync with
@@ -58,7 +63,17 @@ where
             PeerError::NotFoundRegistry(_) => NotFoundClass::Registry,
             _ => NotFoundClass::Other,
         };
-        Self(Arc::new(TracedError::from(inner)), class)
+        let find_blocks_retry_after = match &inner {
+            PeerError::NoEligibleFindBlocksPeer { retry_after } => Some(*retry_after),
+            _ => None,
+        };
+        let attributable_find_blocks_failure = matches!(&inner, PeerError::NotFoundResponse(_));
+        Self(
+            Arc::new(TracedError::from(inner)),
+            class,
+            find_blocks_retry_after,
+            attributable_find_blocks_failure,
+        )
     }
 }
 
@@ -75,6 +90,18 @@ impl SharedPeerError {
     /// Returns `None` for errors that aren't a `notfound`-style failure.
     pub fn not_found_class(&self) -> Option<NotFoundClass> {
         (self.1 != NotFoundClass::Other).then_some(self.1)
+    }
+
+    /// Returns how long discovery should wait before checking for another eligible
+    /// `FindBlocks` peer.
+    pub fn find_blocks_retry_after(&self) -> Option<Duration> {
+        self.2
+    }
+
+    /// Returns true for a peer-attributable request failure that does not imply
+    /// the connection has already closed.
+    pub fn is_attributable_find_blocks_failure(&self) -> bool {
+        self.3
     }
 }
 
@@ -131,6 +158,19 @@ pub enum PeerError {
     /// There are no ready remote peers.
     #[error("No ready peers available")]
     NoReadyPeers,
+
+    /// There are connected peers, but none are currently eligible for another
+    /// rate-limited `FindBlocks` request.
+    #[error("No eligible FindBlocks peer; retry after {retry_after:?}")]
+    NoEligibleFindBlocksPeer {
+        /// The earliest known cooldown expiry, capped by the peer-churn recheck.
+        retry_after: Duration,
+    },
+
+    /// A `FindBlocks` request reached its response deadline without closing
+    /// the underlying connection.
+    #[error("FindBlocks response exceeded its deadline")]
+    FindBlocksResponseTimeout,
 
     /// This peer request's caused an internal service timeout, so the connection was dropped
     /// to shed load or prevent attacks.
@@ -198,6 +238,8 @@ impl PeerError {
             PeerError::DuplicateHandshake => "DuplicateHandshake".into(),
             PeerError::Overloaded => "Overloaded".into(),
             PeerError::NoReadyPeers => "NoReadyPeers".into(),
+            PeerError::NoEligibleFindBlocksPeer { .. } => "NoEligibleFindBlocksPeer".into(),
+            PeerError::FindBlocksResponseTimeout => "FindBlocksResponseTimeout".into(),
             PeerError::InboundTimeout => "InboundTimeout".into(),
             PeerError::ServiceShutdown => "ServiceShutdown".into(),
             PeerError::NotFoundResponse(_) => "NotFoundResponse".into(),

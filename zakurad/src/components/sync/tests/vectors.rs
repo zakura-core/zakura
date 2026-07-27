@@ -53,6 +53,25 @@ type TestChainSync = ChainSync<
     MockChainTip,
 >;
 
+#[test]
+fn discovery_backpressure_pauses_resumes_and_enforces_hard_bound() {
+    let lookahead = 1_000;
+
+    assert!(sync::discovery_can_start(lookahead, 499, 1_000));
+    assert!(!sync::discovery_can_start(lookahead, 500, 1_000));
+
+    assert_eq!(
+        sync::discovery_acceptance_capacity(lookahead, 2_000, 3_000),
+        1_000,
+        "an active wave accepts only the prefix below lookahead + 5,000"
+    );
+    assert_eq!(
+        sync::discovery_acceptance_capacity(lookahead, 2_000, 4_000),
+        0,
+        "the hard bound rejects all additional hashes"
+    );
+}
+
 /// Maximum time to wait for a request to any test service.
 ///
 /// The default [`MockService`] value can be too short for some of these tests that take a little
@@ -211,18 +230,7 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
     }
 
     // Check that nothing unexpected happened.
-    peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;
-
-    // State is checked for all non-tip blocks (blocks 1 & 2) in response order
-    state_service
-        .expect_request(zs::Request::KnownBlock(block1_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-    state_service
-        .expect_request(zs::Request::KnownBlock(block2_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
 
     // Blocks 1 & 2 are fetched in order, then verified concurrently
     peer_set
@@ -432,12 +440,6 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
             .await
             .respond(Err(zn::BoxError::from("synthetic short-tip peer error")));
     }
-    for hash in &hashes[1..=2] {
-        state_service
-            .expect_request(zs::Request::KnownBlock(*hash))
-            .await
-            .respond(zs::Response::KnownBlock(None));
-    }
     for (hash, block) in hashes[1..=2].iter().zip(&blocks[1..=2]) {
         peer_set
             .expect_request(zn::Request::BlocksByHash(iter::once(*hash).collect()))
@@ -525,12 +527,6 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
             })
             .await
             .respond(Err(zn::BoxError::from("synthetic refreshed-tip error")));
-    }
-    for hash in &hashes[1..=4] {
-        state_service
-            .expect_request(zs::Request::KnownBlock(*hash))
-            .await
-            .respond(zs::Response::KnownBlock(None));
     }
     for (hash, block) in hashes[3..=4].iter().zip(&blocks[3..=4]) {
         peer_set
@@ -710,18 +706,7 @@ async fn sync_blocks_trailing_hashes_ok() -> Result<(), crate::BoxError> {
     }
 
     // Check that nothing unexpected happened.
-    peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;
-
-    // State is checked for all non-tip blocks (blocks 1 & 2) in response order
-    state_service
-        .expect_request(zs::Request::KnownBlock(block1_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-    state_service
-        .expect_request(zs::Request::KnownBlock(block2_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
 
     // Blocks 1 & 2 are fetched in order, then verified concurrently
     peer_set
@@ -1025,22 +1010,7 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
     }
 
     // Check that nothing unexpected happened.
-    peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;
-
-    // State is checked for all non-tip blocks (blocks 982k, 1, 2) in response order
-    state_service
-        .expect_request(zs::Request::KnownBlock(block982k_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-    state_service
-        .expect_request(zs::Request::KnownBlock(block1_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-    state_service
-        .expect_request(zs::Request::KnownBlock(block2_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
 
     // Blocks 982k, 1, 2 are fetched in order, then verified concurrently,
     // but block 982k verification is skipped because it is too high.
@@ -1206,18 +1176,7 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
     }
 
     // Check that nothing unexpected happened.
-    peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;
-
-    // State is checked for all non-tip blocks (blocks 1 & 2) in response order
-    state_service
-        .expect_request(zs::Request::KnownBlock(block1_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-    state_service
-        .expect_request(zs::Request::KnownBlock(block2_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
 
     // Blocks 1 & 2 are fetched in order, then verified concurrently
     peer_set
@@ -1886,6 +1845,84 @@ async fn obtain_tips_ignores_known_hash_after_first_unknown() -> Result<(), crat
 }
 
 #[tokio::test]
+async fn obtain_tips_dispatches_useful_result_before_silent_peers_finish(
+) -> Result<(), crate::BoxError> {
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        mut state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let locator = block::Hash::from([0x20; 32]);
+    let first = block::Hash::from([0x21; 32]);
+    let second = block::Hash::from([0x22; 32]);
+    let trailing = block::Hash::from([0x23; 32]);
+
+    let respond_to_requests = async {
+        state_service
+            .expect_request(zs::Request::BlockLocator)
+            .await
+            .respond(zs::Response::BlockLocator(vec![locator]));
+
+        let useful = peer_set
+            .expect_request(zn::Request::FindBlocks {
+                known_blocks: vec![locator],
+                stop: None,
+            })
+            .await;
+        let mut silent = Vec::new();
+        for _ in 1..sync::FANOUT {
+            silent.push(
+                peer_set
+                    .expect_request(zn::Request::FindBlocks {
+                        known_blocks: vec![locator],
+                        stop: None,
+                    })
+                    .await,
+            );
+        }
+        useful.respond(zn::Response::BlockHashes(vec![first, second, trailing]));
+
+        for hash in [first, second] {
+            state_service
+                .expect_request(zs::Request::KnownBlock(hash))
+                .await
+                .respond(zs::Response::KnownBlock(None));
+        }
+
+        let early_download = tokio::time::timeout(
+            Duration::from_secs(1),
+            peer_set.expect_request(zn::Request::BlocksByHash(iter::once(first).collect())),
+        )
+        .await
+        .expect("a useful response must dispatch before silent discovery peers finish");
+
+        for request in silent {
+            request.respond(Err(zn::BoxError::from("synthetic silent-peer completion")));
+        }
+
+        // Keep the block-download failure unrelated to discovery completion.
+        early_download.respond(Err(zn::BoxError::from(
+            "synthetic independent block-download failure",
+        )));
+
+        Ok::<_, crate::BoxError>(())
+    };
+
+    let (obtained, responded) = futures::join!(chain_sync.obtain_tips(), respond_to_requests);
+    responded?;
+    obtained?;
+
+    block_verifier_router.expect_no_requests().await;
+    state_service.expect_no_requests().await;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn build_extend_ignores_malformed_find_blocks_responses() -> Result<(), crate::BoxError> {
     let (
         _chain_sync,
@@ -1950,6 +1987,17 @@ async fn build_extend_ignores_malformed_find_blocks_responses() -> Result<(), cr
         })
         .await
         .respond(zn::Response::BlockHashes(vec![random]));
+    for _ in 3..sync::FANOUT {
+        peer_set
+            .expect_request(zn::Request::FindBlocks {
+                known_blocks: vec![tip],
+                stop: None,
+            })
+            .await
+            .respond(Err(zn::BoxError::from(
+                "synthetic malformed-response peer error",
+            )));
+    }
 
     let (download_set, prospective_tips, discovered) = extend_handle
         .await

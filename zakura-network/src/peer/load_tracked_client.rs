@@ -18,7 +18,10 @@ use tower::{
 use crate::{
     constants::{EWMA_DECAY_TIME_NANOS, EWMA_DEFAULT_RTT},
     peer::{Client, ConnectedAddr, ConnectionInfo},
-    protocol::external::{canonical_socket_addr, types::Version},
+    protocol::external::{
+        canonical_socket_addr,
+        types::{PeerServices, Version},
+    },
 };
 
 static NEXT_PEER_TRACE_ID: AtomicU64 = AtomicU64::new(1);
@@ -73,6 +76,11 @@ impl LoadTrackedClient {
     /// Retrieve a process-local identifier used to correlate peer trace events.
     pub(crate) fn trace_id(&self) -> u64 {
         self.trace_id
+    }
+
+    /// Retrieve the services advertised by the remote peer.
+    pub(crate) fn remote_services(&self) -> PeerServices {
+        self.connection_info.remote.services
     }
 
     /// Returns true if this peer connected directly to us from `ip`.

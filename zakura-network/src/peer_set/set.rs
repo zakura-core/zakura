@@ -101,7 +101,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use futures::{
@@ -123,7 +123,11 @@ use tower::{
     Service,
 };
 
-use zakura_chain::{chain_tip::ChainTip, parameters::Network};
+use zakura_chain::{
+    block,
+    chain_tip::{ChainTip, AT_OR_NEAR_TIP_THRESHOLD},
+    parameters::{Network, NetworkUpgrade},
+};
 
 use crate::{
     address_book::AddressMetrics,
@@ -136,7 +140,7 @@ use crate::{
         InventoryChange, InventoryRegistry,
     },
     protocol::{
-        external::{canonical_ip, canonical_socket_addr, InventoryHash},
+        external::{canonical_ip, canonical_socket_addr, types::PeerServices, InventoryHash},
         internal::{Request, Response},
     },
     BannedIps, BoxError, Config, PeerError, PeerSocketAddr, SharedPeerError,
@@ -162,7 +166,7 @@ pub struct CancelClientWork;
 
 type ResponseFuture = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send + 'static>>;
 
-/// Classification of a `FindBlocks`/`FindHeaders` response, sent from a
+/// Classification of a `FindBlocks` response, sent from a
 /// response-wrapping future to [`PeerSet::poll_ready`] via an mpsc channel so
 /// the stall tracker can be updated and the peer disconnected if needed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -171,14 +175,30 @@ enum StallOutcome {
     Clear,
 }
 
-fn classify_find_response<E>(result: &Result<Response, E>) -> Option<StallOutcome> {
+#[derive(Copy, Clone, Debug)]
+struct StallEvent {
+    peer: PeerSocketAddr,
+    generation: u64,
+    locator: block::Hash,
+    outcome: StallOutcome,
+}
+
+/// Maximum duration of one peer's legacy `FindBlocks` response.
+pub const FIND_BLOCKS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(9);
+
+/// Maximum delay before discovery rechecks for peer churn when every connected
+/// peer is busy or in its locator cooldown.
+pub const FIND_BLOCKS_PEER_CHURN_RECHECK: Duration = Duration::from_secs(10);
+
+fn classify_find_blocks_response(
+    result: &Result<Response, SharedPeerError>,
+) -> Option<StallOutcome> {
     match result {
         Ok(Response::BlockHashes(hashes)) if hashes.is_empty() => Some(StallOutcome::Stall),
         Ok(Response::BlockHashes(_)) => Some(StallOutcome::Clear),
-        Ok(Response::BlockHeaders(headers)) if headers.is_empty() => Some(StallOutcome::Stall),
-        Ok(Response::BlockHeaders(_)) => Some(StallOutcome::Clear),
         Ok(_) => None,
-        Err(_) => Some(StallOutcome::Stall),
+        Err(error) if error.is_attributable_find_blocks_failure() => Some(StallOutcome::Stall),
+        Err(_) => None,
     }
 }
 
@@ -210,7 +230,7 @@ where
     /// A shared list of banned IP addresses.
     bans: BannedIps,
 
-    /// Tracks peers returning empty `FindBlocks`/`FindHeaders` responses.
+    /// Tracks full-serving peers failing emergency `FindBlocks` discovery.
     /// Mutated only from [`Self::poll_ready`] via [`Self::stall_event_rx`].
     find_response_stalls: FindResponseStallTracker,
 
@@ -218,10 +238,25 @@ where
     /// [`Self::route_p2c`]. The channel keeps the tracker single-owner (no
     /// `Mutex`) and confines mutation to `poll_ready`, where the peer set can
     /// call [`Self::remove`] directly.
-    stall_event_rx: tokio_mpsc::UnboundedReceiver<(PeerSocketAddr, StallOutcome)>,
+    stall_event_rx: tokio_mpsc::UnboundedReceiver<StallEvent>,
 
     /// Producer clones handed to each tracked request's response wrapper.
-    stall_event_tx: tokio_mpsc::UnboundedSender<(PeerSocketAddr, StallOutcome)>,
+    stall_event_tx: tokio_mpsc::UnboundedSender<StallEvent>,
+
+    /// Last `FindBlocks` query for each live connection generation.
+    ///
+    /// Keeping only the latest locator bounds this state by the connection
+    /// limit while making locator advancement immediately eligible.
+    find_blocks_queries: HashMap<u64, (block::Hash, Instant)>,
+
+    /// Current connection generation for each transient peer address.
+    connection_generations: HashMap<PeerSocketAddr, u64>,
+
+    /// Locator whose emergency strikes are currently being tracked.
+    emergency_locator: Option<block::Hash>,
+
+    /// Time at which the peer set most recently observed an empty chain.
+    empty_chain_since: Option<Instant>,
 
     // Peer Tracking: Ready Peers
     //
@@ -385,6 +420,10 @@ where
             find_response_stalls: FindResponseStallTracker::new(),
             stall_event_rx,
             stall_event_tx,
+            find_blocks_queries: HashMap::new(),
+            connection_generations: HashMap::new(),
+            emergency_locator: None,
+            empty_chain_since: None,
 
             // Ready peers
             ready_services: HashMap::new(),
@@ -826,18 +865,37 @@ where
     /// TCP connection is closed when its service is dropped; address book and
     /// ban list are untouched, so the peer is free to reconnect.
     fn drain_stall_events(&mut self, cx: &mut Context<'_>) {
-        while let Poll::Ready(Some((addr, outcome))) = self.stall_event_rx.poll_recv(cx) {
-            match outcome {
+        while let Poll::Ready(Some(event)) = self.stall_event_rx.poll_recv(cx) {
+            match event.outcome {
                 StallOutcome::Stall => {
-                    if self.find_response_stalls.record_stall(addr) {
+                    let strikes = self
+                        .find_response_stalls
+                        .count(event.generation, event.locator)
+                        + 1;
+                    metrics::histogram!("sync.discovery.emergency.peer.strikes")
+                        .record(strikes as f64);
+                    trace!(
+                        peer = %event.peer.addr_label(self.expose_peer_addresses),
+                        generation = event.generation,
+                        locator = ?event.locator,
+                        strikes,
+                        "recording emergency FindBlocks strike",
+                    );
+                    if self
+                        .find_response_stalls
+                        .record_stall(event.generation, event.locator)
+                    {
                         info!(
-                            peer = %addr.addr_label(self.expose_peer_addresses),
-                            "dropping stalled peer: exceeded FindBlocks/FindHeaders stall threshold",
+                            peer = %event.peer.addr_label(self.expose_peer_addresses),
+                            generation = event.generation,
+                            locator = ?event.locator,
+                            "dropping stalled peer: exceeded emergency FindBlocks threshold",
                         );
-                        self.remove(&addr);
+                        metrics::counter!("sync.discovery.peers.disconnected").increment(1);
+                        self.remove(&event.peer);
                     }
                 }
-                StallOutcome::Clear => self.find_response_stalls.clear(addr),
+                StallOutcome::Clear => self.find_response_stalls.clear(),
             }
         }
     }
@@ -847,7 +905,10 @@ where
     /// Drops the service, cancelling any pending request or response to that peer.
     /// If the peer does not exist, does nothing.
     fn remove(&mut self, key: &D::Key) {
-        self.find_response_stalls.clear(*key);
+        if let Some(generation) = self.connection_generations.remove(key) {
+            self.find_response_stalls.clear_generation(generation);
+            self.find_blocks_queries.remove(&generation);
+        }
 
         if let Some(ready_service) = self.take_ready_service(key) {
             // A ready service has no work to cancel, so just drop it.
@@ -886,6 +947,7 @@ where
     /// service is dropped.
     fn push_unready(&mut self, key: D::Key, svc: D::Service) {
         let peer_version = svc.remote_version();
+        self.connection_generations.insert(key, svc.trace_id());
         let (tx, rx) = oneshot::channel();
 
         self.unready_services.push(UnreadyService {
@@ -1023,6 +1085,179 @@ where
         }
     }
 
+    /// Returns the target block period at the local next height.
+    fn find_blocks_cooldown(&self) -> Duration {
+        let next_height = self
+            .minimum_peer_version
+            .chain_tip()
+            .best_tip_height()
+            .unwrap_or(block::Height(0))
+            .next()
+            .unwrap_or(block::Height::MAX);
+
+        NetworkUpgrade::target_spacing_for_height(&self.network, next_height)
+            .to_std()
+            .expect("target block spacing is positive")
+    }
+
+    /// Updates and returns the conservative emergency-disconnect mode.
+    fn emergency_find_blocks_mode(&mut self, locator: block::Hash) -> bool {
+        let chain_tip = self.minimum_peer_version.chain_tip();
+        let best_height = chain_tip.best_tip_height();
+
+        if best_height.is_some() {
+            self.empty_chain_since = None;
+        } else {
+            self.empty_chain_since.get_or_insert_with(Instant::now);
+        }
+
+        let far_from_tip = chain_tip
+            .estimate_distance_to_network_chain_tip(&self.network)
+            .is_some_and(|(distance, _)| distance > AT_OR_NEAR_TIP_THRESHOLD);
+        let empty_too_long = best_height.is_none()
+            && self.empty_chain_since.is_some_and(|since| {
+                since.elapsed()
+                    >= self
+                        .find_blocks_cooldown()
+                        .saturating_mul(AT_OR_NEAR_TIP_THRESHOLD as u32)
+            });
+        let emergency = far_from_tip || empty_too_long;
+
+        if !emergency || self.emergency_locator != Some(locator) {
+            self.find_response_stalls.clear();
+        }
+        self.emergency_locator = emergency.then_some(locator);
+
+        metrics::gauge!("sync.discovery.emergency.active").set(u8::from(emergency) as f64);
+        emergency
+    }
+
+    /// Routes a rate-limited `FindBlocks` request to one eligible connection.
+    fn route_find_blocks(
+        &mut self,
+        req: Request,
+        locator: block::Hash,
+    ) -> <Self as tower::Service<Request>>::Future {
+        let now = Instant::now();
+        let cooldown = self.find_blocks_cooldown();
+        let eligible: HashSet<_> = self
+            .ready_services
+            .iter()
+            .filter_map(|(key, service)| {
+                let generation = service.trace_id();
+                let in_cooldown = self.find_blocks_queries.get(&generation).is_some_and(
+                    |(last_locator, queried_at)| {
+                        *last_locator == locator && queried_at.elapsed() < cooldown
+                    },
+                );
+                (!in_cooldown).then_some(*key)
+            })
+            .collect();
+
+        metrics::gauge!("sync.discovery.peers.eligible").set(eligible.len() as f64);
+
+        let Some(peer) = self.select_p2c_peer_from_list(&eligible) else {
+            let retry_after = self
+                .connection_generations
+                .values()
+                .filter_map(|generation| self.find_blocks_queries.get(generation))
+                .filter(|(last_locator, _)| *last_locator == locator)
+                .filter_map(|(_, queried_at)| {
+                    let expires = *queried_at + cooldown;
+                    (expires > now).then_some(expires.duration_since(now))
+                })
+                .min()
+                .unwrap_or(FIND_BLOCKS_PEER_CHURN_RECHECK)
+                .min(FIND_BLOCKS_PEER_CHURN_RECHECK);
+
+            metrics::gauge!("sync.discovery.cooldown.retry_seconds").set(retry_after.as_secs_f64());
+            return async move {
+                Err(SharedPeerError::from(PeerError::NoEligibleFindBlocksPeer {
+                    retry_after,
+                }))
+            }
+            .map_err(Into::into)
+            .boxed();
+        };
+
+        let mut svc = self
+            .take_ready_service(&peer)
+            .expect("selected FindBlocks peer must be ready");
+        let generation = svc.trace_id();
+        self.find_blocks_queries.insert(generation, (locator, now));
+        metrics::counter!("sync.discovery.peers.queried").increment(1);
+        metrics::gauge!("sync.discovery.requests.active").increment(1.0);
+
+        let request_id = self.legacy_peer_trace.next_request_id();
+        let trace_context = self.legacy_peer_trace_context(peer, &svc);
+        let stop = match &req {
+            Request::FindBlocks { stop, .. } => *stop,
+            _ => unreachable!("route_find_blocks only handles FindBlocks"),
+        };
+        let emergency = self.emergency_find_blocks_mode(locator);
+        let track_stalls = emergency
+            && svc.remote_services().contains(PeerServices::NODE_NETWORK)
+            && !self.is_zcashd_compat_peer(&svc);
+
+        let fut = svc.call(req);
+        self.push_unready(peer, svc);
+
+        let stall_tx = self.stall_event_tx.clone();
+        let trace = self.legacy_peer_trace.clone();
+        async move {
+            let result = tokio::time::timeout(FIND_BLOCKS_RESPONSE_TIMEOUT, fut).await;
+            metrics::gauge!("sync.discovery.requests.active").decrement(1.0);
+
+            let result = match result {
+                Ok(result) => {
+                    if matches!(&result, Ok(Response::BlockHashes(hashes)) if hashes.is_empty()) {
+                        metrics::counter!("sync.discovery.peers.empty").increment(1);
+                    } else if matches!(&result, Ok(Response::BlockHashes(hashes)) if !hashes.is_empty())
+                    {
+                        metrics::counter!("sync.discovery.peers.useful").increment(1);
+                    }
+
+                    if let Some(outcome) = classify_find_blocks_response(&result) {
+                        if outcome == StallOutcome::Clear || track_stalls {
+                            let _ = stall_tx.send(StallEvent {
+                                peer,
+                                generation,
+                                locator,
+                                outcome,
+                            });
+                        }
+                    }
+                    result
+                }
+                Err(_) => {
+                    metrics::counter!("sync.discovery.peers.timed_out").increment(1);
+                    if track_stalls {
+                        let _ = stall_tx.send(StallEvent {
+                            peer,
+                            generation,
+                            locator,
+                            outcome: StallOutcome::Stall,
+                        });
+                    }
+                    Err(SharedPeerError::from(
+                        PeerError::FindBlocksResponseTimeout,
+                    ))
+                }
+            };
+
+            trace.find_blocks_finish(
+                request_id,
+                trace_context,
+                Some(locator),
+                stop,
+                now.elapsed(),
+                &result,
+            );
+            result.map_err(Into::into)
+        }
+        .boxed()
+    }
+
     /// Routes a request using P2C load-balancing.
     fn route_p2c(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
         if let Some(p2c_key) = self.select_ready_p2c_peer() {
@@ -1046,30 +1281,13 @@ where
                 _ => None,
             };
 
-            let is_find_request = matches!(
-                &req,
-                Request::FindBlocks { .. } | Request::FindHeaders { .. }
-            );
-            let track_stalls = is_find_request
-                && !self.is_zcashd_compat_peer(&svc)
-                && !self
-                    .minimum_peer_version
-                    .chain_tip()
-                    .is_at_or_near_network_tip(&self.network);
-
             let fut = svc.call(req);
             self.push_unready(p2c_key, svc);
 
-            if track_stalls || find_blocks_trace.is_some() {
-                let stall_tx = self.stall_event_tx.clone();
+            if find_blocks_trace.is_some() {
                 let trace = self.legacy_peer_trace.clone();
                 return async move {
                     let result = fut.await;
-                    if track_stalls {
-                        if let Some(outcome) = classify_find_response(&result) {
-                            let _ = stall_tx.send((p2c_key, outcome));
-                        }
-                    }
                     if let Some((request_id, peer, locator_tip, stop, started)) = find_blocks_trace
                     {
                         trace.find_blocks_finish(
@@ -1699,6 +1917,16 @@ where
 
     fn call(&mut self, req: Request) -> Self::Future {
         let fut = match req {
+            Request::FindBlocks {
+                ref known_blocks, ..
+            } => {
+                let locator = known_blocks
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| self.network.genesis_hash());
+                self.route_find_blocks(req, locator)
+            }
+
             // Only do inventory-aware routing on individual items.
             Request::BlocksByHash(ref hashes) | Request::BlocksByHashFrom { ref hashes, .. }
                 if hashes.len() == 1 =>

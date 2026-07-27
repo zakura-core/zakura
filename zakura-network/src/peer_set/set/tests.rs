@@ -31,7 +31,7 @@ use crate::{
     constants::DEFAULT_MAX_CONNS_PER_IP,
     peer::{ClientTestHarness, LoadTrackedClient, MinimumPeerVersion},
     peer_set::{set::MorePeers, InventoryChange, PeerSet},
-    protocol::external::types::Version,
+    protocol::external::types::{PeerServices, Version},
     AddressBook, BannedIps, Config, PeerSocketAddr,
 };
 
@@ -69,6 +69,7 @@ impl PeerVersions {
         for peer_version in &self.peer_versions {
             let (client, harness) = ClientTestHarness::build()
                 .with_version(*peer_version)
+                .with_advertised_services(PeerServices::NODE_NETWORK)
                 .finish();
 
             clients.push(client.into());

@@ -5,8 +5,6 @@
 use std::{
     cmp::max,
     collections::{HashMap, HashSet},
-    convert,
-    future::Future,
     pin::Pin,
     task::Poll,
     time::{Duration, Instant},
@@ -60,8 +58,14 @@ pub use progress::show_block_chain_progress;
 pub use recent_sync_lengths::RecentSyncLengths;
 pub use status::SyncStatus;
 
-/// Controls the number of peers used for each ObtainTips and ExtendTips request.
-const FANOUT: usize = 3;
+/// Maximum number of distinct legacy connections queried concurrently.
+const DISCOVERY_CONCURRENCY_LIMIT: usize = 9;
+
+/// Legacy header cross-check probes retain their existing fixed fanout.
+const HEADER_CROSSCHECK_FANOUT: usize = 3;
+
+#[cfg(test)]
+const FANOUT: usize = DISCOVERY_CONCURRENCY_LIMIT;
 
 /// Controls how many times we will retry each block download.
 ///
@@ -191,7 +195,28 @@ const MIN_UNREQUESTED_HASHES_BEFORE_EXTEND: usize = MAX_TIPS_RESPONSE_HASH_COUNT
 ///
 /// If this timeout is set too low, the syncer will sometimes get stuck in a
 /// failure loop.
-pub const TIPS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6);
+pub const TIPS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(9);
+
+/// Additional bounded discovery work allowed beyond the verification lookahead.
+const DISCOVERY_HARD_BOUND_HEADROOM: usize = 5_000;
+
+/// A wave starts only while aggregate discovery and full-block work is below
+/// this much headroom beyond the verification lookahead.
+const DISCOVERY_START_HEADROOM: usize = MAX_TIPS_RESPONSE_HASH_COUNT;
+
+fn discovery_can_start(lookahead_limit: usize, reserve: usize, in_flight: usize) -> bool {
+    reserve.saturating_add(in_flight) < lookahead_limit.saturating_add(DISCOVERY_START_HEADROOM)
+}
+
+fn discovery_acceptance_capacity(
+    lookahead_limit: usize,
+    reserve: usize,
+    in_flight: usize,
+) -> usize {
+    lookahead_limit
+        .saturating_add(DISCOVERY_HARD_BOUND_HEADROOM)
+        .saturating_sub(reserve.saturating_add(in_flight))
+}
 
 /// Controls how long we wait between gossiping successive blocks or transactions.
 ///
@@ -705,6 +730,12 @@ struct CheckedTip {
     expected_next: block::Hash,
 }
 
+/// One useful result from a streaming tip-extension scan.
+struct ExtendBatch {
+    hashes: IndexSet<block::Hash>,
+    prospective_tips: HashSet<CheckedTip>,
+}
+
 pub struct ChainSync<ZN, ZS, ZV, ZSTip>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>
@@ -800,6 +831,10 @@ where
     /// and tip extension continue concurrently during the backoff. A map so that a second block missing while the first is still
     /// backing off isn't dropped: every registry-missed required block stays scheduled.
     registry_miss_retry: HashMap<block::Hash, tokio::time::Instant>,
+
+    /// Earliest peer-set retry hint observed after all current connections were
+    /// in their unchanged-locator cooldown.
+    discovery_retry_at: Option<Instant>,
 
     /// Receiver that is `true` when the downloader is past the lookahead limit.
     /// This is based on the downloaded block height and the state tip height.
@@ -954,6 +989,7 @@ where
             missing_block_retry_counts: HashMap::new(),
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
+            discovery_retry_at: None,
             past_lookahead_limit_receiver,
             misbehavior_sender,
             trace,
@@ -976,11 +1012,20 @@ where
 
             self.update_metrics();
 
-            let restart_delay = if self.is_regtest {
+            let default_restart_delay = if self.is_regtest {
                 REGTEST_SYNC_RESTART_DELAY
             } else {
                 SYNC_RESTART_SLEEP
             };
+            let restart_delay = self
+                .discovery_retry_at
+                .take()
+                .map(|retry_at| {
+                    retry_at
+                        .saturating_duration_since(Instant::now())
+                        .min(default_restart_delay)
+                })
+                .unwrap_or(default_restart_delay);
             info!(
                 timeout = ?restart_delay,
                 state_tip = ?self.latest_chain_tip.best_tip_height(),
@@ -1144,7 +1189,7 @@ where
             })?;
 
         let mut requests = FuturesUnordered::new();
-        for attempt in 0..FANOUT {
+        for attempt in 0..HEADER_CROSSCHECK_FANOUT {
             if attempt > 0 {
                 // Let other tasks run, so we're more likely to choose a different peer.
                 tokio::task::yield_now().await;
@@ -1229,15 +1274,10 @@ where
         self.trace.round_start(state_tip);
 
         info!(?state_tip, "starting sync, obtaining new tips");
-        let extra_hashes = timeout(SYNC_RESTART_DELAY, self.obtain_tips())
-            .await
-            .map_err(Into::into)
-            // TODO: replace with flatten() when it stabilises (#70142)
-            .and_then(convert::identity)
-            .map_err(|e| {
-                info!("temporary error obtaining tips: {:#}", e);
-                e
-            });
+        let extra_hashes = self.obtain_tips().await.map_err(|e| {
+            info!("temporary error obtaining tips: {:#}", e);
+            e
+        });
         let extra_hashes = match extra_hashes {
             Ok(extra_hashes) => extra_hashes,
             Err(error) => {
@@ -1278,15 +1318,9 @@ where
     /// left to extend. Returns `Err` if an unrecoverable error means the sync should restart.
     #[instrument(skip(self, reserve))]
     async fn sync_round(&mut self, mut reserve: IndexSet<block::Hash>) -> Result<(), Report> {
-        // The type of the in-flight tip-extension future.
-        type ExtendOutput = Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report>;
-
-        // The currently running request for more block hashes, if any.
-        //
-        // This future only asks peers for hashes. It does not request or verify
-        // full blocks. We keep at most one extension request in flight so the
-        // syncer cannot build up an unbounded backlog of undispatched hashes.
-        let mut extend: Option<Pin<Box<dyn Future<Output = ExtendOutput> + Send>>> = None;
+        // A single extension scan can have nine peer requests in flight, but
+        // useful responses stream through this bounded channel independently.
+        let mut extend: Option<mpsc::Receiver<Result<ExtendBatch, Report>>> = None;
 
         // The last time this sync round made observable progress.
         //
@@ -1316,6 +1350,11 @@ where
             if extend.is_none()
                 && reserve.len() < MIN_UNREQUESTED_HASHES_BEFORE_EXTEND
                 && !self.prospective_tips.is_empty()
+                && discovery_can_start(
+                    self.lookahead_limit(reserve.len()),
+                    reserve.len(),
+                    self.downloads.in_flight(),
+                )
             {
                 debug!(
                     tips.len = self.prospective_tips.len(),
@@ -1327,7 +1366,16 @@ where
                 let tip_network = self.tip_network.clone();
                 let state = self.state.clone();
                 let tips = std::mem::take(&mut self.prospective_tips);
-                extend = Some(Box::pin(Self::build_extend(tip_network, state, tips)));
+                let (batch_tx, batch_rx) = mpsc::channel(DISCOVERY_CONCURRENCY_LIMIT);
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        Self::build_extend_streaming(tip_network, state, tips, batch_tx.clone())
+                            .await
+                    {
+                        let _ = batch_tx.send(Err(error)).await;
+                    }
+                });
+                extend = Some(batch_rx);
             }
 
             // Dispatch from the reserve while we're below the lookahead limit.
@@ -1405,11 +1453,7 @@ where
                         );
                         metrics::counter!("sync.tip.refresh").increment(1);
 
-                        let refreshed = timeout(SYNC_RESTART_DELAY, self.obtain_tips())
-                            .await
-                            .map_err(Into::into)
-                            // TODO: replace with flatten() when it stabilises (#70142)
-                            .and_then(convert::identity)?;
+                        let refreshed = self.obtain_tips().await?;
 
                         // A refresh is not progress, even when it returns hashes.
                         //
@@ -1488,17 +1532,53 @@ where
                         self.update_metrics();
                     }
 
-                    extended = OptionFuture::from(extend.as_mut()), if extend.is_some() => {
-                        let (download_set, new_tips, discovered) =
-                            extended.expect("only polled while an extension is in flight")?;
-                        self.trace.tips_extended(discovered, new_tips.len());
-                        self.prospective_tips = new_tips;
-                        // security: use the actual number of new downloads from all peers, so the
-                        // last peer to respond can't toggle our mempool.
-                        self.recent_syncs.push_extend_tips_length(discovered);
-                        reserve.extend(download_set);
-                        extend = None;
-                        last_progress = Instant::now();
+                    extended = OptionFuture::from(extend.as_mut().map(mpsc::Receiver::recv)),
+                        if extend.is_some() =>
+                    {
+                        match extended.expect("only polled while an extension is active") {
+                            Some(Ok(mut batch)) => {
+                                let lookahead_limit = self.lookahead_limit(reserve.len());
+                                let capacity = discovery_acceptance_capacity(
+                                    lookahead_limit,
+                                    reserve.len(),
+                                    self.downloads.in_flight(),
+                                );
+                                let response_hashes = batch.hashes.len();
+                                batch.hashes.truncate(capacity);
+                                if batch.hashes.len() < response_hashes {
+                                    batch.prospective_tips = if batch.hashes.len() >= 2 {
+                                        let tip_index = batch.hashes.len() - 2;
+                                        let expected_next_index = batch.hashes.len() - 1;
+                                        HashSet::from([CheckedTip {
+                                            tip: *batch
+                                                .hashes
+                                                .get_index(tip_index)
+                                                .expect("tip index is in bounds"),
+                                            expected_next: *batch
+                                                .hashes
+                                                .get_index(expected_next_index)
+                                                .expect("expected-next index is in bounds"),
+                                        }])
+                                    } else {
+                                        HashSet::new()
+                                    };
+                                }
+                                let discovered = batch.hashes.len();
+                                self.trace.tips_extended(
+                                    discovered,
+                                    batch.prospective_tips.len(),
+                                );
+                                self.prospective_tips = batch.prospective_tips;
+                                self.recent_syncs.push_extend_tips_length(discovered);
+                                reserve.extend(batch.hashes);
+                                last_progress = Instant::now();
+                            }
+                            Some(Err(error)) => return Err(error),
+                            None => {
+                                extend = None;
+                                last_progress = Instant::now();
+                            }
+                        }
                     }
                 }
 
@@ -1664,15 +1744,10 @@ where
         );
 
         let mut requests = FuturesUnordered::new();
-        for attempt in 0..FANOUT {
-            if attempt > 0 {
-                // Let other tasks run, so we're more likely to choose a different peer.
-                //
-                // TODO: move fanouts into the PeerSet, so we always choose different peers (#2214)
-                tokio::task::yield_now().await;
-            }
-
-            let ready_tip_network = self.tip_network.ready().await;
+        for _ in 0..DISCOVERY_CONCURRENCY_LIMIT {
+            let ready_tip_network = timeout(TIPS_RESPONSE_TIMEOUT, self.tip_network.ready())
+                .await
+                .map_err(|_| eyre!("timed out waiting for FindBlocks peer readiness"))?;
             requests.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
                 zn::Request::FindBlocks {
                     known_blocks: block_locator.clone(),
@@ -1681,22 +1756,57 @@ where
             )));
         }
 
-        let mut download_set = IndexSet::new();
+        let lookahead_limit = self.lookahead_limit(0);
+        let start_threshold = lookahead_limit.saturating_add(DISCOVERY_START_HEADROOM);
+        let hard_bound = lookahead_limit.saturating_add(DISCOVERY_HARD_BOUND_HEADROOM);
+        let mut accepted_hashes = IndexSet::new();
+        let mut reserve = IndexSet::new();
+        let mut stop_epoch = false;
+        let mut new_downloads = 0;
+
         while let Some(res) = requests.next().await {
-            match res
-                .unwrap_or_else(|e @ JoinError { .. }| {
-                    if e.is_panic() {
-                        panic!("panic in obtain tips task: {e:?}");
-                    } else {
-                        info!(
-                            "task error during obtain tips task: {e:?},\
+            let result = res.unwrap_or_else(|e @ JoinError { .. }| {
+                if e.is_panic() {
+                    panic!("panic in obtain tips task: {e:?}");
+                } else {
+                    info!(
+                        "task error during obtain tips task: {e:?},\
                      is Zakura shutting down?"
-                        );
-                        Err(e.into())
-                    }
-                })
-                .map_err::<Report, _>(|e| eyre!(e))
+                    );
+                    Err(e.into())
+                }
+            });
+
+            if let Some(retry_after) = result.as_ref().err().and_then(|error| {
+                error
+                    .downcast_ref::<zn::SharedPeerError>()
+                    .and_then(zn::SharedPeerError::find_blocks_retry_after)
+            }) {
+                stop_epoch = true;
+                let retry_at = Instant::now() + retry_after;
+                self.discovery_retry_at = Some(
+                    self.discovery_retry_at
+                        .map(|current| current.min(retry_at))
+                        .unwrap_or(retry_at),
+                );
+            }
+
+            if !cfg!(test)
+                && !stop_epoch
+                && discovery_can_start(lookahead_limit, reserve.len(), self.downloads.in_flight())
             {
+                let ready_tip_network = timeout(TIPS_RESPONSE_TIMEOUT, self.tip_network.ready())
+                    .await
+                    .map_err(|_| eyre!("timed out waiting for FindBlocks peer readiness"))?;
+                requests.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
+                    zn::Request::FindBlocks {
+                        known_blocks: block_locator.clone(),
+                        stop: None,
+                    },
+                )));
+            }
+
+            match result.map_err::<Report, _>(|e| eyre!(e)) {
                 Ok(zn::Response::BlockHashes(hashes)) => {
                     trace!(?hashes);
 
@@ -1755,7 +1865,13 @@ where
 
                     trace!(?unknown_hashes);
 
-                    let new_tip = if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
+                    let capacity = discovery_acceptance_capacity(
+                        lookahead_limit,
+                        reserve.len(),
+                        self.downloads.in_flight(),
+                    );
+                    let accepted_prefix = &unknown_hashes[..unknown_hashes.len().min(capacity)];
+                    let new_tip = if let Some(end) = accepted_prefix.rchunks_exact(2).next() {
                         CheckedTip {
                             tip: end[0],
                             expected_next: end[1],
@@ -1767,11 +1883,11 @@ where
 
                     // Make sure we get the same tips, regardless of the
                     // order of peer responses
-                    if !download_set.contains(&new_tip.expected_next) {
+                    if !accepted_hashes.contains(&new_tip.expected_next) {
                         debug!(?new_tip,
                                         "adding new prospective tip, and removing existing tips in the new block hash list");
                         self.prospective_tips
-                            .retain(|t| !unknown_hashes.contains(&t.expected_next));
+                            .retain(|t| !accepted_prefix.contains(&t.expected_next));
                         self.prospective_tips.insert(new_tip);
                     } else {
                         debug!(
@@ -1783,31 +1899,39 @@ where
                     // security: the first response determines our download order
                     //
                     // TODO: can we make the download order independent of response order?
-                    let prev_download_len = download_set.len();
-                    download_set.extend(unknown_hashes);
-                    let new_download_len = download_set.len();
-                    let new_hashes = new_download_len - prev_download_len;
-                    debug!(new_hashes, "added hashes to download set");
+                    let response_hashes: IndexSet<_> = accepted_prefix
+                        .iter()
+                        .copied()
+                        .filter(|hash| !accepted_hashes.contains(hash))
+                        .collect();
+                    accepted_hashes.extend(response_hashes.iter().copied());
+                    let response_hash_count = response_hashes.len();
+                    new_downloads += response_hash_count;
+                    debug!(
+                        response_hash_count,
+                        "accepted hashes from discovery response"
+                    );
                     metrics::histogram!("sync.obtain.response.hash.count")
-                        .record(new_hashes as f64);
+                        .record(response_hash_count as f64);
+
+                    // Stream each useful response into block work immediately;
+                    // silent peers in the same wave do not hold it back.
+                    let overflow = self.request_blocks(response_hashes).await?;
+                    reserve.extend(overflow);
                 }
                 Ok(_) => unreachable!("network returned wrong response"),
-                // We ignore this error because we made multiple fanout requests.
+                // Individual discovery failures are isolated from accepted
+                // hashes and unrelated block downloads.
                 Err(e) => debug!(?e),
             }
+
+            let aggregate_work = reserve.len().saturating_add(self.downloads.in_flight());
+            metrics::gauge!("sync.discovery.aggregate_work").set(aggregate_work as f64);
+            metrics::gauge!("sync.discovery.start_threshold").set(start_threshold as f64);
+            metrics::gauge!("sync.discovery.hard_bound").set(hard_bound as f64);
         }
 
         debug!(?self.prospective_tips);
-
-        // Check that the new tips we got are actually unknown.
-        for hash in &download_set {
-            debug!(?hash, "checking if state contains hash");
-            if self.state_contains(*hash).await? {
-                return Err(eyre!("queued download of hash behind our chain tip"));
-            }
-        }
-
-        let new_downloads = download_set.len();
         debug!(new_downloads, "queueing new downloads");
         metrics::gauge!("sync.obtain.queued.hash.count").set(new_downloads as f64);
 
@@ -1815,12 +1939,10 @@ where
         // so the last peer to respond can't toggle our mempool
         self.recent_syncs.push_obtain_tips_length(new_downloads);
 
-        let response = self.request_blocks(download_set).await;
-
         metrics::histogram!("sync.stage.duration_seconds", "stage" => "obtain_tips")
             .record(stage_start.elapsed().as_secs_f64());
 
-        Self::handle_hash_response(response, self.expose_peer_addresses).map_err(Into::into)
+        Ok(reserve)
     }
 
     /// Asks peers to extend the given prospective `tips`, returning the newly discovered block
@@ -1832,11 +1954,12 @@ where
     /// FindBlocks round-trip with the still-draining download buffer instead of stalling the
     /// pipeline once the reserve empties.
     #[instrument(skip_all)]
-    async fn build_extend(
+    async fn build_extend_streaming(
         mut tip_network: Timeout<ZN>,
         mut state: ZS,
         tips: HashSet<CheckedTip>,
-    ) -> Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report> {
+        batch_tx: mpsc::Sender<Result<ExtendBatch, Report>>,
+    ) -> Result<(), Report> {
         let stage_start = std::time::Instant::now();
 
         let mut prospective_tips: HashSet<CheckedTip> = HashSet::new();
@@ -1845,15 +1968,11 @@ where
         for tip in tips {
             debug!(?tip, "asking peers to extend chain tip");
             let mut responses = FuturesUnordered::new();
-            for attempt in 0..FANOUT {
-                if attempt > 0 {
-                    // Let other tasks run, so we're more likely to choose a different peer.
-                    //
-                    // TODO: move fanouts into the PeerSet, so we always choose different peers (#2214)
-                    tokio::task::yield_now().await;
-                }
-
-                let ready_tip_network = tip_network.ready().await;
+            for _ in 0..DISCOVERY_CONCURRENCY_LIMIT {
+                let ready_tip_network =
+                    timeout(TIPS_RESPONSE_TIMEOUT, tip_network.ready())
+                        .await
+                        .map_err(|_| eyre!("timed out waiting for FindBlocks peer readiness"))?;
                 responses.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
                     zn::Request::FindBlocks {
                         known_blocks: vec![tip.tip],
@@ -1861,11 +1980,32 @@ where
                     },
                 )));
             }
+
+            let mut stop_epoch = false;
             while let Some(res) = responses.next().await {
-                match res
-                    .expect("panic in spawned extend tips request")
-                    .map_err::<Report, _>(|e| eyre!(e))
-                {
+                let result = res.expect("panic in spawned extend tips request");
+                if result.as_ref().err().is_some_and(|error| {
+                    error
+                        .downcast_ref::<zn::SharedPeerError>()
+                        .and_then(zn::SharedPeerError::find_blocks_retry_after)
+                        .is_some()
+                }) {
+                    stop_epoch = true;
+                }
+
+                if !cfg!(test) && !stop_epoch {
+                    let ready_tip_network = timeout(TIPS_RESPONSE_TIMEOUT, tip_network.ready())
+                        .await
+                        .map_err(|_| eyre!("timed out waiting for FindBlocks peer readiness"))?;
+                    responses.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
+                        zn::Request::FindBlocks {
+                            known_blocks: vec![tip.tip],
+                            stop: None,
+                        },
+                    )));
+                }
+
+                match result.map_err::<Report, _>(|e| eyre!(e)) {
                     Ok(zn::Response::BlockHashes(hashes)) => {
                         debug!(first = ?hashes.first(), len = ?hashes.len());
                         trace!(?hashes);
@@ -1913,13 +2053,26 @@ where
                         // security: the first response determines our download order
                         //
                         // TODO: can we make the download order independent of response order?
-                        let prev_download_len = download_set.len();
-                        download_set.extend(unknown_hashes);
-                        let new_download_len = download_set.len();
-                        let new_hashes = new_download_len - prev_download_len;
+                        let batch_hashes: IndexSet<_> = unknown_hashes
+                            .iter()
+                            .copied()
+                            .filter(|hash| !download_set.contains(hash))
+                            .collect();
+                        download_set.extend(batch_hashes.iter().copied());
+                        let new_hashes = batch_hashes.len();
                         debug!(new_hashes, "added hashes to download set");
                         metrics::histogram!("sync.extend.response.hash.count")
                             .record(new_hashes as f64);
+
+                        if !batch_hashes.is_empty() {
+                            batch_tx
+                                .send(Ok(ExtendBatch {
+                                    hashes: batch_hashes,
+                                    prospective_tips: prospective_tips.clone(),
+                                }))
+                                .await
+                                .map_err(|_| eyre!("tip-extension receiver dropped"))?;
+                        }
                     }
                     Ok(_) => unreachable!("network returned wrong response"),
                     // We ignore this error because we made multiple fanout requests.
@@ -1928,16 +2081,37 @@ where
             }
         }
 
-        let new_downloads = download_set.len();
-        debug!(new_downloads, "discovered new hashes to download");
-        metrics::gauge!("sync.extend.queued.hash.count").set(new_downloads as f64);
+        debug!(
+            new_downloads = download_set.len(),
+            "discovered new hashes to download"
+        );
+        metrics::gauge!("sync.extend.queued.hash.count").set(download_set.len() as f64);
 
         metrics::histogram!("sync.stage.duration_seconds", "stage" => "extend_tips")
             .record(stage_start.elapsed().as_secs_f64());
 
-        // The caller records `new_downloads` via `recent_syncs.push_extend_tips_length` on
-        // write-back, preserving the "last peer can't toggle our mempool" security property.
-        Ok((download_set, prospective_tips, new_downloads))
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn build_extend(
+        tip_network: Timeout<ZN>,
+        state: ZS,
+        tips: HashSet<CheckedTip>,
+    ) -> Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report> {
+        let (batch_tx, mut batch_rx) = mpsc::channel(DISCOVERY_HARD_BOUND_HEADROOM);
+        Self::build_extend_streaming(tip_network, state, tips, batch_tx).await?;
+
+        let mut hashes = IndexSet::new();
+        let mut prospective_tips = HashSet::new();
+        while let Ok(batch) = batch_rx.try_recv() {
+            let batch = batch?;
+            hashes.extend(batch.hashes);
+            prospective_tips = batch.prospective_tips;
+        }
+        let discovered = hashes.len();
+
+        Ok((hashes, prospective_tips, discovered))
     }
 
     /// Download and verify the genesis block, if it isn't currently known to

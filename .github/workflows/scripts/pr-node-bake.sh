@@ -151,6 +151,25 @@ fetch_state() {
   echo "Restored $(ls -d "$dest"/state/v*/"$network")"
 }
 
+db_format_at_ref() {
+  git show "$1:zakura-state/src/constants.rs" | awk '
+    /^const DATABASE_FORMAT_VERSION:/ {
+      gsub(/;/, "", $NF); major = $NF
+    }
+    /^const DATABASE_FORMAT_MINOR_VERSION:/ {
+      gsub(/;/, "", $NF); minor = $NF
+    }
+    /^const DATABASE_FORMAT_PATCH_VERSION:/ {
+      gsub(/;/, "", $NF); patch = $NF
+    }
+    END {
+      if (major != "" && minor != "" && patch != "") {
+        printf "%s.%s.%s\n", major, minor, patch
+      }
+    }
+  '
+}
+
 MAINNET_MNT=/mnt/bake-mainnet
 TESTNET_MNT=/mnt/bake-testnet
 APPROACH_MNT=/mnt/bake-approach
@@ -162,6 +181,7 @@ mount_volume "$APPROACH_VOLUME_NAME" "$APPROACH_MNT"
 TIP_META=$(curl -fsSL --retry 3 "$TIP_MAINNET_LATEST_JSON")
 TIP_URL=$(echo "$TIP_META" | jq -er '.url')
 TIP_SHA=$(echo "$TIP_META" | jq -er '.sha256')
+TIP_DB_FORMAT=$(echo "$TIP_META" | jq -er '.db_format_version')
 echo "Mainnet tip: $(echo "$TIP_META" | jq -r '"\(.filename) height=\(.height) db=\(.db_format_version)"')"
 # The workflow embeds this height in the volume snapshot name, so the pr-node
 # pre-checkpoint mode can pick the newest snapshot below a branch's checkpoint.
@@ -191,10 +211,37 @@ if [ "$ROLLBACK_COUNT" -le "$MAINNET_RETENTION" ]; then
   cp -a "$MAINNET_MNT/tip/." "$APPROACH_MNT/tip/"
   rm -rf "$APPROACH_MNT/tip/non_finalized_state"
   if [ "$ROLLBACK_COUNT" -gt 0 ]; then
-    /root/cargo-target/release/zakura-rollback-state \
+    ROLLBACK_BIN=/root/cargo-target/release/zakura-rollback-state
+    CURRENT_DB_FORMAT=$(db_format_at_ref HEAD)
+    if [ "$TIP_DB_FORMAT" != "$CURRENT_DB_FORMAT" ]; then
+      ROLLBACK_REF=""
+      while read -r ref; do
+        if [ "$(db_format_at_ref "$ref")" = "$TIP_DB_FORMAT" ]; then
+          ROLLBACK_REF="$ref"
+          break
+        fi
+      done < <(git rev-list HEAD -- zakura-state/src/constants.rs)
+      [ -n "$ROLLBACK_REF" ] || {
+        echo "no rollback source implements snapshot DB format $TIP_DB_FORMAT" >&2
+        exit 1
+      }
+      echo "Building rollback utility for snapshot DB format $TIP_DB_FORMAT at $ROLLBACK_REF"
+      git worktree add --detach /root/rollback-source "$ROLLBACK_REF"
+      (
+        cd /root/rollback-source
+        CARGO_TARGET_DIR=/root/rollback-target \
+          cargo build --release --locked -p zakura --bin zakura-rollback-state
+      )
+      ROLLBACK_BIN=/root/rollback-target/release/zakura-rollback-state
+    fi
+    "$ROLLBACK_BIN" \
       --height "$APPROACH_H" \
       --cache-dir "$APPROACH_MNT/tip" \
       --network Mainnet
+    if [ -d /root/rollback-source ]; then
+      git worktree remove --force /root/rollback-source
+      rm -rf /root/rollback-target
+    fi
   fi
   echo "$APPROACH_H" > /root/mainnet-approach-height
   echo "Mainnet VCT approach state: height=$APPROACH_H handoff=$MAX_CKPT"

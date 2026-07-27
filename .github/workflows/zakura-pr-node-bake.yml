@@ -221,13 +221,13 @@ jobs:
         if: always()
         env:
           DROPLET_ID: ${{ steps.droplet.outputs.id }}
-          DROPLET_NAME: ${{ steps.droplet.outputs.droplet_name }}
+          DROPLET_NAME: ${{ steps.droplet.outputs.droplet_name || format('zakura-pr-bake-{0}', github.run_id) }}
           MAINNET_VOL_ID: ${{ steps.droplet.outputs.mainnet_vol_id }}
-          MAINNET_VOL_NAME: ${{ steps.droplet.outputs.mainnet_vol }}
+          MAINNET_VOL_NAME: ${{ steps.droplet.outputs.mainnet_vol || format('zakura-pr-bake-mainnet-{0}', github.run_id) }}
           TESTNET_VOL_ID: ${{ steps.droplet.outputs.testnet_vol_id }}
-          TESTNET_VOL_NAME: ${{ steps.droplet.outputs.testnet_vol }}
+          TESTNET_VOL_NAME: ${{ steps.droplet.outputs.testnet_vol || format('zakura-pr-bake-testnet-{0}', github.run_id) }}
           APPROACH_VOL_ID: ${{ steps.droplet.outputs.approach_vol_id }}
-          APPROACH_VOL_NAME: ${{ steps.droplet.outputs.approach_vol }}
+          APPROACH_VOL_NAME: ${{ steps.droplet.outputs.approach_vol || format('zakura-pr-bake-approach-{0}', github.run_id) }}
         run: |
           set +e
           if [ -z "${DROPLET_ID}" ] && [ -n "${DROPLET_NAME}" ]; then

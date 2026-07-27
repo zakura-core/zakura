@@ -468,9 +468,9 @@ jobs:
         if: always()
         env:
           DROPLET_ID: ${{ steps.droplet.outputs.id }}
-          DROPLET_NAME: ${{ steps.droplet.outputs.droplet_name }}
+          DROPLET_NAME: ${{ steps.droplet.outputs.droplet_name || format('zakura-pr-{0}-{1}', steps.target.outputs.slug, github.run_id) }}
           VOLUME_ID: ${{ steps.droplet.outputs.volume_id }}
-          VOLUME_NAME: ${{ steps.droplet.outputs.volume_name }}
+          VOLUME_NAME: ${{ steps.droplet.outputs.volume_name || (inputs.snapshot_mode != 'genesis' && format('zakura-pr-vol-{0}', github.run_id)) || '' }}
           TEARDOWN: ${{ inputs.teardown_after_run }}
           SSH_FAILED: ${{ steps.sshwait.outcome == 'failure' }}
           PROVISION_FAILED: ${{ steps.droplet.outcome == 'failure' }}

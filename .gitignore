@@ -175,3 +175,7 @@ perf-artifacts/**/*
 # local VCT fast-sync run artifacts (state cache, config, logs, traces)
 .zakurad-vct-local-cache/
 zakurad-vct-local*
+
+# Local mempool-spam funding and recovery material
+/testnet_wallet
+**/recovery.json

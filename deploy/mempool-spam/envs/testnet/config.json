@@ -1,0 +1,40 @@
+{
+  "network": "test",
+  "controller": {
+    "ssh_host": "167.99.103.111",
+    "spam_root": "/root/ironwood-spam",
+    "zecd_rpc": "http://127.0.0.1:18888"
+  },
+  "nodes": [
+    {
+      "name": "zakura-testnet-3",
+      "impl": "zakura",
+      "rpc_url": "http://138.68.229.254:18232"
+    },
+    {
+      "name": "roman-zebra",
+      "impl": "zebra",
+      "rpc_url": "http://159.65.164.85:18232"
+    },
+    {
+      "name": "zakura-testnet-eu",
+      "impl": "zakura",
+      "rpc_url": "http://164.92.209.78:18232"
+    },
+    {
+      "name": "zebra-testnet-eu",
+      "impl": "zebra",
+      "rpc_url": "http://165.22.204.93:18232"
+    },
+    {
+      "name": "zakura-testnet-as",
+      "impl": "zakura",
+      "rpc_url": "http://206.189.148.0:18232"
+    },
+    {
+      "name": "zebra-testnet-as",
+      "impl": "zebra",
+      "rpc_url": "http://167.71.209.44:18232"
+    }
+  ]
+}

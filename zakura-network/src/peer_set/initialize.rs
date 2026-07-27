@@ -968,15 +968,105 @@ enum CrawlerAction {
     /// Initiate a handshake to the next candidate peer in response to demand.
     ///
     /// If there are no available candidates, crawl existing peers.
-    DemandHandshakeOrCrawl,
+    DemandHandshakeOrCrawl { source: DemandSource },
     /// Crawl existing peers for more peers in response to a timer `tick`.
     TimerCrawl { tick: Instant },
     /// Clear a finished handshake.
-    HandshakeFinished,
+    HandshakeFinished {
+        resume_replenishment_demand: bool,
+        restore_replenishment_demand: bool,
+    },
     /// Clear a finished demand crawl (DemandHandshakeOrCrawl with no peers).
-    DemandCrawlFinished,
+    DemandCrawlFinished { restore_replenishment_demand: bool },
     /// Clear a finished TimerCrawl.
     TimerCrawlFinished,
+}
+
+/// The source of an outbound connection demand action.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum DemandSource {
+    /// Demand received from the peer set or another crawler task.
+    Queued,
+    /// Demand generated locally after a periodic crawl.
+    Replenishment,
+}
+
+/// The result of an outbound dial attempt.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum DialOutcome {
+    /// The connection was sent to the peer set.
+    Connected,
+    /// The connection failed.
+    Failed,
+}
+
+/// Locally generated outbound connection demand.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct ReplenishmentDemand {
+    remaining: usize,
+    paused: bool,
+}
+
+impl ReplenishmentDemand {
+    /// Replace local demand with a fresh periodic-crawl deficit.
+    fn replace(&mut self, demand: usize) {
+        self.remaining = demand;
+        self.paused = false;
+    }
+
+    /// Resume local demand, clamping stale demand to the current deficit.
+    fn resume(&mut self, current_deficit: usize) {
+        self.clamp(current_deficit);
+        self.paused = false;
+    }
+
+    /// Clamp stale local demand to the current deficit.
+    fn clamp(&mut self, current_deficit: usize) {
+        self.remaining = self.remaining.min(current_deficit);
+    }
+
+    /// Tentatively consume one local demand unit.
+    fn take(&mut self) -> bool {
+        if self.remaining == 0 {
+            false
+        } else {
+            self.remaining -= 1;
+            true
+        }
+    }
+
+    /// Restore tentatively consumed demand after a failed dial.
+    fn restore(&mut self, current_deficit: usize) {
+        self.remaining = self.remaining.saturating_add(1).min(current_deficit);
+    }
+
+    /// Restore tentatively consumed demand when no candidate was available.
+    ///
+    /// Pausing prevents a hot retry loop against an empty candidate set.
+    fn restore_and_pause(&mut self, current_deficit: usize) {
+        self.restore(current_deficit);
+        self.paused = true;
+    }
+
+    /// Pause local demand without discarding it.
+    fn pause(&mut self) {
+        self.paused = true;
+    }
+
+    /// Returns `true` if local demand is ready to be processed.
+    fn is_ready(&self) -> bool {
+        self.remaining > 0 && !self.paused
+    }
+
+    /// Returns `true` if local demand is paused.
+    fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Returns the number of remaining local demand units.
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
 }
 
 const OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR: usize = 27;
@@ -1094,7 +1184,7 @@ where
     // replenishment demand. Existing queued demand is processed first and
     // consumes this count, so timer crawls do not duplicate connection attempts
     // that are already waiting in `demand_rx`.
-    let mut remaining_replenishment_demand: usize = 0;
+    let mut replenishment_demand = ReplenishmentDemand::default();
 
     // # Concurrency
     //
@@ -1121,23 +1211,26 @@ where
             // rate-limited timer in this biased select.
             next_demand = demand_rx.next() => next_demand
                 .ok_or("demand stream closed, is Zakura shutting down?".into())
-                .map(|MorePeers| DemandHandshakeOrCrawl),
+                .map(|MorePeers| DemandHandshakeOrCrawl {
+                    source: DemandSource::Queued,
+                }),
             // Existing channel demand gets priority over local replenishment.
-            // Each action consumes one unit of replenishment demand below.
-            _ = future::ready(()), if remaining_replenishment_demand > 0 => {
-                Ok(DemandHandshakeOrCrawl)
+            // Each scheduled action tentatively consumes one local demand unit.
+            _ = future::ready(()), if replenishment_demand.is_ready() => {
+                Ok(DemandHandshakeOrCrawl {
+                    source: DemandSource::Replenishment,
+                })
             }
         };
 
         match crawler_action {
             // Spawned tasks
-            Ok(DemandHandshakeOrCrawl) => {
-                remaining_replenishment_demand = remaining_replenishment_demand.saturating_sub(1);
+            Ok(DemandHandshakeOrCrawl { source }) => {
+                let outbound_connection_count = active_outbound_connections.update_count();
+                let outbound_connection_limit = config.peerset_outbound_connection_limit();
 
-                if active_outbound_connections.update_count()
-                    >= config.peerset_outbound_connection_limit()
-                {
-                    remaining_replenishment_demand = 0;
+                if outbound_connection_count >= outbound_connection_limit {
+                    replenishment_demand.pause();
 
                     // This is set to trace level because when the peer set is
                     // congested it can generate a lot of demand signals.
@@ -1151,6 +1244,16 @@ where
                     let address_book_updater = address_book_updater.clone();
                     let demand_tx = demand_tx.clone();
                     let expose_peer_addresses = config.expose_peer_addresses;
+                    if source == DemandSource::Queued {
+                        let current_deficit = outbound_peer_replenishment_demand(
+                            outbound_connection_count,
+                            outbound_connection_limit,
+                        );
+                        replenishment_demand.clamp(current_deficit);
+                    }
+                    let resume_replenishment_demand =
+                        source == DemandSource::Queued && replenishment_demand.is_paused();
+                    let restore_replenishment_demand = replenishment_demand.take();
 
                     // Increment the connection count before we spawn the connection.
                     let outbound_connection_tracker =
@@ -1178,7 +1281,7 @@ where
 
                             if let Some(candidate) = candidate {
                                 // we don't need to spawn here, because there's nothing running concurrently
-                                dial(
+                                let dial_outcome = dial(
                                     candidate,
                                     outbound_connector,
                                     outbound_connection_tracker,
@@ -1190,14 +1293,22 @@ where
                                 )
                                 .await?;
 
-                                Ok(HandshakeFinished)
+                                Ok(HandshakeFinished {
+                                    resume_replenishment_demand,
+                                    restore_replenishment_demand: restore_replenishment_demand
+                                        && dial_outcome == DialOutcome::Failed,
+                                })
                             } else {
                                 // There weren't any peers, so try to get more peers.
                                 debug!("demand for peers but no available candidates");
 
+                                // Release the reserved outbound slot before crawling.
+                                std::mem::drop(outbound_connection_tracker);
                                 crawl(candidates, demand_tx).await?;
 
-                                Ok(DemandCrawlFinished)
+                                Ok(DemandCrawlFinished {
+                                    restore_replenishment_demand,
+                                })
                             }
                         }
                         .in_current_span(),
@@ -1230,10 +1341,40 @@ where
             }
 
             // Completed spawned tasks
-            Ok(HandshakeFinished) => {
+            Ok(HandshakeFinished {
+                resume_replenishment_demand,
+                restore_replenishment_demand,
+            }) => {
+                if resume_replenishment_demand || restore_replenishment_demand {
+                    let active_outbound_connections = active_outbound_connections.update_count();
+                    let outbound_connection_limit = config.peerset_outbound_connection_limit();
+                    let current_deficit = outbound_peer_replenishment_demand(
+                        active_outbound_connections,
+                        outbound_connection_limit,
+                    );
+                    if restore_replenishment_demand {
+                        replenishment_demand.restore(current_deficit);
+                    }
+                    if resume_replenishment_demand {
+                        replenishment_demand.resume(current_deficit);
+                    }
+                }
+
                 // Already logged in dial()
             }
-            Ok(DemandCrawlFinished) => {
+            Ok(DemandCrawlFinished {
+                restore_replenishment_demand,
+            }) => {
+                if restore_replenishment_demand {
+                    let active_outbound_connections = active_outbound_connections.update_count();
+                    let outbound_connection_limit = config.peerset_outbound_connection_limit();
+                    let current_deficit = outbound_peer_replenishment_demand(
+                        active_outbound_connections,
+                        outbound_connection_limit,
+                    );
+                    replenishment_demand.restore_and_pause(current_deficit);
+                }
+
                 // This is set to trace level because when the peerset is
                 // congested it can generate a lot of demand signal very rapidly.
                 trace!("demand-based crawl finished");
@@ -1241,15 +1382,16 @@ where
             Ok(TimerCrawlFinished) => {
                 let active_outbound_connections = active_outbound_connections.update_count();
                 let outbound_connection_limit = config.peerset_outbound_connection_limit();
-                remaining_replenishment_demand = outbound_peer_replenishment_demand(
+                let replenishment_deficit = outbound_peer_replenishment_demand(
                     active_outbound_connections,
                     outbound_connection_limit,
                 );
+                replenishment_demand.replace(replenishment_deficit);
 
                 debug!(
                     active_outbound_connections,
                     outbound_connection_limit,
-                    remaining_replenishment_demand,
+                    remaining_replenishment_demand = replenishment_demand.remaining(),
                     "timer-based crawl finished"
                 );
             }
@@ -1342,7 +1484,7 @@ async fn dial<C>(
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
     mut demand_tx: futures::channel::mpsc::Sender<MorePeers>,
     expose_peer_addresses: bool,
-) -> Result<(), BoxError>
+) -> Result<DialOutcome, BoxError>
 where
     C: Service<
             OutboundConnectorRequest,
@@ -1377,12 +1519,14 @@ where
     // the handshake has timeouts, so it shouldn't hang
     let handshake_result = outbound_connector.call(req).map(Into::into).await;
 
-    match handshake_result {
+    let dial_outcome = match handshake_result {
         Ok((address, client)) => {
             debug!(peer = %addr_label, "successfully dialed new peer");
 
             // The connection limit makes sure this send doesn't block.
             peerset_tx.send((address, client)).await?;
+
+            DialOutcome::Connected
         }
         // The connection was never opened, or it failed the handshake and was dropped.
         Err(error) => {
@@ -1419,10 +1563,12 @@ where
                     return Err(send_error.into());
                 }
             }
-        }
-    }
 
-    Ok(())
+            DialOutcome::Failed
+        }
+    };
+
+    Ok(dial_outcome)
 }
 
 /// Mark `addr` as a failed peer to `address_book_updater`.

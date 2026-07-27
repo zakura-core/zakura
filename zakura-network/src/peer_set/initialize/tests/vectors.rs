@@ -41,7 +41,7 @@ use crate::{
     peer_set::{
         initialize::{
             accept_inbound_connections, add_initial_peers, crawl_and_dial, open_listener,
-            outbound_peer_replenishment_demand, DiscoveredPeer,
+            outbound_peer_replenishment_demand, DiscoveredPeer, ReplenishmentDemand,
             OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR,
             OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR,
         },
@@ -493,6 +493,57 @@ fn crawler_replenishes_outbound_peers_below_twenty_seven_percent_limit() {
     }
 }
 
+#[test]
+fn crawler_replenishment_pauses_without_discarding_demand_at_limit() {
+    let mut replenishment_demand = ReplenishmentDemand::default();
+    replenishment_demand.replace(CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS);
+
+    replenishment_demand.pause();
+
+    assert_eq!(
+        replenishment_demand.remaining(),
+        CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS
+    );
+    assert!(!replenishment_demand.is_ready());
+
+    replenishment_demand.resume(4);
+
+    assert_eq!(replenishment_demand.remaining(), 4);
+    assert!(replenishment_demand.is_ready());
+}
+
+#[test]
+fn crawler_replenishment_restores_no_candidate_demand() {
+    let mut replenishment_demand = ReplenishmentDemand::default();
+    replenishment_demand.replace(CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS);
+
+    assert!(replenishment_demand.take());
+    assert_eq!(
+        replenishment_demand.remaining(),
+        CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS - 1
+    );
+
+    replenishment_demand.restore_and_pause(CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS);
+
+    assert_eq!(
+        replenishment_demand.remaining(),
+        CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS
+    );
+    assert!(!replenishment_demand.is_ready());
+}
+
+#[test]
+fn crawler_replenishment_restores_failed_dial_demand() {
+    let mut replenishment_demand = ReplenishmentDemand::default();
+    replenishment_demand.replace(CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS);
+
+    assert!(replenishment_demand.take());
+    replenishment_demand.restore(3);
+
+    assert_eq!(replenishment_demand.remaining(), 3);
+    assert!(replenishment_demand.is_ready());
+}
+
 #[tokio::test(start_paused = true)]
 async fn crawler_startup_demand_satisfies_replenishment() {
     let mut harness = spawn_replenishment_crawler(
@@ -529,6 +580,26 @@ async fn crawler_demand_arriving_during_crawl_counts_toward_target() {
     harness.wait_for_crawl_start().await;
     harness.queue_demand(4);
     harness.release_crawl();
+    harness
+        .assert_connection_attempts(CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS)
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn crawler_no_candidate_does_not_spend_replenishment_demand() {
+    let mut harness = spawn_replenishment_crawler_with_candidates(
+        0,
+        0,
+        constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL,
+        false,
+    )
+    .await;
+
+    harness.wait_for_crawl_start().await;
+    harness.release_crawl();
+    harness.wait_for_no_candidate_replenishment_pause().await;
+    harness.add_candidates(CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS);
+    harness.queue_demand(1);
     harness
         .assert_connection_attempts(CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS)
         .await;
@@ -2008,6 +2079,8 @@ struct ReplenishmentCrawlerTestHarness {
     address_book_updater_guard: JoinHandle<Result<(), BoxError>>,
     _peerset_rx: mpsc::Receiver<DiscoveredPeer>,
     initial_connection_trackers: Vec<ConnectionTracker>,
+    address_book: Arc<std::sync::Mutex<AddressBook>>,
+    next_candidate_address: usize,
 }
 
 impl ReplenishmentCrawlerTestHarness {
@@ -2032,6 +2105,32 @@ impl ReplenishmentCrawlerTestHarness {
                 .try_send(MorePeers)
                 .expect("replenishment test demand channel has capacity");
         }
+    }
+
+    fn add_candidates(&mut self, candidate_count: usize) {
+        add_replenishment_candidates(
+            &self.address_book,
+            self.next_candidate_address,
+            candidate_count,
+        );
+        self.next_candidate_address = self
+            .next_candidate_address
+            .checked_add(candidate_count)
+            .expect("small replenishment test candidate count does not overflow");
+    }
+
+    async fn wait_for_no_candidate_replenishment_pause(&mut self) {
+        for _ in 0..CRAWLER_REPLENISHMENT_OUTBOUND_LIMIT_FOR_TESTS {
+            tokio::task::spawn_blocking(|| {})
+                .await
+                .expect("crawler test blocking-task synchronization should not panic");
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            self.connection_tracker_rx.try_recv().is_err(),
+            "crawler should not dial when the candidate set is empty"
+        );
     }
 
     fn drop_initial_connections(&mut self, connection_count: usize) {
@@ -2116,6 +2215,21 @@ async fn spawn_replenishment_crawler(
     initial_demand_count: usize,
     crawl_new_peer_interval: Duration,
 ) -> ReplenishmentCrawlerTestHarness {
+    spawn_replenishment_crawler_with_candidates(
+        initial_connection_count,
+        initial_demand_count,
+        crawl_new_peer_interval,
+        true,
+    )
+    .await
+}
+
+async fn spawn_replenishment_crawler_with_candidates(
+    initial_connection_count: usize,
+    initial_demand_count: usize,
+    crawl_new_peer_interval: Duration,
+    add_initial_candidates: bool,
+) -> ReplenishmentCrawlerTestHarness {
     let config = Config {
         peerset_initial_target_size: CRAWLER_REPLENISHMENT_TARGET_SIZE_FOR_TESTS,
         crawl_new_peer_interval,
@@ -2132,29 +2246,6 @@ async fn spawn_replenishment_crawler(
         _address_metrics,
         address_book_updater_guard,
     ) = AddressBookUpdater::spawn(&config, config.listen_addr, PeerServices::NODE_NETWORK);
-
-    let candidate_count = outbound_connection_limit
-        .saturating_mul(2)
-        .saturating_add(1);
-    for address_number in 0..candidate_count {
-        let address_number =
-            u32::try_from(address_number).expect("small replenishment test address count fits u32");
-        let ip =
-            Ipv4Addr::from(u32::from(Ipv4Addr::new(127, 2, 0, 0)).saturating_add(address_number));
-        let addr = MetaAddr::new_gossiped_meta_addr(
-            SocketAddr::new(ip.into(), 8233).into(),
-            PeerServices::NODE_NETWORK,
-            DateTime32::now(),
-        )
-        .new_gossiped_change()
-        .expect("replenishment test peer has valid gossiped address fields");
-
-        address_book
-            .lock()
-            .expect("previous test thread panicked while holding the address book")
-            .update(addr)
-            .expect("replenishment test peer is valid");
-    }
 
     let (crawl_started_tx, crawl_started_rx) = tokio::sync::mpsc::unbounded_channel();
     let (crawl_release_tx, crawl_release_rx) = tokio::sync::watch::channel(false);
@@ -2178,7 +2269,18 @@ async fn spawn_replenishment_crawler(
             Err::<Response, BoxError>("controlled peer crawl returns no addresses".into())
         }
     });
-    let candidates = CandidateSet::new(address_book, controlled_peer_set);
+
+    let candidate_count = outbound_connection_limit
+        .saturating_mul(2)
+        .saturating_add(1);
+    let initial_candidate_count = if add_initial_candidates {
+        candidate_count
+    } else {
+        0
+    };
+    add_replenishment_candidates(&address_book, 0, initial_candidate_count);
+
+    let candidates = CandidateSet::new(address_book.clone(), controlled_peer_set);
 
     let channel_capacity = candidate_count.max(initial_demand_count);
     let (peerset_tx, peerset_rx) = mpsc::channel::<DiscoveredPeer>(channel_capacity);
@@ -2237,6 +2339,38 @@ async fn spawn_replenishment_crawler(
         address_book_updater_guard,
         _peerset_rx: peerset_rx,
         initial_connection_trackers,
+        address_book,
+        next_candidate_address: initial_candidate_count,
+    }
+}
+
+fn add_replenishment_candidates(
+    address_book: &Arc<std::sync::Mutex<AddressBook>>,
+    first_candidate_address: usize,
+    candidate_count: usize,
+) {
+    let last_candidate_address = first_candidate_address
+        .checked_add(candidate_count)
+        .expect("small replenishment test candidate count does not overflow");
+
+    for address_number in first_candidate_address..last_candidate_address {
+        let address_number =
+            u32::try_from(address_number).expect("small replenishment test address count fits u32");
+        let ip =
+            Ipv4Addr::from(u32::from(Ipv4Addr::new(127, 2, 0, 0)).saturating_add(address_number));
+        let addr = MetaAddr::new_gossiped_meta_addr(
+            SocketAddr::new(ip.into(), 8233).into(),
+            PeerServices::NODE_NETWORK,
+            DateTime32::now(),
+        )
+        .new_gossiped_change()
+        .expect("replenishment test peer has valid gossiped address fields");
+
+        address_book
+            .lock()
+            .expect("previous test thread panicked while holding the address book")
+            .update(addr)
+            .expect("replenishment test peer is valid");
     }
 }
 

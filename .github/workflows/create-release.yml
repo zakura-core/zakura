@@ -1,6 +1,7 @@
 # This workflow is the only supported path for creating v* release tags.
-# It builds and verifies every release asset before a protected environment
-# allows the release GitHub App to publish a draft and create the immutable tag.
+# It proves the Mainnet VCT handoff and builds/verifies every release asset
+# before a protected environment allows the release GitHub App to publish a
+# draft and create the immutable tag.
 #
 # It dispatches from main, or from a hotfix/vX.Y.Z branch named for the exact
 # tag it releases (see docs/security-hotfix-release.md). The
@@ -87,6 +88,18 @@ jobs:
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
 
+  handoff-canary:
+    name: Verify VCT handoff crossing
+    needs: [validate]
+    if: ${{ !inputs.source_first_release }}
+    uses: ./.github/workflows/zakura-vct-handoff-canary.yml
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      target_ref: ${{ needs.validate.outputs.target_sha }}
+    secrets: inherit
+
   build-assets:
     name: Build and verify release assets
     needs: [validate]
@@ -111,12 +124,17 @@ jobs:
   publish:
     name: Publish release and create tag
     runs-on: ubuntu-latest
-    needs: [validate, build-assets]
-    # Tolerate build-assets being skipped, but only when Mode B asked for it.
+    needs: [validate, handoff-canary, build-assets]
+    # Tolerate release gates being skipped only when emergency Mode B asked
+    # for the source-first path.
     if: >-
       ${{
         !cancelled()
         && needs.validate.result == 'success'
+        && (
+          needs.handoff-canary.result == 'success'
+          || (inputs.source_first_release && needs.handoff-canary.result == 'skipped')
+        )
         && (
           needs.build-assets.result == 'success'
           || (inputs.source_first_release && needs.build-assets.result == 'skipped')

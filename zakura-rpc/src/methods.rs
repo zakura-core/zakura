@@ -3535,7 +3535,8 @@ pub struct GetBlockchainInfoResponse {
     #[serde(rename = "chainwork")]
     chain_work: u64,
 
-    /// Whether this node is pruned, currently always false in Zebra.
+    /// Whether this node's blocks are subject to pruning, that is, whether it
+    /// runs in pruned storage mode or has already pruned historical data.
     pruned: bool,
 
     /// The estimated size of the block and undo files on disk

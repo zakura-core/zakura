@@ -1821,7 +1821,7 @@ impl Service<ReadRequest> for ReadStateService {
             ReadRequest::UsageInfo => Ok(ReadResponse::UsageInfo(state.db.size())),
 
             // Used by the `getblockchaininfo` RPC.
-            ReadRequest::IsPruned => Ok(ReadResponse::IsPruned(state.db.is_pruned())),
+            ReadRequest::IsPruned => Ok(ReadResponse::IsPruned(state.db.prunes_historical_data())),
 
             // Used by the StateService.
             ReadRequest::Tip => Ok(ReadResponse::Tip(read::tip(

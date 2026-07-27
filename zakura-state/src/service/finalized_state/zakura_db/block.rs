@@ -877,6 +877,23 @@ impl ZakuraDb {
         self.lowest_retained_height().is_some()
     }
 
+    /// Returns `true` if this node's block data is subject to pruning: either
+    /// pruned storage mode is configured, or the database has already pruned
+    /// historical data.
+    ///
+    /// This is what `getblockchaininfo.pruned` reports, matching `zcashd`, which
+    /// returns its prune-mode setting rather than whether any block has actually
+    /// been deleted yet. A node configured with
+    /// [`StorageMode::Pruned`](crate::StorageMode::Pruned) prunes nothing until
+    /// its tip rises above the retention window, but it is still a pruned node,
+    /// and clients must not assume it can serve arbitrary historical blocks.
+    ///
+    /// Use [`is_pruned`](Self::is_pruned) instead for the one-way on-disk state
+    /// that decides whether a database may be reopened in archive mode.
+    pub fn prunes_historical_data(&self) -> bool {
+        self.config().pruning_config().is_some() || self.is_pruned()
+    }
+
     // Verified-commitment-trees fast-sync methods
 
     /// Returns the checkpoint handoff height `H` of a verified-commitment-trees fast-synced

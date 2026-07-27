@@ -1290,7 +1290,9 @@ pub enum ReadRequest {
     UsageInfo,
 
     /// Returns [`ReadResponse::IsPruned(bool)`](ReadResponse::IsPruned)
-    /// with whether the database has pruned historical data.
+    /// with whether this node's block data is subject to pruning, because
+    /// pruned storage mode is configured or historical data has already been
+    /// pruned.
     IsPruned,
 
     /// Returns [`ReadResponse::Tip(Option<(Height, block::Hash)>)`](ReadResponse::Tip)

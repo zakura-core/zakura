@@ -374,8 +374,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::UsageInfo`] with the current best chain tip.
     UsageInfo(u64),
 
-    /// Response to [`ReadRequest::IsPruned`] with whether the database has
-    /// pruned historical data.
+    /// Response to [`ReadRequest::IsPruned`] with whether this node's block data
+    /// is subject to pruning, because pruned storage mode is configured or
+    /// historical data has already been pruned.
     IsPruned(bool),
 
     /// Response to [`ReadRequest::BlockRoots`] with the per-block commitment roots

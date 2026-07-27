@@ -1115,6 +1115,11 @@ fn pruned_mode_reports_pruned_before_anything_is_pruned() {
         "a node configured in pruned storage mode is a pruned node from the start, \
          even before its tip rises above the retention window"
     );
+    assert_eq!(
+        state.db.prune_height(),
+        Some(Height::MIN),
+        "every block body from genesis upwards is still retained"
+    );
 }
 
 #[test]
@@ -1128,6 +1133,11 @@ fn archive_mode_never_reports_pruned() {
     assert!(
         !state.db.prunes_historical_data(),
         "an archive node's blocks are not subject to pruning"
+    );
+    assert_eq!(
+        state.db.prune_height(),
+        None,
+        "an archive node reports no prune height"
     );
 }
 
@@ -1160,6 +1170,11 @@ fn reopened_pruned_database_reports_pruned_before_committing_a_block() {
 
     assert!(reopened.db.is_pruned());
     assert!(reopened.db.prunes_historical_data());
+    assert_eq!(
+        reopened.db.prune_height(),
+        Some(Height(4)),
+        "the prune height tracks the marker once bodies have been deleted"
+    );
 }
 
 #[test]

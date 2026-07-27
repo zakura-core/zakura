@@ -1018,26 +1018,37 @@ where
         let debug_force_finished_sync = self.debug_force_finished_sync;
         let network = &self.network;
 
-        let (usage_info_rsp, is_pruned_rsp, tip_pool_values_rsp, chain_tip_difficulty) = {
+        let (usage_info_rsp, pruning_info_rsp, tip_pool_values_rsp, chain_tip_difficulty) = {
             use zakura_state::ReadRequest::*;
             let state_call = |request| self.read_state.clone().oneshot(request);
             tokio::join!(
                 state_call(UsageInfo),
-                state_call(IsPruned),
+                state_call(PruningInfo),
                 state_call(TipPoolValues),
                 chain_tip_difficulty(network.clone(), self.read_state.clone(), true)
             )
         };
 
-        let (size_on_disk, is_pruned, (tip_height, tip_hash), value_balance, difficulty) = {
+        let (
+            size_on_disk,
+            is_pruned,
+            prune_height,
+            (tip_height, tip_hash),
+            value_balance,
+            difficulty,
+        ) = {
             use zakura_state::ReadResponse::*;
 
             let UsageInfo(size_on_disk) = usage_info_rsp.map_misc_error()? else {
                 unreachable!("unmatched response to a UsageInfo request")
             };
 
-            let IsPruned(is_pruned) = is_pruned_rsp.map_misc_error()? else {
-                unreachable!("unmatched response to an IsPruned request")
+            let PruningInfo {
+                pruned: is_pruned,
+                prune_height,
+            } = pruning_info_rsp.map_misc_error()?
+            else {
+                unreachable!("unmatched response to a PruningInfo request")
             };
 
             let (tip, value_balance) = match tip_pool_values_rsp {
@@ -1053,7 +1064,14 @@ where
             let difficulty = chain_tip_difficulty
                 .expect("should always be Ok when `should_use_default` is true");
 
-            (size_on_disk, is_pruned, tip, value_balance, difficulty)
+            (
+                size_on_disk,
+                is_pruned,
+                prune_height,
+                tip,
+                value_balance,
+                difficulty,
+            )
         };
 
         let now = Utc::now();
@@ -1143,6 +1161,7 @@ where
             // TODO: store work in the finalized state for each height (#7109)
             chain_work: 0,
             pruned: is_pruned,
+            prune_height,
             size_on_disk,
             // TODO: Investigate whether this needs to be implemented (it's sprout-only in zcashd)
             commitments: 0,
@@ -3539,6 +3558,21 @@ pub struct GetBlockchainInfoResponse {
     /// runs in pruned storage mode or has already pruned historical data.
     pruned: bool,
 
+    /// The lowest height whose block body this node still stores, omitted when
+    /// [`pruned`](Self::pruned) is false.
+    ///
+    /// Zakura prunes raw transaction data, so blocks below this height still
+    /// have their headers, transaction IDs, and consensus state — only their
+    /// bodies cannot be served. The genesis block is never pruned, so its body
+    /// is available below this height too.
+    #[serde(
+        default,
+        rename = "pruneheight",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[getter(copy)]
+    prune_height: Option<Height>,
+
     /// The estimated size of the block and undo files on disk
     size_on_disk: u64,
 
@@ -3593,6 +3627,7 @@ impl Default for GetBlockchainInfoResponse {
             verification_progress: 0.0,
             chain_work: 0,
             pruned: false,
+            prune_height: None,
             size_on_disk: 0,
             commitments: 0,
         }
@@ -3618,6 +3653,7 @@ impl GetBlockchainInfoResponse {
         verification_progress: f64,
         chain_work: u64,
         pruned: bool,
+        prune_height: Option<Height>,
         size_on_disk: u64,
         commitments: u64,
     ) -> Self {
@@ -3635,6 +3671,7 @@ impl GetBlockchainInfoResponse {
             verification_progress,
             chain_work,
             pruned,
+            prune_height,
             size_on_disk,
             commitments,
         }

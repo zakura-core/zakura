@@ -121,6 +121,7 @@ fn test_get_blockchain_info() -> Result<(), Box<dyn std::error::Error>> {
     let verification_progress = obj.verification_progress();
     let chain_work = obj.chain_work();
     let pruned = obj.pruned();
+    let prune_height = obj.prune_height();
     let size_on_disk = obj.size_on_disk();
     let commitments = obj.commitments();
     let best_block_hash = obj.best_block_hash();
@@ -144,6 +145,7 @@ fn test_get_blockchain_info() -> Result<(), Box<dyn std::error::Error>> {
         verification_progress,
         chain_work,
         pruned,
+        prune_height,
         size_on_disk,
         commitments,
     );

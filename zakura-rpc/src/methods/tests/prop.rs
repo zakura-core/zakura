@@ -395,10 +395,13 @@ proptest! {
                         .respond(zakura_state::ReadResponse::UsageInfo(0));
 
                     state
-                        .expect_request(zakura_state::ReadRequest::IsPruned)
+                        .expect_request(zakura_state::ReadRequest::PruningInfo)
                         .await
                         .expect("getblockchaininfo should call mock state service with correct request")
-                        .respond(zakura_state::ReadResponse::IsPruned(false));
+                        .respond(zakura_state::ReadResponse::PruningInfo {
+                            pruned: false,
+                            prune_height: None,
+                        });
 
                     state
                         .expect_request(zakura_state::ReadRequest::TipPoolValues)
@@ -458,6 +461,7 @@ proptest! {
         let block_hash = block.hash();
         let expected_size_on_disk = 1_000;
         let expected_is_pruned = true;
+        let expected_prune_height = Some(Height(1_000));
 
         // check no requests were made during this test
         runtime.block_on(async move {
@@ -472,10 +476,13 @@ proptest! {
                         .respond(zakura_state::ReadResponse::UsageInfo(expected_size_on_disk));
 
                     state
-                        .expect_request(zakura_state::ReadRequest::IsPruned)
+                        .expect_request(zakura_state::ReadRequest::PruningInfo)
                         .await
                         .expect("getblockchaininfo should call mock state service with correct request")
-                        .respond(zakura_state::ReadResponse::IsPruned(expected_is_pruned));
+                        .respond(zakura_state::ReadResponse::PruningInfo {
+                            pruned: expected_is_pruned,
+                            prune_height: expected_prune_height,
+                        });
 
                     state
                         .expect_request(zakura_state::ReadRequest::TipPoolValues)
@@ -513,6 +520,7 @@ proptest! {
                     prop_assert_eq!(info.best_block_hash, block_hash);
                     prop_assert_eq!(info.size_on_disk, expected_size_on_disk);
                     prop_assert_eq!(info.pruned, expected_is_pruned);
+                    prop_assert_eq!(info.prune_height, expected_prune_height);
                     prop_assert!(info.estimated_height < Height::MAX);
 
                     prop_assert_eq!(
@@ -589,10 +597,13 @@ proptest! {
                     .respond(zakura_state::ReadResponse::UsageInfo(expected_size_on_disk));
 
                 state
-                    .expect_request(zakura_state::ReadRequest::IsPruned)
+                    .expect_request(zakura_state::ReadRequest::PruningInfo)
                     .await
                     .expect("getblockchaininfo should call mock state service with correct request")
-                    .respond(zakura_state::ReadResponse::IsPruned(false));
+                    .respond(zakura_state::ReadResponse::PruningInfo {
+                            pruned: false,
+                            prune_height: None,
+                        });
 
                 state.expect_request(zakura_state::ReadRequest::TipPoolValues)
                     .await

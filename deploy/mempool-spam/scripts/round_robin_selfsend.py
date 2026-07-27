@@ -555,6 +555,12 @@ def main() -> int:
                 )
     except RunDurationElapsed:
         log_event({"event": "duration_elapsed", "rounds": round_index})
+    except TimeoutError as exc:
+        if run_deadline is not None and time.monotonic() >= run_deadline:
+            log_event({"event": "duration_elapsed", "rounds": round_index})
+        else:
+            run_error = str(exc)
+            log_event({"event": "fatal", "error": run_error})
     except (Exception, InterruptedError) as exc:  # noqa: BLE001
         run_error = str(exc)
         log_event({"event": "fatal", "error": run_error})

@@ -39,7 +39,7 @@ jobs:
         id: target
         env:
           TARGET_ENVIRONMENT: ${{ inputs.environment }}
-          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+          DURATION_MINUTES: ${{ github.event_name == 'push' && '1' || inputs.duration_minutes || '10' }}
           AMOUNT: ${{ inputs.amount }}
         run: |
           set -euo pipefail
@@ -111,7 +111,7 @@ jobs:
           HOST: ${{ steps.target.outputs.host }}
           SPAM_ROOT: ${{ steps.target.outputs.spam_root }}
           TARGET_ENVIRONMENT: ${{ inputs.environment }}
-          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+          DURATION_MINUTES: ${{ github.event_name == 'push' && '1' || inputs.duration_minutes || '10' }}
           AMOUNT: ${{ inputs.amount }}
         run: |
           set -euo pipefail

@@ -238,6 +238,7 @@ log "using zakurad binary: ${ZAKURAD_BIN}"
 log "writing Zakura traces under: ${ZAKURA_E2E_TRACE_DIR}"
 
 ORACLE_RAN=0
+OPTIONAL_NODE4_QUIESCED=0
 
 trace_dir_has_jsonl() {
   [[ -d "${ZAKURA_E2E_TRACE_DIR}" ]] \
@@ -567,6 +568,34 @@ block_count() { rpc "$1" getblockcount | jq -r '.result // 0'; }
 block_hash() { rpc "$1" getblockhash "[$2]" | jq -r '.result // empty'; }
 strict_upgrade() { [[ "${ZAKURA_REGTEST_E2E_STRICT_UPGRADE:-0}" == "1" ]]; }
 
+# The restart matrix only stresses node2. Stop the known-optional upgraded peer
+# at a verified idle trace boundary so its unrelated catch-up cannot outlive it.
+quiesce_optional_node4_for_restart_matrix() {
+  [[ "${ZAKURA_E2E_MODE}" == "restart-matrix" ]] || return 0
+  strict_upgrade && return 0
+
+  log "quiescing optional node4 before the node2 restart matrix"
+  wait_metric_zero 19004 sync_block_budget_reserved_bytes "node4 pre-matrix budget"
+  wait_metric_zero 19004 sync_block_reorder_buffered_bytes "node4 pre-matrix reorder"
+  wait_metric_zero 19004 sync_block_applying "node4 pre-matrix applying"
+  wait_metric_zero 19004 sync_block_outstanding "node4 pre-matrix outstanding"
+  wait_for_commit_trace_balance node4 "node4 pre-matrix"
+  wait_for_trace_flush
+
+  local file="${ZAKURA_E2E_TRACE_DIR}/node4/block_sync.jsonl" last leak
+  last=$(grep 'block_sync_state' "${file}" 2>/dev/null | tail -1 || true)
+  [[ -n "${last}" ]] || fail "node4 pre-matrix block-sync trace is missing"
+  leak=$(printf '%s' "${last}" \
+    | jq -er '[(.applying//0),(.budget_reserved//0),(.reorder//0),(.outstanding//0)]|add') \
+    || fail "could not read node4 pre-matrix block-sync trace"
+  [[ "${leak}" == "0" ]] \
+    || fail "node4 pre-matrix block-sync trace is not drained (total ${leak})"
+
+  docker compose -f "${COMPOSE_FILE}" stop zakura-node-4 \
+    || fail "could not stop optional node4 before the restart matrix"
+  OPTIONAL_NODE4_QUIESCED=1
+}
+
 invalidate_block_if_present() {
   local port="$1" height="$2" hash="$3" label="$4"
   local current_height current_hash
@@ -636,6 +665,8 @@ wait_zakura_body_frontiers_at_tip() {
   wait_zakura_body_frontier_at_tip 19002 18332 "${target}" "node2 ${phase}"
   if strict_upgrade; then
     wait_zakura_body_frontier_at_tip 19004 18532 "${target}" "node4 ${phase}"
+  elif [[ "${OPTIONAL_NODE4_QUIESCED}" == "1" ]]; then
+    printf '  node4 %s quiesced after upgrade smoke coverage\n' "${phase}"
   else
     h4=$(block_count 18532)
     header4=$(metric 19004 sync_block_best_header_tip_height)
@@ -660,6 +691,8 @@ assert_block_sync_budget_empty() {
     wait_metric_zero 19004 sync_block_reorder_buffered_bytes "node4 ${phase} reorder"
     wait_metric_zero 19004 sync_block_applying "node4 ${phase} applying"
     wait_metric_zero 19004 sync_block_outstanding "node4 ${phase} outstanding"
+  elif [[ "${OPTIONAL_NODE4_QUIESCED}" == "1" ]]; then
+    printf '  node4 %s quiesced after upgrade smoke coverage\n' "${phase}"
   else
     printf '  node4 %s optional budget=%s reorder=%s applying=%s outstanding=%s\n' \
       "${phase}" \
@@ -890,6 +923,7 @@ log "asserting Zakura body frontier reached the header tip after gossip propagat
 wait_zakura_body_frontiers_at_tip "${target}" "post-generate"
 assert_block_sync_budget_empty "post-generate"
 snapshot_timeline "post-generate"
+quiesce_optional_node4_for_restart_matrix
 
 log "stopping pure-Zakura node2 before the from-scratch catch-up setup"
 wait_for_commit_trace_balance node2 "node2 pre-reset"
@@ -1026,7 +1060,11 @@ old_tip_hash=$(block_hash 18232 "${target}")
 invalidate_block_if_present 18232 "${target}" "${old_tip_hash}" node1
 invalidate_block_if_present 18332 "${target}" "${old_tip_hash}" node2
 invalidate_block_if_present 18432 "${target}" "${old_tip_hash}" node3
-invalidate_block_if_present 18532 "${target}" "${old_tip_hash}" node4
+if [[ "${OPTIONAL_NODE4_QUIESCED}" == "1" ]]; then
+  printf '  node4 skipping invalidate: quiesced after upgrade smoke coverage\n'
+else
+  invalidate_block_if_present 18532 "${target}" "${old_tip_hash}" node4
+fi
 reorg_base=$((target - 1))
 wait_block_count_equal 18232 "${reorg_base}" node1
 wait_block_count_equal 18332 "${reorg_base}" node2

@@ -24,6 +24,15 @@ on:
         description: "DO region (must host the run droplets too)"
         required: false
         default: nyc3
+      approach_source_snapshot_id:
+        description: "Optional older Mainnet PR-state snapshot ID for the VCT approach state"
+        required: false
+      approach_source_height:
+        description: "Finalized tip height in approach_source_snapshot_id"
+        required: false
+      approach_source_db_format:
+        description: "Database format in approach_source_snapshot_id (for example 28.0.1)"
+        required: false
   schedule:
     - cron: "0 4 * * 1" # weekly Monday 04:00 UTC
 
@@ -67,8 +76,21 @@ jobs:
           REGION: ${{ inputs.region || 'nyc3' }}
           DROPLET_SIZE: ${{ inputs.droplet_size || 'c-8' }}
           SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+          APPROACH_SOURCE_SNAPSHOT_ID: ${{ inputs.approach_source_snapshot_id }}
+          APPROACH_SOURCE_HEIGHT: ${{ inputs.approach_source_height }}
+          APPROACH_SOURCE_DB_FORMAT: ${{ inputs.approach_source_db_format }}
         run: |
           set -euo pipefail
+          if [ -n "$APPROACH_SOURCE_SNAPSHOT_ID" ]; then
+            [[ "$APPROACH_SOURCE_HEIGHT" =~ ^[0-9]+$ ]] || {
+              echo "approach_source_height must be numeric when a source snapshot is set" >&2
+              exit 1
+            }
+            [[ "$APPROACH_SOURCE_DB_FORMAT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "approach_source_db_format must be semantic when a source snapshot is set" >&2
+              exit 1
+            }
+          fi
           MAINNET_VOL="zakura-pr-bake-mainnet-${GITHUB_RUN_ID}"
           TESTNET_VOL="zakura-pr-bake-testnet-${GITHUB_RUN_ID}"
           APPROACH_VOL="zakura-pr-bake-approach-${GITHUB_RUN_ID}"
@@ -86,6 +108,18 @@ jobs:
           APPROACH_VOL_ID=$(doctl compute volume create "$APPROACH_VOL" \
             --region "${REGION}" --size 100GiB --format ID --no-header)
           echo "approach_vol_id=$APPROACH_VOL_ID" >> "$GITHUB_OUTPUT"
+          SOURCE_VOLUME_ARGS=()
+          if [ -n "$APPROACH_SOURCE_SNAPSHOT_ID" ]; then
+            SOURCE_VOL="zakura-pr-bake-approach-source-${GITHUB_RUN_ID}"
+            echo "source_vol=$SOURCE_VOL" >> "$GITHUB_OUTPUT"
+            SOURCE_SIZE=$(doctl compute snapshot get "$APPROACH_SOURCE_SNAPSHOT_ID" \
+              --format MinDiskSize --no-header)
+            SOURCE_VOL_ID=$(doctl compute volume create "$SOURCE_VOL" \
+              --region "${REGION}" --snapshot "$APPROACH_SOURCE_SNAPSHOT_ID" \
+              --size "${SOURCE_SIZE}GiB" --format ID --no-header)
+            echo "source_vol_id=$SOURCE_VOL_ID" >> "$GITHUB_OUTPUT"
+            SOURCE_VOLUME_ARGS=(--volumes "$SOURCE_VOL_ID")
+          fi
 
           NAME="zakura-pr-bake-${GITHUB_RUN_ID}"
           echo "droplet_name=$NAME" >> "$GITHUB_OUTPUT"
@@ -97,6 +131,7 @@ jobs:
             --volumes "${MAINNET_VOL_ID}" \
             --volumes "${TESTNET_VOL_ID}" \
             --volumes "${APPROACH_VOL_ID}" \
+            "${SOURCE_VOLUME_ARGS[@]}" \
             --tag-name zakura-image-bake \
             --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
           echo "id=$(awk '{print $1}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
@@ -126,6 +161,9 @@ jobs:
           MAINNET_VOLUME_NAME: ${{ steps.droplet.outputs.mainnet_vol }}
           TESTNET_VOLUME_NAME: ${{ steps.droplet.outputs.testnet_vol }}
           APPROACH_VOLUME_NAME: ${{ steps.droplet.outputs.approach_vol }}
+          APPROACH_SOURCE_VOLUME_NAME: ${{ steps.droplet.outputs.source_vol }}
+          APPROACH_SOURCE_HEIGHT: ${{ inputs.approach_source_height }}
+          APPROACH_SOURCE_DB_FORMAT: ${{ inputs.approach_source_db_format }}
           TIP_MAINNET_LATEST_JSON: ${{ vars.ZAKURA_PR_NODE_TIP_LATEST_JSON || 'https://zakura.valargroup.dev/mainnet-pruned/latest.json' }}
           # Pre-spam-region archive snapshot; same artifact checkpoint-sync-bench pins.
           SANDBLAST_URL: ${{ vars.ZAKURA_PR_NODE_SANDBLAST_URL || 'https://zakura.valargroup.dev/mainnet/historical/zakura-mainnet-20260717T095333Z-1707210.tar.zst' }}
@@ -140,6 +178,9 @@ jobs:
             printf 'MAINNET_VOLUME_NAME=%q\n'     "${MAINNET_VOLUME_NAME}"
             printf 'TESTNET_VOLUME_NAME=%q\n'     "${TESTNET_VOLUME_NAME}"
             printf 'APPROACH_VOLUME_NAME=%q\n'    "${APPROACH_VOLUME_NAME}"
+            printf 'APPROACH_SOURCE_VOLUME_NAME=%q\n' "${APPROACH_SOURCE_VOLUME_NAME}"
+            printf 'APPROACH_SOURCE_HEIGHT=%q\n'  "${APPROACH_SOURCE_HEIGHT}"
+            printf 'APPROACH_SOURCE_DB_FORMAT=%q\n' "${APPROACH_SOURCE_DB_FORMAT}"
             printf 'TIP_MAINNET_LATEST_JSON=%q\n' "${TIP_MAINNET_LATEST_JSON}"
             printf 'SANDBLAST_URL=%q\n'           "${SANDBLAST_URL}"
             printf 'SANDBLAST_SHA256=%q\n'        "${SANDBLAST_SHA256}"
@@ -228,6 +269,8 @@ jobs:
           TESTNET_VOL_NAME: ${{ steps.droplet.outputs.testnet_vol || format('zakura-pr-bake-testnet-{0}', github.run_id) }}
           APPROACH_VOL_ID: ${{ steps.droplet.outputs.approach_vol_id }}
           APPROACH_VOL_NAME: ${{ steps.droplet.outputs.approach_vol || format('zakura-pr-bake-approach-{0}', github.run_id) }}
+          SOURCE_VOL_ID: ${{ steps.droplet.outputs.source_vol_id }}
+          SOURCE_VOL_NAME: ${{ steps.droplet.outputs.source_vol || (inputs.approach_source_snapshot_id != '' && format('zakura-pr-bake-approach-source-{0}', github.run_id)) || '' }}
         run: |
           set +e
           if [ -z "${DROPLET_ID}" ] && [ -n "${DROPLET_NAME}" ]; then
@@ -249,8 +292,11 @@ jobs:
           if [ -z "${APPROACH_VOL_ID}" ] && [ -n "${APPROACH_VOL_NAME}" ]; then
             APPROACH_VOL_ID=$(doctl compute volume get "${APPROACH_VOL_NAME}" --format ID --no-header 2>/dev/null)
           fi
+          if [ -z "${SOURCE_VOL_ID}" ] && [ -n "${SOURCE_VOL_NAME}" ]; then
+            SOURCE_VOL_ID=$(doctl compute volume get "${SOURCE_VOL_NAME}" --format ID --no-header 2>/dev/null)
+          fi
           # Volumes detach asynchronously after the droplet delete.
-          for VOL_ID in "${MAINNET_VOL_ID}" "${TESTNET_VOL_ID}" "${APPROACH_VOL_ID}"; do
+          for VOL_ID in "${MAINNET_VOL_ID}" "${TESTNET_VOL_ID}" "${APPROACH_VOL_ID}" "${SOURCE_VOL_ID}"; do
             [ -z "${VOL_ID}" ] && continue
             for _ in $(seq 1 12); do
               doctl compute volume delete "${VOL_ID}" -f && break

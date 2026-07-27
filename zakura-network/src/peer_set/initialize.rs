@@ -973,11 +973,25 @@ enum CrawlerAction {
     /// Initiate a handshake to the next candidate peer in response to demand.
     ///
     /// If there are no available candidates, crawl existing peers.
-    DemandHandshakeOrCrawl,
+    ///
+    /// `restore_replenishment_demand` is set when this action consumed a unit of
+    /// timer replenishment demand. Failed dials that restore `MorePeers` must
+    /// credit that unit so the retry does not permanently double-spend the budget.
+    DemandHandshakeOrCrawl {
+        restore_replenishment_demand: bool,
+    },
     /// Crawl existing peers for more peers in response to a timer `tick`.
     TimerCrawl { tick: Instant },
-    /// Clear a finished handshake.
+    /// Clear a finished successful handshake.
     HandshakeFinished,
+    /// Clear a finished failed handshake that restored demand to the channel.
+    ///
+    /// When `restore_replenishment_demand` is set, credits one unit of remaining
+    /// replenishment demand so a restored `MorePeers` message does not
+    /// permanently consume the timer-based budget.
+    HandshakeFailed {
+        restore_replenishment_demand: bool,
+    },
     /// Clear a finished demand crawl (DemandHandshakeOrCrawl with no peers).
     DemandCrawlFinished,
     /// Clear a finished TimerCrawl.
@@ -1019,7 +1033,9 @@ fn outbound_peer_replenishment_demand(
 /// of the configured outbound connection limit.
 ///
 /// If a handshake fails, restore the unused demand signal by sending it to
-/// `demand_tx`.
+/// `demand_tx`, and credit one unit of remaining replenishment demand when that
+/// attempt consumed timer budget so the restored signal does not permanently
+/// double-spend the budget.
 ///
 /// The crawler terminates when `candidates.update()` or `peerset_tx` returns a
 /// permanent internal error. Transient errors and individual peer errors should
@@ -1125,18 +1141,28 @@ where
             // rate-limited timer in this biased select.
             next_demand = demand_rx.next() => next_demand
                 .ok_or("demand stream closed, is Zakura shutting down?".into())
-                .map(|MorePeers| DemandHandshakeOrCrawl),
+                // Placeholder flag; replaced below after checking the live counter.
+                .map(|MorePeers| DemandHandshakeOrCrawl {
+                    restore_replenishment_demand: false,
+                }),
             // Existing channel demand gets priority over local replenishment.
             // Each action consumes one unit of replenishment demand below.
             _ = future::ready(()),
                 if remaining_replenishment_demand.load(Ordering::Relaxed) > 0 =>
             {
-                Ok(DemandHandshakeOrCrawl)
+                Ok(DemandHandshakeOrCrawl {
+                    restore_replenishment_demand: false,
+                })
             }
         };
 
         let crawler_action = match crawler_action {
-            Ok(DemandHandshakeOrCrawl) => {
+            Ok(DemandHandshakeOrCrawl { .. }) => {
+                // Only credit later if this action actually consumed a timer
+                // replenishment unit. Channel demand with remaining == 0 must
+                // not invent local budget on failure.
+                let restore_replenishment_demand =
+                    remaining_replenishment_demand.load(Ordering::Relaxed) > 0;
                 let _ = remaining_replenishment_demand.fetch_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
@@ -1149,7 +1175,9 @@ where
                     remaining_replenishment_demand.store(0, Ordering::Relaxed);
                     Ok(DemandDrop)
                 } else {
-                    Ok(DemandHandshakeOrCrawl)
+                    Ok(DemandHandshakeOrCrawl {
+                        restore_replenishment_demand,
+                    })
                 }
             }
             crawler_action => crawler_action,
@@ -1164,7 +1192,9 @@ where
             }
 
             // Spawned tasks
-            Ok(DemandHandshakeOrCrawl) => {
+            Ok(DemandHandshakeOrCrawl {
+                restore_replenishment_demand,
+            }) => {
                 let candidates = candidates.clone();
                 let outbound_connector = outbound_connector.clone();
                 let peerset_tx = peerset_tx.clone();
@@ -1197,7 +1227,7 @@ where
 
                         if let Some(candidate) = candidate {
                             // we don't need to spawn here, because there's nothing running concurrently
-                            dial(
+                            match dial(
                                 candidate,
                                 outbound_connector,
                                 outbound_connection_tracker,
@@ -1207,9 +1237,13 @@ where
                                 demand_tx,
                                 expose_peer_addresses,
                             )
-                            .await?;
-
-                            Ok(HandshakeFinished)
+                            .await?
+                            {
+                                DialOutcome::Connected => Ok(HandshakeFinished),
+                                DialOutcome::Failed => Ok(HandshakeFailed {
+                                    restore_replenishment_demand,
+                                }),
+                            }
                         } else {
                             // There weren't any peers, so try to get more peers.
                             debug!("demand for peers but no available candidates");
@@ -1250,6 +1284,15 @@ where
             // Completed spawned tasks
             Ok(HandshakeFinished) => {
                 // Already logged in dial()
+            }
+            Ok(HandshakeFailed {
+                restore_replenishment_demand,
+            }) => {
+                // dial() restored MorePeers to demand_rx when possible. Credit
+                // only when this attempt consumed timer replenishment demand.
+                if restore_replenishment_demand {
+                    let _ = remaining_replenishment_demand.fetch_add(1, Ordering::Relaxed);
+                }
             }
             Ok(DemandCrawlFinished) => {
                 // This is set to trace level because when the peerset is
@@ -1335,6 +1378,14 @@ where
     Ok(())
 }
 
+/// Outcome of an outbound dial for crawler replenishment bookkeeping.
+enum DialOutcome {
+    /// The handshake succeeded and the peer was sent to the peer set.
+    Connected,
+    /// The handshake failed; demand was restored to `demand_tx` when possible.
+    Failed,
+}
+
 /// Try to connect to `candidate` using `outbound_connector`.
 /// Uses `outbound_connection_tracker` to track the active connection count.
 ///
@@ -1361,7 +1412,7 @@ async fn dial<C>(
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
     mut demand_tx: futures::channel::mpsc::Sender<MorePeers>,
     expose_peer_addresses: bool,
-) -> Result<(), BoxError>
+) -> Result<DialOutcome, BoxError>
 where
     C: Service<
             OutboundConnectorRequest,
@@ -1402,6 +1453,8 @@ where
 
             // The connection limit makes sure this send doesn't block.
             peerset_tx.send((address, client)).await?;
+
+            Ok(DialOutcome::Connected)
         }
         // The connection was never opened, or it failed the handshake and was dropped.
         Err(error) => {
@@ -1438,10 +1491,10 @@ where
                     return Err(send_error.into());
                 }
             }
+
+            Ok(DialOutcome::Failed)
         }
     }
-
-    Ok(())
 }
 
 /// Mark `addr` as a failed peer to `address_book_updater`.

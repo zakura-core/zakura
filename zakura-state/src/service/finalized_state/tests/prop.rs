@@ -2612,3 +2612,125 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
 
     Ok(())
 }
+
+/// Production PeerSource never receives an authenticated DB row at the handoff height
+/// (header-root auth promotes through C-1 only). Committing the handoff must still
+/// succeed by reading the embedded frontier roots from [`commitment_aux::PeerSource`].
+#[test]
+#[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] and by height
+fn vct_peer_source_handoff_without_db_root_at_c() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    let network = early_upgrade_network();
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("NU5 activation height is configured");
+    // Handoff at NU5 + 3, plus one trailing block for below-handoff successor witnesses.
+    let tested_block_count =
+        usize::try_from(nu5_height.0 + 5).expect("test activation height fits in usize");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
+
+            let blocks: Vec<_> = chain.iter().collect();
+            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+            let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
+            let last = (nu5 + 3) as usize;
+            prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
+            let seed = (heartwood - 1) as usize;
+            let handoff = Height(last as u32);
+
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network)
+                .expect("opening an ephemeral database should succeed");
+            let mut handoff_trees = None;
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let (_h, trees) = legacy
+                    .commit_finalized_direct(cv.into(), None, None, "vct peer handoff legacy")
+                    .unwrap();
+                if i == last {
+                    handoff_trees = Some(trees);
+                }
+            }
+            let handoff_trees = handoff_trees.expect("committed the handoff block");
+            let golden_anchors = legacy.db.vct_anchor_digest();
+            let golden_history = legacy.db.history_tree().hash();
+            let golden_tip = legacy.db.note_commitment_trees_for_tip().unwrap();
+
+            // Authenticated roots through C-1 only — the production header-root lane
+            // never promotes a row at C.
+            let below_handoff_roots = commitment_aux::produce_block_roots(
+                &legacy.db,
+                Height((seed + 1) as u32)..=Height((last as u32) - 1),
+            );
+            prop_assert!(
+                !below_handoff_roots.iter().any(|root| root.height == handoff),
+                "the fixture must omit the handoff root from the authenticated index"
+            );
+
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network)
+                .expect("opening an ephemeral database should succeed");
+            fast.db
+                .insert_zakura_header_commitment_roots(below_handoff_roots)
+                .expect("writing below-handoff header-sync roots succeeds");
+            let peer_source = commitment_aux::PeerSource::new(
+                fast.db.clone(),
+                commitment_aux::FinalFrontiers {
+                    height: handoff,
+                    sapling: handoff_trees.sapling.clone(),
+                    orchard: handoff_trees.orchard.clone(),
+                    sprout: handoff_trees.sprout.clone(),
+                    ironwood: handoff_trees.ironwood.clone(),
+                },
+            );
+            fast.enable_vct_fast_source(Box::new(peer_source), true);
+
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = (i < last).then(|| vct_successor_header(blocks[i + 1].block.clone()));
+                fast.commit_finalized_direct(
+                    cv.into(),
+                    None,
+                    next,
+                    "vct peer handoff without DB root at C",
+                )
+                .expect("handoff commit must succeed from embedded frontier roots");
+            }
+
+            prop_assert_eq!(
+                fast.vct_fast_synced_below(),
+                Some(handoff),
+                "fast-sync marker is set to the handoff height"
+            );
+            prop_assert_eq!(
+                fast.db.vct_anchor_digest(),
+                golden_anchors,
+                "fast anchors must match legacy after a PeerSource handoff"
+            );
+            prop_assert_eq!(
+                fast.db.history_tree().hash(),
+                golden_history,
+                "fast history must match legacy after a PeerSource handoff"
+            );
+            let fast_tip = fast.db.note_commitment_trees_for_tip().unwrap();
+            prop_assert_eq!(
+                fast_tip.sapling.root(),
+                golden_tip.sapling.root(),
+                "tip sapling frontier must match legacy"
+            );
+            prop_assert_eq!(
+                fast_tip.orchard.root(),
+                golden_tip.orchard.root(),
+                "tip orchard frontier must match legacy"
+            );
+            prop_assert_eq!(
+                fast_tip.sprout.root(),
+                golden_tip.sprout.root(),
+                "tip sprout frontier must match legacy"
+            );
+    });
+
+    Ok(())
+}

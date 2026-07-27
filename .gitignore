@@ -176,6 +176,3 @@ perf-artifacts/**/*
 .zakurad-vct-local-cache/
 zakurad-vct-local*
 
-# Local mempool-spam funding and recovery material
-/testnet_wallet
-**/recovery.json

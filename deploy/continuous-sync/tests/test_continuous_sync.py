@@ -276,6 +276,46 @@ class ContinuousSyncTests(unittest.TestCase):
                 alert.run_once(config)
                 post_alert.assert_called_once()
 
+    def test_metrics_degraded_while_service_active_does_not_page_down(self):
+        hostname = "temp-zakura-sync-test-6"
+        status = {
+            "hostname": hostname,
+            "public_ip": "138.68.249.46",
+            "mode": "Zebra/legacy-only",
+            "service": "zakura.service",
+            "service_active": True,
+            "metrics_status": "unavailable: TimeoutError",
+            "height": None,
+            "connection": "root@138.68.249.46",
+            "alias_connection": f"ssh {hostname}",
+            "log_path": "/tmp/zebrad.log",
+            "trace_path": "/tmp/traces",
+            "monitor_log_path": "/tmp/monitor.log",
+            "controller_state": {"phase": "syncing", "failed": False},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "defaults": {
+                    "alert_state_file": str(Path(tmp) / "state.json"),
+                    "monitor_log": str(Path(tmp) / "monitor.log"),
+                    "down_confirmation_samples": 2,
+                },
+                "nodes": [{"hostname": hostname}],
+            }
+            with (
+                patch.object(alert, "query_node", return_value=status),
+                patch.object(alert.socket, "gethostname", return_value=hostname),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                alert.run_once(config)
+                post_alert.assert_not_called()
+
+            log_text = (Path(tmp) / "monitor.log").read_text(encoding="utf-8")
+            self.assertIn("metrics-degraded", log_text)
+            self.assertTrue(alert.metrics_degraded(status))
+            self.assertFalse(alert.node_healthy(status))
+
     def test_controller_failure_alerts_immediately(self):
         hostname = "temp-zakura-sync-test-1"
         status = {

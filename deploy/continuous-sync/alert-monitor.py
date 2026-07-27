@@ -123,6 +123,14 @@ def node_healthy(status: dict[str, Any]) -> bool:
     )
 
 
+def metrics_degraded(status: dict[str, Any]) -> bool:
+    """True when zakurad is up but /metrics could not be scraped successfully."""
+    return (
+        status.get("service_active") is True
+        and status.get("metrics_status") != "ok"
+    )
+
+
 def controller_phase(status: dict[str, Any]) -> str:
     controller_state = status.get("controller_state")
     if not isinstance(controller_state, dict):
@@ -331,9 +339,15 @@ def run_once(config: dict[str, Any]) -> int:
             if expects_node_service(status) and status.get("service_active") is not True:
                 down = True
                 reasons.append(f"{service_name} is not active")
-            if expects_node_service(status) and status.get("metrics_status") != "ok":
-                down = True
-                reasons.append(f"metrics endpoint is {status.get('metrics_status')}")
+            # Metrics scrape failures alone are not "node down": long genesis syncs
+            # can make /metrics large/slow while zakurad keeps syncing. Treat those
+            # as degraded and log them; only inactive service / controller halt page.
+            if expects_node_service(status) and metrics_degraded(status):
+                log(
+                    config,
+                    f"metrics-degraded host={name} "
+                    f"metrics={status.get('metrics_status')} service_active=True",
+                )
         node_record = state.setdefault("nodes", {}).setdefault(name, {})
         if down:
             node_record["consecutive_down_samples"] = int(

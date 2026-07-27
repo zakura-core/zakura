@@ -141,7 +141,25 @@ jobs:
                 echo "$PINNED_NAME" >> "$KEEP_NAMES"
                 echo "pinning Mainnet approach snapshot $PINNED_NAME below handoff $MAINNET_C"
               else
-                echo "::warning::no height-stamped Mainnet snapshot exists below handoff $MAINNET_C"
+                APPROACH_AVAILABLE=false
+                while read -r name _id; do
+                  height=$(printf '%s' "$name" | sed -n 's/.*-h\([0-9][0-9]*\)$/\1/p')
+                  if [ -n "$height" ] && [ "$height" -lt "$MAINNET_C" ]; then
+                    APPROACH_AVAILABLE=true
+                  fi
+                done < <(
+                  doctl compute snapshot list --resource volume --format ID,Name --no-header | \
+                    awk '$2 ~ /^zakura-vct-approach-mainnet-/ {print $2, $1}'
+                )
+                if [ "$APPROACH_AVAILABLE" != "true" ]; then
+                  LEGACY_NAME=$(awk '$1 !~ /-h[0-9]+$/ { print $1; exit }' "$SNAPSHOTS")
+                  if [ -n "$LEGACY_NAME" ]; then
+                    echo "$LEGACY_NAME" >> "$KEEP_NAMES"
+                    echo "pinning transition snapshot $LEGACY_NAME until a verified approach exists"
+                  else
+                    echo "::warning::no Mainnet snapshot exists below handoff $MAINNET_C"
+                  fi
+                fi
               fi
             fi
 

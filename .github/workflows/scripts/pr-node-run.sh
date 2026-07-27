@@ -137,12 +137,8 @@ BUILD_START=$(date +%s)
 python3 deploy/deployer/deploy.py build --config /root/fleet.toml
 note "Incremental build took $(( $(date +%s) - BUILD_START ))s (warm baked cache)."
 
-python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
-python3 deploy/deployer/deploy.py status --config /root/fleet.toml || true
-
-# A height-stamped snapshot proves the state starts below the handoff even when
-# the node crosses it before RPC becomes available. Legacy date-only snapshots
-# fall back to the monitor's first observed RPC height.
+# Read the restored DB directly before networking starts. Snapshot names are a
+# picker optimization, not trusted proof of the handoff start height.
 MONITOR_CROSSING_ARGS=()
 if [ "$MODE" = "pre-checkpoint" ]; then
   [[ "$MAX_CKPT" =~ ^[0-9]+$ ]] || {
@@ -152,22 +148,44 @@ if [ "$MODE" = "pre-checkpoint" ]; then
   MONITOR_CROSSING_ARGS=(
     --required-start-below "$MAX_CKPT"
     --stop-after-height "$MAX_CKPT"
+    --required-finalized-at-least "$MAX_CKPT"
+    --require-vct-fast-blocks
   )
+  TIP_OUTPUT=$(
+    /root/cargo-target/release/zakurad tip-height \
+      --cache-dir "$STATE_CACHE_DIR" \
+      --network "$NET_TOML" 2>&1
+  ) || {
+    note "**FAILED:** could not read the restored database tip before starting the node."
+    printf '%s\n' "$TIP_OUTPUT" >&2
+    exit 1
+  }
+  VERIFIED_START_HEIGHT=$(printf '%s\n' "$TIP_OUTPUT" | awk '/^[0-9]+$/ { height=$1 } END { print height }')
+  [[ "$VERIFIED_START_HEIGHT" =~ ^[0-9]+$ ]] || {
+    note "**FAILED:** restored database tip-height output was not numeric."
+    printf '%s\n' "$TIP_OUTPUT" >&2
+    exit 1
+  }
+  if [ "$VERIFIED_START_HEIGHT" -ge "$MAX_CKPT" ]; then
+    note "**FAILED: no handoff crossing** — restored database height ${VERIFIED_START_HEIGHT} is at or above max checkpoint ${MAX_CKPT}."
+    exit 1
+  fi
+  MONITOR_CROSSING_ARGS+=(--known-start-height "$VERIFIED_START_HEIGHT")
   if [ -n "$SNAPSHOT_HEIGHT" ]; then
     [[ "$SNAPSHOT_HEIGHT" =~ ^[0-9]+$ ]] || {
       note "**FAILED:** selected snapshot has a non-numeric baked height."
       exit 1
     }
-    if [ "$SNAPSHOT_HEIGHT" -ge "$MAX_CKPT" ]; then
-      note "**FAILED: no handoff crossing** — snapshot height ${SNAPSHOT_HEIGHT} is at or above max checkpoint ${MAX_CKPT}."
+    if [ "$SNAPSHOT_HEIGHT" -ne "$VERIFIED_START_HEIGHT" ]; then
+      note "**FAILED:** snapshot name height ${SNAPSHOT_HEIGHT} does not match restored database height ${VERIFIED_START_HEIGHT}."
       exit 1
     fi
-    MONITOR_CROSSING_ARGS+=(--known-start-height "$SNAPSHOT_HEIGHT")
-    note "pre-checkpoint: snapshot height ${SNAPSHOT_HEIGHT} is $((MAX_CKPT - SNAPSHOT_HEIGHT)) blocks below max checkpoint ${MAX_CKPT}."
-  else
-    note "pre-checkpoint: legacy snapshot has no baked height; first RPC sample must prove the start is below ${MAX_CKPT}."
   fi
+  note "pre-checkpoint: verified database height ${VERIFIED_START_HEIGHT} is $((MAX_CKPT - VERIFIED_START_HEIGHT)) blocks below max checkpoint ${MAX_CKPT}."
 fi
+
+python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
+python3 deploy/deployer/deploy.py status --config /root/fleet.toml || true
 
 # ---------------------------------------------------------------------------- #
 # Monitor for the requested duration, then package outputs
@@ -178,6 +196,7 @@ python3 /root/pr-node-monitor.py \
   --duration-minutes "${DURATION_MINUTES}" \
   --interval 30 \
   --rpc-url http://127.0.0.1:8232 \
+  --metrics-url http://127.0.0.1:9999/metrics \
   --service zakurad \
   --log-file /var/log/zakura/zakura.log \
   --notes "$NOTES" \

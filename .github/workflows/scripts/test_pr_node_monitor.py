@@ -22,7 +22,7 @@ def load_module(name: str, path: Path):
 monitor = load_module("pr_node_monitor", SCRIPTS / "pr-node-monitor.py")
 
 
-def sample(height: int) -> dict:
+def sample(height: int, finalized: int = 100, vct_fast_blocks: int = 1) -> dict:
     return {
         "height": height,
         "estimated": height + 10,
@@ -30,6 +30,8 @@ def sample(height: int) -> dict:
         "rss_mib": 100.0,
         "restarts": 0,
         "active_state": "active",
+        "finalized_height": finalized,
+        "vct_fast_blocks": vct_fast_blocks,
     }
 
 
@@ -46,6 +48,8 @@ class HandoffCrossingVerdict(unittest.TestCase):
             known_start_height=known_start,
             required_start_below=100,
             stop_after_height=100,
+            required_finalized_at_least=100,
+            require_vct_fast_blocks=True,
         )
 
     def test_height_stamped_snapshot_proves_start_if_rpc_appears_after_crossing(self):
@@ -70,6 +74,36 @@ class HandoffCrossingVerdict(unittest.TestCase):
 
         self.assertEqual(summary["verdict"], "ok")
         self.assertEqual(summary["start_height"], 99)
+
+    def test_fails_without_vct_fast_path_activity(self):
+        summary = monitor.build_summary(
+            {"mode": "pre-checkpoint", "network": "mainnet"},
+            [sample(101, vct_fast_blocks=0)],
+            LOGS,
+            1.0,
+            known_start_height=99,
+            required_start_below=100,
+            stop_after_height=100,
+            required_finalized_at_least=100,
+            require_vct_fast_blocks=True,
+        )
+
+        self.assertEqual(summary["verdict"], "failed")
+
+    def test_fails_before_handoff_is_finalized(self):
+        summary = monitor.build_summary(
+            {"mode": "pre-checkpoint", "network": "mainnet"},
+            [sample(101, finalized=99)],
+            LOGS,
+            1.0,
+            known_start_height=99,
+            required_start_below=100,
+            stop_after_height=100,
+            required_finalized_at_least=100,
+            require_vct_fast_blocks=True,
+        )
+
+        self.assertEqual(summary["verdict"], "failed")
 
 
 if __name__ == "__main__":

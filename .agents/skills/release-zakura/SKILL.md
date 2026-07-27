@@ -205,6 +205,11 @@ asset build. A handoff-canary failure in the normal path blocks release
 publication and alerts `#zakura-alerts`; investigate it rather than bypassing
 the gate.
 
+Before a Mode A hotfix from an older release line, confirm the PR-node assets
+include a database-compatible snapshot below that branch's checkpoint. If
+retention cannot satisfy the older checkpoint, use the explicitly approved
+source-first emergency path and record why the canary could not run.
+
 Do not retry from an unmerged branch. A version mismatch failure means `main`
 still has the previous package version.
 

@@ -165,7 +165,8 @@ TIP_SHA=$(echo "$TIP_META" | jq -er '.sha256')
 echo "Mainnet tip: $(echo "$TIP_META" | jq -r '"\(.filename) height=\(.height) db=\(.db_format_version)"')"
 # The workflow embeds this height in the volume snapshot name, so the pr-node
 # pre-checkpoint mode can pick the newest snapshot below a branch's checkpoint.
-echo "$TIP_META" | jq -er '.height' > /root/mainnet-state-height || true
+echo "$TIP_META" | jq -er '.height | select(type == "number" and floor == .)' \
+  > /root/mainnet-state-height
 fetch_state "$TIP_URL" "$TIP_SHA" "$MAINNET_MNT/tip" mainnet
 
 # Mainnet VCT approach state: copy the current pruned state to its own volume,
@@ -213,7 +214,8 @@ TN_FILE=$(echo "$ENTRY" | jq -er '.file')
 TN_SHA=$(echo "$ENTRY" | jq -er '.sha256')
 TN_BASE=$(echo "$TESTNET_META" | jq -r '.siteBaseUrl // empty')
 echo "Testnet tip: $(echo "$ENTRY" | jq -r '"\(.file) height=\(.height) db=\(.dbFormat)"')"
-echo "$ENTRY" | jq -er '.height' > /root/testnet-state-height || true
+echo "$ENTRY" | jq -er '.height | select(type == "number" and floor == .)' \
+  > /root/testnet-state-height
 if [ -n "$TN_BASE" ] && curl -fsIL --retry 2 "${TN_BASE}/files/${TN_FILE}" >/dev/null 2>&1; then
   fetch_state "${TN_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
 else

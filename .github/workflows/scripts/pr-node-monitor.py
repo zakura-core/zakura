@@ -40,6 +40,20 @@ def rpc_call(url: str, method: str):
         return json.loads(resp.read())["result"]
 
 
+def scrape_metric(url: str, name: str) -> float | None:
+    with urllib.request.urlopen(url, timeout=15) as resp:
+        text = resp.read().decode("utf-8", "replace")
+    values = [
+        float(match.group(1))
+        for match in re.finditer(
+            rf"^{re.escape(name)}(?:\{{[^}}]*\}})?\s+([-+0-9.eE]+)$",
+            text,
+            re.MULTILINE,
+        )
+    ]
+    return max(values) if values else None
+
+
 def systemd_props(service: str) -> dict[str, str]:
     out = subprocess.run(
         ["systemctl", "show", service, "--property=ActiveState,NRestarts,MainPID"],
@@ -60,7 +74,14 @@ def rss_mib(pid: str) -> float | None:
 
 
 def take_sample(args) -> dict:
-    sample: dict = {"elapsed": None, "height": None, "estimated": None, "peers": None}
+    sample: dict = {
+        "elapsed": None,
+        "height": None,
+        "estimated": None,
+        "peers": None,
+        "finalized_height": None,
+        "vct_fast_blocks": None,
+    }
     try:
         info = rpc_call(args.rpc_url, "getblockchaininfo")
         sample["height"] = info.get("blocks")
@@ -71,6 +92,15 @@ def take_sample(args) -> dict:
         sample["peers"] = len(rpc_call(args.rpc_url, "getpeerinfo"))
     except Exception:  # noqa: BLE001
         pass
+    try:
+        sample["finalized_height"] = scrape_metric(
+            args.metrics_url, "state_finalized_block_height"
+        )
+        sample["vct_fast_blocks"] = scrape_metric(
+            args.metrics_url, "state_vct_fast_block_count"
+        )
+    except Exception as exc:  # noqa: BLE001 — metrics failure is recorded in the sample
+        sample["metrics_error"] = str(exc)
     props = systemd_props(args.service)
     sample["active_state"] = props.get("ActiveState")
     sample["restarts"] = int(props.get("NRestarts") or 0)
@@ -118,6 +148,8 @@ def build_summary(
     known_start_height: int | None = None,
     required_start_below: int | None = None,
     stop_after_height: int | None = None,
+    required_finalized_at_least: int | None = None,
+    require_vct_fast_blocks: bool = False,
 ) -> dict:
     heighted = [s for s in samples if s["height"] is not None]
     first_observed_h = heighted[0]["height"] if heighted else None
@@ -127,6 +159,12 @@ def build_summary(
     last = samples[-1] if samples else {}
     peers = [s["peers"] for s in samples if s["peers"] is not None]
     rss = [s["rss_mib"] for s in samples if s["rss_mib"] is not None]
+    finalized = [
+        s["finalized_height"] for s in samples if s.get("finalized_height") is not None
+    ]
+    vct_fast = [s["vct_fast_blocks"] for s in samples if s.get("vct_fast_blocks") is not None]
+    finalized_h = max(finalized) if finalized else None
+    vct_fast_blocks = max(vct_fast) if vct_fast else None
     restarts = max((s["restarts"] for s in samples), default=0)
 
     if (
@@ -142,6 +180,11 @@ def build_summary(
             stop_after_height is not None
             and (end_h is None or end_h <= stop_after_height)
         )
+        or (
+            required_finalized_at_least is not None
+            and (finalized_h is None or finalized_h < required_finalized_at_least)
+        )
+        or (require_vct_fast_blocks and (vct_fast_blocks is None or vct_fast_blocks <= 0))
     ):
         verdict = "failed"
     elif logs["errors"] > 0 or (progress is not None and progress <= 0):
@@ -172,6 +215,10 @@ def build_summary(
         "last_errors": logs["last_errors"],
         "required_start_below": required_start_below,
         "required_end_above": stop_after_height,
+        "finalized_height": finalized_h,
+        "required_finalized_at_least": required_finalized_at_least,
+        "vct_fast_blocks": vct_fast_blocks,
+        "require_vct_fast_blocks": require_vct_fast_blocks,
     }
 
 
@@ -203,6 +250,14 @@ def write_markdown(out: Path, summary: dict, samples: list[dict], notes_file: st
             f"end > {summary['required_end_above']} |"
         )
         lines.append(f"| First observed RPC height | {fmt(summary['first_observed_height'])} |")
+        lines.append(
+            f"| Finalized height | {fmt(summary['finalized_height'])} "
+            f"(required ≥ {summary['required_finalized_at_least']}) |"
+        )
+        lines.append(
+            f"| VCT fast-path blocks | {fmt(summary['vct_fast_blocks'])} "
+            f"(required > 0: {summary['require_vct_fast_blocks']}) |"
+        )
 
     shown = [s for s in samples if s["height"] is not None]
     if shown:
@@ -234,6 +289,7 @@ def main() -> int:
     parser.add_argument("--duration-minutes", type=float, required=True)
     parser.add_argument("--interval", type=float, default=30)
     parser.add_argument("--rpc-url", default="http://127.0.0.1:8232")
+    parser.add_argument("--metrics-url", default="http://127.0.0.1:9999/metrics")
     parser.add_argument("--service", default="zakurad")
     parser.add_argument("--log-file", default="/var/log/zakura/zakura.log")
     parser.add_argument("--notes", default=None, help="markdown notes file to append")
@@ -256,6 +312,8 @@ def main() -> int:
         default=None,
         help="stop successfully once RPC block height is strictly above this height",
     )
+    parser.add_argument("--required-finalized-at-least", type=int, default=None)
+    parser.add_argument("--require-vct-fast-blocks", action="store_true")
     parser.add_argument("--out", required=True, help="output directory")
     args = parser.parse_args()
 
@@ -272,6 +330,8 @@ def main() -> int:
         samples.append(sample)
         status = (
             f"[{int(sample['elapsed'])}s] height={fmt(sample['height'])} "
+            f"finalized={fmt(sample['finalized_height'])} "
+            f"vct_fast={fmt(sample['vct_fast_blocks'])} "
             f"peers={fmt(sample['peers'])} rss={fmt(sample['rss_mib'])}MiB "
             f"state={sample['active_state']}"
         )
@@ -284,6 +344,20 @@ def main() -> int:
             args.stop_after_height is not None
             and sample["height"] is not None
             and sample["height"] > args.stop_after_height
+            and (
+                args.required_finalized_at_least is None
+                or (
+                    sample["finalized_height"] is not None
+                    and sample["finalized_height"] >= args.required_finalized_at_least
+                )
+            )
+            and (
+                not args.require_vct_fast_blocks
+                or (
+                    sample["vct_fast_blocks"] is not None
+                    and sample["vct_fast_blocks"] > 0
+                )
+            )
         ):
             print(
                 f"crossed required height {args.stop_after_height}; stopping monitor",
@@ -304,6 +378,8 @@ def main() -> int:
         known_start_height=args.known_start_height,
         required_start_below=args.required_start_below,
         stop_after_height=args.stop_after_height,
+        required_finalized_at_least=args.required_finalized_at_least,
+        require_vct_fast_blocks=args.require_vct_fast_blocks,
     )
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     write_markdown(out, summary, samples, args.notes)

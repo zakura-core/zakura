@@ -72,22 +72,23 @@ jobs:
           MAINNET_VOL="zakura-pr-bake-mainnet-${GITHUB_RUN_ID}"
           TESTNET_VOL="zakura-pr-bake-testnet-${GITHUB_RUN_ID}"
           APPROACH_VOL="zakura-pr-bake-approach-${GITHUB_RUN_ID}"
-          MAINNET_VOL_ID=$(doctl compute volume create "$MAINNET_VOL" \
-            --region "${REGION}" --size 300GiB --format ID --no-header)
-          TESTNET_VOL_ID=$(doctl compute volume create "$TESTNET_VOL" \
-            --region "${REGION}" --size 100GiB --format ID --no-header)
-          APPROACH_VOL_ID=$(doctl compute volume create "$APPROACH_VOL" \
-            --region "${REGION}" --size 100GiB --format ID --no-header)
           {
             echo "mainnet_vol=$MAINNET_VOL"
             echo "testnet_vol=$TESTNET_VOL"
             echo "approach_vol=$APPROACH_VOL"
-            echo "mainnet_vol_id=$MAINNET_VOL_ID"
-            echo "testnet_vol_id=$TESTNET_VOL_ID"
-            echo "approach_vol_id=$APPROACH_VOL_ID"
           } >> "$GITHUB_OUTPUT"
+          MAINNET_VOL_ID=$(doctl compute volume create "$MAINNET_VOL" \
+            --region "${REGION}" --size 300GiB --format ID --no-header)
+          echo "mainnet_vol_id=$MAINNET_VOL_ID" >> "$GITHUB_OUTPUT"
+          TESTNET_VOL_ID=$(doctl compute volume create "$TESTNET_VOL" \
+            --region "${REGION}" --size 100GiB --format ID --no-header)
+          echo "testnet_vol_id=$TESTNET_VOL_ID" >> "$GITHUB_OUTPUT"
+          APPROACH_VOL_ID=$(doctl compute volume create "$APPROACH_VOL" \
+            --region "${REGION}" --size 100GiB --format ID --no-header)
+          echo "approach_vol_id=$APPROACH_VOL_ID" >> "$GITHUB_OUTPUT"
 
           NAME="zakura-pr-bake-${GITHUB_RUN_ID}"
+          echo "droplet_name=$NAME" >> "$GITHUB_OUTPUT"
           doctl compute droplet create "$NAME" \
             --region "${REGION}" \
             --size "${DROPLET_SIZE}" \
@@ -164,12 +165,23 @@ jobs:
           # The -h<height> suffix lets the pr-node pre-checkpoint mode pick the
           # newest snapshot whose state is below a branch's max checkpoint.
           fetch_height() {
-            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
-              "root@${IP}" "cat $1 2>/dev/null" | grep -E '^[0-9]+$' || true
+            local height
+            height=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+              "root@${IP}" "cat $1")
+            [[ "$height" =~ ^[0-9]+$ ]] || {
+              echo "bake did not produce a numeric height in $1" >&2
+              return 1
+            }
+            printf '%s\n' "$height"
           }
           MAINNET_H=$(fetch_height /root/mainnet-state-height)
           TESTNET_H=$(fetch_height /root/testnet-state-height)
-          APPROACH_H=$(fetch_height /root/mainnet-approach-height)
+          APPROACH_H=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            "root@${IP}" "cat /root/mainnet-approach-height 2>/dev/null" || true)
+          if [ -n "$APPROACH_H" ] && [[ ! "$APPROACH_H" =~ ^[0-9]+$ ]]; then
+            echo "bake produced a non-numeric approach height" >&2
+            exit 1
+          fi
           STAMP=$(date -u +%Y%m%d-%H%M)
           doctl compute volume snapshot "${MAINNET_VOL_ID}" \
             --snapshot-name "zakura-pr-state-mainnet-${STAMP}${MAINNET_H:+-h${MAINNET_H}}"
@@ -209,16 +221,33 @@ jobs:
         if: always()
         env:
           DROPLET_ID: ${{ steps.droplet.outputs.id }}
+          DROPLET_NAME: ${{ steps.droplet.outputs.droplet_name }}
           MAINNET_VOL_ID: ${{ steps.droplet.outputs.mainnet_vol_id }}
+          MAINNET_VOL_NAME: ${{ steps.droplet.outputs.mainnet_vol }}
           TESTNET_VOL_ID: ${{ steps.droplet.outputs.testnet_vol_id }}
+          TESTNET_VOL_NAME: ${{ steps.droplet.outputs.testnet_vol }}
           APPROACH_VOL_ID: ${{ steps.droplet.outputs.approach_vol_id }}
+          APPROACH_VOL_NAME: ${{ steps.droplet.outputs.approach_vol }}
         run: |
           set +e
+          if [ -z "${DROPLET_ID}" ] && [ -n "${DROPLET_NAME}" ]; then
+            DROPLET_ID=$(doctl compute droplet list --tag-name zakura-image-bake \
+              --format ID,Name --no-header | awk -v name="$DROPLET_NAME" '$2 == name { print $1; exit }')
+          fi
           if [ -n "${DROPLET_ID}" ]; then
             for _ in 1 2 3; do
               doctl compute droplet delete "${DROPLET_ID}" -f && break
               sleep 5
             done
+          fi
+          if [ -z "${MAINNET_VOL_ID}" ] && [ -n "${MAINNET_VOL_NAME}" ]; then
+            MAINNET_VOL_ID=$(doctl compute volume get "${MAINNET_VOL_NAME}" --format ID --no-header 2>/dev/null)
+          fi
+          if [ -z "${TESTNET_VOL_ID}" ] && [ -n "${TESTNET_VOL_NAME}" ]; then
+            TESTNET_VOL_ID=$(doctl compute volume get "${TESTNET_VOL_NAME}" --format ID --no-header 2>/dev/null)
+          fi
+          if [ -z "${APPROACH_VOL_ID}" ] && [ -n "${APPROACH_VOL_NAME}" ]; then
+            APPROACH_VOL_ID=$(doctl compute volume get "${APPROACH_VOL_NAME}" --format ID --no-header 2>/dev/null)
           fi
           # Volumes detach asynchronously after the droplet delete.
           for VOL_ID in "${MAINNET_VOL_ID}" "${TESTNET_VOL_ID}" "${APPROACH_VOL_ID}"; do

@@ -1,8 +1,8 @@
 name: VCT handoff canary
 
 # Boots a Mainnet node from the newest retained state below the embedded VCT
-# frontier, forces the Zakura P2P/tree_aux path, and succeeds only after the
-# finalized state crosses the handoff.
+# frontier, forces the Zakura P2P/tree_aux path, and succeeds only after C is
+# finalized, the best chain reaches C+1, and VCT fast-path metrics increment.
 on:
   workflow_call:
     inputs:

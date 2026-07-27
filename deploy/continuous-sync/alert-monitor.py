@@ -59,7 +59,7 @@ def log(config: dict[str, Any], message: str) -> None:
         file.write(time.strftime("%Y-%m-%dT%H:%M:%S%z ") + message + "\n")
 
 
-def run_json(cmd: list[str], timeout: int = 8) -> tuple[dict[str, Any] | None, str | None]:
+def run_json(cmd: list[str], timeout: int = 20) -> tuple[dict[str, Any] | None, str | None]:
     try:
         result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
     except Exception as exc:

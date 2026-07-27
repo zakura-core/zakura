@@ -7,11 +7,14 @@
 #
 # Config via /root/run.env (sourced by the caller before exec):
 #   GH_REPO / GH_CLONE_TOKEN  repo slug + per-run token for the PR-ref fetch
-#   MODE                      tip | sandblast | genesis
+#   MODE                      tip | pre-checkpoint | sandblast | genesis
 #   NETWORK                   mainnet | testnet
 #   SHA / REFSPEC             commit to test + refspec that reaches it
 #   DURATION_MINUTES          how long to monitor the running node
 #   VOLUME_NAME               state volume name ("" in genesis mode)
+#   P2P_STACK                 default | legacy | zakura | dual
+#   MAX_CKPT                  required handoff height in pre-checkpoint mode
+#   SNAPSHOT_HEIGHT           baked state height, when encoded in the snapshot name
 set -euo pipefail
 
 OUT_DIR=/root/out
@@ -108,6 +111,10 @@ case "$NETWORK" in
   testnet) NET_TOML=Testnet ;;
   *) echo "unknown network: $NETWORK" >&2; exit 1 ;;
 esac
+case "$P2P_STACK" in
+  default|legacy|zakura|dual) ;;
+  *) echo "unknown P2P stack: $P2P_STACK" >&2; exit 1 ;;
+esac
 
 cat > /root/fleet.toml <<TOML
 [[nodes]]
@@ -117,7 +124,9 @@ commit = "${SHA}"
 network = "${NET_TOML}"
 state_cache_dir = "${STATE_CACHE_DIR}"
 storage_mode = "${STORAGE_MODE}"
-p2p_stack = "default"
+p2p_stack = "${P2P_STACK}"
+checkpoint_sync = true
+vct_fast_sync = true
 rpc_listen_addr = "127.0.0.1:8232"
 rpc_enable_cookie_auth = false
 metrics_endpoint = "127.0.0.1:9999"
@@ -131,32 +140,32 @@ note "Incremental build took $(( $(date +%s) - BUILD_START ))s (warm baked cache
 python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
 python3 deploy/deployer/deploy.py status --config /root/fleet.toml || true
 
-# pre-checkpoint is only useful when the state actually starts below the tree's
-# max checkpoint; surface the crossing status so a run that starts above it is
-# never mistaken for a handoff test.
+# A height-stamped snapshot proves the state starts below the handoff even when
+# the node crosses it before RPC becomes available. Legacy date-only snapshots
+# fall back to the monitor's first observed RPC height.
+MONITOR_CROSSING_ARGS=()
 if [ "$MODE" = "pre-checkpoint" ]; then
-  case "$NETWORK" in
-    mainnet) CKPT_FILE=zakura-chain/src/parameters/checkpoint/main-checkpoints.txt ;;
-    testnet) CKPT_FILE=zakura-chain/src/parameters/checkpoint/test-checkpoints.txt ;;
-  esac
-  MAX_CKPT=$(tail -1 "$CKPT_FILE" | cut -d' ' -f1)
-  START_HEIGHT=""
-  for _ in $(seq 1 30); do
-    START_HEIGHT=$(curl -s -m 5 -H 'Content-Type: application/json' \
-      -d '{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}' \
-      http://127.0.0.1:8232 | \
-      python3 -c 'import json, sys; print(json.load(sys.stdin)["result"]["blocks"])' \
-      2>/dev/null) && [ -n "$START_HEIGHT" ] && break
-    sleep 2
-  done
-  if [ -z "$START_HEIGHT" ]; then
-    note "**FAILED: pre-checkpoint crossing status unknown** — could not read the start height over RPC, so this run cannot prove a handoff crossing."
+  [[ "$MAX_CKPT" =~ ^[0-9]+$ ]] || {
+    note "**FAILED:** pre-checkpoint mode requires a numeric max checkpoint."
     exit 1
-  elif [ "$START_HEIGHT" -lt "$MAX_CKPT" ]; then
-    note "pre-checkpoint: start height ${START_HEIGHT} is $((MAX_CKPT - START_HEIGHT)) blocks below max checkpoint ${MAX_CKPT} — this run crosses the checkpoint handoff."
+  }
+  MONITOR_CROSSING_ARGS=(
+    --required-start-below "$MAX_CKPT"
+    --stop-after-height "$MAX_CKPT"
+  )
+  if [ -n "$SNAPSHOT_HEIGHT" ]; then
+    [[ "$SNAPSHOT_HEIGHT" =~ ^[0-9]+$ ]] || {
+      note "**FAILED:** selected snapshot has a non-numeric baked height."
+      exit 1
+    }
+    if [ "$SNAPSHOT_HEIGHT" -ge "$MAX_CKPT" ]; then
+      note "**FAILED: no handoff crossing** — snapshot height ${SNAPSHOT_HEIGHT} is at or above max checkpoint ${MAX_CKPT}."
+      exit 1
+    fi
+    MONITOR_CROSSING_ARGS+=(--known-start-height "$SNAPSHOT_HEIGHT")
+    note "pre-checkpoint: snapshot height ${SNAPSHOT_HEIGHT} is $((MAX_CKPT - SNAPSHOT_HEIGHT)) blocks below max checkpoint ${MAX_CKPT}."
   else
-    note "**FAILED: no handoff crossing** — start height ${START_HEIGHT} is already at or above max checkpoint ${MAX_CKPT}, so a green run would be a false positive. The tree's checkpoints predate the retained snapshots; re-run against a branch with newer checkpoints (e.g. a release-state bundle PR)."
-    exit 1
+    note "pre-checkpoint: legacy snapshot has no baked height; first RPC sample must prove the start is below ${MAX_CKPT}."
   fi
 fi
 
@@ -173,6 +182,7 @@ python3 /root/pr-node-monitor.py \
   --log-file /var/log/zakura/zakura.log \
   --notes "$NOTES" \
   --meta "mode=${MODE},network=${NETWORK},sha=${SHA}" \
+  "${MONITOR_CROSSING_ARGS[@]}" \
   --out "$OUT_DIR" || MONITOR_RC=$?
 
 tail -n 2000 /var/log/zakura/zakura.log > "$OUT_DIR/zakura-tail.log" 2>/dev/null || true

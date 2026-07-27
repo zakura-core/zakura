@@ -12,6 +12,59 @@ name: PR node
 # teardown_after_run=true).
 
 on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "PR number to test (exactly one of pr_number / ref)"
+        required: false
+        type: string
+        default: ""
+      ref:
+        description: "Branch, tag, or SHA to test (exactly one of pr_number / ref)"
+        required: false
+        type: string
+        default: ""
+      snapshot_mode:
+        description: "Chain state to start from"
+        required: false
+        type: string
+        default: tip
+      network:
+        description: "Network"
+        required: false
+        type: string
+        default: mainnet
+      duration_minutes:
+        description: "Maximum time to monitor the running node"
+        required: false
+        type: string
+        default: "60"
+      droplet_size:
+        description: "DigitalOcean droplet size"
+        required: false
+        type: string
+        default: c-8
+      teardown_after_run:
+        description: "Delete the droplet immediately after the run"
+        required: false
+        type: boolean
+        default: true
+      p2p_stack:
+        description: "P2P stack to exercise"
+        required: false
+        type: string
+        default: default
+    outputs:
+      target_sha:
+        value: ${{ jobs.node.outputs.target_sha }}
+      max_checkpoint:
+        value: ${{ jobs.node.outputs.max_checkpoint }}
+      start_height:
+        value: ${{ jobs.node.outputs.start_height }}
+      end_height:
+        value: ${{ jobs.node.outputs.end_height }}
+      verdict:
+        value: ${{ jobs.node.outputs.verdict }}
   workflow_dispatch:
     inputs:
       pr_number:
@@ -21,7 +74,7 @@ on:
         description: "Branch, tag, or SHA to test (exactly one of pr_number / ref)"
         required: false
       snapshot_mode:
-        description: "Chain state to start from (pre-checkpoint: oldest retained tip snapshot, to sync through the last checkpoint handoff)"
+        description: "Chain state to start from (pre-checkpoint: newest retained tip snapshot below the last checkpoint)"
         type: choice
         options: [tip, pre-checkpoint, sandblast, genesis]
         default: tip
@@ -38,6 +91,11 @@ on:
         description: "Droplet size (disk must be >= the baked image's disk)"
         required: false
         default: c-8
+      p2p_stack:
+        description: "P2P stack to exercise"
+        type: choice
+        options: [default, legacy, zakura, dual]
+        default: default
       teardown_after_run:
         description: "Delete the droplet immediately after the run"
         type: boolean
@@ -54,6 +112,12 @@ concurrency:
 jobs:
   node:
     runs-on: ubuntu-latest
+    outputs:
+      target_sha: ${{ steps.target.outputs.sha }}
+      max_checkpoint: ${{ steps.target.outputs.max_ckpt }}
+      start_height: ${{ steps.result.outputs.start_height }}
+      end_height: ${{ steps.result.outputs.end_height }}
+      verdict: ${{ steps.result.outputs.verdict }}
     # duration_minutes (<=60 typically) + incremental build + provisioning overhead.
     timeout-minutes: 110
     steps:
@@ -155,11 +219,17 @@ jobs:
           echo "image_id=${IMAGE}" >> "$GITHUB_OUTPUT"
           if [ "${MODE}" = "genesis" ]; then
             echo "vol_snap_id=" >> "$GITHUB_OUTPUT"
+            echo "snapshot_height=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           SNAPS=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
             awk -v pre="zakura-pr-state-${NETWORK}-" 'index($2, pre) == 1 {print $2, $1}' | sort)
-          if [ -z "${SNAPS}" ]; then
+          APPROACH_SNAPS=""
+          if [ "${MODE}" = "pre-checkpoint" ] && [ "${NETWORK}" = "mainnet" ]; then
+            APPROACH_SNAPS=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
+              awk '$2 ~ /^zakura-vct-approach-mainnet-/ {print $2, $1}' | sort)
+          fi
+          if [ -z "${SNAPS}" ] && [ -z "${APPROACH_SNAPS}" ]; then
             echo "no zakura-pr-state-${NETWORK}-* volume snapshot found; run the bake workflow first" >&2
             exit 1
           fi
@@ -167,14 +237,17 @@ jobs:
             # Newest retained snapshot whose baked state height (the -h<height>
             # name suffix) is below the target's max checkpoint: guarantees a
             # handoff crossing with the shortest possible sync.
-            CANDIDATES=$(echo "${SNAPS}" | while read -r name id; do
+            SEARCH_SNAPS=$(printf '%s\n%s\n' "${SNAPS}" "${APPROACH_SNAPS}" | awk 'NF' | sort)
+            CANDIDATES=$(echo "${SEARCH_SNAPS}" | while read -r name id; do
               h=$(printf '%s' "$name" | sed -n 's/.*-h\([0-9][0-9]*\)$/\1/p')
-              [ -n "$h" ] && [ "$h" -lt "${MAX_CKPT}" ] && echo "$name $id"
-            done || true)
-            HEIGHT_NAMED=$(echo "${SNAPS}" | awk '$1 ~ /-h[0-9]+$/' | wc -l)
+              [ -n "$h" ] && [ "$h" -lt "${MAX_CKPT}" ] && echo "$h $name $id"
+            done | sort -n || true)
+            HEIGHT_NAMED=$(echo "${SEARCH_SNAPS}" | awk '$1 ~ /-h[0-9]+$/' | wc -l)
             if [ -n "${CANDIDATES}" ]; then
-              SNAP=$(echo "${CANDIDATES}" | tail -1 | awk '{print $2}')
-              echo "picked $(echo "${CANDIDATES}" | tail -1 | awk '{print $1}') (below max checkpoint ${MAX_CKPT})"
+              SELECTED=$(echo "${CANDIDATES}" | tail -1)
+              SNAP=$(echo "${SELECTED}" | awk '{print $3}')
+              SNAP_NAME=$(echo "${SELECTED}" | awk '{print $2}')
+              echo "picked ${SNAP_NAME} (below max checkpoint ${MAX_CKPT})"
             elif [ "${HEIGHT_NAMED}" -gt 0 ]; then
               echo "no retained ${NETWORK} snapshot is below the target's max checkpoint ${MAX_CKPT}; a handoff crossing is impossible" >&2
               exit 1
@@ -185,12 +258,18 @@ jobs:
                 echo "pre-checkpoint needs at least two retained snapshots; only one exists (bake again later)" >&2
                 exit 1
               fi
-              SNAP=$(echo "${SNAPS}" | head -1 | awk '{print $2}')
+              SELECTED=$(echo "${SNAPS}" | head -1)
+              SNAP=$(echo "${SELECTED}" | awk '{print $2}')
+              SNAP_NAME=$(echo "${SELECTED}" | awk '{print $1}')
             fi
           else
-            SNAP=$(echo "${SNAPS}" | tail -1 | awk '{print $2}')
+            SELECTED=$(echo "${SNAPS}" | tail -1)
+            SNAP=$(echo "${SELECTED}" | awk '{print $2}')
+            SNAP_NAME=$(echo "${SELECTED}" | awk '{print $1}')
           fi
           echo "vol_snap_id=${SNAP}" >> "$GITHUB_OUTPUT"
+          SNAPSHOT_HEIGHT=$(printf '%s' "${SNAP_NAME}" | sed -n 's/.*-h\([0-9][0-9]*\)$/\1/p')
+          echo "snapshot_height=${SNAPSHOT_HEIGHT}" >> "$GITHUB_OUTPUT"
 
       - name: Create droplet (+ state volume)
         id: droplet
@@ -254,6 +333,9 @@ jobs:
           REFSPEC: ${{ steps.target.outputs.refspec }}
           DURATION_MINUTES: ${{ inputs.duration_minutes || '60' }}
           VOLUME_NAME: ${{ steps.droplet.outputs.volume_name }}
+          P2P_STACK: ${{ inputs.p2p_stack || 'default' }}
+          MAX_CKPT: ${{ steps.target.outputs.max_ckpt }}
+          SNAPSHOT_HEIGHT: ${{ steps.baked.outputs.snapshot_height }}
         run: |
           set -euo pipefail
           umask 077
@@ -266,6 +348,9 @@ jobs:
             printf 'REFSPEC=%q\n'           "${REFSPEC}"
             printf 'DURATION_MINUTES=%q\n'  "${DURATION_MINUTES}"
             printf 'VOLUME_NAME=%q\n'       "${VOLUME_NAME}"
+            printf 'P2P_STACK=%q\n'         "${P2P_STACK}"
+            printf 'MAX_CKPT=%q\n'           "${MAX_CKPT}"
+            printf 'SNAPSHOT_HEIGHT=%q\n'     "${SNAPSHOT_HEIGHT}"
           } > /tmp/run.env
           scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
             /tmp/run.env \
@@ -279,6 +364,7 @@ jobs:
             'set -euo pipefail; set -a; . /root/run.env; set +a; bash /root/pr-node-run.sh'
 
       - name: Collect run outputs
+        id: result
         if: always() && steps.droplet.outputs.ip != ''
         env:
           IP: ${{ steps.droplet.outputs.ip }}
@@ -288,6 +374,17 @@ jobs:
           scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
             "root@${IP}:/root/out/*" /tmp/out/
           ls -la /tmp/out
+          {
+            if [ -f /tmp/out/summary.json ]; then
+              echo "start_height=$(jq -r '.start_height // ""' /tmp/out/summary.json)"
+              echo "end_height=$(jq -r '.end_height // ""' /tmp/out/summary.json)"
+              echo "verdict=$(jq -r '.verdict // ""' /tmp/out/summary.json)"
+            else
+              echo "start_height="
+              echo "end_height="
+              echo "verdict="
+            fi
+          } >> "$GITHUB_OUTPUT"
           true
 
       - name: Write step summary

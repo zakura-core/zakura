@@ -11,6 +11,7 @@
 #                            reset token-free afterwards, nothing is baked
 #   MAINNET_VOLUME_NAME      DO volume that gets tip/ + sandblast/ mainnet state
 #   TESTNET_VOLUME_NAME      DO volume that gets tip/ testnet state
+#   APPROACH_VOLUME_NAME     DO volume rolled back to just below the VCT handoff
 #   TIP_MAINNET_LATEST_JSON  latest.json pointer for the mainnet pruned tip
 #   SANDBLAST_URL            pinned pre-spam-region mainnet archive snapshot
 #   SANDBLAST_SHA256         its sha256
@@ -152,8 +153,10 @@ fetch_state() {
 
 MAINNET_MNT=/mnt/bake-mainnet
 TESTNET_MNT=/mnt/bake-testnet
+APPROACH_MNT=/mnt/bake-approach
 mount_volume "$MAINNET_VOLUME_NAME" "$MAINNET_MNT"
 mount_volume "$TESTNET_VOLUME_NAME" "$TESTNET_MNT"
+mount_volume "$APPROACH_VOLUME_NAME" "$APPROACH_MNT"
 
 # Mainnet tip: resolve the daily pruned snapshot through its latest.json pointer.
 TIP_META=$(curl -fsSL --retry 3 "$TIP_MAINNET_LATEST_JSON")
@@ -164,6 +167,39 @@ echo "Mainnet tip: $(echo "$TIP_META" | jq -r '"\(.filename) height=\(.height) d
 # pre-checkpoint mode can pick the newest snapshot below a branch's checkpoint.
 echo "$TIP_META" | jq -er '.height' > /root/mainnet-state-height || true
 fetch_state "$TIP_URL" "$TIP_SHA" "$MAINNET_MNT/tip" mainnet
+
+# Mainnet VCT approach state: copy the current pruned state to its own volume,
+# then roll it back below the embedded frontier. This guarantees a usable
+# handoff-crossing source even after every retained weekly tip is above C.
+MAINNET_H=$(echo "$TIP_META" | jq -er '.height')
+MAINNET_RETENTION=$(echo "$TIP_META" | jq -er '.tx_retention // 10000')
+MAX_CKPT=$(tail -1 zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
+[[ "$MAX_CKPT" =~ ^[0-9]+$ ]] || {
+  echo "could not determine Mainnet max checkpoint" >&2
+  exit 1
+}
+if [ "$MAINNET_H" -ge "$MAX_CKPT" ]; then
+  APPROACH_H=$((MAX_CKPT - 100))
+  ROLLBACK_COUNT=$((MAINNET_H - APPROACH_H))
+else
+  APPROACH_H="$MAINNET_H"
+  ROLLBACK_COUNT=0
+fi
+if [ "$ROLLBACK_COUNT" -le "$MAINNET_RETENTION" ]; then
+  mkdir -p "$APPROACH_MNT/tip"
+  cp -a "$MAINNET_MNT/tip/." "$APPROACH_MNT/tip/"
+  rm -rf "$APPROACH_MNT/tip/non_finalized_state"
+  if [ "$ROLLBACK_COUNT" -gt 0 ]; then
+    /root/cargo-target/release/zakura-rollback-state \
+      --height "$APPROACH_H" \
+      --cache-dir "$APPROACH_MNT/tip" \
+      --network Mainnet
+  fi
+  echo "$APPROACH_H" > /root/mainnet-approach-height
+  echo "Mainnet VCT approach state: height=$APPROACH_H handoff=$MAX_CKPT"
+else
+  echo "Skipping approach refresh: rollback $ROLLBACK_COUNT exceeds retained $MAINNET_RETENTION blocks"
+fi
 
 # Mainnet sandblast: pinned archive just before the 2022 spam region.
 fetch_state "$SANDBLAST_URL" "$SANDBLAST_SHA256" "$MAINNET_MNT/sandblast" mainnet
@@ -185,7 +221,7 @@ else
 fi
 
 sync
-umount "$MAINNET_MNT" "$TESTNET_MNT"
+umount "$MAINNET_MNT" "$TESTNET_MNT" "$APPROACH_MNT"
 
 # --------------------------------------------------------------------------- #
 # Clean the droplet for imaging

@@ -192,11 +192,18 @@ gh workflow run create-release.yml \
 The workflow must:
 
 1. validate the tag against the `zakura` package version
-2. build and verify assets before tag creation
-3. wait for approval of the `release` environment
-4. create the immutable tag and GitHub pre-release
-5. publish the release assets; the tag push then triggers
+2. boot from a retained Mainnet state below the VCT handoff and prove finalized
+   state crosses it using the Zakura P2P stack
+3. build and verify assets before tag creation
+4. wait for approval of the `release` environment
+5. create the immutable tag and GitHub pre-release
+6. publish the release assets; the tag push then triggers
    `release-binaries.yml`, which publishes the Docker images
+
+The documented emergency source-first mode skips the pre-tag VCT crossing and
+asset build. A handoff-canary failure in the normal path blocks release
+publication and alerts `#zakura-alerts`; investigate it rather than bypassing
+the gate.
 
 Do not retry from an unmerged branch. A version mismatch failure means `main`
 still has the previous package version.

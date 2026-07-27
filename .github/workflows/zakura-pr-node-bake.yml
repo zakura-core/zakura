@@ -4,7 +4,8 @@ name: PR node image bake
 #   - one base droplet image: build deps + rustup + repo clone + warm cargo
 #     release cache + a loopback SSH identity for deploy.py,
 #   - one volume snapshot per network with extracted chain state
-#     (mainnet: tip/ + sandblast/, testnet: tip/).
+#     (mainnet: tip/ + sandblast/, testnet: tip/),
+#   - one small Mainnet pruned-state snapshot rolled back below the VCT handoff.
 # Runs weekly so the tip states and the cargo cache never drift far from main;
 # PR-node runs sync the remaining gap during their hour.
 
@@ -70,15 +71,20 @@ jobs:
           set -euo pipefail
           MAINNET_VOL="zakura-pr-bake-mainnet-${GITHUB_RUN_ID}"
           TESTNET_VOL="zakura-pr-bake-testnet-${GITHUB_RUN_ID}"
+          APPROACH_VOL="zakura-pr-bake-approach-${GITHUB_RUN_ID}"
           MAINNET_VOL_ID=$(doctl compute volume create "$MAINNET_VOL" \
             --region "${REGION}" --size 300GiB --format ID --no-header)
           TESTNET_VOL_ID=$(doctl compute volume create "$TESTNET_VOL" \
             --region "${REGION}" --size 100GiB --format ID --no-header)
+          APPROACH_VOL_ID=$(doctl compute volume create "$APPROACH_VOL" \
+            --region "${REGION}" --size 100GiB --format ID --no-header)
           {
             echo "mainnet_vol=$MAINNET_VOL"
             echo "testnet_vol=$TESTNET_VOL"
+            echo "approach_vol=$APPROACH_VOL"
             echo "mainnet_vol_id=$MAINNET_VOL_ID"
             echo "testnet_vol_id=$TESTNET_VOL_ID"
+            echo "approach_vol_id=$APPROACH_VOL_ID"
           } >> "$GITHUB_OUTPUT"
 
           NAME="zakura-pr-bake-${GITHUB_RUN_ID}"
@@ -89,6 +95,7 @@ jobs:
             --ssh-keys "${SSH_FINGERPRINT}" \
             --volumes "${MAINNET_VOL_ID}" \
             --volumes "${TESTNET_VOL_ID}" \
+            --volumes "${APPROACH_VOL_ID}" \
             --tag-name zakura-image-bake \
             --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
           echo "id=$(awk '{print $1}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
@@ -117,6 +124,7 @@ jobs:
           KRESKO_BAKE_REF: ${{ inputs.kresko_ref || vars.KRESKO_BAKE_REF || 'main' }}
           MAINNET_VOLUME_NAME: ${{ steps.droplet.outputs.mainnet_vol }}
           TESTNET_VOLUME_NAME: ${{ steps.droplet.outputs.testnet_vol }}
+          APPROACH_VOLUME_NAME: ${{ steps.droplet.outputs.approach_vol }}
           TIP_MAINNET_LATEST_JSON: ${{ vars.ZAKURA_PR_NODE_TIP_LATEST_JSON || 'https://zakura.valargroup.dev/mainnet-pruned/latest.json' }}
           # Pre-spam-region archive snapshot; same artifact checkpoint-sync-bench pins.
           SANDBLAST_URL: ${{ vars.ZAKURA_PR_NODE_SANDBLAST_URL || 'https://zakura.valargroup.dev/mainnet/historical/zakura-mainnet-20260717T095333Z-1707210.tar.zst' }}
@@ -130,6 +138,7 @@ jobs:
             printf 'GH_CLONE_TOKEN=%q\n'          "${GH_CLONE_TOKEN}"
             printf 'MAINNET_VOLUME_NAME=%q\n'     "${MAINNET_VOLUME_NAME}"
             printf 'TESTNET_VOLUME_NAME=%q\n'     "${TESTNET_VOLUME_NAME}"
+            printf 'APPROACH_VOLUME_NAME=%q\n'    "${APPROACH_VOLUME_NAME}"
             printf 'TIP_MAINNET_LATEST_JSON=%q\n' "${TIP_MAINNET_LATEST_JSON}"
             printf 'SANDBLAST_URL=%q\n'           "${SANDBLAST_URL}"
             printf 'SANDBLAST_SHA256=%q\n'        "${SANDBLAST_SHA256}"
@@ -149,6 +158,7 @@ jobs:
           IP: ${{ steps.droplet.outputs.ip }}
           MAINNET_VOL_ID: ${{ steps.droplet.outputs.mainnet_vol_id }}
           TESTNET_VOL_ID: ${{ steps.droplet.outputs.testnet_vol_id }}
+          APPROACH_VOL_ID: ${{ steps.droplet.outputs.approach_vol_id }}
         run: |
           set -euo pipefail
           # The -h<height> suffix lets the pr-node pre-checkpoint mode pick the
@@ -159,11 +169,18 @@ jobs:
           }
           MAINNET_H=$(fetch_height /root/mainnet-state-height)
           TESTNET_H=$(fetch_height /root/testnet-state-height)
+          APPROACH_H=$(fetch_height /root/mainnet-approach-height)
           STAMP=$(date -u +%Y%m%d-%H%M)
           doctl compute volume snapshot "${MAINNET_VOL_ID}" \
             --snapshot-name "zakura-pr-state-mainnet-${STAMP}${MAINNET_H:+-h${MAINNET_H}}"
           doctl compute volume snapshot "${TESTNET_VOL_ID}" \
             --snapshot-name "zakura-pr-state-testnet-${STAMP}${TESTNET_H:+-h${TESTNET_H}}"
+          if [ -n "$APPROACH_H" ]; then
+            doctl compute volume snapshot "${APPROACH_VOL_ID}" \
+              --snapshot-name "zakura-vct-approach-mainnet-${STAMP}-h${APPROACH_H}"
+          else
+            echo "::warning::approach state was not refreshed; retaining the existing pinned snapshot"
+          fi
 
       - name: Snapshot droplet image
         env:
@@ -194,6 +211,7 @@ jobs:
           DROPLET_ID: ${{ steps.droplet.outputs.id }}
           MAINNET_VOL_ID: ${{ steps.droplet.outputs.mainnet_vol_id }}
           TESTNET_VOL_ID: ${{ steps.droplet.outputs.testnet_vol_id }}
+          APPROACH_VOL_ID: ${{ steps.droplet.outputs.approach_vol_id }}
         run: |
           set +e
           if [ -n "${DROPLET_ID}" ]; then
@@ -203,7 +221,7 @@ jobs:
             done
           fi
           # Volumes detach asynchronously after the droplet delete.
-          for VOL_ID in "${MAINNET_VOL_ID}" "${TESTNET_VOL_ID}"; do
+          for VOL_ID in "${MAINNET_VOL_ID}" "${TESTNET_VOL_ID}" "${APPROACH_VOL_ID}"; do
             [ -z "${VOL_ID}" ] && continue
             for _ in $(seq 1 12); do
               doctl compute volume delete "${VOL_ID}" -f && break
@@ -211,24 +229,10 @@ jobs:
             done
           done
           # Keep the newest 2 images so runs never depend on the latest bake
-          # having succeeded. Mainnet volume snapshots keep 6 weekly generations
-          # (~90 GiB each, ~$32/month total) so the pr-node pre-checkpoint mode
-          # can find a state below a branch's max checkpoint even after several
-          # checkpoint-less weeks; testnet keeps the short window. If this ever
-          # needs to be longer, split the static sandblast/ state out of the
-          # weekly snapshot first — it is re-stored identically each week and
-          # is roughly half the bytes.
+          # having succeeded. The hourly reaper owns volume-snapshot retention:
+          # it keeps 6 Mainnet and 3 Testnet generations, plus the dynamically
+          # pinned Mainnet snapshot immediately below the current VCT handoff.
           doctl compute image list-user --format ID,Name --no-header | \
             awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | head -n -2 | \
             while read -r _name id; do doctl compute image delete "$id" -f; done
-          for NET in mainnet testnet; do
-            case "$NET" in
-              mainnet) KEEP=6 ;;
-              testnet) KEEP=3 ;;
-            esac
-            doctl compute snapshot list --resource volume --format ID,Name --no-header | \
-              awk -v pre="zakura-pr-state-${NET}-" 'index($2, pre) == 1 {print $2, $1}' | \
-              sort | head -n "-${KEEP}" | \
-              while read -r _name id; do doctl compute snapshot delete "$id" -f; done
-          done
           true

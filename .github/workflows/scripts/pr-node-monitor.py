@@ -9,7 +9,8 @@ summary.json (machine) + summary.md (human, posted as the PR comment).
 Stdlib only, mirroring deploy/deployer/deploy.py.
 
 Exit status: 0 for an ok/degraded run, 1 for a failed run (service inactive at
-the end, a panic, an unexpected restart, or RPC never came up).
+the end, a panic, an unexpected restart, RPC never came up, or a required
+height boundary was not crossed).
 """
 
 from __future__ import annotations
@@ -109,11 +110,20 @@ def fmt(value, suffix: str = "") -> str:
     return f"{value}{suffix}" if value is not None else "n/a"
 
 
-def build_summary(meta: dict, samples: list[dict], logs: dict, duration_min: float) -> dict:
+def build_summary(
+    meta: dict,
+    samples: list[dict],
+    logs: dict,
+    duration_min: float,
+    known_start_height: int | None = None,
+    required_start_below: int | None = None,
+    stop_after_height: int | None = None,
+) -> dict:
     heighted = [s for s in samples if s["height"] is not None]
-    start_h = heighted[0]["height"] if heighted else None
+    first_observed_h = heighted[0]["height"] if heighted else None
+    start_h = known_start_height if known_start_height is not None else first_observed_h
     end_h = heighted[-1]["height"] if heighted else None
-    progress = (end_h - start_h) if heighted else None
+    progress = (end_h - start_h) if end_h is not None and start_h is not None else None
     last = samples[-1] if samples else {}
     peers = [s["peers"] for s in samples if s["peers"] is not None]
     rss = [s["rss_mib"] for s in samples if s["rss_mib"] is not None]
@@ -124,6 +134,14 @@ def build_summary(meta: dict, samples: list[dict], logs: dict, duration_min: flo
         or logs["panics"] > 0
         or restarts > 0
         or not heighted
+        or (
+            required_start_below is not None
+            and (start_h is None or start_h >= required_start_below)
+        )
+        or (
+            stop_after_height is not None
+            and (end_h is None or end_h <= stop_after_height)
+        )
     ):
         verdict = "failed"
     elif logs["errors"] > 0 or (progress is not None and progress <= 0):
@@ -136,6 +154,7 @@ def build_summary(meta: dict, samples: list[dict], logs: dict, duration_min: flo
         "verdict": verdict,
         "duration_minutes": duration_min,
         "start_height": start_h,
+        "first_observed_height": first_observed_h,
         "end_height": end_h,
         "blocks_synced": progress,
         "blocks_per_hour": (
@@ -151,6 +170,8 @@ def build_summary(meta: dict, samples: list[dict], logs: dict, duration_min: flo
         "log_warns": logs["warns"],
         "panics": logs["panics"],
         "last_errors": logs["last_errors"],
+        "required_start_below": required_start_below,
+        "required_end_above": stop_after_height,
     }
 
 
@@ -176,6 +197,12 @@ def write_markdown(out: Path, summary: dict, samples: list[dict], notes_file: st
         f"| Log errors/warns/panics | {summary['log_errors']} / {summary['log_warns']} / "
         f"{summary['panics']} |",
     ]
+    if summary["required_start_below"] is not None:
+        lines.append(
+            f"| Required crossing | start < {summary['required_start_below']}, "
+            f"end > {summary['required_end_above']} |"
+        )
+        lines.append(f"| First observed RPC height | {fmt(summary['first_observed_height'])} |")
 
     shown = [s for s in samples if s["height"] is not None]
     if shown:
@@ -211,6 +238,24 @@ def main() -> int:
     parser.add_argument("--log-file", default="/var/log/zakura/zakura.log")
     parser.add_argument("--notes", default=None, help="markdown notes file to append")
     parser.add_argument("--meta", default="", help="comma-separated key=value run metadata")
+    parser.add_argument(
+        "--known-start-height",
+        type=int,
+        default=None,
+        help="state snapshot height, used when sync crosses before RPC is available",
+    )
+    parser.add_argument(
+        "--required-start-below",
+        type=int,
+        default=None,
+        help="fail unless the known/first observed start height is below this height",
+    )
+    parser.add_argument(
+        "--stop-after-height",
+        type=int,
+        default=None,
+        help="stop successfully once RPC block height is strictly above this height",
+    )
     parser.add_argument("--out", required=True, help="output directory")
     args = parser.parse_args()
 
@@ -235,12 +280,31 @@ def main() -> int:
         if sample["elapsed"] > RPC_GRACE_SECS and sample["active_state"] == "failed":
             print("service failed; stopping monitor early", flush=True)
             break
+        if (
+            args.stop_after_height is not None
+            and sample["height"] is not None
+            and sample["height"] > args.stop_after_height
+        ):
+            print(
+                f"crossed required height {args.stop_after_height}; stopping monitor",
+                flush=True,
+            )
+            break
         if time.monotonic() + args.interval > deadline:
             break
         time.sleep(args.interval)
 
     logs = scan_logs(args.log_file, args.service)
-    summary = build_summary(meta, samples, logs, args.duration_minutes)
+    actual_duration_min = (time.monotonic() - start) / 60
+    summary = build_summary(
+        meta,
+        samples,
+        logs,
+        actual_duration_min,
+        known_start_height=args.known_start_height,
+        required_start_below=args.required_start_below,
+        stop_after_height=args.stop_after_height,
+    )
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     write_markdown(out, summary, samples, args.notes)
     print(f"verdict: {summary['verdict']}", flush=True)

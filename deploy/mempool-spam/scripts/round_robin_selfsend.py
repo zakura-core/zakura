@@ -45,6 +45,19 @@ ZECD_RPC_URL = "http://127.0.0.1:18888"
 NETWORK = "test"
 
 
+class RunDurationElapsed(TimeoutError):
+    """The configured transaction submission duration elapsed."""
+
+
+def remaining_timeout(deadline: float | None, maximum: float) -> float:
+    if deadline is None:
+        return maximum
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RunDurationElapsed("transaction submission duration elapsed")
+    return min(maximum, remaining)
+
+
 def on_stop(*_args) -> None:
     global STOP
     STOP = True
@@ -88,52 +101,81 @@ def write_status(status: dict) -> None:
     STATUS_FILE.write_text(json.dumps(status, indent=2) + "\n")
 
 
-def tip_height(rpc_url: str) -> int:
-    return int(rpc_call(rpc_url, "getblockchaininfo")["blocks"])
+def tip_height(rpc_url: str, timeout=30) -> int:
+    return int(rpc_call(rpc_url, "getblockchaininfo", timeout=timeout)["blocks"])
 
 
-def wait_next_block(rpc_url: str, start_height: int, timeout=600) -> int:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+def wait_next_block(
+    rpc_url: str, start_height: int, timeout=600, run_deadline: float | None = None
+) -> int:
+    deadline = time.monotonic() + timeout
+    if run_deadline is not None:
+        deadline = min(deadline, run_deadline)
+    while time.monotonic() < deadline:
         if STOP:
             raise InterruptedError("stopped")
-        height = tip_height(rpc_url)
+        height = tip_height(rpc_url, timeout=remaining_timeout(deadline, 30))
         if height > start_height:
             return height
-        time.sleep(3)
+        time.sleep(min(3, max(0, deadline - time.monotonic())))
+    if run_deadline is not None and time.monotonic() >= run_deadline:
+        raise RunDurationElapsed("transaction submission duration elapsed")
     raise TimeoutError(f"no new block after height {start_height}")
 
 
-def transaction_state(node: dict, txid: str) -> tuple[bool, dict | None]:
+def transaction_state(
+    node: dict, txid: str, deadline: float | None = None
+) -> tuple[bool, dict | None]:
     try:
-        if txid in rpc_call(node["rpc_url"], "getrawmempool", timeout=10):
+        if txid in rpc_call(
+            node["rpc_url"], "getrawmempool", timeout=remaining_timeout(deadline, 10)
+        ):
             return True, None
+    except RunDurationElapsed:
+        raise
     except Exception:  # noqa: BLE001
         pass
     try:
-        tx = rpc_call(node["rpc_url"], "getrawtransaction", [txid, 1], timeout=10)
+        tx = rpc_call(
+            node["rpc_url"],
+            "getrawtransaction",
+            [txid, 1],
+            timeout=remaining_timeout(deadline, 10),
+        )
         return True, tx if isinstance(tx, dict) else None
+    except RunDurationElapsed:
+        raise
     except Exception:  # noqa: BLE001
         return False, None
 
 
 def first_seen_matrix(
-    nodes: list[dict], txid: str, duration=30.0, interval=1.0
+    nodes: list[dict],
+    txid: str,
+    duration=30.0,
+    interval=1.0,
+    run_deadline: float | None = None,
 ) -> dict[str, float]:
     started = time.monotonic()
+    deadline = started + duration
+    if run_deadline is not None:
+        deadline = min(deadline, run_deadline)
     seen: dict[str, float] = {}
-    while time.monotonic() - started < duration:
+    while time.monotonic() < deadline:
         if STOP:
             break
         for node in nodes:
             if node["name"] in seen:
                 continue
-            known, _ = transaction_state(node, txid)
+            try:
+                known, _ = transaction_state(node, txid, deadline=deadline)
+            except RunDurationElapsed:
+                return seen
             if known:
                 seen[node["name"]] = round(time.monotonic() - started, 3)
         if len(seen) == len(nodes):
             break
-        time.sleep(interval)
+        time.sleep(min(interval, max(0, deadline - time.monotonic())))
     return seen
 
 
@@ -185,9 +227,11 @@ def server_uri(rpc_url: str) -> str:
     return f"zebra://{parsed.hostname}:{parsed.port or default_port}"
 
 
-def inventory_pools() -> dict:
+def inventory_pools(deadline: float | None = None) -> dict:
     pools = {}
-    for note in zecd_rpc("listunspent", [0]) or []:
+    for note in zecd_rpc(
+        "listunspent", [0], timeout=remaining_timeout(deadline, 300)
+    ) or []:
         pool = note.get("pool", "?")
         record = pools.setdefault(pool, {"notes": 0, "taz": 0.0})
         record["notes"] += 1
@@ -256,23 +300,29 @@ def stop_zecd() -> None:
     time.sleep(1)
 
 
-def wait_zecd_ready(timeout=120) -> None:
-    deadline = time.time() + timeout
+def wait_zecd_ready(timeout=120, run_deadline: float | None = None) -> None:
+    deadline = time.monotonic() + timeout
+    if run_deadline is not None:
+        deadline = min(deadline, run_deadline)
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         if STOP:
             raise InterruptedError("stopped")
         try:
-            zecd_rpc("getwalletinfo", timeout=10)
-            zecd_rpc("getblockchaininfo", timeout=10)
+            zecd_rpc("getwalletinfo", timeout=remaining_timeout(deadline, 10))
+            zecd_rpc("getblockchaininfo", timeout=remaining_timeout(deadline, 10))
             return
+        except RunDurationElapsed:
+            raise
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
-            time.sleep(0.5)
+            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+    if run_deadline is not None and time.monotonic() >= run_deadline:
+        raise RunDurationElapsed("transaction submission duration elapsed")
     raise RuntimeError(f"zecd not ready: {last_error}")
 
 
-def start_zecd(server: str) -> None:
+def start_zecd(server: str, run_deadline: float | None = None) -> None:
     global PROC
     stop_zecd()
     ensure_conf()
@@ -296,20 +346,33 @@ def start_zecd(server: str) -> None:
             stderr=subprocess.STDOUT,
         )
     PID_FILE.write_text(f"{PROC.pid}\n")
-    wait_zecd_ready()
+    wait_zecd_ready(run_deadline=run_deadline)
 
 
 def send_with_retry(
-    node: dict, amount: float, max_retries: int = 4
+    node: dict,
+    amount: float,
+    max_retries: int = 4,
+    run_deadline: float | None = None,
 ) -> tuple[str, int, dict, dict]:
     last_error = None
     for attempt in range(max_retries):
-        before = inventory_pools()
-        height = tip_height(node["rpc_url"])
-        address = zecd_rpc("getnewaddress", [])
+        before = inventory_pools(deadline=run_deadline)
+        height = tip_height(
+            node["rpc_url"], timeout=remaining_timeout(run_deadline, 30)
+        )
+        address = zecd_rpc(
+            "getnewaddress", [], timeout=remaining_timeout(run_deadline, 300)
+        )
         try:
-            txid = zecd_rpc("sendtoaddress", [address, amount], timeout=600)
-            return txid, height, before, inventory_pools()
+            txid = zecd_rpc(
+                "sendtoaddress",
+                [address, amount],
+                timeout=remaining_timeout(run_deadline, 600),
+            )
+            return txid, height, before, inventory_pools(deadline=run_deadline)
+        except RunDurationElapsed:
+            raise
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             log_event(
@@ -321,7 +384,7 @@ def send_with_retry(
                     "height": height,
                 }
             )
-            wait_next_block(node["rpc_url"], height)
+            wait_next_block(node["rpc_url"], height, run_deadline=run_deadline)
     raise RuntimeError(f"sendtoaddress failed after retries: {last_error}")
 
 
@@ -402,6 +465,9 @@ def main() -> int:
     RUN_LOG.write_text("")
     submitted_txids: list[str] = []
     run_started = time.monotonic()
+    run_deadline = (
+        run_started + args.duration_minutes * 60 if args.duration_minutes else None
+    )
     run_error = None
 
     log_event(
@@ -423,8 +489,7 @@ def main() -> int:
         while not STOP:
             if args.max_rounds and round_index >= args.max_rounds:
                 break
-            if args.duration_minutes and time.monotonic() - run_started >= args.duration_minutes * 60:
-                break
+            remaining_timeout(run_deadline, float("inf"))
             node = nodes[round_index % len(nodes)]
             round_index += 1
             server = server_uri(node["rpc_url"])
@@ -444,17 +509,24 @@ def main() -> int:
                     "server": server,
                 }
             )
-            start_zecd(server)
-            inventory = inventory_pools()
+            start_zecd(server, run_deadline=run_deadline)
+            inventory = inventory_pools(deadline=run_deadline)
             spendable = sum(
                 inventory.get(pool, {}).get("notes", 0) for pool in ("ironwood", "orchard")
             )
             if spendable < 1:
                 raise RuntimeError(f"no spendable Ironwood or Orchard notes: {inventory}")
             started = time.monotonic()
-            txid, height, before, after = send_with_retry(node, args.amount)
+            txid, height, before, after = send_with_retry(
+                node, args.amount, run_deadline=run_deadline
+            )
             submitted_txids.append(txid)
-            seen = first_seen_matrix(nodes, txid, duration=args.matrix_secs)
+            seen = first_seen_matrix(
+                nodes,
+                txid,
+                duration=args.matrix_secs,
+                run_deadline=run_deadline,
+            )
             missing = [candidate["name"] for candidate in nodes if candidate["name"] not in seen]
             log_event(
                 {
@@ -475,10 +547,14 @@ def main() -> int:
                 }
             )
             if args.wait_block:
-                new_height = wait_next_block(node["rpc_url"], height)
+                new_height = wait_next_block(
+                    node["rpc_url"], height, run_deadline=run_deadline
+                )
                 log_event(
                     {"event": "block", "round": round_index, "height": new_height, "txid": txid}
                 )
+    except RunDurationElapsed:
+        log_event({"event": "duration_elapsed", "rounds": round_index})
     except (Exception, InterruptedError) as exc:  # noqa: BLE001
         run_error = str(exc)
         log_event({"event": "fatal", "error": run_error})

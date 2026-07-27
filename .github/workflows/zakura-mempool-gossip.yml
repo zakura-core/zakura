@@ -94,11 +94,11 @@ jobs:
 
       - name: Write SSH key
         env:
-          DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+          ZAKURA_TESTNET_DEPLOY_SSH_KEY: ${{ secrets.ZAKURA_TESTNET_DEPLOY_SSH_KEY }}
         run: |
           set -euo pipefail
           install -m 600 /dev/null /tmp/do_ssh
-          printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh
+          printf '%s\n' "${ZAKURA_TESTNET_DEPLOY_SSH_KEY}" > /tmp/do_ssh
 
       - name: Sync harness to controller
         env:

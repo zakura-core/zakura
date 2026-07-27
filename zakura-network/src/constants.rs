@@ -293,7 +293,7 @@ pub const GET_ADDR_FANOUT: usize = 1;
 /// <https://zips.z.cash/zip-0155#specification>
 pub const MAX_ADDRS_IN_MESSAGE: usize = 1000;
 
-/// The fraction of addresses Zebra sends in response to a `Peers` request.
+/// The fraction of addresses Zakura sends in response to a `GetAddr` request.
 ///
 /// Each response contains approximately:
 /// `address_book.len() / ADDR_RESPONSE_LIMIT_DENOMINATOR`
@@ -301,18 +301,24 @@ pub const MAX_ADDRS_IN_MESSAGE: usize = 1000;
 ///
 /// # Security
 ///
-/// This limit makes sure that Zebra does not reveal its entire address book
-/// in a single `Peers` response.
-pub const ADDR_RESPONSE_LIMIT_DENOMINATOR: usize = 4;
+/// This limit makes sure that Zakura does not reveal its entire address book
+/// in a single `GetAddr` response.
+pub const ADDR_RESPONSE_LIMIT_DENOMINATOR: usize = 2;
 
-/// The maximum number of addresses Zebra will keep in its address book.
+/// The address book capacity as a multiple of the address message limit.
+const ADDRESS_BOOK_CAPACITY_MULTIPLIER: usize = 5;
+
+/// The maximum number of addresses Zakura will keep in its address book.
 ///
 /// This is a tradeoff between:
 /// - revealing the whole address book in a few requests,
 /// - sending the maximum number of peer addresses, and
 /// - making sure the limit code actually gets run.
+///
+/// This capacity is independent of the response fraction, so tuning address
+/// gossip does not also change how many peers Zakura retains.
 pub const MAX_ADDRS_IN_ADDRESS_BOOK: usize =
-    MAX_ADDRS_IN_MESSAGE * (ADDR_RESPONSE_LIMIT_DENOMINATOR + 1);
+    MAX_ADDRS_IN_MESSAGE * ADDRESS_BOOK_CAPACITY_MULTIPLIER;
 
 /// Truncate timestamps in outbound address messages to this time interval.
 ///

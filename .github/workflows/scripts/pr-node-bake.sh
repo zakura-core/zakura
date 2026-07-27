@@ -12,6 +12,8 @@
 #   MAINNET_VOLUME_NAME      DO volume that gets tip/ + sandblast/ mainnet state
 #   TESTNET_VOLUME_NAME      DO volume that gets tip/ testnet state
 #   APPROACH_VOLUME_NAME     DO volume rolled back to just below the VCT handoff
+#   APPROACH_SOURCE_VOLUME_NAME  optional older PR-state volume to roll back
+#   APPROACH_SOURCE_HEIGHT / APPROACH_SOURCE_DB_FORMAT  metadata for that volume
 #   TIP_MAINNET_LATEST_JSON  latest.json pointer for the mainnet pruned tip
 #   SANDBLAST_URL            pinned pre-spam-region mainnet archive snapshot
 #   SANDBLAST_SHA256         its sha256
@@ -173,9 +175,13 @@ db_format_at_ref() {
 MAINNET_MNT=/mnt/bake-mainnet
 TESTNET_MNT=/mnt/bake-testnet
 APPROACH_MNT=/mnt/bake-approach
+APPROACH_SOURCE_MNT=/mnt/bake-approach-source
 mount_volume "$MAINNET_VOLUME_NAME" "$MAINNET_MNT"
 mount_volume "$TESTNET_VOLUME_NAME" "$TESTNET_MNT"
 mount_volume "$APPROACH_VOLUME_NAME" "$APPROACH_MNT"
+if [ -n "$APPROACH_SOURCE_VOLUME_NAME" ]; then
+  mount_volume "$APPROACH_SOURCE_VOLUME_NAME" "$APPROACH_SOURCE_MNT"
+fi
 
 # Mainnet tip: resolve the daily pruned snapshot through its latest.json pointer.
 TIP_META=$(curl -fsSL --retry 3 "$TIP_MAINNET_LATEST_JSON")
@@ -199,16 +205,27 @@ MAX_CKPT=$(tail -1 zakura-chain/src/parameters/checkpoint/main-checkpoints.txt |
   echo "could not determine Mainnet max checkpoint" >&2
   exit 1
 }
-if [ "$MAINNET_H" -ge "$MAX_CKPT" ]; then
+APPROACH_SOURCE_DIR="$MAINNET_MNT/tip"
+APPROACH_SOURCE_H="$MAINNET_H"
+if [ -n "$APPROACH_SOURCE_VOLUME_NAME" ]; then
+  APPROACH_SOURCE_DIR="$APPROACH_SOURCE_MNT/tip"
+  APPROACH_SOURCE_H="$APPROACH_SOURCE_HEIGHT"
+  TIP_DB_FORMAT="$APPROACH_SOURCE_DB_FORMAT"
+  [ -d "$APPROACH_SOURCE_DIR" ] || {
+    echo "historical approach source has no tip/ state" >&2
+    exit 1
+  }
+fi
+if [ "$APPROACH_SOURCE_H" -ge "$MAX_CKPT" ]; then
   APPROACH_H=$((MAX_CKPT - 100))
-  ROLLBACK_COUNT=$((MAINNET_H - APPROACH_H))
+  ROLLBACK_COUNT=$((APPROACH_SOURCE_H - APPROACH_H))
 else
-  APPROACH_H="$MAINNET_H"
+  APPROACH_H="$APPROACH_SOURCE_H"
   ROLLBACK_COUNT=0
 fi
 if [ "$ROLLBACK_COUNT" -le "$MAINNET_RETENTION" ]; then
   mkdir -p "$APPROACH_MNT/tip"
-  cp -a "$MAINNET_MNT/tip/." "$APPROACH_MNT/tip/"
+  cp -a "$APPROACH_SOURCE_DIR/." "$APPROACH_MNT/tip/"
   rm -rf "$APPROACH_MNT/tip/non_finalized_state"
   if [ "$ROLLBACK_COUNT" -gt 0 ]; then
     ROLLBACK_BIN=/root/cargo-target/release/zakura-rollback-state
@@ -271,6 +288,9 @@ fi
 
 sync
 umount "$MAINNET_MNT" "$TESTNET_MNT" "$APPROACH_MNT"
+if mountpoint -q "$APPROACH_SOURCE_MNT"; then
+  umount "$APPROACH_SOURCE_MNT"
+fi
 
 # --------------------------------------------------------------------------- #
 # Clean the droplet for imaging

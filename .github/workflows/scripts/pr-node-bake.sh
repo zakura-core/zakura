@@ -211,8 +211,12 @@ TOML
     echo "approach sync exited unexpectedly with status $ZAKURAD_STATUS" >&2
     exit "$ZAKURAD_STATUS"
   fi
+  cat > /root/inspect-approach.toml <<TOML
+[state]
+storage_mode = "pruned"
+TOML
   VERIFIED_APPROACH_H=$(
-    /root/cargo-target/release/zakurad tip-height \
+    /root/cargo-target/release/zakurad -c /root/inspect-approach.toml tip-height \
       --cache-dir "$APPROACH_MNT/tip" \
       --network Mainnet 2>/dev/null |
       awk '/^[0-9]+$/ { height=$1 } END { print height }'

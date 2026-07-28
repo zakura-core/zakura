@@ -151,8 +151,12 @@ if [ "$MODE" = "pre-checkpoint" ]; then
     --required-finalized-at-least "$MAX_CKPT"
     --require-vct-fast-blocks
   )
+  cat > /root/tip-height.toml <<TOML
+[state]
+storage_mode = "$STORAGE_MODE"
+TOML
   TIP_OUTPUT=$(
-    /root/cargo-target/release/zakurad tip-height \
+    /root/cargo-target/release/zakurad -c /root/tip-height.toml tip-height \
       --cache-dir "$STATE_CACHE_DIR" \
       --network "$NET_TOML" 2>&1
   ) || {

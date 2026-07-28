@@ -67,12 +67,21 @@ const PEER_CACHE_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// flooding the test runtime with hundreds of immediate fake handshakes.
 const CRAWLER_MANY_PEER_LIMIT_FOR_TESTS: usize = 15;
 
+/// The peer set target size used by the multi-peer listener tests.
+///
+/// The default target size would need hundreds of real TCP connections to go
+/// over the inbound limit, which is too slow and too resource-hungry for a unit
+/// test. The default limit arithmetic is covered by the `zakura_network::config`
+/// tests instead.
+const LISTENER_MANY_PEER_TARGET_SIZE_FOR_TESTS: usize = 10;
+
 /// A small peer target that keeps replenishment race tests fast.
 const CRAWLER_REPLENISHMENT_TARGET_SIZE_FOR_TESTS: usize = 10;
 
 /// The outbound connection limit used by replenishment race tests.
 const CRAWLER_REPLENISHMENT_OUTBOUND_LIMIT_FOR_TESTS: usize =
-    CRAWLER_REPLENISHMENT_TARGET_SIZE_FOR_TESTS * constants::OUTBOUND_PEER_LIMIT_MULTIPLIER;
+    CRAWLER_REPLENISHMENT_TARGET_SIZE_FOR_TESTS * constants::OUTBOUND_PEER_LIMIT_MULTIPLIER
+        / constants::OUTBOUND_PEER_LIMIT_DIVISOR;
 
 /// The outbound connection target used by replenishment race tests.
 const CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS: usize =
@@ -1196,16 +1205,20 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
             }
         });
 
+    // The smallest peer set target size that still leaves public inbound slots
+    // next to the reserved zcashd-compat slot.
     let mut config = Config {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
-        peerset_initial_target_size: 2,
+        peerset_initial_target_size: 1,
         max_connections_per_ip: usize::MAX,
         ..Config::default()
     };
+    let public_inbound_limit = config.peerset_inbound_connection_limit() - 1;
     let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
     config.listen_addr = listen_addr;
 
-    let (peerset_tx, mut peerset_rx) = mpsc::channel::<DiscoveredPeer>(4);
+    let (peerset_tx, mut peerset_rx) =
+        mpsc::channel::<DiscoveredPeer>(config.peerset_inbound_connection_limit() * 2);
     let bans = BannedIps::default();
 
     let listen_fut = accept_inbound_connections(
@@ -1219,7 +1232,12 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
     );
     let listen_task_handle = tokio::spawn(listen_fut);
 
-    let public_connection = connect_from(public_ip, listen_addr).await;
+    // Fill every public slot, then offer one more connection of each kind than
+    // the listener can accept.
+    let mut public_connections = Vec::new();
+    for _ in 0..public_inbound_limit {
+        public_connections.push(connect_from(public_ip, listen_addr).await);
+    }
     let rejected_public_connection = connect_from(public_ip, listen_addr).await;
     let zcashd_compat_connection = connect_from(zcashd_compat_ip, listen_addr).await;
     let rejected_zcashd_compat_connection = connect_from(zcashd_compat_ip, listen_addr).await;
@@ -1240,8 +1258,8 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
     );
     assert_eq!(
         accepted_ips.iter().filter(|ip| **ip == public_ip).count(),
-        1,
-        "ordinary inbound peers should only use the public slot"
+        public_inbound_limit,
+        "ordinary inbound peers should only use the public slots"
     );
     assert_eq!(
         accepted_ips
@@ -1252,7 +1270,7 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
         "the canonically matched zcashd-compat peer should use the reserved slot"
     );
 
-    std::mem::drop(public_connection);
+    std::mem::drop(public_connections);
     std::mem::drop(rejected_public_connection);
     std::mem::drop(zcashd_compat_connection);
     std::mem::drop(rejected_zcashd_compat_connection);
@@ -1539,9 +1557,9 @@ async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
     std::mem::drop(banned_connection);
 }
 
-/// Test the listener with the default inbound peer limit, and a handshaker that always errors.
+/// Test the listener with a multi-peer inbound limit, and a handshaker that always errors.
 #[tokio::test]
-async fn listener_peer_limit_default_handshake_error() {
+async fn listener_peer_limit_many_handshake_error() {
     let _init_guard = zakura_test::init();
 
     // This test requires an IPv4 network stack with 127.0.0.1 as localhost.
@@ -1552,8 +1570,12 @@ async fn listener_peer_limit_default_handshake_error() {
     let error_inbound_handshaker =
         service_fn(|_| async { Err("test inbound handshaker always returns errors".into()) });
 
-    let (_config, discovered_peers) =
-        spawn_inbound_listener_with_peer_limit(None, None, error_inbound_handshaker).await;
+    let (_config, discovered_peers) = spawn_inbound_listener_with_peer_limit(
+        LISTENER_MANY_PEER_TARGET_SIZE_FOR_TESTS,
+        None,
+        error_inbound_handshaker,
+    )
+    .await;
 
     assert!(
         discovered_peers.is_empty(),
@@ -1561,14 +1583,14 @@ async fn listener_peer_limit_default_handshake_error() {
     );
 }
 
-/// Test the listener with the default inbound peer limit,
+/// Test the listener with a multi-peer inbound limit,
 /// and a handshaker that returns success then disconnects the peer.
 ///
 /// TODO: tweak the crawler timeouts and rate-limits so we get over the actual limit on macOS
 ///       (currently, getting over the limit can take 30 seconds or more)
 #[cfg(not(target_os = "macos"))]
 #[tokio::test]
-async fn listener_peer_limit_default_handshake_ok_then_drop() {
+async fn listener_peer_limit_many_handshake_ok_then_drop() {
     let _init_guard = zakura_test::init();
 
     // This test requires an IPv4 network stack with 127.0.0.1 as localhost.
@@ -1597,7 +1619,7 @@ async fn listener_peer_limit_default_handshake_ok_then_drop() {
         });
 
     let (config, discovered_peers) = spawn_inbound_listener_with_peer_limit(
-        None,
+        LISTENER_MANY_PEER_TARGET_SIZE_FOR_TESTS,
         usize::MAX,
         success_disconnect_inbound_handshaker,
     )
@@ -1613,10 +1635,10 @@ async fn listener_peer_limit_default_handshake_ok_then_drop() {
     );
 }
 
-/// Test the listener with the default inbound peer limit,
+/// Test the listener with a multi-peer inbound limit,
 /// and a handshaker that returns success then holds the peer open.
 #[tokio::test]
-async fn listener_peer_limit_default_handshake_ok_stay_open() {
+async fn listener_peer_limit_many_handshake_ok_stay_open() {
     let _init_guard = zakura_test::init();
 
     // This test requires an IPv4 network stack with 127.0.0.1 as localhost.
@@ -1647,9 +1669,12 @@ async fn listener_peer_limit_default_handshake_ok_stay_open() {
             }
         });
 
-    let (config, discovered_peers) =
-        spawn_inbound_listener_with_peer_limit(None, None, success_stay_open_inbound_handshaker)
-            .await;
+    let (config, discovered_peers) = spawn_inbound_listener_with_peer_limit(
+        LISTENER_MANY_PEER_TARGET_SIZE_FOR_TESTS,
+        None,
+        success_stay_open_inbound_handshaker,
+    )
+    .await;
 
     let peer_change_count = discovered_peers.len();
 

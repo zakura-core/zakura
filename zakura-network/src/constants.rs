@@ -37,7 +37,8 @@ use zakura_chain::{
 /// (This is similar to `zcashd`'s default inbound limit.)
 ///
 /// The outbound limit is:
-/// `crate::Config::peerset_initial_target_size * OUTBOUND_PEER_LIMIT_MULTIPLIER`.
+/// `crate::Config::peerset_initial_target_size * OUTBOUND_PEER_LIMIT_MULTIPLIER
+/// / OUTBOUND_PEER_LIMIT_DIVISOR`.
 /// (This is a bit larger than `zcashd`'s default outbound limit.)
 ///
 /// # Security
@@ -46,19 +47,31 @@ use zakura_chain::{
 /// But some peers only make outbound connections, because they are behind a firewall,
 /// or their lister port address is misconfigured.
 ///
-/// This fork prioritizes fast outbound sync over inbound-serving capacity.
-/// Inbound peers do not help us download the chain, and they can add handshake
-/// churn and CPU load, so the inbound limit is capped at the peer set target
-/// size. This also keeps a majority of connections in the outbound set chosen
-/// from our address book.
+/// So the inbound limit is larger than the outbound limit, to make sure that
+/// peers which can not accept inbound connections can still reach these nodes.
+/// A node which only dials out is useless to the rest of the network, and
+/// restricting inbound capacity also shrinks the address book coverage other
+/// nodes can build from us.
 ///
-/// Raise this again if these nodes need to prioritize public inbound serving.
-pub const INBOUND_PEER_LIMIT_MULTIPLIER: usize = 1;
+/// This means that an attacker can supply a large fraction of a node's inbound
+/// peers. Outbound peers are chosen from the address book, so the outbound set
+/// stays under this node's control.
+pub const INBOUND_PEER_LIMIT_MULTIPLIER: usize = 3;
 
 /// A multiplier used to calculate the outbound connection limit for the peer set,
 ///
 /// See [`INBOUND_PEER_LIMIT_MULTIPLIER`] for details.
 pub const OUTBOUND_PEER_LIMIT_MULTIPLIER: usize = 3;
+
+/// A divisor used to calculate the outbound connection limit for the peer set,
+///
+/// With the default peer set target size, this allows one and a half times the
+/// target size in outbound connections, which is enough headroom to replace
+/// stalled or slow sync peers without opening connections this node does not
+/// need.
+///
+/// See [`INBOUND_PEER_LIMIT_MULTIPLIER`] for details.
+pub const OUTBOUND_PEER_LIMIT_DIVISOR: usize = 2;
 
 /// The default maximum number of legacy TCP peer connections Zebra will keep
 /// for a given IP address before it drops any additional peer connections with
@@ -170,10 +183,11 @@ pub const PEER_DISK_CACHE_UPDATE_INTERVAL: Duration = Duration::from_secs(5 * 60
 
 /// The maximum number of addresses in the peer disk cache.
 ///
-/// This is chosen to be less than the number of active peers,
-/// and approximately the same as the number of seed peers returned by DNS.
+/// This is chosen to be similar to the number of connections these nodes keep,
+/// so a restarted node has enough dialable candidates to refill its peer set
+/// before the DNS seeders and the address crawler catch up.
 /// It is a tradeoff between fingerprinting attacks, DNS pollution risk, and cache pollution risk.
-pub const MAX_PEER_DISK_CACHE_SIZE: usize = 75;
+pub const MAX_PEER_DISK_CACHE_SIZE: usize = 300;
 
 /// The maximum duration since a peer was last seen to consider it reachable.
 ///

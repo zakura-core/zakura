@@ -34,7 +34,7 @@ use crate::{
     constants::{
         DEFAULT_CRAWL_NEW_PEER_INTERVAL, DEFAULT_MAX_CONNS_PER_IP,
         DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT, INBOUND_PEER_LIMIT_MULTIPLIER,
-        MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_MULTIPLIER,
+        MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     protocol::external::{canonical_peer_addr, canonical_socket_addr},
     zakura::ZakuraConfig,
@@ -373,13 +373,14 @@ impl Config {
     /// Therefore, a maximum-sized block can take up to 2 seconds to
     /// download. So the initial outbound peer set adds up to 100 seconds worth
     /// of blocks to the queue. If Zakura has reached its outbound peer limit,
-    /// that adds an extra 200 seconds of queued blocks.
+    /// that adds an extra 100 seconds of queued blocks.
     ///
     /// But the peer set for slow nodes is typically much smaller, due to
     /// the handshake RTT timeout. And Zakura responds to inbound request
     /// overloads by dropping peer connections.
     pub fn peerset_outbound_connection_limit(&self) -> usize {
         self.peerset_initial_target_size * OUTBOUND_PEER_LIMIT_MULTIPLIER
+            / OUTBOUND_PEER_LIMIT_DIVISOR
     }
 
     /// The maximum number of inbound connections that Zakura will accept at the same time.

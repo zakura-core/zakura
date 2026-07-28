@@ -10,7 +10,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -380,6 +380,7 @@ where
             peerset_tx,
             active_outbound_connections,
             address_book_updater,
+            Arc::new(AtomicBool::new(false)),
         );
         task_handles.push(tokio::spawn(crawl_fut.in_current_span()));
     } else {
@@ -984,11 +985,12 @@ enum CrawlerAction {
     TimerCrawl { tick: Instant },
     /// Clear a finished successful handshake.
     HandshakeFinished,
-    /// Clear a finished failed handshake that restored demand to the channel.
+    /// Clear a finished failed handshake.
     ///
     /// When `restore_replenishment_demand` is set, credits one unit of remaining
-    /// replenishment demand so a restored `MorePeers` message does not
-    /// permanently consume the timer-based budget.
+    /// replenishment demand. That flag is only set when this attempt both spent
+    /// timer budget and successfully restored `MorePeers` to the demand channel,
+    /// so a full channel cannot credit budget without a matching later decrement.
     HandshakeFailed {
         restore_replenishment_demand: bool,
     },
@@ -1033,9 +1035,10 @@ fn outbound_peer_replenishment_demand(
 /// of the configured outbound connection limit.
 ///
 /// If a handshake fails, restore the unused demand signal by sending it to
-/// `demand_tx`, and credit one unit of remaining replenishment demand when that
-/// attempt consumed timer budget so the restored signal does not permanently
-/// double-spend the budget.
+/// `demand_tx`. When that restore succeeds and the attempt consumed timer
+/// budget, credit one replenishment unit so the restored signal does not
+/// permanently double-spend the budget. A full demand channel does not credit,
+/// because there will be no later channel-driven decrement.
 ///
 /// The crawler terminates when `candidates.update()` or `peerset_tx` returns a
 /// permanent internal error. Transient errors and individual peer errors should
@@ -1054,6 +1057,7 @@ fn outbound_peer_replenishment_demand(
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
+        force_failed_dial_demand_restore_full,
     ),
     fields(
         new_peer_interval = ?config.crawl_new_peer_interval,
@@ -1068,6 +1072,9 @@ async fn crawl_and_dial<C, S>(
     peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     mut active_outbound_connections: ActiveConnectionCounter,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    // When true, failed dials report a full demand channel so tests can cover
+    // unrestored-demand credit gating without racing the crawler select loop.
+    force_failed_dial_demand_restore_full: Arc<AtomicBool>,
 ) -> Result<(), BoxError>
 where
     C: Service<
@@ -1201,6 +1208,8 @@ where
                 let address_book_updater = address_book_updater.clone();
                 let demand_tx = demand_tx.clone();
                 let expose_peer_addresses = config.expose_peer_addresses;
+                let force_failed_dial_demand_restore_full =
+                    force_failed_dial_demand_restore_full.clone();
 
                 // Increment the connection count before we spawn the connection.
                 let outbound_connection_tracker = active_outbound_connections.track_connection();
@@ -1236,12 +1245,14 @@ where
                                 address_book_updater,
                                 demand_tx,
                                 expose_peer_addresses,
+                                force_failed_dial_demand_restore_full,
                             )
                             .await?
                             {
                                 DialOutcome::Connected => Ok(HandshakeFinished),
-                                DialOutcome::Failed => Ok(HandshakeFailed {
-                                    restore_replenishment_demand,
+                                DialOutcome::Failed { demand_restored } => Ok(HandshakeFailed {
+                                    restore_replenishment_demand: restore_replenishment_demand
+                                        && demand_restored,
                                 }),
                             }
                         } else {
@@ -1288,8 +1299,9 @@ where
             Ok(HandshakeFailed {
                 restore_replenishment_demand,
             }) => {
-                // dial() restored MorePeers to demand_rx when possible. Credit
-                // only when this attempt consumed timer replenishment demand.
+                // Credit only when this attempt spent timer budget and dial()
+                // successfully restored MorePeers. A full channel must not
+                // credit, or remaining would rise without a matching decrement.
                 if restore_replenishment_demand {
                     let _ = remaining_replenishment_demand.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1382,8 +1394,31 @@ where
 enum DialOutcome {
     /// The handshake succeeded and the peer was sent to the peer set.
     Connected,
-    /// The handshake failed; demand was restored to `demand_tx` when possible.
-    Failed,
+    /// The handshake failed.
+    ///
+    /// `demand_restored` is true only when `MorePeers` was successfully
+    /// re-queued on the demand channel.
+    Failed { demand_restored: bool },
+}
+
+/// Try to restore demand after a failed dial.
+///
+/// Returns whether `MorePeers` was queued. A full channel returns `Ok(false)`
+/// so callers do not credit replenishment budget without a later decrement.
+fn try_restore_demand_after_failed_dial(
+    demand_tx: &mut futures::channel::mpsc::Sender<MorePeers>,
+    force_failed_dial_demand_restore_full: &AtomicBool,
+) -> Result<bool, BoxError> {
+    // Tests can force a full-channel outcome without racing the crawler select.
+    if force_failed_dial_demand_restore_full.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+
+    match demand_tx.try_send(MorePeers) {
+        Ok(()) => Ok(true),
+        Err(send_error) if send_error.is_disconnected() => Err(send_error.into()),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Try to connect to `candidate` using `outbound_connector`.
@@ -1391,7 +1426,7 @@ enum DialOutcome {
 ///
 /// On success, sends peers to `peerset_tx`.
 /// On failure, marks the peer as failed in the address book,
-/// then re-adds demand to `demand_tx`.
+/// then re-adds demand to `demand_tx` when the channel has capacity.
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip(
     candidate,
@@ -1402,6 +1437,7 @@ enum DialOutcome {
     address_book_updater,
     demand_tx,
     expose_peer_addresses,
+    force_failed_dial_demand_restore_full,
 ), fields(peer = %candidate.addr.addr_label(expose_peer_addresses)))]
 async fn dial<C>(
     candidate: MetaAddr,
@@ -1412,6 +1448,7 @@ async fn dial<C>(
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
     mut demand_tx: futures::channel::mpsc::Sender<MorePeers>,
     expose_peer_addresses: bool,
+    force_failed_dial_demand_restore_full: Arc<AtomicBool>,
 ) -> Result<DialOutcome, BoxError>
 where
     C: Service<
@@ -1480,19 +1517,17 @@ where
             }
 
             // The demand signal that was taken out of the queue to attempt to connect to the
-            // failed candidate never turned into a connection, so add it back.
+            // failed candidate never turned into a connection, so add it back when possible.
             //
             // # Security
             //
             // Handshake failures are rate-limited by peer attempt timeouts.
-            if let Err(send_error) = demand_tx.try_send(MorePeers) {
-                if send_error.is_disconnected() {
-                    // Zakura's peer set is shutting down.
-                    return Err(send_error.into());
-                }
-            }
+            let demand_restored = try_restore_demand_after_failed_dial(
+                &mut demand_tx,
+                &force_failed_dial_demand_restore_full,
+            )?;
 
-            Ok(DialOutcome::Failed)
+            Ok(DialOutcome::Failed { demand_restored })
         }
     }
 }

@@ -16,7 +16,7 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -600,6 +600,7 @@ async fn crawler_failed_dials_do_not_shrink_replenishment_budget() {
         constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL,
         ReplenishmentCrawlerOptions {
             fail_first_dials: FAILED_DIALS,
+            ..ReplenishmentCrawlerOptions::default()
         },
     )
     .await;
@@ -611,6 +612,85 @@ async fn crawler_failed_dials_do_not_shrink_replenishment_budget() {
             CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS + FAILED_DIALS,
         )
         .await;
+}
+
+/// When demand cannot be restored (full channel), failed dials must not credit
+/// replenishment budget. Crediting without a queued `MorePeers` would leave
+/// `remaining` unchanged and keep local replenishment dialing past the target.
+#[tokio::test(start_paused = true)]
+async fn crawler_unrestored_failed_dials_do_not_credit_replenishment() {
+    let mut harness = spawn_replenishment_crawler_with(
+        0,
+        0,
+        constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL,
+        ReplenishmentCrawlerOptions {
+            fail_first_dials: CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS,
+            force_failed_dial_demand_restore_full: true,
+        },
+    )
+    .await;
+
+    harness.wait_for_crawl_start().await;
+    harness.release_crawl();
+    harness
+        .assert_connection_attempts(CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS)
+        .await;
+}
+
+#[test]
+fn try_restore_demand_after_failed_dial_reports_full_channel() {
+    // futures::mpsc capacity is buffer + number of senders, so buffer 0 still
+    // has one sender slot. Filling that slot makes the next try_send Full.
+    let (mut demand_tx, demand_rx) = mpsc::channel::<MorePeers>(0);
+    demand_tx
+        .try_send(MorePeers)
+        .expect("test demand channel accepts the sender's reserved slot");
+
+    let demand_restored = super::super::try_restore_demand_after_failed_dial(
+        &mut demand_tx,
+        &AtomicBool::new(false),
+    )
+    .expect("full channel is not a fatal restore error");
+    assert!(
+        !demand_restored,
+        "a full demand channel must not report a successful restore"
+    );
+
+    std::mem::drop(demand_rx);
+}
+
+#[test]
+fn try_restore_demand_after_failed_dial_reports_success() {
+    let (mut demand_tx, demand_rx) = mpsc::channel::<MorePeers>(1);
+
+    let demand_restored = super::super::try_restore_demand_after_failed_dial(
+        &mut demand_tx,
+        &AtomicBool::new(false),
+    )
+    .expect("empty channel accepts restored demand");
+    assert!(
+        demand_restored,
+        "an empty demand channel must report a successful restore"
+    );
+
+    std::mem::drop(demand_rx);
+}
+
+#[test]
+fn try_restore_demand_after_failed_dial_honors_force_full() {
+    let (mut demand_tx, demand_rx) = mpsc::channel::<MorePeers>(1);
+
+    let demand_restored = super::super::try_restore_demand_after_failed_dial(
+        &mut demand_tx,
+        &AtomicBool::new(true),
+    )
+    .expect("forced full channel is not a fatal restore error");
+    assert!(
+        !demand_restored,
+        "forced full-channel mode must not report a successful restore"
+    );
+
+    std::mem::drop(demand_rx);
 }
 
 /// Test the crawler with an outbound peer limit of zero peers, and a connector that panics.
@@ -2145,6 +2225,8 @@ impl ReplenishmentCrawlerTestHarness {
 struct ReplenishmentCrawlerOptions {
     /// Fail the first N outbound dials before succeeding.
     fail_first_dials: usize,
+    /// Report failed-dial demand restores as full-channel misses.
+    force_failed_dial_demand_restore_full: bool,
 }
 
 async fn spawn_replenishment_crawler(
@@ -2292,6 +2374,7 @@ async fn spawn_replenishment_crawler_with(
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
+        Arc::new(AtomicBool::new(options.force_failed_dial_demand_restore_full)),
     ));
 
     ReplenishmentCrawlerTestHarness {
@@ -2483,6 +2566,7 @@ where
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
+        Arc::new(AtomicBool::new(false)),
     );
     let crawl_task_handle = tokio::spawn(crawl_fut);
 

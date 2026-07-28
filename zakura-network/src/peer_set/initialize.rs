@@ -978,9 +978,7 @@ enum CrawlerAction {
     /// `restore_replenishment_demand` is set when this action consumed a unit of
     /// timer replenishment demand. Failed dials that restore `MorePeers` must
     /// credit that unit so the retry does not permanently double-spend the budget.
-    DemandHandshakeOrCrawl {
-        restore_replenishment_demand: bool,
-    },
+    DemandHandshakeOrCrawl { restore_replenishment_demand: bool },
     /// Crawl existing peers for more peers in response to a timer `tick`.
     TimerCrawl { tick: Instant },
     /// Clear a finished successful handshake.
@@ -991,9 +989,7 @@ enum CrawlerAction {
     /// replenishment demand. That flag is only set when this attempt both spent
     /// timer budget and successfully restored `MorePeers` to the demand channel,
     /// so a full channel cannot credit budget without a matching later decrement.
-    HandshakeFailed {
-        restore_replenishment_demand: bool,
-    },
+    HandshakeFailed { restore_replenishment_demand: bool },
     /// Clear a finished demand crawl (DemandHandshakeOrCrawl with no peers).
     DemandCrawlFinished,
     /// Clear a finished TimerCrawl.

@@ -646,11 +646,9 @@ fn try_restore_demand_after_failed_dial_reports_full_channel() {
         .try_send(MorePeers)
         .expect("test demand channel accepts the sender's reserved slot");
 
-    let demand_restored = super::super::try_restore_demand_after_failed_dial(
-        &mut demand_tx,
-        &AtomicBool::new(false),
-    )
-    .expect("full channel is not a fatal restore error");
+    let demand_restored =
+        super::super::try_restore_demand_after_failed_dial(&mut demand_tx, &AtomicBool::new(false))
+            .expect("full channel is not a fatal restore error");
     assert!(
         !demand_restored,
         "a full demand channel must not report a successful restore"
@@ -663,11 +661,9 @@ fn try_restore_demand_after_failed_dial_reports_full_channel() {
 fn try_restore_demand_after_failed_dial_reports_success() {
     let (mut demand_tx, demand_rx) = mpsc::channel::<MorePeers>(1);
 
-    let demand_restored = super::super::try_restore_demand_after_failed_dial(
-        &mut demand_tx,
-        &AtomicBool::new(false),
-    )
-    .expect("empty channel accepts restored demand");
+    let demand_restored =
+        super::super::try_restore_demand_after_failed_dial(&mut demand_tx, &AtomicBool::new(false))
+            .expect("empty channel accepts restored demand");
     assert!(
         demand_restored,
         "an empty demand channel must report a successful restore"
@@ -680,11 +676,9 @@ fn try_restore_demand_after_failed_dial_reports_success() {
 fn try_restore_demand_after_failed_dial_honors_force_full() {
     let (mut demand_tx, demand_rx) = mpsc::channel::<MorePeers>(1);
 
-    let demand_restored = super::super::try_restore_demand_after_failed_dial(
-        &mut demand_tx,
-        &AtomicBool::new(true),
-    )
-    .expect("forced full channel is not a fatal restore error");
+    let demand_restored =
+        super::super::try_restore_demand_after_failed_dial(&mut demand_tx, &AtomicBool::new(true))
+            .expect("forced full channel is not a fatal restore error");
     assert!(
         !demand_restored,
         "forced full-channel mode must not report a successful restore"
@@ -2374,7 +2368,9 @@ async fn spawn_replenishment_crawler_with(
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
-        Arc::new(AtomicBool::new(options.force_failed_dial_demand_restore_full)),
+        Arc::new(AtomicBool::new(
+            options.force_failed_dial_demand_restore_full,
+        )),
     ));
 
     ReplenishmentCrawlerTestHarness {

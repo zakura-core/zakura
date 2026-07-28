@@ -165,6 +165,7 @@ jobs:
           MAINNET_VOL_ID: ${{ steps.droplet.outputs.mainnet_vol_id }}
           TESTNET_VOL_ID: ${{ steps.droplet.outputs.testnet_vol_id }}
           APPROACH_VOL_ID: ${{ steps.droplet.outputs.approach_vol_id }}
+          REBUILD_APPROACH_FROM_SANDBLAST: ${{ inputs.rebuild_approach_from_sandblast || false }}
         run: |
           set -euo pipefail
           # The -h<height> suffix lets the pr-node pre-checkpoint mode pick the
@@ -179,8 +180,6 @@ jobs:
             }
             printf '%s\n' "$height"
           }
-          MAINNET_H=$(fetch_height /root/mainnet-state-height)
-          TESTNET_H=$(fetch_height /root/testnet-state-height)
           APPROACH_H=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
             "root@${IP}" "cat /root/mainnet-approach-height 2>/dev/null" || true)
           if [ -n "$APPROACH_H" ] && [[ ! "$APPROACH_H" =~ ^[0-9]+$ ]]; then
@@ -188,10 +187,14 @@ jobs:
             exit 1
           fi
           STAMP=$(date -u +%Y%m%d-%H%M)
-          doctl compute volume snapshot "${MAINNET_VOL_ID}" \
-            --snapshot-name "zakura-pr-state-mainnet-${STAMP}${MAINNET_H:+-h${MAINNET_H}}"
-          doctl compute volume snapshot "${TESTNET_VOL_ID}" \
-            --snapshot-name "zakura-pr-state-testnet-${STAMP}${TESTNET_H:+-h${TESTNET_H}}"
+          if [ "$REBUILD_APPROACH_FROM_SANDBLAST" != "true" ]; then
+            MAINNET_H=$(fetch_height /root/mainnet-state-height)
+            TESTNET_H=$(fetch_height /root/testnet-state-height)
+            doctl compute volume snapshot "${MAINNET_VOL_ID}" \
+              --snapshot-name "zakura-pr-state-mainnet-${STAMP}-h${MAINNET_H}"
+            doctl compute volume snapshot "${TESTNET_VOL_ID}" \
+              --snapshot-name "zakura-pr-state-testnet-${STAMP}-h${TESTNET_H}"
+          fi
           if [ -n "$APPROACH_H" ]; then
             doctl compute volume snapshot "${APPROACH_VOL_ID}" \
               --snapshot-name "zakura-vct-approach-mainnet-${STAMP}-h${APPROACH_H}"
@@ -200,6 +203,7 @@ jobs:
           fi
 
       - name: Snapshot droplet image
+        if: ${{ !inputs.rebuild_approach_from_sandblast }}
         env:
           DROPLET_ID: ${{ steps.droplet.outputs.id }}
         run: |

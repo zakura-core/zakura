@@ -80,18 +80,20 @@ cargo build --release --locked -p zakura
 KRESKO_BAKE_REPO="${KRESKO_BAKE_REPO:-https://github.com/valargroup/kresko.git}"
 KRESKO_BAKE_REF="${KRESKO_BAKE_REF:-main}"
 
-if [ ! -d /root/kresko ]; then
-  git clone "${KRESKO_BAKE_REPO}" /root/kresko
+if [ "$REBUILD_APPROACH_FROM_SANDBLAST" != "true" ]; then
+  if [ ! -d /root/kresko ]; then
+    git clone "${KRESKO_BAKE_REPO}" /root/kresko
+  fi
+  git -C /root/kresko fetch --no-tags origin "${KRESKO_BAKE_REF}"
+  git -C /root/kresko checkout --detach FETCH_HEAD
+  # Own target dir, for the same reasons as mempool-load-run.sh: the binary
+  # must land where that script looks for it, and kresko must not share a
+  # cargo cache with zakurad.
+  ( cd /root/kresko && CARGO_TARGET_DIR=/root/kresko/target cargo build --release )
+  test -x /root/kresko/target/release/kresko
+  git -C /root/kresko rev-parse HEAD > /root/kresko/.baked-ref
+  echo "baked kresko at $(cat /root/kresko/.baked-ref)"
 fi
-git -C /root/kresko fetch --no-tags origin "${KRESKO_BAKE_REF}"
-git -C /root/kresko checkout --detach FETCH_HEAD
-# Own target dir, for the same reasons as mempool-load-run.sh: the binary
-# must land where that script looks for it, and kresko must not share a
-# cargo cache with zakurad.
-( cd /root/kresko && CARGO_TARGET_DIR=/root/kresko/target cargo build --release )
-test -x /root/kresko/target/release/kresko
-git -C /root/kresko rev-parse HEAD > /root/kresko/.baked-ref
-echo "baked kresko at $(cat /root/kresko/.baked-ref)"
 
 # --------------------------------------------------------------------------- #
 # Loopback SSH identity: deploy.py drives the node over root@localhost
@@ -159,37 +161,19 @@ mount_volume "$MAINNET_VOLUME_NAME" "$MAINNET_MNT"
 mount_volume "$TESTNET_VOLUME_NAME" "$TESTNET_MNT"
 mount_volume "$APPROACH_VOLUME_NAME" "$APPROACH_MNT"
 
-# Mainnet tip: resolve the daily pruned snapshot through its latest.json pointer.
-TIP_META=$(curl -fsSL --retry 3 "$TIP_MAINNET_LATEST_JSON")
-TIP_URL=$(echo "$TIP_META" | jq -er '.url')
-TIP_SHA=$(echo "$TIP_META" | jq -er '.sha256')
-echo "Mainnet tip: $(echo "$TIP_META" | jq -r '"\(.filename) height=\(.height) db=\(.db_format_version)"')"
-# The workflow embeds this height in the volume snapshot name, so the pr-node
-# pre-checkpoint mode can pick the newest snapshot below a branch's checkpoint.
-echo "$TIP_META" | jq -er '.height | select(type == "number" and floor == .)' \
-  > /root/mainnet-state-height
-fetch_state "$TIP_URL" "$TIP_SHA" "$MAINNET_MNT/tip" mainnet
-
 # Mainnet sandblast: pinned archive just before the 2022 spam region.
 fetch_state "$SANDBLAST_URL" "$SANDBLAST_SHA256" "$MAINNET_MNT/sandblast" mainnet
 
 # Mainnet VCT approach state. Existing pruned snapshots cannot be rolled back
 # reliably because pruning removes transaction data rollback-state needs.
 # Build the rare handoff fixture forward from the retained archive instead.
-MAINNET_H=$(echo "$TIP_META" | jq -er '.height')
 MAX_CKPT=$(tail -1 zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
 [[ "$MAX_CKPT" =~ ^[0-9]+$ ]] || {
   echo "could not determine Mainnet max checkpoint" >&2
   exit 1
 }
 APPROACH_H=$((MAX_CKPT - 100))
-if [ "$MAINNET_H" -lt "$MAX_CKPT" ]; then
-  mkdir -p "$APPROACH_MNT/tip"
-  cp -a "$MAINNET_MNT/tip/." "$APPROACH_MNT/tip/"
-  rm -rf "$APPROACH_MNT/tip/non_finalized_state"
-  echo "$MAINNET_H" > /root/mainnet-approach-height
-  echo "Mainnet VCT approach state copied at height=$MAINNET_H handoff=$MAX_CKPT"
-elif [ "$REBUILD_APPROACH_FROM_SANDBLAST" = "true" ]; then
+if [ "$REBUILD_APPROACH_FROM_SANDBLAST" = "true" ]; then
   mkdir -p "$APPROACH_MNT/tip"
   cp -a "$MAINNET_MNT/sandblast/." "$APPROACH_MNT/tip/"
   find "$APPROACH_MNT/tip" -name LOCK -delete
@@ -216,8 +200,17 @@ endpoint_addr = "127.0.0.1:9999"
 filter = "info"
 TOML
   echo "Syncing Mainnet VCT approach state to height=$APPROACH_H handoff=$MAX_CKPT"
+  set +e
   timeout 4h /root/cargo-target/release/zakurad -c /root/approach.toml start \
     2>&1 | tee /root/approach-sync.log
+  ZAKURAD_STATUS=${PIPESTATUS[0]}
+  set -e
+  if [ "$ZAKURAD_STATUS" -ne 0 ] &&
+    ! grep -q "stopping at configured height.*height=Height($APPROACH_H)" /root/approach-sync.log
+  then
+    echo "approach sync exited unexpectedly with status $ZAKURAD_STATUS" >&2
+    exit "$ZAKURAD_STATUS"
+  fi
   VERIFIED_APPROACH_H=$(
     /root/cargo-target/release/zakurad tip-height \
       --cache-dir "$APPROACH_MNT/tip" \
@@ -231,23 +224,32 @@ TOML
   echo "$VERIFIED_APPROACH_H" > /root/mainnet-approach-height
 else
   echo "Keeping the retained approach snapshot; dispatch with rebuild_approach_from_sandblast=true to replace it"
-fi
 
-# Testnet tip: newest enabled pruned entry from the snapshots site metadata.
-TESTNET_META=$(curl -fsSL --retry 3 "$TESTNET_SNAPSHOTS_BASE/snapshots.json")
-ENTRY=$(echo "$TESTNET_META" | jq -er \
-  '[.snapshots[] | select(.enabled and .kind == "pruned")] | sort_by(.published) | last')
-[ "$ENTRY" != "null" ] || { echo "no enabled pruned testnet snapshot found" >&2; exit 1; }
-TN_FILE=$(echo "$ENTRY" | jq -er '.file')
-TN_SHA=$(echo "$ENTRY" | jq -er '.sha256')
-TN_BASE=$(echo "$TESTNET_META" | jq -r '.siteBaseUrl // empty')
-echo "Testnet tip: $(echo "$ENTRY" | jq -r '"\(.file) height=\(.height) db=\(.dbFormat)"')"
-echo "$ENTRY" | jq -er '.height | select(type == "number" and floor == .)' \
-  > /root/testnet-state-height
-if [ -n "$TN_BASE" ] && curl -fsIL --retry 2 "${TN_BASE}/files/${TN_FILE}" >/dev/null 2>&1; then
-  fetch_state "${TN_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
-else
-  fetch_state "${TESTNET_SNAPSHOTS_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
+  # Mainnet tip: resolve the daily pruned snapshot through its latest.json pointer.
+  TIP_META=$(curl -fsSL --retry 3 "$TIP_MAINNET_LATEST_JSON")
+  TIP_URL=$(echo "$TIP_META" | jq -er '.url')
+  TIP_SHA=$(echo "$TIP_META" | jq -er '.sha256')
+  echo "Mainnet tip: $(echo "$TIP_META" | jq -r '"\(.filename) height=\(.height) db=\(.db_format_version)"')"
+  echo "$TIP_META" | jq -er '.height | select(type == "number" and floor == .)' \
+    > /root/mainnet-state-height
+  fetch_state "$TIP_URL" "$TIP_SHA" "$MAINNET_MNT/tip" mainnet
+
+  # Testnet tip: newest enabled pruned entry from the snapshots site metadata.
+  TESTNET_META=$(curl -fsSL --retry 3 "$TESTNET_SNAPSHOTS_BASE/snapshots.json")
+  ENTRY=$(echo "$TESTNET_META" | jq -er \
+    '[.snapshots[] | select(.enabled and .kind == "pruned")] | sort_by(.published) | last')
+  [ "$ENTRY" != "null" ] || { echo "no enabled pruned testnet snapshot found" >&2; exit 1; }
+  TN_FILE=$(echo "$ENTRY" | jq -er '.file')
+  TN_SHA=$(echo "$ENTRY" | jq -er '.sha256')
+  TN_BASE=$(echo "$TESTNET_META" | jq -r '.siteBaseUrl // empty')
+  echo "Testnet tip: $(echo "$ENTRY" | jq -r '"\(.file) height=\(.height) db=\(.dbFormat)"')"
+  echo "$ENTRY" | jq -er '.height | select(type == "number" and floor == .)' \
+    > /root/testnet-state-height
+  if [ -n "$TN_BASE" ] && curl -fsIL --retry 2 "${TN_BASE}/files/${TN_FILE}" >/dev/null 2>&1; then
+    fetch_state "${TN_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
+  else
+    fetch_state "${TESTNET_SNAPSHOTS_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
+  fi
 fi
 
 sync

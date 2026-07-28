@@ -8602,7 +8602,7 @@ checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 
 [[package]]
 name = "zakura"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "abscissa_core",
  "anyhow",
@@ -8692,7 +8692,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "bech32",
  "bitflags 2.13.0",
@@ -8825,7 +8825,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -8974,7 +8974,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "bincode",
  "chrono",

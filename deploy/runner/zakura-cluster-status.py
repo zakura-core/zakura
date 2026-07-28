@@ -716,6 +716,7 @@ class ClusterCollector:
             "generated_at": time.time(),
             "last_poll": last_poll,
             "stale_after": self.stale_after,
+            "network": self.network,
             "healthy": healthy,
             "total": len(rows),
             "upgrade": upgrade,
@@ -848,7 +849,7 @@ class ClusterCollector:
 
     def upgrade_estimate(self, now: float) -> dict:
         # A non-positive upgrade height means there is no pending activation to
-        # count down to (e.g. mainnet); the dashboard hides the upgrade cards.
+        # count down to; the dashboard hides the upgrade cards.
         if self.upgrade_height <= 0:
             return {"enabled": False}
 
@@ -933,7 +934,7 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Zakura Ironwood testnet cluster status">
+<meta name="description" content="Zakura Ironwood cluster status">
 <title>Zakura cluster status</title>
 <link rel="icon" href="https://avatars.githubusercontent.com/u/272444516?s=200&v=4" type="image/png">
 <style>
@@ -1244,7 +1245,7 @@ tbody tr:hover td { background: rgba(46, 42, 66, 0.35); }
     <div class="brand">
       <img src="https://avatars.githubusercontent.com/u/272444516?s=200&v=4" alt="Valar Group" class="brand-icon" width="44" height="44">
       <div class="brand-wordmark">
-        <p class="eyebrow">Zakura Ironwood testnet observability</p>
+        <p class="eyebrow" id="network-eyebrow">Zakura Ironwood observability</p>
         <h1>Zakura Cluster Status</h1>
       </div>
     </div>
@@ -1393,6 +1394,10 @@ async function tick() {
   document.getElementById('healthy-count').textContent = data.healthy + ' / ' + data.total;
   document.getElementById('last-poll').textContent = poll;
   document.getElementById('stale-window').textContent = Math.round(data.stale_after) + 's';
+  if (data.network) {
+    document.getElementById('network-eyebrow').textContent =
+      'Zakura Ironwood ' + data.network + ' observability';
+  }
   const upgrade = data.upgrade || {};
   const upgradeEnabled = upgrade.enabled !== false;
   document.querySelectorAll('.upgrade-card').forEach((card) => {
@@ -1594,7 +1599,7 @@ def main() -> None:
         "--upgrade-height",
         type=int,
         default=DEFAULT_UPGRADE_HEIGHT,
-        help="upgrade activation height to estimate; 0 hides the upgrade cards (e.g. mainnet)",
+        help="upgrade activation height to estimate; 0 hides the upgrade cards",
     )
     parser.add_argument(
         "--target-spacing",

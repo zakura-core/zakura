@@ -219,8 +219,10 @@ The workflow refreshes a fleet status dashboard on `us-east-0`:
 - install dir: `/opt/zakura-mainnet-dashboard`
 
 It is the same `zakura-cluster-status.py` as testnet, launched with
-`--upgrade-height 0`, which hides the upgrade-ETA cards (mainnet has no pending
-Zakura activation to count down to). Manual run:
+`--upgrade-height 3428143` for the Ironwood mainnet activation height. The ETA
+uses observed cluster block movement when enough samples are available,
+otherwise it falls back to `--target-spacing 75` (post-Blossom mainnet spacing).
+Manual run:
 
 ```bash
 python3 deploy/runner/zakura-cluster-status.py \
@@ -228,7 +230,8 @@ python3 deploy/runner/zakura-cluster-status.py \
   --host 0.0.0.0 \
   --port 8090 \
   --network mainnet \
-  --upgrade-height 0
+  --upgrade-height 3428143 \
+  --target-spacing 75
 ```
 
 The mainnet workflow also installs a Slack watchdog on `us-east-0`:

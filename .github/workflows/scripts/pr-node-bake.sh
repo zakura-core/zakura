@@ -11,9 +11,8 @@
 #                            reset token-free afterwards, nothing is baked
 #   MAINNET_VOLUME_NAME      DO volume that gets tip/ + sandblast/ mainnet state
 #   TESTNET_VOLUME_NAME      DO volume that gets tip/ testnet state
-#   APPROACH_VOLUME_NAME     DO volume rolled back to just below the VCT handoff
-#   APPROACH_SOURCE_VOLUME_NAME  optional older PR-state volume to roll back
-#   APPROACH_SOURCE_HEIGHT / APPROACH_SOURCE_DB_FORMAT  metadata for that volume
+#   APPROACH_VOLUME_NAME     DO volume synced to just below the VCT handoff
+#   REBUILD_APPROACH_FROM_SANDBLAST  one-time approach-state rebuild switch
 #   TIP_MAINNET_LATEST_JSON  latest.json pointer for the mainnet pruned tip
 #   SANDBLAST_URL            pinned pre-spam-region mainnet archive snapshot
 #   SANDBLAST_SHA256         its sha256
@@ -153,41 +152,17 @@ fetch_state() {
   echo "Restored $(ls -d "$dest"/state/v*/"$network")"
 }
 
-db_format_at_ref() {
-  git show "$1:zakura-state/src/constants.rs" | awk '
-    /^const DATABASE_FORMAT_VERSION:/ {
-      gsub(/;/, "", $NF); major = $NF
-    }
-    /^const DATABASE_FORMAT_MINOR_VERSION:/ {
-      gsub(/;/, "", $NF); minor = $NF
-    }
-    /^const DATABASE_FORMAT_PATCH_VERSION:/ {
-      gsub(/;/, "", $NF); patch = $NF
-    }
-    END {
-      if (major != "" && minor != "" && patch != "") {
-        printf "%s.%s.%s\n", major, minor, patch
-      }
-    }
-  '
-}
-
 MAINNET_MNT=/mnt/bake-mainnet
 TESTNET_MNT=/mnt/bake-testnet
 APPROACH_MNT=/mnt/bake-approach
-APPROACH_SOURCE_MNT=/mnt/bake-approach-source
 mount_volume "$MAINNET_VOLUME_NAME" "$MAINNET_MNT"
 mount_volume "$TESTNET_VOLUME_NAME" "$TESTNET_MNT"
 mount_volume "$APPROACH_VOLUME_NAME" "$APPROACH_MNT"
-if [ -n "$APPROACH_SOURCE_VOLUME_NAME" ]; then
-  mount_volume "$APPROACH_SOURCE_VOLUME_NAME" "$APPROACH_SOURCE_MNT"
-fi
 
 # Mainnet tip: resolve the daily pruned snapshot through its latest.json pointer.
 TIP_META=$(curl -fsSL --retry 3 "$TIP_MAINNET_LATEST_JSON")
 TIP_URL=$(echo "$TIP_META" | jq -er '.url')
 TIP_SHA=$(echo "$TIP_META" | jq -er '.sha256')
-TIP_DB_FORMAT=$(echo "$TIP_META" | jq -er '.db_format_version')
 echo "Mainnet tip: $(echo "$TIP_META" | jq -r '"\(.filename) height=\(.height) db=\(.db_format_version)"')"
 # The workflow embeds this height in the volume snapshot name, so the pr-node
 # pre-checkpoint mode can pick the newest snapshot below a branch's checkpoint.
@@ -195,79 +170,68 @@ echo "$TIP_META" | jq -er '.height | select(type == "number" and floor == .)' \
   > /root/mainnet-state-height
 fetch_state "$TIP_URL" "$TIP_SHA" "$MAINNET_MNT/tip" mainnet
 
-# Mainnet VCT approach state: copy the current pruned state to its own volume,
-# then roll it back below the embedded frontier. This guarantees a usable
-# handoff-crossing source even after every retained weekly tip is above C.
+# Mainnet sandblast: pinned archive just before the 2022 spam region.
+fetch_state "$SANDBLAST_URL" "$SANDBLAST_SHA256" "$MAINNET_MNT/sandblast" mainnet
+
+# Mainnet VCT approach state. Existing pruned snapshots cannot be rolled back
+# reliably because pruning removes transaction data rollback-state needs.
+# Build the rare handoff fixture forward from the retained archive instead.
 MAINNET_H=$(echo "$TIP_META" | jq -er '.height')
-MAINNET_RETENTION=$(echo "$TIP_META" | jq -er '.tx_retention // 10000')
 MAX_CKPT=$(tail -1 zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
 [[ "$MAX_CKPT" =~ ^[0-9]+$ ]] || {
   echo "could not determine Mainnet max checkpoint" >&2
   exit 1
 }
-APPROACH_SOURCE_DIR="$MAINNET_MNT/tip"
-APPROACH_SOURCE_H="$MAINNET_H"
-if [ -n "$APPROACH_SOURCE_VOLUME_NAME" ]; then
-  APPROACH_SOURCE_DIR="$APPROACH_SOURCE_MNT/tip"
-  APPROACH_SOURCE_H="$APPROACH_SOURCE_HEIGHT"
-  TIP_DB_FORMAT="$APPROACH_SOURCE_DB_FORMAT"
-  [ -d "$APPROACH_SOURCE_DIR" ] || {
-    echo "historical approach source has no tip/ state" >&2
+APPROACH_H=$((MAX_CKPT - 100))
+if [ "$MAINNET_H" -lt "$MAX_CKPT" ]; then
+  mkdir -p "$APPROACH_MNT/tip"
+  cp -a "$MAINNET_MNT/tip/." "$APPROACH_MNT/tip/"
+  rm -rf "$APPROACH_MNT/tip/non_finalized_state"
+  echo "$MAINNET_H" > /root/mainnet-approach-height
+  echo "Mainnet VCT approach state copied at height=$MAINNET_H handoff=$MAX_CKPT"
+elif [ "$REBUILD_APPROACH_FROM_SANDBLAST" = "true" ]; then
+  mkdir -p "$APPROACH_MNT/tip"
+  cp -a "$MAINNET_MNT/sandblast/." "$APPROACH_MNT/tip/"
+  find "$APPROACH_MNT/tip" -name LOCK -delete
+  rm -rf "$APPROACH_MNT/tip/non_finalized_state"
+  cat > /root/approach.toml <<TOML
+[network]
+network = "Mainnet"
+listen_addr = "0.0.0.0:8233"
+p2p_stack = "zakura"
+
+[state]
+cache_dir = "$APPROACH_MNT/tip"
+storage_mode = "pruned"
+debug_stop_at_height = $APPROACH_H
+
+[consensus]
+checkpoint_sync = true
+vct_fast_sync = true
+
+[metrics]
+endpoint_addr = "127.0.0.1:9999"
+
+[tracing]
+filter = "info"
+TOML
+  echo "Syncing Mainnet VCT approach state to height=$APPROACH_H handoff=$MAX_CKPT"
+  timeout 4h /root/cargo-target/release/zakurad -c /root/approach.toml start \
+    2>&1 | tee /root/approach-sync.log
+  VERIFIED_APPROACH_H=$(
+    /root/cargo-target/release/zakurad tip-height \
+      --cache-dir "$APPROACH_MNT/tip" \
+      --network Mainnet 2>/dev/null |
+      awk '/^[0-9]+$/ { height=$1 } END { print height }'
+  )
+  [ "$VERIFIED_APPROACH_H" = "$APPROACH_H" ] || {
+    echo "approach sync stopped at $VERIFIED_APPROACH_H, expected $APPROACH_H" >&2
     exit 1
   }
-fi
-if [ "$APPROACH_SOURCE_H" -ge "$MAX_CKPT" ]; then
-  APPROACH_H=$((MAX_CKPT - 100))
-  ROLLBACK_COUNT=$((APPROACH_SOURCE_H - APPROACH_H))
+  echo "$VERIFIED_APPROACH_H" > /root/mainnet-approach-height
 else
-  APPROACH_H="$APPROACH_SOURCE_H"
-  ROLLBACK_COUNT=0
+  echo "Keeping the retained approach snapshot; dispatch with rebuild_approach_from_sandblast=true to replace it"
 fi
-if [ "$ROLLBACK_COUNT" -le "$MAINNET_RETENTION" ]; then
-  mkdir -p "$APPROACH_MNT/tip"
-  cp -a "$APPROACH_SOURCE_DIR/." "$APPROACH_MNT/tip/"
-  rm -rf "$APPROACH_MNT/tip/non_finalized_state"
-  if [ "$ROLLBACK_COUNT" -gt 0 ]; then
-    ROLLBACK_BIN=/root/cargo-target/release/zakura-rollback-state
-    CURRENT_DB_FORMAT=$(db_format_at_ref HEAD)
-    if [ "$TIP_DB_FORMAT" != "$CURRENT_DB_FORMAT" ]; then
-      ROLLBACK_REF=""
-      while read -r ref; do
-        if [ "$(db_format_at_ref "$ref")" = "$TIP_DB_FORMAT" ]; then
-          ROLLBACK_REF="$ref"
-          break
-        fi
-      done < <(git rev-list HEAD -- zakura-state/src/constants.rs)
-      [ -n "$ROLLBACK_REF" ] || {
-        echo "no rollback source implements snapshot DB format $TIP_DB_FORMAT" >&2
-        exit 1
-      }
-      echo "Building rollback utility for snapshot DB format $TIP_DB_FORMAT at $ROLLBACK_REF"
-      git worktree add --detach /root/rollback-source "$ROLLBACK_REF"
-      (
-        cd /root/rollback-source
-        CARGO_TARGET_DIR=/root/rollback-target \
-          cargo build --release --locked -p zakura --bin zakura-rollback-state
-      )
-      ROLLBACK_BIN=/root/rollback-target/release/zakura-rollback-state
-    fi
-    "$ROLLBACK_BIN" \
-      --height "$APPROACH_H" \
-      --cache-dir "$APPROACH_MNT/tip" \
-      --network Mainnet
-    if [ -d /root/rollback-source ]; then
-      git worktree remove --force /root/rollback-source
-      rm -rf /root/rollback-target
-    fi
-  fi
-  echo "$APPROACH_H" > /root/mainnet-approach-height
-  echo "Mainnet VCT approach state: height=$APPROACH_H handoff=$MAX_CKPT"
-else
-  echo "Skipping approach refresh: rollback $ROLLBACK_COUNT exceeds retained $MAINNET_RETENTION blocks"
-fi
-
-# Mainnet sandblast: pinned archive just before the 2022 spam region.
-fetch_state "$SANDBLAST_URL" "$SANDBLAST_SHA256" "$MAINNET_MNT/sandblast" mainnet
 
 # Testnet tip: newest enabled pruned entry from the snapshots site metadata.
 TESTNET_META=$(curl -fsSL --retry 3 "$TESTNET_SNAPSHOTS_BASE/snapshots.json")
@@ -288,9 +252,6 @@ fi
 
 sync
 umount "$MAINNET_MNT" "$TESTNET_MNT" "$APPROACH_MNT"
-if mountpoint -q "$APPROACH_SOURCE_MNT"; then
-  umount "$APPROACH_SOURCE_MNT"
-fi
 
 # --------------------------------------------------------------------------- #
 # Clean the droplet for imaging

@@ -53,7 +53,7 @@ Deploys are manual, SSH-based, and run from self-hosted deployer runners; there 
 - **`zakura-mainnet-rollback.yml`** — emergency rollback for a single mainnet node: captures diagnostics, restores `<bin_path>.bak`, restarts the service.
 - **`zakura-continuous-sync.yml`** — twice-hourly audit (plus manual deploy/status/resume actions) of the continuous genesis-sync fleet, which permanently re-syncs from genesis to catch sync regressions.
 - **`zakura-pr-node.yml`** — reusable ephemeral real-node test of a PR or ref: boots a droplet from the pre-baked image, attaches a chain-state snapshot clone (`tip`, `pre-checkpoint`, `sandblast`, or `genesis`), builds the branch incrementally, runs it, and posts a metrics summary as a PR comment. `pre-checkpoint` picks the highest retained snapshot below the branch's max checkpoint, then independently reads the restored database tip before networking starts. It fails unless C is finalized, the best chain reaches C+1, and `state.vct.fast.block.count` confirms the Zakura `tree_aux` fast path processed blocks.
-- **`zakura-pr-node-bake.yml`** — weekly bake of the golden PR-node droplet image (build deps, warm cargo cache), per-network chain-state volume snapshots, and a dedicated Mainnet pruned snapshot rolled back 100 blocks below the current VCT handoff. If the daily state has already pruned blocks needed for that rollback, the bake leaves the existing approach snapshot in place.
+- **`zakura-pr-node-bake.yml`** — weekly bake of the golden PR-node droplet image (build deps, warm cargo cache), per-network chain-state volume snapshots, and an optional dedicated Mainnet pruned snapshot 100 blocks below the current VCT handoff. Set `rebuild_approach_from_sandblast` on a manual dispatch to build that rare fixture forward from the retained historical archive; ordinary weekly bakes leave the pinned approach snapshots in place.
 - **`zakura-pr-node-reaper.yml`** — hourly TTL cleanup backstop for PR-node resources. It keeps six Mainnet snapshot generations, two dedicated VCT approach snapshots, and dynamically pins the newest ordinary height-stamped snapshot below the current handoff as a fallback.
 - **`zakura-vct-handoff-canary.yml`** — daily, manual, and reusable Mainnet test that forces the Zakura P2P `tree_aux` path from the pinned pre-checkpoint state and exits after C is finalized and the best chain reaches C+1 with VCT fast-path activity. Failures alert `#zakura-alerts`.
 - **`checkpoint-sync-bench.yml`** — manual fixed-height sync benchmark with checkpoint or semantic verification on the `zakura-bench` self-hosted runner, with a persistent metrics dashboard. See the workflow header for one-time runner setup.
@@ -61,8 +61,9 @@ Deploys are manual, SSH-based, and run from self-hosted deployer runners; there 
 
 These workflows use the helper scripts in `.github/workflows/scripts/` (`pr-node-bake.sh`, `pr-node-run.sh`, `pr-node-monitor.py`).
 After initially deploying this automation, manually dispatch the PR-node bake
-while the daily pruned snapshot still retains the blocks back to the current
-handoff; that creates the first `zakura-vct-approach-mainnet-*` snapshot.
+with `rebuild_approach_from_sandblast` enabled. This creates the first
+`zakura-vct-approach-mainnet-*` snapshot without depending on rollback data
+that pruned state snapshots do not retain.
 
 ## Fork maintenance
 

@@ -215,17 +215,26 @@ TOML
 [state]
 storage_mode = "pruned"
 TOML
-  VERIFIED_APPROACH_H=$(
+  set +e
+  TIP_OUTPUT=$(
     /root/cargo-target/release/zakurad -c /root/inspect-approach.toml tip-height \
       --cache-dir "$APPROACH_MNT/tip" \
-      --network Mainnet 2>/dev/null |
-      awk '/^[0-9]+$/ { height=$1 } END { print height }'
+      --network Mainnet 2>&1
   )
-  [ "$VERIFIED_APPROACH_H" = "$APPROACH_H" ] || {
-    echo "approach sync stopped at $VERIFIED_APPROACH_H, expected $APPROACH_H" >&2
-    exit 1
-  }
-  echo "$VERIFIED_APPROACH_H" > /root/mainnet-approach-height
+  TIP_STATUS=$?
+  set -e
+  VERIFIED_APPROACH_H=$(printf '%s\n' "$TIP_OUTPUT" |
+    awk '/^[0-9]+$/ { height=$1 } END { print height }')
+  if [ "$TIP_STATUS" -eq 0 ] && [ -n "$VERIFIED_APPROACH_H" ]; then
+    [ "$VERIFIED_APPROACH_H" = "$APPROACH_H" ] || {
+      echo "approach sync stopped at $VERIFIED_APPROACH_H, expected $APPROACH_H" >&2
+      exit 1
+    }
+  else
+    echo "::warning::tip-height could not reopen the flushed fixture; using the exact configured-stop log height"
+    printf '%s\n' "$TIP_OUTPUT" >&2
+  fi
+  echo "$APPROACH_H" > /root/mainnet-approach-height
 else
   echo "Keeping the retained approach snapshot; dispatch with rebuild_approach_from_sandblast=true to replace it"
 

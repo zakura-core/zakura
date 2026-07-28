@@ -54,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   minutes to 20 minutes, reducing unnecessary peer disconnects during ordinary
   block-time variance and propagation delay
   ([#469](https://github.com/zakura-core/zakura/pull/469)).
+- Credit outbound peer replenishment demand when a failed dial restores
+  channel demand, so poor connectivity does not double-spend the timer budget
+  ([#474](https://github.com/zakura-core/zakura/pull/474)).
 
 ## [1.0.4] - 2026-07-25
 

@@ -4,6 +4,9 @@ This directory contains helper services and scripts that run on Zakura deploy or
 benchmark hosts. The deploy workflows copy the tracked service files here onto
 the self-hosted runners.
 
+The public `sendrawtransaction` broadcast gateway lives under
+[`deploy/gateway/`](../gateway/README.md).
+
 ## Cluster Status and Public Ironwood API
 
 `zakura-cluster-status.py` polls authenticated node RPC endpoints over SSH and

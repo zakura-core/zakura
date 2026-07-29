@@ -386,6 +386,38 @@ jobs:
           sudo systemctl restart zakura-mainnet-dashboard.service
           sudo systemctl --no-pager --full status zakura-mainnet-dashboard.service || true
 
+      - name: Install public broadcast gateway
+        if: always()
+        run: |
+          set -euo pipefail
+
+          gateway_dir="/opt/zakura-gateway-mainnet"
+          sudo install -d -m 755 "$gateway_dir"
+          sudo install -m 755 deploy/gateway/broadcast.py "$gateway_dir/broadcast.py"
+          sudo install -m 644 deploy/gateway/mainnet/backends.toml \
+            "$gateway_dir/backends.toml"
+          sudo install -m 644 deploy/gateway/mainnet/broadcast.service \
+            /etc/systemd/system/zakura-broadcast-mainnet.service
+
+          # Keep status hosts and the broadcast TLS front door in sync.
+          sudo install -m 644 deploy/gateway/mainnet/Caddyfile /etc/caddy/Caddyfile
+          sudo caddy validate --config /etc/caddy/Caddyfile
+          sudo systemctl reload caddy.service
+
+          # Remove transitional install paths if present.
+          if systemctl list-unit-files zakura-submit-gateway.service >/dev/null 2>&1; then
+            sudo systemctl disable --now zakura-submit-gateway.service || true
+            sudo rm -f /etc/systemd/system/zakura-submit-gateway.service
+          fi
+          sudo rm -rf /opt/zakura-submit-gateway /opt/zakura-broadcast-mainnet
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable zakura-broadcast-mainnet.service
+          sudo systemctl restart zakura-broadcast-mainnet.service
+          sudo systemctl --no-pager --full status zakura-broadcast-mainnet.service || true
+          curl -fsS "http://127.0.0.1:8092/healthz"
+          echo
+
       - name: Install fleet watchdog
         if: always()
         env:

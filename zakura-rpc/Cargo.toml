@@ -118,7 +118,7 @@ zakura-node-services = { path = "../zakura-node-services", version = "3.0.0", fe
     "rpc-client",
 ] }
 zakura-script = { path = "../zakura-script", version = "3.0.0" }
-zakura-state = { path = "../zakura-state", version = "5.0.0" }
+zakura-state = { path = "../zakura-state", version = "6.0.0" }
 rustls = "0.23.40"
 tokio-rustls = "0.26.4"
 rustls-pemfile = "2.2.0"
@@ -149,7 +149,7 @@ zakura-consensus = { path = "../zakura-consensus", version = "5.0.0", features =
 zakura-network = { path = "../zakura-network", version = "5.0.0", features = [
     "proptest-impl",
 ] }
-zakura-state = { path = "../zakura-state", version = "5.0.0", features = [
+zakura-state = { path = "../zakura-state", version = "6.0.0", features = [
     "proptest-impl",
 ] }
 

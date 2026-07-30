@@ -877,6 +877,45 @@ impl ZakuraDb {
         self.lowest_retained_height().is_some()
     }
 
+    /// Returns `true` if this node's block data is subject to pruning: either
+    /// pruned storage mode is configured, or the database has already pruned
+    /// historical data.
+    ///
+    /// This is what `getblockchaininfo.pruned` reports, matching `zcashd`, which
+    /// returns its prune-mode setting rather than whether any block has actually
+    /// been deleted yet:
+    /// <https://github.com/zcash/zcash/blob/v6.3.0/src/rpc/blockchain.cpp>
+    ///
+    ///     obj.pushKV("pruned", fPruneMode);
+    ///
+    /// A node configured with
+    /// [`StorageMode::Pruned`](crate::StorageMode::Pruned) prunes nothing until
+    /// its tip rises above the retention window, but it is still a pruned node,
+    /// and clients must not assume it can serve arbitrary historical blocks.
+    ///
+    /// Use [`is_pruned`](Self::is_pruned) instead for the one-way on-disk state
+    /// that decides whether a database may be reopened in archive mode.
+    pub fn prunes_historical_data(&self) -> bool {
+        self.config().pruning_config().is_some() || self.is_pruned()
+    }
+
+    /// Returns the lowest height at and above which every block body is
+    /// retained, or `None` if this node does not prune.
+    ///
+    /// A pruning node that has not deleted anything yet still retains every
+    /// body, so this is [`Height::MIN`] until the first prune. The genesis
+    /// block is never pruned, so its body is available even when this returns a
+    /// higher height.
+    ///
+    /// This is what `getblockchaininfo.pruneheight` reports. `zcashd` emits that
+    /// field only when `pruned` is true, and reports the lowest height whose
+    /// full block it still stores:
+    /// <https://github.com/zcash/zcash/blob/v6.3.0/src/rpc/blockchain.cpp>
+    pub fn prune_height(&self) -> Option<Height> {
+        self.prunes_historical_data()
+            .then(|| self.lowest_retained_height().unwrap_or(Height::MIN))
+    }
+
     // Verified-commitment-trees fast-sync methods
 
     /// Returns the checkpoint handoff height `H` of a verified-commitment-trees fast-synced

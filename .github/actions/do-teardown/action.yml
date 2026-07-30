@@ -1,0 +1,72 @@
+name: "Tear down a droplet"
+description: >-
+  Best-effort delete of a droplet and any volumes it used. Never fails the job:
+  whatever survives is swept by the hourly reaper.
+
+inputs:
+  droplet_id:
+    description: "Droplet to delete. Empty is a no-op (creation never got that far)."
+    required: false
+    default: ""
+  droplet_name:
+    description: "Droplet name used to recover its ID when provisioning failed before publishing outputs."
+    required: false
+    default: ""
+  volume_ids:
+    description: "Whitespace-separated volume IDs to delete after the droplet"
+    required: false
+    default: ""
+  volume_names:
+    description: "Whitespace-separated volume names used to recover IDs missing after partial provisioning."
+    required: false
+    default: ""
+  enabled:
+    description: "Anything other than 'true' keeps the resources for inspection and prints why"
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Teardown
+      shell: bash
+      env:
+        DROPLET_ID: ${{ inputs.droplet_id }}
+        DROPLET_NAME: ${{ inputs.droplet_name }}
+        VOLUME_IDS: ${{ inputs.volume_ids }}
+        VOLUME_NAMES: ${{ inputs.volume_names }}
+        ENABLED: ${{ inputs.enabled }}
+      run: |
+        set +e
+        if [ "${ENABLED}" != "true" ]; then
+          echo "Teardown skipped; droplet ${DROPLET_ID:-${DROPLET_NAME:-none}} and volumes ${VOLUME_IDS:-${VOLUME_NAMES:-none}} kept for inspection (the reaper deletes them within 24h of creation)."
+          exit 0
+        fi
+        if [ -z "${DROPLET_ID}" ] && [ -n "${DROPLET_NAME}" ]; then
+          DROPLET_ID=$(doctl compute droplet list --format ID,Name --no-header | \
+            awk -v name="${DROPLET_NAME}" '$2 == name { print $1; exit }')
+        fi
+        for VOL_NAME in ${VOLUME_NAMES}; do
+          VOL_ID=$(doctl compute volume get "${VOL_NAME}" --format ID --no-header 2>/dev/null)
+          if [ -n "${VOL_ID}" ] && ! printf '%s\n' "${VOLUME_IDS}" | grep -qw "${VOL_ID}"; then
+            VOLUME_IDS="${VOLUME_IDS} ${VOL_ID}"
+          fi
+        done
+        if [ -n "${DROPLET_ID}" ]; then
+          for _ in 1 2 3; do
+            doctl compute droplet delete "${DROPLET_ID}" -f && break
+            sleep 5
+          done
+        fi
+        # Volumes detach asynchronously after the droplet delete, so the first
+        # few attempts are expected to fail while the detach settles.
+        for VOL_ID in ${VOLUME_IDS}; do
+          DELETED=""
+          for _ in $(seq 1 12); do
+            doctl compute volume delete "${VOL_ID}" -f && { DELETED=1; break; }
+            sleep 10
+          done
+          # Say so explicitly: this line is what a leak audit greps for.
+          [ -n "${DELETED}" ] || echo "volume ${VOL_ID} still attached; the reaper will remove it" >&2
+        done
+        true

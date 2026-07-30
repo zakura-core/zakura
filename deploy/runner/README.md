@@ -4,6 +4,9 @@ This directory contains helper services and scripts that run on Zakura deploy or
 benchmark hosts. The deploy workflows copy the tracked service files here onto
 the self-hosted runners.
 
+The public `sendrawtransaction` broadcast gateway lives under
+[`deploy/gateway/`](../gateway/README.md).
+
 ## Cluster Status and Public Ironwood API
 
 `zakura-cluster-status.py` polls authenticated node RPC endpoints over SSH and
@@ -19,6 +22,21 @@ cannot verify a matching network, Ironwood pool, tip, or source client, or if
 the most recent complete observation is more than 120 seconds old. The endpoint
 is rate-limited and permits cross-origin reads from `https://zakura.com`.
 Testnet additionally permits the two development origins on port `1111`.
+
+### Tip Agreement and Orphan Pairs
+
+Each poll groups the fleet by `(height, tip hash)`. A single group means the
+nodes agree; several groups at the leading height mean a split, and the
+dashboard labels each node `majority`, `fork`, `ahead`, or `behind`. Fork depth
+between two tips at the same height is estimated from best-chain ancestor
+hashes sampled at 1, 2, 5, 10, and 32 blocks back, so an unresolved fork reports
+`> 32 or unknown` rather than a wrong number.
+
+A node whose height drops or whose tip hash changes at the same height records
+an orphan pair: the discarded hash, the new canonical hash, and the depth. Pass
+`--state-file` to persist that history across restarts; the deploy workflows
+point it at `/var/lib/zakura-<network>-dashboard/orphan-pairs.json`. Without the
+flag the history is in-memory only and is lost on every restart.
 
 ## Fleet Slack Watchdog
 

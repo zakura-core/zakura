@@ -1,0 +1,28 @@
+# Managed Caddyfile for us-east-0 (zakura mainnet runner).
+# Source: deploy/gateway/mainnet/Caddyfile
+# Installs via zakura-mainnet-deploy.yml; do not hand-edit on the host.
+
+status.mainnet.zakura.valargroup.dev {
+	reverse_proxy 127.0.0.1:8090
+}
+
+status-mainnet.valargroup.dev {
+	reverse_proxy 127.0.0.1:8090
+}
+
+# HTTPS-only public submit endpoint. Explicit HTTP block avoids an
+# HTTP→HTTPS redirect that Vizor (redirect policy: none) cannot follow.
+http://zakura-broadcast.valargroup.dev {
+	respond "HTTPS required" 400
+}
+
+zakura-broadcast.valargroup.dev {
+	# Do not expose internal /backends inventory on the public hostname.
+	@public path / /healthz
+	handle @public {
+		reverse_proxy 127.0.0.1:8092
+	}
+	handle {
+		respond "not found" 404
+	}
+}

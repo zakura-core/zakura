@@ -1,0 +1,14 @@
+# Testnet Zakura JSON-RPC backends for the public broadcast gateway.
+# Reachable :18232 from zakura-testnet-1.
+
+[[backends]]
+name = "zakura-testnet-1"
+url = "http://127.0.0.1:18232/"
+
+[[backends]]
+name = "zakura-testnet-2"
+url = "http://167.99.110.145:18232/"
+
+[[backends]]
+name = "zakura-testnet-3"
+url = "http://138.68.229.254:18232/"

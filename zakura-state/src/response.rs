@@ -374,9 +374,21 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::UsageInfo`] with the current best chain tip.
     UsageInfo(u64),
 
-    /// Response to [`ReadRequest::IsPruned`] with whether the database has
-    /// pruned historical data.
-    IsPruned(bool),
+    /// Response to [`ReadRequest::PruningInfo`] with this node's pruning status.
+    PruningInfo {
+        /// Whether this node's block data is subject to pruning, because pruned
+        /// storage mode is configured or historical data has already been
+        /// pruned.
+        pruned: bool,
+
+        /// The lowest height at and above which every block body is retained,
+        /// or `None` when this node does not prune.
+        ///
+        /// This is [`Height::MIN`](block::Height::MIN) while a pruning node has
+        /// not deleted anything yet. The genesis block is never pruned, so its
+        /// body is available even when this is a higher height.
+        prune_height: Option<block::Height>,
+    },
 
     /// Response to [`ReadRequest::BlockRoots`] with the per-block commitment roots
     /// this node holds for the requested range, in ascending height order.
@@ -643,7 +655,7 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::ValidBestChainTipNullifiersAndAnchors => Ok(Response::ValidBestChainTipNullifiersAndAnchors),
 
             ReadResponse::UsageInfo(_)
-            | ReadResponse::IsPruned(_)
+            | ReadResponse::PruningInfo { .. }
             | ReadResponse::BlockRoots(_)
             | ReadResponse::TipPoolValues { .. }
             | ReadResponse::BlockInfo(_)

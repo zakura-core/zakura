@@ -20,9 +20,11 @@ pub use network_chain_tip_height_estimator::NetworkChainTipHeightEstimator;
 ///
 /// Allows for normal block-time variance and propagation delay. Considering the
 /// 75 second target for the time between blocks on Mainnet, this equals
-/// approximately 6 minutes of time the node can stay without receiving a new
-/// block before being considered far from the tip.
-pub const AT_OR_NEAR_TIP_THRESHOLD: block::HeightDiff = 5;
+/// approximately 20 minutes of time the node can stay without receiving a new
+/// block before being considered far from the tip. Because the comparison is
+/// inclusive, the node is considered far from the tip once the estimated
+/// distance exceeds 16 blocks.
+pub const AT_OR_NEAR_TIP_THRESHOLD: block::HeightDiff = 16;
 
 /// An interface for querying the chain tip.
 ///

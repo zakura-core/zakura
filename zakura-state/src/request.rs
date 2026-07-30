@@ -1289,9 +1289,10 @@ pub enum ReadRequest {
     /// with the current disk space usage in bytes.
     UsageInfo,
 
-    /// Returns [`ReadResponse::IsPruned(bool)`](ReadResponse::IsPruned)
-    /// with whether the database has pruned historical data.
-    IsPruned,
+    /// Returns [`ReadResponse::PruningInfo`](ReadResponse::PruningInfo) with
+    /// whether this node's block data is subject to pruning, and the lowest
+    /// height at and above which every block body is retained.
+    PruningInfo,
 
     /// Returns [`ReadResponse::Tip(Option<(Height, block::Hash)>)`](ReadResponse::Tip)
     /// with the current best chain tip.
@@ -1719,7 +1720,7 @@ impl ReadRequest {
     pub fn variant_name(&self) -> &'static str {
         match self {
             ReadRequest::UsageInfo => "usage_info",
-            ReadRequest::IsPruned => "is_pruned",
+            ReadRequest::PruningInfo => "pruning_info",
             ReadRequest::Tip => "tip",
             ReadRequest::FinalizedTip => "finalized_tip",
             ReadRequest::TipPoolValues => "tip_pool_values",

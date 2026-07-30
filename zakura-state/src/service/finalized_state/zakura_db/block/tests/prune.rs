@@ -1099,6 +1099,85 @@ fn prepare_prune_batch_deletes_history_and_keeps_consensus_state() {
 }
 
 #[test]
+fn pruned_mode_reports_pruned_before_anything_is_pruned() {
+    let _init_guard = zakura_test::init();
+    let network = Mainnet;
+
+    // The tip is far below the retention window, so nothing has been pruned yet.
+    let state = new_state_with_blocks(&pruned_config(), &network);
+
+    assert!(
+        !state.db.is_pruned(),
+        "no raw transaction data has been deleted, so the one-way marker is unset"
+    );
+    assert!(
+        state.db.prunes_historical_data(),
+        "a node configured in pruned storage mode is a pruned node from the start, \
+         even before its tip rises above the retention window"
+    );
+    assert_eq!(
+        state.db.prune_height(),
+        Some(Height::MIN),
+        "every block body from genesis upwards is still retained"
+    );
+}
+
+#[test]
+fn archive_mode_never_reports_pruned() {
+    let _init_guard = zakura_test::init();
+    let network = Mainnet;
+
+    let state = new_state_with_blocks(&Config::ephemeral(), &network);
+
+    assert!(!state.db.is_pruned());
+    assert!(
+        !state.db.prunes_historical_data(),
+        "an archive node's blocks are not subject to pruning"
+    );
+    assert_eq!(
+        state.db.prune_height(),
+        None,
+        "an archive node reports no prune height"
+    );
+}
+
+#[test]
+fn reopened_pruned_database_reports_pruned_before_committing_a_block() {
+    let _init_guard = zakura_test::init();
+    let network = Mainnet;
+
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        storage_mode: StorageMode::Pruned(PruningConfig {
+            tx_retention: MIN_PRUNING_RETENTION,
+        }),
+        ..Config::default()
+    };
+
+    // Prune some raw transaction data, then drop the handle to release the lock.
+    {
+        let state = new_state_with_blocks(&config, &network);
+        let mut batch = DiskWriteBatch::new();
+        batch.prepare_prune_batch(&state.db, Height(1), Height(4));
+        state.db.write_batch(batch).expect("prune batch writes");
+    }
+
+    // The durable marker makes the reopened database report pruned immediately,
+    // without waiting for a block commit to prune anything.
+    let reopened = FinalizedState::new(&config, &network).expect("reopening the database succeeds");
+
+    assert!(reopened.db.is_pruned());
+    assert!(reopened.db.prunes_historical_data());
+    assert_eq!(
+        reopened.db.prune_height(),
+        Some(Height(4)),
+        "the prune height tracks the marker once bodies have been deleted"
+    );
+}
+
+#[test]
 fn pruned_block_bodies_stop_tree_derived_root_serving() {
     let _init_guard = zakura_test::init();
     let network = Mainnet;

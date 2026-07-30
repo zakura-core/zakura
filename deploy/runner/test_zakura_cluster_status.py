@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -83,6 +84,9 @@ class IronwoodStatusTests(unittest.TestCase):
         compile(status.REMOTE_PROBE, "<remote-probe>", "exec")
         self.assertIn('rpc_call("getblockchaininfo")', status.REMOTE_PROBE)
         self.assertIn('rpc_call("getinfo")', status.REMOTE_PROBE)
+        self.assertIn('blockchain_info.get("headers")', status.REMOTE_PROBE)
+        self.assertIn('"getblockhash"', status.REMOTE_PROBE)
+        self.assertIn('rpc_call("getblockheader"', status.REMOTE_PROBE)
 
     def test_success_response_has_the_stable_public_shape(self):
         subject = collector()
@@ -182,6 +186,214 @@ class IronwoodStatusTests(unittest.TestCase):
         payload = subject.snapshot()
 
         self.assertEqual(payload["rows"][0]["ssh"], "root@192.0.2.1")
+        self.assertIn("chain", payload)
+        self.assertEqual(payload["chain"]["status"], "unknown")
+
+
+class TipAgreementTests(unittest.TestCase):
+    def test_classify_tip_event_detects_reorg_signals(self):
+        self.assertEqual(
+            status.classify_tip_event(None, None, 10, "a" * 64),
+            "initial",
+        )
+        self.assertEqual(
+            status.classify_tip_event(10, "a" * 64, 11, "b" * 64),
+            "advanced",
+        )
+        self.assertEqual(
+            status.classify_tip_event(10, "a" * 64, 10, "a" * 64),
+            "unchanged",
+        )
+        self.assertEqual(
+            status.classify_tip_event(10, "a" * 64, 10, "b" * 64),
+            "tip_switch",
+        )
+        self.assertEqual(
+            status.classify_tip_event(10, "a" * 64, 8, "c" * 64),
+            "reorg_height_drop",
+        )
+
+    def test_chain_summary_agreed_lagging_and_split(self):
+        agreed = status.compute_chain_summary(
+            [
+                {"name": "a", "height": 100, "block_hash": "aa", "client_name": "zakurad"},
+                {"name": "b", "height": 100, "block_hash": "aa", "client_name": "zakurad"},
+            ]
+        )
+        self.assertEqual(agreed["status"], "agreed")
+        self.assertFalse(agreed["split"])
+        self.assertEqual(agreed["majority_height"], 100)
+
+        lagging = status.compute_chain_summary(
+            [
+                {"name": "a", "height": 100, "block_hash": "aa", "client_name": "zakurad"},
+                {"name": "b", "height": 99, "block_hash": "bb", "client_name": "zakurad"},
+            ]
+        )
+        self.assertEqual(lagging["status"], "lagging")
+        self.assertFalse(lagging["split"])
+
+        split = status.compute_chain_summary(
+            [
+                {"name": "a", "height": 100, "block_hash": "aa", "client_name": "zakurad"},
+                {"name": "b", "height": 100, "block_hash": "bb", "client_name": "zcashd"},
+            ]
+        )
+        self.assertEqual(split["status"], "split")
+        self.assertTrue(split["split"])
+        self.assertTrue(split["compat_split"])
+
+    def test_enrich_chain_roles(self):
+        rows = [
+            {"name": "a", "height": 100, "block_hash": "aa"},
+            {"name": "b", "height": 100, "block_hash": "aa"},
+            {"name": "c", "height": 100, "block_hash": "ff"},
+            {"name": "d", "height": 99, "block_hash": "dd"},
+            {"name": "e", "height": None, "block_hash": ""},
+        ]
+        chain = status.compute_chain_summary(rows)
+        status.enrich_chain_roles(rows, chain)
+
+        roles = {row["name"]: row["chain_role"] for row in rows}
+        self.assertEqual(chain["status"], "split")
+        self.assertEqual(roles["a"], "majority")
+        self.assertEqual(roles["b"], "majority")
+        self.assertEqual(roles["c"], "fork")
+        self.assertEqual(roles["d"], "behind")
+        self.assertEqual(roles["e"], "unknown")
+
+        ahead_rows = [
+            {"name": "a", "height": 100, "block_hash": "aa"},
+            {"name": "b", "height": 100, "block_hash": "aa"},
+            {"name": "c", "height": 101, "block_hash": "cc"},
+        ]
+        ahead_chain = status.compute_chain_summary(ahead_rows)
+        status.enrich_chain_roles(ahead_rows, ahead_chain)
+        self.assertEqual(ahead_chain["status"], "lagging")
+        self.assertEqual(
+            {row["name"]: row["chain_role"] for row in ahead_rows},
+            {"a": "majority", "b": "majority", "c": "ahead"},
+        )
+
+    def test_row_for_records_reorg_and_headers(self):
+        subject = collector()
+        subject.last_height["node-a"] = 100
+        subject.last_block_hash["node-a"] = "a" * 64
+        subject.last_advanced_at["node-a"] = 1_000.0
+
+        row = subject.row_for(
+            node(),
+            {
+                "height": 98,
+                "headers": 101,
+                "block_hash": "b" * 64,
+                "active_state": "active",
+                "process_running": True,
+                "client_name": "zakurad",
+                "client_version": "v1",
+            },
+            now=1_100.0,
+        )
+
+        self.assertEqual(row["tip_event"], "reorg_height_drop")
+        self.assertEqual(row["headers"], 101)
+        self.assertEqual(row["header_lag"], 3)
+        self.assertEqual(len(subject.recent_reorgs), 1)
+        self.assertEqual(subject.recent_reorgs[0]["kind"], "reorg_height_drop")
+
+        subject.rows = [row]
+        subject.chain = status.compute_chain_summary(
+            subject.rows,
+            list(subject.recent_reorgs),
+        )
+        status.enrich_chain_roles(subject.rows, subject.chain)
+        snapshot = subject.snapshot()
+        self.assertEqual(snapshot["chain"]["recent_reorgs"][0]["node"], "node-a")
+        self.assertIn("height dropped", snapshot["rows"][0]["detail"])
+        self.assertEqual(snapshot["chain"]["recent_reorgs"][0]["depth"], 2)
+        self.assertEqual(
+            snapshot["chain"]["recent_reorgs"][0]["discarded_hash"],
+            "a" * 64,
+        )
+
+    def test_orphan_pairs_persist_across_collector_restarts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "orphan-pairs.json"
+            first = status.ClusterCollector(
+                [node()],
+                interval=10,
+                stale_after=300,
+                upgrade_height=0,
+                target_spacing=7.5,
+                network="testnet",
+                state_file=state_file,
+            )
+            first.last_height["node-a"] = 100
+            first.last_block_hash["node-a"] = "a" * 64
+            first.last_ancestors["node-a"] = {"1": "p" * 64}
+            first.last_advanced_at["node-a"] = 1_000.0
+            first.row_for(
+                node(),
+                {
+                    "height": 100,
+                    "block_hash": "b" * 64,
+                    "ancestor_hashes": {"1": "p" * 64},
+                    "active_state": "active",
+                    "process_running": True,
+                },
+                now=1_100.0,
+            )
+            self.assertTrue(state_file.exists())
+
+            second = status.ClusterCollector(
+                [node()],
+                interval=10,
+                stale_after=300,
+                upgrade_height=0,
+                target_spacing=7.5,
+                network="testnet",
+                state_file=state_file,
+            )
+            self.assertEqual(len(second.recent_reorgs), 1)
+            event = second.recent_reorgs[0]
+            self.assertEqual(event["kind"], "tip_switch")
+            self.assertEqual(event["depth"], 1)
+            self.assertEqual(event["discarded_hash"], "a" * 64)
+            self.assertEqual(event["canonical_hash"], "b" * 64)
+
+    def test_fork_depth_from_ancestor_samples(self):
+        depth = status.estimate_fork_depth_from_ancestors(
+            {"1": "x", "2": "y", "5": "same"},
+            {"1": "a", "2": "b", "5": "same"},
+        )
+        self.assertEqual(depth["depth"], 5)
+        self.assertEqual(depth["label"], "depth 5")
+
+        split = status.compute_chain_summary(
+            [
+                {
+                    "name": "a",
+                    "height": 100,
+                    "block_hash": "aa",
+                    "ancestor_hashes": {"1": "p1", "2": "shared"},
+                    "client_name": "zakurad",
+                },
+                {
+                    "name": "b",
+                    "height": 100,
+                    "block_hash": "bb",
+                    "ancestor_hashes": {"1": "q1", "2": "shared"},
+                    "client_name": "zakurad",
+                },
+            ]
+        )
+        other = next(
+            group
+            for group in split["tip_groups"]
+            if group["block_hash"] != split["majority_hash"]
+        )
+        self.assertEqual(other["fork_depth"], 2)
+        self.assertEqual(other["fork_depth_label"], "depth 2")
 
 
 class RateLimiterTests(unittest.TestCase):

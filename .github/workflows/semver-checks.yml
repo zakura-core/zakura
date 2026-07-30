@@ -33,20 +33,33 @@ on:
       - .github/workflows/semver-checks.yml
       - .github/workflows/scripts/affected_semver_packages.py
       - .github/workflows/scripts/test_affected_semver_packages.py
+  push:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - .github/workflows/semver-checks.yml
+      - .github/workflows/scripts/affected_semver_packages.py
+      - .github/workflows/scripts/test_affected_semver_packages.py
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  semver-checks:
-    name: semver-checks
+  select-packages:
+    name: Select semver packages
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    outputs:
+      baseline_tag: ${{ steps.affected.outputs.baseline_tag }}
+      has_packages: ${{ steps.affected.outputs.has_packages }}
+      packages: ${{ steps.affected.outputs.packages }}
+      packages_json: ${{ steps.affected.outputs.packages_json }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
@@ -60,22 +73,34 @@ jobs:
         run: |
           python3 .github/workflows/scripts/test_affected_semver_packages.py
 
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            packages="$(
-              python3 .github/workflows/scripts/affected_semver_packages.py --all
-            )"
-          else
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             packages="$(
               python3 .github/workflows/scripts/affected_semver_packages.py \
                 --base "$BASE_SHA" \
                 --head "$GITHUB_SHA"
             )"
+          else
+            # Trusted main runs populate reusable rustdoc JSON for the latest
+            # stable crates.io baselines. Check every publishable crate so one
+            # cache entry can warm any package selected by a later PR.
+            packages="$(
+              python3 .github/workflows/scripts/affected_semver_packages.py --all
+            )"
           fi
 
+          packages_json="$(
+            printf '%s\n' "$packages" \
+              | jq --raw-input --slurp --compact-output \
+                'split("\n") | map(select(length > 0))'
+          )"
+
           {
+            echo "baseline_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*')"
+            echo "has_packages=$([[ -n "$packages" ]] && echo true || echo false)"
             echo "packages<<EOF"
             echo "$packages"
             echo "EOF"
+            echo "packages_json=$packages_json"
           } >> "$GITHUB_OUTPUT"
 
           if [[ -n "$packages" ]]; then
@@ -85,57 +110,57 @@ jobs:
             echo "No publishable crates need semver checks."
           fi
 
+  check-package:
+    name: semver (${{ matrix.package }})
+    if: >-
+      github.event_name == 'pull_request'
+      && needs.select-packages.outputs.has_packages == 'true'
+    needs: select-packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.select-packages.outputs.packages_json) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
-        if: steps.affected.outputs.packages != ''
         id: toolchain
         with:
           toolchain: stable
-          cache-key: semver-checks
-          cache-on-failure: true
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          # cargo-semver-checks removes its temporary build directories after
+          # producing rustdoc JSON. Cache that small final output rather than
+          # retaining unrelated Cargo registry and target artifacts.
+          cache: false
 
       # cargo-semver-checks reuses generated baseline rustdoc JSON from
       # target/semver-checks/cache (~1-2 MB per crate baseline; a hit skips
-      # that baseline's download and rustdoc build entirely). rust-cache's
-      # target-dir cleaner deletes unrecognized target/ entries before
-      # saving, so this cache needs its own steps. Keyed on the rustc
-      # version: the rustdoc JSON format (and the tool's own invalidation)
-      # rotates with the toolchain. The run_id suffix makes every manual main
-      # run save a fresh entry; restores prefix-match the newest one.
+      # that baseline's download and rustdoc build entirely). Keyed on the
+      # rustc version because the rustdoc JSON format rotates with the
+      # toolchain, and on the last release tag because published baselines
+      # remain immutable until the next release.
       - name: Restore baseline rustdoc cache
-        if: steps.affected.outputs.packages != ''
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: target/semver-checks/cache
-          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ github.run_id }}
+          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ needs.select-packages.outputs.baseline_tag }}
           restore-keys: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
 
       # Deliberately unpinned (like cargo-hack): cargo-semver-checks must
       # track new stable rustdoc formats; pin only if a regression forces it.
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
-        if: steps.affected.outputs.packages != ''
         with:
           tool: cargo-semver-checks
 
       - uses: ./.github/actions/setup-zakura-build
-        if: steps.affected.outputs.packages != ''
 
-      - name: Check affected crates against stable crates.io baselines
-        if: steps.affected.outputs.packages != ''
+      - name: Check package against its stable crates.io baseline
         env:
-          PACKAGES: ${{ steps.affected.outputs.packages }}
-        run: |
-          while IFS= read -r package; do
-            [[ -n "$package" ]] || continue
-            cargo semver-checks --package "$package" --default-features
-          done <<< "$PACKAGES"
-
-      - name: Save baseline rustdoc cache
-        if: github.ref == 'refs/heads/main' && steps.affected.outputs.packages != ''
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
-        with:
-          path: target/semver-checks/cache
-          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ github.run_id }}
+          PACKAGE: ${{ matrix.package }}
+        run: cargo semver-checks --package "$PACKAGE" --default-features
 
       - name: Explain the failure
         if: failure()
@@ -152,3 +177,91 @@ jobs:
           CHANGELOG_GUIDELINES.md ("Library crates") and the release
           checklist ("Update Crate Versions").
           EOF
+
+  warm-baselines:
+    name: Warm semver baselines
+    if: >-
+      github.event_name != 'pull_request'
+      && needs.select-packages.outputs.has_packages == 'true'
+    needs: select-packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        id: toolchain
+        with:
+          toolchain: stable
+          cache: false
+
+      - name: Restore baseline rustdoc cache
+        id: baseline-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: target/semver-checks/cache
+          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ needs.select-packages.outputs.baseline_tag }}
+          restore-keys: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
+
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
+        with:
+          tool: cargo-semver-checks
+
+      - uses: ./.github/actions/setup-zakura-build
+
+      - name: Check all crates against stable crates.io baselines
+        env:
+          PACKAGES: ${{ needs.select-packages.outputs.packages }}
+        run: |
+          while IFS= read -r package; do
+            [[ -n "$package" ]] || continue
+            cargo semver-checks --package "$package" --default-features
+          done <<< "$PACKAGES"
+
+      - name: Save baseline rustdoc cache
+        if: >-
+          github.ref == 'refs/heads/main'
+          && steps.baseline-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: target/semver-checks/cache
+          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ needs.select-packages.outputs.baseline_tag }}
+
+      - name: Explain the failure
+        if: failure()
+        run: |
+          cat >&2 <<'EOF'
+          cargo-semver-checks failed while warming the latest release
+          baselines. Review the package report above before retrying.
+          EOF
+
+  semver-checks:
+    name: semver-checks
+    if: always()
+    needs: [select-packages, check-package, warm-baselines]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check semver job results
+        env:
+          CHECK_RESULT: ${{ needs.check-package.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          HAS_PACKAGES: ${{ needs.select-packages.outputs.has_packages }}
+          SELECT_RESULT: ${{ needs.select-packages.result }}
+          WARM_RESULT: ${{ needs.warm-baselines.result }}
+        run: |
+          if [[ "$SELECT_RESULT" != "success" ]]; then
+            echo "Package selection failed: $SELECT_RESULT" >&2
+            exit 1
+          fi
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            if [[ "$HAS_PACKAGES" == "true" && "$CHECK_RESULT" != "success" ]]; then
+              echo "Package checks failed: $CHECK_RESULT" >&2
+              exit 1
+            fi
+          elif [[ "$WARM_RESULT" != "success" ]]; then
+            echo "Baseline warmer failed: $WARM_RESULT" >&2
+            exit 1
+          fi

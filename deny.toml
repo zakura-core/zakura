@@ -121,9 +121,6 @@ skip-tree = [
     # wait for structopt-derive to update heck
     { name = "heck", version = "=0.3.3" },
 
-    # wait for librocksdb-sys to update bindgen
-    { name = "bindgen", version = "=0.69.5" },
-
     # wait for halo2_gadgets and primitive-types to update uint
     { name = "uint", version = "=0.9.5" },
 

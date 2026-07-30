@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-07-27
+
+### Changed
+
+- Improved address-book metric collection performance, which was surprisingly
+  active in CPU profiles
+  ([#451](https://github.com/zakura-core/zakura/pull/451)).
+- Increased the number of peers returned in refreshed `GetAddr` responses from
+  approximately one quarter to one half of eligible address-book entries
+  ([#458](https://github.com/zakura-core/zakura/pull/458)).
+- Restored the legacy `FindBlocks` compatibility behavior while additional
+  peer-response and chain-head edge cases are validated
+  ([#459](https://github.com/zakura-core/zakura/pull/459)).
+
+### Fixed
+
+- Prevent banned peer addresses from blocking outbound reconnections
+  ([#439](https://github.com/zakura-core/zakura/pull/439)).
+- Fixed legacy genesis sync livelocking at height 0. Reverted the pruned-peer
+  block-routing filter from
+  [#440](https://github.com/zakura-core/zakura/pull/440), which failed
+  historical block requests with a `NoReadyPeers` error whenever no ready peer
+  advertised `NODE_NETWORK` — including under ordinary peer-set saturation. The
+  syncer treats that error as fatal, so every sync round was aborted about a
+  millisecond after dispatch and its in-flight downloads discarded
+  ([#448](https://github.com/zakura-core/zakura/pull/448)).
+- Avoid duplicate block advertisements when a mined-block notification and the
+  committed-tip fallback become ready together
+  ([#450](https://github.com/zakura-core/zakura/pull/450)).
+- Fixed legacy block sync stalling when a peer advertises only one new block
+  at the chain head
+  ([#452](https://github.com/zakura-core/zakura/pull/452)).
+- Replenish legacy outbound peers during periodic crawls when fewer than 27%
+  of the configured outbound connection slots are active
+  ([#462](https://github.com/zakura-core/zakura/pull/462)).
+- Fixed Mainnet genesis VCT sync failing closed at the handoff height by serving
+  embedded frontier roots from `PeerSource` when no authenticated DB root exists
+  at that height
+  ([#464](https://github.com/zakura-core/zakura/pull/464)).
+- Fixed Prometheus cardinality growth for `zakura.net.connection.state` by
+  aggregating live connections by command instead of retaining historical
+  per-peer address series
+  ([#467](https://github.com/zakura-core/zakura/pull/467)).
+- Extended the legacy syncer's near-tip stall grace from approximately 6
+  minutes to 20 minutes, reducing unnecessary peer disconnects during ordinary
+  block-time variance and propagation delay
+  ([#469](https://github.com/zakura-core/zakura/pull/469)).
+- Credit outbound peer replenishment demand when a failed dial restores
+  channel demand, so poor connectivity does not double-spend the timer budget
+  ([#474](https://github.com/zakura-core/zakura/pull/474)).
+
 ## [1.0.4] - 2026-07-25
 
 ### Added

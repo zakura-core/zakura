@@ -421,7 +421,7 @@ def service_active(config: Config) -> bool:
     ).returncode == 0
 
 
-def fetch_text(url: str, timeout: int = 10) -> str:
+def fetch_text(url: str, timeout: int = 15) -> str:
     with urllib.request.urlopen(url, timeout=timeout) as response:
         return response.read().decode("utf-8", errors="replace")
 

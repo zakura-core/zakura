@@ -1,0 +1,36 @@
+# Managed Caddyfile for zakura-testnet-1.
+# Source: deploy/gateway/testnet/Caddyfile
+# Installs via zakura-testnet-deploy.yml; do not hand-edit on the host.
+
+ironwood.zakura.valargroup.dev {
+	reverse_proxy 127.0.0.1:8091
+}
+
+ironwood-testnet.valargroup.dev {
+	reverse_proxy 127.0.0.1:8091
+}
+
+status.testnet.zakura.valargroup.dev {
+	reverse_proxy 127.0.0.1:8090
+}
+
+status-testnet.valargroup.dev {
+	reverse_proxy 127.0.0.1:8090
+}
+
+# HTTPS-only public submit endpoint. Explicit HTTP block avoids an
+# HTTP→HTTPS redirect that Vizor (redirect policy: none) cannot follow.
+http://zakura-broadcast.testnet.valargroup.dev {
+	respond "HTTPS required" 400
+}
+
+zakura-broadcast.testnet.valargroup.dev {
+	# Do not expose internal /backends inventory on the public hostname.
+	@public path / /healthz
+	handle @public {
+		reverse_proxy 127.0.0.1:8092
+	}
+	handle {
+		respond "not found" 404
+	}
+}

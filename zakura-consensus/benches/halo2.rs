@@ -29,16 +29,26 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+};
+use orchard::bundle::{Authorized, Bundle};
 
 use zakura_chain::{
-    block::Block, parameters::NetworkUpgrade, serialization::ZcashDeserializeInto, transparent,
+    block::Block,
+    parameters::NetworkUpgrade,
+    serialization::ZcashDeserializeInto,
+    transaction::{HashType, SigHash},
+    transparent,
 };
 
 use tower_batch_control::RequestWeight;
 use zakura_consensus::halo2::{Item, VERIFYING_KEY_PRE_NU6_2};
+use zcash_protocol::value::ZatBalance;
+
+type Halo2Input = (Bundle<Authorized, ZatBalance>, SigHash);
 
 /// Extracts valid Halo2 items (Orchard bundles + sighashes) from NU5+ mainnet
 /// test blocks.
@@ -47,8 +57,8 @@ use zakura_consensus::halo2::{Item, VERIFYING_KEY_PRE_NU6_2};
 /// sighash requires the previous outputs they spend, which are not available
 /// in the test vectors. Orchard-only and Sapling-to-Orchard transactions
 /// work with an empty previous outputs set.
-fn extract_halo2_items_from_blocks() -> Vec<Item> {
-    let mut items = Vec::new();
+fn extract_halo2_inputs_from_blocks() -> Vec<Halo2Input> {
+    let mut inputs = Vec::new();
 
     for bytes in zakura_test::vectors::MAINNET_BLOCKS.values() {
         let block: Block = bytes.zcash_deserialize_into().expect("valid block");
@@ -72,21 +82,28 @@ fn extract_halo2_items_from_blocks() -> Vec<Item> {
                 continue;
             };
 
-            let sighash = sighasher.sighash(zakura_chain::transaction::HashType::ALL, None);
+            let sighash = sighasher.sighash(HashType::ALL, None);
 
             // These mainnet test blocks are NU5-era Orchard history (mined before NU6.2),
             // so they verify under the pre-NU6.2 verifying key (see the `verify_single` calls
             // below, which pass `VERIFYING_KEY_PRE_NU6_2`).
-            items.push(Item::new(bundle, sighash));
+            inputs.push((bundle, sighash));
         }
     }
 
     assert!(
-        !items.is_empty(),
+        !inputs.is_empty(),
         "NU5+ test blocks must contain Orchard transactions without transparent inputs"
     );
 
-    items
+    inputs
+}
+
+fn extract_halo2_items_from_blocks() -> Vec<Item> {
+    extract_halo2_inputs_from_blocks()
+        .into_iter()
+        .map(|(bundle, sighash)| Item::new(bundle, sighash))
+        .collect()
 }
 
 fn bench_halo2_verify(c: &mut Criterion) {
@@ -125,9 +142,61 @@ fn bench_halo2_verify(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_halo2_item_clone(c: &mut Criterion) {
+    let source_items = extract_halo2_items_from_blocks();
+    let mut items_by_action_count = BTreeMap::new();
+
+    for item in source_items {
+        items_by_action_count
+            .entry(item.request_weight())
+            .or_insert(item);
+    }
+
+    let mut group = c.benchmark_group("halo2 item clone");
+
+    for (action_count, item) in items_by_action_count {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{action_count} actions")),
+            &item,
+            |b, item| b.iter(|| black_box(black_box(item).clone())),
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_halo2_item_construction(c: &mut Criterion) {
+    let source_inputs = extract_halo2_inputs_from_blocks();
+    let mut inputs_by_action_count = BTreeMap::new();
+
+    for input in source_inputs {
+        let action_count = input.0.actions().len();
+
+        inputs_by_action_count.entry(action_count).or_insert(input);
+    }
+
+    let mut group = c.benchmark_group("halo2 item construction");
+
+    for (action_count, input) in inputs_by_action_count {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{action_count} actions")),
+            &input,
+            |b, (bundle, sighash)| {
+                b.iter_batched(
+                    || (bundle.clone(), *sighash),
+                    |(bundle, sighash)| black_box(Item::new(bundle, sighash)),
+                    BatchSize::SmallInput,
+                )
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().noise_threshold(0.1).sample_size(50);
-    targets = bench_halo2_verify
+    targets = bench_halo2_verify, bench_halo2_item_clone, bench_halo2_item_construction
 }
 criterion_main!(benches);

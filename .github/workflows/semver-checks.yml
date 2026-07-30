@@ -111,14 +111,23 @@ jobs:
       # target/semver-checks/cache (~1-2 MB per crate baseline; a hit skips
       # that baseline's download and rustdoc build entirely). Keyed on the
       # rustc version because the rustdoc JSON format rotates with the
-      # toolchain. The run_id suffix makes every trusted main run save a fresh
-      # entry; PRs restore-prefix-match the newest one.
+      # toolchain, and on the last release tag because published baselines
+      # remain immutable until the next release.
+      - name: Find latest release tag
+        if: steps.affected.outputs.packages != ''
+        id: baseline
+        run: |
+          tag="$(git describe --tags --abbrev=0 --match 'v[0-9]*')"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Using $tag for the baseline cache."
+
       - name: Restore baseline rustdoc cache
         if: steps.affected.outputs.packages != ''
+        id: baseline-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: target/semver-checks/cache
-          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ github.run_id }}
+          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ steps.baseline.outputs.tag }}
           restore-keys: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
 
       # Deliberately unpinned (like cargo-hack): cargo-semver-checks must
@@ -142,11 +151,14 @@ jobs:
           done <<< "$PACKAGES"
 
       - name: Save baseline rustdoc cache
-        if: github.ref == 'refs/heads/main' && steps.affected.outputs.packages != ''
+        if: >-
+          github.ref == 'refs/heads/main'
+          && steps.affected.outputs.packages != ''
+          && steps.baseline-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: target/semver-checks/cache
-          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ github.run_id }}
+          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ steps.baseline.outputs.tag }}
 
       - name: Explain the failure
         if: failure()

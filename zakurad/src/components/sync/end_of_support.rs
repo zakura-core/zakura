@@ -7,13 +7,19 @@ use color_eyre::Report;
 use zakura_chain::{
     block::Height,
     chain_tip::ChainTip,
-    parameters::{Network, NetworkUpgrade},
+    parameters::{Network, POST_BLOSSOM_POW_TARGET_SPACING},
 };
 
 use crate::application::release_version;
 
 /// The estimated height that this release will be published.
 pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_428_500;
+
+/// The estimated number of blocks per day after Blossom.
+///
+/// All Zakura releases ship after Blossom, so this matches the spacing seen at
+/// every reachable tip height.
+pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET_SPACING;
 
 /// The maximum number of days after `ESTIMATED_RELEASE_HEIGHT` where a Zebra server will run
 /// without halting.
@@ -65,22 +71,26 @@ pub async fn start(
     }
 }
 
+/// Returns the last supported height, or `None` when support is not enforced.
+///
+/// The node runs at this height and halts when the tip goes past it. This
+/// matches zcashd's `end_of_service.block_height` threshold semantics.
+pub fn end_of_support_height(network: &Network) -> Option<Height> {
+    (network == &Network::Mainnet).then_some(Height(
+        ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY),
+    ))
+}
+
 /// Check if the current release is too old and panic if so.
 pub fn check(tip_height: Height, network: &Network) {
     info!("Checking if Zakura release is inside support range ...");
 
-    // Get the current block spacing
-    let target_block_spacing = NetworkUpgrade::target_spacing_for_height(network, tip_height);
-
-    // Get the number of blocks per day
-    let estimated_blocks_per_day =
-        u32::try_from(chrono::Duration::days(1).num_seconds() / target_block_spacing.num_seconds())
-            .expect("number is always small enough to fit");
-
-    let panic_height =
-        Height(ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * estimated_blocks_per_day));
+    let Some(panic_height) = end_of_support_height(network) else {
+        info!("Release always valid outside Mainnet");
+        return;
+    };
     let warn_height =
-        Height(ESTIMATED_RELEASE_HEIGHT + (EOS_WARN_AFTER * estimated_blocks_per_day));
+        Height(ESTIMATED_RELEASE_HEIGHT + (EOS_WARN_AFTER * ESTIMATED_BLOCKS_PER_DAY));
 
     if tip_height > panic_height {
         panic!(

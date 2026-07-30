@@ -8,11 +8,9 @@ use color_eyre::eyre::Result;
 
 use zakura_chain::{block::Height, chain_tip::mock::MockChainTip, parameters::Network};
 use zakurad::components::sync::end_of_support::{
-    self, EOS_PANIC_AFTER, EOS_WARN_AFTER, EOS_WARN_MESSAGE_HEADER, ESTIMATED_RELEASE_HEIGHT,
+    self, EOS_PANIC_AFTER, EOS_WARN_AFTER, EOS_WARN_MESSAGE_HEADER, ESTIMATED_BLOCKS_PER_DAY,
+    ESTIMATED_RELEASE_HEIGHT,
 };
-
-// Estimated blocks per day with the current 75 seconds block spacing.
-const ESTIMATED_BLOCKS_PER_DAY: u32 = 1152;
 
 /// Test that the `end_of_support` function is working as expected.
 #[test]
@@ -50,6 +48,22 @@ fn end_of_support_function() {
     ));
 
     // Panic is tested in `end_of_support_panic`
+}
+
+/// Test that end of support is only reported and enforced on Mainnet.
+#[test]
+fn end_of_support_height_per_network() {
+    let last_supported_height =
+        Height(ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY));
+    assert_eq!(
+        end_of_support::end_of_support_height(&Network::Mainnet),
+        Some(last_supported_height)
+    );
+    end_of_support::check(last_supported_height, &Network::Mainnet);
+
+    let testnet = Network::new_default_testnet();
+    assert_eq!(end_of_support::end_of_support_height(&testnet), None);
+    end_of_support::check(Height::MAX, &testnet);
 }
 
 /// Test that we are never in end of support warning or panic.

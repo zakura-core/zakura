@@ -23,14 +23,14 @@ use zakura_rpc::client::zakura_chain::{
     work::difficulty::{CompactDifficulty, ExpandedDifficulty},
 };
 use zakura_rpc::client::{
-    BlockHeaderObject, BlockObject, BlockTemplateResponse, Commitments, DefaultRoots,
+    BlockHeaderObject, BlockObject, BlockTemplateResponse, Commitments, DefaultRoots, EndOfService,
     FundingStream, GetAddressBalanceRequest, GetAddressBalanceResponse, GetAddressTxIdsRequest,
     GetAddressUtxosResponse, GetAddressUtxosResponseObject, GetBlockHashResponse,
     GetBlockHeaderResponse, GetBlockHeightAndHashResponse, GetBlockResponse,
     GetBlockSubsidyResponse, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
     GetBlockTemplateResponse, GetBlockTransaction, GetBlockTrees, GetBlockchainInfoBalance,
-    GetBlockchainInfoResponse, GetInfoResponse, GetMiningInfoResponse, GetNetworkInfoResponse,
-    GetPeerInfoResponse, GetRawMempoolResponse, GetRawTransactionResponse,
+    GetBlockchainInfoResponse, GetDeprecationInfoResponse, GetInfoResponse, GetMiningInfoResponse,
+    GetNetworkInfoResponse, GetPeerInfoResponse, GetRawMempoolResponse, GetRawTransactionResponse,
     GetSubtreesByIndexResponse, GetTreestateResponse, Hash, Input, JoinSplit, MempoolObject,
     Orchard, OrchardAction, OrchardFlags, Output, PeerInfo, ScriptPubKey, ScriptSig,
     SendRawTransactionResponse, ShieldedOutput, ShieldedSpend, SubmitBlockErrorResponse,
@@ -104,6 +104,41 @@ fn test_get_info() -> Result<(), Box<dyn std::error::Error>> {
         errors_timestamp,
     );
 
+    assert_eq!(obj, new_obj);
+
+    Ok(())
+}
+
+#[test]
+fn test_get_deprecation_info() -> Result<(), Box<dyn std::error::Error>> {
+    let json = r#"
+{
+  "end_of_service": {
+    "block_height": 3546440,
+    "estimated_time": 1769900000
+  }
+}"#;
+    let obj: GetDeprecationInfoResponse = serde_json::from_str(json)?;
+
+    let end_of_service = obj
+        .end_of_service()
+        .clone()
+        .expect("end_of_service is present in the JSON");
+    let block_height = end_of_service.block_height();
+    let estimated_time = end_of_service.estimated_time();
+
+    assert_eq!(block_height, 3_546_440);
+    assert_eq!(estimated_time, 1_769_900_000);
+
+    let new_obj =
+        GetDeprecationInfoResponse::new(Some(EndOfService::new(block_height, estimated_time)));
+    assert_eq!(obj, new_obj);
+
+    let obj: GetDeprecationInfoResponse = serde_json::from_str("{}")?;
+    assert_eq!(*obj.end_of_service(), None);
+    assert_eq!(serde_json::to_string(&obj)?, "{}");
+
+    let new_obj = GetDeprecationInfoResponse::new(None);
     assert_eq!(obj, new_obj);
 
     Ok(())

@@ -68,7 +68,8 @@ use zakura_chain::{
             block_subsidy, founders_reward, funding_stream_values, miner_subsidy,
             FundingStreamReceiver,
         },
-        ConsensusBranchId, Network, NetworkUpgrade, POW_AVERAGING_WINDOW,
+        ConsensusBranchId, Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING,
+        POW_AVERAGING_WINDOW,
     },
     serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     subtree::NoteCommitmentSubtreeIndex,
@@ -193,6 +194,31 @@ pub trait Rpc {
     /// [required for lightwalletd support.](https://github.com/zcash/lightwalletd/blob/v0.4.9/common/common.go#L91-L95)
     #[method(name = "getinfo")]
     async fn get_info(&self) -> Result<GetInfoResponse>;
+
+    /// Returns end-of-support information for this node release, as a
+    /// [`GetDeprecationInfoResponse`] JSON struct.
+    ///
+    /// zcashd reference:
+    /// [`getdeprecationinfo`](https://zcash.github.io/rpc/getdeprecationinfo.html)
+    /// method: post
+    /// tags: network
+    ///
+    /// # Notes
+    ///
+    /// As in zcashd, the `end_of_service` object is only present on Mainnet,
+    /// where end of support is enforced. Zakura reports the estimated last
+    /// height this release supports in `end_of_service.block_height`; the node
+    /// halts when the tip goes past it.
+    ///
+    /// Some fields from the zcashd response are missing from Zakura's response:
+    /// `version` and `subversion` are available from `getinfo`,
+    /// `deprecationheight` is deprecated in zcashd, and Zakura does not have
+    /// zcashd's feature deprecation framework.
+    ///
+    /// The estimate assumes the node is synced to the network tip; during
+    /// initial sync it is significantly overestimated.
+    #[method(name = "getdeprecationinfo")]
+    async fn get_deprecation_info(&self) -> Result<GetDeprecationInfoResponse>;
 
     /// Returns blockchain state information, as a [`GetBlockchainInfoResponse`] JSON struct.
     ///
@@ -810,6 +836,9 @@ where
     /// no matter what the estimated height or local clock is.
     debug_force_finished_sync: bool,
 
+    /// The estimated last height this release supports, if enforced.
+    end_of_support_height: Option<Height>,
+
     // Services
     //
     /// A handle to the mempool service.
@@ -924,6 +953,7 @@ where
             user_agent,
             network: network.clone(),
             debug_force_finished_sync,
+            end_of_support_height: None,
             mempool: mempool.clone(),
             state: state.clone(),
             read_state: read_state.clone(),
@@ -947,6 +977,14 @@ where
     /// Returns a reference to the configured network.
     pub fn network(&self) -> &Network {
         &self.network
+    }
+
+    /// Sets the end-of-support height reported by `getdeprecationinfo`.
+    ///
+    /// When unset, or set to `None`, the RPC omits `end_of_service`.
+    pub fn with_end_of_support_height(mut self, end_of_support_height: Option<Height>) -> Self {
+        self.end_of_support_height = end_of_support_height;
+        self
     }
 }
 
@@ -1011,6 +1049,37 @@ where
         };
 
         Ok(response)
+    }
+
+    async fn get_deprecation_info(&self) -> Result<GetDeprecationInfoResponse> {
+        let end_of_service = self
+            .end_of_support_height
+            // End of support is only enforced on Mainnet. Match zcashd by
+            // omitting `end_of_service` on other networks.
+            .filter(|_| self.network == Network::Mainnet)
+            .map(|end_of_support_height| {
+                // If the tip is unavailable, use the latest checkpoint so the
+                // estimate remains useful during startup.
+                let tip_height = self
+                    .latest_chain_tip
+                    .best_tip_height()
+                    .unwrap_or_else(|| self.network.checkpoint_list().max_height());
+                let remaining_blocks = i64::from(end_of_support_height.0) - i64::from(tip_height.0);
+                let estimated_time = Utc::now()
+                    .timestamp()
+                    .saturating_add(
+                        remaining_blocks.saturating_mul(i64::from(POST_BLOSSOM_POW_TARGET_SPACING)),
+                    )
+                    .saturating_sub(END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN)
+                    .max(0);
+
+                EndOfService {
+                    block_height: end_of_support_height.0,
+                    estimated_time,
+                }
+            });
+
+        Ok(GetDeprecationInfoResponse { end_of_service })
     }
 
     #[allow(clippy::unwrap_in_result)]
@@ -3473,6 +3542,39 @@ impl GetInfoResponse {
 
         Some(version_number)
     }
+}
+
+/// Seconds subtracted from `getdeprecationinfo`'s estimated halt time.
+///
+/// Block times vary, so the halt can happen earlier than a spacing-based
+/// estimate. Reporting it a day early gives consumers time to act.
+const END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN: i64 = 24 * 60 * 60;
+
+/// Response to a `getdeprecationinfo` RPC request.
+///
+/// See the notes for [`Rpc::get_deprecation_info`].
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct GetDeprecationInfoResponse {
+    /// End-of-service information, only present on Mainnet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_of_service: Option<EndOfService>,
+}
+
+/// The `end_of_service` object in a [`GetDeprecationInfoResponse`].
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct EndOfService {
+    /// The estimated last height this server version supports.
+    ///
+    /// The node halts when the chain tip goes past this height.
+    #[getter(copy)]
+    block_height: u32,
+
+    /// Approximate halt time in seconds since the Unix epoch.
+    ///
+    /// This is reported 24 hours earlier than the spacing-based estimate, so
+    /// consumers are warned early when block times vary.
+    #[getter(copy)]
+    estimated_time: i64,
 }
 
 /// Type alias for the array of `GetBlockchainInfoBalance` objects

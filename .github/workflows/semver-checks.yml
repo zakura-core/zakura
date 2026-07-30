@@ -33,6 +33,15 @@ on:
       - .github/workflows/semver-checks.yml
       - .github/workflows/scripts/affected_semver_packages.py
       - .github/workflows/scripts/test_affected_semver_packages.py
+  push:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - .github/workflows/semver-checks.yml
+      - .github/workflows/scripts/affected_semver_packages.py
+      - .github/workflows/scripts/test_affected_semver_packages.py
   workflow_dispatch:
 
 permissions:
@@ -60,15 +69,18 @@ jobs:
         run: |
           python3 .github/workflows/scripts/test_affected_semver_packages.py
 
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            packages="$(
-              python3 .github/workflows/scripts/affected_semver_packages.py --all
-            )"
-          else
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             packages="$(
               python3 .github/workflows/scripts/affected_semver_packages.py \
                 --base "$BASE_SHA" \
                 --head "$GITHUB_SHA"
+            )"
+          else
+            # Trusted main runs populate reusable rustdoc JSON for the latest
+            # stable crates.io baselines. Check every publishable crate so one
+            # cache entry can warm any package selected by a later PR.
+            packages="$(
+              python3 .github/workflows/scripts/affected_semver_packages.py --all
             )"
           fi
 
@@ -90,18 +102,17 @@ jobs:
         id: toolchain
         with:
           toolchain: stable
-          cache-key: semver-checks
-          cache-on-failure: true
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          # cargo-semver-checks removes its temporary build directories after
+          # producing rustdoc JSON. Cache that small final output below rather
+          # than retaining unrelated Cargo registry and target artifacts.
+          cache: false
 
       # cargo-semver-checks reuses generated baseline rustdoc JSON from
       # target/semver-checks/cache (~1-2 MB per crate baseline; a hit skips
-      # that baseline's download and rustdoc build entirely). rust-cache's
-      # target-dir cleaner deletes unrecognized target/ entries before
-      # saving, so this cache needs its own steps. Keyed on the rustc
-      # version: the rustdoc JSON format (and the tool's own invalidation)
-      # rotates with the toolchain. The run_id suffix makes every manual main
-      # run save a fresh entry; restores prefix-match the newest one.
+      # that baseline's download and rustdoc build entirely). Keyed on the
+      # rustc version because the rustdoc JSON format rotates with the
+      # toolchain. The run_id suffix makes every trusted main run save a fresh
+      # entry; PRs restore-prefix-match the newest one.
       - name: Restore baseline rustdoc cache
         if: steps.affected.outputs.packages != ''
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0

@@ -98,9 +98,9 @@ const ZCASHD_COMPAT_LISTENER_TEST_DURATION: Duration = Duration::from_millis(500
 /// The amount of time to make the inbound connection acceptor wait between peer connections.
 const MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS: Duration = Duration::from_millis(25);
 
-/// Misbehavior reports are coalesced per peer and flushed after one second.
+/// Misbehavior reports are coalesced per peer and flushed after five seconds.
 #[tokio::test(start_paused = true)]
-async fn misbehavior_reports_are_batched_for_one_second() {
+async fn misbehavior_reports_are_batched_for_five_seconds() {
     let peer_addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
     let (misbehavior_tx, misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let (address_book_updater, mut address_book_updates) = tokio::sync::mpsc::channel(1);

@@ -69,9 +69,9 @@ type DiscoveredPeer = (PeerSocketAddr, peer::Client);
 ///
 /// Batching caps address book queue and mutex pressure at one flush per
 /// interval, no matter how fast peers send invalid blocks or transactions.
-/// One second keeps ban-threshold score application prompt; do not remove the
+/// Five seconds keeps ban-threshold score application prompt; do not remove the
 /// batching to make bans immediate.
-const MISBEHAVIOR_BATCH_INTERVAL: Duration = Duration::from_secs(1);
+const MISBEHAVIOR_BATCH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Batches peer misbehavior reports before forwarding them to the address book updater.
 async fn batch_misbehavior_reports(

@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -77,15 +78,31 @@ class ContinuousSyncTests(unittest.TestCase):
 
         self.assertEqual(alert_status.metric_height(metrics), 900)
 
-    def test_alert_status_service_query_failure_propagates(self):
-        with (
-            patch.object(
+    def test_alert_status_distinguishes_active_and_inactive_service(self):
+        for active_state, expected in (("active", True), ("inactive", False), ("failed", False)):
+            with self.subTest(active_state=active_state), patch.object(
                 alert_status.subprocess,
                 "run",
-                side_effect=RuntimeError("systemctl timed out"),
+                return_value=subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=f"{active_state}\n",
+                    stderr="",
+                ),
+            ):
+                self.assertIs(alert_status.service_active("zakura.service"), expected)
+
+    def test_alert_status_service_query_failure_propagates(self):
+        with patch.object(
+            alert_status.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr="Failed to connect to bus",
             ),
-            self.assertRaisesRegex(RuntimeError, "systemctl timed out"),
-        ):
+        ), self.assertRaisesRegex(RuntimeError, "Failed to connect to bus"):
             alert_status.service_active("zakura.service")
 
     def test_preflight_checks_dependencies_before_a_cycle(self):

@@ -287,8 +287,9 @@ def update_progress_state(state: dict[str, Any], statuses: list[dict[str, Any]],
         if height is None:
             continue
         record = nodes.setdefault(status["hostname"], {})
-        if record.get("height") != height:
-            record["height"] = height
+        previous_height = record.get("height")
+        record["height"] = height
+        if previous_height is None or height > previous_height:
             record["last_progress"] = ts
         else:
             record.setdefault("last_progress", ts)

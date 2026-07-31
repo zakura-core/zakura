@@ -497,6 +497,43 @@ class ContinuousSyncTests(unittest.TestCase):
 
             post_alert.assert_not_called()
 
+    def test_regressing_higher_peer_does_not_prove_local_stall(self):
+        local = "temp-zakura-sync-test-1"
+        peer = "temp-zakura-sync-test-2"
+        statuses = {
+            local: alert_status_fixture(local, service_active=True, height=10),
+            peer: alert_status_fixture(peer, service_active=True, height=20),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            config = alert_config(Path(tmp), [local, peer], cluster_stall_seconds=10)
+            with (
+                patch.object(alert, "query_node", side_effect=lambda _, node: statuses[node["hostname"]]),
+                patch.object(alert.socket, "gethostname", return_value=local),
+                patch.object(alert, "now", side_effect=[100, 111]),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                statuses[peer]["height"] = 15
+                alert.run_once(config)
+
+            post_alert.assert_not_called()
+
+    def test_height_regression_does_not_reset_progress_time(self):
+        hostname = "temp-zakura-sync-test-1"
+        status = alert_status_fixture(hostname, service_active=True, height=10)
+        state = {"nodes": {}, "alerts": {}}
+
+        alert.update_progress_state(state, [status], 100)
+        status["height"] = 0
+        alert.update_progress_state(state, [status], 111)
+
+        self.assertEqual(state["nodes"][hostname]["height"], 0)
+        self.assertEqual(state["nodes"][hostname]["last_progress"], 100)
+
+        status["height"] = 1
+        alert.update_progress_state(state, [status], 112)
+        self.assertEqual(state["nodes"][hostname]["last_progress"], 112)
+
     def test_failed_stall_recovery_is_retried(self):
         local = "temp-zakura-sync-test-1"
         peer = "temp-zakura-sync-test-2"

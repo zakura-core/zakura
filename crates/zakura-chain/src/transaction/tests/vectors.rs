@@ -2058,6 +2058,40 @@ fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
 }
 
 #[test]
+fn standalone_orchard_proof_size_is_enforced_during_deserialization() {
+    let _init_guard = zakura_test::init();
+
+    let orchard_shielded_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+
+    let canonical_bytes = Some(orchard_shielded_data.clone())
+        .zcash_serialize_to_vec()
+        .expect("serialize");
+    Option::<orchard::ShieldedData>::zcash_deserialize(&canonical_bytes[..])
+        .expect("standalone Orchard data with a canonical proof round-trips");
+
+    let mut short = orchard_shielded_data.clone();
+    short
+        .proof
+        .0
+        .pop()
+        .expect("real Orchard proof is not empty");
+    let mut padded = orchard_shielded_data;
+    padded.proof.0.push(0);
+
+    for noncanonical in [short, padded] {
+        let bytes = Some(noncanonical)
+            .zcash_serialize_to_vec()
+            .expect("serialize");
+        let error = Option::<orchard::ShieldedData>::zcash_deserialize(&bytes[..])
+            .expect_err("standalone Orchard proof size must be canonical");
+        assert_noncanonical_orchard_protocol_proof_size(error);
+    }
+}
+
+#[test]
 fn v5_orchard_proof_size_is_always_enforced_during_deserialization() {
     let _init_guard = zakura_test::init();
 

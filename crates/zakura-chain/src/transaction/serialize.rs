@@ -589,7 +589,7 @@ impl ZcashDeserialize for Option<orchard::ShieldedData> {
         deserialize_orchard_shielded_data_with_flags(
             reader,
             !ALLOW_CROSS_ADDRESS_BIT,
-            ProofSizeEnforcement::Unenforced,
+            ProofSizeEnforcement::Strict,
         )
     }
 }

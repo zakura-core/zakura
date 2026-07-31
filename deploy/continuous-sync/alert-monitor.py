@@ -283,13 +283,29 @@ def post_alert(
 def update_progress_state(state: dict[str, Any], statuses: list[dict[str, Any]], ts: int) -> None:
     nodes = state.setdefault("nodes", {})
     for status in statuses:
+        record = nodes.setdefault(status["hostname"], {})
+        controller_state = status.get("controller_state")
+        run_id = (
+            controller_state.get("current_run")
+            if isinstance(controller_state, dict)
+            else None
+        )
+        previous_run_id = record.get("controller_run")
+        if run_id:
+            if previous_run_id is not None and previous_run_id != run_id:
+                record["progress_reset_pending"] = True
+            record["controller_run"] = run_id
+
         height = status.get("height")
         if height is None:
             continue
-        record = nodes.setdefault(status["hostname"], {})
         previous_height = record.get("height")
         record["height"] = height
-        if previous_height is None or height > previous_height:
+        if (
+            record.pop("progress_reset_pending", False)
+            or previous_height is None
+            or height > previous_height
+        ):
             record["last_progress"] = ts
         else:
             record.setdefault("last_progress", ts)
@@ -329,6 +345,23 @@ def maybe_alert(
             log(config, f"recovery-sent key={key} host={status['hostname']}")
         else:
             record["recovery_pending"] = True
+
+
+def retire_alert(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    key: str,
+    hostname: str,
+    reason: str,
+) -> None:
+    record = state.setdefault("alerts", {}).get(key)
+    if not isinstance(record, dict) or not (
+        record.get("active") or record.get("recovery_pending")
+    ):
+        return
+    record["active"] = False
+    record.pop("recovery_pending", None)
+    log(config, f"alert-retired key={key} host={hostname} reason={reason}")
 
 
 def run_once(config: dict[str, Any]) -> int:
@@ -389,11 +422,23 @@ def run_once(config: dict[str, Any]) -> int:
             f"down-pending-confirmation host={local_host} "
             f"samples={node_record['consecutive_down_samples']}/{required_samples}",
         )
-    if confirmed_down or local_status.get("service_active") is True:
+    controller_owns_lifecycle = controller_failed(local_status) or not expects_node_service(
+        local_status
+    )
+    node_down_key = f"node-service-down:{local_host}"
+    if controller_owns_lifecycle:
+        retire_alert(
+            config,
+            state,
+            node_down_key,
+            local_host,
+            f"controller phase is {controller_phase(local_status)}",
+        )
+    elif confirmed_down or local_status.get("service_active") is True:
         maybe_alert(
             config,
             state,
-            f"node-service-down:{local_host}",
+            node_down_key,
             confirmed_down,
             "NODE DOWN",
             local_status,
@@ -443,7 +488,15 @@ def run_once(config: dict[str, Any]) -> int:
         and isinstance(previous_local_height, int)
         and height > previous_local_height
     )
-    if stalled or (stall_active and (local_progressed or recovery_pending)):
+    if controller_owns_lifecycle:
+        retire_alert(
+            config,
+            state,
+            stall_key,
+            local_host,
+            f"controller phase is {controller_phase(local_status)}",
+        )
+    elif stalled or (stall_active and (local_progressed or recovery_pending)):
         maybe_alert(
             config,
             state,

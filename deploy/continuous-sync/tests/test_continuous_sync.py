@@ -307,10 +307,6 @@ class ContinuousSyncTests(unittest.TestCase):
                 alert.run_once(config)
                 post_alert.assert_called_once()
 
-                status["controller_state"] = {"phase": "failed", "failed": True}
-                alert.run_once(config)
-                post_alert.assert_called_once()
-
                 status["service_active"] = True
                 status["metrics_status"] = "ok"
                 status["height"] = 42
@@ -319,6 +315,32 @@ class ContinuousSyncTests(unittest.TestCase):
             self.assertEqual(post_alert.call_count, 2)
             self.assertEqual(post_alert.call_args_list[0].args[1], "NODE DOWN")
             self.assertEqual(post_alert.call_args_list[1].args[1], "NODE RECOVERED")
+
+    def test_controller_lifecycle_retires_node_down_before_a_fresh_outage(self):
+        hostname = "temp-zakura-sync-test-1"
+        status = alert_status_fixture(hostname, service_active=False, phase="syncing")
+        with tempfile.TemporaryDirectory() as tmp:
+            config = alert_config(Path(tmp), [hostname])
+            with (
+                patch.object(alert, "query_node", return_value=status),
+                patch.object(alert.socket, "gethostname", return_value=hostname),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                alert.run_once(config)
+
+                status["controller_state"] = {"phase": "failed", "failed": True}
+                alert.run_once(config)
+
+                status["controller_state"] = {"phase": "syncing", "failed": False}
+                alert.run_once(config)
+                self.assertEqual(post_alert.call_count, 1)
+                alert.run_once(config)
+
+            self.assertEqual(
+                [call.args[1] for call in post_alert.call_args_list],
+                ["NODE DOWN", "NODE DOWN"],
+            )
 
     def test_metrics_degraded_while_service_active_does_not_page_down(self):
         hostname = "temp-zakura-sync-test-6"
@@ -533,6 +555,43 @@ class ContinuousSyncTests(unittest.TestCase):
         status["height"] = 1
         alert.update_progress_state(state, [status], 112)
         self.assertEqual(state["nodes"][hostname]["last_progress"], 112)
+
+    def test_new_controller_run_retires_stall_and_starts_a_fresh_progress_window(self):
+        local = "temp-zakura-sync-test-1"
+        peer = "temp-zakura-sync-test-2"
+        statuses = {
+            local: alert_status_fixture(local, service_active=True, height=10),
+            peer: alert_status_fixture(peer, service_active=True, height=20),
+        }
+        statuses[local]["controller_state"]["current_run"] = "run-1"
+        statuses[peer]["controller_state"]["current_run"] = "peer-run"
+        with tempfile.TemporaryDirectory() as tmp:
+            config = alert_config(Path(tmp), [local, peer], cluster_stall_seconds=10)
+            with (
+                patch.object(alert, "query_node", side_effect=lambda _, node: statuses[node["hostname"]]),
+                patch.object(alert.socket, "gethostname", return_value=local),
+                patch.object(alert, "now", side_effect=[100, 111, 112, 113, 124]),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                statuses[peer]["height"] = 21
+                alert.run_once(config)
+
+                statuses[local]["controller_state"].update({"phase": "failed", "failed": True})
+                alert.run_once(config)
+
+                statuses[local] = alert_status_fixture(local, service_active=True, height=0)
+                statuses[local]["controller_state"]["current_run"] = "run-2"
+                alert.run_once(config)
+                self.assertEqual(post_alert.call_count, 1)
+
+                statuses[peer]["height"] = 22
+                alert.run_once(config)
+
+            self.assertEqual(
+                [call.args[1] for call in post_alert.call_args_list],
+                ["SYNC STALLED", "SYNC STALLED"],
+            )
 
     def test_failed_stall_recovery_is_retried(self):
         local = "temp-zakura-sync-test-1"

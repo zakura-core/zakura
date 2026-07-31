@@ -84,7 +84,7 @@ impl CommitmentRootVerification {
     }
 }
 
-/// Identifies whether VCT verification rejected the current block body or a supplied root.
+/// Identifies which exact VCT verification input failed.
 #[derive(Debug)]
 pub(crate) enum CommitmentRootVerificationError {
     /// The current block body does not match its parent-history commitment.
@@ -92,8 +92,13 @@ pub(crate) enum CommitmentRootVerificationError {
         height: Height,
         error: ValidateContextError,
     },
-    /// A supplied root failed a direct check or the successor commitment check.
-    SuppliedRoot {
+    /// The current block's supplied roots failed a direct check or history-tree fold.
+    CurrentRoots {
+        height: Height,
+        error: ValidateContextError,
+    },
+    /// The successor header rejected the candidate tree containing the current roots.
+    SuccessorBoundary {
         height: Height,
         error: ValidateContextError,
     },
@@ -101,16 +106,31 @@ pub(crate) enum CommitmentRootVerificationError {
 
 impl CommitmentRootVerificationError {
     #[cfg(test)]
+    fn failure_kind(&self) -> crate::error::VctCommitFailure {
+        match self {
+            Self::CurrentRoots { .. } => crate::error::VctCommitFailure::CurrentRoots,
+            Self::SuccessorBoundary { .. } => crate::error::VctCommitFailure::SuccessorBoundary,
+            Self::CurrentBlock { .. } => {
+                panic!("current block failures are not auxiliary metadata failures")
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn height(&self) -> Height {
         match self {
-            Self::CurrentBlock { height, .. } | Self::SuppliedRoot { height, .. } => *height,
+            Self::CurrentBlock { height, .. }
+            | Self::CurrentRoots { height, .. }
+            | Self::SuccessorBoundary { height, .. } => *height,
         }
     }
 
     #[cfg(test)]
     fn error(&self) -> &ValidateContextError {
         match self {
-            Self::CurrentBlock { error, .. } | Self::SuppliedRoot { error, .. } => error,
+            Self::CurrentBlock { error, .. }
+            | Self::CurrentRoots { error, .. }
+            | Self::SuccessorBoundary { error, .. } => error,
         }
     }
 }
@@ -290,7 +310,9 @@ where
                         ValidateContextError::HistoryTreeError(error)
                     }
                 })
-                .map_err(|error| CommitmentRootVerificationError::SuppliedRoot { height, error })?;
+                .map_err(|error| {
+                    CommitmentRootVerificationError::SuccessorBoundary { height, error }
+                })?;
             }
         }
 
@@ -300,11 +322,11 @@ where
 
         let block = block.expect("verification items with supplied roots have a block body");
         verify_supplied_sapling_root_below_heartwood(network, &block, &sapling_root)
-            .map_err(|error| CommitmentRootVerificationError::SuppliedRoot { height, error })?;
+            .map_err(|error| CommitmentRootVerificationError::CurrentRoots { height, error })?;
         verify_supplied_orchard_root_below_nu5(network, height, &orchard_root)
-            .map_err(|error| CommitmentRootVerificationError::SuppliedRoot { height, error })?;
+            .map_err(|error| CommitmentRootVerificationError::CurrentRoots { height, error })?;
         verify_supplied_ironwood_root_below_nu6_3(network, height, &ironwood_root)
-            .map_err(|error| CommitmentRootVerificationError::SuppliedRoot { height, error })?;
+            .map_err(|error| CommitmentRootVerificationError::CurrentRoots { height, error })?;
 
         // Fold this block's supplied roots into the running MMR (builds the leaf
         // from the block body tx-counts + the roots).
@@ -312,7 +334,7 @@ where
             .push(network, block, &sapling_root, &orchard_root, &ironwood_root)
             .map_err(Arc::new)
             .map_err(ValidateContextError::from)
-            .map_err(|error| CommitmentRootVerificationError::SuppliedRoot { height, error })?;
+            .map_err(|error| CommitmentRootVerificationError::CurrentRoots { height, error })?;
     }
 
     Ok(history_tree)
@@ -701,6 +723,11 @@ mod tests {
             failure.height().0,
             activation + 1,
             "a wrong root at H is detected at H+1 (the lag)"
+        );
+        assert_eq!(
+            failure.failure_kind(),
+            crate::error::VctCommitFailure::SuccessorBoundary,
+            "the verifier preserves that the successor boundary detected the mismatch"
         );
     }
 

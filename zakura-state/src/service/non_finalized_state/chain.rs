@@ -33,6 +33,7 @@ use zakura_chain::{
     value_balance::ValueBalance,
     work::difficulty::PartialCumulativeWork,
 };
+use zakura_header_chain::{ChainScore, SuffixWork};
 
 use crate::{
     request::Treestate, service::check, ContextuallyVerifiedBlock, HashOrHeight, OutputLocation,
@@ -2649,28 +2650,19 @@ impl Ord for Chain {
     /// [1]: super::NonFinalizedState
     /// [2]: super::NonFinalizedState::chain_set
     fn cmp(&self, other: &Self) -> Ordering {
-        if self.partial_cumulative_work != other.partial_cumulative_work {
-            self.partial_cumulative_work
-                .cmp(&other.partial_cumulative_work)
-        } else {
-            let self_hash = self
+        let score = |chain: &Self| {
+            let tip = chain
                 .blocks
                 .values()
                 .last()
-                .expect("always at least 1 element")
+                .expect("a non-finalized chain always contains a block")
                 .hash;
-
-            let other_hash = other
-                .blocks
-                .values()
-                .last()
-                .expect("always at least 1 element")
-                .hash;
-
-            // This comparison is a tie-breaker within the local node, so it does not need to
-            // be consistent with the ordering on `ExpandedDifficulty` and `block::Hash`.
-            self_hash.0.cmp(&other_hash.0)
-        }
+            ChainScore::new(
+                SuffixWork::new(chain.partial_cumulative_work.as_u256()),
+                tip,
+            )
+        };
+        score(self).cmp(&score(other))
     }
 }
 

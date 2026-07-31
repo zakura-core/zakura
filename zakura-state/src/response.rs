@@ -19,7 +19,7 @@ use zakura_chain::{
     value_balance::ValueBalance,
 };
 
-use zakura_chain::work::difficulty::CompactDifficulty;
+use zakura_chain::work::difficulty::{CompactDifficulty, U256};
 
 // Allow *only* these unused imports, so that rustdoc link resolution
 // will work with inline links.
@@ -37,12 +37,24 @@ mod tests;
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].
 pub enum Response {
+    /// Response to [`Request::ApplyHeaderChainInsert`].
+    HeaderChainInsertApplied(zakura_header_chain::ApplyResult),
+
+    /// Result of persisting one retryable header-chain body-availability result.
+    HeaderChainBodyUnavailableRecorded(zakura_header_chain::ApplyResult),
+
+    /// Result of persisting one deterministic header-chain body rejection.
+    HeaderChainBodyInvalidRecorded(zakura_header_chain::ApplyResult),
+
+    /// Result of restarting one persistent body-unavailability episode.
+    HeaderChainBodyAvailabilityRestarted(zakura_header_chain::ApplyResult),
+
+    /// Result of an authenticated operator body-availability retry.
+    HeaderChainBodyAvailabilityRetried(zakura_header_chain::ApplyResult),
+
     /// Response to [`Request::CommitSemanticallyVerifiedBlock`] and [`Request::CommitCheckpointVerifiedBlock`]
     /// indicating that a block was successfully committed to the state.
     Committed(block::Hash),
-
-    /// Response to [`Request::AuthenticateHeaderRoots`] after durable promotion.
-    AuthenticatedHeaderRoots(crate::AuthenticatedHeaderRoots),
 
     /// Response to [`Request::InvalidateBlock`] indicating that a block was found and
     /// invalidated in the state.
@@ -468,11 +480,30 @@ pub enum ReadResponse {
     /// The response to a `FindBlockHeaders` request.
     BlockHeaders(Vec<block::CountedHeader>),
 
-    /// Response to [`ReadRequest::HeadersByHeightRange`].
-    Headers(Vec<(block::Height, block::Hash, Arc<block::Header>)>),
+    /// Response to [`ReadRequest::HeaderChainSnapshot`], absent before semantic handoff.
+    HeaderChainSnapshot(Option<zakura_header_chain::EngineSnapshot>),
 
-    /// Response to [`ReadRequest::BestDurableHeaderTip`].
-    BestDurableHeaderTip(Option<(block::Height, block::Hash)>),
+    /// Response to [`ReadRequest::HeaderLocator`], absent before semantic handoff.
+    HeaderLocator(Option<zakura_header_chain::HeaderLocator>),
+
+    /// Response to [`ReadRequest::HeaderValidationLease`], absent before attachment or after
+    /// the requested parent ceased to be retained.
+    HeaderValidationLease(Option<zakura_header_chain::ValidationLease>),
+
+    /// Response to [`ReadRequest::VctRepairContext`], absent when its owner is stale.
+    VctRepairContext(Option<zakura_header_chain::VctRepairContext>),
+
+    /// Response to [`ReadRequest::AcquireRetainedHeaderPath`].
+    RetainedHeaderPathLease(crate::RetainedPathLeaseOutcome),
+
+    /// Response to [`ReadRequest::ReadRetainedHeaderPath`].
+    RetainedHeaderPathPage(crate::RetainedPathReadOutcome),
+
+    /// Response to [`ReadRequest::ReleaseRetainedHeaderPath`].
+    RetainedHeaderPathReleased(bool),
+
+    /// Response to [`ReadRequest::BestHeaderTip`].
+    BestHeaderTip(Option<(block::Height, block::Hash)>),
 
     /// Response to [`ReadRequest::MissingBlockBodies`].
     MissingBlockBodies(Vec<block::Height>),
@@ -557,7 +588,7 @@ pub enum ReadResponse {
     ChainInfo(GetBlockTemplateChainInfo),
 
     /// Response to [`ReadRequest::SolutionRate`]
-    SolutionRate(Option<u128>),
+    SolutionRate(Option<U256>),
 
     /// Response to [`ReadRequest::CheckBlockProposalValidity`]
     ValidBlockProposal,
@@ -671,8 +702,14 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::AddressesTransactionIds(_)
             | ReadResponse::AddressUtxos(_)
             | ReadResponse::ChainInfo(_)
-            | ReadResponse::Headers(_)
-            | ReadResponse::BestDurableHeaderTip(_)
+            | ReadResponse::HeaderChainSnapshot(_)
+            | ReadResponse::HeaderLocator(_)
+            | ReadResponse::HeaderValidationLease(_)
+            | ReadResponse::VctRepairContext(_)
+            | ReadResponse::RetainedHeaderPathLease(_)
+            | ReadResponse::RetainedHeaderPathPage(_)
+            | ReadResponse::RetainedHeaderPathReleased(_)
+            | ReadResponse::BestHeaderTip(_)
             | ReadResponse::MissingBlockBodies(_)
             | ReadResponse::MissingBlockBodyMetadata(_)
             | ReadResponse::BlockSizeHints(_)

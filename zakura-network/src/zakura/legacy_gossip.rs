@@ -3666,6 +3666,7 @@ mod tests {
         let (service_send, _peer_recv) = framed_channel(8);
         let stream = ServiceStream::new(
             session_id,
+            LEGACY_GOSSIP_VERSION,
             service_recv,
             service_send,
             cancel_token.child_token(),

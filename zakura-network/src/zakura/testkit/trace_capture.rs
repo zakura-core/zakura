@@ -201,9 +201,8 @@ mod tests {
 
     use crate::zakura::{
         trace::{
-            block_sync_trace as bs_trace, commit_state_trace as cs_trace,
-            header_sync_trace as hs_trace, BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, CONN_TABLE,
-            HEADER_SYNC_TABLE,
+            block_sync_trace as bs_trace, commit_state_trace as cs_trace, BLOCK_SYNC_TABLE,
+            COMMIT_STATE_TABLE, CONN_TABLE, HEADER_SYNC_TABLE,
         },
         ZakuraTrace, ZakuraTraceEvent,
     };
@@ -329,7 +328,7 @@ mod tests {
         });
         trace.emit_with(HEADER_SYNC_TABLE, |row| {
             row.insert(
-                hs_trace::EVENT.to_string(),
+                "event".to_string(),
                 serde_json::Value::String("header_test".to_string()),
             );
         });

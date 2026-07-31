@@ -595,13 +595,16 @@ where
         &self,
         block: Arc<Block>,
     ) -> Result<CheckpointVerifiedBlock, VerifyCheckpointError> {
-        let hash = block.hash();
+        let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
+            .map_err(BlockError::from)?;
         let height = block
             .coinbase_height()
             .ok_or(VerifyCheckpointError::CoinbaseHeight { hash })?;
         self.check_height(height)?;
 
-        if self.network.disable_pow() {
+        let pow_policy = zakura_header_chain::PowPolicy::for_network(&self.network)
+            .map_err(VerifyBlockError::from)?;
+        if pow_policy.is_authenticated_custom_waiver() {
             crate::block::check::difficulty_threshold_is_valid(
                 &block.header,
                 &self.network,
@@ -1035,6 +1038,53 @@ impl From<equihash::Error> for VerifyCheckpointError {
 }
 
 impl VerifyCheckpointError {
+    /// Classify checkpoint verification without attributing scheduler or state failures to peers.
+    pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
+        use zakura_header_chain::{
+            BodyCommitmentKind, BodyRuleId, BodyVerificationClass, TransientBodyFailureKind,
+        };
+
+        let consensus = |rule| BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(rule));
+        match self {
+            Self::AlreadyVerified { .. } | Self::NewerRequest { .. } => {
+                BodyVerificationClass::Duplicate
+            }
+            Self::CoinbaseHeight { .. } => BodyVerificationClass::PayloadMismatch(
+                BodyCommitmentKind::Other("missing_coinbase_height"),
+            ),
+            Self::BadMerkleRoot { .. } => {
+                BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot)
+            }
+            Self::DuplicateTransaction => consensus("checkpoint.duplicate_transaction"),
+            Self::VerifyBlock(error) => error.body_verification_class(),
+            Self::SubsidyError(_) => consensus("checkpoint.subsidy"),
+            Self::AmountError(_) => consensus("checkpoint.amount"),
+            Self::CommitCheckpointVerified(source) => source
+                .downcast_ref::<zs::CommitCheckpointVerifiedError>()
+                .map(|error| error.inner().body_verification_class())
+                .or_else(|| {
+                    source
+                        .downcast_ref::<zs::CommitBlockError>()
+                        .map(zs::CommitBlockError::body_verification_class)
+                })
+                .unwrap_or(BodyVerificationClass::Retryable(
+                    TransientBodyFailureKind::Storage,
+                )),
+            Self::Finished
+            | Self::TooHigh { .. }
+            | Self::UnexpectedSideChain { .. }
+            | Self::ShuttingDown => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::Canceled)
+            }
+            Self::Dropped | Self::Tip(_) | Self::CheckpointList(_) => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
+            Self::QueuedLimit => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::ResourceExhausted)
+            }
+        }
+    }
+
     /// Returns `true` if this is definitely a duplicate request.
     /// Some duplicate requests might not be detected, and therefore return `false`.
     pub fn is_duplicate_request(&self) -> bool {

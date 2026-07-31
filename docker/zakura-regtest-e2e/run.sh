@@ -223,11 +223,8 @@ if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
   grep -q '^ephemeral = false$' "${CONFIG_DIR}/node2.toml" \
     || fail "failed to make node2 state persistent for restart-matrix"
 fi
-# node2 runs with the default header-sync config (accept_new_blocks = true). We no
-# longer try to force a body gap by suppressing tip-flood acceptance — that never
-# worked, because node2 still fills bodies via the inbound advertisement -> download
-# path regardless of that flag. kind-6 block sync is instead exercised by the
-# from-scratch reset phase below, which removes gossip as a source entirely.
+# Header sync has no block-relay toggle. Kind-6 block sync is exercised by the
+# from-scratch reset phase below, which removes gossip as a body source entirely.
 export ZAKURA_NODE1_CONFIG="${CONFIG_DIR}/node1.toml"
 export ZAKURA_NODE2_CONFIG="${CONFIG_DIR}/node2.toml"
 export ZAKURA_NODE3_CONFIG="${CONFIG_DIR}/node3.toml"

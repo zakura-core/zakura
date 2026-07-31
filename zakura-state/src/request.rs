@@ -829,42 +829,6 @@ impl MappedRequest for CommitCheckpointVerifiedBlockRequest {
     }
 }
 
-/// Authenticate canonical supplied header roots through the serialized state writer.
-pub struct AuthenticateHeaderRootsRequest {
-    /// Exact compact state snapshot used to construct this request.
-    pub expected_state: crate::HeaderRootAuthState,
-    /// Current authenticated frontier hash.
-    pub anchor: block::Hash,
-    /// First supplied item height.
-    pub start: block::Height,
-    /// Canonical stored headers.
-    pub headers: Vec<Arc<block::Header>>,
-    /// Roots aligned with `headers`.
-    pub roots: Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>,
-}
-
-impl MappedRequest for AuthenticateHeaderRootsRequest {
-    type MappedResponse = crate::AuthenticatedHeaderRoots;
-    type Error = crate::AuthenticateHeaderRootsError;
-
-    fn map_request(self) -> Request {
-        Request::AuthenticateHeaderRoots {
-            expected_state: self.expected_state,
-            anchor: self.anchor,
-            start: self.start,
-            headers: self.headers,
-            roots: self.roots,
-        }
-    }
-
-    fn map_response(response: Response) -> Self::MappedResponse {
-        match response {
-            Response::AuthenticatedHeaderRoots(success) => success,
-            _ => unreachable!("wrong response variant for request"),
-        }
-    }
-}
-
 /// Request to invalidate a block in the state.
 ///
 /// See the [`crate`] documentation and [`Request::InvalidateBlock`] for details.
@@ -913,6 +877,52 @@ impl MappedRequest for ReconsiderBlockRequest {
 /// A query about or modification to the chain state, via the
 /// [`StateService`](crate::service::StateService).
 pub enum Request {
+    /// Atomically admit one complete, already prepared header target through the serialized
+    /// fork-aware header-chain writer.
+    ApplyHeaderChainInsert {
+        /// Durable version observed while acquiring the validation context.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Sealed complete-target insertion; other transition authorities are unrepresentable.
+        insert: Box<zakura_header_chain::InsertHeaders>,
+    },
+
+    /// Persist one retryable body-availability result through the serialized
+    /// fork-aware header-chain writer.
+    ///
+    /// This request deliberately accepts only transient evidence. Deterministic
+    /// consensus invalidity remains constructible only at the full verifier boundary.
+    RecordHeaderChainBodyUnavailable {
+        /// Durable version that owned the body retry attempt.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Exact body and bounded retry-episode summary.
+        failure: zakura_header_chain::TransientBodyFailure,
+    },
+
+    /// Persist one commitment-matching deterministic body rejection through the
+    /// serialized fork-aware header-chain writer.
+    RecordHeaderChainBodyInvalid {
+        /// Durable version that owned the body verification attempt.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Exact invalid body conclusion and its authenticated supplier.
+        invalid: zakura_header_chain::ConsensusBodyInvalid,
+    },
+
+    /// Persist a fresh retry episode after authenticated supplier discovery.
+    RestartHeaderChainBodyAvailability {
+        /// Durable version whose selected alarm is being restarted.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Exact supplier-set evidence and fresh episode summary.
+        discovery: zakura_header_chain::BodySupplierDiscovered,
+    },
+
+    /// Persist a fresh retry episode after an authenticated operator request.
+    RetryHeaderChainBodyAvailability {
+        /// Durable version whose selected alarm is being retried.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Exact operator evidence and fresh episode summary.
+        retry: zakura_header_chain::OperatorBodyRetry,
+    },
+
     /// Performs contextual validation of the given semantically verified block,
     /// committing it to the state if successful.
     ///
@@ -990,46 +1000,6 @@ pub enum Request {
     ///
     /// [0]: (crate::error::CommitCheckpointVerifiedError)
     CommitCheckpointVerifiedBlock(CheckpointVerifiedBlock),
-
-    /// Persist a validated, contiguous run of Zakura headers that links to `anchor`.
-    ///
-    /// Header-only commits write separate header-sync indexes, not finalized block
-    /// indexes. They do not write transaction/body rows and therefore do not make
-    /// the block known to body-serving APIs.
-    CommitHeaderRange {
-        /// Hash of the held parent header for the first header in `headers`.
-        anchor: block::Hash,
-        /// Contiguous headers in ascending height order.
-        headers: Vec<Arc<block::Header>>,
-        /// Advisory serialized body sizes, parallel to `headers`.
-        ///
-        /// A `0` value means unknown. These hints are not consensus data.
-        body_sizes: Vec<u32>,
-        /// Legacy tree-aux payload, ignored by header validity and persistence.
-        ///
-        /// Call [`Request::AuthenticateHeaderRoots`] after the canonical headers
-        /// are durable to authenticate and promote aligned roots.
-        tree_aux_roots: Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>,
-    },
-
-    /// Authenticate aligned roots for canonical stored headers and durably promote them.
-    ///
-    /// The range must start immediately after `expected_state`'s authenticated
-    /// height. Normal advancement includes at least one root plus its successor
-    /// header witness; an explicitly scheduled missing-witness recovery contains
-    /// exactly the terminal witness record.
-    AuthenticateHeaderRoots {
-        /// Exact compact state snapshot on which the caller built this request.
-        expected_state: crate::HeaderRootAuthState,
-        /// Current authenticated frontier hash.
-        anchor: block::Hash,
-        /// First supplied header and root height.
-        start: block::Height,
-        /// Canonical stored headers in ascending contiguous order.
-        headers: Vec<Arc<block::Header>>,
-        /// Roots aligned one-for-one with `headers`.
-        roots: Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>,
-    },
 
     /// Computes the depth in the current best chain of the block identified by the given hash.
     ///
@@ -1241,10 +1211,19 @@ impl Request {
     /// Returns a [`&'static str`](str) name of the variant representing this value.
     pub fn variant_name(&self) -> &'static str {
         match self {
+            Request::ApplyHeaderChainInsert { .. } => "apply_header_chain_insert",
+            Request::RecordHeaderChainBodyUnavailable { .. } => {
+                "record_header_chain_body_unavailable"
+            }
+            Request::RecordHeaderChainBodyInvalid { .. } => "record_header_chain_body_invalid",
+            Request::RestartHeaderChainBodyAvailability { .. } => {
+                "restart_header_chain_body_availability"
+            }
+            Request::RetryHeaderChainBodyAvailability { .. } => {
+                "retry_header_chain_body_availability"
+            }
             Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
-            Request::CommitHeaderRange { .. } => "commit_header_range",
-            Request::AuthenticateHeaderRoots { .. } => "authenticate_header_roots",
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Depth(_) => "depth",
             Request::Tip => "tip",
@@ -1479,15 +1458,66 @@ pub enum ReadRequest {
         stop: Option<block::Hash>,
     },
 
-    /// Returns contiguous headers by height, in ascending order.
-    ///
-    /// The response stops before the first missing height and is capped by
-    /// [`MAX_HEADER_SYNC_HEIGHT_RANGE`](crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE).
-    HeadersByHeightRange {
-        /// First height to read.
-        start: block::Height,
-        /// Maximum number of headers to return.
-        count: u32,
+    /// Returns the latest atomic committed header-engine snapshot after semantic handoff.
+    HeaderChainSnapshot,
+
+    /// Returns the exact committed selected-header locator after semantic handoff.
+    HeaderLocator,
+
+    /// Return the exact immutable branch context for preparing children of `parent_hash`.
+    HeaderValidationLease {
+        /// Retained parent fixed by the requester's initial locator intersection.
+        parent_hash: block::Hash,
+    },
+
+    /// Resolve one current branch-owned VCT repair to its exact selected request context.
+    VctRepairContext {
+        /// Complete owner captured when the repair was scheduled.
+        owner: zakura_header_chain::WorkOwner,
+        /// Exact selected height whose auxiliary metadata is unavailable.
+        height: block::Height,
+    },
+
+    /// Acquire one immutable retained path for an exact header-sync target.
+    AcquireRetainedHeaderPath {
+        /// Stable requesting peer identity.
+        peer: zakura_header_chain::SourceId,
+        /// Ordered-stream generation that owns the lease.
+        session_id: u64,
+        /// Exact target named by the peer's status.
+        target_tip_hash: block::Hash,
+        /// Exact generation and branch captured before the state read.
+        scope: zakura_header_chain::WorkScope,
+        /// Locator hashes in requester order.
+        locator_hashes: Vec<block::Hash>,
+    },
+
+    /// Read and renew one bounded hash-keyed page from an immutable lease.
+    ReadRetainedHeaderPath {
+        /// Stable requesting peer identity.
+        peer: zakura_header_chain::SourceId,
+        /// Ordered-stream generation that owns the lease.
+        session_id: u64,
+        /// Exact state-issued lease identity.
+        lease_id: u64,
+        /// Exact generation and branch fixed by the lease.
+        scope: zakura_header_chain::WorkScope,
+        /// Common ancestor or prior page tip.
+        after_hash: block::Hash,
+        /// Maximum nodes returned.
+        max_count: u32,
+    },
+
+    /// Release one retained path owned by this exact peer session.
+    ReleaseRetainedHeaderPath {
+        /// Stable requesting peer identity.
+        peer: zakura_header_chain::SourceId,
+        /// Ordered-stream generation that owns the lease.
+        session_id: u64,
+        /// Exact state-issued lease identity.
+        lease_id: u64,
+        /// Exact generation and branch fixed by the lease.
+        scope: zakura_header_chain::WorkScope,
     },
 
     /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)
@@ -1500,11 +1530,8 @@ pub enum ReadRequest {
         count: u32,
     },
 
-    /// Returns the highest contiguous header held in the durable full-block/header database.
-    ///
-    /// This request never consults the in-memory non-finalized chain, so its
-    /// result is safe to use as a [`Request::CommitHeaderRange`] anchor.
-    BestDurableHeaderTip,
+    /// Returns the highest header held on disk.
+    BestHeaderTip,
 
     /// Returns header-known, body-missing heights in `(verified_block_tip, best_header_tip]`.
     MissingBlockBodies {
@@ -1739,9 +1766,15 @@ impl ReadRequest {
             ReadRequest::BlockLocator => "block_locator",
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
-            ReadRequest::HeadersByHeightRange { .. } => "headers_by_height_range",
+            ReadRequest::HeaderChainSnapshot => "header_chain_snapshot",
+            ReadRequest::HeaderLocator => "header_locator",
+            ReadRequest::HeaderValidationLease { .. } => "header_validation_lease",
+            ReadRequest::VctRepairContext { .. } => "vct_repair_context",
+            ReadRequest::AcquireRetainedHeaderPath { .. } => "acquire_retained_header_path",
+            ReadRequest::ReadRetainedHeaderPath { .. } => "read_retained_header_path",
+            ReadRequest::ReleaseRetainedHeaderPath { .. } => "release_retained_header_path",
             ReadRequest::BlockRoots { .. } => "block_roots",
-            ReadRequest::BestDurableHeaderTip => "best_durable_header_tip",
+            ReadRequest::BestHeaderTip => "best_header_tip",
             ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",
             ReadRequest::MissingBlockBodyMetadata { .. } => "missing_block_body_metadata",
             ReadRequest::BlockSizeHints { .. } => "block_size_hints",
@@ -1819,10 +1852,13 @@ impl TryFrom<Request> for ReadRequest {
                 Ok(ReadRequest::CheckBestChainTipNullifiersAndAnchors(tx))
             }
 
-            Request::CommitSemanticallyVerifiedBlock(_)
+            Request::ApplyHeaderChainInsert { .. }
+            | Request::RecordHeaderChainBodyUnavailable { .. }
+            | Request::RecordHeaderChainBodyInvalid { .. }
+            | Request::RestartHeaderChainBodyAvailability { .. }
+            | Request::RetryHeaderChainBodyAvailability { .. }
+            | Request::CommitSemanticallyVerifiedBlock(_)
             | Request::CommitCheckpointVerifiedBlock(_)
-            | Request::CommitHeaderRange { .. }
-            | Request::AuthenticateHeaderRoots { .. }
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),
 
@@ -1845,53 +1881,6 @@ impl TryFrom<Request> for ReadRequest {
 pub struct TimedSpan {
     timer: CodeTimer,
     span: tracing::Span,
-}
-
-#[cfg(test)]
-mod header_root_auth_tests {
-    use super::*;
-
-    #[test]
-    fn typed_header_root_auth_request_dispatches_typed_response() {
-        let state = crate::HeaderRootAuthState {
-            authenticated_height: block::Height(10),
-            authenticated_hash: block::Hash([1; 32]),
-            completed_checkpoint_height: block::Height(20),
-            completed_checkpoint_hash: block::Hash([2; 32]),
-            header_witness: None,
-        };
-        let request = AuthenticateHeaderRootsRequest {
-            expected_state: state,
-            anchor: state.authenticated_hash,
-            start: block::Height(11),
-            headers: Vec::new(),
-            roots: Vec::new(),
-        }
-        .map_request();
-        assert_eq!(request.variant_name(), "authenticate_header_roots");
-        assert!(matches!(
-            request,
-            Request::AuthenticateHeaderRoots {
-                expected_state,
-                anchor,
-                start: block::Height(11),
-                ..
-            } if expected_state == state && anchor == state.authenticated_hash
-        ));
-
-        let success = crate::AuthenticatedHeaderRoots {
-            state,
-            update: crate::HeaderRootAuthUpdate::Advanced {
-                authenticated: block::Height(11)..=block::Height(19),
-            },
-        };
-        assert_eq!(
-            AuthenticateHeaderRootsRequest::map_response(Response::AuthenticatedHeaderRoots(
-                success.clone()
-            )),
-            success
-        );
-    }
 }
 
 impl TimedSpan {

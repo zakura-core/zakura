@@ -18,7 +18,7 @@ use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -52,16 +52,15 @@ use crate::{
     service::{
         block_iter::any_ancestor_blocks,
         chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip},
-        finalized_state::{FinalizedState, ZakuraDb},
+        finalized_state::{header_chain::HeaderChainStoreError, FinalizedState, ZakuraDb},
         non_finalized_state::{Chain, NonFinalizedState},
         pending_utxos::PendingUtxos,
         queued_blocks::QueuedBlocks,
         read::find,
         watch_receiver::WatchReceiver,
     },
-    BoxError, CheckpointVerifiedBlock, CommitHeaderRangeError, CommitSemanticallyVerifiedError,
-    Config, KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
-    StateInitError,
+    BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config, KnownBlock,
+    ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock, StateInitError,
 };
 
 pub mod block_iter;
@@ -243,21 +242,20 @@ pub struct ReadStateService {
     /// once the queues have received all their parent blocks.
     ///
     /// Used to check for panics when writing blocks.
-    block_write_task: Option<Arc<std::thread::JoinHandle<()>>>,
-
-    /// Watch channel publishing durable completed-checkpoint advances.
-    highest_completed_checkpoint_receiver:
-        tokio::sync::watch::Receiver<Option<finalized_state::HighestCompletedCheckpoint>>,
-
-    /// Keeps the completed-checkpoint watch open in read-only services.
-    _highest_completed_checkpoint_sender:
-        Option<tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>>,
+    block_write_task: Option<Arc<std::thread::JoinHandle<write::BlockWriteTaskExit>>>,
+    /// Shared fail-closed attachment result, visible to every clone without joining the worker.
+    block_write_failure: Arc<OnceLock<write::BlockWriteTaskFailure>>,
 
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
     vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
-    /// Compact durable header-root authentication progress.
-    header_root_auth_receiver:
-        tokio::sync::watch::Receiver<Option<finalized_state::HeaderRootAuthState>>,
+
+    /// Committed header-engine snapshots, absent until the semantic handoff audit succeeds.
+    header_chain_snapshot_receiver:
+        tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+
+    /// Coherent durable header-engine reader, absent until semantic handoff.
+    header_chain_reader_receiver:
+        tokio::sync::watch::Receiver<Option<finalized_state::header_chain::HeaderChainReader>>,
 }
 
 impl Drop for StateService {
@@ -310,10 +308,14 @@ impl Drop for ReadStateService {
                 debug!("waiting for the block write task to finish");
 
                 // TODO: move this into a check_for_panics() method
-                if let Err(thread_panic) = block_write_task_handle.join() {
-                    std::panic::resume_unwind(thread_panic);
-                } else {
-                    debug!("shutting down the state because the block write task has finished");
+                match block_write_task_handle.join() {
+                    Err(thread_panic) => std::panic::resume_unwind(thread_panic),
+                    Ok(write::BlockWriteTaskExit::HeaderChainAttachmentFailed(error)) => {
+                        tracing::error!(?error, "block write task stopped during header attachment")
+                    }
+                    Ok(write::BlockWriteTaskExit::Completed) => {
+                        debug!("shutting down the state because the block write task has finished")
+                    }
                 }
             }
         } else {
@@ -408,13 +410,16 @@ impl StateService {
         let finalized_state_for_writing = finalized_state.clone();
         let should_use_finalized_block_write_sender = non_finalized_state.is_chain_set_empty();
         let sync_backup_dir_path = backup_dir_path.filter(|_| skip_backup_task);
+        let (header_chain_snapshot_sender, header_chain_snapshot_receiver) =
+            tokio::sync::watch::channel(None);
+        let (header_chain_reader_sender, header_chain_reader_receiver) =
+            tokio::sync::watch::channel(None);
         let (
             block_write_sender,
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
-            highest_completed_checkpoint_receiver,
             vct_root_repair_receiver,
-            header_root_auth_receiver,
+            block_write_failure,
             block_write_task,
         ) = write::BlockWriteSender::spawn(
             finalized_state_for_writing,
@@ -423,16 +428,20 @@ impl StateService {
             non_finalized_state_sender,
             should_use_finalized_block_write_sender,
             sync_backup_dir_path,
+            write::HeaderChainObservers::new(
+                header_chain_snapshot_sender,
+                header_chain_reader_sender,
+            ),
         );
 
         let read_service = ReadStateService::new(
             &finalized_state,
             block_write_task,
+            block_write_failure,
             non_finalized_state_receiver,
-            highest_completed_checkpoint_receiver,
-            None,
             vct_root_repair_receiver,
-            header_root_auth_receiver,
+            header_chain_snapshot_receiver,
+            header_chain_reader_receiver,
         );
 
         let full_verifier_utxo_lookahead = max_checkpoint_height
@@ -1008,80 +1017,132 @@ impl StateService {
         rsp_rx
     }
 
-    fn send_header_range(
+    fn send_header_chain_insert(
         &self,
-        anchor: block::Hash,
-        headers: Vec<Arc<block::Header>>,
-        body_sizes: Vec<u32>,
-        tree_aux_roots: Vec<BlockCommitmentRoots>,
-    ) -> oneshot::Receiver<Result<block::Hash, CommitHeaderRangeError>> {
+        expected_version: zakura_header_chain::StateVersion,
+        insert: Box<zakura_header_chain::InsertHeaders>,
+    ) -> oneshot::Receiver<Result<zakura_header_chain::ApplyResult, HeaderChainStoreError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
-
         let Some(sender) = &self.block_write_sender.non_finalized else {
-            let _ = rsp_tx.send(Err(CommitHeaderRangeError::SendCommitRequestFailed));
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
             return rsp_rx;
         };
-
-        if let Err(tokio::sync::mpsc::error::SendError(error)) =
-            sender.send(NonFinalizedWriteMessage::CommitHeaderRange {
-                anchor,
-                headers,
-                body_sizes,
-                tree_aux_roots,
+        if let Err(tokio::sync::mpsc::error::SendError(message)) =
+            sender.send(NonFinalizedWriteMessage::ApplyHeaderChainInsert {
+                expected_version,
+                insert,
                 rsp_tx,
             })
         {
-            let NonFinalizedWriteMessage::CommitHeaderRange { rsp_tx, .. } = error else {
-                unreachable!("should return the same CommitHeaderRange message could not be sent");
+            let NonFinalizedWriteMessage::ApplyHeaderChainInsert { rsp_tx, .. } = message else {
+                unreachable!("the failed send returns the same header insertion message");
             };
-
-            let _ = rsp_tx.send(Err(CommitHeaderRangeError::SendCommitRequestFailed));
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
         }
-
         rsp_rx
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn send_authenticate_header_roots(
+    fn send_header_chain_body_unavailable(
         &self,
-        expected_state: finalized_state::HeaderRootAuthState,
-        anchor: block::Hash,
-        start: block::Height,
-        headers: Vec<Arc<block::Header>>,
-        roots: Vec<BlockCommitmentRoots>,
-    ) -> oneshot::Receiver<
-        Result<
-            finalized_state::AuthenticatedHeaderRoots,
-            finalized_state::AuthenticateHeaderRootsError,
-        >,
-    > {
+        expected_version: zakura_header_chain::StateVersion,
+        failure: zakura_header_chain::TransientBodyFailure,
+    ) -> oneshot::Receiver<Result<zakura_header_chain::ApplyResult, HeaderChainStoreError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
         let Some(sender) = &self.block_write_sender.non_finalized else {
-            let _ = rsp_tx.send(Err(
-                finalized_state::AuthenticateHeaderRootsError::Frontier(
-                    finalized_state::HeaderRootAuthFrontierError::WriteTaskUnavailable,
-                ),
-            ));
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
             return rsp_rx;
         };
-        if let Err(tokio::sync::mpsc::error::SendError(error)) =
-            sender.send(NonFinalizedWriteMessage::AuthenticateHeaderRoots {
-                expected_state,
-                anchor,
-                start,
-                headers,
-                roots,
+        if let Err(tokio::sync::mpsc::error::SendError(message)) =
+            sender.send(NonFinalizedWriteMessage::RecordHeaderChainBodyUnavailable {
+                expected_version,
+                failure,
                 rsp_tx,
             })
         {
-            let NonFinalizedWriteMessage::AuthenticateHeaderRoots { rsp_tx, .. } = error else {
-                unreachable!("send returned the same authentication message");
+            let NonFinalizedWriteMessage::RecordHeaderChainBodyUnavailable { rsp_tx, .. } = message
+            else {
+                unreachable!("the failed send returns the same body-availability message");
             };
-            let _ = rsp_tx.send(Err(
-                finalized_state::AuthenticateHeaderRootsError::Frontier(
-                    finalized_state::HeaderRootAuthFrontierError::WriteTaskUnavailable,
-                ),
-            ));
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+        }
+        rsp_rx
+    }
+
+    fn send_header_chain_body_invalid(
+        &self,
+        expected_version: zakura_header_chain::StateVersion,
+        invalid: zakura_header_chain::ConsensusBodyInvalid,
+    ) -> oneshot::Receiver<Result<zakura_header_chain::ApplyResult, HeaderChainStoreError>> {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        let Some(sender) = &self.block_write_sender.non_finalized else {
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+            return rsp_rx;
+        };
+        if let Err(tokio::sync::mpsc::error::SendError(message)) =
+            sender.send(NonFinalizedWriteMessage::RecordHeaderChainBodyInvalid {
+                expected_version,
+                invalid,
+                rsp_tx,
+            })
+        {
+            let NonFinalizedWriteMessage::RecordHeaderChainBodyInvalid { rsp_tx, .. } = message
+            else {
+                unreachable!("the failed send returns the same invalid-body message");
+            };
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+        }
+        rsp_rx
+    }
+
+    fn send_header_chain_body_availability_restart(
+        &self,
+        expected_version: zakura_header_chain::StateVersion,
+        discovery: zakura_header_chain::BodySupplierDiscovered,
+    ) -> oneshot::Receiver<Result<zakura_header_chain::ApplyResult, HeaderChainStoreError>> {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        let Some(sender) = &self.block_write_sender.non_finalized else {
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+            return rsp_rx;
+        };
+        if let Err(tokio::sync::mpsc::error::SendError(message)) = sender.send(
+            NonFinalizedWriteMessage::RestartHeaderChainBodyAvailability {
+                expected_version,
+                discovery,
+                rsp_tx,
+            },
+        ) {
+            let NonFinalizedWriteMessage::RestartHeaderChainBodyAvailability { rsp_tx, .. } =
+                message
+            else {
+                unreachable!("the failed send returns the same body-restart message");
+            };
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+        }
+        rsp_rx
+    }
+
+    fn send_header_chain_body_availability_retry(
+        &self,
+        expected_version: zakura_header_chain::StateVersion,
+        retry: zakura_header_chain::OperatorBodyRetry,
+    ) -> oneshot::Receiver<Result<zakura_header_chain::ApplyResult, HeaderChainStoreError>> {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        let Some(sender) = &self.block_write_sender.non_finalized else {
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
+            return rsp_rx;
+        };
+        if let Err(tokio::sync::mpsc::error::SendError(message)) =
+            sender.send(NonFinalizedWriteMessage::RetryHeaderChainBodyAvailability {
+                expected_version,
+                retry,
+                rsp_tx,
+            })
+        {
+            let NonFinalizedWriteMessage::RetryHeaderChainBodyAvailability { rsp_tx, .. } = message
+            else {
+                unreachable!("the failed send returns the same operator-retry message");
+            };
+            let _ = rsp_tx.send(Err(HeaderChainStoreError::Uninitialized));
         }
         rsp_rx
     }
@@ -1112,17 +1173,15 @@ impl ReadStateService {
     /// and a watch channel for updating the shared recent non-finalized chain.
     pub(crate) fn new(
         finalized_state: &FinalizedState,
-        block_write_task: Option<Arc<std::thread::JoinHandle<()>>>,
+        block_write_task: Option<Arc<std::thread::JoinHandle<write::BlockWriteTaskExit>>>,
+        block_write_failure: Arc<OnceLock<write::BlockWriteTaskFailure>>,
         non_finalized_state_receiver: WatchReceiver<NonFinalizedState>,
-        highest_completed_checkpoint_receiver: tokio::sync::watch::Receiver<
-            Option<finalized_state::HighestCompletedCheckpoint>,
-        >,
-        highest_completed_checkpoint_sender: Option<
-            tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>,
-        >,
         vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
-        header_root_auth_receiver: tokio::sync::watch::Receiver<
-            Option<finalized_state::HeaderRootAuthState>,
+        header_chain_snapshot_receiver: tokio::sync::watch::Receiver<
+            Option<zakura_header_chain::EngineSnapshot>,
+        >,
+        header_chain_reader_receiver: tokio::sync::watch::Receiver<
+            Option<finalized_state::header_chain::HeaderChainReader>,
         >,
     ) -> Self {
         let read_service = Self {
@@ -1130,10 +1189,10 @@ impl ReadStateService {
             db: finalized_state.db.clone(),
             non_finalized_state_receiver,
             block_write_task,
-            highest_completed_checkpoint_receiver,
-            _highest_completed_checkpoint_sender: highest_completed_checkpoint_sender,
+            block_write_failure,
             vct_root_repair_receiver,
-            header_root_auth_receiver,
+            header_chain_snapshot_receiver,
+            header_chain_reader_receiver,
         };
 
         tracing::debug!("created new read-only state service");
@@ -1151,18 +1210,11 @@ impl ReadStateService {
         self.vct_root_repair_receiver.clone()
     }
 
-    /// Subscribe to durable completed-checkpoint advances.
-    pub fn subscribe_highest_completed_checkpoint(
+    /// Subscribe to snapshots published only after a durable header-engine commit.
+    pub fn subscribe_header_chain_snapshots(
         &self,
-    ) -> tokio::sync::watch::Receiver<Option<finalized_state::HighestCompletedCheckpoint>> {
-        self.highest_completed_checkpoint_receiver.clone()
-    }
-
-    /// Subscribe to compact durable header-root authentication progress.
-    pub fn subscribe_header_root_auth(
-        &self,
-    ) -> tokio::sync::watch::Receiver<Option<finalized_state::HeaderRootAuthState>> {
-        self.header_root_auth_receiver.clone()
+    ) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>> {
+        self.header_chain_snapshot_receiver.clone()
     }
 
     /// Gets a clone of the latest non-finalized state from the `non_finalized_state_receiver`
@@ -1239,6 +1291,78 @@ impl Service<Request> for StateService {
         let span = Span::current();
 
         match req {
+            Request::ApplyHeaderChainInsert {
+                expected_version,
+                insert,
+            } => {
+                let rsp_rx = self.send_header_chain_insert(expected_version, insert);
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| BoxError::from("header-chain writer exited"))?
+                        .map(Response::HeaderChainInsertApplied)
+                        .map_err(BoxError::from)
+                }
+                .boxed()
+            }
+            Request::RecordHeaderChainBodyUnavailable {
+                expected_version,
+                failure,
+            } => {
+                let rsp_rx = self.send_header_chain_body_unavailable(expected_version, failure);
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| BoxError::from("header-chain writer exited"))?
+                        .map(Response::HeaderChainBodyUnavailableRecorded)
+                        .map_err(BoxError::from)
+                }
+                .boxed()
+            }
+            Request::RecordHeaderChainBodyInvalid {
+                expected_version,
+                invalid,
+            } => {
+                let rsp_rx = self.send_header_chain_body_invalid(expected_version, invalid);
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| BoxError::from("header-chain writer exited"))?
+                        .map(Response::HeaderChainBodyInvalidRecorded)
+                        .map_err(BoxError::from)
+                }
+                .boxed()
+            }
+            Request::RestartHeaderChainBodyAvailability {
+                expected_version,
+                discovery,
+            } => {
+                let rsp_rx =
+                    self.send_header_chain_body_availability_restart(expected_version, discovery);
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| BoxError::from("header-chain writer exited"))?
+                        .map(Response::HeaderChainBodyAvailabilityRestarted)
+                        .map_err(BoxError::from)
+                }
+                .boxed()
+            }
+            Request::RetryHeaderChainBodyAvailability {
+                expected_version,
+                retry,
+            } => {
+                let rsp_rx =
+                    self.send_header_chain_body_availability_retry(expected_version, retry);
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| BoxError::from("header-chain writer exited"))?
+                        .map(Response::HeaderChainBodyAvailabilityRetried)
+                        .map_err(BoxError::from)
+                }
+                .boxed()
+            }
             // Uses non_finalized_state_queued_blocks and pending_utxos in the StateService
             // Accesses shared writeable state in the StateService, NonFinalizedState, and ZakuraDb.
             //
@@ -1340,67 +1464,6 @@ impl Service<Request> for StateService {
                 .boxed()
             }
 
-            Request::CommitHeaderRange {
-                anchor,
-                headers,
-                body_sizes,
-                tree_aux_roots,
-            } => {
-                let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| {
-                        self.send_header_range(anchor, headers, body_sizes, tree_aux_roots)
-                    })
-                });
-
-                let span = Span::current();
-                async move {
-                    rsp_rx
-                        .await
-                        .map_err(|_recv_error| CommitHeaderRangeError::CommitResponseDropped)
-                        .and_then(|result| result)
-                        .map_err(BoxError::from)
-                        .map(Response::Committed)
-                }
-                .instrument(span)
-                .boxed()
-            }
-
-            Request::AuthenticateHeaderRoots {
-                expected_state,
-                anchor,
-                start,
-                headers,
-                roots,
-            } => {
-                let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| {
-                        self.send_authenticate_header_roots(
-                            expected_state,
-                            anchor,
-                            start,
-                            headers,
-                            roots,
-                        )
-                    })
-                });
-
-                let span = Span::current();
-                async move {
-                    rsp_rx
-                        .await
-                        .map_err(|_| {
-                            finalized_state::AuthenticateHeaderRootsError::Frontier(
-                                finalized_state::HeaderRootAuthFrontierError::WriteTaskUnavailable,
-                            )
-                        })
-                        .and_then(|result| result)
-                        .map_err(BoxError::from)
-                        .map(Response::AuthenticatedHeaderRoots)
-                }
-                .instrument(span)
-                .boxed()
-            }
-
             // Uses pending_utxos and non_finalized_state_queued_blocks in the StateService.
             // If the UTXO isn't in the queued blocks, runs concurrently using the ReadStateService.
             Request::AwaitUtxo(outpoint) => {
@@ -1479,8 +1542,6 @@ impl Service<Request> for StateService {
             // Used by sync, inbound, and block verifier to check if a block is already in the state
             // before downloading or validating it.
             Request::KnownBlock(hash) => {
-                self.drain_non_finalized_rejected_hashes();
-
                 let timer = CodeTimer::start();
                 let sent_hash_response = self.known_sent_hash(&hash);
                 let read_service = self.read_service.clone();
@@ -1584,60 +1645,26 @@ impl Service<Request> for StateService {
     }
 }
 
-fn headers_by_height_range<C>(
-    chain: Option<C>,
-    db: &ZakuraDb,
-    start: block::Height,
-    count: u32,
-) -> Vec<(block::Height, block::Hash, Arc<block::Header>)>
-where
-    C: AsRef<Chain> + Clone,
-{
-    let capped_count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
-    let mut headers = Vec::with_capacity(
-        usize::try_from(capped_count).expect("capped header count fits in usize"),
-    );
-    let mut height = start;
-
-    for _ in 0..capped_count {
-        let next_header = read::hash_by_height(chain.clone(), db, height)
-            .and_then(|hash| {
-                read::block_header(chain.clone(), db, height.into())
-                    .map(|header| (height, hash, header))
-            })
-            .or_else(|| db.headers_by_height_range(height, 1).into_iter().next());
-
-        let Some(header) = next_header else {
-            break;
-        };
-
-        headers.push(header);
-
-        let Ok(next_height) = height.next() else {
-            break;
-        };
-        height = next_height;
-    }
-
-    headers
-}
-
 fn missing_block_body_metadata<C>(
     chain: Option<C>,
     db: &ZakuraDb,
+    header_chain: Option<&finalized_state::header_chain::HeaderChainReader>,
     from: block::Height,
     limit: u32,
-) -> Vec<(block::Height, block::Hash, Option<u32>)>
+) -> Result<
+    Vec<(block::Height, block::Hash, Option<u32>)>,
+    finalized_state::header_chain::HeaderChainStoreError,
+>
 where
     C: AsRef<Chain> + Clone,
 {
     let verified_block_tip = read::tip_height(chain.clone(), db);
-    let best_header_tip = db
-        .best_header_tip()
-        .map(|(height, _)| height)
-        .max(verified_block_tip);
+    let best_header_tip = match header_chain {
+        Some(reader) => Some(reader.selected_tip()?.height),
+        None => verified_block_tip,
+    };
     let Some(best_header_tip) = best_header_tip else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let start = verified_block_tip
@@ -1645,7 +1672,7 @@ where
         .map_or(from, |first_missing| first_missing.max(from));
 
     if start > best_header_tip {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let count = limit
@@ -1655,24 +1682,37 @@ where
         .into_iter()
         .collect();
 
-    (0..count)
-        .filter_map(|offset| start.0.checked_add(offset).map(block::Height))
-        .filter(|height| !db.contains_body_at_height(*height))
-        .filter_map(|height| {
-            read::hash_by_height(chain.clone(), db, height)
-                .or_else(|| db.header_hash(height))
-                .map(|hash| (height, hash, size_hints.get(&height).copied().flatten()))
-        })
-        .take(usize::try_from(limit).expect("u32 limit fits in usize on supported targets"))
-        .collect()
+    let mut metadata = Vec::new();
+    for offset in 0..count {
+        let Some(height) = start.0.checked_add(offset).map(block::Height) else {
+            break;
+        };
+        if db.contains_body_at_height(height) {
+            continue;
+        }
+        let hash = match read::hash_by_height(chain.clone(), db, height) {
+            Some(hash) => Some(hash),
+            None => header_chain
+                .map(|reader| reader.selected_hash(height))
+                .transpose()?
+                .flatten(),
+        };
+        let Some(hash) = hash else {
+            continue;
+        };
+        metadata.push((height, hash, size_hints.get(&height).copied().flatten()));
+    }
+
+    Ok(metadata)
 }
 
 fn block_roots_by_height_range<C>(
     chain: Option<C>,
     db: &ZakuraDb,
+    header_chain: Option<&finalized_state::header_chain::HeaderChainReader>,
     start: block::Height,
     count: u32,
-) -> Vec<BlockCommitmentRoots>
+) -> Result<Vec<BlockCommitmentRoots>, HeaderChainStoreError>
 where
     C: AsRef<Chain>,
 {
@@ -1685,15 +1725,17 @@ where
         Some(_) => "mixed",
     };
     metrics::counter!("state.block_roots.response", "source" => source).increment(1);
-    let mut roots =
-        Vec::with_capacity(usize::try_from(capped_count).expect("capped root count fits in usize"));
+    let mut roots = Vec::new();
+    let mut selected_aux_roots: Option<std::vec::IntoIter<BlockCommitmentRoots>> = None;
 
     for offset in 0..capped_count {
         let Some(height) = start + i64::from(offset) else {
             break;
         };
 
-        let root = if db
+        let root = if let Some(selected_aux_roots) = selected_aux_roots.as_mut() {
+            selected_aux_roots.next()
+        } else if db
             .finalized_tip_height()
             .is_some_and(|finalized_tip| height <= finalized_tip)
         {
@@ -1742,9 +1784,17 @@ where
                 _ => None,
             }
         } else {
-            db.commitment_roots_by_height_range(height..=height)
-                .into_iter()
-                .next()
+            if selected_aux_roots.is_none() {
+                let remaining = capped_count.saturating_sub(offset);
+                selected_aux_roots = Some(
+                    header_chain
+                        .map(|reader| reader.selected_block_roots(height, remaining))
+                        .transpose()?
+                        .unwrap_or_default()
+                        .into_iter(),
+                );
+            }
+            selected_aux_roots.as_mut().and_then(Iterator::next)
         };
 
         let Some(root) = root else {
@@ -1758,7 +1808,7 @@ where
         roots.push(root);
     }
 
-    roots
+    Ok(roots)
 }
 
 impl Service<ReadRequest> for ReadStateService {
@@ -1768,6 +1818,10 @@ impl Service<ReadRequest> for ReadStateService {
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
     fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if let Some(error) = self.block_write_failure.get() {
+            return Poll::Ready(Err(Box::new(error.clone())));
+        }
+
         // Check for panics in the block write task
         //
         // TODO: move into a check_for_panics() method
@@ -1777,8 +1831,12 @@ impl Service<ReadRequest> for ReadStateService {
             if block_write_task.is_finished() {
                 if let Some(block_write_task) = Arc::into_inner(block_write_task) {
                     // We are the last state with a reference to this task, so we can propagate any panics
-                    if let Err(thread_panic) = block_write_task.join() {
-                        std::panic::resume_unwind(thread_panic);
+                    match block_write_task.join() {
+                        Err(thread_panic) => std::panic::resume_unwind(thread_panic),
+                        Ok(write::BlockWriteTaskExit::HeaderChainAttachmentFailed(error)) => {
+                            return Poll::Ready(Err(Box::new(error)));
+                        }
+                        Ok(write::BlockWriteTaskExit::Completed) => {}
                     }
                 }
             } else {
@@ -1993,9 +2051,88 @@ impl Service<ReadRequest> for ReadStateService {
                 .collect(),
             )),
 
-            ReadRequest::HeadersByHeightRange { start, count } => Ok(ReadResponse::Headers(
-                headers_by_height_range(state.latest_best_chain(), &state.db, start, count),
-            )),
+            ReadRequest::HeaderLocator => {
+                let reader = state.header_chain_reader_receiver.borrow().clone();
+                let locator = reader.map(|reader| reader.selected_locator()).transpose()?;
+                Ok(ReadResponse::HeaderLocator(locator))
+            }
+
+            ReadRequest::HeaderValidationLease { parent_hash } => {
+                let reader = state.header_chain_reader_receiver.borrow().clone();
+                let lease = reader
+                    .map(|reader| reader.validation_context(parent_hash))
+                    .transpose()?
+                    .flatten();
+                Ok(ReadResponse::HeaderValidationLease(lease))
+            }
+
+            ReadRequest::VctRepairContext { owner, height } => {
+                let reader = state.header_chain_reader_receiver.borrow().clone();
+                let context = reader
+                    .map(|reader| reader.vct_repair_context(owner, height))
+                    .transpose()?
+                    .flatten();
+                Ok(ReadResponse::VctRepairContext(context))
+            }
+
+            ReadRequest::AcquireRetainedHeaderPath {
+                peer,
+                session_id,
+                target_tip_hash,
+                scope,
+                locator_hashes,
+            } => {
+                let Some(reader) = state.header_chain_reader_receiver.borrow().clone() else {
+                    return Ok(ReadResponse::RetainedHeaderPathLease(
+                        crate::RetainedPathLeaseOutcome::TargetNotRetained,
+                    ));
+                };
+                Ok(ReadResponse::RetainedHeaderPathLease(
+                    reader.acquire_retained_path(
+                        peer,
+                        session_id,
+                        target_tip_hash,
+                        &locator_hashes,
+                        scope,
+                    )?,
+                ))
+            }
+
+            ReadRequest::ReadRetainedHeaderPath {
+                peer,
+                session_id,
+                lease_id,
+                scope,
+                after_hash,
+                max_count,
+            } => {
+                let Some(reader) = state.header_chain_reader_receiver.borrow().clone() else {
+                    return Ok(ReadResponse::RetainedHeaderPathPage(
+                        crate::RetainedPathReadOutcome::Unavailable,
+                    ));
+                };
+                Ok(ReadResponse::RetainedHeaderPathPage(
+                    reader.read_retained_path(
+                        peer, session_id, lease_id, scope, after_hash, max_count,
+                    )?,
+                ))
+            }
+
+            ReadRequest::ReleaseRetainedHeaderPath {
+                peer,
+                session_id,
+                lease_id,
+                scope,
+            } => {
+                let released = state
+                    .header_chain_reader_receiver
+                    .borrow()
+                    .clone()
+                    .map(|reader| reader.release_retained_path(peer, session_id, lease_id, scope))
+                    .transpose()?
+                    .unwrap_or(false);
+                Ok(ReadResponse::RetainedHeaderPathReleased(released))
+            }
 
             ReadRequest::BlockRoots {
                 start_height,
@@ -2007,25 +2144,37 @@ impl Service<ReadRequest> for ReadStateService {
                     block_roots_by_height_range(
                         state.latest_best_chain(),
                         &state.db,
+                        state.header_chain_reader_receiver.borrow().as_ref(),
                         start_height,
                         count,
-                    )
+                    )?
                 };
 
                 Ok(ReadResponse::BlockRoots(roots))
             }
 
-            ReadRequest::BestDurableHeaderTip => Ok(ReadResponse::BestDurableHeaderTip(
-                state.db.best_header_tip(),
+            ReadRequest::BestHeaderTip => {
+                let header_chain_reader = state.header_chain_reader_receiver.borrow().clone();
+                let tip = match header_chain_reader {
+                    Some(reader) => reader
+                        .selected_tip()
+                        .map(|tip| Some((tip.height, tip.hash)))?,
+                    None => read::tip(state.latest_best_chain(), &state.db),
+                };
+                Ok(ReadResponse::BestHeaderTip(tip))
+            }
+
+            ReadRequest::HeaderChainSnapshot => Ok(ReadResponse::HeaderChainSnapshot(
+                state.header_chain_snapshot_receiver.borrow().clone(),
             )),
 
             ReadRequest::MissingBlockBodies { from, limit } => {
                 let verified_block_tip = read::tip_height(state.latest_best_chain(), &state.db);
-                let best_header_tip = state
-                    .db
-                    .best_header_tip()
-                    .map(|(height, _)| height)
-                    .max(verified_block_tip);
+                let header_chain_reader = state.header_chain_reader_receiver.borrow().clone();
+                let best_header_tip = match header_chain_reader {
+                    Some(reader) => Some(reader.selected_tip()?.height),
+                    None => verified_block_tip,
+                };
 
                 Ok(ReadResponse::MissingBlockBodies(
                     state
@@ -2035,8 +2184,15 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::MissingBlockBodyMetadata { from, limit } => {
+                let reader = state.header_chain_reader_receiver.borrow().clone();
                 Ok(ReadResponse::MissingBlockBodyMetadata(
-                    missing_block_body_metadata(state.latest_best_chain(), &state.db, from, limit),
+                    missing_block_body_metadata(
+                        state.latest_best_chain(),
+                        &state.db,
+                        reader.as_ref(),
+                        from,
+                        limit,
+                    )?,
                 ))
             }
 
@@ -2376,20 +2532,20 @@ pub fn init_read_only(
         tokio::sync::watch::channel(NonFinalizedState::new(network));
     let (_vct_root_repair_sender, vct_root_repair_receiver) =
         tokio::sync::watch::channel(VctRootRepairStatus::default());
-    let (highest_completed_checkpoint, highest_completed_checkpoint_receiver) =
-        finalized_state::HighestCompletedCheckpointTracker::open(&finalized_state.db);
-    let highest_completed_checkpoint_sender = Some(highest_completed_checkpoint.keepalive_sender());
-    let (_header_root_auth_sender, header_root_auth_receiver) = tokio::sync::watch::channel(None);
+    let (_header_chain_snapshot_sender, header_chain_snapshot_receiver) =
+        tokio::sync::watch::channel(None);
+    let (_header_chain_reader_sender, header_chain_reader_receiver) =
+        tokio::sync::watch::channel(None);
 
     Ok((
         ReadStateService::new(
             &finalized_state,
             None,
+            Arc::new(OnceLock::new()),
             WatchReceiver::new(non_finalized_state_receiver),
-            highest_completed_checkpoint_receiver,
-            highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
-            header_root_auth_receiver,
+            header_chain_snapshot_receiver,
+            header_chain_reader_receiver,
         ),
         finalized_state.db.clone(),
         non_finalized_state_sender,

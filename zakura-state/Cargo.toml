@@ -35,6 +35,7 @@ indexer = []
 commit-metrics = []
 
 # Test-only features
+header-fuzz = []
 proptest-impl = [
     "proptest",
     "proptest-derive",
@@ -77,6 +78,7 @@ zakura-vct-sprout-history = { workspace = true }
 
 zakura-node-services = { path = "../zakura-node-services", version = "3.0.0" }
 zakura-chain = { path = "../zakura-chain", version = "3.0.0", features = ["async-error"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0-rc0" }
 
 # prod feature progress-bar
 howudoin = { workspace = true, optional = true }

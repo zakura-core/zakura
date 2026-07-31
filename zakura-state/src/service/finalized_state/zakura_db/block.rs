@@ -29,16 +29,12 @@ use zakura_chain::{
     transaction::{self, Transaction},
     transparent,
     value_balance::ValueBalance,
-    work::difficulty::PartialCumulativeWork,
 };
 
 use crate::{
-    constants::{
-        MAX_BLOCK_REORG_HEIGHT, MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_PRUNE_HEIGHTS_PER_COMMIT,
-    },
-    error::{CommitCheckpointVerifiedError, CommitHeaderRangeError, StoreIncoherentError},
+    constants::MAX_PRUNE_HEIGHTS_PER_COMMIT,
+    error::CommitCheckpointVerifiedError,
     request::FinalizedBlock,
-    service::check,
     service::finalized_state::{
         disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
         disk_format::{
@@ -49,30 +45,27 @@ use crate::{
         zakura_db::{metrics::block_precommit_metrics, ZakuraDb},
         FromDisk, IntoDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
     },
-    HashOrHeight,
+    CommitBlockError, HashOrHeight,
 };
 
 #[cfg(feature = "indexer")]
 use crate::request::Spend;
 
-mod startup_audit;
-
 #[cfg(test)]
 mod tests;
 
-const ZAKURA_HEADER_HASH_BY_HEIGHT: &str = "zakura_header_hash_by_height";
-const ZAKURA_HEADER_HEIGHT_BY_HASH: &str = "zakura_header_height_by_hash";
-const ZAKURA_HEADER_BY_HEIGHT: &str = "zakura_header_by_height";
+pub(in crate::service::finalized_state) const ZAKURA_HEADER_HASH_BY_HEIGHT: &str =
+    "zakura_header_hash_by_height";
+pub(in crate::service::finalized_state) const ZAKURA_HEADER_HEIGHT_BY_HASH: &str =
+    "zakura_header_height_by_hash";
+pub(in crate::service::finalized_state) const ZAKURA_HEADER_BY_HEIGHT: &str =
+    "zakura_header_by_height";
 pub const ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT: &str = "zakura_header_body_size_by_height";
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct AdvertisedBodySize(u32);
 
 impl AdvertisedBodySize {
-    fn new(size: u32) -> Option<Self> {
-        (size != 0).then_some(Self(size))
-    }
-
     fn get(self) -> u32 {
         self.0
     }
@@ -479,132 +472,6 @@ impl ZakuraDb {
         self.block(height.into())
     }
 
-    /// Returns the highest header stored on disk.
-    #[allow(clippy::unwrap_in_result)]
-    pub fn best_header_tip(&self) -> Option<(block::Height, block::Hash)> {
-        let body_tip = self.tip();
-        let zakura_header_tip = self.zakura_header_tip();
-
-        match (body_tip, zakura_header_tip) {
-            (Some(body_tip), Some(header_tip)) if body_tip.0 >= header_tip.0 => Some(body_tip),
-            (Some(_), Some(header_tip)) => Some(header_tip),
-            (Some(body_tip), None) => Some(body_tip),
-            (None, Some(header_tip)) => Some(header_tip),
-            (None, None) => None,
-        }
-    }
-
-    /// Returns a contiguous ascending header range from full blocks and Zakura header rows.
-    pub fn headers_by_height_range(
-        &self,
-        start: block::Height,
-        count: u32,
-    ) -> Vec<(block::Height, block::Hash, Arc<block::Header>)> {
-        let capped_count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
-
-        let mut headers = Vec::with_capacity(
-            usize::try_from(capped_count).expect("capped header count fits in usize"),
-        );
-        let mut height = start;
-
-        for _ in 0..capped_count {
-            let Some((hash, header)) = self.header_by_height(height) else {
-                break;
-            };
-
-            headers.push((height, hash, header));
-
-            let Ok(next_height) = height.next() else {
-                break;
-            };
-            height = next_height;
-        }
-
-        headers
-    }
-
-    /// Returns recent header difficulty/time context in reverse height order,
-    /// starting at `height`, verifying `previous_block_hash` linkage at every
-    /// step of the walk.
-    ///
-    /// Returns an empty context when there is no stored row at `height` (the
-    /// caller decides whether that anchor is unknown), and a shorter-than-span
-    /// context when the walk reaches genesis.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreIncoherentError`] when the walk finds a header row that
-    /// is not the block its hash row names, a row that does not link to the
-    /// row below it, or a gap below a stored row. Feeding such a window into
-    /// difficulty validation would mix rows from more than one branch (or
-    /// shift the adjustment window), producing `InvalidDifficultyThreshold`
-    /// rejections of honest input — the reader surfaces the storage fault
-    /// explicitly instead. The per-row hash check costs one header hash per
-    /// consumed row, negligible next to the validation the window feeds.
-    pub fn recent_header_context(
-        &self,
-        height: block::Height,
-    ) -> Result<
-        Vec<(
-            zakura_chain::work::difficulty::CompactDifficulty,
-            DateTime<Utc>,
-        )>,
-        StoreIncoherentError,
-    > {
-        let mut context = Vec::with_capacity(check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN);
-
-        let Some((mut hash, mut header)) = self.header_by_height(height) else {
-            return Ok(context);
-        };
-        let mut height = height;
-
-        loop {
-            let computed = block::Hash::from(&*header);
-            if computed != hash {
-                return Err(StoreIncoherentError::HeaderHashMismatch {
-                    height,
-                    indexed: hash,
-                    computed,
-                });
-            }
-
-            context.push((header.difficulty_threshold, header.time));
-
-            if context.len() == check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN {
-                return Ok(context);
-            }
-            let Ok(below) = height.previous() else {
-                // The walk reached genesis: a short context is legitimate, and
-                // the difficulty functions handle it (MedianTime clamps
-                // negative heights to zero).
-                return Ok(context);
-            };
-
-            let Some((below_hash, below_header)) = self.header_by_height(below) else {
-                // Rows must be contiguous from genesis up to the header tip
-                // (full-block rows below the body tip — retained even under
-                // pruning — and zakura rows above it), so a missing row below
-                // a stored one is a gap, not the end of history.
-                return Err(StoreIncoherentError::Gap {
-                    height,
-                    missing: below,
-                });
-            };
-
-            if header.previous_block_hash != below_hash {
-                return Err(StoreIncoherentError::BrokenLinkage {
-                    height,
-                    expected_parent: header.previous_block_hash,
-                    actual_below: below_hash,
-                });
-            }
-
-            height = below;
-            hash = below_hash;
-            header = below_header;
-        }
-    }
-
     /// Returns header-known, body-missing heights.
     pub fn missing_block_bodies(
         &self,
@@ -627,56 +494,15 @@ impl ZakuraDb {
 
         let count = limit.min(best_header_tip.0.saturating_sub(start.0).saturating_add(1));
 
-        self.headers_by_height_range(start, count)
-            .into_iter()
-            .map(|(height, _, _)| height)
+        (0..count)
+            .filter_map(|offset| start.0.checked_add(offset).map(block::Height))
             .filter(|height| !self.contains_body_at_height(*height))
             .take(limit as usize)
             .collect()
     }
 
     #[allow(clippy::unwrap_in_result)]
-    fn zakura_header_tip(&self) -> Option<(block::Height, block::Hash)> {
-        let hash_by_height = self.db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
-        self.db.zs_last_key_value(&hash_by_height)
-    }
-
-    #[allow(clippy::unwrap_in_result)]
-    fn zakura_header_hash(&self, height: block::Height) -> Option<block::Hash> {
-        let hash_by_height = self.db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
-        self.db.zs_get(&hash_by_height, &height)
-    }
-
-    #[allow(clippy::unwrap_in_result)]
-    fn zakura_header_height(&self, hash: block::Hash) -> Option<block::Height> {
-        let height_by_hash = self.db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
-        self.db.zs_get(&height_by_hash, &hash)
-    }
-
-    #[allow(clippy::unwrap_in_result)]
-    pub(crate) fn zakura_header(&self, height: block::Height) -> Option<Arc<block::Header>> {
-        let header_by_height = self.db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
-        self.db.zs_get(&header_by_height, &height)
-    }
-
-    // The header readers below resolve from the consensus header column families
-    // (`hash_by_height` / `height_by_hash` / `block_header_by_height`) *ungated*
-    // by body availability, then fall back to the provisional Zakura frontier.
-    // Reading the consensus header rows directly keeps a height's header readable
-    // even when its body is absent because it was pruned (those rows are retained
-    // by pruning, which only deletes `tx_by_loc`).
-
-    pub(crate) fn header_hash(&self, height: block::Height) -> Option<block::Hash> {
-        self.hash(height)
-            .or_else(|| self.zakura_header_hash(height))
-    }
-
-    pub(crate) fn header_height(&self, hash: block::Hash) -> Option<block::Height> {
-        self.height(hash)
-            .or_else(|| self.zakura_header_height(hash))
-    }
-
-    pub(crate) fn header_by_height(
+    pub(in crate::service) fn header_by_height(
         &self,
         height: block::Height,
     ) -> Option<(block::Hash, Arc<block::Header>)> {
@@ -686,10 +512,40 @@ impl ZakuraDb {
                 .map(|header| (hash, header));
         }
 
-        let hash = self.zakura_header_hash(height)?;
-        let header = self.zakura_header(height)?;
-
+        let hash_by_height = self.db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
+        let header_by_height = self.db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
+        let hash = self.db.zs_get(&hash_by_height, &height)?;
+        let header = self.db.zs_get(&header_by_height, &height)?;
         Some((hash, header))
+    }
+
+    pub(crate) fn header_hash(&self, height: block::Height) -> Option<block::Hash> {
+        self.header_by_height(height).map(|(hash, _header)| hash)
+    }
+
+    /// Returns the height for a canonical full-state or header-only hash.
+    #[allow(dead_code)]
+    pub(crate) fn header_height(&self, hash: block::Hash) -> Option<block::Height> {
+        self.height(hash).or_else(|| {
+            let height_by_hash = self.db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
+            self.db.zs_get(&height_by_hash, &hash)
+        })
+    }
+
+    /// Returns the highest canonical full-state or header-only tip.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn best_header_tip(&self) -> Option<(block::Height, block::Hash)> {
+        let body_tip = self.tip();
+        let hash_by_height = self.db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
+        let header_tip = self.db.zs_last_key_value(&hash_by_height);
+
+        match (body_tip, header_tip) {
+            (Some(body_tip), Some(header_tip)) if body_tip.0 >= header_tip.0 => Some(body_tip),
+            (Some(_), Some(header_tip)) => Some(header_tip),
+            (Some(body_tip), None) => Some(body_tip),
+            (None, Some(header_tip)) => Some(header_tip),
+            (None, None) => None,
+        }
     }
 
     // Read transaction methods
@@ -1042,7 +898,7 @@ impl ZakuraDb {
 
     // Write block methods
 
-    /// Write `finalized` to the finalized state.
+    /// Prepare `finalized`, then delegate its only durable batch to `commit`.
     ///
     /// Uses:
     /// - `history_tree`: the current tip's history tree
@@ -1056,7 +912,7 @@ impl ZakuraDb {
     ///   from applying the change to the chain value balance
     #[allow(clippy::unwrap_in_result)]
     #[allow(clippy::too_many_arguments)]
-    pub(in super::super) fn write_block(
+    pub(in super::super) fn write_block_with<C>(
         &mut self,
         finalized: FinalizedBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
@@ -1064,7 +920,11 @@ impl ZakuraDb {
         source: &str,
         retention: RetentionPlan,
         vct_data: VctWriteData,
-    ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
+        commit: C,
+    ) -> Result<block::Hash, CommitCheckpointVerifiedError>
+    where
+        C: FnOnce(&mut Self, DiskWriteBatch) -> Result<(), CommitCheckpointVerifiedError>,
+    {
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
             .iter()
@@ -1260,9 +1120,7 @@ impl ZakuraDb {
 
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
-        self.db
-            .write(batch)
-            .expect("unexpected rocksdb error while writing block");
+        commit(self, batch)?;
         metrics::histogram!("zakura.state.rocksdb.batch_commit.duration_seconds")
             .record(batch_start.elapsed().as_secs_f64());
 
@@ -1298,21 +1156,6 @@ impl ZakuraDb {
         let range_end = TransactionLocation::min_for_height(prune_until_strictly_before);
 
         self.db.zs_compact_range(&tx_by_loc, range_start, range_end);
-    }
-
-    /// Seed or reconcile the Zakura header store from a committed full block.
-    pub(crate) fn seed_zakura_header_from_committed_block(
-        &self,
-        height: block::Height,
-        block: &Arc<block::Block>,
-    ) -> Result<(), CommitHeaderRangeError> {
-        let mut batch = DiskWriteBatch::new();
-        batch.prepare_zakura_header_from_committed_block(self, height, block)?;
-        self.db
-            .write(batch)
-            .map_err(|error| CommitHeaderRangeError::StorageWriteError {
-                error: error.to_string(),
-            })
     }
 }
 
@@ -1545,40 +1388,6 @@ impl RetentionPlan {
     }
 }
 
-#[cfg(test)]
-fn inferred_header_range_roots(
-    zakura_db: &ZakuraDb,
-    anchor: block::Hash,
-    count: usize,
-) -> Result<Vec<BlockCommitmentRoots>, CommitHeaderRangeError> {
-    let anchor_height = zakura_db
-        .header_height(anchor)
-        .or_else(|| (anchor == zakura_db.network().genesis_hash()).then_some(block::Height(0)))
-        .unwrap_or(block::Height(0));
-
-    (0..count)
-        .map(|index| {
-            let offset =
-                u32::try_from(index + 1).map_err(|_| CommitHeaderRangeError::HeightOverflow)?;
-            let height = (anchor_height + i64::from(offset))
-                .ok_or(CommitHeaderRangeError::HeightOverflow)?;
-            Ok(BlockCommitmentRoots {
-                height,
-                sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
-                orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-                // Placeholder default roots: this fallback range carries no real roots
-                // (the recipient re-verifies and rejects them), so the Ironwood root, the
-                // counts, and the auth-data root are all unused zeros here too.
-                ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-                sapling_tx: 0,
-                orchard_tx: 0,
-                ironwood_tx: 0,
-                auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
-            })
-        })
-        .collect()
-}
-
 impl DiskWriteBatch {
     // Write block methods
 
@@ -1619,8 +1428,6 @@ impl DiskWriteBatch {
             store_raw_transactions,
             precomputed_raw_txs,
         )?;
-        self.delete_superseded_header_commitment_root(zakura_db, finalized.height);
-
         // The consensus rules are silent on shielded transactions in the genesis block,
         // because there aren't any in the mainnet or testnet genesis blocks.
         // So this means the genesis anchor is the same as the empty anchor,
@@ -1759,27 +1566,17 @@ impl DiskWriteBatch {
             ..
         } = finalized;
 
-        // Commit block header data. Full block verification is authoritative:
-        // it may replace conflicting header-only provisional rows at this
-        // height and truncate their header-only descendants.
+        // Commit authenticated full-block header data.
         let existing_body_header: Option<Arc<block::Header>> =
             db.zs_get(&block_header_by_height, height);
         if existing_body_header.is_some_and(|existing_header| existing_header != block.header) {
-            return Err(
-                CommitHeaderRangeError::ConflictingFullBlockHeader { height: *height }.into(),
-            );
+            return Err(CommitBlockError::HeaderChainError {
+                error: format!("full block header conflicts with stored header at {height:?}"),
+            }
+            .into());
         }
 
-        // Release the provisional Zakura header row for this height: once the
-        // body is committed the authoritative header lives in
-        // `block_header_by_height`, so the Zakura header store only ever holds
-        // heights with no committed body (the frontier above the body tip).
-        // This is unconditional so it also cleans up rows left by a prior run
-        // that had `enable_zakura_header_seed_from_committed_blocks` enabled.
-        self.prepare_zakura_header_release_from_committed_block(zakura_db, *height, block)?;
-
-        // Index the block header, hash, and height. This also restores the
-        // verified full block row after any provisional cleanup above.
+        // Index the authenticated full-block header, hash, and height.
         self.zs_insert(&block_header_by_height, height, &block.header);
         self.zs_insert(&hash_by_height, height, hash);
         self.zs_insert(&height_by_hash, hash, height);
@@ -1830,478 +1627,6 @@ impl DiskWriteBatch {
         }
 
         Ok(())
-    }
-
-    /// Prepare a database batch that seeds the Zakura header store from a
-    /// committed full block.
-    ///
-    /// Full block verification is authoritative for the stored body. If a
-    /// provisional Zakura header at this height differs, replace it with the
-    /// block-derived header and drop stale provisional descendants.
-    ///
-    /// A block whose parent hash does not match the stored header row below
-    /// `height` is skipped without error: writing it would leave a gap or
-    /// broken link in the header store, so the store instead waits for
-    /// header-range sync to deliver the connecting rows (see the linkage
-    /// refusal below).
-    #[allow(clippy::unwrap_in_result)]
-    pub fn prepare_zakura_header_from_committed_block(
-        &mut self,
-        zakura_db: &ZakuraDb,
-        height: block::Height,
-        block: &Arc<block::Block>,
-    ) -> Result<(), CommitHeaderRangeError> {
-        let db = &zakura_db.db;
-        let zakura_header_by_height = db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
-        let zakura_hash_by_height = db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
-        let zakura_height_by_hash = db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
-        let zakura_body_size_by_height = db.cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT).unwrap();
-        let tx_by_loc = db.cf_handle("tx_by_loc").unwrap();
-
-        let hash = block.hash();
-        let existing_zakura_header: Option<Arc<block::Header>> =
-            db.zs_get(&zakura_header_by_height, &height);
-
-        if existing_zakura_header.as_ref() == Some(&block.header)
-            && db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &height) == Some(hash)
-        {
-            return Ok(());
-        }
-
-        // Seeds can jump to a non-finalized best tip whose parent is not the
-        // stored row below it. Refuse those seeds so the header store stays
-        // linked; header-range sync will later deliver the missing rows.
-        let hash_by_height = db.cf_handle("hash_by_height").unwrap();
-        let parent_hash: Option<block::Hash> = height.previous().ok().and_then(|parent_height| {
-            db.zs_get(&hash_by_height, &parent_height)
-                .or_else(|| db.zs_get(&zakura_hash_by_height, &parent_height))
-        });
-        if parent_hash != Some(block.header.previous_block_hash) {
-            tracing::debug!(
-                ?height,
-                ?hash,
-                parent = ?block.header.previous_block_hash,
-                stored_parent = ?parent_hash,
-                "skipping Zakura header seed that does not link to the stored row below it"
-            );
-            return Ok(());
-        }
-
-        if existing_zakura_header.is_some_and(|existing_header| existing_header != block.header) {
-            let best_header_tip: Option<(block::Height, block::Hash)> =
-                db.zs_last_key_value(&zakura_hash_by_height);
-
-            if let Some((best_header_tip, _)) = best_header_tip {
-                for old_height in height.0..=best_header_tip.0 {
-                    let old_height = block::Height(old_height);
-
-                    if old_height != height
-                        && db.zs_contains(
-                            &tx_by_loc,
-                            &TransactionLocation::min_for_height(old_height),
-                        )
-                    {
-                        return Err(CommitHeaderRangeError::ConflictingFullBlockHeader {
-                            height: old_height,
-                        });
-                    }
-
-                    if let Some(old_hash) =
-                        db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &old_height)
-                    {
-                        self.zs_delete(&zakura_height_by_hash, old_hash);
-                    }
-
-                    self.zs_delete(&zakura_hash_by_height, old_height);
-                    self.zs_delete(&zakura_header_by_height, old_height);
-                    self.zs_delete(&zakura_body_size_by_height, old_height);
-                }
-
-                if !zakura_db.has_header_root_auth_frontier_row() {
-                    self.delete_header_reorg_commitment_roots(zakura_db, height, best_header_tip);
-                } else if let Some(body_tip) = zakura_db.finalized_tip_height() {
-                    self.truncate_commitment_roots_after(zakura_db, body_tip);
-                    zakura_db
-                        .prepare_header_root_auth_frontier_from_body_tip(self)
-                        .map_err(|error| CommitHeaderRangeError::HeaderRootAuthFrontier {
-                            reason: error.to_string(),
-                        })?;
-                } else {
-                    self.truncate_all_commitment_roots(zakura_db);
-                    self.delete_header_root_auth_frontier(zakura_db);
-                }
-            }
-        } else if let Some(old_hash) =
-            db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &height)
-        {
-            if old_hash != hash {
-                self.zs_delete(&zakura_height_by_hash, old_hash);
-            }
-        }
-
-        self.zs_insert(&zakura_header_by_height, height, &block.header);
-        self.zs_insert(&zakura_hash_by_height, height, hash);
-        self.zs_insert(&zakura_height_by_hash, hash, height);
-
-        Ok(())
-    }
-
-    /// Prepare a database batch that releases the Zakura header store entry for a
-    /// committed full block.
-    ///
-    /// Once a full block body is committed at `height`, its authoritative header
-    /// lives in `block_header_by_height`, so the provisional Zakura header row at
-    /// this height is dropped. This maintains the frontier-overlay invariant: the
-    /// Zakura header store only ever holds heights with no committed body (the
-    /// frontier strictly above the body tip), so it never overlaps pruned history
-    /// and is self-trimming as bodies arrive.
-    ///
-    /// If the committed block's header conflicts with a provisional header at this
-    /// height, the stale provisional descendants above it are truncated as well,
-    /// refusing to touch any height that already has a committed body.
-    #[allow(clippy::unwrap_in_result)]
-    pub fn prepare_zakura_header_release_from_committed_block(
-        &mut self,
-        zakura_db: &ZakuraDb,
-        height: block::Height,
-        block: &Arc<block::Block>,
-    ) -> Result<(), CommitHeaderRangeError> {
-        let db = &zakura_db.db;
-        let zakura_header_by_height = db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
-        let zakura_hash_by_height = db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
-        let zakura_height_by_hash = db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
-        let zakura_body_size_by_height = db.cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT).unwrap();
-        let tx_by_loc = db.cf_handle("tx_by_loc").unwrap();
-
-        let existing_zakura_header: Option<Arc<block::Header>> =
-            db.zs_get(&zakura_header_by_height, &height);
-        let existing_zakura_hash: Option<block::Hash> = db.zs_get(&zakura_hash_by_height, &height);
-
-        // Nothing to release: this height never carried a provisional header.
-        if existing_zakura_header.is_none() && existing_zakura_hash.is_none() {
-            return Ok(());
-        }
-
-        // A committed block whose header conflicts with the provisional chain at
-        // this height invalidates the provisional descendants built on top of it.
-        // Drop them, but never overwrite a height that already has a committed body.
-        if existing_zakura_header.is_some_and(|existing_header| existing_header != block.header) {
-            let zakura_tip: Option<(block::Height, block::Hash)> =
-                db.zs_last_key_value(&zakura_hash_by_height);
-
-            if let Some((zakura_tip, _)) = zakura_tip {
-                for descendant in (height.0 + 1)..=zakura_tip.0 {
-                    let descendant = block::Height(descendant);
-
-                    if db.zs_contains(&tx_by_loc, &TransactionLocation::min_for_height(descendant))
-                    {
-                        return Err(CommitHeaderRangeError::ConflictingFullBlockHeader {
-                            height: descendant,
-                        });
-                    }
-
-                    if let Some(old_hash) =
-                        db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &descendant)
-                    {
-                        self.zs_delete(&zakura_height_by_hash, old_hash);
-                    }
-
-                    self.zs_delete(&zakura_hash_by_height, descendant);
-                    self.zs_delete(&zakura_header_by_height, descendant);
-                    self.zs_delete(&zakura_body_size_by_height, descendant);
-                }
-
-                if let Ok(first_descendant) = height.next() {
-                    self.delete_header_reorg_commitment_roots(
-                        zakura_db,
-                        first_descendant,
-                        zakura_tip,
-                    );
-                }
-            }
-        }
-
-        // Release the provisional row at this height.
-        if let Some(old_hash) = existing_zakura_hash {
-            self.zs_delete(&zakura_height_by_hash, old_hash);
-        }
-        self.zs_delete(&zakura_hash_by_height, height);
-        self.zs_delete(&zakura_header_by_height, height);
-        self.zs_delete(&zakura_body_size_by_height, height);
-        self.delete_superseded_header_commitment_root(zakura_db, height);
-
-        Ok(())
-    }
-
-    /// Prepare a database batch containing a contextually validated header range.
-    #[cfg(test)]
-    #[allow(clippy::unwrap_in_result)]
-    pub fn prepare_header_range_batch(
-        &mut self,
-        zakura_db: &ZakuraDb,
-        anchor: block::Hash,
-        headers: &[Arc<block::Header>],
-        body_sizes: &[u32],
-    ) -> Result<block::Hash, CommitHeaderRangeError> {
-        let roots = inferred_header_range_roots(zakura_db, anchor, headers.len())?;
-        self.prepare_header_range_batch_with_roots(zakura_db, anchor, headers, body_sizes, &roots)
-    }
-
-    /// Prepare a database batch containing a contextually validated header range.
-    ///
-    /// Tree-aux roots are shape-checked but are not persisted until authenticated.
-    #[allow(clippy::unwrap_in_result)]
-    pub fn prepare_header_range_batch_with_roots(
-        &mut self,
-        zakura_db: &ZakuraDb,
-        anchor: block::Hash,
-        headers: &[Arc<block::Header>],
-        body_sizes: &[u32],
-        _tree_aux_roots: &[BlockCommitmentRoots],
-    ) -> Result<block::Hash, CommitHeaderRangeError> {
-        if headers.is_empty() {
-            return Err(CommitHeaderRangeError::EmptyRange);
-        }
-
-        if headers.len() != body_sizes.len() {
-            return Err(CommitHeaderRangeError::BodySizeCountMismatch {
-                headers: headers.len(),
-                body_sizes: body_sizes.len(),
-            });
-        }
-
-        if headers.len() > MAX_HEADER_SYNC_HEIGHT_RANGE as usize {
-            return Err(CommitHeaderRangeError::RangeTooLong {
-                actual: headers.len(),
-            });
-        }
-
-        let header_by_height = zakura_db.db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
-        let hash_by_height = zakura_db
-            .db
-            .cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT)
-            .unwrap();
-        let height_by_hash = zakura_db
-            .db
-            .cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH)
-            .unwrap();
-        let body_size_by_height = zakura_db
-            .db
-            .cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
-            .unwrap();
-
-        let anchor_height = zakura_db
-            .header_height(anchor)
-            .or_else(|| (anchor == zakura_db.network().genesis_hash()).then_some(block::Height(0)))
-            .ok_or(CommitHeaderRangeError::UnknownAnchor { anchor })?;
-
-        // The hash→height index knows the anchor, so a failed height→hash
-        // round-trip is a bijection violation in our own store — a local
-        // storage fault, not an unknown anchor supplied by the caller.
-        if anchor != zakura_db.network().genesis_hash() {
-            let stored = zakura_db.header_hash(anchor_height);
-            if stored != Some(anchor) {
-                return Err(StoreIncoherentError::BijectionMismatch {
-                    hash: anchor,
-                    height: anchor_height,
-                    stored,
-                }
-                .into());
-            }
-        }
-
-        let finalized_height = zakura_db.finalized_tip_height();
-        let best_header_tip = zakura_db.best_header_tip().map(|(height, _)| height);
-        let checkpoints = zakura_db.network().checkpoint_list();
-
-        let mut recent_headers = zakura_db.recent_header_context(anchor_height)?;
-        if recent_headers.is_empty() {
-            if anchor == zakura_db.network().genesis_hash() && anchor_height == block::Height(0) {
-                return Err(CommitHeaderRangeError::MissingGenesisAnchor { anchor });
-            }
-            return Err(CommitHeaderRangeError::UnknownAnchor { anchor });
-        }
-
-        let mut first_conflicting_height = None;
-        let mut validated_headers = Vec::with_capacity(headers.len());
-
-        // Each header must link to the anchor (for the first header) or to its
-        // predecessor in the range. Without this check, a range anchored at the
-        // same-height hash of a *different* branch can pass contextual
-        // difficulty validation and commit a suffix that does not link to the
-        // row below it — an on-disk linkage violation reachable from a single
-        // peer response.
-        let mut expected_parent = anchor;
-
-        for (index, header) in headers.iter().enumerate() {
-            let offset =
-                u32::try_from(index + 1).map_err(|_| CommitHeaderRangeError::HeightOverflow)?;
-            let height = (anchor_height + i64::from(offset))
-                .ok_or(CommitHeaderRangeError::HeightOverflow)?;
-            let hash = block::Hash::from(&**header);
-            let body_size = body_sizes[index];
-
-            if header.previous_block_hash != expected_parent {
-                return Err(CommitHeaderRangeError::UnlinkedRange {
-                    height,
-                    expected_parent,
-                    actual_parent: header.previous_block_hash,
-                });
-            }
-            expected_parent = hash;
-
-            if let Some(expected) = checkpoints.hash(height) {
-                if expected != hash {
-                    return Err(CommitHeaderRangeError::CheckpointConflict {
-                        height,
-                        expected,
-                        actual: hash,
-                    });
-                }
-            }
-
-            if let Some((_existing_hash, existing_header)) = zakura_db.header_by_height(height) {
-                if existing_header != *header {
-                    if finalized_height.is_some_and(|finalized_height| height <= finalized_height) {
-                        return Err(CommitHeaderRangeError::ImmutableConflict { height });
-                    }
-
-                    if zakura_db.contains_body_at_height(height) {
-                        return Err(CommitHeaderRangeError::ConflictingFullBlockHeader { height });
-                    }
-
-                    if let Some(best_header_tip) = best_header_tip {
-                        if best_header_tip.0.saturating_sub(height.0) >= MAX_BLOCK_REORG_HEIGHT {
-                            return Err(CommitHeaderRangeError::ReorgTooDeep {
-                                height,
-                                best_header_tip,
-                            });
-                        }
-                    }
-
-                    first_conflicting_height.get_or_insert(height);
-                }
-            }
-
-            check::header_is_valid_for_recent_chain(
-                header,
-                height
-                    .previous()
-                    .map_err(|_| CommitHeaderRangeError::HeightOverflow)?,
-                &zakura_db.network(),
-                recent_headers.iter().copied(),
-            )?;
-
-            recent_headers.insert(0, (header.difficulty_threshold, header.time));
-            recent_headers.truncate(check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN);
-
-            validated_headers.push((height, hash, header, body_size));
-        }
-
-        // Before overwriting a conflicting header suffix, require the new range to
-        // carry strictly more cumulative work than the chain it would replace. The
-        // per-header checks above only validate each header's own difficulty
-        // threshold and contextual difficulty; without this most-work gate, a
-        // lower-work fork — for example a low-difficulty header flood built with
-        // manipulated timestamps past the last checkpoint — could replace a longer,
-        // higher-work header chain purely because it conflicts within the reorg
-        // window, steering body-gap discovery off the real chain. Heights below
-        // `first_conflicting_height` are shared by both chains, so comparing the
-        // conflicting suffixes is equivalent to comparing total chain work.
-        if let (Some(first_conflicting_height), Some(best_header_tip)) =
-            (first_conflicting_height, best_header_tip)
-        {
-            let mut existing_work = PartialCumulativeWork::zero();
-            for height in first_conflicting_height.0..=best_header_tip.0 {
-                if let Some((_hash, existing_header)) =
-                    zakura_db.header_by_height(block::Height(height))
-                {
-                    // A stored header passed difficulty validation when committed, so
-                    // its threshold always converts to work; skip defensively if not.
-                    if let Some(work) = existing_header.difficulty_threshold.to_work() {
-                        existing_work += work;
-                    }
-                }
-            }
-
-            let mut new_work = PartialCumulativeWork::zero();
-            for (height, _hash, header, _body_size) in &validated_headers {
-                if *height >= first_conflicting_height {
-                    if let Some(work) = header.difficulty_threshold.to_work() {
-                        new_work += work;
-                    }
-                }
-            }
-
-            if new_work <= existing_work {
-                return Err(CommitHeaderRangeError::LowerWorkConflict {
-                    height: first_conflicting_height,
-                    existing_work: existing_work.as_u128(),
-                    new_work: new_work.as_u128(),
-                });
-            }
-        }
-
-        if let (Some(first_conflicting_height), Some(best_header_tip)) =
-            (first_conflicting_height, best_header_tip)
-        {
-            for height in first_conflicting_height.0..=best_header_tip.0 {
-                let height = block::Height(height);
-
-                if zakura_db.contains_body_at_height(height) {
-                    return Err(CommitHeaderRangeError::ConflictingFullBlockHeader { height });
-                }
-
-                if let Some(old_hash) = zakura_db.zakura_header_hash(height) {
-                    self.zs_delete(&height_by_hash, old_hash);
-                }
-
-                self.zs_delete(&hash_by_height, height);
-                self.zs_delete(&header_by_height, height);
-                self.zs_delete(&body_size_by_height, height);
-            }
-
-            if !zakura_db.has_header_root_auth_frontier_row() {
-                self.delete_header_reorg_commitment_roots(
-                    zakura_db,
-                    first_conflicting_height,
-                    best_header_tip,
-                );
-            }
-        }
-
-        for (height, hash, header, body_size) in validated_headers {
-            // Finalized block heights already have authoritative block rows and
-            // verified roots, even when pruning has removed their transactions.
-            // Re-delivered headers must not recreate provisional zakura rows
-            // there, because those rows are only trimmed during body commit.
-            if zakura_db.contains_height(height) {
-                continue;
-            }
-
-            let same_header = zakura_db.zakura_header_hash(height) == Some(hash);
-            let advertised_body_size = match (
-                same_header,
-                zakura_db.advertised_body_size(height),
-                AdvertisedBodySize::new(body_size).map(AdvertisedBodySize::get),
-            ) {
-                (true, existing, Some(new)) => Some(existing.unwrap_or(0).max(new)),
-                (true, existing, None) => existing,
-                (false, _existing, new) => new,
-            };
-
-            self.zs_insert(&header_by_height, height, header);
-            self.zs_insert(&hash_by_height, height, hash);
-            self.zs_insert(&height_by_hash, hash, height);
-            if let Some(body_size) = advertised_body_size.and_then(AdvertisedBodySize::new) {
-                self.zs_insert(&body_size_by_height, height, body_size);
-            } else {
-                self.zs_delete(&body_size_by_height, height);
-            }
-        }
-        Ok(block::Hash::from(
-            &**headers.last().expect("headers is non-empty"),
-        ))
     }
 
     /// Deletes the block header at `height`.

@@ -35,21 +35,6 @@ default-run = "zakurad"
 [lib]
 name = "zakurad"
 
-[[bin]]
-name = "zakurad"
-path = "src/bin/zakurad/main.rs"
-test = false
-
-[[bin]]
-name = "zakura-prune-state"
-path = "src/bin/zakura-prune-state/main.rs"
-test = false
-
-[[bin]]
-name = "zakura-rollback-state"
-path = "src/bin/zakura-rollback-state/main.rs"
-test = false
-
 # `cargo release` settings
 [package.metadata.release]
 pre-release-replacements = [
@@ -169,6 +154,7 @@ comparison-interpreter = ["zakura-script/comparison-interpreter"]
 
 [dependencies]
 zakura-chain = { path = "../zakura-chain", version = "3.0.0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0-rc0" }
 zakura-consensus = { path = "../zakura-consensus", version = "5.0.0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.0.1" }
 zakura-network = { path = "../zakura-network", version = "5.0.0" }

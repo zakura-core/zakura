@@ -459,7 +459,12 @@ impl HostilePeer {
 
     /// Selected header-sync stream version for an explicit capability mask.
     pub fn selected_header_sync_version(capabilities: u64) -> Option<u16> {
-        (capabilities & ZAKURA_CAP_HEADER_SYNC != 0).then_some(ZAKURA_HEADER_SYNC_STREAM_VERSION)
+        if capabilities & ZAKURA_CAP_HEADER_SYNC != 0 {
+            Some(ZAKURA_HEADER_SYNC_STREAM_VERSION)
+        } else {
+            (capabilities & ZAKURA_CAP_HEADER_SYNC != 0)
+                .then_some(ZAKURA_HEADER_SYNC_STREAM_VERSION)
+        }
     }
 
     async fn read_prelude(recv: &mut RecvStream) -> Result<StreamPrelude, BoxError> {

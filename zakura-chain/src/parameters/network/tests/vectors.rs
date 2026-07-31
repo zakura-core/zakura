@@ -350,6 +350,27 @@ fn configured_nu6_3_activation_preserves_upgrade_order() {
     assert_eq!(out_of_order, ParametersBuilderError::OutOfOrderUpgrades);
 }
 
+#[test]
+fn configured_max_block_time_policy_is_local() {
+    let public_testnet = Network::new_default_testnet();
+    assert!(!public_testnet.is_max_block_time_enforced(Height(653_605)));
+    assert!(public_testnet.is_max_block_time_enforced(Height(653_606)));
+
+    let custom = testnet::Parameters::build()
+        .to_network()
+        .expect("the default custom-network builder is valid");
+    assert!(!custom.is_max_block_time_enforced(Height(1)));
+    assert!(custom.is_max_block_time_enforced(Height(2)));
+
+    let configured_height = Height(42);
+    let configured = testnet::Parameters::build()
+        .with_max_block_time_start_height(configured_height)
+        .to_network()
+        .expect("the configured max-time policy is valid");
+    assert!(!configured.is_max_block_time_enforced(Height(41)));
+    assert!(configured.is_max_block_time_enforced(configured_height));
+}
+
 /// Regtest must not activate NU6.3 unless it is explicitly configured, and
 /// must preserve a configured NU6.3 height in its activation map.
 #[test]

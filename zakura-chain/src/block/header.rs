@@ -101,8 +101,7 @@ pub enum BlockTimeError {
 }
 
 impl Header {
-    /// TODO: Inline this function into zakura_consensus::block::check::time_is_valid_at.
-    /// See <https://github.com/ZcashFoundation/zebra/issues/1021> for more details.
+    /// Shared observable-header validation delegates to this canonical time calculation.
     #[allow(clippy::unwrap_in_result)]
     pub fn time_is_valid_at(
         &self,

@@ -9,7 +9,7 @@ use crate::{
         checkpoint::list::{CheckpointList, TESTNET_CHECKPOINT_LIST},
         constants::{magics, SLOW_START_INTERVAL, SLOW_START_SHIFT},
         network::error::ParametersBuilderError,
-        network_upgrade::TESTNET_ACTIVATION_HEIGHTS,
+        network_upgrade::{TESTNET_ACTIVATION_HEIGHTS, TESTNET_MAX_TIME_START_HEIGHT},
         subsidy::{
             constants::mainnet,
             constants::testnet,
@@ -475,6 +475,8 @@ pub struct ParametersBuilder {
     target_difficulty_limit: ExpandedDifficulty,
     /// A flag for disabling proof-of-work checks when Zebra is validating blocks
     disable_pow: bool,
+    /// Optional local activation height for the MTP-plus-90-minutes rule.
+    max_block_time_start_height: Option<Height>,
     /// Whether to allow transactions with transparent outputs to spend coinbase outputs,
     /// similar to `fCoinbaseMustBeShielded` in zcashd.
     should_allow_unshielded_coinbase_spends: bool,
@@ -514,6 +516,7 @@ impl Default for ParametersBuilder {
                 .to_expanded()
                 .expect("difficulty limits are valid expanded values"),
             disable_pow: false,
+            max_block_time_start_height: None,
             funding_streams: testnet::FUNDING_STREAMS.clone(),
             should_lock_funding_stream_address_period: false,
             pre_blossom_halving_interval: PRE_BLOSSOM_HALVING_INTERVAL,
@@ -751,6 +754,12 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets the local activation height for the MTP-plus-90-minutes rule.
+    pub fn with_max_block_time_start_height(mut self, height: Height) -> Self {
+        self.max_block_time_start_height = Some(height);
+        self
+    }
+
     /// Sets the `disable_pow` flag to be used in the [`Parameters`] being built.
     pub fn with_unshielded_coinbase_spends(
         mut self,
@@ -843,6 +852,7 @@ impl ParametersBuilder {
 
     /// Converts the builder to a [`Parameters`] struct
     fn finish(self) -> Parameters {
+        let max_block_time_start_height = self.max_block_time_start_height.unwrap_or(Height(2));
         let Self {
             network_name,
             network_magic,
@@ -853,6 +863,7 @@ impl ParametersBuilder {
             should_lock_funding_stream_address_period: _,
             target_difficulty_limit,
             disable_pow,
+            max_block_time_start_height: _,
             should_allow_unshielded_coinbase_spends,
             pre_blossom_halving_interval,
             post_blossom_halving_interval,
@@ -870,6 +881,7 @@ impl ParametersBuilder {
             funding_streams,
             target_difficulty_limit,
             disable_pow,
+            max_block_time_start_height,
             should_allow_unshielded_coinbase_spends,
             pre_blossom_halving_interval,
             post_blossom_halving_interval,
@@ -907,6 +919,13 @@ impl ParametersBuilder {
 
     /// Returns true if these [`Parameters`] should be compatible with the default Testnet parameters.
     pub fn is_compatible_with_default_parameters(&self) -> bool {
+        let max_block_time_start_height = self.max_block_time_start_height.unwrap_or_else(|| {
+            if self == &Self::default() {
+                TESTNET_MAX_TIME_START_HEIGHT
+            } else {
+                Height(2)
+            }
+        });
         let Self {
             network_name: _,
             network_magic,
@@ -917,6 +936,7 @@ impl ParametersBuilder {
             should_lock_funding_stream_address_period: _,
             target_difficulty_limit,
             disable_pow,
+            max_block_time_start_height: _,
             should_allow_unshielded_coinbase_spends,
             pre_blossom_halving_interval,
             post_blossom_halving_interval,
@@ -932,6 +952,7 @@ impl ParametersBuilder {
             && self.funding_streams == funding_streams
             && self.target_difficulty_limit == target_difficulty_limit
             && self.disable_pow == disable_pow
+            && max_block_time_start_height == TESTNET_MAX_TIME_START_HEIGHT
             && self.should_allow_unshielded_coinbase_spends
                 == should_allow_unshielded_coinbase_spends
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
@@ -951,6 +972,8 @@ pub struct RegtestParameters {
     pub lockbox_disbursements: Option<Vec<ConfiguredLockboxDisbursement>>,
     /// Configured checkpointed block heights and hashes.
     pub checkpoints: Option<ConfiguredCheckpoints>,
+    /// Local activation height for the MTP-plus-90-minutes rule.
+    pub max_block_time_start_height: Option<Height>,
     /// Whether funding stream addresses should be repeated to fill all required funding stream periods.
     pub extend_funding_stream_addresses_as_required: Option<bool>,
 }
@@ -985,6 +1008,8 @@ pub struct Parameters {
     target_difficulty_limit: ExpandedDifficulty,
     /// A flag for disabling proof-of-work checks when Zebra is validating blocks
     disable_pow: bool,
+    /// Activation height for the MTP-plus-90-minutes rule.
+    max_block_time_start_height: Height,
     /// Whether to allow transactions with transparent outputs to spend coinbase outputs,
     /// similar to `fCoinbaseMustBeShielded` in zcashd.
     should_allow_unshielded_coinbase_spends: bool,
@@ -1005,6 +1030,7 @@ impl Default for Parameters {
     fn default() -> Self {
         Self {
             network_name: "Testnet".to_string(),
+            max_block_time_start_height: TESTNET_MAX_TIME_START_HEIGHT,
             ..Self::build().finish()
         }
     }
@@ -1026,6 +1052,7 @@ impl Parameters {
             lockbox_disbursements,
             checkpoints,
             extend_funding_stream_addresses_as_required,
+            max_block_time_start_height,
         }: RegtestParameters,
     ) -> Result<Self, ParametersBuilderError> {
         let mut parameters = Self::build()
@@ -1045,6 +1072,10 @@ impl Parameters {
             .with_funding_streams(funding_streams.unwrap_or_default())
             .with_lockbox_disbursements(lockbox_disbursements.unwrap_or_default())
             .with_checkpoints(checkpoints.unwrap_or_default())?;
+
+        if let Some(height) = max_block_time_start_height {
+            parameters = parameters.with_max_block_time_start_height(height);
+        }
 
         if Some(true) == extend_funding_stream_addresses_as_required {
             parameters = parameters.extend_funding_streams();
@@ -1080,6 +1111,7 @@ impl Parameters {
             funding_streams: _,
             target_difficulty_limit,
             disable_pow,
+            max_block_time_start_height,
             should_allow_unshielded_coinbase_spends,
             pre_blossom_halving_interval,
             post_blossom_halving_interval,
@@ -1094,6 +1126,7 @@ impl Parameters {
             && self.slow_start_shift == slow_start_shift
             && self.target_difficulty_limit == target_difficulty_limit
             && self.disable_pow == disable_pow
+            && self.max_block_time_start_height == max_block_time_start_height
             && self.should_allow_unshielded_coinbase_spends
                 == should_allow_unshielded_coinbase_spends
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
@@ -1143,6 +1176,11 @@ impl Parameters {
     /// Returns true if proof-of-work validation should be disabled for this network
     pub fn disable_pow(&self) -> bool {
         self.disable_pow
+    }
+
+    /// Returns the local activation height for the MTP-plus-90-minutes rule.
+    pub fn max_block_time_start_height(&self) -> Height {
+        self.max_block_time_start_height
     }
 
     /// Returns true if this network should allow transactions with transparent outputs

@@ -22,6 +22,7 @@ extern crate tracing;
 pub mod config;
 // Most constants are exported by default
 pub mod constants;
+mod header_chain;
 
 // Allow use in external tests
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -42,14 +43,14 @@ pub use config::{
 };
 pub use constants::{state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT};
 pub use error::{
-    BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError, CommitHeaderRangeError,
+    BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
     CommitSemanticallyVerifiedError, DuplicateNullifierError, MissingSproutTipTree, StateInitError,
-    StoreIncoherentError, ValidateContextError,
+    ValidateContextError,
 };
+pub use header_chain::*;
 pub use request::{
-    AuthenticateHeaderRootsRequest, CheckpointVerifiedBlock,
-    CommitSemanticallyVerifiedBlockRequest, HashOrHeight, MappedRequest, ReadRequest, Request,
-    SemanticallyVerifiedBlock,
+    CheckpointVerifiedBlock, CommitSemanticallyVerifiedBlockRequest, HashOrHeight, MappedRequest,
+    ReadRequest, Request, SemanticallyVerifiedBlock,
 };
 
 #[cfg(feature = "indexer")]
@@ -59,6 +60,8 @@ pub use response::{
     AnyTx, GetBlockTemplateChainInfo, KnownBlock, MinedTx, NonFinalizedBlocksListener,
     ReadResponse, Response,
 };
+#[cfg(any(test, feature = "header-fuzz"))]
+pub use service::finalized_state::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub use service::{
     chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip, TipAction},
     check,
@@ -77,9 +80,7 @@ pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch}
 pub use service::finalized_state::{
     generate_mainnet_from_archive, produce_final_frontiers_bytes,
     produce_settled_final_frontiers_bytes, validate_final_frontiers_bytes,
-    AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,
     FinalFrontiersGenerationError, FinalFrontiersValidationError, GeneratorError,
-    HeaderRootAuthState, HeaderRootAuthUpdate, HeaderWitnessState,
 };
 pub use service::finalized_state::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,
@@ -93,10 +94,7 @@ pub use service::finalized_state::{
     VctSproutHistoryValidationError, VctSproutHistoryValidationSummary,
 };
 pub use service::{
-    finalized_state::{
-        DiskWriteBatch, FromDisk, HighestCompletedCheckpoint, HighestCompletedCheckpointError,
-        IntoDisk, WriteDisk, ZakuraDb,
-    },
+    finalized_state::{DiskWriteBatch, FallibleDiskValue, FromDisk, IntoDisk, WriteDisk, ZakuraDb},
     ReadStateService, VctRootRepairState, VctRootRepairStatus,
 };
 

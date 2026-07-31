@@ -8517,6 +8517,11 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2 0.10.9",
+ "toml 1.1.2+spec-1.1.0",
+]
 
 [[package]]
 name = "yaml-rust2"
@@ -8636,6 +8641,7 @@ dependencies = [
  "vergen-git2",
  "zakura-chain",
  "zakura-consensus",
+ "zakura-header-chain",
  "zakura-jsonl-trace",
  "zakura-network",
  "zakura-node-services",
@@ -8758,6 +8764,7 @@ dependencies = [
  "tracing-futures",
  "tracing-subscriber",
  "zakura-chain",
+ "zakura-header-chain",
  "zakura-node-services",
  "zakura-script",
  "zakura-state",
@@ -8769,6 +8776,19 @@ dependencies = [
  "zcash_protocol",
  "zcash_script",
  "zcash_transparent",
+]
+
+[[package]]
+name = "zakura-header-chain"
+version = "1.0.0-rc0"
+dependencies = [
+ "chrono",
+ "proptest",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "toml 1.1.2+spec-1.1.0",
+ "zakura-chain",
+ "zakura-test",
 ]
 
 [[package]]
@@ -8824,7 +8844,9 @@ dependencies = [
  "tracing-error",
  "tracing-futures",
  "zakura-chain",
+ "zakura-header-chain",
  "zakura-jsonl-trace",
+ "zakura-node-services",
  "zakura-test",
 ]
 
@@ -8840,6 +8862,7 @@ dependencies = [
  "tokio",
  "tower 0.4.13",
  "zakura-chain",
+ "zakura-header-chain",
 ]
 
 [[package]]
@@ -8977,6 +9000,7 @@ dependencies = [
  "tower 0.4.13",
  "tracing",
  "zakura-chain",
+ "zakura-header-chain",
  "zakura-node-services",
  "zakura-test",
  "zakura-vct-sprout-history",

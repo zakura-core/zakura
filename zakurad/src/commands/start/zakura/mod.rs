@@ -128,24 +128,16 @@ pub(crate) use block_sync_driver::{
     block_sync_missing_body_window, block_sync_needed_blocks_from_state,
     coalesce_ready_needed_block_queries, coalesce_stale_needed_block_queries,
     commit_block_sync_body, query_block_sync_needed_blocks, BlockApplyClass,
-    ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+    ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
 };
 pub(crate) use frontier::{query_block_sync_frontiers, verified_block_tip_from_state};
+pub(crate) use header_sync_driver::zakura_header_sync_driver_startup;
 #[cfg(test)]
-pub(crate) use header_sync_driver::{
-    best_durable_header_tip, block_sync_chain_tip_event, body_sizes_for_served_header_range,
-    chain_tip_mirror_frontier_change, header_range_commit_error_label,
-    header_range_commit_failure_kind, notify_block_sync_header_tip,
-    tree_aux_roots_for_served_header_range,
-};
-pub(crate) use header_sync_driver::{
-    drive_header_root_auth_updates, drive_vct_root_repairs, drive_zakura_header_sync_actions,
-    mirror_zakura_full_block_commits, zakura_header_sync_driver_startup,
-    ZakuraHeaderSyncDriverHandles,
-};
+pub(crate) use header_sync_driver::{block_roots_cover_range, root_covered_query_best_header_tip};
 pub(crate) use throughput_probe::{BlocksyncThroughputProbe, BlocksyncThroughputSummary};
 
 pub(crate) const ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) fn emit_commit_state(
     trace: &ZakuraTrace,
@@ -186,29 +178,8 @@ pub(crate) fn insert_cs_u64(row: &mut Map<String, Value>, key: &'static str, val
     row.insert(key.to_string(), Value::Number(Number::from(value)));
 }
 
-pub(crate) fn insert_cs_bool(row: &mut Map<String, Value>, key: &'static str, value: bool) {
-    row.insert(key.to_string(), Value::Bool(value));
-}
-
 pub(crate) fn insert_cs_str(row: &mut Map<String, Value>, key: &'static str, value: &str) {
     row.insert(key.to_string(), Value::String(value.to_string()));
-}
-
-pub(crate) fn insert_cs_frontiers(
-    row: &mut Map<String, Value>,
-    frontiers: &zakura_network::zakura::BlockSyncFrontiers,
-) {
-    insert_cs_height(row, cs_trace::FINALIZED_HEIGHT, frontiers.finalized_height);
-    insert_cs_height(
-        row,
-        cs_trace::VERIFIED_BLOCK_TIP,
-        frontiers.verified_block_tip,
-    );
-    insert_cs_hash(
-        row,
-        cs_trace::VERIFIED_BLOCK_HASH,
-        frontiers.verified_block_hash,
-    );
 }
 
 pub(crate) fn block_apply_result_label(result: BlockApplyResult) -> &'static str {
@@ -216,30 +187,59 @@ pub(crate) fn block_apply_result_label(result: BlockApplyResult) -> &'static str
         BlockApplyResult::Committed => "committed",
         BlockApplyResult::Duplicate => "duplicate",
         BlockApplyResult::Rejected => "rejected",
+        BlockApplyResult::Unavailable => "unavailable",
         BlockApplyResult::TimedOut => "timed_out",
     }
 }
 
-pub(crate) fn block_verify_error_is_duplicate<Error>(error: &Error) -> bool
+pub(crate) fn block_verify_error_class<Error>(
+    error: &Error,
+) -> zakura_header_chain::BodyVerificationClass
 where
     Error: std::fmt::Debug + Send + Sync + 'static,
 {
-    let error = error as &dyn std::any::Any;
+    use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
 
-    error
-        .downcast_ref::<zakura_consensus::RouterError>()
-        .is_some_and(zakura_consensus::RouterError::is_duplicate_request)
-        || error
-            .downcast_ref::<zakura_consensus::VerifyBlockError>()
-            .is_some_and(zakura_consensus::VerifyBlockError::is_duplicate_request)
-        || error
-            .downcast_ref::<zakura_consensus::BoxError>()
-            .is_some_and(|error| {
+    fn classify(error: &(dyn std::any::Any + Send + Sync)) -> Option<BodyVerificationClass> {
+        error
+            .downcast_ref::<zakura_consensus::RouterError>()
+            .map(zakura_consensus::RouterError::body_verification_class)
+            .or_else(|| {
                 error
-                    .downcast_ref::<zakura_consensus::RouterError>()
-                    .is_some_and(zakura_consensus::RouterError::is_duplicate_request)
-                    || error
-                        .downcast_ref::<zakura_consensus::VerifyBlockError>()
-                        .is_some_and(zakura_consensus::VerifyBlockError::is_duplicate_request)
+                    .downcast_ref::<zakura_consensus::VerifyBlockError>()
+                    .map(zakura_consensus::VerifyBlockError::body_verification_class)
             })
+            .or_else(|| {
+                error
+                    .downcast_ref::<zakura_consensus::VerifyCheckpointError>()
+                    .map(zakura_consensus::VerifyCheckpointError::body_verification_class)
+            })
+    }
+
+    fn classify_box(error: &zakura_consensus::BoxError) -> Option<BodyVerificationClass> {
+        error
+            .downcast_ref::<zakura_consensus::RouterError>()
+            .map(zakura_consensus::RouterError::body_verification_class)
+            .or_else(|| {
+                error
+                    .downcast_ref::<zakura_consensus::VerifyBlockError>()
+                    .map(zakura_consensus::VerifyBlockError::body_verification_class)
+            })
+            .or_else(|| {
+                error
+                    .downcast_ref::<zakura_consensus::VerifyCheckpointError>()
+                    .map(zakura_consensus::VerifyCheckpointError::body_verification_class)
+            })
+    }
+
+    let error = error as &(dyn std::any::Any + Send + Sync);
+    classify(error)
+        .or_else(|| {
+            error
+                .downcast_ref::<zakura_consensus::BoxError>()
+                .and_then(classify_box)
+        })
+        .unwrap_or(BodyVerificationClass::Retryable(
+            TransientBodyFailureKind::VerifierUnavailable,
+        ))
 }

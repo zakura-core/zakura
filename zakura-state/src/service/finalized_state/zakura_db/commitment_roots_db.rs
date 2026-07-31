@@ -1543,10 +1543,6 @@ mod tests {
             ("block.rs", include_str!("block.rs")),
             ("shielded.rs", include_str!("shielded.rs")),
             ("rollback.rs", include_str!("rollback.rs")),
-            (
-                "block/startup_audit.rs",
-                include_str!("block/startup_audit.rs"),
-            ),
         ];
 
         for (path, source) in production_sources {
@@ -1828,7 +1824,6 @@ mod tests {
         let config = Config {
             cache_dir: cache.path().to_owned(),
             ephemeral: false,
-            repair_zakura_header_store_on_startup: true,
             ..Config::default()
         };
         let (mut db, _block1, _block2, state) = two_block_checkpoint_fixture_with_config(&config);

@@ -14,7 +14,6 @@ use std::{
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use futures::StreamExt as _;
 use iroh::Watcher as _;
 use iroh::{
     endpoint::{
@@ -30,7 +29,6 @@ use tokio::{
     task::{AbortHandle, JoinHandle, JoinSet},
     time::{timeout, Instant},
 };
-use tokio_stream::StreamMap;
 use tokio_util::sync::CancellationToken;
 use zakura_chain::{
     block::{self, Block, CountedHeader},
@@ -47,26 +45,27 @@ use super::{
     },
     ZakuraTraceEvent,
 };
+#[cfg(any(test, feature = "zakura-testkit"))]
+use crate::zakura::drive_header_sync_actions;
+#[cfg(any(test, feature = "zakura-testkit"))]
+use crate::zakura::HeaderSyncAction;
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        canonical_ip, direct_endpoint_builder, drive_header_sync_actions, spawn_block_sync_reactor,
-        spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
-        BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FramedRecv,
-        FramedSend, Frontier, FrontierChange, FrontierUpdate, HeaderRootAuthState,
-        HeaderSyncAction, HeaderSyncFrontiers, HeaderSyncPassthroughService, HeaderSyncService,
-        HeaderSyncStartup, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer,
-        RealClock, Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject,
-        Stream, StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig,
-        ZakuraConnId, ZakuraControlAck, ZakuraControlHello, ZakuraControlRole,
-        ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
-        ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
-        ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason, ZakuraSyncExchange,
+        direct_endpoint_builder, spawn_block_sync_reactor, spawn_header_sync_reactor,
+        BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle, BlockSyncService, BlockSyncStartup,
+        Clock, CloseCause, Frame, FramedRecv, FramedSend, FullStateFrontiers,
+        HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup, Peer, RealClock,
+        Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject, Stream,
+        StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId,
+        ZakuraControlAck, ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation,
+        ZakuraHandshakeConfig, ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits,
+        ZakuraLimits, ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
         ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
         FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
         MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
-        TRANSCRIPT_HASH_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1,
-        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+        TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
 use crate::{BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
@@ -217,7 +216,7 @@ const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
 const _: () = assert!(DISCOVERY_STREAM_KIND == super::discovery::ZAKURA_STREAM_DISCOVERY);
 const _: () = assert!(HEADER_SYNC_STREAM_KIND == super::header_sync::ZAKURA_STREAM_HEADER_SYNC);
-const _: () = assert!(ZAKURA_STREAM_VERSION_7 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
+const _: () = assert!(ZAKURA_HEADER_SYNC_STREAM_VERSION == 8);
 const _: () =
     assert!(LEGACY_REQUEST_BLOCKS_BY_HASH == super::legacy_gossip::MSG_REQUEST_BLOCKS_BY_HASH);
 const _: () = assert!(
@@ -527,8 +526,8 @@ pub struct ZakuraEndpoint {
     handler: ZakuraProtocolHandler,
     header_sync: Option<super::HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
-    sync_frontier: Option<ZakuraSyncExchange>,
     header_sync_tasks: Option<Arc<HeaderSyncBackgroundTasks>>,
+    #[cfg(any(test, feature = "zakura-testkit"))]
     header_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<HeaderSyncAction>>>>>,
     block_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<BlockSyncAction>>>>>,
     /// Maintained native dials started by the legacy->Zakura upgrade hand-off,
@@ -548,13 +547,17 @@ struct HeaderSyncBackgroundTasks {
 #[derive(Clone, Debug)]
 pub struct ZakuraHeaderSyncDriverStartup {
     /// Durable state frontiers loaded at node startup.
-    pub frontiers: HeaderSyncFrontiers,
+    pub frontiers: FullStateFrontiers,
     /// Durable best header tip loaded from state.
     pub best_header_tip: Option<(block::Height, block::Hash)>,
     /// Hash of `frontiers.verified_block_tip`.
     pub verified_block_tip_hash: block::Hash,
-    /// Compact durable header-root authentication progress loaded from state.
-    pub header_root_auth: Option<HeaderRootAuthState>,
+    /// Durable header snapshots, whose value is absent until semantic handoff succeeds.
+    pub committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+    /// VCT metadata repair needs published by the finalized writer.
+    pub vct_root_repairs: Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
+    /// Typed header-chain operations used directly by the reactor.
+    pub header_chain_port: Arc<dyn zakura_node_services::header_chain::HeaderChainPort>,
 }
 
 impl ZakuraEndpoint {
@@ -605,33 +608,8 @@ impl ZakuraEndpoint {
         self.block_sync.clone()
     }
 
-    /// Subscribe to the shared Zakura sync frontier stream.
-    pub fn subscribe_sync_frontier(&self) -> Option<watch::Receiver<FrontierUpdate>> {
-        self.sync_frontier
-            .as_ref()
-            .map(ZakuraSyncExchange::subscribe_frontier)
-    }
-
-    /// Return the currently cached shared Zakura sync frontier update.
-    pub fn current_sync_frontier(&self) -> Option<FrontierUpdate> {
-        self.sync_frontier
-            .as_ref()
-            .map(ZakuraSyncExchange::current_frontier)
-    }
-
-    /// Publish a shared Zakura sync frontier update.
-    pub fn publish_sync_frontier(&self, update: FrontierUpdate) {
-        self.publish_sync_frontier_from(update, "unknown");
-    }
-
-    /// Publish a shared Zakura sync frontier update with a trace source.
-    pub fn publish_sync_frontier_from(&self, update: FrontierUpdate, source: &'static str) {
-        if let Some(sync_frontier) = &self.sync_frontier {
-            sync_frontier.publish_frontier(update, source);
-        }
-    }
-
     /// Take the header-sync action receiver when this endpoint was started in external-driver mode.
+    #[cfg(any(test, feature = "zakura-testkit"))]
     pub async fn take_header_sync_actions(&self) -> Option<mpsc::Receiver<HeaderSyncAction>> {
         let actions = self.header_sync_actions.as_ref()?;
         actions.lock().await.take()
@@ -828,7 +806,6 @@ impl ZakuraEndpoint {
             handler,
             header_sync: None,
             block_sync: None,
-            sync_frontier: None,
             header_sync_tasks: None,
             header_sync_actions: None,
             block_sync_actions: None,
@@ -853,7 +830,6 @@ impl ZakuraEndpoint {
             handler,
             header_sync: Some(header_sync),
             block_sync: None,
-            sync_frontier: None,
             header_sync_tasks: Some(Arc::new(HeaderSyncBackgroundTasks {
                 shutdown,
                 tasks: Mutex::new(tasks),
@@ -883,7 +859,6 @@ impl ZakuraEndpoint {
             handler,
             header_sync: Some(header_sync),
             block_sync: Some(block_sync),
-            sync_frontier: None,
             header_sync_tasks: Some(Arc::new(HeaderSyncBackgroundTasks {
                 shutdown,
                 tasks: Mutex::new(tasks),
@@ -1109,7 +1084,6 @@ impl ZakuraSupervisorHandle {
         disconnect_token: CancellationToken,
         _accepted_capabilities: u64,
     ) -> ZakuraRegistration {
-        let remote_ip = remote_ip.map(canonical_ip);
         let mut state = self.inner.lock().await;
         // A re-registration for a peer id that is already active from the same
         // IP is a duplicate redial, not a new per-IP allocation: the incumbent
@@ -1249,7 +1223,6 @@ impl ZakuraSupervisorHandle {
         remote_ip: IpAddr,
         in_flight_count: usize,
     ) -> bool {
-        let remote_ip = canonical_ip(remote_ip);
         let state = self.inner.lock().await;
         let active_count = state
             .active_by_ip
@@ -1421,10 +1394,10 @@ struct ConnectionServeContext {
     direction: ServicePeerDirection,
     transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
     /// Whether this node wins same-kind ordered-stream collisions on this
-    /// connection. Block sync can be opened by either peer, so it can arrive
-    /// twice; the winner keeps its own stream and the loser adopts the peer's.
-    /// Computed from the connection role so the two ends always agree: the
-    /// dialing side wins.
+    /// connection. Both sides open their demanded ordered streams (connection
+    /// symmetry), so a kind both sides open arrives twice; the winner keeps its
+    /// own stream and the loser adopts the peer's. Computed from the node ids so
+    /// the two ends always agree: `local_node_id < remote_node_id`.
     i_open_collision_winner: bool,
     conn: ZakuraConnTrace,
 }
@@ -1436,8 +1409,10 @@ struct RegisteredConnectionServeContext {
     connection_token: CancellationToken,
     close_cause: CloseCause,
     accepted_capabilities: u64,
-    /// Whether this side dialed the connection. The initiator opens ordinary
-    /// ordered streams; either side may open block sync.
+    /// Whether this side dialed the connection. The dialer (initiator) opens all
+    /// of its demanded ordered streams as before; the responder additionally
+    /// opens only block-sync (the sole symmetric service), keeping the legacy
+    /// initiator-opens behaviour for gossip/header-sync/discovery.
     is_initiator: bool,
     /// See [`ConnectionServeContext::i_open_collision_winner`].
     i_open_collision_winner: bool,
@@ -1464,8 +1439,9 @@ impl StreamWorkerContext {
     }
 }
 
-struct AdmittedOrderedSession {
+struct AdmittedOrderedStream {
     kind: u16,
+    version: u16,
     session_id: u64,
     recv: FramedRecv,
     send: FramedSend,
@@ -1473,192 +1449,34 @@ struct AdmittedOrderedSession {
 }
 
 #[derive(Copy, Clone, Debug)]
-struct OrderedSessionExit {
+struct OrderedStreamExit {
     stream: Stream,
     session_id: u64,
     opened_locally: bool,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum OrderedSessionWaitReason {
-    Demand,
-    Transport,
-}
-
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-enum OrderedSessionReopenState {
-    #[default]
-    Idle,
-    Waiting(OrderedSessionWaitReason),
-    Retired,
-}
-
-type OrderedSessionWait = futures::stream::Once<BoxRunFuture<'static, ()>>;
-type OrderedSessionWaits = StreamMap<u16, OrderedSessionWait>;
-
-/// Connection-owned lifecycle for one negotiated ordered stream kind.
-#[derive(Debug)]
-struct OrderedSessionState {
-    stream: Stream,
-    local_session_id: Option<u64>,
-    remote_session_id: Option<u64>,
-    // Keep cumulative transport re-offers across successful opens: a remote
-    // service can immediately park the stream again, and resetting here would
-    // turn persistent refusal into a base-delay reopen loop.
-    reopen_attempts: u32,
-    reopen_state: OrderedSessionReopenState,
-}
-
-impl OrderedSessionState {
-    fn new(stream: Stream) -> Self {
-        Self {
-            stream,
-            local_session_id: None,
-            remote_session_id: None,
-            reopen_attempts: 0,
-            reopen_state: OrderedSessionReopenState::Idle,
-        }
-    }
-
-    fn has_active_session(&self) -> bool {
-        self.local_session_id.is_some() || self.remote_session_id.is_some()
-    }
-
-    fn remove_active_session(&mut self, opened_locally: bool, session_id: u64) -> bool {
-        let active_session = if opened_locally {
-            &mut self.local_session_id
-        } else {
-            &mut self.remote_session_id
-        };
-        if *active_session != Some(session_id) {
-            return false;
-        }
-
-        *active_session = None;
-        true
-    }
-
-    fn schedule_demand(&mut self, waits: &mut OrderedSessionWaits, demand: OrderedSessionDemand) {
-        match demand {
-            OrderedSessionDemand::OpenNow => {
-                self.cancel_wait(waits);
-                self.install_wait(
-                    waits,
-                    OrderedSessionWaitReason::Demand,
-                    Box::pin(future::ready(())),
-                );
-            }
-            OrderedSessionDemand::RetryAt(at) => {
-                self.install_demand_wait(
-                    waits,
-                    Box::pin(async move {
-                        tokio::time::sleep_until(at.into()).await;
-                    }),
-                );
-            }
-            OrderedSessionDemand::WaitForChange(changed) => {
-                self.install_demand_wait(waits, changed);
-            }
-            OrderedSessionDemand::Retire => {
-                waits.remove(&self.stream.kind);
-                self.reopen_state = OrderedSessionReopenState::Retired;
-            }
-        }
-    }
-
-    fn schedule_transport_backoff(&mut self, waits: &mut OrderedSessionWaits) -> Option<Duration> {
-        if self.reopen_state != OrderedSessionReopenState::Idle {
-            return None;
-        }
-        debug_assert!(
-            !waits.contains_key(&self.stream.kind),
-            "idle ordered session cannot already have a reopen wait"
-        );
-
-        let delay = ordered_session_reopen_backoff(self.reopen_attempts);
-        self.reopen_attempts = self.reopen_attempts.saturating_add(1);
-        self.install_wait(
-            waits,
-            OrderedSessionWaitReason::Transport,
-            Box::pin(tokio::time::sleep(delay)),
-        );
-        Some(delay)
-    }
-
-    fn finish_wait(&mut self, waits: &mut OrderedSessionWaits) {
-        let removed = waits.remove(&self.stream.kind);
-        debug_assert!(
-            removed.is_some(),
-            "yielded ordered session wait remains keyed until it is handled"
-        );
-        if matches!(self.reopen_state, OrderedSessionReopenState::Waiting(_)) {
-            self.reopen_state = OrderedSessionReopenState::Idle;
-        }
-    }
-
-    fn cancel_wait(&mut self, waits: &mut OrderedSessionWaits) {
-        waits.remove(&self.stream.kind);
-        if matches!(self.reopen_state, OrderedSessionReopenState::Waiting(_)) {
-            self.reopen_state = OrderedSessionReopenState::Idle;
-        }
-    }
-
-    fn install_demand_wait(
-        &mut self,
-        waits: &mut OrderedSessionWaits,
-        wait: BoxRunFuture<'static, ()>,
-    ) {
-        if self.reopen_state == OrderedSessionReopenState::Waiting(OrderedSessionWaitReason::Demand)
-        {
-            return;
-        }
-
-        self.cancel_wait(waits);
-        self.install_wait(waits, OrderedSessionWaitReason::Demand, wait);
-    }
-
-    fn install_wait(
-        &mut self,
-        waits: &mut OrderedSessionWaits,
-        reason: OrderedSessionWaitReason,
-        wait: BoxRunFuture<'static, ()>,
-    ) {
-        let replaced = waits.insert(self.stream.kind, futures::stream::once(wait));
-        debug_assert!(
-            replaced.is_none(),
-            "ordered session wait is cancelled before replacement"
-        );
-        self.reopen_state = OrderedSessionReopenState::Waiting(reason);
-    }
-}
-
-/// Whether this side may open `kind` itself.
+/// Whether an exited ordered stream should be reopened on the same connection.
 ///
-/// The initiator opens ordinary ordered streams. Block sync is symmetric, so
-/// either side may open it and simultaneous offers use the connection's
-/// deterministic collision tiebreak.
-fn may_open_ordered_stream(policy: OrderedStreamPolicy, is_initiator: bool) -> bool {
-    is_initiator || policy.opening == OrderedStreamOpening::EitherSide
-}
-
-/// An ordered service session can be locally parked while its connection and
-/// sibling services remain healthy. Any side entitled by the transport policy
-/// to open a replacement keeps offering one with bounded backoff.
-fn should_reopen_ordered_session(
-    exited: OrderedSessionExit,
-    policy: OrderedStreamPolicy,
+/// A header-sync stream can die while its connection stays healthy: the responder
+/// parks it when the service is at capacity or has no demand, and the transport can
+/// drop it on its own. Nothing else reopens it, so without this the connection keeps
+/// running with header sync permanently dark on it. Only the initiator reopens, and
+/// only a stream it opened itself, so the two sides cannot race to reopen the same
+/// kind.
+fn should_reopen_ordered_stream(
+    exited: OrderedStreamExit,
     is_initiator: bool,
     connection_cancelled: bool,
 ) -> bool {
-    exited.stream.mode == StreamMode::Ordered
-        && policy.reopen
-        && may_open_ordered_stream(policy, is_initiator)
+    exited.opened_locally
+        && is_initiator
+        && exited.stream.kind == ZAKURA_STREAM_HEADER_SYNC
         && !connection_cancelled
 }
 
 /// Exponential reopen delay for one ordered stream kind, capped so a
 /// persistently failing local open cannot spin the connection loop.
-fn ordered_session_reopen_backoff(attempts: u32) -> Duration {
+fn ordered_stream_reopen_backoff(attempts: u32) -> Duration {
     // The shift is safe: attempts is clamped so the multiplier fits in u32.
     ORDERED_STREAM_REOPEN_BACKOFF
         .saturating_mul(1u32 << attempts.min(8))
@@ -1728,15 +1546,15 @@ pub(crate) fn service_registry(
     block_sync: Option<BlockSyncHandle>,
     block_sync_config: ZakuraBlockSyncConfig,
     legacy_service: Arc<dyn Service>,
-    discovery_service: Arc<super::DiscoveryService>,
+    discovery_service: Arc<dyn Service>,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
-    let mut services = vec![legacy_service.clone()];
-    let header_sync_service = if let Some(header_sync) = &header_sync {
-        Arc::new(HeaderSyncService::new(header_sync.clone())) as Arc<dyn Service>
+    let mut services = vec![legacy_service.clone(), discovery_service];
+    if let Some(header_sync) = &header_sync {
+        services.push(Arc::new(HeaderSyncService::new(header_sync.clone())) as Arc<dyn Service>);
     } else {
-        Arc::new(HeaderSyncPassthroughService::new(legacy_service.clone())) as Arc<dyn Service>
-    };
-    services.push(header_sync_service.clone());
+        services
+            .push(Arc::new(HeaderSyncPassthroughService::new(legacy_service)) as Arc<dyn Service>);
+    }
     let block_sync = match block_sync {
         Some(block_sync) => BlockSyncService::new_with_handle(block_sync_config, block_sync),
         None => match header_sync.as_ref() {
@@ -1747,14 +1565,7 @@ pub(crate) fn service_registry(
             None => BlockSyncService::new(block_sync_config),
         },
     };
-    let block_sync = Arc::new(block_sync) as Arc<dyn Service>;
-    discovery_service.set_connection_owners(vec![
-        legacy_service,
-        header_sync_service,
-        block_sync.clone(),
-    ]);
-    services.push(discovery_service as Arc<dyn Service>);
-    services.push(block_sync);
+    services.push(Arc::new(block_sync) as Arc<dyn Service>);
 
     Ok(Arc::new(
         ServiceRegistry::new(services).map_err(|error| -> BoxError { Box::new(error) })?,
@@ -1766,6 +1577,7 @@ pub(crate) fn service_registry(
 pub struct ZakuraProtocolHandler {
     supervisor: ZakuraSupervisorHandle,
     handshake_config: ZakuraHandshakeConfig,
+    supported_capabilities: Arc<AtomicU64>,
     limits: ZakuraLocalLimits,
     registry: Arc<ServiceRegistry>,
     trace: ZakuraTrace,
@@ -1794,22 +1606,18 @@ fn random_stream_session_seed() -> u64 {
     }
 }
 
-/// Resolve a connected peer's confirmed UDP source IP from the endpoint's node
-/// map so the per-IP connection cap can be enforced against the path that
-/// actually carries the connection.
+/// Resolve the inbound peer's UDP source IP from the endpoint's node map so the
+/// per-IP connection cap can be enforced for Router-accepted connections.
 ///
-/// Used for both directions. Inbound: iroh exposes the peer address on
-/// `Incoming`, which the Router consumes before `ProtocolHandler::accept`.
-/// Outbound: a dialed peer may advertise several addresses, but only one path
-/// ends up carrying the connection — charging the first *advertised* address
-/// lets a record list a decoy address to escape the cap. In both cases, after
-/// the native control handshake the connection has exchanged real QUIC payload
-/// over its direct path, so the endpoint's node map knows the peer's UDP
-/// address: prefer the connection's confirmed current path (`conn_type`), then
-/// fall back to the direct address that most recently delivered payload from
-/// this peer. Relay-only paths have no single attributable source IP, so they
-/// correctly yield `None` (the global connection cap still bounds them).
-fn confirmed_remote_ip(endpoint: &Endpoint, node_id: NodeId) -> Option<IpAddr> {
+/// Iroh exposes the peer address on `Incoming`, which the Router consumes before
+/// `ProtocolHandler::accept`. After the native control handshake the connection
+/// has exchanged real QUIC payload over its direct path, so the endpoint's node
+/// map knows the peer's UDP address: prefer the connection's confirmed current
+/// path (`conn_type`), then fall back to the direct address that most recently
+/// delivered payload from this peer. Relay-only paths have no single
+/// attributable source IP, so they correctly yield `None` (the global
+/// connection cap still bounds them).
+fn inbound_remote_ip(endpoint: &Endpoint, node_id: NodeId) -> Option<IpAddr> {
     if let Some(mut conn_type) = endpoint.conn_type(node_id) {
         match conn_type.get() {
             ConnectionType::Direct(addr) | ConnectionType::Mixed(addr, _) => {
@@ -1842,14 +1650,13 @@ fn native_connection_transcript_hash(
 }
 
 /// Whether the local node wins same-kind ordered-stream collisions against
-/// Both sides open their demanded ordered streams, so a kind both sides open
-/// arrives twice; the dialing side wins and keeps its own stream while the
-/// accepting side adopts the peer's. Both ends always know who initiated the
-/// connection, so they converge on a single surviving stream without any extra
-/// round trip — and without needing the local node id, which responder-side
-/// contexts may not have (no bound endpoint).
-fn i_open_collision_winner(is_initiator: bool) -> bool {
-    is_initiator
+/// `remote_node_id`. Both sides open their demanded ordered streams, so a kind
+/// both sides open arrives twice; the lexicographically smaller node id wins and
+/// keeps its own stream while the other adopts the peer's. The two ends always
+/// compute complementary answers from the same (distinct) node ids, so they
+/// converge on a single surviving stream without any extra round trip.
+fn i_open_collision_winner(local_node_id: &NodeId, remote_node_id: &NodeId) -> bool {
+    local_node_id.as_bytes() < remote_node_id.as_bytes()
 }
 
 impl ZakuraProtocolHandler {
@@ -1898,9 +1705,12 @@ impl ZakuraProtocolHandler {
     ) -> Self {
         let mut handshake_config = handshake_config;
         handshake_config.supported_capabilities = registry.supported_capabilities();
+        let supported_capabilities =
+            Arc::new(AtomicU64::new(handshake_config.supported_capabilities));
         Self {
             supervisor,
             handshake_config,
+            supported_capabilities,
             registry,
             trace,
             next_conn_id: Arc::new(AtomicU64::new(1)),
@@ -1923,7 +1733,27 @@ impl ZakuraProtocolHandler {
     #[cfg(any(test, feature = "zakura-testkit"))]
     pub(crate) fn with_supported_capabilities(mut self, supported_capabilities: u64) -> Self {
         self.handshake_config.supported_capabilities &= supported_capabilities;
+        self.supported_capabilities.store(
+            self.handshake_config.supported_capabilities,
+            Ordering::Relaxed,
+        );
         self
+    }
+
+    fn current_handshake_config(&self) -> ZakuraHandshakeConfig {
+        let mut config = self.handshake_config;
+        config.supported_capabilities = self.supported_capabilities.load(Ordering::Relaxed);
+        config
+    }
+
+    fn set_header_sync_enabled(&self, enabled: bool) {
+        if enabled {
+            self.supported_capabilities
+                .fetch_or(ZAKURA_CAP_HEADER_SYNC, Ordering::Relaxed);
+        } else {
+            self.supported_capabilities
+                .fetch_and(!ZAKURA_CAP_HEADER_SYNC, Ordering::Relaxed);
+        }
     }
 
     /// Attach the bound iroh endpoint so inbound Router-accepted connections can
@@ -1978,7 +1808,7 @@ impl ZakuraProtocolHandler {
         let remote_ip = self
             .endpoint
             .as_ref()
-            .and_then(|endpoint| confirmed_remote_ip(endpoint, remote_node_id));
+            .and_then(|endpoint| inbound_remote_ip(endpoint, remote_node_id));
         let local_node_id = self
             .endpoint
             .as_ref()
@@ -1999,7 +1829,7 @@ impl ZakuraProtocolHandler {
                     &local_node_id,
                     &remote_node_id,
                 ),
-                i_open_collision_winner: i_open_collision_winner(false),
+                i_open_collision_winner: i_open_collision_winner(&local_node_id, &remote_node_id),
                 conn,
             },
         )
@@ -2038,12 +1868,13 @@ impl ZakuraProtocolHandler {
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
     ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
+        let handshake_config = self.current_handshake_config();
         self.trace.emit(
             HANDSHAKE_TABLE,
             conn.event("control.started")
                 .role("responder")
                 .phase("control")
-                .network(self.handshake_config.network_label()),
+                .network(handshake_config.network_label()),
         );
         let (mut send, mut recv) = timeout(self.limits.control_timeout, connection.accept_bi())
             .await
@@ -2051,13 +1882,13 @@ impl ZakuraProtocolHandler {
 
         let hello_bytes = read_control_payload(
             &mut recv,
-            self.handshake_config.max_control_frame_bytes,
+            handshake_config.max_control_frame_bytes,
             self.limits.control_timeout,
         )
         .await?;
         let hello = ZakuraControlHello::decode(&hello_bytes)?;
         let expected = ZakuraControlValidation {
-            local: &self.handshake_config,
+            local: &handshake_config,
             authenticated_remote_id: remote_peer_id.as_bytes(),
             selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_1,
             handshake_path: ZakuraHandshakePath::Native,
@@ -2078,9 +1909,8 @@ impl ZakuraProtocolHandler {
             selected_zakura_protocol: hello.selected_zakura_protocol,
             peer_nonce: local_nonce,
             remote_peer_nonce: hello.peer_nonce,
-            accepted_capabilities: hello.capabilities
-                & self.handshake_config.supported_capabilities,
-            accepted_channels: hello.required_channels & self.handshake_config.supported_channels,
+            accepted_capabilities: hello.capabilities & handshake_config.supported_capabilities,
+            accepted_channels: hello.required_channels & handshake_config.supported_channels,
             accepted_limits,
         };
         write_control_payload(&mut send, &ack.encode()?, self.limits.control_timeout).await?;
@@ -2090,7 +1920,7 @@ impl ZakuraProtocolHandler {
                 .role("responder")
                 .phase("control")
                 .selected_protocol(ack.selected_zakura_protocol)
-                .network(self.handshake_config.network_label()),
+                .network(handshake_config.network_label()),
         );
         Ok(NativeHandshakeNegotiated {
             limits: accepted_limits,
@@ -2135,38 +1965,35 @@ impl ZakuraProtocolHandler {
         let accepted_capabilities = context.accepted_capabilities;
         let stream_sem = Arc::new(Semaphore::new(usize::from(limits.max_open_streams)));
         let mut workers = JoinSet::new();
-        let (ordered_session_exit_tx, mut ordered_session_exit_rx) = mpsc::unbounded_channel();
-        let mut ordered_session_waits = OrderedSessionWaits::new();
+        let (ordered_stream_exit_tx, mut ordered_stream_exit_rx) = mpsc::unbounded_channel();
+        let (ordered_stream_reopen_tx, mut ordered_stream_reopen_rx) = mpsc::unbounded_channel();
+        // Consecutive reopen attempts per stream kind; reset once a reopen
+        // succeeds so ordinary stream deaths keep the base delay.
+        let mut ordered_stream_reopen_attempts: HashMap<u16, u32> = HashMap::new();
         let mut open_limiter = TokenBucket::new(limits.stream_open_rate_per_second);
         let mut message_buckets = MessageRateBuckets::new();
         let (freshness_tx, freshness_rx) = watch::channel(Instant::now());
         let negotiated_ordered_streams = self
             .registry
             .ordered_streams_for_negotiated(accepted_capabilities);
-        let mut ordered_sessions: HashMap<u16, OrderedSessionState> = negotiated_ordered_streams
-            .iter()
-            .copied()
-            .map(|stream| (stream.kind, OrderedSessionState::new(stream)))
+        // Block-sync connection symmetry: the dialer (initiator) proactively
+        // opens all of its demanded ordered streams as before; the responder
+        // additionally opens block-sync so a two-way block-sync channel exists
+        // regardless of who dialed (the reactor treats every peer the same). The
+        // other ordered services (gossip/header-sync/discovery) keep the legacy
+        // initiator-opens/responder-accepts behaviour. A block-sync stream both
+        // sides open arrives twice and is resolved by the node-id collision
+        // tiebreak in the accept loop below.
+        let ordered_streams: Vec<Stream> = self
+            .registry
+            .ordered_streams_for_escalation(accepted_capabilities, &peer_id, context.direction)
+            .into_iter()
+            .filter(|stream| {
+                // In-process tests use one stream-6 session per connection so
+                // local harnesses avoid exercising the symmetric collision path.
+                context.is_initiator || (!cfg!(test) && stream.kind == ZAKURA_STREAM_BLOCK_SYNC)
+            })
             .collect();
-        let mut ordered_streams = Vec::new();
-        let mut deferred_ordered_streams = Vec::new();
-        for stream in negotiated_ordered_streams.iter().copied() {
-            let policy = self.registry.ordered_stream_policy(stream.kind);
-            if !may_open_ordered_stream(policy, context.is_initiator) {
-                continue;
-            }
-
-            match self.registry.ordered_session_demand(
-                stream.kind,
-                conn_id,
-                accepted_capabilities,
-                &peer_id,
-                context.direction,
-            ) {
-                OrderedSessionDemand::OpenNow => ordered_streams.push(stream),
-                demand => deferred_ordered_streams.push((stream, demand)),
-            }
-        }
         let request_response_stream_count = self
             .registry
             .request_response_streams_for_negotiated(accepted_capabilities)
@@ -2180,24 +2007,33 @@ impl ZakuraProtocolHandler {
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"ordered streams");
             close_cause.record("resource_ordered_streams");
             connection_token.cancel();
-        } else if !negotiated_ordered_streams.is_empty()
-            && usize::from(limits.max_inbound_queue_depth) < negotiated_ordered_streams.len()
+        } else if !ordered_streams.is_empty()
+            && usize::from(limits.max_inbound_queue_depth) < ordered_streams.len()
         {
             debug!(
                 max_inbound_queue_depth = limits.max_inbound_queue_depth,
-                ordered_stream_count = negotiated_ordered_streams.len(),
+                ordered_stream_count = ordered_streams.len(),
                 "closing Zakura peer because inbound queue depth cannot be split across ordered streams"
             );
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"queue split");
             close_cause.record("resource_queue_split");
             connection_token.cancel();
         }
+        let selected_ordered_streams: HashMap<u16, Stream> = negotiated_ordered_streams
+            .iter()
+            .map(|stream| (stream.kind, *stream))
+            .collect();
+        let ordered_kinds: HashSet<u16> = selected_ordered_streams.keys().copied().collect();
         let queue_split_stream_count = negotiated_ordered_streams.len().max(ordered_streams.len());
         let per_stream_queue_depth = per_stream_inbound_queue_depth(
             limits.max_inbound_queue_depth,
             queue_split_stream_count,
         );
         let mut service_streams = HashMap::new();
+        // Ordered-stream kinds this side proactively opened, used by the accept
+        // loop to detect same-kind collisions (both sides opened the kind).
+        let mut opened_kinds: HashSet<u16> = HashSet::new();
+        let mut accepted_ordered_kinds = HashSet::new();
         let run_freshness_reaper =
             should_run_freshness_reaper(queue_split_stream_count, request_response_stream_count);
 
@@ -2232,7 +2068,7 @@ impl ZakuraProtocolHandler {
                         freshness_tx.clone(),
                         conn.clone(),
                         peer_id.clone(),
-                        ordered_session_exit_tx.clone(),
+                        ordered_stream_exit_tx.clone(),
                     )
                     .await
                 {
@@ -2252,14 +2088,12 @@ impl ZakuraProtocolHandler {
                         break;
                     }
                 };
-                ordered_sessions
-                    .get_mut(&admitted.kind)
-                    .expect("opened ordered stream was selected from negotiated session state")
-                    .local_session_id = Some(admitted.session_id);
+                opened_kinds.insert(admitted.kind);
                 service_streams.insert(
                     admitted.kind,
                     ServiceStream::new(
                         admitted.session_id,
+                        admitted.version,
                         admitted.recv,
                         admitted.send,
                         admitted.cancel_token,
@@ -2286,21 +2120,6 @@ impl ZakuraProtocolHandler {
             }
         }
 
-        if !connection_token.is_cancelled() {
-            for (stream, demand) in deferred_ordered_streams {
-                debug!(
-                    ?peer_id,
-                    stream_kind = stream.kind,
-                    ?demand,
-                    "deferring ordered service session according to reactor demand"
-                );
-                ordered_sessions
-                    .get_mut(&stream.kind)
-                    .expect("deferred ordered stream has negotiated session state")
-                    .schedule_demand(&mut ordered_session_waits, demand);
-            }
-        }
-
         loop {
             tokio::select! {
                 biased;
@@ -2310,65 +2129,52 @@ impl ZakuraProtocolHandler {
                     close_cause.record("idle_timeout");
                     break;
                 }
-                Some(exited) = ordered_session_exit_rx.recv() => {
+                Some(exited) = ordered_stream_exit_rx.recv() => {
                     // Stop tracking the dead generation, or a legitimate reopen of the
                     // same kind would look like a duplicate stream and kill the whole
                     // connection, taking block sync and gossip down with header sync.
-                    let Some(session) = ordered_sessions.get_mut(&exited.stream.kind) else {
-                        continue;
-                    };
-                    let removed_active_session =
-                        session.remove_active_session(exited.opened_locally, exited.session_id);
-                    let policy = self.registry.ordered_stream_policy(exited.stream.kind);
-                    if removed_active_session
-                        && !session.has_active_session()
-                        && should_reopen_ordered_session(
+                    if exited.opened_locally {
+                        opened_kinds.remove(&exited.stream.kind);
+                    } else {
+                        accepted_ordered_kinds.remove(&exited.stream.kind);
+                    }
+                    if should_reopen_ordered_stream(
                         exited,
-                        policy,
                         context.is_initiator,
                         connection_token.is_cancelled(),
-                    )
-                    {
-                        if let Some(delay) =
-                            session.schedule_transport_backoff(&mut ordered_session_waits)
-                        {
-                            debug!(
-                                stream_kind = exited.stream.kind,
-                                stream_version = exited.stream.version,
-                                session_id = exited.session_id,
-                                ?delay,
-                                "scheduling Zakura ordered stream reopen"
-                            );
-                        }
+                    ) {
+                        let attempts = ordered_stream_reopen_attempts
+                            .entry(exited.stream.kind)
+                            .or_insert(0);
+                        let delay = ordered_stream_reopen_backoff(*attempts);
+                        *attempts = attempts.saturating_add(1);
+                        debug!(
+                            stream_kind = exited.stream.kind,
+                            stream_version = exited.stream.version,
+                            session_id = exited.session_id,
+                            ?delay,
+                            "scheduling Zakura ordered stream reopen"
+                        );
+                        let reopen = ordered_stream_reopen_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let _ = reopen.send(exited.stream);
+                        });
                     }
                 }
-                Some((kind, ())) = ordered_session_waits.next(), if !ordered_session_waits.is_empty() => {
-                    let Some(session) = ordered_sessions.get_mut(&kind) else {
-                        continue;
-                    };
-                    session.finish_wait(&mut ordered_session_waits);
-                    let stream = session.stream;
-                    let policy = self.registry.ordered_stream_policy(stream.kind);
+                Some(stream) = ordered_stream_reopen_rx.recv() => {
                     if connection_token.is_cancelled()
-                        || !may_open_ordered_stream(policy, context.is_initiator)
-                        || session.has_active_session()
+                        || !context.is_initiator
+                        || opened_kinds.contains(&stream.kind)
+                        || selected_ordered_streams.get(&stream.kind) != Some(&stream)
+                        || !self.registry.wants_ordered_stream(
+                            stream.kind,
+                            accepted_capabilities,
+                            &peer_id,
+                            context.direction,
+                        )
                     {
                         continue;
-                    }
-
-                    let demand = self.registry.ordered_session_demand(
-                        stream.kind,
-                        conn_id,
-                        accepted_capabilities,
-                        &peer_id,
-                        context.direction,
-                    );
-                    match demand {
-                        OrderedSessionDemand::OpenNow => {}
-                        demand => {
-                            session.schedule_demand(&mut ordered_session_waits, demand);
-                            continue;
-                        }
                     }
 
                     match self
@@ -2385,20 +2191,18 @@ impl ZakuraProtocolHandler {
                             freshness_tx.clone(),
                             conn.clone(),
                             peer_id.clone(),
-                            ordered_session_exit_tx.clone(),
+                            ordered_stream_exit_tx.clone(),
                         )
                         .await
                     {
                         Ok(admitted) => {
-                            let session = ordered_sessions
-                                .get_mut(&admitted.kind)
-                                .expect("opened ordered stream has negotiated session state");
-                            session.cancel_wait(&mut ordered_session_waits);
-                            session.local_session_id = Some(admitted.session_id);
+                            ordered_stream_reopen_attempts.remove(&admitted.kind);
+                            opened_kinds.insert(admitted.kind);
                             let service_streams = HashMap::from([(
                                 admitted.kind,
                                 ServiceStream::new(
                                     admitted.session_id,
+                                    admitted.version,
                                     admitted.recv,
                                     admitted.send,
                                     admitted.cancel_token,
@@ -2419,16 +2223,22 @@ impl ZakuraProtocolHandler {
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                         }
                         Err(error) => {
-                            let delay = ordered_sessions
-                                .get_mut(&stream.kind)
-                                .expect("failed ordered stream open has negotiated session state")
-                                .schedule_transport_backoff(&mut ordered_session_waits);
+                            let attempts = ordered_stream_reopen_attempts
+                                .entry(stream.kind)
+                                .or_insert(0);
+                            let delay = ordered_stream_reopen_backoff(*attempts);
+                            *attempts = attempts.saturating_add(1);
                             debug!(
                                 ?error,
                                 stream_kind = stream.kind,
                                 ?delay,
                                 "retrying Zakura ordered stream reopen after local failure"
                             );
+                            let reopen = ordered_stream_reopen_tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                let _ = reopen.send(stream);
+                            });
                         }
                     }
                 }
@@ -2460,7 +2270,7 @@ impl ZakuraProtocolHandler {
                                     recv,
                                     &mut admission,
                                     per_stream_queue_depth,
-                                    ordered_session_exit_tx.clone(),
+                                    ordered_stream_exit_tx.clone(),
                                 )
                                 .await
                             {
@@ -2469,7 +2279,7 @@ impl ZakuraProtocolHandler {
                                 // A stream kind we never negotiated is a protocol
                                 // fault: tear the connection down (unchanged
                                 // strictness).
-                                if !ordered_sessions.contains_key(&kind) {
+                                if !ordered_kinds.contains(&kind) {
                                     debug!(
                                         stream_kind = kind,
                                         "closing peer after unexpected ordered stream"
@@ -2478,38 +2288,46 @@ impl ZakuraProtocolHandler {
                                     connection_token.cancel();
                                     continue;
                                 }
-                                // Reject a stream opened by a peer whose
-                                // connection role is not entitled to open this
-                                // kind, even if it races our own offer.
-                                let policy = self.registry.ordered_stream_policy(kind);
-                                if !may_open_ordered_stream(policy, !context.is_initiator) {
+                                let is_block_sync = kind == ZAKURA_STREAM_BLOCK_SYNC;
+                                // A block-sync collision means both sides opened
+                                // block-sync (the only symmetric service).
+                                let is_block_sync_collision =
+                                    is_block_sync && opened_kinds.contains(&kind);
+
+                                // Winner of a block-sync collision keeps its own
+                                // stream and parks the peer's. The connection is
+                                // never torn down for this benign double-open; the
+                                // loser falls through and adopts the peer's stream.
+                                if is_block_sync_collision && context.i_open_collision_winner {
                                     debug!(
                                         stream_kind = kind,
-                                        "closing peer after unexpected ordered stream"
+                                        "winning block-sync collision; parking peer's duplicate"
                                     );
-                                    close_cause.record("unexpected_stream");
-                                    connection_token.cancel();
+                                    admitted.cancel_token.cancel();
                                     continue;
                                 }
 
-                                let is_collision =
-                                    ordered_sessions[&kind].local_session_id.is_some();
-                                // The deterministic winner keeps its own stream
-                                // and parks the peer's. The loser falls through
-                                // and adopts the peer's stream.
-                                if is_collision && context.i_open_collision_winner {
+                                // Block-sync is symmetric: both sides accept it so
+                                // a two-way channel exists regardless of who
+                                // dialed. Every other ordered service keeps the
+                                // legacy rule that only the responder accepts —
+                                // the initiator already opened all it wanted, so a
+                                // peer-opened non-block-sync stream toward the
+                                // initiator is unexpected.
+                                if !is_block_sync && context.is_initiator {
                                     debug!(
                                         stream_kind = kind,
-                                        "winning ordered-stream collision; parking peer's duplicate"
+                                        "closing peer after unexpected ordered stream"
                                     );
-                                    admitted.cancel_token.cancel();
+                                    close_cause.record("unexpected_stream");
+                                    connection_token.cancel();
                                     continue;
                                 }
 
                                 // We intend to adopt the peer's stream. A second
                                 // accepted stream of the same kind is a real
                                 // duplicate and a fault.
-                                if ordered_sessions[&kind].remote_session_id.is_some() {
+                                if !accepted_ordered_kinds.insert(kind) {
                                     debug!(
                                         stream_kind = kind,
                                         "closing peer after duplicate ordered stream"
@@ -2518,28 +2336,19 @@ impl ZakuraProtocolHandler {
                                     connection_token.cancel();
                                     continue;
                                 }
-                                ordered_sessions
-                                    .get_mut(&kind)
-                                    .expect("accepted ordered stream has negotiated session state")
-                                    .remote_session_id = Some(admitted.session_id);
 
-                                // Honour the owning service's current per-peer
-                                // demand. For a collision we lost, demand is
-                                // implied because we already opened the same kind.
-                                let demand = (!is_collision).then(|| {
-                                    self.registry.ordered_session_demand(
+                                // Honour the owning service's per-peer demand (so
+                                // per-service caps such as discovery stay
+                                // enforced). For a block-sync collision we lost we
+                                // already opened block-sync ourselves, so demand is
+                                // implied — adopt the peer's stream directly.
+                                if !is_block_sync_collision
+                                    && !self.registry.wants_ordered_stream(
                                         kind,
-                                        conn_id,
                                         accepted_capabilities,
                                         &peer_id,
                                         context.direction,
                                     )
-                                });
-                                if demand
-                                    .as_ref()
-                                    .is_some_and(|demand| {
-                                        !matches!(demand, OrderedSessionDemand::OpenNow)
-                                    })
                                 {
                                     metrics::counter!(
                                         "zakura.p2p.stream.parked.no_demand",
@@ -2551,36 +2360,15 @@ impl ZakuraProtocolHandler {
                                         stream_kind = kind,
                                         "locally parking ordered service stream because the service has no demand"
                                     );
-                                    // We are not adopting it after all, so this kind
-                                    // is free again -- both for a later re-offer by
-                                    // the peer and for the demand re-check below.
-                                    let session = ordered_sessions
-                                        .get_mut(&kind)
-                                        .expect("parked ordered stream has negotiated session state");
-                                    session.remove_active_session(false, admitted.session_id);
-                                    // If this side may open the stream, re-check its
-                                    // local demand. Otherwise the entitled remote
-                                    // opener observes the parked stream and retries.
-                                    if policy.reopen
-                                        && may_open_ordered_stream(policy, context.is_initiator)
-                                    {
-                                        session.schedule_demand(
-                                            &mut ordered_session_waits,
-                                            demand.expect("non-open demand exists because this branch checked it"),
-                                        );
-                                    }
                                     admitted.cancel_token.cancel();
                                     continue;
                                 }
 
-                                ordered_sessions
-                                    .get_mut(&kind)
-                                    .expect("adopted ordered stream has negotiated session state")
-                                    .cancel_wait(&mut ordered_session_waits);
                                 let service_streams = HashMap::from([(
                                     kind,
                                     ServiceStream::new(
                                         admitted.session_id,
+                                        admitted.version,
                                         admitted.recv,
                                         admitted.send,
                                         admitted.cancel_token.clone(),
@@ -2710,8 +2498,8 @@ impl ZakuraProtocolHandler {
         freshness_tx: watch::Sender<Instant>,
         conn: ZakuraConnTrace,
         peer_id: ZakuraPeerId,
-        ordered_session_exit_tx: mpsc::UnboundedSender<OrderedSessionExit>,
-    ) -> Result<AdmittedOrderedSession, ZakuraHandlerError> {
+        ordered_stream_exit_tx: mpsc::UnboundedSender<OrderedStreamExit>,
+    ) -> Result<AdmittedOrderedStream, ZakuraHandlerError> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let permit = stream_sem
             .clone()
@@ -2777,7 +2565,7 @@ impl ZakuraProtocolHandler {
             context,
             per_stream_queue_depth,
             true,
-            ordered_session_exit_tx,
+            ordered_stream_exit_tx,
         ))
     }
 
@@ -2787,8 +2575,8 @@ impl ZakuraProtocolHandler {
         mut recv: RecvStream,
         admission: &mut StreamAdmission<'_>,
         per_stream_queue_depth: usize,
-        ordered_session_exit_tx: mpsc::UnboundedSender<OrderedSessionExit>,
-    ) -> Option<AdmittedOrderedSession> {
+        ordered_stream_exit_tx: mpsc::UnboundedSender<OrderedStreamExit>,
+    ) -> Option<AdmittedOrderedStream> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let Ok(permit) = admission.stream_sem.clone().try_acquire_owned() else {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
@@ -2877,6 +2665,34 @@ impl ZakuraProtocolHandler {
             return None;
         }
 
+        if stream.mode == StreamMode::Ordered
+            && self
+                .registry
+                .ordered_streams_for_negotiated(admission.accepted_capabilities)
+                .into_iter()
+                .find(|selected| selected.kind == stream.kind)
+                .is_some_and(|selected| selected.version != stream.version)
+        {
+            debug!(
+                stream_kind = prelude.stream_kind,
+                stream_version = prelude.stream_version,
+                "rejecting a lower ordered-stream version than the mutually selected version"
+            );
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_UNKNOWN_STREAM));
+            metrics::counter!(
+                "zakura.p2p.stream.rejected.unselected_version",
+                "stream_kind" => stream_kind,
+            )
+            .increment(1);
+            admission.trace.emit(
+                STREAM_TABLE,
+                admission
+                    .event("rejected.unselected_version", stream_id)
+                    .stream_kind(stream_kind),
+            );
+            return None;
+        }
+
         if stream.mode != StreamMode::RequestResponse && prelude.request_id.is_some() {
             debug!("rejecting non-request Zakura stream with request id");
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
@@ -2960,7 +2776,7 @@ impl ZakuraProtocolHandler {
                 context,
                 per_stream_queue_depth,
                 false,
-                ordered_session_exit_tx,
+                ordered_stream_exit_tx,
             ))
         }
     }
@@ -2983,10 +2799,6 @@ impl ZakuraProtocolHandler {
                 context.direction,
             )
             .len();
-        let negotiated_ordered_stream_count = self
-            .registry
-            .ordered_streams_for_negotiated(context.accepted_capabilities)
-            .len();
         if ordered_stream_count > usize::from(context.limits.max_open_streams) {
             debug!(
                 max_open_streams = context.limits.max_open_streams,
@@ -2996,12 +2808,12 @@ impl ZakuraProtocolHandler {
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"ordered streams");
             return Ok(());
         }
-        if negotiated_ordered_stream_count > 0
-            && usize::from(context.limits.max_inbound_queue_depth) < negotiated_ordered_stream_count
+        if ordered_stream_count > 0
+            && usize::from(context.limits.max_inbound_queue_depth) < ordered_stream_count
         {
             debug!(
                 max_inbound_queue_depth = context.limits.max_inbound_queue_depth,
-                ordered_stream_count = negotiated_ordered_stream_count,
+                ordered_stream_count,
                 "rejecting Zakura peer before registration because inbound queue depth cannot be split"
             );
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"queue split");
@@ -3146,42 +2958,6 @@ fn bind_native_endpoint(
     }
 }
 
-fn discovery_direct_addrs(config: &Config, local_node_id: NodeId) -> Vec<SocketAddr> {
-    let Some(listen_addr) = config.zakura.listen_addr else {
-        return Vec::new();
-    };
-    let mut direct_addrs = Vec::new();
-
-    if !listen_addr.ip().is_unspecified() {
-        direct_addrs.push(listen_addr);
-    }
-    if let Some(external_addr) = config.external_addr {
-        direct_addrs.push(SocketAddr::new(external_addr.ip(), listen_addr.port()));
-    }
-    for entry in &config.zakura.bootstrap_peers {
-        let Ok(node_addr) = super::discovery::parse_bootstrap_peer(entry) else {
-            continue;
-        };
-        if node_addr.node_id == local_node_id {
-            direct_addrs.extend(node_addr.direct_addresses().copied());
-        }
-    }
-
-    direct_addrs.sort_unstable();
-    direct_addrs.dedup();
-    direct_addrs
-}
-
-fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: NodeId) -> usize {
-    bootstrap_peers
-        .iter()
-        .filter_map(|entry| super::discovery::parse_bootstrap_peer(entry).ok())
-        .filter(|node_addr| node_addr.node_id != local_node_id)
-        .map(|node_addr| node_addr.node_id)
-        .collect::<HashSet<_>>()
-        .len()
-}
-
 /// Start a Zakura endpoint and router when P2P v2 is enabled.
 pub async fn spawn_zakura_endpoint(
     config: &Config,
@@ -3203,7 +2979,6 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     let limits = ZakuraLocalLimits::from_config(config);
     validate_idle_invariant(&limits)?;
     let secret_key = zakura_secret_key(config)?;
-    let local_node_id = secret_key.public();
     let discovery_secret_key = secret_key.clone();
     let builder = direct_endpoint_builder(secret_key).transport_config(limits.transport_config());
     // Bind a fixed address when configured so this node has a stable, advertisable
@@ -3225,16 +3000,16 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     );
     let discovery = super::discovery::build_discovery_handle(
         discovery_secret_key,
-        discovery_direct_addrs(config, local_node_id),
+        config.zakura.listen_addr.into_iter().collect(),
         super::discovery::default_advertised_services(),
         &handshake_config,
         config.zakura.max_connections,
-        remote_bootstrap_peer_count(&config.zakura.bootstrap_peers, local_node_id),
+        config.zakura.bootstrap_peers.len(),
         supervisor.subscribe(),
     )?;
     let anchor = config.zakura.header_sync.anchor(&config.network)?;
     let frontiers = header_sync_driver_startup.as_ref().map_or(
-        HeaderSyncFrontiers {
+        FullStateFrontiers {
             finalized_height: anchor.0,
             verified_block_tip: anchor.0,
             verified_block_hash: anchor.1,
@@ -3244,29 +3019,6 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     let best_header_tip = header_sync_driver_startup
         .as_ref()
         .map_or(Some(anchor), |startup| startup.best_header_tip);
-    let sync_frontier = header_sync_driver_startup.as_ref().map(|driver_startup| {
-        let body_sync_tip = driver_startup.header_root_auth.map_or(
-            driver_startup.best_header_tip.unwrap_or(anchor),
-            |_| {
-                (
-                    driver_startup.frontiers.verified_block_tip,
-                    driver_startup.verified_block_tip_hash,
-                )
-            },
-        );
-        let initial = FrontierUpdate {
-            frontier: crate::zakura::chain_frontier_from_parts(
-                driver_startup.frontiers.finalized_height,
-                Frontier::new(
-                    driver_startup.frontiers.verified_block_tip,
-                    driver_startup.verified_block_tip_hash,
-                ),
-                Frontier::new(body_sync_tip.0, body_sync_tip.1),
-            ),
-            change: FrontierChange::Snapshot,
-        };
-        ZakuraSyncExchange::new(initial, trace.clone())
-    });
     let mut startup = HeaderSyncStartup::new(
         config.network.clone(),
         anchor,
@@ -3275,44 +3027,31 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         config.zakura.header_sync.clone(),
         limits.max_frame_bytes,
     );
-    startup.header_root_auth = header_sync_driver_startup
-        .as_ref()
-        .and_then(|driver| driver.header_root_auth);
     startup.trace = trace.clone();
-    startup.frontier_updates = sync_frontier
+    startup.committed_snapshots = header_sync_driver_startup
         .as_ref()
-        .map(ZakuraSyncExchange::subscribe_frontier);
+        .map(|driver| driver.committed_snapshots.clone());
+    startup.vct_root_repairs = header_sync_driver_startup
+        .as_ref()
+        .and_then(|driver| driver.vct_root_repairs.clone());
+    if let Some(driver) = header_sync_driver_startup.as_ref() {
+        startup.header_chain_port = driver.header_chain_port.clone();
+    }
     let header_sync_shutdown = CancellationToken::new();
     startup.shutdown = header_sync_shutdown.clone();
-    if header_sync_driver_startup.is_some() {
-        startup.range_state_actions_enabled = true;
-        startup.inbound_new_block_acceptance_enabled = config.zakura.header_sync.accept_new_blocks;
-    }
     let (header_sync, header_sync_actions, header_sync_task) = spawn_header_sync_reactor(startup)?;
     let block_sync_driver_enabled = header_sync_driver_startup.is_some();
     let (block_sync, block_sync_actions, block_sync_task) =
         if let Some(driver_startup) = header_sync_driver_startup.as_ref() {
-            let body_sync_tip = driver_startup.header_root_auth.map_or(
-                driver_startup.best_header_tip.unwrap_or(anchor),
-                |_| {
-                    (
-                        driver_startup.frontiers.verified_block_tip,
-                        driver_startup.verified_block_tip_hash,
-                    )
-                },
-            );
-            let frontier_updates = sync_frontier
-                .as_ref()
-                .expect("sync frontier is initialized when block sync driver is enabled")
-                .subscribe_frontier();
-            let mut startup = BlockSyncStartup::new_with_exchange(
+            let best_header_tip = driver_startup.best_header_tip.unwrap_or(anchor);
+            let mut startup = BlockSyncStartup::new_with_committed_snapshots(
                 BlockSyncFrontiers {
                     finalized_height: driver_startup.frontiers.finalized_height,
                     verified_block_tip: driver_startup.frontiers.verified_block_tip,
                     verified_block_hash: driver_startup.verified_block_tip_hash,
                 },
-                body_sync_tip,
-                frontier_updates,
+                best_header_tip,
+                driver_startup.committed_snapshots.clone(),
                 config.zakura.block_sync.clone(),
             );
             startup.shutdown = header_sync_shutdown.clone();
@@ -3326,7 +3065,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         discovery.clone(),
         header_sync.clone(),
         block_sync.clone(),
-    ));
+    )) as Arc<dyn Service>;
     let legacy_service = sink_factory(supervisor.clone(), trace.clone());
     let registry = service_registry(
         &supervisor,
@@ -3340,6 +3079,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     if let Some(task) = block_sync_task {
         tasks.push(task);
     }
+    #[cfg(any(test, feature = "zakura-testkit"))]
     let header_sync_actions = if block_sync_driver_enabled {
         Some(Arc::new(Mutex::new(Some(header_sync_actions))))
     } else {
@@ -3352,6 +3092,8 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         tasks.push(action_driver_task);
         None
     };
+    #[cfg(not(any(test, feature = "zakura-testkit")))]
+    drop(header_sync_actions);
     let block_sync_actions = block_sync_actions
         .filter(|_| block_sync_driver_enabled)
         .map(|actions| Arc::new(Mutex::new(Some(actions))));
@@ -3359,6 +3101,12 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         shutdown: header_sync_shutdown,
         tasks: Mutex::new(tasks),
     });
+    let committed_snapshots = header_sync_driver_startup
+        .as_ref()
+        .map(|startup| startup.committed_snapshots.clone());
+    let header_sync_ready = committed_snapshots
+        .as_ref()
+        .is_some_and(|snapshots| snapshots.borrow().is_some());
     let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
         supervisor.clone(),
         config.network.clone(),
@@ -3370,6 +3118,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     // Give the handler the bound endpoint so inbound accepts can resolve the
     // peer's source IP and enforce the per-IP connection cap.
     .with_endpoint(endpoint.clone());
+    handler.set_header_sync_enabled(header_sync_ready);
     let router = Router::builder(endpoint)
         .accept(P2P_V2_ALPN, handler.clone())
         .spawn();
@@ -3379,12 +3128,35 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         handler,
         header_sync: Some(header_sync),
         block_sync,
-        sync_frontier,
         header_sync_tasks: Some(header_sync_tasks),
+        #[cfg(any(test, feature = "zakura-testkit"))]
         header_sync_actions,
         block_sync_actions,
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
     };
+
+    if let Some(mut snapshots) = committed_snapshots {
+        let capability_handler = endpoint.handler.clone();
+        let shutdown = endpoint.background_shutdown_token();
+        let task = tokio::spawn(async move {
+            loop {
+                if snapshots.borrow().is_some() {
+                    capability_handler.set_header_sync_enabled(true);
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    changed = snapshots.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        endpoint.push_header_sync_task(task).await;
+    }
 
     // Log our own dial address once iroh has resolved it, so operators can hand
     // out `<node_id>@<direct_addr>` for other nodes' `zakura.bootstrap_peers`.
@@ -3451,6 +3223,7 @@ pub(crate) async fn serve_native_dial_connection(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ZakuraHandlerError::ResourceLimit("admission"))?;
+    let remote_ip = node_addr.direct_addresses().next().map(|addr| addr.ip());
     let connection = timeout(
         limits.control_timeout,
         endpoint.router.endpoint().connect(node_addr, P2P_V2_ALPN),
@@ -3469,10 +3242,11 @@ pub(crate) async fn serve_native_dial_connection(
             .clone()
             .try_acquire_owned()
             .map_err(|_| ZakuraHandlerError::ResourceLimit("pending handshake"))?;
+        let handshake_config = endpoint.handler.current_handshake_config();
         run_native_initiator_handshake(
             &connection,
             limits,
-            &endpoint.handler.handshake_config,
+            &handshake_config,
             &local_peer_id,
             &endpoint.handler.trace,
             &conn,
@@ -3480,12 +3254,6 @@ pub(crate) async fn serve_native_dial_connection(
         .await?
     };
     let conn_limits = limits.clamp(&negotiated.limits);
-    // Charge the connection to the path iroh actually confirmed, not the first
-    // address the record advertised: a record can list an unreachable decoy as
-    // its first direct address to escape the per-IP cap while the connection is
-    // served over a different (shared) address. The handshake above exchanged
-    // QUIC payload, so the node map now knows the confirmed path.
-    let remote_ip = confirmed_remote_ip(endpoint.router.endpoint(), remote_node_id);
     let direction = ServicePeerDirection::Outbound;
     endpoint
         .handler
@@ -3503,7 +3271,7 @@ pub(crate) async fn serve_native_dial_connection(
                     &local_node_id,
                     &remote_node_id,
                 ),
-                i_open_collision_winner: i_open_collision_winner(true),
+                i_open_collision_winner: i_open_collision_winner(&local_node_id, &remote_node_id),
                 conn,
             },
         )
@@ -3606,19 +3374,20 @@ fn spawn_persistent_stream_worker(
     context: StreamWorkerContext,
     queue_depth: usize,
     opened_locally: bool,
-    ordered_session_exit_tx: mpsc::UnboundedSender<OrderedSessionExit>,
-) -> AdmittedOrderedSession {
+    ordered_stream_exit_tx: mpsc::UnboundedSender<OrderedStreamExit>,
+) -> AdmittedOrderedStream {
     let (to_service_tx, to_service_rx) = mpsc::channel(queue_depth);
     let (from_service_tx, from_service_rx) = mpsc::channel(queue_depth);
-    let admitted = AdmittedOrderedSession {
+    let admitted = AdmittedOrderedStream {
         kind: prelude.stream_kind,
+        version: prelude.stream_version,
         session_id: context.stream_id,
         recv: FramedRecv::new(to_service_rx),
         send: FramedSend::new(from_service_tx),
         cancel_token: context.stream_token.clone(),
     };
 
-    let exit = OrderedSessionExit {
+    let exit = OrderedStreamExit {
         stream,
         session_id: admitted.session_id,
         opened_locally,
@@ -3634,7 +3403,7 @@ fn spawn_persistent_stream_worker(
             queue_depth,
         )
         .await;
-        let _ = ordered_session_exit_tx.send(exit);
+        let _ = ordered_stream_exit_tx.send(exit);
     });
 
     admitted
@@ -4865,12 +4634,7 @@ fn per_stream_inbound_queue_depth(
         return total;
     }
 
-    let per_stream = total.saturating_div(ordered_stream_count).max(1);
-    debug_assert!(
-        per_stream.saturating_mul(ordered_stream_count) <= total,
-        "ordered stream queue split must stay within the negotiated aggregate limit"
-    );
-    per_stream
+    total.saturating_div(ordered_stream_count).max(1)
 }
 
 fn should_run_freshness_reaper(
@@ -4880,11 +4644,8 @@ fn should_run_freshness_reaper(
     ordered_stream_count > 0 || request_response_stream_count == 0
 }
 
-/// The stream-kind versions this handler serves. Most known kinds are at version 1;
-/// header sync is at version 7, which correlates each `Headers` response with the
-/// request that solicited it. Earlier header-sync versions are not served.
+/// The common stream version used by services whose declarations remain at version 1.
 const ZAKURA_STREAM_VERSION_1: u16 = 1;
-const ZAKURA_STREAM_VERSION_7: u16 = 7;
 
 /// Returns whether the handler can serve a stream with this kind and version.
 ///
@@ -5081,12 +4842,10 @@ mod tests {
         protocol::internal::{InventoryResponse, Response},
         zakura::{
             legacy_gossip::{LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec},
-            testkit::{await_until, LocalEndpointFactory, ZakuraTestNode},
-            HeaderSyncEvent, HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession,
-            HeaderSyncRequestId, HeaderSyncStatus, ServicePeerLimits, ZakuraDiscoveryConfig,
-            ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, LOCAL_MAX_MESSAGE_BYTES,
-            MAX_HS_MESSAGE_BYTES, MSG_HS_STATUS, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-            ZAKURA_CAP_LEGACY_GOSSIP,
+            testkit::LocalEndpointFactory,
+            HeaderSyncEvent, HeaderSyncMisbehavior, HeaderSyncPeerSession, ServicePeerLimits,
+            LOCAL_MAX_MESSAGE_BYTES, MAX_HS_MESSAGE_BYTES, ZAKURA_CAP_DISCOVERY,
+            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
         },
         P2pStack,
     };
@@ -5100,6 +4859,32 @@ mod tests {
         transaction::{self, UnminedTxId},
     };
     use zakura_test::vectors::BLOCK_TESTNET_141042_BYTES;
+
+    #[test]
+    fn header_capability_tracks_committed_snapshot_readiness() {
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(1),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            ZakuraLocalLimits::from_config(&Config::default()),
+        );
+        handler.supported_capabilities.store(
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC,
+            Ordering::Relaxed,
+        );
+
+        handler.set_header_sync_enabled(false);
+        assert_eq!(
+            handler.current_handshake_config().supported_capabilities,
+            ZAKURA_CAP_DISCOVERY
+        );
+
+        handler.set_header_sync_enabled(true);
+        assert_eq!(
+            handler.current_handshake_config().supported_capabilities,
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC
+        );
+    }
 
     /// With no configured `zakura.listen_addr`, the native endpoint must bind
     /// loopback-only. Otherwise iroh's default bind (`0.0.0.0:0` / `[::]:0`)
@@ -5128,48 +4913,6 @@ mod tests {
         endpoint.close().await;
     }
 
-    #[test]
-    fn discovery_uses_external_ip_with_the_native_listen_port() {
-        let secret_key = SecretKey::generate(OsRng);
-        let mut config = Config::default();
-        config.zakura.listen_addr = Some("0.0.0.0:8234".parse().expect("test address parses"));
-        config.external_addr = Some("203.0.113.42:8233".parse().expect("test address parses"));
-        config.zakura.bootstrap_peers.clear();
-
-        assert_eq!(
-            discovery_direct_addrs(&config, secret_key.public()),
-            vec!["203.0.113.42:8234".parse().expect("test address parses")]
-        );
-    }
-
-    #[test]
-    fn discovery_uses_matching_local_bootstrap_address_and_counts_only_remote_peers() {
-        let local_secret_key = SecretKey::generate(OsRng);
-        let remote_secret_key = SecretKey::generate(OsRng);
-        let local_node_id = local_secret_key.public();
-        let remote_node_id = remote_secret_key.public();
-        let local_entry = format!("{local_node_id}@198.51.100.7:8234");
-        let remote_entry = format!("{remote_node_id}@198.51.100.8:8234");
-        let mut config = Config::default();
-        config.zakura.listen_addr = Some("0.0.0.0:8234".parse().expect("test address parses"));
-        config.external_addr = None;
-        config.zakura.bootstrap_peers = vec![
-            local_entry,
-            remote_entry.clone(),
-            remote_entry,
-            "malformed".to_string(),
-        ];
-
-        assert_eq!(
-            discovery_direct_addrs(&config, local_node_id),
-            vec!["198.51.100.7:8234".parse().expect("test address parses")]
-        );
-        assert_eq!(
-            remote_bootstrap_peer_count(&config.zakura.bootstrap_peers, local_node_id),
-            1
-        );
-    }
-
     #[derive(Debug, Clone)]
     struct CaptureConnection {
         connection_tx: mpsc::Sender<Connection>,
@@ -5185,47 +4928,6 @@ mod tests {
                 };
                 let _ = self.stream_tx.send(streams).await;
             }
-            Ok(())
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct RecordingService {
-        deliveries: std::sync::Mutex<Vec<(ZakuraPeerId, u16, u16)>>,
-    }
-
-    impl RecordingService {
-        fn deliveries(&self) -> Vec<(ZakuraPeerId, u16, u16)> {
-            self.deliveries
-                .lock()
-                .expect("recording sink mutex is never poisoned")
-                .clone()
-        }
-    }
-
-    impl Service for RecordingService {
-        fn name(&self) -> &'static str {
-            "recording"
-        }
-
-        fn streams(&self) -> &[Stream] {
-            crate::zakura::legacy_gossip::legacy_gossip_streams()
-        }
-
-        fn add_peer(&self, _peer: Peer) {}
-
-        fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
-
-        fn deliver_frame(
-            &self,
-            peer_id: ZakuraPeerId,
-            stream_kind: u16,
-            frame: Frame,
-        ) -> Result<(), SinkReject> {
-            self.deliveries
-                .lock()
-                .map_err(|error| SinkReject::local(format!("recording sink poisoned: {error}")))?
-                .push((peer_id, stream_kind, frame.message_type));
             Ok(())
         }
     }
@@ -5877,16 +5579,20 @@ mod tests {
 
     #[test]
     fn ordered_stream_collision_winner_is_mirror_stable() {
-        // The two ends of one connection hold complementary roles and must
-        // reach complementary answers, so exactly one side keeps its own
-        // opened stream while the other adopts the peer's.
+        // Both ends compute the collision winner from the same pair of node ids
+        // and must reach complementary answers, so exactly one side keeps its
+        // own opened stream while the other adopts the peer's.
+        let node_a = LocalEndpointFactory::secret_key(1).public();
+        let node_b = LocalEndpointFactory::secret_key(2).public();
+        assert_ne!(node_a, node_b);
         assert_ne!(
-            i_open_collision_winner(true),
-            i_open_collision_winner(false),
+            i_open_collision_winner(&node_a, &node_b),
+            i_open_collision_winner(&node_b, &node_a),
             "exactly one side must win a same-kind ordered-stream collision",
         );
-        // The winner is deterministic: the dialing side.
-        assert!(i_open_collision_winner(true));
+        // The winner is deterministic: the lexicographically smaller node id.
+        let a_wins = node_a.as_bytes() < node_b.as_bytes();
+        assert_eq!(i_open_collision_winner(&node_a, &node_b), a_wins);
     }
 
     fn header_sync_test_session(
@@ -5899,48 +5605,13 @@ mod tests {
         )
     }
 
-    fn test_discovery_service(
-        supervisor: &ZakuraSupervisorHandle,
-    ) -> Arc<crate::zakura::DiscoveryService> {
-        let (_handle, service) =
-            test_discovery_service_with_peer_limits(supervisor, ServicePeerLimits::default());
-        service
-    }
-
-    fn test_discovery_service_with_peer_limits(
-        supervisor: &ZakuraSupervisorHandle,
-        peer_limits: ServicePeerLimits,
-    ) -> (ZakuraDiscoveryHandle, Arc<crate::zakura::DiscoveryService>) {
-        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
-        let handle = ZakuraDiscoveryHandle::new(
-            ZakuraDiscoveryLocalConfig {
-                secret_key: SecretKey::from_bytes(&[7u8; 32]),
-                direct_addrs: Vec::new(),
-                services: crate::zakura::discovery::default_advertised_services(),
-                zakura_protocol_min: handshake.zakura_protocol_min,
-                zakura_protocol_max: handshake.zakura_protocol_max,
-                network_id: handshake.network_id,
-                chain_id: handshake.chain_id,
-                last_authored_sequence: None,
-            },
-            ZakuraDiscoveryConfig {
-                peer_limits,
-                ..ZakuraDiscoveryConfig::default()
-            },
-            supervisor.subscribe(),
-        )
-        .expect("test discovery handle builds");
-        let service = Arc::new(crate::zakura::DiscoveryService::new(handle.clone()));
-        (handle, service)
-    }
-
     fn header_sync_startup(shutdown: CancellationToken) -> HeaderSyncStartup {
         let network = Network::Mainnet;
         let anchor = (block::Height(0), network.genesis_hash());
         let mut startup = HeaderSyncStartup::new(
             network,
             anchor,
-            HeaderSyncFrontiers {
+            FullStateFrontiers {
                 finalized_height: anchor.0,
                 verified_block_tip: anchor.0,
                 verified_block_hash: anchor.1,
@@ -5951,24 +5622,6 @@ mod tests {
         );
         startup.shutdown = shutdown;
         startup
-    }
-
-    async fn next_header_sync_action(
-        actions: &mut mpsc::Receiver<HeaderSyncAction>,
-    ) -> HeaderSyncAction {
-        tokio::time::timeout(Duration::from_secs(2), actions.recv())
-            .await
-            .expect("header-sync action arrives before timeout")
-            .expect("header-sync action channel stays open")
-    }
-
-    fn status_at_genesis(network: &Network) -> HeaderSyncStatus {
-        HeaderSyncStatus {
-            tip_height: block::Height(0),
-            tip_hash: network.genesis_hash(),
-            anchor_height: block::Height(0),
-            ..HeaderSyncStatus::default()
-        }
     }
 
     async fn register_test_peer(
@@ -6260,198 +5913,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_routes_legacy_and_header_sync_and_drops_unknown() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let shutdown = CancellationToken::new();
-        let startup = header_sync_startup(shutdown.clone());
-        let (header_sync, mut actions, task) = spawn_header_sync_reactor(startup)?;
-        let recorder = Arc::new(RecordingService::default());
-        let supervisor = ZakuraSupervisorHandle::new(1);
-        let registry = service_registry(
-            &supervisor,
-            Some(header_sync.clone()),
-            None,
-            ZakuraBlockSyncConfig::default(),
-            recorder.clone(),
-            test_discovery_service(&supervisor),
-        )?;
-        let peer = test_peer(6);
-
-        let (session, _recv) = header_sync_test_session(peer.clone());
-        header_sync
-            .send(HeaderSyncEvent::PeerConnected(session))
-            .await?;
-        assert!(matches!(
-            next_header_sync_action(&mut actions).await,
-            HeaderSyncAction::SendMessage {
-                msg: HeaderSyncMessage::Status(_),
-                ..
-            }
-        ));
-
-        let gossip_frame = Frame {
-            message_type: 11,
-            flags: 0,
-            payload: Vec::new(),
-        };
-        let request_frame = Frame {
-            message_type: 12,
-            flags: 0,
-            payload: Vec::new(),
-        };
-        let get_headers_frame = HeaderSyncMessage::GetHeaders {
-            start_height: block::Height(1),
-            count: 1,
-            want_tree_aux_roots: false,
-        }
-        .encode_frame(Some(
-            HeaderSyncRequestId::new(1).expect("non-zero request id"),
-        ))?;
-
-        let (gossip_result, request_result, header_sync_result) = tokio::join!(
-            async { registry.deliver(peer.clone(), LEGACY_GOSSIP_STREAM_KIND, gossip_frame) },
-            async { registry.deliver(peer.clone(), LEGACY_REQUEST_STREAM_KIND, request_frame) },
-            async { registry.deliver(peer.clone(), HEADER_SYNC_STREAM_KIND, get_headers_frame) },
-        );
-
-        gossip_result?;
-        request_result?;
-        header_sync_result?;
-        registry.deliver(
-            peer.clone(),
-            99,
-            Frame {
-                message_type: 13,
-                flags: 0,
-                payload: Vec::new(),
-            },
-        )?;
-
-        let action = next_header_sync_action(&mut actions).await;
-        assert!(
-            matches!(
-                action,
-                HeaderSyncAction::Misbehavior {
-                    reason: HeaderSyncMisbehavior::GetHeadersSpam,
-                    ..
-                }
-            ),
-            "kind-5 GetHeaders must reach the header-sync reactor, got {action:?}"
-        );
-
-        let deliveries = recorder.deliveries();
-        assert_eq!(deliveries.len(), 2);
-        assert!(deliveries.iter().any(|(_, kind, message_type)| *kind
-            == LEGACY_GOSSIP_STREAM_KIND
-            && *message_type == 11));
-        assert!(deliveries.iter().any(|(_, kind, message_type)| *kind
-            == LEGACY_REQUEST_STREAM_KIND
-            && *message_type == 12));
-        assert!(!deliveries
-            .iter()
-            .any(|(_, kind, _)| *kind == HEADER_SYNC_STREAM_KIND));
-
-        let rejected = registry
-            .request(
-                peer,
-                HEADER_SYNC_STREAM_KIND,
-                99,
-                LOCAL_MAX_CONTROL_FRAME_BYTES,
-                LOCAL_MAX_CONTROL_FRAME_BYTES,
-                Frame {
-                    message_type: 1,
-                    flags: 0,
-                    payload: Vec::new(),
-                },
-            )
-            .await;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
-
-        shutdown.cancel();
-        task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn malformed_header_sync_frame_is_protocol_reject_when_reactor_queue_closed(
-    ) -> Result<(), BoxError> {
-        let shutdown = CancellationToken::new();
-        let startup = header_sync_startup(shutdown.clone());
-        let (header_sync, _actions, task) = spawn_header_sync_reactor(startup)?;
-        let service = HeaderSyncService::new(header_sync);
-        let peer = test_peer(11);
-
-        shutdown.cancel();
-        task.await?;
-
-        let valid_status_frame =
-            HeaderSyncMessage::Status(status_at_genesis(&Network::Mainnet)).encode_frame(None)?;
-        let valid_result =
-            service.deliver_frame(peer.clone(), HEADER_SYNC_STREAM_KIND, valid_status_frame);
-        assert!(
-            matches!(valid_result, Err(SinkReject::Local(_))),
-            "valid header-sync frames depend on local reactor queue availability"
-        );
-
-        let malformed_frame = Frame {
-            message_type: u16::from(MSG_HS_STATUS),
-            flags: 0,
-            payload: Vec::new(),
-        };
-        let malformed_result =
-            service.deliver_frame(peer, HEADER_SYNC_STREAM_KIND, malformed_frame);
-        assert!(
-            matches!(malformed_result, Err(SinkReject::Protocol(_))),
-            "malformed header-sync frames must disconnect independently of reactor queue availability"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn header_sync_peer_connected_has_ready_outbound_source() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let shutdown = CancellationToken::new();
-        let startup = header_sync_startup(shutdown.clone());
-        let (header_sync, mut actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let service = HeaderSyncService::new(header_sync);
-        let peer = test_peer(12);
-        let cancel_token = CancellationToken::new();
-        let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
-        let (outbound_tx, mut outbound_rx) = crate::zakura::framed_channel(1);
-
-        let mut streams = HashMap::new();
-        streams.insert(HEADER_SYNC_STREAM_KIND, (inbound_rx, outbound_tx));
-        service.add_peer(Peer::new(
-            peer.clone(),
-            None,
-            ZAKURA_CAP_HEADER_SYNC,
-            streams,
-            cancel_token.clone(),
-        ));
-
-        let received = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .expect("header-sync outbound source is immediately ready")
-            .expect("header-sync outbound receiver stays open");
-        assert_eq!(received.message_type, u16::from(MSG_HS_STATUS));
-
-        assert!(matches!(
-            next_header_sync_action(&mut actions).await,
-            HeaderSyncAction::SendMessage {
-                msg: HeaderSyncMessage::Status(_),
-                ..
-            }
-        ));
-
-        cancel_token.cancel();
-        service.remove_peer(&peer, 0);
-        shutdown.cancel();
-        reactor_task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn lazy_escalation_service_demand_respects_directional_caps() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let shutdown = CancellationToken::new();
@@ -6477,251 +5938,6 @@ mod tests {
             ),
             "an outbound slot should still allow lazy header-sync escalation"
         );
-
-        shutdown.cancel();
-        reactor_task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn registry_add_remove_updates_header_sync_peers() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let shutdown = CancellationToken::new();
-        let startup = header_sync_startup(shutdown.clone());
-        let (header_sync, mut actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let peer = test_peer(7);
-        let supervisor = ZakuraSupervisorHandle::new(1);
-        let registry = service_registry(
-            &supervisor,
-            Some(header_sync.clone()),
-            None,
-            ZakuraBlockSyncConfig::default(),
-            Arc::new(RecordingService::default()),
-            test_discovery_service(&supervisor),
-        )?;
-        let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
-        let (outbound_tx, _outbound_rx) = crate::zakura::framed_channel(1);
-        let mut streams = HashMap::new();
-        streams.insert(HEADER_SYNC_STREAM_KIND, (inbound_rx, outbound_tx));
-        registry.add_peer(Peer::new(
-            peer.clone(),
-            None,
-            ZAKURA_CAP_HEADER_SYNC,
-            streams,
-            CancellationToken::new(),
-        ));
-        assert!(matches!(
-            next_header_sync_action(&mut actions).await,
-            HeaderSyncAction::SendMessage {
-                msg: HeaderSyncMessage::Status(_),
-                ..
-            }
-        ));
-
-        header_sync
-            .send(HeaderSyncEvent::WireMessage {
-                peer: peer.clone(),
-                msg: HeaderSyncMessage::Status(status_at_genesis(&Network::Mainnet)),
-            })
-            .await?;
-        assert_eq!(header_sync.peer_snapshot().inbound_peers, 1);
-
-        registry.remove_peer(&peer, 0, ZAKURA_CAP_HEADER_SYNC);
-
-        // Deregistering must drop the peer from header-sync state and release its
-        // slot. Its in-flight wire events are then dropped by the session guard
-        // rather than scored, so the freed slot is the observable.
-        timeout(Duration::from_secs(2), async {
-            while header_sync.peer_snapshot().inbound_peers != 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("deregistered peer must be removed from header-sync state");
-
-        shutdown.cancel();
-        reactor_task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn discovery_admission_is_independent_when_header_sync_is_full() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let shutdown = CancellationToken::new();
-        let mut startup = header_sync_startup(shutdown.clone());
-        startup.config.peer_limits = ServicePeerLimits {
-            max_inbound_peers: 0,
-            ..ServicePeerLimits::default()
-        };
-        let (header_sync, mut actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let supervisor = ZakuraSupervisorHandle::new(1);
-        let (discovery_handle, discovery_service) = test_discovery_service_with_peer_limits(
-            &supervisor,
-            ServicePeerLimits {
-                max_inbound_peers: 1,
-                ..ServicePeerLimits::default()
-            },
-        );
-        let registry = service_registry(
-            &supervisor,
-            Some(header_sync.clone()),
-            None,
-            ZakuraBlockSyncConfig::default(),
-            Arc::new(RecordingService::default()),
-            discovery_service,
-        )?;
-        let peer_node_id = SecretKey::from_bytes(&[13u8; 32]).public();
-        let peer = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
-        let (_hs_inbound_tx, hs_inbound_rx) = crate::zakura::framed_channel(1);
-        let (hs_outbound_tx, mut hs_outbound_rx) = crate::zakura::framed_channel(1);
-        let (_discovery_inbound_tx, discovery_inbound_rx) = crate::zakura::framed_channel(1);
-        let (discovery_outbound_tx, mut discovery_outbound_rx) = crate::zakura::framed_channel(4);
-        let streams = HashMap::from([
-            (HEADER_SYNC_STREAM_KIND, (hs_inbound_rx, hs_outbound_tx)),
-            (
-                DISCOVERY_STREAM_KIND,
-                (discovery_inbound_rx, discovery_outbound_tx),
-            ),
-        ]);
-
-        registry.add_peer(Peer::new(
-            peer.clone(),
-            None,
-            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY,
-            streams,
-            CancellationToken::new(),
-        ));
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            let mut snapshots = discovery_handle.subscribe_peer_snapshot();
-            while snapshots.borrow().inbound_peers != 1 {
-                snapshots
-                    .changed()
-                    .await
-                    .expect("discovery snapshot channel stays open");
-            }
-        })
-        .await
-        .expect("discovery admits while header-sync is full");
-
-        assert_eq!(header_sync.peer_snapshot().inbound_peers, 0);
-        assert_eq!(header_sync.peer_snapshot().inbound_slots_free, 0);
-        assert!(
-            !matches!(
-                tokio::time::timeout(Duration::from_millis(100), hs_outbound_rx.recv()).await,
-                Ok(Some(_))
-            ),
-            "header-sync rejected peer must not receive Status"
-        );
-        let discovery_frame =
-            tokio::time::timeout(Duration::from_secs(1), discovery_outbound_rx.recv())
-                .await
-                .expect("discovery source sends its normal hello")
-                .expect("discovery outbound stream stays open");
-        assert_eq!(discovery_frame.message_type, 1);
-
-        while let Ok(Some(action)) =
-            tokio::time::timeout(Duration::from_millis(50), actions.recv()).await
-        {
-            assert!(
-                !matches!(action, HeaderSyncAction::Misbehavior { peer: action_peer, .. } if action_peer == peer),
-                "header-sync cap rejection must not score peer misbehavior"
-            );
-        }
-
-        registry.remove_peer(&peer, 0, ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            let mut snapshots = discovery_handle.subscribe_peer_snapshot();
-            while snapshots.borrow().inbound_peers != 0 {
-                snapshots
-                    .changed()
-                    .await
-                    .expect("discovery snapshot channel stays open");
-            }
-        })
-        .await
-        .expect("discovery peer state is removed");
-
-        shutdown.cancel();
-        reactor_task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn header_sync_admission_is_independent_when_discovery_is_full() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let shutdown = CancellationToken::new();
-        let mut startup = header_sync_startup(shutdown.clone());
-        startup.config.peer_limits = ServicePeerLimits {
-            max_inbound_peers: 1,
-            ..ServicePeerLimits::default()
-        };
-        let (header_sync, mut actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let supervisor = ZakuraSupervisorHandle::new(1);
-        let (discovery_handle, discovery_service) = test_discovery_service_with_peer_limits(
-            &supervisor,
-            ServicePeerLimits {
-                max_inbound_peers: 0,
-                ..ServicePeerLimits::default()
-            },
-        );
-        let registry = service_registry(
-            &supervisor,
-            Some(header_sync.clone()),
-            None,
-            ZakuraBlockSyncConfig::default(),
-            Arc::new(RecordingService::default()),
-            discovery_service,
-        )?;
-        let peer_node_id = SecretKey::from_bytes(&[14u8; 32]).public();
-        let peer = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
-        let (_hs_inbound_tx, hs_inbound_rx) = crate::zakura::framed_channel(1);
-        let (hs_outbound_tx, mut hs_outbound_rx) = crate::zakura::framed_channel(1);
-        let (_discovery_inbound_tx, discovery_inbound_rx) = crate::zakura::framed_channel(1);
-        let (discovery_outbound_tx, mut discovery_outbound_rx) = crate::zakura::framed_channel(1);
-        let streams = HashMap::from([
-            (HEADER_SYNC_STREAM_KIND, (hs_inbound_rx, hs_outbound_tx)),
-            (
-                DISCOVERY_STREAM_KIND,
-                (discovery_inbound_rx, discovery_outbound_tx),
-            ),
-        ]);
-
-        registry.add_peer(Peer::new(
-            peer.clone(),
-            None,
-            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY,
-            streams,
-            CancellationToken::new(),
-        ));
-
-        let header_frame = tokio::time::timeout(Duration::from_secs(1), hs_outbound_rx.recv())
-            .await
-            .expect("header-sync sends immediate Status")
-            .expect("header-sync outbound stream stays open");
-        assert_eq!(header_frame.message_type, u16::from(MSG_HS_STATUS));
-        assert!(matches!(
-            next_header_sync_action(&mut actions).await,
-            HeaderSyncAction::SendMessage {
-                peer: action_peer,
-                msg: HeaderSyncMessage::Status(_),
-                ..
-            } if action_peer == peer
-        ));
-        assert_eq!(header_sync.peer_snapshot().inbound_peers, 1);
-        assert_eq!(discovery_handle.peer_snapshot().inbound_peers, 0);
-        assert!(
-            !matches!(
-                tokio::time::timeout(Duration::from_millis(100), discovery_outbound_rx.recv())
-                    .await,
-                Ok(Some(_))
-            ),
-            "discovery rejected peer must not receive discovery source messages"
-        );
-
-        registry.remove_peer(&peer, 0, ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(header_sync.peer_snapshot().inbound_peers, 0);
 
         shutdown.cancel();
         reactor_task.await?;
@@ -6883,66 +6099,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn ipv4_embedded_ipv6_addresses_share_the_supervisor_ip_bucket() {
-        async fn register_from_ip(
-            supervisor: &ZakuraSupervisorHandle,
-            peer: ZakuraPeerId,
-            ip: IpAddr,
-        ) -> ZakuraRegistration {
-            let (outbound_tx, _outbound_rx) = mpsc::channel(1);
-            let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
-            supervisor
-                .register(
-                    test_conn_id(),
-                    peer.clone(),
-                    Some(ip),
-                    [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
-                    outbound_handle,
-                    CancellationToken::new(),
-                    ZAKURA_CAP_DISCOVERY,
-                )
-                .await
-        }
-
-        let ipv4: IpAddr = "93.184.216.34".parse().expect("IPv4 test address parses");
-        let mapped: IpAddr = "::ffff:93.184.216.34"
-            .parse()
-            .expect("mapped test address parses");
-        let compatible: IpAddr = "::93.184.216.34"
-            .parse()
-            .expect("compatible test address parses");
-        let six_to_four: IpAddr = "2002:5db8:d822::"
-            .parse()
-            .expect("6to4 test address parses");
-        let teredo: IpAddr = "2001:0:c000:22d::a247:27dd"
-            .parse()
-            .expect("Teredo test address parses");
-        let nat64: IpAddr = "64:ff9b::5db8:d822"
-            .parse()
-            .expect("NAT64 test address parses");
-        let supervisor = ZakuraSupervisorHandle::new(1);
-
-        assert!(matches!(
-            register_from_ip(&supervisor, test_peer(60), six_to_four).await,
-            ZakuraRegistration::Registered { .. }
-        ));
-
-        for alias in [ipv4, mapped, compatible, six_to_four, teredo, nat64] {
-            assert!(
-                !supervisor
-                    .can_accept_remote_ip_with_in_flight(alias, 0)
-                    .await,
-                "{alias} must share the occupied IPv4 identity bucket"
-            );
-        }
-
-        assert!(matches!(
-            register_from_ip(&supervisor, test_peer(61), ipv4).await,
-            ZakuraRegistration::Rejected(ZakuraRejectReason::ResourceLimit)
-        ));
-    }
-
     // A restarted or resyncing peer redials from its stable IP while its previous
     // connection still lingers as the incumbent. Waiting out the full
     // `ZAKURA_DUPLICATE_EVICT_MIN_AGE` (300s) locks that peer out of block sync
@@ -7078,401 +6234,61 @@ mod tests {
         Ok(())
     }
 
-    /// Reopen policy follows the transport's opening roles.
+    /// Reopen exists because a header-sync stream can die while its connection is
+    /// healthy (the responder parks it at capacity or with no demand). It is not tied
+    /// to any particular header-sync version.
     #[test]
-    fn ordered_session_reopen_follows_transport_opening_policy() {
-        let initiator_opened = Stream {
-            kind: ZAKURA_STREAM_HEADER_SYNC,
-            version: 1,
-            frame_cap: 1,
-            capability: ZAKURA_CAP_HEADER_SYNC,
-            mode: StreamMode::Ordered,
-        };
-        let exit = OrderedSessionExit {
-            stream: initiator_opened,
-            session_id: 1,
-            opened_locally: true,
-        };
-        let initiator_policy = OrderedStreamPolicy {
-            opening: OrderedStreamOpening::InitiatorOnly,
-            reopen: true,
-        };
-        assert!(should_reopen_ordered_session(
-            exit,
-            initiator_policy,
-            true,
-            false
-        ));
-        assert!(!should_reopen_ordered_session(
-            exit,
-            initiator_policy,
-            false,
-            false
-        ));
-        assert!(!should_reopen_ordered_session(
-            exit,
-            initiator_policy,
-            true,
-            true
-        ));
-        assert!(!should_reopen_ordered_session(
-            exit,
-            OrderedStreamPolicy::default(),
-            true,
-            false,
-        ));
-
-        // The authorized side replaces an accepted stream too; replacement does
-        // not depend on which physical generation just exited.
-        assert!(should_reopen_ordered_session(
-            OrderedSessionExit {
-                opened_locally: false,
-                ..exit
-            },
-            initiator_policy,
-            true,
-            false,
-        ));
-
-        let either_peer = OrderedSessionExit {
-            stream: Stream {
-                kind: ZAKURA_STREAM_BLOCK_SYNC,
-                ..initiator_opened
-            },
-            ..exit
-        };
-        let either_policy = OrderedStreamPolicy {
-            opening: OrderedStreamOpening::EitherSide,
-            reopen: true,
-        };
-        assert!(should_reopen_ordered_session(
-            either_peer,
-            either_policy,
-            true,
-            false
-        ));
-        assert!(should_reopen_ordered_session(
-            either_peer,
-            either_policy,
-            false,
-            false
-        ));
-
-        let request_response = OrderedSessionExit {
-            stream: Stream {
-                kind: 102,
-                mode: StreamMode::RequestResponse,
-                ..initiator_opened
-            },
-            ..exit
-        };
-        assert!(!should_reopen_ordered_session(
-            request_response,
-            either_policy,
-            true,
-            false,
-        ));
-    }
-
-    #[test]
-    fn stale_ordered_session_exit_keeps_newer_active_generation() {
-        let stream = test_ordered_stream();
-        let mut session = OrderedSessionState::new(stream);
-        session.remote_session_id = Some(2);
-
-        assert!(!session.remove_active_session(false, 1));
-        assert_eq!(session.remote_session_id, Some(2));
-        assert!(session.remove_active_session(false, 2));
-        assert_eq!(session.remote_session_id, None);
-    }
-
-    #[test]
-    fn ordered_session_reopen_backoff_grows_and_caps() {
-        assert_eq!(
-            ordered_session_reopen_backoff(0),
-            ORDERED_STREAM_REOPEN_BACKOFF
-        );
-        assert_eq!(
-            ordered_session_reopen_backoff(1),
-            ORDERED_STREAM_REOPEN_BACKOFF * 2
-        );
-        assert_eq!(
-            ordered_session_reopen_backoff(5),
-            ORDERED_STREAM_REOPEN_BACKOFF_CAP
-        );
-        assert_eq!(
-            ordered_session_reopen_backoff(u32::MAX),
-            ORDERED_STREAM_REOPEN_BACKOFF_CAP
-        );
-    }
-
-    fn test_ordered_stream() -> Stream {
-        Stream {
+    fn ordered_stream_reopen_is_limited_to_local_header_initiator() {
+        let header = Stream {
             kind: ZAKURA_STREAM_HEADER_SYNC,
             version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
             frame_cap: 1,
             capability: ZAKURA_CAP_HEADER_SYNC,
             mode: StreamMode::Ordered,
-        }
-    }
+        };
+        let local_header = OrderedStreamExit {
+            stream: header,
+            session_id: 1,
+            opened_locally: true,
+        };
+        assert!(should_reopen_ordered_stream(local_header, true, false));
+        assert!(!should_reopen_ordered_stream(local_header, false, false));
+        assert!(!should_reopen_ordered_stream(local_header, true, true));
 
-    #[tokio::test(start_paused = true)]
-    async fn ordered_session_waits_deduplicate_demand() {
-        let stream = test_ordered_stream();
-        let mut session = OrderedSessionState::new(stream);
-        let mut waits = OrderedSessionWaits::new();
-        let (change_tx, change_rx) = watch::channel(());
+        let accepted_header = OrderedStreamExit {
+            opened_locally: false,
+            ..local_header
+        };
+        assert!(!should_reopen_ordered_stream(accepted_header, true, false));
 
-        session.schedule_demand(
-            &mut waits,
-            OrderedSessionDemand::WaitForChange(Box::pin(async move {
-                let mut change_rx = change_rx;
-                let _ = change_rx.changed().await;
-            })),
-        );
-        session.schedule_demand(
-            &mut waits,
-            OrderedSessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
-        );
-
-        assert_eq!(waits.len(), 1);
-        assert_eq!(
-            session.reopen_state,
-            OrderedSessionReopenState::Waiting(OrderedSessionWaitReason::Demand)
-        );
-        assert_eq!(
-            change_tx.receiver_count(),
-            1,
-            "repeated demand must retain the original reactor wait"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn ordered_session_demand_replaces_transport_backoff() {
-        let stream = test_ordered_stream();
-        let mut session = OrderedSessionState::new(stream);
-        let mut waits = OrderedSessionWaits::new();
-
-        assert_eq!(
-            session.schedule_transport_backoff(&mut waits),
-            Some(ORDERED_STREAM_REOPEN_BACKOFF)
-        );
-        session.schedule_demand(
-            &mut waits,
-            OrderedSessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
-        );
-
-        assert_eq!(session.reopen_attempts, 1);
-        assert_eq!(waits.len(), 1);
-        assert_eq!(
-            session.reopen_state,
-            OrderedSessionReopenState::Waiting(OrderedSessionWaitReason::Demand)
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn ordered_session_exit_keeps_existing_demand_wait() {
-        let stream = test_ordered_stream();
-        let mut session = OrderedSessionState::new(stream);
-        let mut waits = OrderedSessionWaits::new();
-
-        session.schedule_demand(
-            &mut waits,
-            OrderedSessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
-        );
-
-        assert_eq!(session.schedule_transport_backoff(&mut waits), None);
-        assert_eq!(session.reopen_attempts, 0);
-        assert_eq!(waits.len(), 1);
-        assert_eq!(
-            session.reopen_state,
-            OrderedSessionReopenState::Waiting(OrderedSessionWaitReason::Demand)
-        );
-    }
-
-    #[tokio::test]
-    async fn ordered_session_retirement_cancels_and_blocks_transport_waits() {
-        let stream = test_ordered_stream();
-        let mut session = OrderedSessionState::new(stream);
-        let mut waits = OrderedSessionWaits::new();
-
-        session.schedule_demand(
-            &mut waits,
-            OrderedSessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
-        );
-        session.schedule_demand(&mut waits, OrderedSessionDemand::Retire);
-
-        assert!(waits.is_empty());
-        assert_eq!(session.reopen_state, OrderedSessionReopenState::Retired);
-        assert_eq!(session.schedule_transport_backoff(&mut waits), None);
-        assert_eq!(session.reopen_attempts, 0);
-    }
-
-    #[tokio::test]
-    async fn ordered_session_adoption_drops_pending_wait() {
-        let stream = test_ordered_stream();
-        let mut session = OrderedSessionState::new(stream);
-        let mut waits = OrderedSessionWaits::new();
-
-        session.schedule_demand(&mut waits, OrderedSessionDemand::OpenNow);
-        session.cancel_wait(&mut waits);
-
-        assert!(waits.is_empty());
-        assert_eq!(session.reopen_state, OrderedSessionReopenState::Idle);
-    }
-
-    #[tokio::test]
-    async fn ordered_session_demand_change_yields_exactly_one_reopen() {
-        let stream = test_ordered_stream();
-        let mut session = OrderedSessionState::new(stream);
-        let mut waits = OrderedSessionWaits::new();
-        let (change_tx, mut change_rx) = watch::channel(());
-
-        session.schedule_demand(
-            &mut waits,
-            OrderedSessionDemand::WaitForChange(Box::pin(async move {
-                let _ = change_rx.changed().await;
-            })),
-        );
-        change_tx.send_replace(());
-        let (kind, ()) = timeout(Duration::from_secs(1), waits.next())
-            .await
-            .expect("reactor change is observed before timeout")
-            .expect("connection still owns a pending session wait");
-
-        assert_eq!(kind, stream.kind);
-        session.finish_wait(&mut waits);
-        assert!(
-            waits.is_empty(),
-            "one state change yields one reopen attempt"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn ordered_session_demand_deadline_yields_exactly_one_reopen() {
-        let stream = test_ordered_stream();
-        let mut session = OrderedSessionState::new(stream);
-        let mut waits = OrderedSessionWaits::new();
-
-        session.schedule_demand(
-            &mut waits,
-            OrderedSessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
-        );
-        tokio::time::advance(Duration::from_secs(60)).await;
-        let (kind, ()) = waits
-            .next()
-            .await
-            .expect("reactor deadline keeps a pending session wait");
-
-        assert_eq!(kind, stream.kind);
-        session.finish_wait(&mut waits);
-        assert!(waits.is_empty(), "one deadline yields one reopen attempt");
+        let gossip = OrderedStreamExit {
+            stream: Stream {
+                kind: LEGACY_GOSSIP_STREAM_KIND,
+                ..header
+            },
+            ..local_header
+        };
+        assert!(!should_reopen_ordered_stream(gossip, true, false));
     }
 
     #[test]
-    fn ordered_session_connection_teardown_drops_pending_waits() {
-        let stream = test_ordered_stream();
-        let mut session = OrderedSessionState::new(stream);
-        let mut waits = OrderedSessionWaits::new();
-        let (change_tx, mut change_rx) = watch::channel(());
-
-        session.schedule_demand(
-            &mut waits,
-            OrderedSessionDemand::WaitForChange(Box::pin(async move {
-                let _ = change_rx.changed().await;
-            })),
-        );
-        assert_eq!(change_tx.receiver_count(), 1);
-        drop(waits);
-
+    fn ordered_stream_reopen_backoff_grows_and_caps() {
         assert_eq!(
-            change_tx.receiver_count(),
-            0,
-            "dropping the connection-owned wait map must drop every pending wait"
+            ordered_stream_reopen_backoff(0),
+            ORDERED_STREAM_REOPEN_BACKOFF
         );
-    }
-
-    /// Regression for the mainnet dual-stack body-sync stall on
-    /// `temp-zakura-sync-test-7` (2026-07-14, run
-    /// `20260714T073939Z-cca353fd1287`): body sync froze at height 2,725,606 for
-    /// 10 minutes with 54,670 blocks of pending work and 6.4 GB of free download
-    /// budget, while header sync happily tracked the tip at 3,411,947. Block sync
-    /// had decayed to `peers: 0` -- permanently.
-    ///
-    /// The cause is entirely in the transport. Block sync evicts a peer that
-    /// missed its no-progress liveness deadline and parks it for
-    /// `no_progress_peer_cooldown` (180s). The transport knows nothing about that
-    /// park and redials the peer ~30s later, well inside the cooldown. At
-    /// connection setup the transport asks block sync once whether it wants the
-    /// peer; it is still parked, so the block-sync stream is withheld -- and that
-    /// decision was never revisited. The connection itself stays up and healthy
-    /// (header sync and discovery keep riding it, which is exactly why headers
-    /// kept reaching the tip), so no redial follows, so there is no new setup to
-    /// ask again; and when the park lapsed nothing re-offered the stream. Every
-    /// block-sync peer was eventually evicted this way, so block sync ended at
-    /// zero peers on a node holding live connections to those very peers.
-    ///
-    /// This drives the real `serve_connection` over a real local QUIC connection
-    /// with the real `BlockSyncService`, parking the peer exactly as the liveness
-    /// deadline does. The park must defer the stream, not lose it: once the
-    /// cooldown lapses on a still-live connection, block sync must get its stream
-    /// without waiting for a redial that is never coming.
-    #[tokio::test]
-    async fn parked_block_sync_peer_gets_a_stream_when_its_cooldown_lapses() -> Result<(), BoxError>
-    {
-        const COOLDOWN: Duration = Duration::from_secs(3);
-
-        let _guard = zakura_test::init();
-
-        let genesis =
-            Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
-        let anchor = (block::Height(0), genesis.hash());
-        let frontiers = HeaderSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: genesis.hash(),
-        };
-        let node = |seed| {
-            ZakuraTestNode::builder(seed)
-                .header_sync_driver(Config::default().network, anchor, frontiers, Some(anchor))
-                .spawn()
-        };
-        let dialer = node(140).await?;
-        let listener = node(141).await?;
-
-        let listener_peer =
-            ZakuraPeerId::new(listener.node_addr().await.node_id.as_bytes().to_vec())?;
-        let block_sync = dialer
-            .block_sync()
-            .expect("the header-sync driver spawns the block-sync reactor");
-
-        // The peer just missed its no-progress liveness deadline: block sync
-        // evicts and parks it. The transport's redial lands inside the cooldown.
-        block_sync.park_peer_for_test(&listener_peer, COOLDOWN);
-        dialer
-            .connect_native(&listener, Duration::from_secs(10))
-            .await?;
-
-        // The park is in force, so block sync is withheld from this connection.
         assert_eq!(
-            block_sync.peer_snapshot().outbound_peers,
-            0,
-            "a parked peer must not be given a block-sync stream while its cooldown runs",
+            ordered_stream_reopen_backoff(1),
+            ORDERED_STREAM_REOPEN_BACKOFF * 2
         );
-
-        // The cooldown lapses while the connection stays up. Nothing will redial
-        // -- the connection is healthy -- so the only way block sync ever gets
-        // this peer back is for the transport to re-check its demand.
-        await_until(
-            "block sync opens a stream to the peer whose park expired",
-            Duration::from_secs(30),
-            || block_sync.peer_snapshot().outbound_peers == 1,
-        )
-        .await?;
-
-        dialer.shutdown().await;
-        listener.shutdown().await;
-        Ok(())
+        assert_eq!(
+            ordered_stream_reopen_backoff(5),
+            ORDERED_STREAM_REOPEN_BACKOFF_CAP
+        );
+        assert_eq!(
+            ordered_stream_reopen_backoff(u32::MAX),
+            ORDERED_STREAM_REOPEN_BACKOFF_CAP
+        );
     }
 
     #[tokio::test]
@@ -8436,7 +7252,7 @@ mod tests {
                 },
                 Stream {
                     kind: HEADER_SYNC_STREAM_KIND,
-                    version: ZAKURA_STREAM_VERSION_7,
+                    version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
                     frame_cap: 1024,
                     capability: ZAKURA_CAP_HEADER_SYNC,
                     mode: StreamMode::Ordered,
@@ -8456,7 +7272,7 @@ mod tests {
             (LEGACY_GOSSIP_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (LEGACY_REQUEST_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (DISCOVERY_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
-            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_7),
+            (HEADER_SYNC_STREAM_KIND, ZAKURA_HEADER_SYNC_STREAM_VERSION),
             (ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_VERSION_1),
         ] {
             assert!(
@@ -8468,7 +7284,7 @@ mod tests {
                 "registered kind {kind} at version 0 must be rejected"
             );
             assert!(
-                !is_supported_stream(&registry, kind, version.saturating_add(1)),
+                !is_supported_stream(&registry, kind, u16::MAX),
                 "registered kind {kind} at an unsupported version must be rejected"
             );
         }
@@ -8480,6 +7296,14 @@ mod tests {
         assert!(
             !is_supported_stream(&registry, HEADER_SYNC_STREAM_KIND, 5),
             "header-sync v5 is rejected after the expanded Ironwood root-record wire break"
+        );
+        assert!(
+            !is_supported_stream(&registry, HEADER_SYNC_STREAM_KIND, 7),
+            "the predecessor header-sync stream version is rejected"
+        );
+        assert!(
+            registry.ordered_streams_for_negotiated(1 << 4).is_empty(),
+            "the retired predecessor capability opens no header-sync stream"
         );
 
         assert_eq!(stream_kind_label(2), "gossip");

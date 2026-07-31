@@ -24,151 +24,36 @@ fn queued_block(seed: u128) -> QueuedCheckpointVerified {
     (CheckpointVerifiedBlock::from(block), rsp_tx)
 }
 
-/// Builds a queued block that extends `parent`, so it passes the
-/// successor-linkage check in [`VctWriteManager::fill_successor`].
-fn queued_child_of(parent: &QueuedCheckpointVerified, seed: u128) -> QueuedCheckpointVerified {
-    let block = parent.0.block.clone().make_fake_child().set_work(seed);
-    let (rsp_tx, _rsp_rx) = oneshot::channel();
-    (CheckpointVerifiedBlock::from(block), rsp_tx)
+#[test]
+fn take_retry_returns_none_when_empty() {
+    let mut manager = VctWriteManager::default();
+    assert!(manager.take_retry().is_none());
 }
 
 #[test]
-fn take_ready_returns_none_when_empty() {
+fn parked_retry_is_taken_before_successor_and_leaves_channel_untouched() {
     let mut manager = VctWriteManager::default();
-    assert!(manager.take_ready().is_none());
-}
-
-#[test]
-fn take_ready_prefers_retry_over_lookahead() {
-    let mut manager = VctWriteManager::default();
+    let (tx, mut rx) = mpsc::unbounded_channel();
     let retry_block = queued_block(1);
     let retry_hash = retry_block.0.hash;
-    let lookahead_block = queued_block(2);
-    let lookahead_hash = lookahead_block.0.hash;
-
-    manager.lookahead.push_back(lookahead_block);
-    manager.retry = Some(retry_block);
-
-    let first = manager.take_ready().expect("retry block is ready");
-    assert_eq!(
-        first.0.hash, retry_hash,
-        "retry must be taken before lookahead"
-    );
-
-    let second = manager.take_ready().expect("lookahead block is ready");
-    assert_eq!(second.0.hash, lookahead_hash);
-
-    assert!(manager.take_ready().is_none());
-}
-
-#[test]
-fn fill_successor_only_buffers_one_linking_block_at_a_time() {
-    let mut manager = VctWriteManager::default();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let current = queued_block(1);
-    let first = queued_child_of(&current, 2);
-    let first_hash = first.0.hash;
-    let second = queued_child_of(&first, 3);
-    let second_hash = second.0.hash;
-    tx.send(first).expect("channel is open");
-    tx.send(second).expect("channel is open");
-
-    // First fill: lookahead was empty, so it pulls exactly one (linking) block.
-    manager.fill_successor(&mut rx, &current);
-    assert_eq!(manager.lookahead.len(), 1);
-    assert_eq!(manager.lookahead.front().unwrap().0.hash, first_hash);
-
-    // Second fill: the front already links to `current`, so it's a no-op — the
-    // second block stays buffered in the channel, not in the look-ahead.
-    manager.fill_successor(&mut rx, &current);
-    assert_eq!(manager.lookahead.len(), 1);
-    assert_eq!(manager.lookahead.front().unwrap().0.hash, first_hash);
-
-    // Once the successor commits it becomes the current block; draining the
-    // look-ahead lets the next fill pull that block's own successor.
-    let committed = manager.take_ready().expect("look-ahead block is ready");
-    manager.fill_successor(&mut rx, &committed);
-    assert_eq!(manager.lookahead.front().unwrap().0.hash, second_hash);
-}
-
-/// A buffered block that does not extend the block being committed is discarded:
-/// because a parked retry is always taken before the look-ahead, leaving it there
-/// would wedge the retry loop ahead of the real successor body.
-#[test]
-fn fill_successor_discards_non_successors_and_keeps_the_linking_block() {
-    let mut manager = VctWriteManager::default();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let current = queued_block(1);
-    // A sibling of `current` (another child of genesis): buffered, but not linking.
-    let non_successor = queued_block(2);
-    let successor = queued_child_of(&current, 3);
+    let successor = queued_block(2);
     let successor_hash = successor.0.hash;
 
-    manager.lookahead.push_back(non_successor);
+    manager.retry = Some(retry_block);
     tx.send(successor).expect("channel is open");
 
-    manager.fill_successor(&mut rx, &current);
-
-    assert_eq!(manager.lookahead.len(), 1);
+    let first = manager.take_retry().expect("retry block is ready");
     assert_eq!(
-        manager.lookahead.front().unwrap().0.hash,
-        successor_hash,
-        "the non-linking block is dropped and the true successor takes its place"
+        first.0.hash, retry_hash,
+        "the stalled current block must be taken before channel input"
     );
     assert_eq!(
-        manager
-            .lookahead
-            .front()
-            .expect("successor is buffered")
+        rx.try_recv()
+            .expect("taking the retry leaves the successor queued")
             .0
-            .block
-            .header
-            .previous_block_hash,
-        current.0.hash,
+            .hash,
+        successor_hash
     );
-}
-
-/// With no linking body buffered anywhere, the look-ahead ends up empty.
-#[test]
-fn fill_successor_empties_the_lookahead_when_no_successor_exists() {
-    let mut manager = VctWriteManager::default();
-    let (_tx, mut rx) = mpsc::unbounded_channel();
-    let current = queued_block(1);
-    manager.lookahead.push_back(queued_block(2));
-
-    manager.fill_successor(&mut rx, &current);
-
-    assert!(manager.lookahead.is_empty());
-}
-
-#[test]
-fn buffered_successor_body_remains_queued_for_its_own_commit() {
-    let mut manager = VctWriteManager::default();
-    let block = queued_block(1);
-    let expected_hash = block.0.hash;
-    manager.lookahead.push_back(block);
-
-    let ready = manager
-        .take_ready()
-        .expect("the buffered successor body is ready for its own commit");
-    assert_eq!(ready.0.hash, expected_hash);
-}
-
-#[test]
-fn reset_clears_the_lookahead() {
-    let mut manager = VctWriteManager::default();
-    manager.lookahead.push_back(queued_block(1));
-    manager.lookahead.push_back(queued_block(2));
-
-    let network = zakura_chain::parameters::Network::Mainnet;
-    let config = crate::Config::ephemeral();
-    let mut finalized_state =
-        crate::service::finalized_state::FinalizedState::new(&config, &network)
-            .expect("opening an ephemeral database should succeed");
-
-    manager.reset(&mut finalized_state);
-
-    assert!(manager.lookahead.is_empty());
 }
 
 #[test]
@@ -253,7 +138,7 @@ fn on_retryable_error_parks_the_block_for_retry() {
     manager.on_retryable_error(Height(1), true, false, block);
 
     let ready = manager
-        .take_ready()
+        .take_retry()
         .expect("the block was parked for retry");
     assert_eq!(ready.0.hash, hash);
 }

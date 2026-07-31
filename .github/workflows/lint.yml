@@ -10,13 +10,18 @@ on:
       - clippy.toml
       - .cargo/config.toml
       - .github/workflows/lint.yml
+      - docs/specs/fork-aware-header-chain-engine.md
       - supply-chain/**
       - "scripts/**.sh"
+<<<<<<< HEAD
+      - zakura-header-chain/conformance.toml
+=======
       - ".github/workflows/scripts/**"
       - ".github/actions/**"
       # ci-python-tests covers these suites, so changes to them must trigger it.
       - "deploy/**"
       - ".github/scripts/**"
+>>>>>>> origin/main
 
   push:
     branches: [main, "feat/**", "release/**"]
@@ -27,13 +32,18 @@ on:
       - clippy.toml
       - .cargo/config.toml
       - .github/workflows/lint.yml
+      - docs/specs/fork-aware-header-chain-engine.md
       - supply-chain/**
       - "scripts/**.sh"
+<<<<<<< HEAD
+      - zakura-header-chain/conformance.toml
+=======
       - ".github/workflows/scripts/**"
       - ".github/actions/**"
       # ci-python-tests covers these suites, so changes to them must trigger it.
       - "deploy/**"
       - ".github/scripts/**"
+>>>>>>> origin/main
 
   # Run the full lint suite when a PR is queued so the merge queue validates the
   # merged result against the latest `main`. `merge_group` ignores path filters,
@@ -167,8 +177,43 @@ jobs:
           components: rustfmt
           cache: false
       - name: Run fmt
+<<<<<<< HEAD
+        run: cargo fmt --all -- --check
+
+  header-conformance:
+    name: header conformance
+    permissions:
+      contents: read
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
+          toolchain: stable
+          cache: false
+      - name: Validate header-chain conformance manifest
+        run: cargo xtask header-conformance
+
+  shellcheck:
+    name: shellcheck
+    permissions:
+      contents: read
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+        with:
+          persist-credentials: false
+
+=======
         if: ${{ !cancelled() }}
         run: cargo +nightly fmt --all -- --check
+>>>>>>> origin/main
       - name: Run shellcheck
         if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned

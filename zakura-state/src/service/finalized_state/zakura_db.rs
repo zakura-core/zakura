@@ -34,7 +34,9 @@ use super::disk_format::upgrade::restorable_db_versions;
 
 pub mod block;
 pub mod chain;
+#[allow(dead_code)]
 pub(crate) mod commitment_roots_db;
+#[allow(dead_code)]
 pub mod highest_completed_checkpoint;
 pub mod metrics;
 
@@ -125,6 +127,11 @@ impl DbOpenMode {
 }
 
 impl ZakuraDb {
+    /// Clone the shared low-level database for the atomic header-chain migration.
+    pub(in crate::service) fn header_chain_disk_db(&self) -> DiskDb {
+        self.db.clone()
+    }
+
     /// Opens or creates the database at a path based on the kind, major version and network,
     /// with the supplied column families, preserving any existing column families,
     /// and returns a shared high-level typed database wrapper.
@@ -318,16 +325,6 @@ impl ZakuraDb {
                 Follow the instructions in the 2.4.1 release notes: https://github.com/ZcashFoundation/zebra/releases/tag/v2.4.1 \
                 If you just run the node for consensus and don't use data from the RPC interface, you can ignore this warning."
             )
-        }
-
-        // Optionally audit the zakura header store's on-disk invariants and
-        // truncate any incoherent suffix. This can scan a large header frontier
-        // while syncing from genesis, so operators opt in when they need a
-        // startup repair. Read-only instances cannot repair; the audit is left
-        // to an explicit writable reopen.
-        if !read_only && config.repair_zakura_header_store_on_startup {
-            db.audit_and_repair_zakura_header_store()
-                .unwrap_or_else(|error| panic!("startup header-store repair failed: {error}"));
         }
 
         db.run_startup_format_change(format_change, prepared_vct_repair);

@@ -329,7 +329,7 @@ fn broadcast_all_queued_removes_banned_peers() {
         let mut remaining_peers = HashSet::new();
         remaining_peers.insert(banned_addr);
 
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         peer_set.queued_broadcast_all = Some((Request::Peers, sender, remaining_peers));
 
         peer_set.broadcast_all_queued();
@@ -429,6 +429,64 @@ fn broadcast_all_queued_removes_canceled_broadcasts() {
         peer_set.broadcast_all_queued();
 
         assert!(peer_set.queued_broadcast_all.is_none());
+    });
+}
+
+/// Queued delivery must make progress across more readiness waves than the old
+/// bounded response channel could hold, even when its receiver is not polled yet.
+#[test]
+fn broadcast_all_queued_does_not_wait_for_receiver_capacity() {
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version; 4],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, _handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .max_conns_per_ip(max(4, DEFAULT_MAX_CONNS_PER_IP))
+            .build();
+
+        let peer_set = peer_set.ready().await.expect("peer set is always ready");
+        assert_eq!(peer_set.ready_services.len(), 4);
+
+        // Hold all services outside the ready map, while cancel handles model the
+        // original unready-peer snapshot. Move them back one at a time to create
+        // four distinct readiness waves without polling the response receiver.
+        let mut services = std::mem::take(&mut peer_set.ready_services);
+        let mut _cancel_receivers = Vec::new();
+        for peer_addr in services.keys() {
+            let (cancel_tx, cancel_rx) =
+                crate::peer_set::set::oneshot::channel::<crate::peer_set::set::CancelClientWork>();
+            peer_set.cancel_handles.insert(*peer_addr, cancel_tx);
+            _cancel_receivers.push(cancel_rx);
+        }
+
+        let mut receiver = peer_set
+            .queue_broadcast_all_unready(&Request::AdvertiseBlockToAll(block::Hash([13; 32])))
+            .expect("cancel handles create a queued broadcast");
+
+        for (peer_addr, service) in services.drain() {
+            assert!(peer_set.cancel_handles.remove(&peer_addr).is_some());
+            assert!(peer_set.ready_services.insert(peer_addr, service).is_none());
+            peer_set.broadcast_all_queued();
+        }
+
+        assert!(peer_set.queued_broadcast_all.is_none());
+
+        let mut queued_deliveries = 0;
+        while receiver.try_recv().is_ok() {
+            queued_deliveries += 1;
+        }
+        assert_eq!(queued_deliveries, 4);
     });
 }
 
@@ -753,7 +811,7 @@ fn broadcast_all_queued_bans_mapped_ipv6_against_canonical_ban() {
         let mut remaining_peers = HashSet::new();
         remaining_peers.insert(mapped_addr);
 
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         peer_set.queued_broadcast_all = Some((Request::Peers, sender, remaining_peers));
 
         peer_set.broadcast_all_queued();

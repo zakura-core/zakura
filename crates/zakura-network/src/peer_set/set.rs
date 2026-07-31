@@ -239,7 +239,7 @@ where
     /// Stores requests that should be routed to peers once they are ready.
     queued_broadcast_all: Option<(
         Request,
-        tokio::sync::mpsc::Sender<ResponseFuture>,
+        tokio::sync::mpsc::UnboundedSender<ResponseFuture>,
         HashSet<D::Key>,
     )>,
 
@@ -1366,13 +1366,13 @@ where
     fn queue_broadcast_all_unready(
         &mut self,
         req: &Request,
-    ) -> Option<tokio::sync::mpsc::Receiver<ResponseFuture>> {
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<ResponseFuture>> {
         if !self.cancel_handles.is_empty() {
-            /// How many broadcast all futures to send to the channel until the peer set should wait for the channel consumer
-            /// to read a message before continuing to send the queued broadcast request to peers that were originally unready.
-            const QUEUED_BROADCAST_FUTS_CHANNEL_SIZE: usize = 3;
-
-            let (sender, receiver) = tokio::sync::mpsc::channel(QUEUED_BROADCAST_FUTS_CHANNEL_SIZE);
+            // Each original peer is removed after its delivery is queued, so the total
+            // number of futures in this channel is bounded by the peer snapshot below.
+            // An unbounded channel avoids stalling the peer set on capacity without a
+            // registered wakeup when several peer readiness waves happen close together.
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
             let unready_peers: HashSet<_> = self.cancel_handles.keys().cloned().collect();
             let queued = (req.clone(), sender, unready_peers);
 
@@ -1418,20 +1418,16 @@ where
             return;
         }
 
-        let reserved_send_slot = match sender.try_reserve() {
-            Ok(reserved_send_slot) => reserved_send_slot,
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => return,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
-                self.queued_broadcast_all = Some((req, sender.clone(), remaining_peers));
-                return;
-            }
-        };
-
         for peer in &peers {
             remaining_peers.remove(peer);
         }
 
-        reserved_send_slot.send(self.send_multiple(req.clone(), peers).boxed());
+        if sender
+            .send(self.send_multiple(req.clone(), peers).boxed())
+            .is_err()
+        {
+            return;
+        }
 
         if !remaining_peers.is_empty() {
             self.queued_broadcast_all = Some((req, sender, remaining_peers));

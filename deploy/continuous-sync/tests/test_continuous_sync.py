@@ -202,6 +202,7 @@ class ContinuousSyncTests(unittest.TestCase):
         rendered = deploy.render_files(nodes[0])
 
         self.assertIn('p2p_stack = "zakura"', rendered["zakurad.toml.template"])
+        self.assertIn("checkpoint_sync = true", rendered["zakurad.toml.template"])
         self.assertIn('mode_label = "Zakura/v2-only"', rendered["controller.toml"])
         self.assertIn("[[nodes]]", rendered["alert-monitor.toml"])
         self.assertIn('hostname = "temp-zakura-sync-test-1"', rendered["alert-monitor.toml"])
@@ -218,8 +219,12 @@ class ContinuousSyncTests(unittest.TestCase):
         rendered = deploy.render_files(nodes[0])
 
         self.assertIn('p2p_stack = "legacy"', rendered["zakurad.toml.template"])
+        self.assertIn("checkpoint_sync = false", rendered["zakurad.toml.template"])
         self.assertIn('mode_label = "Zebra/legacy-only"', rendered["controller.toml"])
-        self.assertIn('branch = "main"', rendered["controller.toml"])
+        self.assertIn(
+            'branch = "fix/reject-noncanonical-shielded-proofs"',
+            rendered["controller.toml"],
+        )
         self.assertEqual(rendered["alert-monitor.toml"].count("[[nodes]]"), 7)
         for index in range(1, 8):
             self.assertIn(

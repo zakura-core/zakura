@@ -32,7 +32,7 @@ ready_max_tip_age = "5m"
 enforce_on_test_networks = true
 
 [consensus]
-checkpoint_sync = true
+checkpoint_sync = {{CHECKPOINT_SYNC}}
 vct_fast_sync = true
 
 [tracing]

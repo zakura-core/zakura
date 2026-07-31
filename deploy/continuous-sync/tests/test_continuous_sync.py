@@ -276,6 +276,22 @@ class ContinuousSyncTests(unittest.TestCase):
                 alert.run_once(config)
                 post_alert.assert_called_once()
 
+                alert.run_once(config)
+                post_alert.assert_called_once()
+
+                status["controller_state"] = {"phase": "failed", "failed": True}
+                alert.run_once(config)
+                post_alert.assert_called_once()
+
+                status["service_active"] = True
+                status["metrics_status"] = "ok"
+                status["height"] = 42
+                alert.run_once(config)
+
+            self.assertEqual(post_alert.call_count, 2)
+            self.assertEqual(post_alert.call_args_list[0].args[1], "NODE DOWN")
+            self.assertEqual(post_alert.call_args_list[1].args[1], "NODE RECOVERED")
+
     def test_metrics_degraded_while_service_active_does_not_page_down(self):
         hostname = "temp-zakura-sync-test-6"
         status = {
@@ -316,36 +332,29 @@ class ContinuousSyncTests(unittest.TestCase):
             self.assertTrue(alert.metrics_degraded(status))
             self.assertFalse(alert.node_healthy(status))
 
-    def test_controller_failure_alerts_immediately(self):
+    def test_intentionally_inactive_service_and_controller_failure_do_not_page(self):
         hostname = "temp-zakura-sync-test-1"
-        status = {
-            "hostname": hostname,
-            "public_ip": "138.68.43.212",
-            "mode": "dual-stack",
-            "service": "zakura.service",
-            "service_active": False,
-            "metrics_status": "unavailable",
-            "height": None,
-            "connection": "root@138.68.43.212",
-            "alias_connection": f"ssh {hostname}",
-            "log_path": "/tmp/zebrad.log",
-            "trace_path": "/tmp/traces",
-            "monitor_log_path": "/tmp/monitor.log",
-            "controller_state": {
-                "phase": "failed",
-                "failed": True,
-                "failure": "build failed",
-            },
-        }
+        for phase in ("building", "installing", "preparing-empty-state", "cleanup", "cooldown", "complete", "failed"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
+                status = alert_status_fixture(hostname, service_active=False, phase=phase)
+                status["controller_state"]["failed"] = phase == "failed"
+                config = alert_config(Path(tmp), [hostname])
+                with (
+                    patch.object(alert, "query_node", return_value=status),
+                    patch.object(alert.socket, "gethostname", return_value=hostname),
+                    patch.object(alert, "post_alert", return_value=True) as post_alert,
+                ):
+                    alert.run_once(config)
+                    alert.run_once(config)
+
+                post_alert.assert_not_called()
+
+    def test_controller_failure_with_active_service_does_not_page(self):
+        hostname = "temp-zakura-sync-test-1"
+        status = alert_status_fixture(hostname, service_active=True, phase="failed")
+        status["controller_state"].update({"failed": True, "failure": "build failed"})
         with tempfile.TemporaryDirectory() as tmp:
-            config = {
-                "defaults": {
-                    "alert_state_file": str(Path(tmp) / "state.json"),
-                    "monitor_log": str(Path(tmp) / "monitor.log"),
-                    "down_confirmation_samples": 2,
-                },
-                "nodes": [{"hostname": hostname}],
-            }
+            config = alert_config(Path(tmp), [hostname])
             with (
                 patch.object(alert, "query_node", return_value=status),
                 patch.object(alert.socket, "gethostname", return_value=hostname),
@@ -353,23 +362,142 @@ class ContinuousSyncTests(unittest.TestCase):
             ):
                 alert.run_once(config)
 
+            post_alert.assert_not_called()
+
+    def test_controller_failure_does_not_page_even_with_syncing_phase(self):
+        hostname = "temp-zakura-sync-test-1"
+        status = alert_status_fixture(hostname, service_active=False, phase="syncing")
+        status["controller_state"].update({"failed": True, "failure": "sync failed"})
+        with tempfile.TemporaryDirectory() as tmp:
+            config = alert_config(Path(tmp), [hostname])
+            with (
+                patch.object(alert, "query_node", return_value=status),
+                patch.object(alert.socket, "gethostname", return_value=hostname),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                alert.run_once(config)
+
+            post_alert.assert_not_called()
+
+    def test_local_query_failure_is_logged_without_changing_alert_state(self):
+        hostname = "temp-zakura-sync-test-1"
+        status = alert_status_fixture(hostname, service_active=None, phase="unknown")
+        status["query_error"] = "status command timed out"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = alert_config(tmp_path, [hostname])
+            with (
+                patch.object(alert, "query_node", return_value=status),
+                patch.object(alert.socket, "gethostname", return_value=hostname),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+
+            post_alert.assert_not_called()
+            self.assertIn(
+                "local-query-failed",
+                (tmp_path / "monitor.log").read_text(encoding="utf-8"),
+            )
+
+    def test_remote_node_down_does_not_page(self):
+        local = "temp-zakura-sync-test-1"
+        remote = "temp-zakura-sync-test-2"
+        statuses = {
+            local: alert_status_fixture(local, service_active=True, height=20),
+            remote: alert_status_fixture(remote, service_active=False, height=10),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            config = alert_config(Path(tmp), [local, remote])
+            with (
+                patch.object(alert, "query_node", side_effect=lambda _, node: statuses[node["hostname"]]),
+                patch.object(alert.socket, "gethostname", return_value=local),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                alert.run_once(config)
+
+            post_alert.assert_not_called()
+
+    def test_local_stall_pages_with_peer_evidence_then_recovers(self):
+        local = "temp-zakura-sync-test-1"
+        peer = "temp-zakura-sync-test-2"
+        statuses = {
+            local: alert_status_fixture(local, service_active=True, height=10),
+            peer: alert_status_fixture(peer, service_active=True, height=11),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            config = alert_config(Path(tmp), [local, peer], cluster_stall_seconds=10)
+            with (
+                patch.object(alert, "query_node", side_effect=lambda _, node: statuses[node["hostname"]]),
+                patch.object(alert.socket, "gethostname", return_value=local),
+                patch.object(alert, "now", side_effect=[100, 111, 112]),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                statuses[peer]["height"] = 12
+                alert.run_once(config)
+                statuses[local]["height"] = 11
+                statuses[peer]["height"] = 13
+                alert.run_once(config)
+
+            self.assertEqual(
+                [call.args[1] for call in post_alert.call_args_list],
+                ["SYNC STALLED", "SYNC RECOVERED"],
+            )
+
+    def test_legacy_alert_state_migrates_without_recovery(self):
+        hostname = "temp-zakura-sync-test-1"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            state_path = tmp_path / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "nodes": {hostname: {"height": 7, "last_progress": 50}},
+                        "alerts": {
+                            f"node-down:{hostname}": {"active": True, "last_sent": 50},
+                            f"cluster-stall:{hostname}": {"active": True, "last_sent": 50},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status = alert_status_fixture(hostname, service_active=False, height=7)
+            config = alert_config(tmp_path, [hostname])
+            with (
+                patch.object(alert, "query_node", return_value=status),
+                patch.object(alert.socket, "gethostname", return_value=hostname),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                post_alert.assert_not_called()
+                alert.run_once(config)
+
             post_alert.assert_called_once()
+            migrated = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(migrated["version"], alert.STATE_VERSION)
+            self.assertEqual(migrated["nodes"][hostname]["height"], 7)
+            self.assertNotIn(f"node-down:{hostname}", migrated["alerts"])
+            self.assertNotIn(f"cluster-stall:{hostname}", migrated["alerts"])
 
-
-    def test_alert_text_is_concise_and_normalizes_mode(self):
+    def test_alert_text_names_condition_and_includes_diagnostics(self):
         text = alert.main_alert_text(
-            "TEST ALERT",
+            "NODE DOWN",
             {
                 "hostname": "temp-zakura-sync-test-2",
                 "mode": "Zakura/v2-only",
                 "public_ip": "138.197.218.91",
+                "height": 123,
             },
-            "controller halted: a very noisy reason",
+            "zakura.service is inactive while controller phase is syncing",
         )
 
         self.assertEqual(
             text,
-            ":rotating_light: Zakura continuous sync alert: temp-zakura-sync-test-2 | v2p2p | root@138.197.218.91",
+            ":rotating_light: Zakura node down: temp-zakura-sync-test-2 | height: 123 | "
+            "reason: zakura.service is inactive while controller phase is syncing | "
+            "ssh: root@138.197.218.91",
         )
         self.assertNotIn("\n", text)
 
@@ -392,7 +520,8 @@ class ContinuousSyncTests(unittest.TestCase):
         self.assertEqual(
             text,
             ":rotating_light: Zakura failed: temp-zakura-sync-test-3 | legacy | "
-            "root@134.209.49.92 | time to failure: 1h 2m 3s | height: 2584406",
+            "root@134.209.49.92 | time to failure: 1h 2m 3s | height: 2584406 | "
+            "reason: boom",
         )
         self.assertNotIn("\n", text)
 
@@ -402,6 +531,20 @@ class ContinuousSyncTests(unittest.TestCase):
         text = sync.failure_text(config, {"time_to_failure_seconds": 5}, "boom")
 
         self.assertIn("time to failure: 5s | height: unknown", text)
+
+    def test_controller_failure_reason_is_normalized_and_bounded(self):
+        config = make_config(Path("/tmp"))
+
+        text = sync.failure_text(
+            config,
+            {"time_to_failure_seconds": 5},
+            "first line\n" + "x" * 200,
+        )
+
+        reason = text.split(" | reason: ", 1)[1]
+        self.assertNotIn("\n", reason)
+        self.assertLessEqual(len(reason), 96)
+        self.assertTrue(reason.endswith("..."))
 
     def test_completion_slack_text_includes_sync_duration(self):
         config = make_config(
@@ -443,6 +586,76 @@ class ContinuousSyncTests(unittest.TestCase):
             self.assertEqual(run_state["time_to_failure_seconds"], 305)
             posted_state = post_slack.call_args.args[1]
             self.assertIn("time to failure: 5m 5s", posted_state)
+
+    def test_resume_posts_recovery_only_after_successful_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp))
+            state_path = config.paths.state_dir / "state.json"
+            sync.save_state(state_path, {"failed": True, "failure": "boom", "phase": "failed"})
+
+            with (
+                patch.object(sync, "run") as run,
+                patch.object(sync, "post_slack") as post_slack,
+            ):
+                sync.resume(config)
+
+            self.assertEqual(run.call_count, 2)
+            self.assertNotIn("failed", sync.load_state(state_path))
+            post_slack.assert_called_once_with(config, sync.resumed_text(config))
+
+    def test_resume_restores_failure_and_does_not_post_when_start_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp))
+            state_path = config.paths.state_dir / "state.json"
+            original = {"failed": True, "failure": "boom", "phase": "failed"}
+            sync.save_state(state_path, original)
+
+            with (
+                patch.object(sync, "run", side_effect=[None, RuntimeError("start failed")]),
+                patch.object(sync, "post_slack") as post_slack,
+                self.assertRaisesRegex(RuntimeError, "start failed"),
+            ):
+                sync.resume(config)
+
+            self.assertEqual(sync.load_state(state_path), original)
+            post_slack.assert_not_called()
+
+
+def alert_status_fixture(
+    hostname: str,
+    *,
+    service_active: bool | None,
+    phase: str = "syncing",
+    height: int | None = None,
+):
+    return {
+        "hostname": hostname,
+        "public_ip": "138.68.43.212",
+        "mode": "dual-stack",
+        "service": "zakura.service",
+        "service_active": service_active,
+        "metrics_status": "ok" if service_active else "unavailable",
+        "height": height,
+        "connection": "root@138.68.43.212",
+        "alias_connection": f"ssh {hostname}",
+        "log_path": "/tmp/zebrad.log",
+        "trace_path": "/tmp/traces",
+        "monitor_log_path": "/tmp/monitor.log",
+        "controller_state": {"phase": phase, "failed": False},
+    }
+
+
+def alert_config(tmp_path: Path, hostnames: list[str], **default_overrides):
+    defaults = {
+        "alert_state_file": str(tmp_path / "state.json"),
+        "monitor_log": str(tmp_path / "monitor.log"),
+        "down_confirmation_samples": 2,
+    }
+    defaults.update(default_overrides)
+    return {
+        "defaults": defaults,
+        "nodes": [{"hostname": hostname} for hostname in hostnames],
+    }
 
 
 def make_config(tmp_path: Path, **overrides):

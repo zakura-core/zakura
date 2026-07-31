@@ -167,7 +167,6 @@ def subst_for(node: Node) -> dict[str, str]:
         "WIPE_ENTRIES": toml_string_list(raw["wipe_entries"]),
         "PRESERVE_ENTRIES": toml_string_list(raw["preserve_entries"]),
         "TRACING_FILTER": str(raw["tracing_filter"]).replace('"', '\\"'),
-        "CHECKPOINT_SYNC": str(bool(raw["checkpoint_sync"])).lower(),
         "BOOTSTRAP_PEERS": "\n".join(f"    {json.dumps(peer)}," for peer in bootstrap_peers),
         "ALERT_NODES": render_alert_nodes(raw),
     }

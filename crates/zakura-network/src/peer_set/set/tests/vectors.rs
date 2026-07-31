@@ -334,11 +334,11 @@ fn broadcast_all_queued_removes_banned_peers() {
 
         peer_set.broadcast_all_queued();
 
-        if let Some((_req, _sender, remaining_peers)) = peer_set.queued_broadcast_all.take() {
-            assert!(remaining_peers.is_empty());
-        } else {
-            assert!(receiver.try_recv().is_ok());
-        }
+        assert!(peer_set.queued_broadcast_all.is_none());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
     });
 }
 
@@ -759,16 +759,13 @@ fn broadcast_all_queued_bans_mapped_ipv6_against_canonical_ban() {
         peer_set.broadcast_all_queued();
 
         // The mapped-form peer must be dropped by the (canonical) ban filter, so no peers
-        // remain queued for the re-send. On un-canonicalized code the mapped peer would
-        // survive the filter and this assertion would fail.
-        if let Some((_req, _sender, remaining_peers)) = peer_set.queued_broadcast_all.take() {
-            assert!(
-                remaining_peers.is_empty(),
-                "banned mapped-IPv6 peer must be filtered by the canonical ban"
-            );
-        } else {
-            assert!(receiver.try_recv().is_ok());
-        }
+        // remain queued for the re-send and the response channel must close. On
+        // un-canonicalized code the mapped peer would survive the filter.
+        assert!(peer_set.queued_broadcast_all.is_none());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
     });
 }
 

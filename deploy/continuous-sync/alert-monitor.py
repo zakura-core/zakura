@@ -56,6 +56,11 @@ def load_state(path: Path) -> dict[str, Any]:
             for key, value in alerts.items()
             if not key.startswith(("node-down:", "cluster-stall:"))
         }
+        nodes = state.get("nodes")
+        if isinstance(nodes, dict):
+            for record in nodes.values():
+                if isinstance(record, dict):
+                    record.pop("consecutive_down_samples", None)
         state["version"] = STATE_VERSION
     state.setdefault("nodes", {})
     state.setdefault("alerts", {})
@@ -307,6 +312,7 @@ def maybe_alert(
     alerts = state.setdefault("alerts", {})
     record = alerts.setdefault(key, {"active": False, "last_sent": 0})
     if active:
+        record.pop("recovery_pending", None)
         if not record.get("active") or ts - int(record.get("last_sent", 0)) >= throttle:
             if post_alert(config, kind, status, statuses, reason):
                 record["last_sent"] = ts
@@ -317,8 +323,11 @@ def maybe_alert(
     elif record.get("active"):
         if post_alert(config, recovery_kind, status, statuses, recovery_reason):
             record["last_sent"] = ts
+            record["active"] = False
+            record.pop("recovery_pending", None)
             log(config, f"recovery-sent key={key} host={status['hostname']}")
-        record["active"] = False
+        else:
+            record["recovery_pending"] = True
 
 
 def run_once(config: dict[str, Any]) -> int:
@@ -409,7 +418,7 @@ def run_once(config: dict[str, Any]) -> int:
             if (
                 peer_height is not None
                 and peer_height > height
-                and int(peer_record.get("last_progress", 0)) >= last_progress
+                and int(peer_record.get("last_progress", 0)) > last_progress
             ):
                 peer_evidence.append(f"{peer['hostname']} advanced to height {peer_height}")
     stalled = (
@@ -425,9 +434,15 @@ def run_once(config: dict[str, Any]) -> int:
         f"peer evidence: {', '.join(peer_evidence)}"
     )
     stall_key = f"local-sync-stall:{local_host}"
-    stall_active = bool(state.get("alerts", {}).get(stall_key, {}).get("active"))
-    local_progressed = height is not None and height != previous_local_height
-    if stalled or (stall_active and local_progressed):
+    stall_record = state.get("alerts", {}).get(stall_key, {})
+    stall_active = bool(stall_record.get("active"))
+    recovery_pending = bool(stall_record.get("recovery_pending"))
+    local_progressed = (
+        isinstance(height, int)
+        and isinstance(previous_local_height, int)
+        and height > previous_local_height
+    )
+    if stalled or (stall_active and (local_progressed or recovery_pending)):
         maybe_alert(
             config,
             state,

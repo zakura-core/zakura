@@ -24,14 +24,11 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def service_active(service: str) -> bool:
-    try:
-        result = subprocess.run(
-            ["systemctl", "is-active", "--quiet", service],
-            timeout=4,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
+    result = subprocess.run(
+        ["systemctl", "is-active", "--quiet", service],
+        timeout=4,
+    )
+    return result.returncode == 0
 
 
 def metric_height(text: str) -> int | None:

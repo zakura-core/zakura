@@ -77,6 +77,17 @@ class ContinuousSyncTests(unittest.TestCase):
 
         self.assertEqual(alert_status.metric_height(metrics), 900)
 
+    def test_alert_status_service_query_failure_propagates(self):
+        with (
+            patch.object(
+                alert_status.subprocess,
+                "run",
+                side_effect=RuntimeError("systemctl timed out"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "systemctl timed out"),
+        ):
+            alert_status.service_active("zakura.service")
+
     def test_preflight_checks_dependencies_before_a_cycle(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -419,7 +430,7 @@ class ContinuousSyncTests(unittest.TestCase):
 
             post_alert.assert_not_called()
 
-    def test_local_stall_pages_with_peer_evidence_then_recovers(self):
+    def test_local_stall_ignores_height_regression_then_recovers_on_progress(self):
         local = "temp-zakura-sync-test-1"
         peer = "temp-zakura-sync-test-2"
         statuses = {
@@ -431,8 +442,59 @@ class ContinuousSyncTests(unittest.TestCase):
             with (
                 patch.object(alert, "query_node", side_effect=lambda _, node: statuses[node["hostname"]]),
                 patch.object(alert.socket, "gethostname", return_value=local),
-                patch.object(alert, "now", side_effect=[100, 111, 112]),
+                patch.object(alert, "now", side_effect=[100, 111, 112, 113]),
                 patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                statuses[peer]["height"] = 12
+                alert.run_once(config)
+                statuses[local]["height"] = 0
+                statuses[peer]["height"] = 13
+                alert.run_once(config)
+                statuses[local]["height"] = 1
+                statuses[peer]["height"] = 14
+                alert.run_once(config)
+
+            self.assertEqual(
+                [call.args[1] for call in post_alert.call_args_list],
+                ["SYNC STALLED", "SYNC RECOVERED"],
+            )
+
+    def test_stationary_higher_peer_does_not_prove_local_stall(self):
+        local = "temp-zakura-sync-test-1"
+        peer = "temp-zakura-sync-test-2"
+        statuses = {
+            local: alert_status_fixture(local, service_active=True, height=10),
+            peer: alert_status_fixture(peer, service_active=True, height=11),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            config = alert_config(Path(tmp), [local, peer], cluster_stall_seconds=10)
+            with (
+                patch.object(alert, "query_node", side_effect=lambda _, node: statuses[node["hostname"]]),
+                patch.object(alert.socket, "gethostname", return_value=local),
+                patch.object(alert, "now", side_effect=[100, 111]),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                alert.run_once(config)
+
+            post_alert.assert_not_called()
+
+    def test_failed_stall_recovery_is_retried(self):
+        local = "temp-zakura-sync-test-1"
+        peer = "temp-zakura-sync-test-2"
+        statuses = {
+            local: alert_status_fixture(local, service_active=True, height=10),
+            peer: alert_status_fixture(peer, service_active=True, height=11),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = alert_config(tmp_path, [local, peer], cluster_stall_seconds=10)
+            with (
+                patch.object(alert, "query_node", side_effect=lambda _, node: statuses[node["hostname"]]),
+                patch.object(alert.socket, "gethostname", return_value=local),
+                patch.object(alert, "now", side_effect=[100, 111, 112, 113]),
+                patch.object(alert, "post_alert", side_effect=[True, False, True]) as post_alert,
             ):
                 alert.run_once(config)
                 statuses[peer]["height"] = 12
@@ -440,10 +502,17 @@ class ContinuousSyncTests(unittest.TestCase):
                 statuses[local]["height"] = 11
                 statuses[peer]["height"] = 13
                 alert.run_once(config)
+                alert.run_once(config)
 
             self.assertEqual(
                 [call.args[1] for call in post_alert.call_args_list],
-                ["SYNC STALLED", "SYNC RECOVERED"],
+                ["SYNC STALLED", "SYNC RECOVERED", "SYNC RECOVERED"],
+            )
+            state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+            self.assertFalse(state["alerts"][f"local-sync-stall:{local}"]["active"])
+            self.assertNotIn(
+                "recovery_pending",
+                state["alerts"][f"local-sync-stall:{local}"],
             )
 
     def test_legacy_alert_state_migrates_without_recovery(self):
@@ -454,7 +523,13 @@ class ContinuousSyncTests(unittest.TestCase):
             state_path.write_text(
                 json.dumps(
                     {
-                        "nodes": {hostname: {"height": 7, "last_progress": 50}},
+                        "nodes": {
+                            hostname: {
+                                "height": 7,
+                                "last_progress": 50,
+                                "consecutive_down_samples": 1,
+                            }
+                        },
                         "alerts": {
                             f"node-down:{hostname}": {"active": True, "last_sent": 50},
                             f"cluster-stall:{hostname}": {"active": True, "last_sent": 50},
@@ -472,12 +547,18 @@ class ContinuousSyncTests(unittest.TestCase):
             ):
                 alert.run_once(config)
                 post_alert.assert_not_called()
+                migrated = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    migrated["nodes"][hostname]["consecutive_down_samples"],
+                    1,
+                )
                 alert.run_once(config)
 
             post_alert.assert_called_once()
             migrated = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(migrated["version"], alert.STATE_VERSION)
             self.assertEqual(migrated["nodes"][hostname]["height"], 7)
+            self.assertEqual(migrated["nodes"][hostname]["last_progress"], 50)
             self.assertNotIn(f"node-down:{hostname}", migrated["alerts"])
             self.assertNotIn(f"cluster-stall:{hostname}", migrated["alerts"])
 

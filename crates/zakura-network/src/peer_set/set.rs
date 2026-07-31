@@ -1418,9 +1418,13 @@ where
             return;
         }
 
-        let Ok(reserved_send_slot) = sender.try_reserve() else {
-            self.queued_broadcast_all = Some((req, sender, remaining_peers));
-            return;
+        let reserved_send_slot = match sender.try_reserve() {
+            Ok(reserved_send_slot) => reserved_send_slot,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                self.queued_broadcast_all = Some((req, sender.clone(), remaining_peers));
+                return;
+            }
         };
 
         for peer in &peers {

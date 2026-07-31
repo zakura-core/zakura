@@ -893,6 +893,8 @@ impl ValidateContextError {
     // peer-attribution decision.
     fn misbehavior_score(&self) -> u32 {
         match self {
+            // Consensus violations the block itself proves: the supplier sent a
+            // block that no honest peer could have produced.
             ValidateContextError::NonSequentialBlock { .. }
             | ValidateContextError::TimeTooEarly { .. }
             | ValidateContextError::TimeTooLate { .. }
@@ -907,9 +909,6 @@ impl ValidateContextError {
             | ValidateContextError::DuplicateOrchardNullifier { .. }
             | ValidateContextError::DuplicateIronwoodNullifier { .. }
             | ValidateContextError::NegativeRemainingTransactionValue { .. }
-            | ValidateContextError::CalculateRemainingTransactionValue { .. }
-            | ValidateContextError::CalculateTransactionValueBalances { .. }
-            | ValidateContextError::CalculateBlockChainValueChange { .. }
             | ValidateContextError::AddValuePool { .. }
             | ValidateContextError::InvalidBlockCommitment(_)
             | ValidateContextError::UnknownSproutAnchor { .. }
@@ -917,7 +916,24 @@ impl ValidateContextError {
             | ValidateContextError::UnknownOrchardAnchor { .. }
             | ValidateContextError::UnknownIronwoodAnchor { .. } => 100,
 
-            ValidateContextError::MissingSproutTipTree(_)
+            // Residual arithmetic failures in our own value summation, not
+            // consensus violations. `remaining_transaction_value()` and
+            // `value_balance()` peel off the "this block creates money" case
+            // into `NegativeRemainingTransactionValue`, and `AddValuePool`
+            // carries the ZIP-209 non-negative pool rule. What reaches these
+            // variants is an out-of-range or overflowing intermediate, which a
+            // local bookkeeping bug can produce just as easily as a bad block.
+            // Scoring them would let one such bug ban every honest peer in turn,
+            // so they stay unscored alongside the other local-state failures.
+            ValidateContextError::CalculateRemainingTransactionValue { .. }
+            | ValidateContextError::CalculateTransactionValueBalances { .. }
+            | ValidateContextError::CalculateBlockChainValueChange { .. }
+
+            // Failures that are not attributable to the block's supplier:
+            // local state and tree errors, operator invalidation, stale forks,
+            // out-of-order arrival, retryable stalls, and auxiliary roots that
+            // may have come from a different peer.
+            | ValidateContextError::MissingSproutTipTree(_)
             | ValidateContextError::HeaderRootAuthFrontier { .. }
             | ValidateContextError::BlockPreviouslyInvalidated { .. }
             | ValidateContextError::NotReadyToBeCommitted
@@ -1026,6 +1042,31 @@ mod tests {
         let value_balance_error = ValueBalanceError::Transparent(amount_error.clone());
         let orchard_nullifier = orchard::Nullifier::try_from([0; 32])
             .expect("zero is a canonical Orchard nullifier encoding");
+        // Residual arithmetic failures in our own value summation. A local
+        // bookkeeping bug produces these just as easily as a bad block does, so
+        // they must not ban the peer that supplied the block.
+        let arithmetic_faults = [
+            ValidateContextError::CalculateRemainingTransactionValue {
+                amount_error: amount_error.clone(),
+                height,
+                tx_index_in_block: 1,
+                transaction_hash,
+            },
+            ValidateContextError::CalculateTransactionValueBalances {
+                value_balance_error: value_balance_error.clone(),
+                height,
+                tx_index_in_block: 1,
+                transaction_hash,
+            },
+            ValidateContextError::CalculateBlockChainValueChange {
+                value_balance_error: value_balance_error.clone(),
+                height,
+                block_hash: block::Hash([3; 32]),
+                transaction_count: 2,
+                spent_utxo_count: 1,
+            },
+        ];
+
         let peer_faults = [
             ValidateContextError::NonSequentialBlock {
                 candidate_height: height,
@@ -1081,25 +1122,6 @@ mod tests {
                 tx_index_in_block: 1,
                 transaction_hash,
             },
-            ValidateContextError::CalculateRemainingTransactionValue {
-                amount_error,
-                height,
-                tx_index_in_block: 1,
-                transaction_hash,
-            },
-            ValidateContextError::CalculateTransactionValueBalances {
-                value_balance_error: value_balance_error.clone(),
-                height,
-                tx_index_in_block: 1,
-                transaction_hash,
-            },
-            ValidateContextError::CalculateBlockChainValueChange {
-                value_balance_error: value_balance_error.clone(),
-                height,
-                block_hash: block::Hash([3; 32]),
-                transaction_count: 2,
-                spent_utxo_count: 1,
-            },
             ValidateContextError::AddValuePool {
                 value_balance_error,
                 chain_value_pools: Box::new(ValueBalance::<NonNegative>::zero()),
@@ -1141,6 +1163,16 @@ mod tests {
                 commit_error.misbehavior_score(),
                 100,
                 "direct contextual consensus failure must be scored: {commit_error:?}"
+            );
+        }
+
+        for error in arithmetic_faults {
+            let commit_error = CommitBlockError::ValidateContextError(Box::new(error));
+            assert_eq!(
+                commit_error.misbehavior_score(),
+                0,
+                "value-summation arithmetic failure must not be attributed to a peer: \
+                 {commit_error:?}"
             );
         }
 

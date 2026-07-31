@@ -1149,6 +1149,13 @@ mod tests {
         ));
         assert_eq!(transient_context_error.misbehavior_score(), 0);
 
+        let local_frontier_error = CommitBlockError::ValidateContextError(Box::new(
+            ValidateContextError::HeaderRootAuthFrontier {
+                reason: "test local storage fault".to_string(),
+            },
+        ));
+        assert_eq!(local_frontier_error.misbehavior_score(), 0);
+
         let invalid_ancestor_error = CommitBlockError::ValidateContextError(Box::new(
             ValidateContextError::InvalidAncestorBlock(block::Hash([1; 32])),
         ));

@@ -1392,19 +1392,40 @@ where
             return;
         };
 
-        remaining_peers.retain(|addr| !self.bans.contains(canonical_ip(addr.ip())));
+        if sender.is_closed() {
+            return;
+        }
+
+        remaining_peers.retain(|addr| {
+            !self.bans.contains(canonical_ip(addr.ip()))
+                && (self.ready_services.contains_key(addr)
+                    || self.cancel_handles.contains_key(addr))
+        });
+
+        if remaining_peers.is_empty() {
+            return;
+        }
+
+        let peers: Vec<_> = self
+            .ready_services
+            .keys()
+            .filter(|ready_peer| remaining_peers.contains(ready_peer))
+            .copied()
+            .collect();
+
+        if peers.is_empty() {
+            self.queued_broadcast_all = Some((req, sender, remaining_peers));
+            return;
+        }
 
         let Ok(reserved_send_slot) = sender.try_reserve() else {
             self.queued_broadcast_all = Some((req, sender, remaining_peers));
             return;
         };
 
-        let peers: Vec<_> = self
-            .ready_services
-            .keys()
-            .filter(|ready_peer| remaining_peers.remove(ready_peer))
-            .copied()
-            .collect();
+        for peer in &peers {
+            remaining_peers.remove(peer);
+        }
 
         reserved_send_slot.send(self.send_multiple(req.clone(), peers).boxed());
 
@@ -1663,6 +1684,10 @@ where
         self.log_peer_set_size();
         self.update_metrics();
 
+        // This also drops queued peers that disconnected while they were unready,
+        // even if there are no ready peers left in the peer set.
+        self.broadcast_all_queued();
+
         if ready_peers.is_pending() {
             // # Correctness
             //
@@ -1687,7 +1712,6 @@ where
             return Poll::Pending;
         }
 
-        self.broadcast_all_queued();
         self.deliver_queued_sidecar_block_gossip();
 
         if self.ready_services.is_empty() {

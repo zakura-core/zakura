@@ -342,6 +342,96 @@ fn broadcast_all_queued_removes_banned_peers() {
     });
 }
 
+/// A peer that disconnects while waiting for a queued broadcast must not keep the
+/// broadcast response open indefinitely.
+#[test]
+fn broadcast_all_queued_removes_disconnected_peers() {
+    let peer_versions = PeerVersions {
+        peer_versions: vec![Version::min_specified_for_upgrade(
+            &Network::Mainnet,
+            NetworkUpgrade::Nu6_2,
+        )],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, _handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+
+        let peer_addr: PeerSocketAddr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1).into();
+        let peer_set = peer_set.ready().await.expect("peer set is always ready");
+        let service = peer_set
+            .take_ready_service(&peer_addr)
+            .expect("mock peer is ready");
+        peer_set.push_unready(peer_addr, service);
+
+        let broadcast_fut =
+            peer_set.broadcast_all(Request::AdvertiseBlockToAll(block::Hash([9; 32])));
+        assert!(peer_set.queued_broadcast_all.is_some());
+
+        peer_set.remove(&peer_addr);
+
+        // Polling readiness processes the canceled service. Since this was the only
+        // peer, readiness remains pending, but queue cleanup must still run.
+        assert!(peer_set.ready().now_or_never().is_none());
+        assert!(peer_set.queued_broadcast_all.is_none());
+
+        timeout(Duration::from_secs(1), broadcast_fut)
+            .await
+            .expect("broadcast should not wait for a disconnected peer")
+            .expect("broadcast_all should succeed");
+    });
+}
+
+/// Dropping the broadcast response future must also discard its queued delivery.
+#[test]
+fn broadcast_all_queued_removes_canceled_broadcasts() {
+    let peer_versions = PeerVersions {
+        peer_versions: vec![Version::min_specified_for_upgrade(
+            &Network::Mainnet,
+            NetworkUpgrade::Nu6_2,
+        )],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, _handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+
+        let peer_addr: PeerSocketAddr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1).into();
+        let peer_set = peer_set.ready().await.expect("peer set is always ready");
+        let service = peer_set
+            .take_ready_service(&peer_addr)
+            .expect("mock peer is ready");
+        peer_set.push_unready(peer_addr, service);
+
+        let broadcast_fut =
+            peer_set.broadcast_all(Request::AdvertiseBlockToAll(block::Hash([11; 32])));
+        assert!(peer_set.queued_broadcast_all.is_some());
+
+        drop(broadcast_fut);
+        peer_set.broadcast_all_queued();
+
+        assert!(peer_set.queued_broadcast_all.is_none());
+    });
+}
+
 /// A mined block advertised via `AdvertiseBlockToAll` while a peer is unready
 /// must reach that peer once it is ready again, not be silently dropped.
 ///

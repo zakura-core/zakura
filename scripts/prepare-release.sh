@@ -3,10 +3,13 @@
 #
 #   1. Bump every changed publishable crate since BASE_TAG (level chosen by
 #      cargo-semver-checks: breaking -> major, anything else -> minor).
-#   2. Cascade-bump published crates whose index requirements cannot select
-#      a version being published (any prerelease; a new major): skipping
-#      them would leave the published graph unresolvable, so they must
-#      republish with rewritten requirements.
+#   2. Cascade-bump every published crate that depends, directly or
+#      transitively, on a crate taking a prerelease or a new major: no
+#      index requirement written before this release can select such a
+#      version, so a skipped dependent's index manifest would keep
+#      resolving the old one — unresolvable for a prerelease, a silent
+#      duplicate for a new major. They must republish with rewritten
+#      requirements.
 #   3. Bump the zakura package to the release tag version.
 #   4. Refresh Cargo.lock.
 #   5. Regenerate the stored config fixture for the new version.
@@ -40,9 +43,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
-# The libraries are linted as standalone shellcheck inputs in lint.yml.
-# shellcheck source=scripts/lib/semver-req.sh disable=SC1091
-. "${repo_root}/scripts/lib/semver-req.sh"
+# The library is linted as a standalone shellcheck input in lint.yml.
 # shellcheck source=scripts/lib/crates-index.sh disable=SC1091
 . "${repo_root}/scripts/lib/crates-index.sh"
 
@@ -57,7 +58,7 @@ release_state_waiver=""
 tag_remote="https://github.com/zakura-core/zakura.git"
 
 usage() {
-  sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -192,6 +193,26 @@ bump_patch() {
   y="${core#*.}"; y="${y%%.*}"
   z="${core##*.}"
   printf '%d.%d.%d' "$x" "$y" "$((z + 1))"
+}
+
+semver_class() {
+  # semver_class X.Y.Z[-PRE]
+  # The semver-compatible class of a version: the prefix a caret
+  # requirement holds fixed, up to the leftmost non-zero component.
+  # 4.1.3 -> 4, 0.3.2 -> 0.3, 0.0.7 -> 0.0.7. The prerelease tag is
+  # dropped: it orders versions inside a class, not classes.
+  local core x y z
+  core="$(strip_pre "$1")"
+  x="${core%%.*}"
+  y="${core#*.}"; y="${y%%.*}"
+  z="${core##*.}"
+  if [ "$x" != 0 ]; then
+    printf '%s' "$x"
+  elif [ "$y" != 0 ]; then
+    printf '%s.%s' "$x" "$y"
+  else
+    printf '%s.%s.%s' "$x" "$y" "$z"
+  fi
 }
 
 manifest_rewrite_dev_only() {
@@ -428,19 +449,22 @@ if [ "$no_crates" = 0 ]; then
     ' <<<"$metadata"
   )
 
-  # --- Cascade: published crates whose requirements must move ---------------
+  # --- Cascade: republish the dependents of prereleases and new majors ------
   #
   # A published crate is skipped at publish time, so its dependents resolve
-  # the manifest on the index — not the local one. When a version being
-  # published is one that crate's index requirement cannot select (any
-  # prerelease, or a new major), skipping it stops being an option: the
-  # graph on the index no longer resolves. That is how v1.1.0-rc0 became
-  # unpublishable — index zakura-node-services 3.0.0 pins zakura-chain
-  # ^3.0.0, which can never select the prerelease 3.1.0-rc0. Fold such
-  # crates into the plan with a patch bump so their rewritten requirements
-  # actually ship. The index is the authority throughout: the local
-  # manifest of a published crate may already carry rewritten requirements
-  # from an earlier preparation.
+  # the manifest on the index — not the local one. When a crate being
+  # published takes a version no index requirement written before this
+  # release can select — any prerelease (a requirement without a
+  # pre-release tag never matches one), or a version opening a new
+  # semver-compatible class (which does not fail resolution: cargo selects
+  # the old major next to the new one, duplicating the crate in consumers'
+  # graphs) — skipping its dependents stops being an option. That is how
+  # v1.1.0-rc0 became unpublishable: index zakura-node-services 3.0.0 pins
+  # zakura-chain ^3.0.0, which can never select the prerelease 3.1.0-rc0.
+  # Fold the crate's whole dependent closure into the plan with patch
+  # bumps: plain dependency-graph reachability, no model of cargo's
+  # resolver. check-crate-publish-graph.sh gates the outcome by asserting
+  # on the Cargo.lock cargo writes into every packaged archive.
 
   # Seed the publish set with crates already at unpublished versions (for
   # example bumps prepared for an earlier release candidate that never
@@ -465,76 +489,121 @@ if [ "$no_crates" = 0 ]; then
     ' <<<"$metadata"
   )
 
-  cascade_progress=1
-  while [ "$cascade_progress" = 1 ]; do
-    cascade_progress=0
-    while IFS=$'\t' read -r crate manifest_path current_version; do
-      [ -n "$crate" ] || continue
-      [ "$crate" != "zakura" ] || continue
-      [ -z "${has_row[$crate]:-}" ] || continue
-      manifest_rel="${manifest_path#"$repo_root"/}"
+  # Workspace dependency edges (dependent -> dependency), dev excluded:
+  # published dev requirements are never used by dependents.
+  internal_edges="$(jq -r '
+    .packages[]
+    | .name as $pkg
+    | .dependencies[]
+    | select(.path != null and .kind != "dev")
+    | [$pkg, .name]
+    | @tsv
+  ' <<<"$metadata")"
 
-      index_rc=0
-      crates_index_has_version "$crate" "$current_version" || index_rc=$?
-      case "$index_rc" in
-        0) ;;
-        1) continue ;; # unpublished: its local manifest ships as-is
-        *) echo "ERROR: could not query the crates.io index for ${crate}." >&2; exit 1 ;;
+  # Why each crate must republish, keyed by crate name; doubles as the
+  # visited set for the closure walk. Seeded with the triggers — publish-set
+  # members taking a version no index requirement on them can select.
+  declare -A cascade_why=()
+  cascade_queue=()
+  while IFS=$'\t' read -r crate _; do
+    [ -n "$crate" ] || continue
+    target="${publish_target[$crate]:-}"
+    [ -n "$target" ] || continue
+    published_versions="$(crates_index_versions "$crate")" || {
+      echo "ERROR: could not query the crates.io index for ${crate}." >&2
+      exit 1
+    }
+    # A crate that has never been published cannot be pinned by any index
+    # manifest, whatever version it starts at.
+    [ -n "$published_versions" ] || continue
+    if [ "$target" != "$(strip_pre "$target")" ]; then
+      cascade_why["$crate"]="takes the prerelease ${target}"
+    else
+      target_class="$(semver_class "$target")"
+      class_published=0
+      while IFS= read -r published_version; do
+        [ -n "$published_version" ] || continue
+        if [ "$(semver_class "$published_version")" = "$target_class" ]; then
+          class_published=1
+          break
+        fi
+      done <<<"$published_versions"
+      [ "$class_published" = 0 ] || continue
+      cascade_why["$crate"]="takes the new major ${target}"
+    fi
+    cascade_queue+=("$crate")
+  done < <(
+    jq -r '
+      .packages[]
+      | select(.publish == null or (.publish | length) > 0)
+      | [.name, .version]
+      | @tsv
+    ' <<<"$metadata"
+  )
+
+  # Grow the transitive dependent closure: any dependent of a crate that
+  # must move must itself move, or its own index copy keeps pinning the
+  # old version. Breadth-first over reverse dependency edges.
+  queue_head=0
+  while [ "$queue_head" -lt "${#cascade_queue[@]}" ]; do
+    moved="${cascade_queue[$queue_head]}"
+    queue_head=$((queue_head + 1))
+    while IFS=$'\t' read -r pkg dep; do
+      [ "$dep" = "$moved" ] || continue
+      # The zakura package is versioned from the release tag and always
+      # publishes alongside crate releases.
+      [ "$pkg" != "zakura" ] || continue
+      [ -z "${cascade_why[$pkg]:-}" ] || continue
+      case "${cascade_why[$moved]}" in
+        takes*) cascade_why["$pkg"]="depends on ${moved}, which ${cascade_why[$moved]}" ;;
+        *) cascade_why["$pkg"]="depends on ${moved}, which republishes in this cascade" ;;
       esac
-
-      published_deps="$(crates_index_deps "$crate" "$current_version")" || {
-        echo "ERROR: could not read ${crate}@${current_version} from the index." >&2
-        exit 1
-      }
-      force_dep="" force_req="" force_target=""
-      while IFS=$'\t' read -r dep req kind; do
-        [ -n "$dep" ] || continue
-        # Published dev requirements are never used by dependents.
-        [ "$kind" != "dev" ] || continue
-        dep_target="${publish_target[$dep]:-}"
-        [ -n "$dep_target" ] || continue
-        match_rc=0
-        semver_req_matches "$req" "$dep_target" || match_rc=$?
-        case "$match_rc" in
-          0) ;;
-          1) force_dep="$dep" force_req="$req" force_target="$dep_target"; break ;;
-          *)
-            echo "ERROR: cannot evaluate ${crate}'s published requirement ${dep} = \"${req}\"." >&2
-            exit 1
-            ;;
-        esac
-      done <<<"$published_deps"
-      [ -n "$force_dep" ] || continue
-
-      # Choose the next patch version whose stable form and suffixed form
-      # are both free on the index, so the later stable fold cannot collide
-      # with a version published from another line (such as a hotfix).
-      published_versions="$(crates_index_versions "$crate")" || {
-        echo "ERROR: could not query the crates.io index for ${crate}." >&2
-        exit 1
-      }
-      core="$(strip_pre "$current_version")"
-      [ "$current_version" != "$core" ] || core="$(bump_patch "$core")"
-      while grep -Fxq -- "$core" <<<"$published_versions" \
-        || grep -Fxq -- "${core}${suffix}" <<<"$published_versions"; do
-        core="$(bump_patch "$core")"
-      done
-      target="${core}${suffix}"
-
-      add_crate_row "$crate" "$current_version" "$current_version" "$target" \
-        "cascade" \
-        "published requirement ${force_dep} = \"${force_req#^}\" cannot select ${force_target}; republish with the rewritten requirement"
-      add_to_plan "$crate" "$target" "$current_version" "$manifest_rel"
-      cascade_progress=1
-    done < <(
-      jq -r '
-        .packages[]
-        | select(.publish == null or (.publish | length) > 0)
-        | [.name, .manifest_path, .version]
-        | @tsv
-      ' <<<"$metadata"
-    )
+      cascade_queue+=("$pkg")
+    done <<<"$internal_edges"
   done
+
+  while IFS=$'\t' read -r crate manifest_path current_version; do
+    [ -n "$crate" ] || continue
+    [ "$crate" != "zakura" ] || continue
+    [ -n "${cascade_why[$crate]:-}" ] || continue
+    [ -z "${has_row[$crate]:-}" ] || continue
+    manifest_rel="${manifest_path#"$repo_root"/}"
+
+    index_rc=0
+    crates_index_has_version "$crate" "$current_version" || index_rc=$?
+    case "$index_rc" in
+      0) ;;
+      1) continue ;; # unpublished: already in the publish set, ships as-is
+      *) echo "ERROR: could not query the crates.io index for ${crate}." >&2; exit 1 ;;
+    esac
+
+    # Choose the next patch version whose stable form and suffixed form
+    # are both free on the index, so the later stable fold cannot collide
+    # with a version published from another line (such as a hotfix).
+    published_versions="$(crates_index_versions "$crate")" || {
+      echo "ERROR: could not query the crates.io index for ${crate}." >&2
+      exit 1
+    }
+    core="$(strip_pre "$current_version")"
+    [ "$current_version" != "$core" ] || core="$(bump_patch "$core")"
+    while grep -Fxq -- "$core" <<<"$published_versions" \
+      || grep -Fxq -- "${core}${suffix}" <<<"$published_versions"; do
+      core="$(bump_patch "$core")"
+    done
+    target="${core}${suffix}"
+
+    add_crate_row "$crate" "$current_version" "$current_version" "$target" \
+      "cascade" \
+      "${cascade_why[$crate]}; a skipped crate's index manifest would keep resolving the old version"
+    add_to_plan "$crate" "$target" "$current_version" "$manifest_rel"
+  done < <(
+    jq -r '
+      .packages[]
+      | select(.publish == null or (.publish | length) > 0)
+      | [.name, .manifest_path, .version]
+      | @tsv
+    ' <<<"$metadata"
+  )
 fi
 
 # The workflow projects the release height from a fresh, digest-verified

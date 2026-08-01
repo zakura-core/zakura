@@ -10,8 +10,9 @@
 # each crate directory, missing workspace-level changes that affect packaging.
 # scripts/check-crate-publish-graph.sh queries the registry, warns when a
 # published crate's local requirements diverge from the index copy, and
-# hard-fails when the publishable graph cannot resolve; publish-time registry
-# content validation remains the final gate.
+# hard-fails unless the publishable graph resolves every workspace crate at
+# its workspace version; publish-time registry content validation remains
+# the final gate.
 #
 # Usage:
 #   ./scripts/check-crate-version-bumps.sh

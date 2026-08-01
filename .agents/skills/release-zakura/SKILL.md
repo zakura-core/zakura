@@ -83,17 +83,24 @@ For crates.io publishing:
 1. Identify changed publishable crates.
 2. Bump those crates before their dependents.
 3. Update every direct dependency requirement that must select the new crate.
-4. Cascade-republish pinning crates: a crate already published at its
+4. Cascade-republish dependents: a crate already published at its
    workspace version is skipped at publish time, and its **index** manifest
-   is what dependents resolve. A requirement without a pre-release tag never
-   matches a pre-release, and caret requirements never cross a major — so
-   any prerelease bump (and any new major) forces a patch bump of every
-   published crate that pins it. `prepare-release.sh` plans these as
-   `cascade` rows; never drop them from a crates.io-publishing release.
+   is what dependents resolve. A prerelease bump makes those manifests
+   unresolvable (a requirement without a pre-release tag never matches a
+   pre-release). A new major never fails resolution at all: a skipped crate
+   pinning the old major makes cargo select both majors side by side, and
+   consumers get a duplicated crate with mismatched types. Either way,
+   every published crate that depends on the bumped crate — directly or
+   transitively — must republish with a patch bump. `prepare-release.sh`
+   plans that dependent closure as `cascade` rows; never drop them from a
+   crates.io-publishing release.
 5. Refresh `Cargo.lock`.
 6. Confirm unchanged published versions still satisfy the resulting graph:
-   `./scripts/check-crate-publish-graph.sh` verifies resolution against the
-   live index and is step 5 of `make pre-release`.
+   `./scripts/check-crate-publish-graph.sh` dry-run-publishes the publish
+   set against the live index, then asserts that the Cargo.lock cargo
+   writes into each packaged archive resolves every workspace crate at its
+   workspace version — a duplicated major passes the dry-run itself. It is
+   step 5 of `make pre-release`.
 
 Partial version graphs are allowed, but all tooling must handle them. Do not
 assume every publishable crate has the `zakura` package version.

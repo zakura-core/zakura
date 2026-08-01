@@ -314,10 +314,12 @@ jobs:
           if cascades:
               lines += [
                   "",
-                  "Cascade rows republish already-published crates whose index",
-                  "requirements cannot select a version above — without them the",
-                  "published graph stops resolving",
-                  "(`scripts/check-crate-publish-graph.sh`). Do not drop them.",
+                  "Cascade rows republish already-published crates that depend on",
+                  "a prerelease or new major above: a skipped crate's index",
+                  "manifest keeps resolving the old version — a resolution",
+                  "failure for a prerelease, a silent duplicate for a new major",
+                  "(`scripts/check-crate-publish-graph.sh` catches both). Do not",
+                  "drop them.",
               ]
 
           lines += [

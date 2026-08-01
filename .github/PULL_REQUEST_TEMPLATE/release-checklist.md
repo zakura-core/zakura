@@ -105,9 +105,11 @@ This check runs automatically on pull requests with the `A-release` label. It mu
 > [Prepare release PR workflow](https://github.com/zakura-core/zakura/actions/workflows/prepare-release-pr.yml)
 > performs the mechanical steps in this section (crate and zakura version
 > bumps, lockfile, stored config, changelog assembly, end-of-support floor)
-> and opens a draft PR. The judgment items remain manual either way: review
+> and opens a draft PR. The judgment items remain manual on this path: review
 > the chosen bump levels, curate the assembled changelog, and set the
-> authoritative end-of-support height below.
+> authoritative end-of-support height below. (`Create release` can instead
+> prepare and merge that PR unattended, which skips this checklist entirely
+> and ships the machine-generated judgment values.)
 
 ## Update Zakura Version
 

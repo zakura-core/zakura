@@ -6,6 +6,15 @@
 # It dispatches from main, or from a hotfix/vX.Y.Z branch named for the exact
 # tag it releases (see docs/security-hotfix-release.md). The
 # source_first_release input is the emergency "Mode B" path described there.
+#
+# Release preparation is resolved first. When main already carries the release
+# tag's version, the prepare jobs are skipped and this workflow behaves exactly
+# as it always has. Otherwise, with auto_prepare (the default), it calls
+# prepare-release-pr.yml with auto_merge, which prepares the release, merges
+# the PR unattended, and hands back the merge commit as the release target —
+# so a release is a single dispatch. That adds up to ~5 hours to the run
+# (cargo-semver-checks baselines), and queues behind any manually dispatched
+# Prepare release PR run because the two share a concurrency group.
 name: Create release
 
 on:
@@ -25,6 +34,16 @@ on:
         required: false
         default: false
         type: boolean
+      auto_prepare:
+        description: "If the release is not prepared on main yet, prepare it and merge the release PR unattended (uncheck to require a human-merged release PR)"
+        required: false
+        default: true
+        type: boolean
+      publish_crates:
+        description: "Bump all changed crates when auto-preparing (uncheck for a GitHub-only release candidate that bumps just the zakura package; ignored for stable tags)"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -34,17 +53,140 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  validate:
-    name: Validate release
+  prepare-check:
+    name: Resolve release preparation
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
-      release_tag: ${{ steps.validate.outputs.release_tag }}
-      target_sha: ${{ steps.validate.outputs.target_sha }}
+      needs_prep: ${{ steps.check.outputs.needs_prep }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
+          toolchain: stable
+          # cargo metadata --no-deps only reads the workspace manifests.
+          cache: false
+
+      - name: Check whether the release is already prepared
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_REF: ${{ github.ref }}
+          AUTO_PREPARE: ${{ inputs.auto_prepare }}
+          SOURCE_FIRST_RELEASE: ${{ inputs.source_first_release }}
+        run: |
+          set -euo pipefail
+
+          package_version="$(
+            cargo metadata --format-version 1 --no-deps --manifest-path Cargo.toml \
+              | jq -r '.packages[] | select(.name == "zakura") | .version'
+          )"
+          if [ -z "$package_version" ] || [ "$package_version" = "null" ]; then
+            echo "Could not find the 'zakura' package in the workspace." >&2
+            exit 1
+          fi
+
+          if [ "v${package_version}" = "$RELEASE_TAG" ]; then
+            echo "needs_prep=false" >> "$GITHUB_OUTPUT"
+            echo "${SOURCE_REF} already carries ${RELEASE_TAG}; skipping preparation."
+            exit 0
+          fi
+          echo "${SOURCE_REF} is at v${package_version}, not ${RELEASE_TAG}: preparation is needed."
+
+          # Automated preparation always prepares main. A hotfix branch follows
+          # docs/security-hotfix-release.md, and Mode B is for when the release
+          # is already prepared and only needs publishing.
+          if [ "$SOURCE_REF" != "refs/heads/main" ]; then
+            echo "Automated preparation only runs on main; prepare ${SOURCE_REF} manually." >&2
+            exit 1
+          fi
+          if [ "$SOURCE_FIRST_RELEASE" = "true" ]; then
+            echo "source_first_release expects a prepared release; prepare ${RELEASE_TAG} first." >&2
+            exit 1
+          fi
+          if [ "$AUTO_PREPARE" != "true" ]; then
+            echo "auto_prepare is off: dispatch Prepare release PR for ${RELEASE_TAG} and merge it first." >&2
+            exit 1
+          fi
+
+          # An open release PR means someone is mid-flight on this version;
+          # merging over it, or recreating its branch, would discard their work.
+          open_prs="$(
+            gh pr list --repo "$REPO" --state open \
+              --head "release/${RELEASE_TAG}" --json number,url --jq '.[].url'
+          )"
+          if [ -n "$open_prs" ]; then
+            echo "An open release PR already claims ${RELEASE_TAG}: ${open_prs}" >&2
+            echo "Merge or close it, then re-dispatch." >&2
+            exit 1
+          fi
+
+          if gh api "repos/${REPO}/git/ref/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Tag ${RELEASE_TAG} already exists; tags are immutable and never reused." >&2
+            exit 1
+          fi
+
+          echo "needs_prep=true" >> "$GITHUB_OUTPUT"
+
+  prepare:
+    name: Prepare the release
+    needs: [prepare-check]
+    if: ${{ needs.prepare-check.outputs.needs_prep == 'true' }}
+    uses: ./.github/workflows/prepare-release-pr.yml
+    permissions:
+      contents: read
+    with:
+      release_tag: ${{ inputs.release_tag }}
+      publish_crates: ${{ inputs.publish_crates }}
+      auto_merge: true
+    secrets: inherit
+
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    needs: [prepare-check, prepare]
+    # prepare is skipped whenever main is already prepared, which is the
+    # unchanged manual path.
+    if: >-
+      ${{
+        !cancelled()
+        && needs.prepare-check.result == 'success'
+        && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
+      }}
+    outputs:
+      release_tag: ${{ steps.validate.outputs.release_tag }}
+      target_sha: ${{ steps.target.outputs.target_sha }}
+    steps:
+      - name: Resolve the release target commit
+        id: target
+        env:
+          MERGED_SHA: ${{ needs.prepare.outputs.merged_sha }}
+          DISPATCH_SHA: ${{ github.sha }}
+          PREPARED: ${{ needs.prepare.result }}
+        run: |
+          set -euo pipefail
+          # The dispatch commit is only the target when nothing was prepared:
+          # otherwise the release is tagged at the merge of the release PR.
+          if [ "$PREPARED" = "success" ] && [ -z "$MERGED_SHA" ]; then
+            echo "Preparation succeeded but reported no merge commit; refusing to release ${DISPATCH_SHA}." >&2
+            exit 1
+          fi
+          TARGET_SHA="${MERGED_SHA:-$DISPATCH_SHA}"
+          echo "target_sha=${TARGET_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Validating ${TARGET_SHA}"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ steps.target.outputs.target_sha }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
@@ -57,7 +199,6 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
           SOURCE_REF: ${{ github.ref }}
-          TARGET_SHA: ${{ github.sha }}
           # The documented emergency override for scripts/check-release-state.sh.
           ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE: ${{ inputs.allow_bootstrap_release_state && '1' || '0' }}
         run: |
@@ -79,14 +220,14 @@ jobs:
               ;;
           esac
 
-          # This validates only release state committed to the source ref.
+          # This validates only release state committed to the target commit,
+          # whether it was prepared by hand or auto-merged by this run.
           # Resolving the moving R2 pointer belongs to update-release-state.yml.
           make pre-release \
             RELEASE_TAG="$RELEASE_TAG" \
             PRE_RELEASE_WARN_CRATE_VERSION_BUMPS=0
 
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
 
   handoff-canary:
     name: Verify VCT handoff crossing

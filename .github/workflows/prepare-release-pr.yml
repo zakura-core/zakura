@@ -1,13 +1,26 @@
-# Prepare a release PR mechanically and open it as a draft for human review.
+# Prepare a release PR mechanically, for human review or for unattended merge.
 #
 # Runs scripts/prepare-release.sh on a fresh checkout of main (crate bumps via
 # cargo-semver-checks, zakura version, lockfile, config fixture, README tag,
 # end-of-support floor, changelog assembly), verifies the result with
-# `make pre-release`, and opens or updates a draft PR through the release
-# GitHub App. Nothing merges, tags, or publishes from this workflow: the PR is
-# always a draft, judgment items (bump-level review, authoritative
-# end-of-support height, changelog curation) are listed in the PR body, and
-# create-release.yml re-validates everything after merge.
+# `make pre-release`, and opens or updates a PR through the release GitHub App.
+#
+# Two paths:
+#
+#   auto_merge: false (default, the dispatch path) — the PR is always a draft,
+#   judgment items (bump-level review, authoritative end-of-support height,
+#   changelog curation) are listed in the PR body, and a human undrafts and
+#   merges it. Nothing merges, tags, or publishes from this workflow.
+#
+#   auto_merge: true — create-release.yml calls this workflow when the release
+#   has not been prepared yet. Verification becomes a hard gate: the PR opens
+#   ready for review and the App squash-merges it unattended, and the merge
+#   commit is returned as merged_sha. If any verification step fails the PR
+#   still opens, but as a draft, and the run fails without merging. This path
+#   accepts the machine-generated judgment values without a curation pass; it
+#   requires the release App to be a bypass actor (pull requests only) on the
+#   main ruleset. create-release.yml re-validates everything after the merge,
+#   and its publish job still gates on the protected release environment.
 #
 # Re-running with the same tag recreates the release/v* branch from the
 # current main HEAD, which is how the PR stays rebased.
@@ -38,6 +51,46 @@ on:
         required: false
         type: boolean
         default: false
+      auto_merge:
+        description: "Open the PR ready for review and squash-merge it unattended (no human review of the release diff)"
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Release tag to prepare, e.g. v1.2.3 or v1.2.3-rc0"
+        required: true
+        type: string
+      base_tag:
+        description: "Base tag to diff against (default: most recent v* tag)"
+        required: false
+        type: string
+      publish_crates:
+        description: "Bump all changed crates (uncheck for a GitHub-only release candidate that bumps just the zakura package; ignored for stable tags)"
+        required: false
+        type: boolean
+        default: true
+      dry_run:
+        description: "Prepare and verify, upload the diff as an artifact, but do not open a PR"
+        required: false
+        type: boolean
+        default: false
+      auto_merge:
+        description: "Open the PR ready for review and squash-merge it unattended (no human review of the release diff)"
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      pull_request_number:
+        description: "The release PR that was opened or updated, empty on a dry run"
+        value: ${{ jobs.prepare.outputs.pull_request_number }}
+      head_sha:
+        description: "Head commit of the release branch, empty on a dry run"
+        value: ${{ jobs.prepare.outputs.head_sha }}
+      merged_sha:
+        description: "Commit the release PR merged as, empty unless auto_merge merged it"
+        value: ${{ jobs.prepare.outputs.merged_sha }}
 
 permissions: {}
 
@@ -54,6 +107,10 @@ jobs:
     environment: release-automation
     permissions:
       contents: read
+    outputs:
+      pull_request_number: ${{ steps.pr.outputs.pull-request-number }}
+      head_sha: ${{ steps.pr.outputs.pull-request-head-sha }}
+      merged_sha: ${{ steps.merge.outputs.merged_sha }}
     steps:
       # fetch-depth: 0 — tag resolution, per-crate diffs against BASE_TAG, and
       # cargo-semver-checks --baseline-rev all need full history.
@@ -70,10 +127,18 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           BASE_TAG_INPUT: ${{ inputs.base_tag }}
           PUBLISH_CRATES: ${{ inputs.publish_crates }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          AUTO_MERGE: ${{ inputs.auto_merge }}
         run: |
           set -euo pipefail
           if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
             echo "release_tag must match vX.Y.Z or vX.Y.Z-rcN, got '$RELEASE_TAG'" >&2
+            exit 1
+          fi
+
+          # A dry run opens no PR, so there is nothing for auto_merge to merge.
+          if [ "$DRY_RUN" = "true" ] && [ "$AUTO_MERGE" = "true" ]; then
+            echo "dry_run and auto_merge are mutually exclusive" >&2
             exit 1
           fi
 
@@ -168,8 +233,10 @@ jobs:
             echo "committed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # Verification is continue-on-error: the draft PR opens either way with
-      # the failure summarized in its body, and the final step fails the run.
+      # Verification is continue-on-error: the PR opens either way with the
+      # failure summarized in its body, and the final step fails the run. Under
+      # auto_merge a failure also forces the PR back to a draft, so it cannot
+      # be merged by the step that follows.
       - name: Verify with make pre-release
         id: verify-prerelease
         continue-on-error: true
@@ -200,6 +267,7 @@ jobs:
           VERIFY_PRERELEASE: ${{ steps.verify-prerelease.outcome }}
           VERIFY_CONFIG: ${{ steps.verify-config.outcome }}
           VERIFY_FMT: ${{ steps.verify-fmt.outcome }}
+          AUTO_MERGE: ${{ inputs.auto_merge }}
         run: |
           python3 - "$RUNNER_TEMP/prep-summary.json" > "$RUNNER_TEMP/pr-body.md" <<'PY'
           import json, os, sys
@@ -279,19 +347,37 @@ jobs:
                   "before review.",
               ]
 
-          lines += [
-              "",
-              "## Remaining manual judgment (before undrafting)",
-              "",
-              "- [ ] Set the authoritative `ESTIMATED_RELEASE_HEIGHT` from the "
+          judgment = [
+              "Set the authoritative `ESTIMATED_RELEASE_HEIGHT` from the "
               "current Mainnet tip and expected tag date (the automated value "
               "is only a staleness floor).",
-              "- [ ] Curate the assembled changelog (dedupe, trim trivial "
+              "Curate the assembled changelog (dedupe, trim trivial "
               "entries, check categories).",
-              "- [ ] Review semver bump levels; downgrade minor → patch where "
+              "Review semver bump levels; downgrade minor → patch where "
               "appropriate; choose initial versions for any new crates.",
-              "- [ ] Confirm no release hold is in effect (an embargoed hotfix "
+              "Confirm no release hold is in effect (an embargoed hotfix "
               "may be in flight for the same version).",
+          ]
+          if os.environ["AUTO_MERGE"] == "true":
+              lines += [
+                  "",
+                  "## Judgment items taken automatically",
+                  "",
+                  "Create release prepared this PR and merges it unattended, "
+                  "so the machine-generated values below ship as they are. "
+                  "Fix them in a follow-up PR and re-release if any is wrong.",
+                  "",
+              ]
+              lines += [f"- {item}" for item in judgment]
+          else:
+              lines += [
+                  "",
+                  "## Remaining manual judgment (before undrafting)",
+                  "",
+              ]
+              lines += [f"- [ ] {item}" for item in judgment]
+
+          lines += [
               "",
               "### AI Disclosure",
               "",
@@ -324,6 +410,28 @@ jobs:
             ${{ runner.temp }}/prep-summary.json
             ${{ runner.temp }}/pr-body.md
 
+      # auto_merge only ever merges a fully verified preparation: any failed
+      # verification demotes the PR back to a draft, and the final step of this
+      # job fails the run, so the merge step below is skipped.
+      - name: Decide the PR draft state
+        id: draft
+        env:
+          AUTO_MERGE: ${{ inputs.auto_merge }}
+          VERIFY_PRERELEASE: ${{ steps.verify-prerelease.outcome }}
+          VERIFY_CONFIG: ${{ steps.verify-config.outcome }}
+          VERIFY_FMT: ${{ steps.verify-fmt.outcome }}
+        run: |
+          set -euo pipefail
+          MODE="always-true"
+          if [ "$AUTO_MERGE" = "true" ] \
+            && [ "$VERIFY_PRERELEASE" = "success" ] \
+            && [ "$VERIFY_CONFIG" = "success" ] \
+            && [ "$VERIFY_FMT" = "success" ]; then
+            MODE="false"
+          fi
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+          echo "Draft mode: ${MODE}"
+
       - name: Create release GitHub App token
         if: ${{ !inputs.dry_run }}
         id: app-token
@@ -336,7 +444,8 @@ jobs:
 
       # Never hotfix/*: that namespace is reserved for the embargoed hotfix
       # process (docs/security-hotfix-release.md).
-      - name: Open or update the draft pull request
+      - name: Open or update the pull request
+        id: pr
         if: ${{ !inputs.dry_run }}
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 #v8.1.1
         with:
@@ -351,8 +460,76 @@ jobs:
             P-Critical :ambulance:
           commit-message: "chore(release): prepare ${{ inputs.release_tag }}"
           sign-commits: true
-          draft: always-true
+          draft: ${{ steps.draft.outputs.mode }}
           delete-branch: true
+
+      # Merging an unapproved PR needs the release App on the main ruleset
+      # bypass list (pull requests only); without it this fails with HTTP 405.
+      # --match-head-commit pins the merge to the commit this run pushed, so a
+      # concurrent push to release/<tag> aborts the merge instead of shipping
+      # content this run never verified.
+      - name: Squash-merge the release PR
+        id: merge
+        if: ${{ !inputs.dry_run && inputs.auto_merge && steps.draft.outputs.mode == 'false' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pull-request-number }}
+          HEAD_SHA: ${{ steps.pr.outputs.pull-request-head-sha }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PR_NUMBER" ] || [ -z "$HEAD_SHA" ]; then
+            echo "No pull request was opened or updated for ${RELEASE_TAG}." >&2
+            exit 1
+          fi
+
+          # create-pull-request only sets the draft state when it opens a PR,
+          # so a PR left over from an earlier draft run is still a draft here.
+          gh pr ready "$PR_NUMBER" --repo "$REPO"
+
+          # GitHub computes mergeability asynchronously; a freshly pushed
+          # branch reports null until the background job finishes.
+          state=""
+          for _ in $(seq 1 30); do
+            state="$(gh pr view "$PR_NUMBER" --repo "$REPO" \
+              --json mergeable --jq '.mergeable')"
+            case "$state" in
+              MERGEABLE) break ;;
+              CONFLICTING)
+                echo "PR #${PR_NUMBER} conflicts with main; rebase or re-run." >&2
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+          if [ "$state" != "MERGEABLE" ]; then
+            echo "PR #${PR_NUMBER} mergeability is '${state}' after 5 minutes." >&2
+            exit 1
+          fi
+
+          gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --delete-branch \
+            --match-head-commit "$HEAD_SHA"
+
+          MERGED_SHA="$(gh pr view "$PR_NUMBER" --repo "$REPO" \
+            --json mergeCommit --jq '.mergeCommit.oid')"
+          if [ -z "$MERGED_SHA" ] || [ "$MERGED_SHA" = "null" ]; then
+            echo "PR #${PR_NUMBER} reports no merge commit after merging." >&2
+            exit 1
+          fi
+
+          # The release is tagged at this commit, so main must still be at it:
+          # anything landing in between would be tagged without verification.
+          MAIN_SHA="$(gh api "repos/${REPO}/commits/main" --jq '.sha')"
+          if [ "$MAIN_SHA" != "$MERGED_SHA" ]; then
+            echo "main advanced to ${MAIN_SHA} after PR #${PR_NUMBER} merged as ${MERGED_SHA}; re-dispatch the release." >&2
+            exit 1
+          fi
+
+          echo "merged_sha=${MERGED_SHA}" >> "$GITHUB_OUTPUT"
+          echo "PR #${PR_NUMBER} squash-merged as ${MERGED_SHA}; main is at it." \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fail the run if verification failed
         if: >-

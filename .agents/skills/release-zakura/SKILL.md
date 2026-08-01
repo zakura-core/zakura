@@ -21,6 +21,9 @@ defining it, and adds the Zakura-specific checks that are easy to miss.
 - Get explicit confirmation immediately before dispatching `create-release.yml`
   or publishing crates to crates.io.
 - Dispatch releases only from merged `main`.
+- Dispatching `create-release.yml` against an unprepared `main` merges a
+  release PR with no human review of the diff. Say so when asking for
+  confirmation, and name the alternative (prepare it first, review, merge).
 - Never create a `v*` tag manually. `create-release.yml` is the only supported
   tag creation path.
 - Do not promote a release candidate from pre-release to Latest. Published
@@ -62,6 +65,12 @@ bot. Prefer dispatching it, then finish the judgment items it lists in the PR
 body (bump-level review, authoritative end-of-support height, changelog
 curation). The manual steps below remain the fallback and the reference for
 what the automation must produce.
+
+`create-release.yml` also calls this workflow itself when `main` is not
+prepared yet, and merges the resulting PR unattended, so the judgment items
+above ship as the machine generated them. Prepare the release explicitly, as
+above, whenever those items need a human pass — which is every stable release,
+and any release candidate whose changelog or bump levels are worth curating.
 
 Name the branch `release/v<version>`. Never use `hotfix/v*` — that namespace
 is reserved for the hotfix release process
@@ -197,9 +206,16 @@ gh workflow run create-release.yml \
   -f release_tag=<tag>
 ```
 
+`release-t0.sh` drives the human-prepared path only: without `--pr` it requires
+`main` to already be at `--head-sha`, which is never true before an automated
+preparation has merged. Use the raw dispatch above to let `create-release.yml`
+prepare the release itself, and add `-f auto_prepare=false` to require that a
+human-merged release PR already landed.
+
 The workflow must:
 
-1. validate the tag against the `zakura` package version
+1. prepare the release if `main` does not carry the version yet, then validate
+   the tag against the `zakura` package version at the resulting commit
 2. boot from a retained Mainnet state below the VCT handoff and prove finalized
    state crosses it using the Zakura P2P stack
 3. build and verify assets before tag creation

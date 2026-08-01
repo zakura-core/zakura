@@ -15,7 +15,8 @@ Apps**, select **New GitHub App**, and create an organization-owned app with:
 
 - Name `zakura-release-bot`
 - Homepage URL set to the `zakura-core/zakura` repository
-- Repository permission `Contents: Read and write`
+- Repository permissions `Contents: Read and write` and
+  `Pull requests: Read and write`
 - All other permissions set to `No access`
 - Webhooks disabled
 - Installation restricted to `zakura-core`
@@ -23,12 +24,22 @@ Apps**, select **New GitHub App**, and create an organization-owned app with:
 After creating the app, select **Install App**, install it on `zakura-core`, and
 grant it access only to the `zakura` repository.
 
+Each workflow mints a token scoped down to what it needs, so the app's
+pull-request permission is only ever used to open and merge release PRs.
+
 Create a private key for the app. Configure a GitHub Actions environment named
 `release`, add the app's client ID as the environment variable
 `RELEASE_APP_CLIENT_ID`, and add its private key as the environment secret
 `RELEASE_APP_PRIVATE_KEY`. Configure required reviewers for the environment so
 that creating a release requires explicit approval. Restrict this environment
 to the `main` deployment branch.
+
+Configure a second environment named `release-automation` with the same
+`RELEASE_APP_CLIENT_ID` variable and `RELEASE_APP_PRIVATE_KEY` secret, also
+restricted to the `main` deployment branch. It has no required reviewers:
+[`prepare-release-pr.yml`](../.github/workflows/prepare-release-pr.yml) uses it
+to open and merge release PRs, and the human gate for the release itself stays
+on the `release` environment.
 
 The app private key is a credential. Store its source copy in the team's secret
 manager and do not commit it or paste it into issues, pull requests, or logs.
@@ -54,11 +65,37 @@ rewriting or deleting an existing release tag. Repository administrators and
 organization owners who can edit rulesets can still disable these controls, so
 ruleset administration must remain limited.
 
+## Main Branch Bypass
+
+The `main` branch ruleset requires one approving review. Automated release
+preparation merges its own PR, which the app authored and therefore cannot
+approve, so add `zakura-release-bot` to that ruleset's bypass list with
+**Pull requests only**.
+
+That mode lets the app merge a pull request that has no approval; it does not
+let the app push to `main` directly, so every change still arrives as a
+reviewable, CI-checked pull request. The trade-off is deliberate: on the
+automated path the release diff (version bumps, assembled changelog,
+end-of-support floor) merges without a human reading it, and the human gate for
+the release moves to the required reviewers on the `release` environment, which
+approve after the assets are built and before the tag exists. Prepare the
+release with a human-reviewed PR (see below) when that trade-off is not
+acceptable for a given release.
+
+Without this bypass entry the automated path fails at the merge step with
+HTTP 405; nothing else in the release pipeline depends on it.
+
 ## Creating a Release
 
-1. Merge the release version bump into `main`.
-2. Open **Actions > Create release > Run workflow**.
-3. Select the `main` branch and enter the exact release tag.
+1. Open **Actions > Create release > Run workflow**.
+2. Select the `main` branch and enter the exact release tag.
+3. If `main` does not carry that version yet, the workflow prepares the release
+   and merges the release PR through the app before validating it. To review
+   that diff by hand instead, dispatch
+   [`Prepare release PR`](../.github/workflows/prepare-release-pr.yml) first,
+   merge its draft PR, and then dispatch `Create release`; the preparation step
+   becomes a no-op. Dispatching with `auto_prepare` unchecked requires that
+   manual path and fails when the release is not prepared.
 4. Wait for the workflow to build and verify the release assets and no-push
    Docker builds. Nothing is tagged or published during this stage.
 5. Approve the `release` environment deployment. The workflow publishes the
@@ -67,8 +104,9 @@ ruleset administration must remain limited.
    the existing assets, publishes the Docker images, and opens the installer
    metadata update pull request.
 
-The workflow always builds the commit selected when it was dispatched, even if
-`main` advances before approval. It is safe to rerun after a partial failure:
+The workflow always builds the commit it validated — the commit selected when
+it was dispatched, or the commit that merged the release PR it prepared — even
+if `main` advances before approval. It is safe to rerun after a partial failure:
 it reuses an unpublished draft or exits successfully for a release already
 published from the expected commit. It refuses to reuse a tag that points
 elsewhere. Every release is initially a pre-release; see

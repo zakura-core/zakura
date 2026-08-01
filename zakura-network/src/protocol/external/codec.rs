@@ -2,9 +2,14 @@
 
 use std::{
     cmp::min,
+    collections::VecDeque,
     fmt,
     io::{Cursor, Read, Write},
     panic::{self, AssertUnwindSafe},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 #[cfg(test)]
@@ -31,6 +36,7 @@ use crate::constants;
 
 use super::{
     addr::{AddrInVersion, AddrV1, AddrV2},
+    inv::InventoryHash,
     message::{
         Message, RejectReason, VersionMessage, MAX_REJECT_MESSAGE_LENGTH, MAX_REJECT_REASON_LENGTH,
         MAX_USER_AGENT_LENGTH,
@@ -53,6 +59,51 @@ const MAX_HANDSHAKE_BODY_LEN: usize = 1024;
 /// The parse error returned when a legacy message body parser panics.
 const PANICKED_MESSAGE_BODY_PARSE_ERROR: &str = "panic while parsing peer message body";
 
+/// A versioned trailing extension marking an unsolicited block-gossip `inv`.
+///
+/// The last two bytes are a little-endian zero payload length. Unknown
+/// versions, kinds, payloads, or malformed extensions are ignored.
+const BLOCK_GOSSIP_INV_EXTENSION: &[u8; 8] = b"ZINV\x01\x01\x00\x00";
+
+/// Private metadata shared by a connection and its legacy codec.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InvGossipState {
+    inbound_inv_tags: Arc<Mutex<VecDeque<bool>>>,
+    tag_next_outbound_inv: Arc<AtomicBool>,
+}
+
+impl InvGossipState {
+    pub(crate) fn push_inbound_inv_tag(&self, is_block_gossip: bool) {
+        self.inbound_inv_tags
+            .lock()
+            .expect("inventory gossip metadata lock is not poisoned")
+            .push_back(is_block_gossip);
+    }
+
+    pub(crate) fn take_inbound_inv_tag(&self) -> bool {
+        self.inbound_inv_tags
+            .lock()
+            .expect("inventory gossip metadata lock is not poisoned")
+            .pop_front()
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn clear_inbound_inv_tags(&self) {
+        self.inbound_inv_tags
+            .lock()
+            .expect("inventory gossip metadata lock is not poisoned")
+            .clear();
+    }
+
+    pub(crate) fn tag_next_outbound_inv(&self) {
+        self.tag_next_outbound_inv.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_outbound_inv_tag(&self) -> bool {
+        self.tag_next_outbound_inv.swap(false, Ordering::AcqRel)
+    }
+}
+
 #[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum BodyDecodePanic {
@@ -65,8 +116,11 @@ enum BodyDecodePanic {
 pub struct Codec {
     builder: Builder,
     state: DecodeState,
+    inv_gossip_state: InvGossipState,
     #[cfg(test)]
     body_decode_panic: Cell<Option<BodyDecodePanic>>,
+    #[cfg(test)]
+    decode_block_gossip_extensions: Cell<bool>,
 }
 
 /// A builder for specifying [`Codec`] options.
@@ -104,6 +158,10 @@ impl Codec {
     pub fn reconfigure_full_body_len(&mut self) {
         self.builder.max_len = MAX_PROTOCOL_MESSAGE_LEN;
     }
+
+    pub(crate) fn inv_gossip_state(&self) -> InvGossipState {
+        self.inv_gossip_state.clone()
+    }
 }
 
 impl Builder {
@@ -112,8 +170,11 @@ impl Builder {
         Codec {
             builder: self,
             state: DecodeState::Head,
+            inv_gossip_state: InvGossipState::default(),
             #[cfg(test)]
             body_decode_panic: Cell::new(None),
+            #[cfg(test)]
+            decode_block_gossip_extensions: Cell::new(true),
         }
     }
 
@@ -152,7 +213,16 @@ impl Encoder<Message> for Codec {
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
         use Error::Parse;
 
-        let body_length = self.body_length(&item);
+        let tag_block_gossip = matches!(
+            &item,
+            Message::Inv(items) if matches!(items.as_slice(), [InventoryHash::Block(_)])
+        ) && self.inv_gossip_state.take_outbound_inv_tag();
+        let body_length = self.body_length(&item)
+            + if tag_block_gossip {
+                BLOCK_GOSSIP_INV_EXTENSION.len()
+            } else {
+                0
+            };
 
         if body_length > self.builder.max_len {
             return Err(Parse("body length exceeded maximum size"));
@@ -206,7 +276,10 @@ impl Encoder<Message> for Codec {
             // after the body has been written.
             dst.write_u32::<LittleEndian>(0)?;
 
-            self.write_body(&item, dst)?;
+            self.write_body(&item, &mut *dst)?;
+            if tag_block_gossip {
+                dst.write_all(BLOCK_GOSSIP_INV_EXTENSION)?;
+            }
         }
         let checksum = sha256d::Checksum::from(&dst[start_len + HEADER_LEN..]);
         dst[start_len + 20..][..4].copy_from_slice(&checksum.0);
@@ -339,7 +412,7 @@ impl Codec {
                     .zcash_serialize(&mut writer)?;
             }
             Message::Headers(headers) => headers.zcash_serialize(&mut writer)?,
-            Message::Inv(hashes) => hashes.zcash_serialize(&mut writer)?,
+            Message::Inv(items) => items.zcash_serialize(&mut writer)?,
             Message::GetData(hashes) => hashes.zcash_serialize(&mut writer)?,
             Message::NotFound(hashes) => hashes.zcash_serialize(&mut writer)?,
             Message::Tx(transaction) => transaction.transaction.zcash_serialize(&mut writer)?,
@@ -813,8 +886,22 @@ impl Codec {
         }
     }
 
-    fn read_inv<R: Read>(&self, reader: R) -> Result<Message, Error> {
-        Ok(Message::Inv(Vec::zcash_deserialize(reader)?))
+    fn read_inv<R: Read>(&self, mut reader: R) -> Result<Message, Error> {
+        let items = Vec::zcash_deserialize(&mut reader)?;
+        let mut extension = Vec::new();
+        reader.read_to_end(&mut extension)?;
+
+        #[cfg(test)]
+        let decode_extension = self.decode_block_gossip_extensions.get();
+        #[cfg(not(test))]
+        let decode_extension = true;
+
+        let is_block_gossip = decode_extension
+            && extension == BLOCK_GOSSIP_INV_EXTENSION
+            && matches!(items.as_slice(), [InventoryHash::Block(_)]);
+        self.inv_gossip_state.push_inbound_inv_tag(is_block_gossip);
+
+        Ok(Message::Inv(items))
     }
 
     fn read_getdata<R: Read>(&self, reader: R) -> Result<Message, Error> {
@@ -884,6 +971,11 @@ impl Codec {
     #[cfg(test)]
     fn inject_body_decode_panic(&self, panic_point: BodyDecodePanic) {
         self.body_decode_panic.set(Some(panic_point));
+    }
+
+    #[cfg(test)]
+    fn disable_block_gossip_extensions(&self) {
+        self.decode_block_gossip_extensions.set(false);
     }
 
     #[cfg(test)]

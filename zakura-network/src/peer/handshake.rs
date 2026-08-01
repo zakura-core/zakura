@@ -1633,6 +1633,8 @@ where
             let bare_codec = peer_conn.codec_mut();
             bare_codec.reconfigure_version(connection_info.negotiated_version);
             bare_codec.reconfigure_full_body_len();
+            let inv_gossip_state = bare_codec.inv_gossip_state();
+            inv_gossip_state.clear_inbound_inv_tags();
 
             debug!("constructing client, spawning server");
 
@@ -1768,6 +1770,7 @@ where
                 server_rx,
                 error_slot.clone(),
                 peer_tx,
+                inv_gossip_state,
                 connection_tracker,
                 connection_info.clone(),
                 addr_label,

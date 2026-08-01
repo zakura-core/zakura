@@ -51,6 +51,20 @@ mod tests;
 
 use downloads::Downloads as BlockDownloads;
 
+fn block_misbehavior(
+    err: BoxError,
+    advertiser_addr: Option<PeerSocketAddr>,
+) -> Option<(PeerSocketAddr, u32)> {
+    let advertiser_addr = advertiser_addr?;
+    let score = if let Some(err) = err.downcast_ref::<RouterError>() {
+        err.misbehavior_score()
+    } else {
+        err.downcast_ref::<VerifyBlockError>()?.misbehavior_score()
+    };
+
+    (score != 0).then_some((advertiser_addr, score))
+}
+
 /// The maximum amount of time an inbound service response can take.
 ///
 /// If the response takes longer than this time, it will be cancelled,
@@ -443,17 +457,12 @@ impl Service<zn::Request> for Inbound {
                 // If we returned Pending here, and there were no waiting block downloads,
                 // then inbound requests would wait for the next block download, and hang forever.
                 while let Poll::Ready(Some(result)) = block_downloads.as_mut().poll_next(cx) {
-                    let Err((err, Some(advertiser_addr))) = result else {
+                    let Err((err, advertiser_addr)) = result else {
                         continue;
                     };
 
-                    let Ok(err) = err.downcast::<VerifyBlockError>() else {
-                        continue;
-                    };
-
-                    if err.misbehavior_score() != 0 {
-                        let _ =
-                            misbehavior_sender.try_send((advertiser_addr, err.misbehavior_score()));
+                    if let Some(misbehavior) = block_misbehavior(err, advertiser_addr) {
+                        let _ = misbehavior_sender.try_send(misbehavior);
                     }
                 }
 

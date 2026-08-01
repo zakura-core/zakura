@@ -34,7 +34,7 @@ use crate::{
     },
     peer_set::ConnectionTracker,
     protocol::{
-        external::{types::Nonce, InventoryHash, Message},
+        external::{codec::InvGossipState, types::Nonce, InventoryHash, Message},
         internal::{InventoryResponse, Request, Response},
     },
     BoxError, PeerSocketAddr, MAX_TX_INV_IN_SENT_MESSAGE,
@@ -142,6 +142,7 @@ impl Handler {
     fn process_message(
         &mut self,
         msg: Message,
+        is_block_gossip: bool,
         cached_addrs: &mut Vec<MetaAddr>,
         transient_addr: Option<PeerSocketAddr>,
     ) -> Option<Message> {
@@ -397,6 +398,11 @@ impl Handler {
                 }
             }
 
+            (Handler::FindBlocks, msg @ Message::Inv(_)) if is_block_gossip => {
+                ignored_msg = Some(msg);
+                Handler::FindBlocks
+            }
+
             // TODO:
             // - use `any(inv)` rather than `all(inv)`?
             (Handler::FindBlocks, Message::Inv(items))
@@ -590,6 +596,7 @@ where
     ///
     /// The corresponding peer message receiver is passed to [`Connection::run`].
     pub(super) peer_tx: PeerTx<Tx>,
+    inv_gossip_state: InvGossipState,
 
     /// A connection tracker that reduces the open connection count when dropped.
     /// Used to limit the number of open connections in Zebra.
@@ -646,6 +653,7 @@ where
         client_rx: futures::channel::mpsc::Receiver<ClientRequest>,
         error_slot: ErrorSlot,
         peer_tx: Tx,
+        inv_gossip_state: InvGossipState,
         connection_tracker: ConnectionTracker,
         connection_info: Arc<ConnectionInfo>,
         addr_label: String,
@@ -659,7 +667,8 @@ where
             svc: inbound_service,
             client_rx: client_rx.into(),
             error_slot,
-            peer_tx: peer_tx.into(),
+            peer_tx: PeerTx::new(peer_tx, inv_gossip_state.clone()),
+            inv_gossip_state,
             connection_tracker,
             addr_label,
             last_metrics_state: None,
@@ -754,6 +763,9 @@ where
                         }
                         Either::Left((Some(Err(e)), _)) => self.fail_with(e).await,
                         Either::Left((Some(Ok(msg)), _)) => {
+                            if matches!(&msg, Message::Inv(_)) {
+                                self.inv_gossip_state.take_inbound_inv_tag();
+                            }
                             let unhandled_msg = self.handle_message_as_request(msg).await;
 
                             if let Some(unhandled_msg) = unhandled_msg {
@@ -873,10 +885,12 @@ where
                             // &mut self. This is a sign that we don't properly
                             // factor the state required for inbound and
                             // outbound requests.
+                            let is_block_gossip = matches!(&peer_msg, Message::Inv(_))
+                                && self.inv_gossip_state.take_inbound_inv_tag();
                             let request_msg = match self.state {
                                 State::AwaitingResponse {
                                     ref mut handler, ..
-                                } => span.in_scope(|| handler.process_message(peer_msg, &mut self.cached_addrs, self.connection_info.connected_addr.get_transient_addr())),
+                                } => span.in_scope(|| handler.process_message(peer_msg, is_block_gossip, &mut self.cached_addrs, self.connection_info.connected_addr.get_transient_addr())),
                                 _ => unreachable!("unexpected state after AwaitingResponse: {:?}, peer_msg: {:?}, client_receiver: {:?}",
                                                   self.state,
                                                   peer_msg,
@@ -1157,7 +1171,7 @@ where
             (AwaitingRequest, AdvertiseBlock(hash, _) | AdvertiseBlockToAll(hash)) => {
                 self
                     .peer_tx
-                    .send(Message::Inv(vec![hash.into()]))
+                    .send_block_gossip(hash)
                     .await
                     .map(|()|
                          Handler::Finished(Ok(Response::Nil))

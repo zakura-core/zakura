@@ -22,7 +22,7 @@ use zakura_chain::{
     serialization::ZcashDeserializeInto,
 };
 use zakura_consensus::{
-    Config as ConsensusConfig, RouterError, VerifyBlockError, VerifyCheckpointError,
+    BlockError, Config as ConsensusConfig, RouterError, VerifyBlockError, VerifyCheckpointError,
 };
 use zakura_network::{InventoryResponse, PeerSocketAddr};
 use zakura_state::Config as StateConfig;
@@ -1608,6 +1608,54 @@ async fn above_lookahead_has_peer_attribution() {
         "AboveLookaheadHeightLimit should carry advertiser_addr for peer scoring \
          (GHSA-gvjc-3w7c-92jx fix)"
     );
+}
+
+#[tokio::test]
+async fn attributed_sync_validation_errors_keep_existing_misbehavior_scores() {
+    let (mut chain_sync, ..) = setup_chain_sync();
+    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(4);
+    chain_sync.misbehavior_sender = misbehavior_tx;
+    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let hash = block::Hash::from([0xCD; 32]);
+
+    let consensus_errors = [
+        VerifyBlockError::Block {
+            source: BlockError::NoTransactions,
+        },
+        VerifyBlockError::Block {
+            source: BlockError::MissingHeight(hash),
+        },
+    ];
+
+    let errors = [
+        BlockDownloadVerifyError::AboveLookaheadHeightLimit {
+            height: block::Height(60_000),
+            hash,
+            advertiser_addr: Some(addr),
+        },
+        BlockDownloadVerifyError::InvalidHeight {
+            hash,
+            advertiser_addr: Some(addr),
+        },
+    ];
+
+    for error in errors {
+        let _ = chain_sync.handle_block_response(Err(error));
+        assert_eq!(misbehavior_rx.recv().await, Some((addr, 100)));
+    }
+
+    for error in consensus_errors {
+        let error = BlockDownloadVerifyError::Invalid {
+            error: RouterError::Block {
+                source: Box::new(error),
+            },
+            height: block::Height(1),
+            hash,
+            advertiser_addr: Some(addr),
+        };
+        let _ = chain_sync.handle_block_response(Err(error));
+        assert_eq!(misbehavior_rx.recv().await, Some((addr, 100)));
+    }
 }
 
 /// Verifies fix for GHSA-gvjc-3w7c-92jx: both height-limit errors now

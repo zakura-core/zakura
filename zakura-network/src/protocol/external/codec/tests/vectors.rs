@@ -5,6 +5,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use chrono::DateTime;
 use futures::prelude::*;
 use lazy_static::lazy_static;
+use tokio_util::codec::{FramedRead, FramedWrite};
+
+use crate::protocol::external::InventoryHash;
 
 use super::*;
 
@@ -65,6 +68,143 @@ fn version_message_round_trip() {
     });
 
     assert_eq!(*v, v_parsed);
+}
+
+#[test]
+fn block_gossip_inventory_round_trips_with_tag() {
+    let (rt, _init_guard) = zakura_test::init_async();
+    let hash = block::Hash([0x42; 32]);
+    let message = Message::Inv(vec![InventoryHash::Block(hash)]);
+
+    for is_block_gossip in [false, true] {
+        let (parsed, parsed_as_gossip) = rt.block_on(async {
+            let mut bytes: Vec<u8> = Vec::new();
+            let encoder = Codec::builder().finish();
+            if is_block_gossip {
+                encoder.inv_gossip_state().tag_next_outbound_inv();
+            }
+            FramedWrite::new(&mut bytes, encoder)
+                .send(message.clone())
+                .await
+                .expect("inventory message must serialize");
+
+            let decoder = Codec::builder().finish();
+            let decoder_state = decoder.inv_gossip_state();
+            let parsed = FramedRead::new(Cursor::new(bytes), decoder)
+                .next()
+                .await
+                .expect("inventory message must be available")
+                .expect("inventory message must deserialize");
+            (parsed, decoder_state.take_inbound_inv_tag())
+        });
+
+        assert_eq!(parsed, message);
+        assert_eq!(parsed_as_gossip, is_block_gossip);
+    }
+}
+
+#[test]
+fn malformed_or_unknown_block_gossip_extensions_are_untagged() {
+    let hash = block::Hash([0x43; 32]);
+    let expected = Message::Inv(vec![InventoryHash::Block(hash)]);
+
+    for extension in [
+        b"ZINV\x02\x01\x00\x00".as_slice(),
+        b"ZINV\x01\x02\x00\x00".as_slice(),
+        b"ZINV\x01\x01\x01\x00".as_slice(),
+        b"ZINV\x01\x01\x00".as_slice(),
+        b"unknown".as_slice(),
+    ] {
+        let mut body = Vec::new();
+        vec![InventoryHash::Block(hash)]
+            .zcash_serialize(&mut body)
+            .expect("inventory must serialize");
+        body.extend_from_slice(extension);
+
+        let codec = Codec::builder().finish();
+        let codec_state = codec.inv_gossip_state();
+        assert_eq!(
+            codec
+                .read_inv(Cursor::new(body))
+                .expect("unknown trailing extensions are ignored"),
+            expected,
+        );
+        assert!(!codec_state.take_inbound_inv_tag());
+    }
+}
+
+#[tokio::test]
+async fn legacy_codec_ignores_block_gossip_tag_and_connection_stays_usable() {
+    use tokio::io::duplex;
+    use tokio_util::codec::Framed;
+
+    let _init_guard = zakura_test::init();
+    let (upgraded_transport, legacy_transport) = duplex(16 * 1024);
+    let upgraded_codec = Codec::builder().finish();
+    let upgraded_state = upgraded_codec.inv_gossip_state();
+    let mut upgraded = Framed::new(upgraded_transport, upgraded_codec);
+    let legacy_codec = Codec::builder().finish();
+    legacy_codec.disable_block_gossip_extensions();
+    let mut legacy = Framed::new(legacy_transport, legacy_codec);
+    let hash = block::Hash([0x44; 32]);
+
+    upgraded_state.tag_next_outbound_inv();
+    upgraded
+        .send(Message::Inv(vec![InventoryHash::Block(hash)]))
+        .await
+        .expect("upgraded endpoint must send tagged gossip");
+    assert_eq!(
+        legacy
+            .next()
+            .await
+            .expect("legacy endpoint must remain connected")
+            .expect("legacy endpoint must decode tagged gossip"),
+        Message::Inv(vec![InventoryHash::Block(hash)]),
+    );
+
+    upgraded
+        .send(Message::Ping(Nonce(1)))
+        .await
+        .expect("upgraded endpoint must remain usable");
+    assert_eq!(
+        legacy
+            .next()
+            .await
+            .expect("legacy endpoint must remain connected")
+            .expect("legacy endpoint must decode ping"),
+        Message::Ping(Nonce(1)),
+    );
+    legacy
+        .send(Message::Pong(Nonce(1)))
+        .await
+        .expect("legacy endpoint must remain usable");
+    assert_eq!(
+        upgraded
+            .next()
+            .await
+            .expect("upgraded endpoint must remain connected")
+            .expect("upgraded endpoint must decode pong"),
+        Message::Pong(Nonce(1)),
+    );
+
+    legacy
+        .send(Message::Inv(vec![InventoryHash::Block(hash)]))
+        .await
+        .expect("legacy endpoint must send untagged inventory");
+    let legacy_inventory = upgraded
+        .next()
+        .await
+        .expect("upgraded endpoint must remain connected")
+        .expect("upgraded endpoint must decode legacy inventory");
+    assert_eq!(
+        legacy_inventory,
+        Message::Inv(vec![InventoryHash::Block(hash)])
+    );
+    let Message::Inv(items) = legacy_inventory else {
+        unreachable!("checked as inventory")
+    };
+    assert_eq!(items, vec![InventoryHash::Block(hash)]);
+    assert!(!upgraded_state.take_inbound_inv_tag());
 }
 
 /// Check that version deserialization rejects out-of-range timestamps with

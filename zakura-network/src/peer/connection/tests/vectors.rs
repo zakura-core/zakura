@@ -24,11 +24,11 @@ use zakura_test::mock_service::{MockService, PanicAssertion};
 use crate::{
     constants::{MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY, REQUEST_TIMEOUT},
     peer::{
-        connection::{overload_drop_connection_probability, Connection, State},
+        connection::{overload_drop_connection_probability, Connection, Handler, State},
         ClientRequest, ErrorSlot,
     },
     peer_set::ActiveConnectionCounter,
-    protocol::external::Message,
+    protocol::external::{InventoryHash, Message},
     types::Nonce,
     PeerError, PeerSource, Request, Response,
 };
@@ -1138,6 +1138,171 @@ async fn connection_ping_pong_round_trip() {
 
     drop(peer_tx);
     let _ = connection.await;
+}
+
+#[tokio::test]
+async fn tagged_block_gossip_bypasses_pending_find_blocks() {
+    let _init_guard = zakura_test::init();
+    let (mut peer_tx, peer_rx) = mpsc::channel(2);
+    let (connection, mut client_tx, mut inbound_service, mut peer_outbound_messages, error_slot) =
+        new_protected_test_connection();
+    let inv_gossip_state = connection.inv_gossip_state.clone();
+    let connection = tokio::spawn(connection.run(peer_rx));
+    let locator = block::Hash([0x51; 32]);
+    let gossip_hash = block::Hash([0x52; 32]);
+    let response_hashes = [block::Hash([0x53; 32]), block::Hash([0x54; 32])];
+
+    let (response_tx, mut response_rx) = oneshot::channel();
+    client_tx
+        .send(ClientRequest {
+            request: Request::FindBlocks {
+                known_blocks: vec![locator],
+                stop: None,
+            },
+            tx: response_tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::none(),
+        })
+        .await
+        .expect("FindBlocks request must reach the connection");
+    assert_eq!(
+        peer_outbound_messages.next().await,
+        Some(Message::GetBlocks {
+            known_blocks: vec![locator],
+            stop: None,
+        }),
+    );
+
+    inv_gossip_state.push_inbound_inv_tag(true);
+    peer_tx
+        .send(Ok(Message::Inv(vec![InventoryHash::Block(gossip_hash)])))
+        .await
+        .expect("tagged gossip must reach the connection");
+    inbound_service
+        .expect_request(Request::AdvertiseBlock(
+            gossip_hash,
+            Some(PeerSource::LegacySocket(
+                "127.0.0.1:4"
+                    .parse()
+                    .expect("test peer socket address is valid"),
+            )),
+        ))
+        .await
+        .respond(Response::Nil);
+
+    assert!(
+        matches!(response_rx.try_recv(), Ok(None)),
+        "tagged gossip must not complete FindBlocks"
+    );
+    assert!(
+        error_slot.try_get_error().is_none(),
+        "tagged gossip must not disconnect the peer"
+    );
+
+    peer_tx
+        .send(Ok(Message::Inv(
+            response_hashes
+                .iter()
+                .copied()
+                .map(InventoryHash::Block)
+                .collect(),
+        )))
+        .await
+        .expect("untagged response must reach the connection");
+    assert_eq!(
+        response_rx
+            .await
+            .expect("FindBlocks response channel must remain open")
+            .expect("untagged FindBlocks response must succeed"),
+        Response::BlockHashes(response_hashes.to_vec()),
+    );
+
+    connection.abort();
+}
+
+#[tokio::test]
+async fn block_advertisement_requests_send_tagged_inventory() {
+    let _init_guard = zakura_test::init();
+    let (_peer_tx, peer_rx) = mpsc::channel(1);
+    let (connection, mut client_tx, _inbound_service, mut peer_messages, _error_slot) =
+        new_test_connection();
+    let inv_gossip_state = connection.inv_gossip_state.clone();
+    let connection = tokio::spawn(connection.run(peer_rx));
+
+    for request in [
+        Request::AdvertiseBlock(block::Hash([0x61; 32]), None),
+        Request::AdvertiseBlockToAll(block::Hash([0x62; 32])),
+    ] {
+        let expected_hash = match request {
+            Request::AdvertiseBlock(hash, _) | Request::AdvertiseBlockToAll(hash) => hash,
+            _ => unreachable!("test requests are block advertisements"),
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        client_tx
+            .send(ClientRequest {
+                request,
+                tx: response_tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: Span::none(),
+            })
+            .await
+            .expect("advertisement request must reach the connection");
+
+        let Message::Inv(items) = peer_messages
+            .next()
+            .await
+            .expect("connection must send block inventory")
+        else {
+            panic!("block advertisement must send inventory");
+        };
+        assert_eq!(items, [InventoryHash::Block(expected_hash)]);
+        assert!(
+            inv_gossip_state.take_outbound_inv_tag(),
+            "block advertisements must request a trailing gossip tag"
+        );
+        assert_eq!(
+            response_rx
+                .await
+                .expect("advertisement response channel must remain open")
+                .expect("advertisement must succeed"),
+            Response::Nil,
+        );
+    }
+
+    connection.abort();
+}
+
+#[test]
+fn untagged_single_and_multi_block_inventory_complete_find_blocks() {
+    let hashes = [block::Hash([0x71; 32]), block::Hash([0x72; 32])];
+
+    for response_hashes in [&hashes[..1], &hashes[..]] {
+        let mut handler = Handler::FindBlocks;
+        let mut cached_addrs = Vec::new();
+        let unused = handler.process_message(
+            Message::Inv(
+                response_hashes
+                    .iter()
+                    .copied()
+                    .map(InventoryHash::Block)
+                    .collect(),
+            ),
+            false,
+            &mut cached_addrs,
+            None,
+        );
+
+        assert!(unused.is_none());
+        assert!(cached_addrs.is_empty());
+        match handler {
+            Handler::Finished(Ok(Response::BlockHashes(actual))) => {
+                assert_eq!(actual, response_hashes)
+            }
+            other => panic!("untagged inventory must complete FindBlocks, got {other:?}"),
+        }
+    }
 }
 
 /// Creates a new [`Connection`] instance for unit tests.

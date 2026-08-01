@@ -5,10 +5,48 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{canonical_ip, PrunedBlockNotFoundLogger, ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL};
+use super::{
+    block_misbehavior, canonical_ip, PrunedBlockNotFoundLogger,
+    ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL,
+};
 
 mod fake_peer_set;
 mod real_peer_set;
+
+#[test]
+fn router_consensus_invalid_gossip_keeps_advertiser_score() {
+    let advertiser = "192.0.2.1:8233".parse().expect("valid peer address");
+    let error = zakura_consensus::VerifyBlockError::Block {
+        source: zakura_consensus::BlockError::NoTransactions,
+    };
+    let router_error = zakura_consensus::RouterError::Block {
+        source: Box::new(error),
+    };
+
+    assert_eq!(
+        block_misbehavior(Box::new(router_error), Some(advertiser)),
+        Some((
+            advertiser,
+            zakura_network::constants::MAX_PEER_MISBEHAVIOR_SCORE,
+        )),
+    );
+}
+
+#[test]
+fn direct_consensus_invalid_gossip_keeps_advertiser_score() {
+    let advertiser = "192.0.2.1:8233".parse().expect("valid peer address");
+    let error = zakura_consensus::VerifyBlockError::Block {
+        source: zakura_consensus::BlockError::NoTransactions,
+    };
+
+    assert_eq!(
+        block_misbehavior(Box::new(error), Some(advertiser)),
+        Some((
+            advertiser,
+            zakura_network::constants::MAX_PEER_MISBEHAVIOR_SCORE,
+        )),
+    );
+}
 
 #[test]
 fn pruned_block_not_found_log_is_rate_limited() {

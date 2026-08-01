@@ -21,7 +21,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-authors = ["Zakura contributors"]
+authors = ["Zakura Contributors"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zakura-core/zakura"
 homepage = "https://github.com/zakura-core/zakura"

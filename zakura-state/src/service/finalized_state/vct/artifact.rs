@@ -110,7 +110,6 @@ fn read_exact(reader: &mut impl Read, bytes: &mut [u8]) -> Result<(), Error> {
     })
 }
 
-#[allow(clippy::type_complexity)]
 #[allow(clippy::unwrap_in_result)]
 fn decode_header(
     bytes: &[u8; HEADER_LEN],

@@ -99,7 +99,7 @@ zakurad (CLI orchestration)
 
 - Rust 2021 conventions and `rustfmt` defaults apply across the workspace (4-space indentation).
 - Naming: `snake_case` for functions/modules/files, `CamelCase` for types/traits, `SCREAMING_SNAKE_CASE` for constants.
-- Respect workspace lint policy in `.cargo/config.toml` and crate-specific lint config in `clippy.toml`.
+- Respect workspace lint policy in `.cargo/config.toml` and the crate-level lint attributes at the top of each crate's `lib.rs`.
 - Keep dependencies flowing downward across crates; maintain `zakura-chain` as sync-only.
 
 ## Code Patterns

@@ -237,7 +237,6 @@ impl VctState {
 
     /// The verified `(sapling, orchard, sprout, ironwood)` frontiers to write as the tip
     /// treestate, when `height` is the checkpoint handoff height.
-    #[allow(clippy::type_complexity)]
     pub(super) fn final_frontiers_for_last_checkpoint(
         &self,
         height: block::Height,

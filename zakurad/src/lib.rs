@@ -121,6 +121,9 @@
 // Tracing causes false positives on this lint:
 // https://github.com/tokio-rs/tracing/issues/553
 #![allow(clippy::cognitive_complexity)]
+// Long Tower service and future types are routine in this crate, and factoring
+// them into type aliases would not make the code clearer.
+#![allow(clippy::type_complexity)]
 
 #[macro_use]
 extern crate tracing;

@@ -8,6 +8,9 @@
 #![doc(html_root_url = "https://docs.rs/zakura_chain")]
 // Required by bitvec! macro
 #![recursion_limit = "256"]
+// Long tuple and result types are routine in this crate, and factoring them
+// into type aliases would not make the code clearer.
+#![allow(clippy::type_complexity)]
 
 #[macro_use]
 extern crate bitflags;

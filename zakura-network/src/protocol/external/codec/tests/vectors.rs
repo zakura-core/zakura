@@ -803,3 +803,111 @@ fn message_with_wrong_network_magic_returns_error() {
         .decode(&mut bytes)
         .expect_err("decoding message with mismatching network magic should return an error");
 }
+
+/// Check that `escape_command` escapes control characters and NUL padding.
+#[test]
+fn escape_command_escapes_control_characters() {
+    // An ANSI clear-screen escape sequence and a newline, followed by
+    // printable ASCII.
+    assert_eq!(escape_command(b"\x1b[2J\nFORGED!"), r"\x1b[2J\nFORGED!");
+
+    // NUL padding in a well-formed command is escaped, not dropped.
+    assert_eq!(
+        escape_command(b"version\0\0\0\0\0"),
+        r"version\x00\x00\x00\x00\x00",
+    );
+}
+
+/// Check that an unknown command containing control characters is escaped in
+/// the "unknown message command" debug event, so a peer can't forge log lines
+/// or inject terminal escape sequences into log output.
+#[test]
+fn unknown_command_is_escaped_in_debug_log() {
+    use std::sync::{Arc, Mutex};
+
+    let _init_guard = zakura_test::init();
+
+    /// A log writer that appends formatted log bytes to a shared buffer.
+    #[derive(Clone)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("no code panics while holding the log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // A mainnet message with an empty body, and an unknown command containing
+    // an ANSI clear-screen escape sequence and a newline.
+    let mut bytes = BytesMut::new();
+    bytes.extend_from_slice(&Network::Mainnet.magic().0);
+    bytes.extend_from_slice(b"\x1b[2J\nFORGED!");
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&sha256d::Checksum::from(&[][..]).0);
+
+    let log_buffer = LogBuffer(Arc::new(Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer({
+            let log_buffer = log_buffer.clone();
+            move || log_buffer.clone()
+        })
+        .finish();
+
+    let decode_result = {
+        // A test-scoped subscriber is safe here because `decode` is
+        // synchronous: its events can't be routed through another thread's
+        // subscriber, and no spans are recorded.
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        Codec::builder().finish().decode(&mut bytes)
+    };
+
+    assert!(
+        decode_result
+            .expect("unknown commands are ignored, not errors")
+            .is_none(),
+        "unknown commands should not decode to a message",
+    );
+
+    // When `debug!` events are statically disabled (for example, by zakurad's
+    // `release_max_level_info` feature in the same build), there is no log
+    // output to check.
+    if tracing::level_filters::STATIC_MAX_LEVEL < tracing::Level::DEBUG {
+        return;
+    }
+
+    let log_output = String::from_utf8(
+        log_buffer
+            .0
+            .lock()
+            .expect("no code panics while holding the log buffer lock")
+            .clone(),
+    )
+    .expect("the fmt subscriber writes valid UTF-8");
+
+    assert!(
+        log_output.contains("unknown message command from peer"),
+        "expected an unknown command debug event, got: {log_output:?}",
+    );
+    assert!(
+        log_output.contains(r"\x1b[2J\nFORGED!"),
+        "expected the escaped command string, got: {log_output:?}",
+    );
+    assert!(
+        !log_output.contains('\x1b'),
+        "raw ANSI escape bytes must not reach the log output: {log_output:?}",
+    );
+    assert!(
+        !log_output.contains("\nFORGED"),
+        "raw newlines from the command must not reach the log output: {log_output:?}",
+    );
+}

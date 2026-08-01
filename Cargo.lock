@@ -8823,6 +8823,7 @@ dependencies = [
  "tracing",
  "tracing-error",
  "tracing-futures",
+ "tracing-subscriber",
  "zakura-chain",
  "zakura-jsonl-trace",
  "zakura-test",

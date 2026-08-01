@@ -53,6 +53,22 @@ const MAX_HANDSHAKE_BODY_LEN: usize = 1024;
 /// The parse error returned when a legacy message body parser panics.
 const PANICKED_MESSAGE_BODY_PARSE_ERROR: &str = "panic while parsing peer message body";
 
+/// Returns the message header `command` bytes escaped as printable ASCII.
+///
+/// # Security
+///
+/// The command field is attacker-controlled, so it must be escaped before
+/// logging. Otherwise, a peer can inject newlines, ANSI escape sequences, or
+/// other control characters into log output.
+fn escape_command(command: &[u8; 12]) -> String {
+    command
+        .iter()
+        .copied()
+        .flat_map(std::ascii::escape_default)
+        .map(char::from)
+        .collect()
+}
+
 #[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum BodyDecodePanic {
@@ -421,12 +437,7 @@ impl Decoder for Codec {
                 trace!(
                     ?self.state,
                     ?magic,
-                    command = %String::from_utf8(
-                        command.iter()
-                            .cloned()
-                            .flat_map(std::ascii::escape_default)
-                            .collect()
-                    ).unwrap(),
+                    command = %escape_command(&command),
                     body_len,
                     ?checksum,
                     "read header from src buffer"
@@ -520,7 +531,12 @@ impl Decoder for Codec {
                         b"filteradd\0\0\0" => self.read_filteradd(&mut body_reader, body_len),
                         b"filterclear\0" => self.read_filterclear(&mut body_reader),
                         _ => {
-                            let command_string = String::from_utf8_lossy(&command);
+                            // # Security
+                            //
+                            // The command bytes are attacker-controlled, so they are
+                            // escaped before logging to stop peers injecting control
+                            // characters into log output.
+                            let command_string = escape_command(&command);
 
                             // # Security
                             //
@@ -556,8 +572,11 @@ impl Decoder for Codec {
                 match decode_result {
                     Ok(result) => result,
                     Err(_panic_payload) => {
-                        let command = String::from_utf8_lossy(&command)
-                            .trim_end_matches('\0')
+                        // Escaped for consistency with the other command logs:
+                        // reaching a body parser requires an exact known-command
+                        // match, so this is defense in depth, not a live risk.
+                        let command = escape_command(&command)
+                            .trim_end_matches(r"\x00")
                             .to_owned();
                         metrics::counter!(
                             "peer.message.parse.panics",

@@ -84,10 +84,19 @@ const CRAWLER_REPLENISHMENT_OUTBOUND_LIMIT_FOR_TESTS: usize =
         / constants::OUTBOUND_PEER_LIMIT_DIVISOR;
 
 /// The outbound connection target used by replenishment race tests.
-const CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS: usize =
-    CRAWLER_REPLENISHMENT_OUTBOUND_LIMIT_FOR_TESTS
+const CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS: usize = {
+    let target = CRAWLER_REPLENISHMENT_TARGET_SIZE_FOR_TESTS
         .saturating_mul(OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR)
         .div_ceil(OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR);
+
+    // `Ord::min` is not const, and the bound matters: the target must never
+    // exceed the outbound connection limit these tests configure.
+    if target < CRAWLER_REPLENISHMENT_OUTBOUND_LIMIT_FOR_TESTS {
+        target
+    } else {
+        CRAWLER_REPLENISHMENT_OUTBOUND_LIMIT_FOR_TESTS
+    }
+};
 
 /// The maximum time to wait for the listener tests to make expected progress.
 const LISTENER_TEST_DURATION: Duration = Duration::from_secs(10);
@@ -525,32 +534,82 @@ fn add_cacheable_peer(address_book: &Arc<std::sync::Mutex<AddressBook>>) -> Peer
 }
 
 #[test]
-fn crawler_replenishes_outbound_peers_below_twenty_seven_percent_limit() {
+fn crawler_replenishes_outbound_peers_below_eighty_percent_of_target_size() {
+    // (active connections, peer set target size, outbound connection limit, demand)
     let cases = [
-        (0, 0, 0),
-        (0, 1, 1),
-        (1, 1, 0),
-        (0, 2, 1),
-        (1, 2, 0),
-        (0, 3, 1),
-        (1, 3, 0),
-        (0, 4, 2),
-        (1, 4, 1),
-        (2, 4, 0),
-        (0, 10, 3),
-        (2, 10, 1),
-        (3, 10, 0),
-        (0, 300, 81),
-        (80, 300, 1),
-        (81, 300, 0),
-        (100, 300, 0),
+        (0, 0, 0, 0),
+        (0, 1, 100, 1),
+        (1, 1, 100, 0),
+        (0, 2, 100, 2),
+        (2, 2, 100, 0),
+        (0, 3, 100, 3),
+        (3, 3, 100, 0),
+        (0, 4, 100, 4),
+        (1, 4, 100, 3),
+        (4, 4, 100, 0),
+        (0, 10, 100, 8),
+        (2, 10, 100, 6),
+        (8, 10, 100, 0),
+        (0, 100, 150, 80),
+        (34, 100, 150, 46),
+        (79, 100, 150, 1),
+        (80, 100, 150, 0),
+        (100, 100, 150, 0),
     ];
 
-    for (active, limit, expected) in cases {
+    for (active, target_size, limit, expected) in cases {
         assert_eq!(
-            outbound_peer_replenishment_demand(active, limit),
+            outbound_peer_replenishment_demand(active, target_size, limit),
             expected,
-            "unexpected replenishment decision for {active} active peers and limit {limit}",
+            "unexpected replenishment decision for {active} active peers, \
+             target size {target_size}, and limit {limit}",
+        );
+    }
+}
+
+/// The replenishment target must depend on the configured peer set size alone.
+///
+/// Keying it to the outbound connection limit made halving that limit move the
+/// steady-state outbound target from 81 to 41, cutting the per-crawl dial budget
+/// roughly sevenfold on a node holding 34 outbound peers.
+#[test]
+fn crawler_replenishment_ignores_outbound_connection_limit_changes() {
+    const PEERSET_TARGET_SIZE: usize = 100;
+    const HALVED_OUTBOUND_LIMIT: usize = PEERSET_TARGET_SIZE * 3 / 2;
+    const ORIGINAL_OUTBOUND_LIMIT: usize = PEERSET_TARGET_SIZE * 3;
+
+    for active in [0, 1, 34, 40, 41, 79, 80, 100] {
+        assert_eq!(
+            outbound_peer_replenishment_demand(
+                active,
+                PEERSET_TARGET_SIZE,
+                ORIGINAL_OUTBOUND_LIMIT,
+            ),
+            outbound_peer_replenishment_demand(active, PEERSET_TARGET_SIZE, HALVED_OUTBOUND_LIMIT),
+            "changing only the outbound connection limit moved the replenishment \
+             demand for {active} active peers",
+        );
+    }
+}
+
+/// An operator who lowers the outbound connection limit below the replenishment
+/// target must not get a crawler that dials forever against the ceiling.
+#[test]
+fn crawler_replenishment_is_bounded_by_the_outbound_connection_limit() {
+    let cases = [
+        (0, 100, 50, 50),
+        (25, 100, 50, 25),
+        (50, 100, 50, 0),
+        (0, 100, 0, 0),
+        (0, usize::MAX, 10, 10),
+    ];
+
+    for (active, target_size, limit, expected) in cases {
+        assert_eq!(
+            outbound_peer_replenishment_demand(active, target_size, limit),
+            expected,
+            "replenishment demand exceeded the outbound connection limit for \
+             {active} active peers, target size {target_size}, and limit {limit}",
         );
     }
 }

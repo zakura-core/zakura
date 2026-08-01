@@ -1010,27 +1010,37 @@ enum CrawlerAction {
     TimerCrawlFinished,
 }
 
-const OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR: usize = 27;
+const OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR: usize = 80;
 const OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR: usize = 100;
 
-/// Returns the number of outbound peers needed to reach 27% of the configured
-/// connection limit.
+/// Returns the number of outbound peers needed to reach 80% of the configured
+/// peer set target size, bounded by the outbound connection limit.
+///
+/// The target is keyed to `peerset_initial_target_size`, the operator's stated
+/// desired peer set size. Keying it to the outbound connection limit instead
+/// makes every change to that safety ceiling silently move the steady-state
+/// outbound peer count.
+///
+/// The connection limit still bounds the result, so lowering it below the
+/// target does not leave the crawler dialing forever against the ceiling.
 ///
 /// The target calculation avoids overflow by applying the ratio separately to
 /// the quotient and remainder. [`usize::div_ceil`] rounds partial peers upward,
 /// and [`usize::saturating_sub`] returns zero at or above the target.
 fn outbound_peer_replenishment_demand(
     active_outbound_connections: usize,
+    peerset_target_size: usize,
     outbound_connection_limit: usize,
 ) -> usize {
-    let target_outbound_connections = (outbound_connection_limit
+    let target_outbound_connections = (peerset_target_size
         / OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR)
         .saturating_mul(OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR)
         .saturating_add(
-            (outbound_connection_limit % OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR)
+            (peerset_target_size % OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR)
                 .saturating_mul(OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR)
                 .div_ceil(OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR),
-        );
+        )
+        .min(outbound_connection_limit);
 
     target_outbound_connections.saturating_sub(active_outbound_connections)
 }
@@ -1041,8 +1051,8 @@ fn outbound_peer_replenishment_demand(
 ///
 /// Crawl for new peers every `config.crawl_new_peer_interval`.
 /// Also crawl whenever there is demand, but no new peers in `candidates`.
-/// After a periodic crawl, refresh the connection demand needed to reach 27%
-/// of the configured outbound connection limit.
+/// After a periodic crawl, refresh the connection demand needed to reach 80%
+/// of the configured peer set target size.
 ///
 /// If a handshake fails, restore the unused demand signal by sending it to
 /// `demand_tx`. When that restore succeeds and the attempt consumed timer
@@ -1323,15 +1333,18 @@ where
             }
             Ok(TimerCrawlFinished) => {
                 let active_outbound_connections = active_outbound_connections.update_count();
+                let peerset_target_size = config.peerset_initial_target_size;
                 let outbound_connection_limit = config.peerset_outbound_connection_limit();
                 let replenishment_demand = outbound_peer_replenishment_demand(
                     active_outbound_connections,
+                    peerset_target_size,
                     outbound_connection_limit,
                 );
                 remaining_replenishment_demand.store(replenishment_demand, Ordering::Relaxed);
 
                 debug!(
                     active_outbound_connections,
+                    peerset_target_size,
                     outbound_connection_limit,
                     remaining_replenishment_demand = replenishment_demand,
                     "timer-based crawl finished"

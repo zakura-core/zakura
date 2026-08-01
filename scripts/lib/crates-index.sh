@@ -37,8 +37,8 @@ crates_index_fetch() {
   fi
   local cache="${_crates_index_cache_dir}/${name}"
   if [ ! -e "$cache" ]; then
-    local url="${CRATES_INDEX_URL}/$(crates_index_path "$name")"
-    local code
+    local url code
+    url="${CRATES_INDEX_URL}/$(crates_index_path "$name")"
     code="$(curl -sS --retry 4 --retry-connrefused -o "${cache}.tmp" \
       -w '%{http_code}' "$url")" || {
       echo "crates_index_fetch: could not reach ${url}" >&2

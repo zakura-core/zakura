@@ -173,7 +173,7 @@ jobs:
         if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned
         # droplets, where a shell bug costs a full provisioning cycle to find.
-        run: shellcheck scripts/*.sh .github/workflows/scripts/*.sh
+        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh
       # Stdlib-only, so there is nothing to install.
       - name: Mempool load harness tests
         if: ${{ !cancelled() }}

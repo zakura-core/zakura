@@ -38,7 +38,8 @@ done
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
-# shellcheck source=scripts/lib/crates-index.sh
+# The library is linted as a standalone shellcheck input in lint.yml.
+# shellcheck source=scripts/lib/crates-index.sh disable=SC1091
 . "${repo_root}/scripts/lib/crates-index.sh"
 
 allow_unpublishable="${ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH:-0}"

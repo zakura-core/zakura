@@ -40,9 +40,10 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
-# shellcheck source=scripts/lib/semver-req.sh
+# The libraries are linted as standalone shellcheck inputs in lint.yml.
+# shellcheck source=scripts/lib/semver-req.sh disable=SC1091
 . "${repo_root}/scripts/lib/semver-req.sh"
-# shellcheck source=scripts/lib/crates-index.sh
+# shellcheck source=scripts/lib/crates-index.sh disable=SC1091
 . "${repo_root}/scripts/lib/crates-index.sh"
 
 release_tag=""

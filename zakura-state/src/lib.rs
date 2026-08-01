@@ -66,7 +66,7 @@ pub use service::{
     chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip, TipAction},
     check,
     finalized_state::FinalizedState,
-    init, init_read_only,
+    init, init_read_only, init_with_database_writer_metadata,
     non_finalized_state::NonFinalizedState,
     spawn_init_read_only, validate_vct_sprout_history,
     watch_receiver::WatchReceiver,
@@ -97,8 +97,8 @@ pub use service::finalized_state::{
 };
 pub use service::{
     finalized_state::{
-        DiskWriteBatch, FromDisk, HighestCompletedCheckpoint, HighestCompletedCheckpointError,
-        IntoDisk, WriteDisk, ZakuraDb,
+        DatabaseWriterMetadata, DiskWriteBatch, FromDisk, HighestCompletedCheckpoint,
+        HighestCompletedCheckpointError, IntoDisk, WriteDisk, ZakuraDb,
     },
     ReadStateService, VctRootRepairState, VctRootRepairStatus,
 };

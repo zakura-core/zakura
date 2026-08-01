@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [1.0.6-rc0] - 2026-08-01
+
+### Added
+
+- Added the `pruneheight` field to `getblockchaininfo`, reporting the lowest
+  height at and above which every block body is retained. As in `zcashd`, it is
+  only present when `pruned` is true. Zakura prunes raw transaction data rather
+  than whole blocks, so blocks below this height keep their headers, transaction
+  IDs, and consensus state, and the genesis block is never pruned
+  ([#470](https://github.com/zakura-core/zakura/pull/470)).
+- Added the `getdeprecationinfo` RPC, which reports Zakura's Mainnet
+  end-of-support height and an estimated halt time with a 24-hour safety
+  margin. When the chain tip is unavailable, the estimate starts from the
+  latest network checkpoint
+  ([#494](https://github.com/zakura-core/zakura/pull/494)).
+
+### Changed
+
+- Changed the read-request metric label `is_pruned` to `pruning_info`, because
+  the request now reports the prune height alongside the pruned flag. Dashboards
+  and alerts keyed on the old label need updating
+  ([#470](https://github.com/zakura-core/zakura/pull/470)).
+- Changed the public `GetBlockchainInfoResponse::new()` in `zakura-rpc` to take
+  a `prune_height` argument, so that downstream callers can set the new field.
+  This breaks existing callers of that constructor
+  ([#470](https://github.com/zakura-core/zakura/pull/470)).
+- Increased the default inbound connection limit from 100 to 300 connections,
+  and reduced the default outbound connection limit from 300 to 150
+  connections, so peers that cannot accept inbound connections can still reach
+  `zakurad` nodes
+  ([#478](https://github.com/zakura-core/zakura/pull/478)).
+- Increased the peer address disk cache from 75 to 300 addresses, so restarted
+  nodes have more dialable peer candidates
+  ([#478](https://github.com/zakura-core/zakura/pull/478)).
+- Updated `rocksdb` to 0.24 (RocksDB 10.4.2), porting
+  [ZcashFoundation/zebra#10922](https://github.com/ZcashFoundation/zebra/pull/10922).
+  Zakura now builds with GCC 15/16 without the `CXXFLAGS="-include cstdint"`
+  workaround. The bundled `librocksdb-sys` now always runs `bindgen` to
+  generate its FFI bindings, so **`libclang` is required at build time** (in
+  addition to `protoc` and a C++ compiler) even when linking a system RocksDB
+  via `ROCKSDB_LIB_DIR`. Install `libclang-dev` (Debian/Ubuntu), `clang`
+  (Arch), or the equivalent for your platform
+  ([#480](https://github.com/zakura-core/zakura/pull/480)).
+- `zakurad-log-filter` no longer requires GNU sed, and no longer reads the
+  `GNU_SED` environment variable. Backslashes in log lines are now printed
+  as-is ([#481](https://github.com/zakura-core/zakura/pull/481)).
+- The first peer disk-cache write is now retried every 20 seconds until it
+  succeeds, instead of waiting the full 5-minute update interval, so a
+  cold-started node caches its peers soon after finding them
+  ([#484](https://github.com/zakura-core/zakura/pull/484)).
+- Raised `zakura-rpc` to 6.0.0 for its breaking public API changes, including
+  the new required `Rpc::get_deprecation_info` trait method and the
+  `GetBlockchainInfoResponse::new` signature change from #470
+  ([#494](https://github.com/zakura-core/zakura/pull/494)).
+- Documented the public `zakura-state` pruning API changes from #470:
+  `ReadRequest::IsPruned` and `ReadResponse::IsPruned(bool)` were replaced by
+  `ReadRequest::PruningInfo` and a structured `ReadResponse::PruningInfo`.
+  Downstream callers must update their request and response matching
+  ([#494](https://github.com/zakura-core/zakura/pull/494)).
+
+### Fixed
+
+- Fixed `getblockchaininfo` reporting `pruned: false` on a node configured with
+  `storage_mode.pruned` until it first deleted block data, which took at least
+  10,000 blocks on Mainnet and Testnet and longer when pruning was enabled on an
+  existing archive database. As in `zcashd`, the field now reports whether blocks
+  are subject to pruning, not whether any block has been deleted yet. Databases
+  that had already pruned were unaffected
+  ([#470](https://github.com/zakura-core/zakura/pull/470)).
+- Fixed a queued-block index leak where dequeuing one fork sibling un-indexed
+  another block at the same height, preventing it from being pruned and leaking
+  entries in the block queue and its known-UTXO cache
+  ([#483](https://github.com/zakura-core/zakura/pull/483)).
+
+### Security
+
+- Ban peers that directly serve blocks with contextual consensus violations,
+  without blaming peers for invalid ancestors
+  ([#330](https://github.com/zakura-core/zakura/pull/330)).
+- `zakurad-log-filter` no longer runs log text as a shell command. Previously a
+  log line containing a single quote could execute arbitrary commands as the
+  user running the filter
+  ([#481](https://github.com/zakura-core/zakura/pull/481)).
+
 ## [1.0.5] - 2026-07-27
 
 ### Changed

@@ -46,6 +46,8 @@
 #                      release state may trail the latest verified bundle
 #   --expected-tag-delay-days DAYS  expected preparation-to-tag delay, 0–30
 #                      (must match the Prepare release PR input; default 0)
+#   --allow-unpublishable-crate-graph  pass the GitHub-only emergency workflow
+#                      input through (crates must not be published)
 #   --repo OWNER/NAME  default zakura-core/zakura (or $REPOSITORY); any other
 #                      value needs --allow-nondefault-repo (staging drills)
 #   --allow-nondefault-repo  explicit staging-repo override
@@ -71,6 +73,7 @@ SOURCE_FIRST=0
 ALLOW_BOOTSTRAP=0
 RELEASE_STATE_WAIVER=""
 EXPECTED_TAG_DELAY_DAYS=0
+ALLOW_UNPUBLISHABLE_GRAPH=0
 ALLOW_NONDEFAULT_REPO=0
 RUN_ID_ARG=""
 DRY_RUN=0
@@ -81,7 +84,7 @@ ALLOW_SQUASH=0
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 
-usage() { sed -n '2,59p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,61p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # --- output helpers ---------------------------------------------------------
 
@@ -589,6 +592,7 @@ step_dispatch() {
   [ "$ALLOW_BOOTSTRAP" = 1 ] && dispatch_args+=(-f allow_bootstrap_release_state=true)
   [ -z "$RELEASE_STATE_WAIVER" ] \
     || dispatch_args+=(-f "release_state_waiver=${RELEASE_STATE_WAIVER}")
+  [ "$ALLOW_UNPUBLISHABLE_GRAPH" = 1 ] && dispatch_args+=(-f allow_unpublishable_crate_graph=true)
   act "dispatching Create release for ${TAG} from ${dispatch_ref}" "${dispatch_args[@]}"
   [ "$DRY_RUN" = 1 ] && return 0
 
@@ -925,6 +929,7 @@ main() {
       --allow-bootstrap-release-state) ALLOW_BOOTSTRAP=1; shift ;;
       --release-state-waiver) RELEASE_STATE_WAIVER="$2"; shift 2 ;;
       --expected-tag-delay-days) EXPECTED_TAG_DELAY_DAYS="$2"; shift 2 ;;
+      --allow-unpublishable-crate-graph) ALLOW_UNPUBLISHABLE_GRAPH=1; shift ;;
       --repo) REPO="$2"; shift 2 ;;
       --allow-nondefault-repo) ALLOW_NONDEFAULT_REPO=1; shift ;;
       --run-id) RUN_ID_ARG="$2"; shift 2 ;;

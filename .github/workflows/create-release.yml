@@ -20,6 +20,11 @@ on:
         required: false
         default: false
         type: boolean
+      allow_unpublishable_crate_graph:
+        description: "Emergency override for a GitHub-only release: proceed although the crates.io publish graph does not resolve — crates must not be published for this release (note it in the release PR)"
+        required: false
+        default: false
+        type: boolean
       source_first_release:
         description: "Emergency mode: skip the staged asset build and publish a source-only release immediately; the tag-push run of release-binaries.yml builds and attaches binaries afterwards (see docs/security-hotfix-release.md, Mode B)"
         required: false
@@ -70,6 +75,9 @@ jobs:
           TARGET_SHA: ${{ github.sha }}
           # The documented emergency override for scripts/check-release-state.sh.
           ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE: ${{ inputs.allow_bootstrap_release_state && '1' || '0' }}
+          # The documented emergency override for
+          # scripts/check-crate-publish-graph.sh (GitHub-only releases).
+          ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH: ${{ inputs.allow_unpublishable_crate_graph && '1' || '0' }}
         run: |
           set -euo pipefail
 

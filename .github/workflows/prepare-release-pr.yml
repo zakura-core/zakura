@@ -310,6 +310,16 @@ jobs:
           if summary["no_crates"]:
               lines.append("| _(GitHub-only rc: crate bumps skipped)_ | | | | |")
 
+          cascades = [c for c in summary["crates"] if c["level"] == "cascade"]
+          if cascades:
+              lines += [
+                  "",
+                  "Cascade rows republish already-published crates whose index",
+                  "requirements cannot select a version above — without them the",
+                  "published graph stops resolving",
+                  "(`scripts/check-crate-publish-graph.sh`). Do not drop them.",
+              ]
+
           lines += [
               "",
               "Bump policy: breaking → major; any other change → minor. Patch is",

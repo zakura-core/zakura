@@ -83,8 +83,17 @@ For crates.io publishing:
 1. Identify changed publishable crates.
 2. Bump those crates before their dependents.
 3. Update every direct dependency requirement that must select the new crate.
-4. Refresh `Cargo.lock`.
-5. Confirm unchanged published versions still satisfy the resulting graph.
+4. Cascade-republish pinning crates: a crate already published at its
+   workspace version is skipped at publish time, and its **index** manifest
+   is what dependents resolve. A requirement without a pre-release tag never
+   matches a pre-release, and caret requirements never cross a major — so
+   any prerelease bump (and any new major) forces a patch bump of every
+   published crate that pins it. `prepare-release.sh` plans these as
+   `cascade` rows; never drop them from a crates.io-publishing release.
+5. Refresh `Cargo.lock`.
+6. Confirm unchanged published versions still satisfy the resulting graph:
+   `./scripts/check-crate-publish-graph.sh` verifies resolution against the
+   live index and is step 5 of `make pre-release`.
 
 Partial version graphs are allowed, but all tooling must handle them. Do not
 assume every publishable crate has the `zakura` package version.
@@ -139,8 +148,16 @@ Run:
 ```bash
 cargo metadata --no-deps --format-version 1 --locked
 make pre-release RELEASE_TAG=<tag> BASE_TAG=<previous-tag>
+./scripts/check-crate-publish-graph.sh
 ./scripts/check-crate-packaging.sh --verify
 ```
+
+`check-crate-publish-graph.sh` needs network access and is the only check
+that resolves the publish set against the live index — packaging checks
+resolve every crate locally and cannot see that a published crate would be
+skipped. For a deliberately GitHub-only release candidate the documented
+override is `ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH=1` (workflow input
+`allow_unpublishable_crate_graph`); crates must not be published under it.
 
 Also:
 

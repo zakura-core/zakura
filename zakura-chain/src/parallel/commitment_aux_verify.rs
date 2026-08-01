@@ -23,7 +23,46 @@ use crate::{
 pub struct VerifiedHeaderCommitmentRoots {
     confirmed_roots: Vec<BlockCommitmentRoots>,
     confirmed_hashes: Vec<block::Hash>,
+    /// The final supplied header, present for every non-empty verified delivery.
+    ///
+    /// It is retained as the successor witness for the confirmed roots, including for a
+    /// one-item delivery that only recovers a missing witness and confirms no new roots.
+    header_witness: Option<HeaderWitness>,
     history_tree: HistoryTree,
+}
+
+/// The final header's authenticated metadata retained for the one-block-lag handoff.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderWitness {
+    height: Height,
+    hash: block::Hash,
+    auth_data_root: AuthDataRoot,
+}
+
+impl HeaderWitness {
+    /// Constructs retained header witness metadata.
+    pub fn from_parts(height: Height, hash: block::Hash, auth_data_root: AuthDataRoot) -> Self {
+        Self {
+            height,
+            hash,
+            auth_data_root,
+        }
+    }
+
+    /// Returns the witness header's height.
+    pub fn height(&self) -> Height {
+        self.height
+    }
+
+    /// Returns the witness header's hash.
+    pub fn hash(&self) -> block::Hash {
+        self.hash
+    }
+
+    /// Returns the authorizing-data root authenticated by the witness header.
+    pub fn auth_data_root(&self) -> AuthDataRoot {
+        self.auth_data_root
+    }
 }
 
 impl VerifiedHeaderCommitmentRoots {
@@ -40,6 +79,13 @@ impl VerifiedHeaderCommitmentRoots {
     /// Returns the header hash at the confirmed tip, if any roots were confirmed.
     pub fn confirmed_hash(&self) -> Option<block::Hash> {
         self.confirmed_hashes.last().copied()
+    }
+
+    /// Returns the final header's authenticated witness metadata.
+    ///
+    /// The witness's note-commitment roots require a later successor and are not retained.
+    pub fn header_witness(&self) -> Option<HeaderWitness> {
+        self.header_witness
     }
 
     /// Returns the history tree after folding the confirmed roots.
@@ -108,9 +154,15 @@ where
             &roots.sapling_root,
         )
         .map_err(|error| (height, error))?;
+        verify_supplied_sapling_tx_below_sapling(network, height, roots.sapling_tx)
+            .map_err(|error| (height, error))?;
         verify_supplied_orchard_root_below_nu5(network, height, &roots.orchard_root)
             .map_err(|error| (height, error))?;
+        verify_supplied_orchard_tx_below_nu5(network, height, roots.orchard_tx)
+            .map_err(|error| (height, error))?;
         verify_supplied_ironwood_root_below_nu6_3(network, height, &roots.ironwood_root)
+            .map_err(|error| (height, error))?;
+        verify_supplied_ironwood_tx_below_nu6_3(network, height, roots.ironwood_tx)
             .map_err(|error| (height, error))?;
 
         // Header H + 1 authenticates roots for H, so the final item is only a boundary check.
@@ -134,13 +186,26 @@ where
         .map_err(Arc::new)
         .map_err(SuppliedRootsError::from)
         .map_err(|error| (height, error))?;
-        confirmed_roots.push((*roots).clone());
+        // Persist only header-authenticated (or pre-activation-pinned) field values under the
+        // verified banner. Body-verified-only fields are cleared to canonical empties so a peer
+        // cannot poison currently-dead or unauthenticated slots that are later re-served.
+        confirmed_roots.push(normalize_unauthenticated_commitment_fields(
+            network,
+            (*roots).clone(),
+        ));
         confirmed_hashes.push(block::Hash::from(*header));
     }
 
     Ok(VerifiedHeaderCommitmentRoots {
         confirmed_roots,
         confirmed_hashes,
+        header_witness: items.last().map(|(header, roots)| {
+            HeaderWitness::from_parts(
+                roots.height,
+                block::Hash::from(*header),
+                roots.auth_data_root,
+            )
+        }),
         history_tree: tree,
     })
 }
@@ -238,6 +303,58 @@ pub fn verify_supplied_sapling_root_below_heartwood_from_header(
     Ok(())
 }
 
+/// Verifies that a supplied Sapling transaction count is zero before Sapling.
+pub fn verify_supplied_sapling_tx_below_sapling(
+    network: &Network,
+    height: Height,
+    sapling_tx: u64,
+) -> Result<(), SuppliedRootsError> {
+    if let Some(sapling_height) = NetworkUpgrade::Sapling.activation_height(network) {
+        if height >= sapling_height {
+            return Ok(());
+        }
+    }
+
+    if sapling_tx != 0 {
+        return Err(CommitmentError::InvalidPreSaplingSaplingTxCount {
+            expected: 0,
+            actual: sapling_tx,
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Clears body-verified-only fields so authenticated rows never persist peer-controlled bytes
+/// that the header layer does not bind.
+///
+/// - `sapling_tx` below Heartwood (ZIP-221 does not exist yet; pre-Sapling is also pinned to zero)
+/// - `auth_data_root` below NU5 (headers commit the chain-history root directly)
+///
+/// Heartwood+ `sapling_tx` and NU5+ `auth_data_root` are left intact: those values were checked
+/// against the applicable header commitment / history leaf before confirmation.
+pub fn normalize_unauthenticated_commitment_fields(
+    network: &Network,
+    mut roots: BlockCommitmentRoots,
+) -> BlockCommitmentRoots {
+    let below_heartwood = NetworkUpgrade::Heartwood
+        .activation_height(network)
+        .is_none_or(|heartwood| roots.height < heartwood);
+    if below_heartwood {
+        roots.sapling_tx = 0;
+    }
+
+    let below_nu5 = NetworkUpgrade::Nu5
+        .activation_height(network)
+        .is_none_or(|nu5| roots.height < nu5);
+    if below_nu5 {
+        roots.auth_data_root = AuthDataRoot::from([0u8; 32]);
+    }
+
+    roots
+}
+
 /// Verifies a supplied Orchard root for a pre-NU5 block.
 pub fn verify_supplied_orchard_root_below_nu5(
     network: &Network,
@@ -262,6 +379,29 @@ pub fn verify_supplied_orchard_root_below_nu5(
     Ok(())
 }
 
+/// Verifies that a supplied Orchard transaction count is zero before NU5.
+pub fn verify_supplied_orchard_tx_below_nu5(
+    network: &Network,
+    height: Height,
+    orchard_tx: u64,
+) -> Result<(), SuppliedRootsError> {
+    if let Some(nu5_height) = NetworkUpgrade::Nu5.activation_height(network) {
+        if height >= nu5_height {
+            return Ok(());
+        }
+    }
+
+    if orchard_tx != 0 {
+        return Err(CommitmentError::InvalidPreNu5OrchardTxCount {
+            expected: 0,
+            actual: orchard_tx,
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
 /// Verifies a supplied Ironwood root for a pre-Ironwood (pre-`Nu6_3`) block.
 pub fn verify_supplied_ironwood_root_below_nu6_3(
     network: &Network,
@@ -279,6 +419,29 @@ pub fn verify_supplied_ironwood_root_below_nu6_3(
         return Err(CommitmentError::InvalidPreNu6_3IronwoodRoot {
             expected: <[u8; 32]>::from(expected),
             actual: <[u8; 32]>::from(*ironwood_root),
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Verifies that a supplied Ironwood transaction count is zero before Nu6_3.
+pub fn verify_supplied_ironwood_tx_below_nu6_3(
+    network: &Network,
+    height: Height,
+    ironwood_tx: u64,
+) -> Result<(), SuppliedRootsError> {
+    if let Some(nu6_3_height) = NetworkUpgrade::Nu6_3.activation_height(network) {
+        if height >= nu6_3_height {
+            return Ok(());
+        }
+    }
+
+    if ironwood_tx != 0 {
+        return Err(CommitmentError::InvalidPreNu6_3IronwoodTxCount {
+            expected: 0,
+            actual: ironwood_tx,
         }
         .into());
     }
@@ -499,6 +662,128 @@ mod tests {
     }
 
     #[test]
+    fn pins_orchard_tx_to_zero_below_nu5_and_defers_above() {
+        let nu5 = NetworkUpgrade::Nu5
+            .activation_height(&Mainnet)
+            .expect("mainnet has NU5");
+        let pre_nu5 = Height(nu5.0 - 1);
+
+        verify_supplied_orchard_tx_below_nu5(&Mainnet, pre_nu5, 0)
+            .expect("a zero Orchard transaction count is accepted below NU5");
+        let error = verify_supplied_orchard_tx_below_nu5(&Mainnet, pre_nu5, 1)
+            .expect_err("a non-zero Orchard transaction count must be rejected below NU5");
+        assert!(
+            matches!(
+                error,
+                SuppliedRootsError::InvalidHeaderCommitment(
+                    CommitmentError::InvalidPreNu5OrchardTxCount { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-NU5 Orchard count error, got: {error:?}"
+        );
+
+        verify_supplied_orchard_tx_below_nu5(&Mainnet, nu5, 1)
+            .expect("at NU5 the Orchard transaction count is authenticated by the MMR");
+    }
+
+    #[test]
+    fn pins_sapling_tx_to_zero_below_sapling_and_defers_above() {
+        let sapling = NetworkUpgrade::Sapling
+            .activation_height(&Mainnet)
+            .expect("mainnet has Sapling");
+        let pre_sapling = Height(sapling.0 - 1);
+
+        verify_supplied_sapling_tx_below_sapling(&Mainnet, pre_sapling, 0)
+            .expect("a zero Sapling transaction count is accepted below Sapling");
+        let error = verify_supplied_sapling_tx_below_sapling(&Mainnet, pre_sapling, 1)
+            .expect_err("a non-zero Sapling transaction count must be rejected below Sapling");
+        assert!(
+            matches!(
+                error,
+                SuppliedRootsError::InvalidHeaderCommitment(
+                    CommitmentError::InvalidPreSaplingSaplingTxCount { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-Sapling Sapling count error, got: {error:?}"
+        );
+
+        verify_supplied_sapling_tx_below_sapling(&Mainnet, sapling, 1)
+            .expect("at Sapling the count is body-verified until Heartwood, not pinned here");
+    }
+
+    #[test]
+    fn clears_unauthenticated_fields_when_confirming_roots() {
+        let sapling = NetworkUpgrade::Sapling
+            .activation_height(&Mainnet)
+            .expect("mainnet has Sapling")
+            .0;
+        let heartwood = NetworkUpgrade::Heartwood
+            .activation_height(&Mainnet)
+            .expect("mainnet has Heartwood")
+            .0;
+        assert!(
+            sapling + 1 < heartwood,
+            "fixture needs a Sapling height strictly below Heartwood"
+        );
+
+        let mut pre_heartwood = roots_from_block(
+            &mainnet_block_at(sapling),
+            mainnet_sapling_root_at(sapling),
+            orchard::tree::NoteCommitmentTree::default().root(),
+        );
+        pre_heartwood.height = Height(sapling);
+        pre_heartwood.sapling_tx = 7;
+        pre_heartwood.auth_data_root = AuthDataRoot::from([0xAA; 32]);
+
+        let normalized =
+            normalize_unauthenticated_commitment_fields(&Mainnet, pre_heartwood.clone());
+        assert_eq!(
+            normalized.sapling_tx, 0,
+            "pre-Heartwood sapling_tx must not be persisted under the verified banner"
+        );
+        assert_eq!(
+            normalized.auth_data_root,
+            AuthDataRoot::from([0u8; 32]),
+            "pre-NU5 auth_data_root must not be persisted under the verified banner"
+        );
+
+        let mut heartwood_roots = roots_from_block(
+            &mainnet_block_at(heartwood),
+            mainnet_sapling_root_at(heartwood),
+            orchard::tree::NoteCommitmentTree::default().root(),
+        );
+        heartwood_roots.sapling_tx = 3;
+        heartwood_roots.auth_data_root = AuthDataRoot::from([0xBB; 32]);
+        let normalized_heartwood =
+            normalize_unauthenticated_commitment_fields(&Mainnet, heartwood_roots.clone());
+        assert_eq!(
+            normalized_heartwood.sapling_tx, 3,
+            "Heartwood+ sapling_tx is authenticated by the history leaf and must be kept"
+        );
+        assert_eq!(
+            normalized_heartwood.auth_data_root,
+            AuthDataRoot::from([0u8; 32]),
+            "Heartwood is still pre-NU5, so auth_data_root is cleared"
+        );
+    }
+
+    #[test]
+    fn pins_orchard_tx_to_zero_when_nu5_is_unconfigured() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu5: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        verify_supplied_orchard_tx_below_nu5(&network, Height(1), 0)
+            .expect("a zero Orchard transaction count is accepted when NU5 is unconfigured");
+        verify_supplied_orchard_tx_below_nu5(&network, Height(1), 1)
+            .expect_err("a non-zero Orchard transaction count is rejected without NU5");
+    }
+
+    #[test]
     fn pins_ironwood_root_to_empty_below_nu6_3_and_defers_above() {
         let network = Network::new_regtest(RegtestParameters {
             activation_heights: ConfiguredActivationHeights {
@@ -530,6 +815,50 @@ mod tests {
     }
 
     #[test]
+    fn pins_ironwood_tx_to_zero_below_nu6_3_and_defers_above() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu6_3: Some(1_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        verify_supplied_ironwood_tx_below_nu6_3(&network, Height(999), 0)
+            .expect("a zero Ironwood transaction count is accepted below Nu6_3");
+        let error = verify_supplied_ironwood_tx_below_nu6_3(&network, Height(999), 1)
+            .expect_err("a non-zero Ironwood transaction count must be rejected below Nu6_3");
+        assert!(
+            matches!(
+                error,
+                SuppliedRootsError::InvalidHeaderCommitment(
+                    CommitmentError::InvalidPreNu6_3IronwoodTxCount { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-Nu6_3 Ironwood count error, got: {error:?}"
+        );
+
+        verify_supplied_ironwood_tx_below_nu6_3(&network, Height(1_000), 1)
+            .expect("at Nu6_3 the Ironwood transaction count is authenticated by the MMR");
+    }
+
+    #[test]
+    fn pins_ironwood_tx_to_zero_when_nu6_3_is_unconfigured() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu6_3: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        verify_supplied_ironwood_tx_below_nu6_3(&network, Height(1), 0)
+            .expect("a zero Ironwood transaction count is accepted when Nu6_3 is unconfigured");
+        verify_supplied_ironwood_tx_below_nu6_3(&network, Height(1), 1)
+            .expect_err("a non-zero Ironwood transaction count is rejected without Nu6_3");
+    }
+
+    #[test]
     fn verifies_real_roots_and_reports_confirmed_tip_with_one_block_lag() {
         let activation = NetworkUpgrade::Heartwood
             .activation_height(&Mainnet)
@@ -552,14 +881,25 @@ mod tests {
         let verified = verify_supplied_roots_from_parts(&Mainnet, empty_history_tree(), items)
             .expect("real roots verify against the headers");
 
+        let expected_confirmed =
+            normalize_unauthenticated_commitment_fields(&Mainnet, act_roots.clone());
         assert_eq!(
             verified.confirmed_roots(),
-            std::slice::from_ref(&act_roots),
+            std::slice::from_ref(&expected_confirmed),
             "a two-header range only confirms the first header's roots"
         );
         assert_eq!(
             verified.confirmed_hash(),
             Some(block::Hash::from(act_block.header.as_ref())),
+        );
+        assert_eq!(
+            verified.header_witness(),
+            Some(HeaderWitness {
+                height: next_roots.height,
+                hash: block::Hash::from(next_block.header.as_ref()),
+                auth_data_root: next_roots.auth_data_root,
+            }),
+            "only the final header's authenticated witness metadata is retained"
         );
         assert_eq!(
             verified.history_tree().hash(),
@@ -574,6 +914,75 @@ mod tests {
             .hash(),
             "the returned tree is folded through the confirmed root tip"
         );
+    }
+
+    #[test]
+    fn one_item_delivery_recovers_only_the_authenticated_header_witness() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu5: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let parent = mainnet_block_at(1);
+        let witness_block = mainnet_block_at(2);
+        let empty_sapling_root = sapling::tree::NoteCommitmentTree::default().root();
+        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+        let parent_tree = HistoryTree::from_block(
+            &network,
+            parent,
+            &empty_sapling_root,
+            &empty_orchard_root,
+            &empty_ironwood_root(),
+        )
+        .expect("the parent history tree builds");
+        let witness_roots =
+            roots_from_block(&witness_block, empty_sapling_root, empty_orchard_root);
+        let mut witness_header = *witness_block.header;
+        witness_header.commitment_bytes =
+            <[u8; 32]>::from(ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                &parent_tree.hash().expect("the parent tree has a root"),
+                &witness_roots.auth_data_root,
+            ))
+            .into();
+
+        let verified = verify_supplied_roots_from_parts(
+            &network,
+            parent_tree.clone(),
+            [(&witness_header, &witness_roots)],
+        )
+        .expect("the one-item witness verifies");
+
+        assert!(verified.confirmed_roots().is_empty());
+        assert!(verified.confirmed_hashes().is_empty());
+        assert_eq!(verified.history_tree(), &parent_tree);
+        assert_eq!(
+            verified.header_witness(),
+            Some(HeaderWitness::from_parts(
+                witness_roots.height,
+                block::Hash::from(&witness_header),
+                witness_roots.auth_data_root,
+            ))
+        );
+
+        let mut wrong_roots = witness_roots;
+        let mut wrong_auth_data_root = <[u8; 32]>::from(wrong_roots.auth_data_root);
+        wrong_auth_data_root[0] ^= 1;
+        wrong_roots.auth_data_root = AuthDataRoot::from(wrong_auth_data_root);
+        let error = verify_supplied_roots_from_parts(
+            &network,
+            parent_tree,
+            [(&witness_header, &wrong_roots)],
+        )
+        .expect_err("a wrong witness auth-data root is rejected");
+        assert_eq!(error.0, wrong_roots.height);
+        assert!(matches!(
+            error.1,
+            SuppliedRootsError::InvalidHeaderCommitment(
+                CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. }
+            )
+        ));
     }
 
     #[test]

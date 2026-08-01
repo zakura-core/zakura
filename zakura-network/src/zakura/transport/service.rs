@@ -1,6 +1,6 @@
 //! Zakura protocol service trait surface.
 
-use std::{collections::HashMap, fmt, future::Future, net::IpAddr, pin::Pin};
+use std::{collections::HashMap, fmt, future::Future, net::IpAddr, pin::Pin, time::Instant};
 
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +23,56 @@ pub enum StreamMode {
     Ordered,
     /// A short-lived request/response stream opened per request.
     RequestResponse,
+}
+
+/// Which endpoint may proactively open an ordered service stream.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum OrderedStreamOpening {
+    /// Only the endpoint that initiated the authenticated connection opens the stream.
+    InitiatorOnly,
+    /// Either endpoint may open the stream; simultaneous opens use the transport tiebreak.
+    EitherSide,
+}
+
+/// Static transport policy for one ordered service stream.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct OrderedStreamPolicy {
+    /// Which endpoint may proactively open the stream.
+    pub opening: OrderedStreamOpening,
+    /// Whether a locally ended session may be re-admitted on the same connection.
+    pub reopen: bool,
+}
+
+impl Default for OrderedStreamPolicy {
+    fn default() -> Self {
+        Self {
+            opening: OrderedStreamOpening::InitiatorOnly,
+            reopen: false,
+        }
+    }
+}
+
+/// A service's current decision for an absent ordered session.
+pub enum OrderedSessionDemand {
+    /// Open and admit the ordered stream now.
+    OpenNow,
+    /// Re-check demand at this instant.
+    RetryAt(Instant),
+    /// Re-check after the supplied reactor-owned state-change future completes.
+    WaitForChange(BoxRunFuture<'static, ()>),
+    /// Do not re-admit this service on the current connection.
+    Retire,
+}
+
+impl fmt::Debug for OrderedSessionDemand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OpenNow => formatter.write_str("OpenNow"),
+            Self::RetryAt(at) => formatter.debug_tuple("RetryAt").field(at).finish(),
+            Self::WaitForChange(_) => formatter.write_str("WaitForChange"),
+            Self::Retire => formatter.write_str("Retire"),
+        }
+    }
 }
 
 /// A service-declared Zakura stream.
@@ -304,6 +354,33 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
     /// Streams this service owns.
     fn streams(&self) -> &[Stream];
 
+    /// Return the transport-owned opening and re-admission policy for `kind`.
+    ///
+    /// The default preserves the legacy one-shot initiator-opens behavior.
+    fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
+        OrderedStreamPolicy::default()
+    }
+
+    /// Return this service's current demand for an absent ordered session.
+    ///
+    /// Services that opt into [`OrderedStreamPolicy::reopen`] should override
+    /// this method so local cooldowns, capacity, and usefulness remain
+    /// reactor-owned. [`OrderedSessionDemand::WaitForChange`] avoids periodic
+    /// transport polling while the service is full or has no useful work.
+    fn ordered_session_demand(
+        &self,
+        _conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> OrderedSessionDemand {
+        if self.wants_peer(peer, negotiated, direction) {
+            OrderedSessionDemand::OpenNow
+        } else {
+            OrderedSessionDemand::Retire
+        }
+    }
+
     /// Return whether this service currently wants a new session for `peer`.
     ///
     /// This is a cheap, advisory demand check used by the transport before
@@ -311,9 +388,8 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
     /// local room/interest state; remote first-party summary preference is
     /// applied upstream before dialing or escalation selection.
     ///
-    /// The service remains authoritative at [`Service::add_peer`], where it
-    /// can still reject or locally park a session if its state changed
-    /// concurrently.
+    /// The service remains authoritative at [`Service::add_peer`], where it can
+    /// still reject or locally park a session if its state changed concurrently.
     fn wants_peer(
         &self,
         _peer: &ZakuraPeerId,

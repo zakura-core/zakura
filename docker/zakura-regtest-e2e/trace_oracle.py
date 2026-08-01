@@ -18,6 +18,7 @@ import argparse
 import json
 import sys
 import tempfile
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -76,6 +77,87 @@ class TraceRow:
     @property
     def ts(self) -> int | None:
         return int_field(self.row, "ts")
+
+
+@dataclass(frozen=True)
+class TraceActivityIndex:
+    """Index timestamp windows while preserving the event-index fallback."""
+
+    rows: tuple[TraceRow, ...]
+    timestamped_rows: tuple[TraceRow, ...]
+    timestamps: tuple[int, ...]
+
+    @classmethod
+    def build(cls, rows: Iterable[TraceRow]) -> TraceActivityIndex:
+        ordered_rows = tuple(sorted(rows, key=sort_key))
+        timestamped = tuple((row.ts, row) for row in ordered_rows if row.ts is not None)
+        return cls(
+            rows=ordered_rows,
+            timestamped_rows=tuple(row for _, row in timestamped),
+            timestamps=tuple(ts for ts, _ in timestamped if ts is not None),
+        )
+
+    def near_count(self, state: TraceRow, options: OracleOptions) -> int:
+        if state.ts is None:
+            return sum(1 for _ in self._rows_near_event_index(state))
+
+        lower, upper = self._timestamp_bounds(state.ts, options.persistent_lag_micros)
+        return upper - lower
+
+    def near_tail(
+        self,
+        state: TraceRow,
+        options: OracleOptions,
+        limit: int,
+    ) -> list[TraceRow]:
+        if limit <= 0:
+            return []
+        if state.ts is None:
+            return list(self._rows_near_event_index(state))[-limit:]
+
+        lower, upper = self._timestamp_bounds(state.ts, options.persistent_lag_micros)
+        return list(self.timestamped_rows[max(lower, upper - limit) : upper])
+
+    def has_near(self, state: TraceRow, options: OracleOptions) -> bool:
+        if state.ts is None:
+            return any(self._rows_near_event_index(state))
+
+        lower, upper = self._timestamp_bounds(state.ts, options.persistent_lag_micros)
+        return lower < upper
+
+    def has_forward(self, state: TraceRow, options: OracleOptions) -> bool:
+        if state.ts is None:
+            return any(
+                row.table != state.table
+                or state.index <= row.index <= state.index + RECENT_ACTIVITY_EVENTS
+                for row in self.rows
+            )
+        if options.persistent_lag_micros < 0:
+            return False
+
+        lower = bisect_left(self.timestamps, state.ts)
+        upper = bisect_right(
+            self.timestamps,
+            state.ts + options.persistent_lag_micros,
+        )
+        return lower < upper
+
+    def _rows_near_event_index(self, state: TraceRow) -> Iterable[TraceRow]:
+        lower = max(0, state.index - RECENT_ACTIVITY_EVENTS)
+        upper = state.index + RECENT_ACTIVITY_EVENTS
+        return (
+            row
+            for row in self.rows
+            if row.table != state.table or lower <= row.index <= upper
+        )
+
+    def _timestamp_bounds(self, state_ts: int, window: int) -> tuple[int, int]:
+        if window < 0:
+            return (0, 0)
+        return (
+            bisect_left(self.timestamps, state_ts - window),
+            bisect_right(self.timestamps, state_ts + window),
+        )
 
 
 @dataclass
@@ -450,17 +532,16 @@ def check_frontiers(node: NodeTrace) -> list[Failure]:
 def check_block_sync_activity(node: NodeTrace, options: OracleOptions) -> list[Failure]:
     failures: list[Failure] = []
     states = node.events("block_sync", BLOCK_SYNC_STATE)
-    real_activity = sorted(
+    real_activity = TraceActivityIndex.build(
         [row for row in node.table("block_sync") if row.event in BODY_PROGRESS_EVENTS]
-        + [row for row in node.table("commit_state") if commit_state_row_is_body_progress(row)],
-        key=sort_key,
+        + [row for row in node.table("commit_state") if commit_state_row_is_body_progress(row)]
     )
-    query_rows = [
+    query_rows = TraceActivityIndex.build(
         row
         for row in node.table("commit_state")
         if row.row.get("action") == QUERY_NEEDED_BLOCKS
         and row.event in {"state_read_start", "state_read_success", "state_read_error", "state_read_timeout"}
-    ]
+    )
 
     if node.node not in options.optional_lag_nodes:
         for state in states:
@@ -469,9 +550,9 @@ def check_block_sync_activity(node: NodeTrace, options: OracleOptions) -> list[F
             if best is None or verified is None or best <= verified:
                 continue
 
-            has_real_activity = has_near_activity(state, real_activity, options)
+            has_real_activity = real_activity.has_near(state, options)
             if not has_real_activity:
-                recent_query_count = len(rows_near(state, query_rows, options))
+                recent_query_count = query_rows.near_count(state, options)
                 invariant = (
                     "lagging_body_sync_not_query_spin"
                     if recent_query_count > 0
@@ -486,13 +567,16 @@ def check_block_sync_activity(node: NodeTrace, options: OracleOptions) -> list[F
                             "best_header_tip": best,
                             "verified_block_tip": verified,
                             "recent_query_needed_blocks": recent_query_count,
-                            "nearby_real_activity": [compact_row(row) for row in rows_near(state, real_activity, options)[-5:]],
+                            "nearby_real_activity": [
+                                compact_row(row)
+                                for row in real_activity.near_tail(state, options, 5)
+                            ],
                         },
                     )
                 )
                 break
 
-            if body_sync_has_pinned_queue(state) and not has_forward_activity(state, real_activity, options):
+            if body_sync_has_pinned_queue(state) and not real_activity.has_forward(state, options):
                 failures.append(
                     failure(
                         node,
@@ -540,38 +624,6 @@ def commit_state_row_is_body_progress(row: TraceRow) -> bool:
     if row.event == COMMIT_FINISH and row.row.get("source") == "block_sync_driver":
         return True
     return False
-
-
-def rows_near(state: TraceRow, activity: list[TraceRow], options: OracleOptions) -> list[TraceRow]:
-    state_ts = state.ts
-    if state_ts is None:
-        lower = max(0, state.index - RECENT_ACTIVITY_EVENTS)
-        upper = state.index + RECENT_ACTIVITY_EVENTS
-        return [row for row in activity if row.table != state.table or lower <= row.index <= upper]
-
-    return [
-        row
-        for row in activity
-        if row.ts is not None and abs(row.ts - state_ts) <= options.persistent_lag_micros
-    ]
-
-
-def has_near_activity(state: TraceRow, activity: list[TraceRow], options: OracleOptions) -> bool:
-    return bool(rows_near(state, activity, options))
-
-
-def has_forward_activity(state: TraceRow, activity: list[TraceRow], options: OracleOptions) -> bool:
-    state_ts = state.ts
-    if state_ts is None:
-        return any(
-            row.table != state.table or state.index <= row.index <= state.index + RECENT_ACTIVITY_EVENTS
-            for row in activity
-        )
-    return any(
-        row.ts is not None
-        and state_ts <= row.ts <= state_ts + options.persistent_lag_micros
-        for row in activity
-    )
 
 
 def body_sync_has_pinned_queue(state: TraceRow) -> bool:
@@ -887,6 +939,35 @@ def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
 
 
 def run_self_test() -> None:
+    state = TraceRow("node1", "block_sync", 50, {"ts": 100})
+    activity = TraceActivityIndex.build(
+        TraceRow("node1", "block_sync", index, {"ts": ts})
+        for index, ts in enumerate((89, 90, 100, 110, 111), start=1)
+    )
+    window = OracleOptions(persistent_lag_micros=10)
+    assert activity.near_count(state, window) == 3
+    assert [row.ts for row in activity.near_tail(state, window, 2)] == [100, 110]
+    assert activity.has_near(state, window)
+    assert activity.has_forward(state, window)
+
+    past_activity = TraceActivityIndex.build(
+        [TraceRow("node1", "block_sync", 1, {"ts": 90})]
+    )
+    assert past_activity.has_near(state, window)
+    assert not past_activity.has_forward(state, window)
+
+    unclocked_state = TraceRow("node1", "block_sync", 2_500, {})
+    unclocked_activity = TraceActivityIndex.build(
+        [TraceRow("node1", "block_sync", 1_000, {})]
+    )
+    assert unclocked_activity.near_count(unclocked_state, window) == 1
+    assert not unclocked_activity.has_forward(unclocked_state, window)
+    cross_table_activity = TraceActivityIndex.build(
+        [TraceRow("node1", "commit_state", 10_000, {})]
+    )
+    assert cross_table_activity.near_count(unclocked_state, window) == 1
+    assert cross_table_activity.has_forward(unclocked_state, window)
+
     with tempfile.TemporaryDirectory(prefix="zakura-trace-oracle.") as tmp:
         root = Path(tmp)
 

@@ -1,0 +1,97 @@
+name: VCT handoff canary
+
+# Boots a Mainnet node from the newest retained state below the embedded VCT
+# frontier, forces the Zakura P2P/tree_aux path, and succeeds only after C is
+# finalized, the best chain reaches C+1, and VCT fast-path metrics increment.
+on:
+  workflow_call:
+    inputs:
+      target_ref:
+        description: "Commit, branch, or tag to test"
+        required: false
+        type: string
+        default: main
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Commit, branch, or tag to test"
+        required: false
+        default: main
+  schedule:
+    - cron: "0 12 * * *"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: zakura-vct-handoff-canary-${{ inputs.target_ref || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  handoff:
+    name: Cross Mainnet VCT handoff
+    uses: ./.github/workflows/zakura-pr-node.yml
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      ref: ${{ inputs.target_ref || 'main' }}
+      snapshot_mode: pre-checkpoint
+      network: mainnet
+      duration_minutes: "60"
+      droplet_size: c-8
+      teardown_after_run: true
+      p2p_stack: zakura
+    secrets: inherit
+
+  alert:
+    name: Alert #zakura-alerts
+    needs: [handoff]
+    if: ${{ always() && needs.handoff.result == 'failure' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
+      TARGET_REF: ${{ inputs.target_ref || 'main' }}
+      TARGET_SHA: ${{ needs.handoff.outputs.target_sha }}
+      MAX_CHECKPOINT: ${{ needs.handoff.outputs.max_checkpoint }}
+      START_HEIGHT: ${{ needs.handoff.outputs.start_height }}
+      END_HEIGHT: ${{ needs.handoff.outputs.end_height }}
+    steps:
+      - name: Post failure alert
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          webhook = os.environ.get("SLACK_WEB_HOOK", "")
+          if not webhook:
+              raise SystemExit("SLACK_WEB_HOOK is not configured")
+
+          def value(name):
+              return os.environ.get(name) or "unknown"
+
+          text = (
+              ":rotating_light: Zakura VCT handoff canary failed\n"
+              f"mainnet | ref={value('TARGET_REF')} | sha={value('TARGET_SHA')} | "
+              f"C={value('MAX_CHECKPOINT')} | start={value('START_HEIGHT')} | "
+              f"end={value('END_HEIGHT')} | {value('RUN_URL')}"
+          )
+          request = urllib.request.Request(
+              webhook,
+              data=json.dumps({"text": text}).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(request, timeout=8) as response:
+              body = response.read().decode("utf-8", "replace").strip()
+              if response.status < 200 or response.status >= 300 or body != "ok":
+                  raise SystemExit(
+                      f"Slack webhook failed: status={response.status} body={body!r}"
+                  )
+          PY

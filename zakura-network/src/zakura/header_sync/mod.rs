@@ -31,6 +31,7 @@ use super::{Frame, ZakuraPeerId, ZakuraTrace, FRAME_HEADER_BYTES, LOCAL_MAX_MESS
 mod config;
 mod error;
 mod events;
+mod header_root_auth;
 mod pipe;
 mod range;
 mod reactor;
@@ -50,9 +51,11 @@ pub use config::{
 };
 pub use error::{HeaderSyncStartError, HeaderSyncWireError};
 pub use events::{
-    ExpectedHeadersResponse, HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent,
-    HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMisbehavior, HeaderSyncOperationIdentity,
-    HeaderSyncOperationKind, HeaderSyncRequestId, HeaderSyncStartup, HeaderSyncWireRequestIdentity,
+    ExpectedHeadersResponse, HeaderRootAuthState, HeaderRootAuthUpdate,
+    HeaderRootAuthenticationFailureKind, HeaderSyncAction, HeaderSyncCommitFailureKind,
+    HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMisbehavior,
+    HeaderSyncOperationIdentity, HeaderSyncOperationKind, HeaderSyncRequestId, HeaderSyncStartup,
+    HeaderSyncWireRequestIdentity, HeaderWitnessState,
 };
 pub use range::{CheckedHeaderRange, HeaderRangeEntry, HeaderRangePayload};
 pub use reactor::spawn_header_sync_reactor;

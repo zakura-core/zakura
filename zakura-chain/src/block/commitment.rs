@@ -416,6 +416,14 @@ pub enum CommitmentError {
         actual: [u8; 32],
     },
 
+    #[error("invalid pre-NU5 orchard transaction count: expected {expected}, actual: {actual}")]
+    InvalidPreNu5OrchardTxCount { expected: u64, actual: u64 },
+
+    #[error(
+        "invalid pre-Sapling sapling transaction count: expected {expected}, actual: {actual}"
+    )]
+    InvalidPreSaplingSaplingTxCount { expected: u64, actual: u64 },
+
     #[error(
         "invalid pre-Nu6_3 ironwood root: expected the empty-tree root {:?}, actual: {:?}",
         hex::encode(expected),
@@ -425,6 +433,9 @@ pub enum CommitmentError {
         expected: [u8; 32],
         actual: [u8; 32],
     },
+
+    #[error("invalid pre-Nu6_3 ironwood transaction count: expected {expected}, actual: {actual}")]
+    InvalidPreNu6_3IronwoodTxCount { expected: u64, actual: u64 },
 
     #[error("missing required block height: block commitments can't be parsed without a block height, block hash: {block_hash:?}")]
     MissingBlockHeight { block_hash: block::Hash },

@@ -11,6 +11,8 @@
 #                            reset token-free afterwards, nothing is baked
 #   MAINNET_VOLUME_NAME      DO volume that gets tip/ + sandblast/ mainnet state
 #   TESTNET_VOLUME_NAME      DO volume that gets tip/ testnet state
+#   APPROACH_VOLUME_NAME     DO volume synced to just below the VCT handoff
+#   REBUILD_APPROACH_FROM_SANDBLAST  one-time approach-state rebuild switch
 #   TIP_MAINNET_LATEST_JSON  latest.json pointer for the mainnet pruned tip
 #   SANDBLAST_URL            pinned pre-spam-region mainnet archive snapshot
 #   SANDBLAST_SHA256         its sha256
@@ -27,6 +29,13 @@ apt-get -o DPkg::Lock::Timeout=600 update -qq
 apt-get -o DPkg::Lock::Timeout=600 install -y -qq \
   build-essential clang cmake pkg-config libssl-dev protobuf-compiler \
   git curl zstd jq python3
+# CPU-profiling tools for zakura-perf-bench.yml (best-effort: perf still gets
+# installed at run time if the kernel-matched package is missing here);
+# libc6-dbg restores glibc's internal symbols for stack sampling
+apt-get -o DPkg::Lock::Timeout=600 install -y -qq \
+  "linux-tools-$(uname -r)" 2>/dev/null \
+  || apt-get -o DPkg::Lock::Timeout=600 install -y -qq linux-tools-generic 2>/dev/null || true
+apt-get -o DPkg::Lock::Timeout=600 install -y -qq libc6-dbg 2>/dev/null || true
 
 # --------------------------------------------------------------------------- #
 # Rust toolchain + repo clone + warm release build
@@ -36,6 +45,12 @@ curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolcha
 # deploy.py runs bare `cargo` from a non-login SSH shell where ~/.cargo/env has
 # not been sourced, so the toolchain must be reachable from the default PATH.
 ln -sf /root/.cargo/bin/cargo /root/.cargo/bin/rustc /root/.cargo/bin/rustup /usr/local/bin/
+# flamegraph renderer + Rust v0 symbol demangler for zakura-perf-bench.yml
+# (best-effort; the run script falls back gracefully without either)
+cargo install inferno --locked >/dev/null 2>&1 || true
+cargo install rustfilt --locked >/dev/null 2>&1 || true
+ln -sf /root/.cargo/bin/inferno-flamegraph /root/.cargo/bin/rustfilt \
+  /usr/local/bin/ 2>/dev/null || true
 
 git clone "https://x-access-token:${GH_CLONE_TOKEN}@github.com/${GH_REPO}.git" /root/zakura
 # Strip the token from the baked image; run droplets fetch with a fresh
@@ -65,18 +80,20 @@ cargo build --release --locked -p zakura
 KRESKO_BAKE_REPO="${KRESKO_BAKE_REPO:-https://github.com/valargroup/kresko.git}"
 KRESKO_BAKE_REF="${KRESKO_BAKE_REF:-main}"
 
-if [ ! -d /root/kresko ]; then
-  git clone "${KRESKO_BAKE_REPO}" /root/kresko
+if [ "$REBUILD_APPROACH_FROM_SANDBLAST" != "true" ]; then
+  if [ ! -d /root/kresko ]; then
+    git clone "${KRESKO_BAKE_REPO}" /root/kresko
+  fi
+  git -C /root/kresko fetch --no-tags origin "${KRESKO_BAKE_REF}"
+  git -C /root/kresko checkout --detach FETCH_HEAD
+  # Own target dir, for the same reasons as mempool-load-run.sh: the binary
+  # must land where that script looks for it, and kresko must not share a
+  # cargo cache with zakurad.
+  ( cd /root/kresko && CARGO_TARGET_DIR=/root/kresko/target cargo build --release )
+  test -x /root/kresko/target/release/kresko
+  git -C /root/kresko rev-parse HEAD > /root/kresko/.baked-ref
+  echo "baked kresko at $(cat /root/kresko/.baked-ref)"
 fi
-git -C /root/kresko fetch --no-tags origin "${KRESKO_BAKE_REF}"
-git -C /root/kresko checkout --detach FETCH_HEAD
-# Own target dir, for the same reasons as mempool-load-run.sh: the binary
-# must land where that script looks for it, and kresko must not share a
-# cargo cache with zakurad.
-( cd /root/kresko && CARGO_TARGET_DIR=/root/kresko/target cargo build --release )
-test -x /root/kresko/target/release/kresko
-git -C /root/kresko rev-parse HEAD > /root/kresko/.baked-ref
-echo "baked kresko at $(cat /root/kresko/.baked-ref)"
 
 # --------------------------------------------------------------------------- #
 # Loopback SSH identity: deploy.py drives the node over root@localhost
@@ -139,36 +156,117 @@ fetch_state() {
 
 MAINNET_MNT=/mnt/bake-mainnet
 TESTNET_MNT=/mnt/bake-testnet
+APPROACH_MNT=/mnt/bake-approach
 mount_volume "$MAINNET_VOLUME_NAME" "$MAINNET_MNT"
 mount_volume "$TESTNET_VOLUME_NAME" "$TESTNET_MNT"
-
-# Mainnet tip: resolve the daily pruned snapshot through its latest.json pointer.
-TIP_META=$(curl -fsSL --retry 3 "$TIP_MAINNET_LATEST_JSON")
-TIP_URL=$(echo "$TIP_META" | jq -er '.url')
-TIP_SHA=$(echo "$TIP_META" | jq -er '.sha256')
-echo "Mainnet tip: $(echo "$TIP_META" | jq -r '"\(.filename) height=\(.height) db=\(.db_format_version)"')"
-fetch_state "$TIP_URL" "$TIP_SHA" "$MAINNET_MNT/tip" mainnet
+mount_volume "$APPROACH_VOLUME_NAME" "$APPROACH_MNT"
 
 # Mainnet sandblast: pinned archive just before the 2022 spam region.
 fetch_state "$SANDBLAST_URL" "$SANDBLAST_SHA256" "$MAINNET_MNT/sandblast" mainnet
 
-# Testnet tip: newest enabled pruned entry from the snapshots site metadata.
-TESTNET_META=$(curl -fsSL --retry 3 "$TESTNET_SNAPSHOTS_BASE/snapshots.json")
-ENTRY=$(echo "$TESTNET_META" | jq -er \
-  '[.snapshots[] | select(.enabled and .kind == "pruned")] | sort_by(.published) | last')
-[ "$ENTRY" != "null" ] || { echo "no enabled pruned testnet snapshot found" >&2; exit 1; }
-TN_FILE=$(echo "$ENTRY" | jq -er '.file')
-TN_SHA=$(echo "$ENTRY" | jq -er '.sha256')
-TN_BASE=$(echo "$TESTNET_META" | jq -r '.siteBaseUrl // empty')
-echo "Testnet tip: $(echo "$ENTRY" | jq -r '"\(.file) height=\(.height) db=\(.dbFormat)"')"
-if [ -n "$TN_BASE" ] && curl -fsIL --retry 2 "${TN_BASE}/files/${TN_FILE}" >/dev/null 2>&1; then
-  fetch_state "${TN_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
+# Mainnet VCT approach state. Existing pruned snapshots cannot be rolled back
+# reliably because pruning removes transaction data rollback-state needs.
+# Build the rare handoff fixture forward from the retained archive instead.
+MAX_CKPT=$(tail -1 zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
+[[ "$MAX_CKPT" =~ ^[0-9]+$ ]] || {
+  echo "could not determine Mainnet max checkpoint" >&2
+  exit 1
+}
+APPROACH_H=$((MAX_CKPT - 100))
+if [ "$REBUILD_APPROACH_FROM_SANDBLAST" = "true" ]; then
+  mkdir -p "$APPROACH_MNT/tip"
+  cp -a "$MAINNET_MNT/sandblast/." "$APPROACH_MNT/tip/"
+  find "$APPROACH_MNT/tip" -name LOCK -delete
+  rm -rf "$APPROACH_MNT/tip/non_finalized_state"
+  cat > /root/approach.toml <<TOML
+[network]
+network = "Mainnet"
+listen_addr = "0.0.0.0:8233"
+p2p_stack = "zakura"
+
+[state]
+cache_dir = "$APPROACH_MNT/tip"
+storage_mode = "pruned"
+debug_stop_at_height = $APPROACH_H
+
+[consensus]
+checkpoint_sync = true
+vct_fast_sync = true
+
+[metrics]
+endpoint_addr = "127.0.0.1:9999"
+
+[tracing]
+filter = "info"
+TOML
+  echo "Syncing Mainnet VCT approach state to height=$APPROACH_H handoff=$MAX_CKPT"
+  set +e
+  timeout 4h /root/cargo-target/release/zakurad -c /root/approach.toml start \
+    2>&1 | tee /root/approach-sync.log
+  ZAKURAD_STATUS=${PIPESTATUS[0]}
+  set -e
+  if [ "$ZAKURAD_STATUS" -ne 0 ] &&
+    ! grep -q "stopping at configured height.*height=Height($APPROACH_H)" /root/approach-sync.log
+  then
+    echo "approach sync exited unexpectedly with status $ZAKURAD_STATUS" >&2
+    exit "$ZAKURAD_STATUS"
+  fi
+  cat > /root/inspect-approach.toml <<TOML
+[state]
+storage_mode = "pruned"
+TOML
+  set +e
+  TIP_OUTPUT=$(
+    /root/cargo-target/release/zakurad -c /root/inspect-approach.toml tip-height \
+      --cache-dir "$APPROACH_MNT/tip" \
+      --network Mainnet 2>&1
+  )
+  TIP_STATUS=$?
+  set -e
+  VERIFIED_APPROACH_H=$(printf '%s\n' "$TIP_OUTPUT" |
+    awk '/^[0-9]+$/ { height=$1 } END { print height }')
+  if [ "$TIP_STATUS" -eq 0 ] && [ -n "$VERIFIED_APPROACH_H" ]; then
+    [ "$VERIFIED_APPROACH_H" = "$APPROACH_H" ] || {
+      echo "approach sync stopped at $VERIFIED_APPROACH_H, expected $APPROACH_H" >&2
+      exit 1
+    }
+  else
+    echo "::warning::tip-height could not reopen the flushed fixture; using the exact configured-stop log height"
+    printf '%s\n' "$TIP_OUTPUT" >&2
+  fi
+  echo "$APPROACH_H" > /root/mainnet-approach-height
 else
-  fetch_state "${TESTNET_SNAPSHOTS_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
+  echo "Keeping the retained approach snapshot; dispatch with rebuild_approach_from_sandblast=true to replace it"
+
+  # Mainnet tip: resolve the daily pruned snapshot through its latest.json pointer.
+  TIP_META=$(curl -fsSL --retry 3 "$TIP_MAINNET_LATEST_JSON")
+  TIP_URL=$(echo "$TIP_META" | jq -er '.url')
+  TIP_SHA=$(echo "$TIP_META" | jq -er '.sha256')
+  echo "Mainnet tip: $(echo "$TIP_META" | jq -r '"\(.filename) height=\(.height) db=\(.db_format_version)"')"
+  echo "$TIP_META" | jq -er '.height | select(type == "number" and floor == .)' \
+    > /root/mainnet-state-height
+  fetch_state "$TIP_URL" "$TIP_SHA" "$MAINNET_MNT/tip" mainnet
+
+  # Testnet tip: newest enabled pruned entry from the snapshots site metadata.
+  TESTNET_META=$(curl -fsSL --retry 3 "$TESTNET_SNAPSHOTS_BASE/snapshots.json")
+  ENTRY=$(echo "$TESTNET_META" | jq -er \
+    '[.snapshots[] | select(.enabled and .kind == "pruned")] | sort_by(.published) | last')
+  [ "$ENTRY" != "null" ] || { echo "no enabled pruned testnet snapshot found" >&2; exit 1; }
+  TN_FILE=$(echo "$ENTRY" | jq -er '.file')
+  TN_SHA=$(echo "$ENTRY" | jq -er '.sha256')
+  TN_BASE=$(echo "$TESTNET_META" | jq -r '.siteBaseUrl // empty')
+  echo "Testnet tip: $(echo "$ENTRY" | jq -r '"\(.file) height=\(.height) db=\(.dbFormat)"')"
+  echo "$ENTRY" | jq -er '.height | select(type == "number" and floor == .)' \
+    > /root/testnet-state-height
+  if [ -n "$TN_BASE" ] && curl -fsIL --retry 2 "${TN_BASE}/files/${TN_FILE}" >/dev/null 2>&1; then
+    fetch_state "${TN_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
+  else
+    fetch_state "${TESTNET_SNAPSHOTS_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
+  fi
 fi
 
 sync
-umount "$MAINNET_MNT" "$TESTNET_MNT"
+umount "$MAINNET_MNT" "$TESTNET_MNT" "$APPROACH_MNT"
 
 # --------------------------------------------------------------------------- #
 # Clean the droplet for imaging

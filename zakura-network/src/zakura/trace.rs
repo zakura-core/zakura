@@ -280,8 +280,8 @@ pub mod block_sync_trace {
     pub const BLOCK_PEER_CONNECTED: &str = "block_peer_connected";
     /// Block-sync peer disconnected from the reactor.
     pub const BLOCK_PEER_DISCONNECTED: &str = "block_peer_disconnected";
-    /// Block-sync peer rejected for a protocol/liveness reason.
-    pub const BLOCK_PEER_PROTOCOL_REJECT: &str = "block_peer_protocol_reject";
+    /// Block-sync service session locally parked for a liveness reason.
+    pub const BLOCK_PEER_PARKED: &str = "block_peer_parked";
     /// Body range request sent to a peer.
     pub const BLOCK_GET_BLOCKS_SENT: &str = "block_get_blocks_sent";
     /// Reactor accepted an inbound event.
@@ -399,6 +399,10 @@ pub mod header_sync_trace {
     pub const FINALIZED_HEIGHT: &str = "finalized_height";
     /// Durable best header tip observed by the header scheduler.
     pub const BEST_HEADER_TIP: &str = "best_header_tip";
+    /// Confirmable root heights missing before the first retained response.
+    pub const ROOT_AUTH_HOLE_HEIGHTS: &str = "root_auth_hole_heights";
+    /// First retained root-carrying response start, when one exists.
+    pub const FIRST_RETAINED_ROOT_HEIGHT: &str = "first_retained_root_height";
     /// Number of header-carried tree-aux roots present on this send/receive.
     pub const TREE_AUX_ROOTS_LEN: &str = "tree_aux_roots_len";
     /// First encoded tree-aux root height.
@@ -462,6 +466,8 @@ pub mod header_sync_trace {
     pub const HEADER_FRONTIER_REANCHORED: &str = "header_frontier_reanchored";
     /// Missing block bodies reported.
     pub const HEADER_MISSING_BODIES_REPORTED: &str = "header_missing_bodies_reported";
+    /// Root-authentication frontier, retained boundary, and exact missing-root count changed.
+    pub const HEADER_ROOT_AUTH_DIAGNOSTICS: &str = "header_root_auth_diagnostics";
     /// The reactor woke because a real retry, timeout, or status deadline expired.
     pub const HEADER_MAINTENANCE_WAKEUP: &str = "header_maintenance_wakeup";
 }

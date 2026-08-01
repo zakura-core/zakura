@@ -8,7 +8,9 @@ use tokio::sync::oneshot;
 use zakura_chain::{
     amount::Amount,
     block::{Block, Height},
+    history_tree::HistoryTree,
     parallel::commitment_aux::BlockCommitmentRoots,
+    parallel::commitment_aux_verify::verify_supplied_roots_from_parts,
     parameters::{
         testnet::{ConfiguredActivationHeights, ParametersBuilder},
         NetworkUpgrade,
@@ -30,7 +32,8 @@ use crate::{
 
 use super::super::{
     commitment_aux, serve_block_roots, vct::validate_final_frontiers_bytes,
-    CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState, NextVctBlock,
+    CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState, HeaderRootAuthUpdate,
+    HeaderWitnessState, HighestCompletedCheckpoint, NextVctBlock,
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -110,7 +113,7 @@ fn next_vct_block(block: Arc<Block>) -> Option<NextVctBlock> {
 }
 
 #[test]
-fn vct_successor_witness_uses_stored_header_without_body() {
+fn vct_header_witness_uses_stored_header_without_body() {
     let _init_guard = zakura_test::init();
     let network = zakura_chain::parameters::Network::Mainnet;
     let mut state = FinalizedState::new(&Config::ephemeral(), &network)
@@ -121,6 +124,11 @@ fn vct_successor_witness_uses_stored_header_without_body() {
     let block1 = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
         .expect("block 1 deserializes");
+    let block2 = zakura_test::vectors::MAINNET_BLOCKS
+        .get(&2)
+        .expect("mainnet block 2 test vector exists")
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("block 2 deserializes");
 
     state
         .commit_finalized_direct(
@@ -131,7 +139,7 @@ fn vct_successor_witness_uses_stored_header_without_body() {
         )
         .expect("genesis commits");
 
-    let roots = BlockCommitmentRoots {
+    let block1_roots = BlockCommitmentRoots {
         height: Height(1),
         sapling_root: zakura_chain::sapling::tree::NoteCommitmentTree::default().root(),
         orchard_root: zakura_chain::orchard::tree::NoteCommitmentTree::default().root(),
@@ -141,32 +149,107 @@ fn vct_successor_witness_uses_stored_header_without_body() {
         ironwood_tx: 0,
         auth_data_root: block1.auth_data_root(),
     };
+    let block2_roots = BlockCommitmentRoots {
+        height: Height(2),
+        auth_data_root: block2.auth_data_root(),
+        ..block1_roots.clone()
+    };
     let mut batch = DiskWriteBatch::new();
     batch
         .prepare_header_range_batch_with_roots(
             &state.db,
             genesis.hash(),
-            std::slice::from_ref(&block1.header),
-            &[0],
-            &[roots],
+            &[block1.header.clone(), block2.header.clone()],
+            &[0, 0],
+            &[block1_roots.clone(), block2_roots.clone()],
         )
-        .expect("block 1 header is contextually valid");
+        .expect("block 1 and 2 headers are contextually valid");
     state
         .db
         .write_batch(batch)
         .expect("header range batch writes");
+    let verified = verify_supplied_roots_from_parts(
+        &network,
+        HistoryTree::default(),
+        [
+            (block1.header.as_ref(), &block1_roots),
+            (block2.header.as_ref(), &block2_roots),
+        ],
+    )
+    .expect("header roots verify");
+    state
+        .db
+        .write_verified_header_commitment_roots(verified)
+        .expect("verified roots and their header witness write");
+    let mut affected_batch = DiskWriteBatch::new();
+    affected_batch
+        .rebase_header_root_auth_frontier(
+            &state.db,
+            Height(1),
+            block1.hash(),
+            &HistoryTree::default(),
+        )
+        .expect("the affected frontier remains coherent without its witness");
+    state
+        .db
+        .write_batch(affected_batch)
+        .expect("the affected frontier writes");
+    let completed = HighestCompletedCheckpoint {
+        height: Height(2),
+        hash: block2.hash(),
+    };
+    let affected = state
+        .db
+        .load_header_root_auth_frontier()
+        .expect("the affected frontier loads")
+        .expect("the affected frontier exists")
+        .state(completed);
+    let recovered = state
+        .db
+        .authenticate_header_roots(
+            completed,
+            affected,
+            affected.authenticated_hash,
+            Height(2),
+            std::slice::from_ref(&block2.header),
+            std::slice::from_ref(&block2_roots),
+        )
+        .expect("the one-record delivery recovers the witness");
+    assert_eq!(
+        recovered.update,
+        HeaderRootAuthUpdate::WitnessRecovered {
+            witness: HeaderWitnessState {
+                height: Height(2),
+                hash: block2.hash(),
+            }
+        }
+    );
 
     assert!(
-        state.db.block(Height(1).into()).is_none(),
+        state.db.block(Height(2).into()).is_none(),
         "the successor body must remain absent"
     );
+    assert_eq!(
+        state.db.commitment_roots(Height(2)),
+        None,
+        "the witness's note roots must remain unconfirmed"
+    );
     let witness = state
-        .vct_successor_from_header_store(Height(0), genesis.hash())
+        .vct_successor_from_header_store(Height(1), block1.hash())
         .expect("the stored header and auth-data root form a successor witness");
-    assert_eq!(witness.header, block1.header);
-    assert_eq!(witness.height, Height(1));
-    assert_eq!(witness.hash, block1.hash());
-    assert_eq!(witness.auth_data_root, Some(block1.auth_data_root()));
+    assert_eq!(witness.header, block2.header);
+    assert_eq!(witness.height, Height(2));
+    assert_eq!(witness.hash, block2.hash());
+    assert_eq!(witness.auth_data_root, Some(block2.auth_data_root()));
+
+    state
+        .commit_finalized_direct(
+            CheckpointVerifiedBlock::from(block1).into(),
+            None,
+            Some(witness),
+            "recovered header-only VCT successor test",
+        )
+        .expect("the C-1 body commits through the recovered witness");
 }
 
 /// A handoff frontier over empty trees at `height`, for sources whose test does not
@@ -711,7 +794,7 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
             }
 
             // Punch a hole: drop a post-NU5 height's root from the fixture, simulating a
-            // peer that omitted it (or a root evicted after failing verification). Earlier
+            // peer that omitted it (or a height authentication has not reached). Earlier
             // fast blocks freeze the frontier, so this height has no real frontier to
             // recompute against.
             let hole = (nu5 + 1) as usize;
@@ -991,13 +1074,13 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
             // Defense in depth: a witness that does not link to the block being committed
             // (here, the block itself — its parent is the previous height) must be ignored
             // and deferred exactly like a missing successor. It must *not* be treated as a
-            // verification failure: that would evict the correct root and, because the write
+            // verification failure: that would reject the correct root and, because the write
             // loop's parked retry is taken before the look-ahead, wedge the retry loop.
             let cv = CheckpointVerifiedBlock::from(target_block.clone());
             let forged_witness = next_vct_block(target_block.clone());
             let error = fast
                 .commit_finalized_direct(cv.into(), None, forged_witness, "vct defer tip forged witness")
-                .expect_err("a non-linking witness must defer, not commit or evict");
+                .expect_err("a non-linking witness must defer, not commit or reject");
             prop_assert!(
                 format!("{error:?}").contains("VctSuppliedRootAwaitingSuccessor"),
                 "a non-linking witness defers with the await-successor error, got: {error:?}"
@@ -1030,7 +1113,7 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
 
             // Once a successor is buffered, the very same height commits and the tip advances:
             // the deferral was a wait, not a permanent stall — and the root survived the
-            // forged-witness attempt (it was never evicted).
+            // forged-witness attempt (it was never rejected).
             let cv = CheckpointVerifiedBlock::from(target_block);
             let next = next_vct_block(target_successor);
             fast.commit_finalized_direct(cv.into(), None, next, "vct defer tip with successor")
@@ -1061,9 +1144,9 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
     Ok(())
 }
 
-/// A wrong peer-supplied root must be recoverable at the same height: the committer rejects and
-/// evicts the bad cached value, leaves the database parked below the height, then commits the
-/// same block once the `tree_aux` driver refills that height with a verifiable root.
+/// A wrong peer-supplied root must be recoverable at the same height: the committer rejects,
+/// leaves the database parked below the height, then commits the same block once the stored
+/// row at that height is replaced with a verifiable root.
 #[test]
 #[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and inserts roots by height
 fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
@@ -1162,11 +1245,11 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
                 "the rejected root left the database parked below the target"
             );
 
-            // Simulate the `tree_aux` driver refilling the evicted height from another peer:
+            // Simulate the root lane replacing the rejected row from another peer:
             // header sync persists the replacement through the same database write path.
             fast.db
                 .insert_zakura_header_commitment_roots([correct_target_root])
-                .expect("refilling the evicted height succeeds");
+                .expect("replacing the rejected row succeeds");
 
             let cv = CheckpointVerifiedBlock::from(blocks[target].block.clone());
             fast.commit_finalized_direct(cv.into(), None, next, "vct refilled target")
@@ -1282,7 +1365,7 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
             }
 
             // Session 2 (restart): reopen the same database, then punch a hole at the next
-            // height (a peer that omitted it, or a root evicted after failing verification).
+            // height (a peer that omitted it, or a height authentication has not reached).
             // Skip the constructor-time interrupted-fast-sync resume guard: this configured
             // network has no embedded frontiers, so `from_config` yields no source, but the
             // test attaches a fixture source below the way a real (Mainnet) node's configured
@@ -1699,7 +1782,18 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
-    proptest!(ProptestConfig::with_cases(1),
+    // Keep this regression seed isolated because the default source-level
+    // persistence file is replayed by every property in this module.
+    let mut proptest_config = ProptestConfig::with_cases(1);
+    proptest_config.failure_persistence = Some(Box::new(
+        proptest::test_runner::FileFailurePersistence::Direct(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/proptest-regressions/service/finalized_state/tests/",
+            "vct_mode_switches_continue_from_safe_boundaries.txt",
+        )),
+    ));
+
+    proptest!(proptest_config,
         |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
             let blocks: Vec<_> = chain.iter().collect();
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
@@ -1754,8 +1848,10 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             let fast_config = Config {
                 cache_dir: fast_to_manual_dir.path().to_path_buf(),
                 ephemeral: false,
+                vct_fast_sync: true,
                 ..Config::default()
             };
+            let restart_index = seed + 1;
             {
                 let mut fast = FinalizedState::new(&fast_config, &network).expect("opening an ephemeral database should succeed");
                 enable_vct_test_fixture_source_with_handoff(
@@ -1767,13 +1863,10 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                     handoff_trees.sprout.clone(),
                     handoff_trees.ironwood.clone(),
                 );
-                // Match the writer service by carrying the frozen in-memory
-                // frontier through an uninterrupted fast-sync sequence.
                 let mut prev_note_commitment_trees = None;
-                for i in 0..=handoff_index {
+                for i in 0..=restart_index {
                     let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                    let next = (i < handoff_index)
-                        .then(|| vct_successor_header(blocks[i + 1].block.clone()));
+                    let next = Some(vct_successor_header(blocks[i + 1].block.clone()));
                     let (_, note_commitment_trees) = fast
                         .commit_finalized_direct(
                             cv.into(),
@@ -1784,6 +1877,46 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                         .expect("verified fast prefix commits");
                     prev_note_commitment_trees = Some(note_commitment_trees);
                 }
+            }
+
+            // Restart inside the absent band, losing the frozen in-memory
+            // frontiers before reaching the handoff. The synthetic network has
+            // no embedded VCT source, so bypass the production resume guard
+            // long enough to inject the test fixture.
+            {
+                let mut fast = FinalizedState::new_with_debug_and_storage_validation(
+                    &fast_config,
+                    &network,
+                    false,
+                    false,
+                    true,
+                    false,
+                )
+                .expect("reopening the fast-sync database should succeed");
+                enable_vct_test_fixture_source_with_handoff(
+                    &mut fast,
+                    fixture.clone(),
+                    handoff,
+                    handoff_trees.sapling.clone(),
+                    handoff_trees.orchard.clone(),
+                    handoff_trees.sprout.clone(),
+                    handoff_trees.ironwood.clone(),
+                );
+                let mut prev_note_commitment_trees = None;
+                for i in (restart_index + 1)..=handoff_index {
+                    let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                    let next = (i < handoff_index)
+                        .then(|| vct_successor_header(blocks[i + 1].block.clone()));
+                    let (_, note_commitment_trees) = fast
+                        .commit_finalized_direct(
+                            cv.into(),
+                            prev_note_commitment_trees.take(),
+                            next,
+                            "vct switch fast prefix after restart",
+                        )
+                        .expect("verified fast prefix commits after restart");
+                    prev_note_commitment_trees = Some(note_commitment_trees);
+                }
                 prop_assert_eq!(fast.vct_fast_synced_below(), Some(handoff), "fast sync reached the handoff before the switch");
             }
 
@@ -1791,12 +1924,29 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 vct_fast_sync: false,
                 ..fast_config
             };
-            let mut manual = FinalizedState::new(&manual_config, &network).expect("opening an ephemeral database should succeed");
-            for i in (handoff_index + 1)..=post_handoff_tip {
+            {
+                let mut manual = FinalizedState::new(&manual_config, &network).expect("opening an ephemeral database should succeed");
+                let i = handoff_index + 1;
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 manual
-                    .commit_finalized_direct(cv.into(), None, None, "vct switch manual suffix")
-                    .expect("manual suffix commits after fast handoff");
+                    .commit_finalized_direct(
+                        cv.into(),
+                        None,
+                        None,
+                        "vct switch first manual block",
+                    )
+                    .expect("first manual block commits after fast handoff");
+            }
+
+            // Restart after the first body-derived post-handoff tree write.
+            // Reopening proves the handoff and first semantic block did not
+            // create duplicate note-commitment trees.
+            let mut manual = FinalizedState::new(&manual_config, &network).expect("database reopens after the first post-handoff block");
+            for i in (handoff_index + 2)..=post_handoff_tip {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                manual
+                    .commit_finalized_direct(cv.into(), None, None, "vct switch resumed manual suffix")
+                    .expect("manual suffix resumes after restart");
             }
             let manual_tip = manual.db.note_commitment_trees_for_tip().unwrap();
             prop_assert_eq!(manual.db.vct_anchor_digest(), golden_anchors, "fast-to-manual anchors match legacy");
@@ -2104,7 +2254,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
                 "the cache-empty rejected body must leave finalized state untouched",
             );
 
-            // Rejecting either form of the invalid body must not evict the
+            // Rejecting either form of the invalid body must not disturb the
             // authenticated VCT roots. A subsequently downloaded honest body
             // with the same hash can therefore commit and let checkpoint sync
             // continue.
@@ -2385,8 +2535,8 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
 }
 
 /// Verified-commitment-trees consumer half of the peer source: a
-/// [`commitment_aux::PeerSource`] whose database is **filled incrementally** (as header
-/// sync persists provisional root ranges when they arrive from peers) drives the fast
+/// [`commitment_aux::PeerSource`] whose database is **filled incrementally** (as the
+/// root-authentication lane promotes root ranges ahead of body sync) drives the fast
 /// path to byte-identical consensus state. Same harness as the DB-produced round-trip,
 /// but the produced roots are written into `commitment_roots_by_height` in two chunks
 /// via [`ZakuraDb::insert_zakura_header_commitment_roots`] — proving the DB-backed,
@@ -2458,6 +2608,128 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
 
             prop_assert_eq!(fast.db.vct_anchor_digest(), golden_anchors, "fast anchors from peer-source roots match legacy");
             prop_assert_eq!(fast.db.history_tree().hash(), golden_history, "fast history from peer-source roots match legacy");
+    });
+
+    Ok(())
+}
+
+/// Production PeerSource never receives an authenticated DB row at the handoff height
+/// (header-root auth promotes through C-1 only). Committing the handoff must still
+/// succeed by reading the embedded frontier roots from [`commitment_aux::PeerSource`].
+#[test]
+#[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] and by height
+fn vct_peer_source_handoff_without_db_root_at_c() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    let network = early_upgrade_network();
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("NU5 activation height is configured");
+    // Handoff at NU5 + 3, plus one trailing block for below-handoff successor witnesses.
+    let tested_block_count =
+        usize::try_from(nu5_height.0 + 5).expect("test activation height fits in usize");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
+
+            let blocks: Vec<_> = chain.iter().collect();
+            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+            let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
+            let last = (nu5 + 3) as usize;
+            prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
+            let seed = (heartwood - 1) as usize;
+            let handoff = Height(last as u32);
+
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network)
+                .expect("opening an ephemeral database should succeed");
+            let mut handoff_trees = None;
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let (_h, trees) = legacy
+                    .commit_finalized_direct(cv.into(), None, None, "vct peer handoff legacy")
+                    .unwrap();
+                if i == last {
+                    handoff_trees = Some(trees);
+                }
+            }
+            let handoff_trees = handoff_trees.expect("committed the handoff block");
+            let golden_anchors = legacy.db.vct_anchor_digest();
+            let golden_history = legacy.db.history_tree().hash();
+            let golden_tip = legacy.db.note_commitment_trees_for_tip().unwrap();
+
+            // Authenticated roots through C-1 only — the production header-root lane
+            // never promotes a row at C.
+            let below_handoff_roots = commitment_aux::produce_block_roots(
+                &legacy.db,
+                Height((seed + 1) as u32)..=Height((last as u32) - 1),
+            );
+            prop_assert!(
+                !below_handoff_roots.iter().any(|root| root.height == handoff),
+                "the fixture must omit the handoff root from the authenticated index"
+            );
+
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network)
+                .expect("opening an ephemeral database should succeed");
+            fast.db
+                .insert_zakura_header_commitment_roots(below_handoff_roots)
+                .expect("writing below-handoff header-sync roots succeeds");
+            let peer_source = commitment_aux::PeerSource::new(
+                fast.db.clone(),
+                commitment_aux::FinalFrontiers {
+                    height: handoff,
+                    sapling: handoff_trees.sapling.clone(),
+                    orchard: handoff_trees.orchard.clone(),
+                    sprout: handoff_trees.sprout.clone(),
+                    ironwood: handoff_trees.ironwood.clone(),
+                },
+            );
+            fast.enable_vct_fast_source(Box::new(peer_source), true);
+
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = (i < last).then(|| vct_successor_header(blocks[i + 1].block.clone()));
+                fast.commit_finalized_direct(
+                    cv.into(),
+                    None,
+                    next,
+                    "vct peer handoff without DB root at C",
+                )
+                .expect("handoff commit must succeed from embedded frontier roots");
+            }
+
+            prop_assert_eq!(
+                fast.vct_fast_synced_below(),
+                Some(handoff),
+                "fast-sync marker is set to the handoff height"
+            );
+            prop_assert_eq!(
+                fast.db.vct_anchor_digest(),
+                golden_anchors,
+                "fast anchors must match legacy after a PeerSource handoff"
+            );
+            prop_assert_eq!(
+                fast.db.history_tree().hash(),
+                golden_history,
+                "fast history must match legacy after a PeerSource handoff"
+            );
+            let fast_tip = fast.db.note_commitment_trees_for_tip().unwrap();
+            prop_assert_eq!(
+                fast_tip.sapling.root(),
+                golden_tip.sapling.root(),
+                "tip sapling frontier must match legacy"
+            );
+            prop_assert_eq!(
+                fast_tip.orchard.root(),
+                golden_tip.orchard.root(),
+                "tip orchard frontier must match legacy"
+            );
+            prop_assert_eq!(
+                fast_tip.sprout.root(),
+                golden_tip.sprout.root(),
+                "tip sprout frontier must match legacy"
+            );
     });
 
     Ok(())

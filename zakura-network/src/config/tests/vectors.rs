@@ -14,7 +14,9 @@ use zakura_chain::{
 use crate::{
     config::zakura_listens_on_loopback_with_non_loopback_bootstrap_peers,
     config::zakura_secret_key_file_path,
-    constants::{INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_MULTIPLIER},
+    constants::{
+        INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
+    },
     zakura::{
         DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
         DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR,
@@ -76,14 +78,19 @@ fn parse_config_listen_addr() {
 fn ensure_peer_connection_limits_consistent() {
     let _init_guard = zakura_test::init();
 
-    // This fork prioritizes fast outbound sync over inbound-serving capacity.
-    const_assert!(INBOUND_PEER_LIMIT_MULTIPLIER <= OUTBOUND_PEER_LIMIT_MULTIPLIER);
+    // Zakura accepts more inbound connections than it opens outbound connections,
+    // so peers which can not accept inbound connections can still reach these nodes.
+    const_assert!(
+        INBOUND_PEER_LIMIT_MULTIPLIER * OUTBOUND_PEER_LIMIT_DIVISOR
+            >= OUTBOUND_PEER_LIMIT_MULTIPLIER
+    );
 
     let config = Config::default();
 
     assert!(
-        config.peerset_inbound_connection_limit() <= config.peerset_outbound_connection_limit(),
-        "this fork caps inbound connections at or below the outbound limit, to prioritize sync",
+        config.peerset_inbound_connection_limit() >= config.peerset_outbound_connection_limit(),
+        "the inbound connection limit is at least the outbound limit, \
+         so unreachable peers can still connect to this node",
     );
 }
 

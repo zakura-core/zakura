@@ -990,10 +990,11 @@ fn peer_set_route_inv_all_missing_fail() {
     });
 }
 
-/// Check that empty `FindBlocks` responses do not trigger stall tracking when the node is at the
-/// chain tip, so peers that correctly return no hashes are not disconnected.
+/// Check that empty `FindBlocks` responses do not trigger stall tracking at the
+/// inclusive near-tip boundary, so peers that correctly return no hashes are
+/// not disconnected.
 #[test]
-fn find_blocks_stall_not_tracked_when_at_tip() {
+fn find_blocks_stall_not_tracked_at_near_tip_boundary() {
     let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
     let peer_versions = PeerVersions {
         peer_versions: vec![peer_version],
@@ -1006,9 +1007,11 @@ fn find_blocks_stall_not_tracked_when_at_tip() {
     let (minimum_peer_version, best_tip) =
         MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
 
-    // Simulate being at the chain tip.
+    // A distance equal to the threshold is still considered near tip.
     best_tip.send_best_tip_height(Some(block::Height(2_500_000)));
-    best_tip.send_estimated_distance_to_network_chain_tip(Some(0));
+    best_tip.send_estimated_distance_to_network_chain_tip(Some(
+        zakura_chain::chain_tip::AT_OR_NEAR_TIP_THRESHOLD,
+    ));
 
     let mut handle = handles.into_iter().next().expect("there is one peer");
 
@@ -1106,10 +1109,11 @@ fn find_blocks_stall_not_tracked_for_zcashd_compat() {
     });
 }
 
-/// Check that empty `FindBlocks` responses trigger stall tracking when the node is syncing,
-/// and that the peer is disconnected after exceeding the stall threshold.
+/// Check that empty `FindBlocks` responses trigger stall tracking immediately
+/// beyond the near-tip boundary, and that the peer is disconnected after
+/// exceeding the stall threshold.
 #[test]
-fn find_blocks_stall_tracked_when_syncing() {
+fn find_blocks_stall_tracked_beyond_near_tip_boundary() {
     let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
     let peer_versions = PeerVersions {
         peer_versions: vec![peer_version],
@@ -1122,9 +1126,11 @@ fn find_blocks_stall_tracked_when_syncing() {
     let (minimum_peer_version, best_tip) =
         MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
 
-    // Simulate being far behind the chain tip, as during initial sync.
+    // A distance one block beyond the threshold activates stall tracking.
     best_tip.send_best_tip_height(Some(block::Height(2_490_000)));
-    best_tip.send_estimated_distance_to_network_chain_tip(Some(10_000));
+    best_tip.send_estimated_distance_to_network_chain_tip(Some(
+        zakura_chain::chain_tip::AT_OR_NEAR_TIP_THRESHOLD + 1,
+    ));
 
     let mut handle = handles.into_iter().next().expect("there is one peer");
 

@@ -39,8 +39,10 @@ pub(crate) struct InvariantReport {
     pub(crate) decoded_stage_totals_match: bool,
     /// Final reserved download bytes (leak detector once quiesced).
     pub(crate) final_budget_reserved: u64,
-    /// Liveness-reaper / protocol-reject disconnects observed.
+    /// Protocol-invalid service rejects observed.
     pub(crate) protocol_rejects: usize,
+    /// Block-sync service sessions locally parked by no-progress liveness.
+    pub(crate) session_parks: usize,
     /// Total `block_get_blocks_sent` requests issued over the run. Exceeds the chain
     /// length when blocks are re-requested (a peer dropped/withheld a height), so it is
     /// the non-vacuous signal that a timeout/re-request scenario actually re-requested.
@@ -134,6 +136,7 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
     let protocol_rejects = reader
         .table("block_sync")
         .count("block_peer_protocol_reject");
+    let session_parks = reader.table("block_sync").count("block_peer_parked");
     let total_requests = reader.table("block_sync").count("block_get_blocks_sent");
     let max_requests_without_block_progress = max_requests_without_block_progress(reader);
     let max_unproven_requests_without_block_progress =
@@ -205,6 +208,7 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         decoded_stage_totals_match,
         final_budget_reserved,
         protocol_rejects,
+        session_parks,
         total_requests,
         max_requests_without_block_progress,
         max_unproven_requests_without_block_progress,
@@ -252,6 +256,7 @@ fn max_requests_without_block_progress(reader: &TraceReader) -> u64 {
             }
             Some("block_body_received")
             | Some("block_peer_disconnected")
+            | Some("block_peer_parked")
             | Some("block_peer_protocol_reject") => {
                 streaks.insert(peer.to_string(), 0);
             }
@@ -274,12 +279,13 @@ pub(crate) fn assert_core(
     // hash-correct committed prefix `1..=target`.
     assert!(
         outcome.reached_target(),
-        "sync stalled at {} of {} (state_samples={}, max_outstanding={}, rejects={})",
+        "sync stalled at {} of {} (state_samples={}, max_outstanding={}, rejects={}, parks={})",
         outcome.committed_tip.0,
         outcome.target.0,
         report.state_samples,
         report.max_outstanding,
         report.protocol_rejects,
+        report.session_parks,
     );
 
     // Tracing actually produced the rows the analysis scripts consume.

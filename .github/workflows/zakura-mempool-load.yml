@@ -138,74 +138,28 @@ jobs:
             echo "slug=${SLUG}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Install doctl
-        env:
-          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-        run: |
-          set -euo pipefail
-          DOCTL_VERSION=1.120.0
-          curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
-          sudo install /tmp/doctl /usr/local/bin/doctl
-          doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
+      - name: Install doctl and the fleet SSH key
+        uses: ./.github/actions/do-cli
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
 
-      - name: Write SSH key
-        env:
-          DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
-        run: |
-          install -m 600 /dev/null /tmp/do_ssh
-          printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh
-
-      - name: Pick baked image
-        id: baked
-        run: |
-          set -euo pipefail
-          # Reuses the PR-node bake: same deps and warm cargo cache. No chain
-          # state volume -- this workload generates its own chain from genesis.
-          IMAGE=$(doctl compute image list-user --format ID,Name --no-header | \
-            awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | tail -1 | awk '{print $2}')
-          if [ -z "${IMAGE}" ]; then
-            echo "no zakura-pr-node-* image found; run the 'PR node image bake' workflow first" >&2
-            exit 1
-          fi
-          echo "image_id=${IMAGE}" >> "$GITHUB_OUTPUT"
-
+      # Reuses the PR-node bake: same deps and warm cargo cache. No chain state
+      # volume -- this workload generates its own chain from genesis.
       - name: Create droplet
         id: droplet
-        env:
-          DROPLET_SIZE: ${{ inputs.droplet_size || 'c-8' }}
-          SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
-          IMAGE_ID: ${{ steps.baked.outputs.image_id }}
-          SLUG: ${{ steps.target.outputs.slug }}
-        run: |
-          set -euo pipefail
-          NAME="zakura-mempool-${SLUG}-${GITHUB_RUN_ID}"
-          # The zakura-mempool-load tag is what the hourly reaper sweeps, so it
-          # must be set at creation -- before anything else can fail.
-          doctl compute droplet create "$NAME" \
-            --region nyc3 \
-            --size "${DROPLET_SIZE}" \
-            --image "${IMAGE_ID}" \
-            --ssh-keys "${SSH_FINGERPRINT}" \
-            --tag-name zakura-mempool-load \
-            --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
-          {
-            echo "id=$(awk '{print $1}' /tmp/droplet.txt)"
-            echo "ip=$(awk '{print $2}' /tmp/droplet.txt)"
-          } >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/do-droplet
+        with:
+          name: zakura-mempool-${{ steps.target.outputs.slug }}-${{ github.run_id }}
+          size: ${{ inputs.droplet_size || 'c-8' }}
+          ssh_fingerprint: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+          tag: zakura-mempool-load
 
       - name: Wait for SSH
         id: sshwait
-        env:
-          IP: ${{ steps.droplet.outputs.ip }}
-        run: |
-          set -euo pipefail
-          for _ in $(seq 1 30); do
-            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i /tmp/do_ssh "root@${IP}" true 2>/dev/null; then
-              echo "SSH up"; exit 0
-            fi
-            sleep 10
-          done
-          echo "SSH did not come up in time"; exit 1
+        uses: ./.github/actions/do-wait-ssh
+        with:
+          ip: ${{ steps.droplet.outputs.ip }}
 
       - name: Run the mempool load workload
         env:
@@ -361,21 +315,11 @@ jobs:
 
       - name: Teardown
         if: always()
-        env:
-          DROPLET_ID: ${{ steps.droplet.outputs.id }}
-          TEARDOWN: ${{ inputs.teardown_after_run && 'true' || 'false' }}
-          SSH_FAILED: ${{ steps.sshwait.outcome == 'failure' }}
-        run: |
-          set +e
+        uses: ./.github/actions/do-teardown
+        with:
+          droplet_id: ${{ steps.droplet.outputs.id }}
           # A droplet we can never SSH into is useless to keep for inspection.
-          if [ "${TEARDOWN}" != "true" ] && [ "${SSH_FAILED}" != "true" ]; then
-            echo "Droplet kept for inspection; the reaper deletes it ~24h after creation."
-            exit 0
-          fi
-          if [ -n "${DROPLET_ID}" ]; then
-            for _ in 1 2 3; do
-              doctl compute droplet delete "${DROPLET_ID}" -f && break
-              sleep 5
-            done
-          fi
-          true
+          # string-compare the input: it is null under any non-dispatch trigger,
+          # and this workflow defaults to tearing down, so null must not become
+          # "keep" and leak a droplet.
+          enabled: ${{ (format('{0}', inputs.teardown_after_run) != 'false' || steps.sshwait.outcome == 'failure') && 'true' || 'false' }}

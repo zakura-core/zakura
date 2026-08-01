@@ -1,0 +1,134 @@
+name: "Create a baked-image droplet"
+description: >-
+  Resolve the newest baked PR-node image (and optionally a chain-state volume
+  snapshot), then create a tagged droplet from them.
+
+inputs:
+  name:
+    description: "Droplet name"
+    required: true
+  size:
+    description: "Droplet size slug (disk must be >= the baked image's disk)"
+    required: true
+  ssh_fingerprint:
+    description: "DigitalOcean SSH key fingerprint (vars.DO_SSH_KEY_FINGERPRINT)"
+    required: true
+  tag:
+    description: "Droplet tag. Must be one the reaper sweeps, and is applied at creation so a later failure cannot leak an untagged droplet."
+    required: true
+  state_network:
+    description: "Attach a clone of the newest zakura-pr-state-<network>-* snapshot (mainnet/testnet). Empty starts with no state volume."
+    required: false
+    default: ""
+  state_snapshot_id:
+    description: "Attach this exact volume snapshot instead of resolving the newest snapshot for state_network."
+    required: false
+    default: ""
+  volume_name:
+    description: "Name for the cloned state volume. Required with state_network or state_snapshot_id, and must start with zakura-pr- so the reaper sweeps it if it leaks."
+    required: false
+    default: ""
+
+outputs:
+  id:
+    description: "Droplet ID"
+    value: ${{ steps.create.outputs.id }}
+  ip:
+    description: "Droplet public IPv4"
+    value: ${{ steps.create.outputs.ip }}
+  image_id:
+    description: "Image the droplet was created from"
+    value: ${{ steps.image.outputs.image_id }}
+  volume_id:
+    description: "Cloned state volume ID, empty when no state snapshot is requested"
+    value: ${{ steps.create.outputs.volume_id }}
+  volume_name:
+    description: "Cloned state volume name, empty when no state snapshot is requested"
+    value: ${{ steps.create.outputs.volume_name }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve baked image and state snapshot
+      id: image
+      shell: bash
+      env:
+        STATE_NETWORK: ${{ inputs.state_network }}
+        STATE_SNAPSHOT_ID: ${{ inputs.state_snapshot_id }}
+        VOLUME_NAME: ${{ inputs.volume_name }}
+      run: |
+        set -euo pipefail
+        # Image names are timestamped, so the lexical max is the newest bake.
+        IMAGE=$(doctl compute image list-user --format ID,Name --no-header | \
+          awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | tail -1 | awk '{print $2}')
+        if [ -z "${IMAGE}" ]; then
+          echo "no zakura-pr-node-* image found; run the 'PR node image bake' workflow first" >&2
+          exit 1
+        fi
+        echo "image_id=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+        if [ -z "${STATE_NETWORK}" ] && [ -z "${STATE_SNAPSHOT_ID}" ]; then
+          echo "vol_snap_id=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if [ -z "${VOLUME_NAME}" ]; then
+          echo "volume_name is required when state_network or state_snapshot_id is set" >&2
+          exit 1
+        fi
+        if [ -n "${STATE_SNAPSHOT_ID}" ]; then
+          echo "vol_snap_id=${STATE_SNAPSHOT_ID}" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        SNAP=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
+          awk -v pre="zakura-pr-state-${STATE_NETWORK}-" 'index($2, pre) == 1 {print $2, $1}' | \
+          sort | tail -1 | awk '{print $2}')
+        if [ -z "${SNAP}" ]; then
+          echo "no zakura-pr-state-${STATE_NETWORK}-* volume snapshot found; run the bake workflow first" >&2
+          exit 1
+        fi
+        echo "vol_snap_id=${SNAP}" >> "$GITHUB_OUTPUT"
+
+    - name: Create droplet
+      id: create
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        DROPLET_SIZE: ${{ inputs.size }}
+        SSH_FINGERPRINT: ${{ inputs.ssh_fingerprint }}
+        TAG: ${{ inputs.tag }}
+        IMAGE_ID: ${{ steps.image.outputs.image_id }}
+        VOL_SNAP_ID: ${{ steps.image.outputs.vol_snap_id }}
+        VOLUME_NAME: ${{ inputs.volume_name }}
+      run: |
+        set -euo pipefail
+        # nyc3 throughout: it must match the region the bake ran in, since the
+        # image and volume snapshots only exist there.
+        VOLUME_ARGS=()
+        if [ -n "${VOL_SNAP_ID}" ]; then
+          # A snapshot restore cannot shrink, so the clone takes the snapshot's
+          # own minimum disk size.
+          SIZE=$(doctl compute snapshot get "${VOL_SNAP_ID}" --format MinDiskSize --no-header)
+          VOLUME_ID=$(doctl compute volume create "${VOLUME_NAME}" \
+            --region nyc3 --snapshot "${VOL_SNAP_ID}" --size "${SIZE}GiB" \
+            --format ID --no-header)
+          VOLUME_ARGS=(--volumes "${VOLUME_ID}")
+          # Publish the volume before creating the droplet: a droplet create
+          # that fails (no capacity, size smaller than the image disk) would
+          # otherwise strand a volume the caller's teardown never learns about.
+          {
+            echo "volume_id=${VOLUME_ID}"
+            echo "volume_name=${VOLUME_NAME}"
+          } >> "$GITHUB_OUTPUT"
+        fi
+        doctl compute droplet create "${NAME}" \
+          --region nyc3 \
+          --size "${DROPLET_SIZE}" \
+          --image "${IMAGE_ID}" \
+          --ssh-keys "${SSH_FINGERPRINT}" \
+          "${VOLUME_ARGS[@]}" \
+          --tag-name "${TAG}" \
+          --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
+        {
+          echo "id=$(awk '{print $1}' /tmp/droplet.txt)"
+          echo "ip=$(awk '{print $2}' /tmp/droplet.txt)"
+        } >> "$GITHUB_OUTPUT"

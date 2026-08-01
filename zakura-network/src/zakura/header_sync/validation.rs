@@ -24,10 +24,6 @@ pub(super) fn previous_height(height: block::Height) -> Option<block::Height> {
     height.0.checked_sub(1).map(block::Height)
 }
 
-pub(super) fn height_after_count(start: block::Height, count: u32) -> Option<block::Height> {
-    start.0.checked_add(count).map(block::Height)
-}
-
 pub(super) fn range_end_height(start: block::Height, count: u32) -> Option<block::Height> {
     count
         .checked_sub(1)

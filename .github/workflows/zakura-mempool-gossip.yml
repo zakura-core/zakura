@@ -1,0 +1,211 @@
+name: Zakura mempool gossip
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Public network environment"
+        type: choice
+        options:
+          - testnet
+          - mainnet
+        default: testnet
+      duration_minutes:
+        description: "Transaction submission duration (1-60 minutes)"
+        required: true
+        default: "10"
+      amount:
+        description: "Self-send amount in ZEC/TAZ"
+        required: true
+        default: "0.0002"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zakura-mempool-gossip-${{ inputs.environment || 'testnet' }}
+  cancel-in-progress: false
+
+jobs:
+  gossip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs and environment
+        id: target
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.environment || 'testnet' }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes || '10' }}
+          AMOUNT: ${{ inputs.amount || '0.0002' }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${DURATION_MINUTES}" =~ ^[0-9]+$ ]] ||
+             [ "${DURATION_MINUTES}" -lt 1 ] ||
+             [ "${DURATION_MINUTES}" -gt 60 ]; then
+            echo "duration_minutes must be an integer between 1 and 60" >&2
+            exit 1
+          fi
+          if ! [[ "${AMOUNT}" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+             ! awk -v amount="${AMOUNT}" 'BEGIN { exit !(amount > 0) }'; then
+            echo "amount must be a positive decimal number" >&2
+            exit 1
+          fi
+          CONFIG="deploy/mempool-spam/envs/${TARGET_ENVIRONMENT}/config.json"
+          if [ ! -f "${CONFIG}" ]; then
+            echo "no live ${TARGET_ENVIRONMENT} config at ${CONFIG}" >&2
+            exit 1
+          fi
+          readarray -t TARGET < <(python3 - "${CONFIG}" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          config = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          controller = config["controller"]
+          print(controller["ssh_host"])
+          print(controller["spam_root"])
+          PY
+          )
+          HOST="${TARGET[0]}"
+          SPAM_ROOT="${TARGET[1]}"
+          if ! [[ "${HOST}" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+            echo "invalid controller ssh_host" >&2
+            exit 1
+          fi
+          if ! [[ "${SPAM_ROOT}" =~ ^/[a-zA-Z0-9._/-]+$ ]]; then
+            echo "invalid controller spam_root" >&2
+            exit 1
+          fi
+          {
+            echo "host=${HOST}"
+            echo "spam_root=${SPAM_ROOT}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Write SSH key
+        env:
+          ZAKURA_TESTNET_DEPLOY_SSH_KEY: ${{ secrets.ZAKURA_TESTNET_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 600 /dev/null /tmp/do_ssh
+          printf '%s\n' "${ZAKURA_TESTNET_DEPLOY_SSH_KEY}" > /tmp/do_ssh
+
+      - name: Sync harness to controller
+        env:
+          HOST: ${{ steps.target.outputs.host }}
+          SPAM_ROOT: ${{ steps.target.outputs.spam_root }}
+        run: |
+          set -euo pipefail
+          SSH=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh)
+          "${SSH[@]}" "root@${HOST}" "mkdir -p '${SPAM_ROOT}/harness'"
+          tar -C deploy/mempool-spam -czf - . |
+            "${SSH[@]}" "root@${HOST}" "tar -C '${SPAM_ROOT}/harness' -xzf -"
+
+      - name: Run timed gossip test
+        id: run
+        continue-on-error: true
+        env:
+          HOST: ${{ steps.target.outputs.host }}
+          SPAM_ROOT: ${{ steps.target.outputs.spam_root }}
+          TARGET_ENVIRONMENT: ${{ inputs.environment || 'testnet' }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes || '10' }}
+          AMOUNT: ${{ inputs.amount || '0.0002' }}
+        run: |
+          set -euo pipefail
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=180 \
+            -i /tmp/do_ssh "root@${HOST}" \
+            bash -s -- "${SPAM_ROOT}" "${TARGET_ENVIRONMENT}" "${DURATION_MINUTES}" "${AMOUNT}" <<'REMOTE'
+          set -euo pipefail
+          SPAM_ROOT=$1
+          TARGET_ENVIRONMENT=$2
+          DURATION_MINUTES=$3
+          AMOUNT=$4
+          PID_FILE="${SPAM_ROOT}/logs/round-robin.pid"
+          if [ -f "${PID_FILE}" ]; then
+            OLD_PID=$(<"${PID_FILE}")
+            if [[ "${OLD_PID}" =~ ^[0-9]+$ ]] && kill -0 "${OLD_PID}" 2>/dev/null; then
+              kill "${OLD_PID}"
+              for _ in {1..30}; do
+                kill -0 "${OLD_PID}" 2>/dev/null || break
+                sleep 1
+              done
+            fi
+          fi
+          mkdir -p "${SPAM_ROOT}/logs"
+          echo "$$" > "${PID_FILE}"
+          trap 'rm -f "${PID_FILE}"' EXIT
+          python3 "${SPAM_ROOT}/harness/scripts/round_robin_selfsend.py" \
+            --environment "${TARGET_ENVIRONMENT}" \
+            --duration-minutes "${DURATION_MINUTES}" \
+            --amount "${AMOUNT}" \
+            --require-all-seen \
+            --require-mined
+          REMOTE
+
+      - name: Collect reports
+        if: always() && steps.target.outputs.host != ''
+        env:
+          HOST: ${{ steps.target.outputs.host }}
+          SPAM_ROOT: ${{ steps.target.outputs.spam_root }}
+        run: |
+          set +e
+          mkdir -p /tmp/mempool-spam-report
+          for file in report.json report.md round-robin.jsonl; do
+            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -i /tmp/do_ssh \
+              "root@${HOST}:${SPAM_ROOT}/logs/${file}" \
+              "/tmp/mempool-spam-report/${file}"
+          done
+          true
+
+      - name: Guard report artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          if find /tmp/mempool-spam-report -type f \
+            \( -iname '*mnemonic*' -o -iname '*recovery*' -o -iname '*identity*' \
+               -o -iname '*keys.toml*' -o -iname '*wallet*' -o -iname '*seed*' \) \
+            -print -quit | grep -q .; then
+            echo "refusing to upload a key-material artifact" >&2
+            rm -rf /tmp/mempool-spam-report
+            exit 1
+          fi
+          if grep -rlE 'mnemonic|age_identity|secret_key|recovery.json' \
+            /tmp/mempool-spam-report 2>/dev/null | grep -q .; then
+            echo "refusing to upload report content that looks like key material" >&2
+            rm -rf /tmp/mempool-spam-report
+            exit 1
+          fi
+
+      - name: Write job summary
+        if: always()
+        run: |
+          if [ -f /tmp/mempool-spam-report/report.md ]; then
+            cat /tmp/mempool-spam-report/report.md >> "${GITHUB_STEP_SUMMARY}"
+          else
+            printf '## Mempool spam report\n\nNo report was produced; see the job log.\n' \
+              >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: zakura-mempool-gossip-${{ inputs.environment || 'testnet' }}-${{ github.run_id }}
+          path: /tmp/mempool-spam-report/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Enforce gossip result
+        if: always()
+        env:
+          RUN_OUTCOME: ${{ steps.run.outcome }}
+        run: |
+          if [ "${RUN_OUTCOME}" != "success" ]; then
+            echo "timed gossip test failed; inspect the report and run log" >&2
+            exit 1
+          fi

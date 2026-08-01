@@ -15,7 +15,7 @@ funds, and no public peers. No Mainnet state and no real value are involved.
 
 | File | Role |
 | --- | --- |
-| `mempool-load-lab.py` | Generates the chain, rewrites per-node configs, seeds/starts/stops nodes, runs the blast, collects artifacts |
+| `mempool-load-lab.py` | Generates the chain, starts/stops nodes, runs the blast, collects artifacts (per-node config localization and chain seeding are delegated to `kresko localize-fleet` / `kresko seed-local`) |
 | `mempool-load-monitor.py` | Samples every node, derives the numbers, writes `summary.json` / `summary.md`, sets the verdict |
 | `mempool-load-compare.py` | Renders a baseline-vs-target regression table |
 | `mempool-load-run.sh` | Droplet entrypoint used by `zakura-mempool-load.yml` |
@@ -68,9 +68,20 @@ Each of these encodes a failure a real run actually produced.
 
 **Nodes bind distinct loopback addresses, not distinct ports.** Kresko fixes one
 p2p/RPC port per host (18233/18232) because it assumes one node per machine.
-Giving each node its own `127.0.0.x` lets Kresko's generated configs and peer
-lists be used almost as-is. Addresses start at `127.0.0.101`: a dev box or
-droplet very often already has something on `127.0.0.1`.
+Giving each node its own `127.0.0.x` lets `kresko localize-fleet` re-point each
+generated config at that node's own address and directories without a port
+remap. Addresses start at `127.0.0.101`: a dev box or droplet very often already
+has something on `127.0.0.1`.
+
+**Per-node config localization and seeding live in Kresko.** The lab used to
+rewrite each generated config in Python (`prepare_node_dirs`) and submit the
+genesis/premine blocks itself. That work is now `kresko localize-fleet` (binds,
+per-node directories, metrics endpoint, internal-miner flag, cleared public
+peers, regenerated loopback peer list) and `kresko seed-local` (the
+`submitblock` loop), keeping the rewrite colocated with the config generation it
+depends on and covered by Kresko's own unit tests. The lab still owns node
+process lifecycle (`spawn`/`up`/`down`, port preflight, peering and convergence
+gates).
 
 **`up` refuses to start if any port is taken.** Without that check, a node that
 fails to bind leaves the lab talking to whatever else owns the port — which in
@@ -87,14 +98,17 @@ lab routinely reads `2 / 0 / 1`.
 Resubmitting genesis to a node whose tip has moved past it returns a bare
 `rejected`, which reads like a chain failure rather than "this already ran".
 
-**`prepare_node_dirs` owns the peer list.** Kresko bakes peer addresses at
-genesis time. Regenerating them at start time keeps `up` correct if the node
+**`kresko localize-fleet` owns the peer list.** Kresko bakes peer addresses at
+genesis time. Regenerating them at localize time keeps `up` correct if the node
 count or address base changes; a stale list silently produces a 0-peer network.
 
-**Config rewrites are addressed by `section.key`.** The same key name recurs
-across sections — `cache_dir` is both the peer cache and the state DB,
+**Config value rewrites are addressed by `section.key`.** The same key name
+recurs across sections — `cache_dir` is both the peer cache and the state DB,
 `listen_addr` appears three times. A bare-key rewrite hits only the first, which
-left every node sharing one RocksDB.
+left every node sharing one RocksDB. `localize-fleet` addresses each by its full
+dotted path; the array clears (public seed peers) match by bare key across every
+section, exactly as before. See Kresko's `zebra_config::set_toml_values` /
+`set_toml_arrays` and their unit tests.
 
 **Teardown escalates and reports.** `down` walks SIGINT → SIGTERM → SIGKILL and
 keeps any PID it could not kill in `pids.json`, exiting non-zero. The blaster is

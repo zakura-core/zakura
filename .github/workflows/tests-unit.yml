@@ -56,6 +56,90 @@ env:
   COLORBT_SHOW_HIDDEN: 1
 
 jobs:
+  # Decide whether this change can affect generated or historical zakurad
+  # configuration. Scheduled runs have no source change to check, while manual
+  # runs explicitly request the complete workflow.
+  changes:
+    name: detect config-relevant changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      config: ${{ steps.filter.outputs.config }}
+    steps:
+      - id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request)
+              changed=$(gh api --paginate \
+                "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+                --jq '.[].filename')
+              ;;
+            push)
+              # The first push of a branch and force-pushes that orphan the old
+              # tip have no usable `before` commit. Compare against the default
+              # branch in that case.
+              if [[ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]] || \
+                 ! changed=$(gh api \
+                   "repos/${GITHUB_REPOSITORY}/compare/${BEFORE_SHA}...${GITHUB_SHA}" \
+                   --jq '.files[].filename'); then
+                changed=$(gh api \
+                  "repos/${GITHUB_REPOSITORY}/compare/${DEFAULT_BRANCH}...${GITHUB_SHA}" \
+                  --jq '.files[].filename')
+              fi
+              ;;
+            merge_group)
+              changed=$(gh api \
+                "repos/${GITHUB_REPOSITORY}/compare/${MERGE_BASE_SHA}...${MERGE_HEAD_SHA}" \
+                --jq '.files[].filename')
+              ;;
+            workflow_dispatch)
+              echo "config=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            schedule)
+              echo "config=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          config=false
+          while IFS= read -r path; do
+            case "$path" in
+              Cargo.toml | Cargo.lock | rust-toolchain.toml | \
+              zakurad/Cargo.toml | zakura-chain/Cargo.toml | \
+              zakura-consensus/Cargo.toml | zakura-network/Cargo.toml | \
+              zakura-rpc/Cargo.toml | zakura-state/Cargo.toml | \
+              */build.rs | \
+              zakurad/src/* | \
+              zakura-chain/src/parameters/* | \
+              zakura-consensus/src/config.rs | \
+              zakura-network/src/config.rs | zakura-network/src/config/* | \
+              zakura-network/src/zakura/handler.rs | \
+              zakura-rpc/src/config.rs | zakura-rpc/src/config/* | \
+              zakura-state/src/config.rs | \
+              zakurad/tests/acceptance.rs | zakurad/tests/common/* | \
+              .config/nextest.toml | \
+              .github/actions/setup-zakura-build/* | \
+              .github/workflows/tests-unit.yml)
+                config=true
+                break
+                ;;
+            esac
+          done <<< "$changed"
+
+          echo "config=$config" >> "$GITHUB_OUTPUT"
+
   # Compile the whole workspace and every test binary ONCE, then hand the result
   # to the shard jobs as a nextest archive. Previously each of the 3 shards ran
   # `cargo nextest run`, so each recompiled the full workspace + all dependencies
@@ -79,8 +163,8 @@ jobs:
         with:
           toolchain: stable
           # PR debug builds restore the cache populated by the main-branch
-          # config job. Main and nightly runs keep separate caches because main
-          # uses `ci-tests`, while nightly uses the exact release profile.
+          # pruned-storage job. Main and nightly runs keep separate caches because
+          # main uses `ci-tests`, while nightly uses the exact release profile.
           cache-shared-key: ${{ github.event_name == 'pull_request' && 'zakura-drb-debug' || (github.event_name == 'schedule' && 'unit-tests-release' || 'unit-tests-ci-tests') }}
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -164,6 +248,8 @@ jobs:
 
   zakura-config:
     name: zakura config compatibility
+    needs: [build-tests, changes]
+    if: needs.changes.outputs.config == 'true'
     permissions:
       contents: read
       id-token: write
@@ -177,21 +263,19 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
           toolchain: stable
-          # These acceptance jobs all do the same debug build of the workspace
-          # with the same features, so they share one build cache instead of each
-          # keeping its own multi-GB copy. `cache-shared-key` (unlike `cache-key`,
-          # which only appends to a per-job key and never shares) is stable across
-          # jobs, consolidating their cache entries across workflow runs.
-          cache-shared-key: zakura-drb-debug
-          cache-on-failure: true
-          # This is the only writer for the shared debug cache.
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          # The test binaries come from build-tests, so this job does not compile.
+          cache: false
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
+      - name: Download nextest archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}
       - name: Check generated zakurad config compatibility
-        run: cargo nextest run --profile zakura-config --locked --features default-release-binaries --no-fail-fast
+        run: cargo nextest run --profile zakura-config --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst" --no-fail-fast
 
   network-dependent:
     name: network-dependent acceptance tests
@@ -236,7 +320,10 @@ jobs:
           toolchain: stable
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
-          cache-save-if: false
+          # This main-only debug build is the sole writer for the shared cache.
+          # If this job is removed or stops compiling, move cache ownership to
+          # network-dependent or a dedicated main-branch debug build job.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
         with:
           tool: cargo-nextest
@@ -278,6 +365,7 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     needs:
+      - changes
       - build-tests
       - unit-tests
       - zakura-config
@@ -290,9 +378,9 @@ jobs:
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          # The release-only dependency check is skipped outside its event scope.
+          # These jobs are skipped outside their event or changed-path scope.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config
 
   report-nightly-result:
     name: report nightly release test result

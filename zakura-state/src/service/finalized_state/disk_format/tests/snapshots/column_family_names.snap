@@ -1,6 +1,6 @@
 ---
-source: zebra-state/src/service/finalized_state/disk_format/tests/snapshot.rs
-assertion_line: 77
+source: zakura-state/src/service/finalized_state/disk_format/tests/snapshot.rs
+assertion_line: 78
 expression: cf_names
 ---
 [
@@ -11,6 +11,7 @@ expression: cf_names
   "default",
   "hash_by_height",
   "hash_by_tx_loc",
+  "header_root_auth_frontier",
   "height_by_hash",
   "history_tree",
   "ironwood_anchors",

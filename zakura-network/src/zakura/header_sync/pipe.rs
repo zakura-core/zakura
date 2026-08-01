@@ -589,6 +589,8 @@ mod tests {
         let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
         let (_candidates_tx, candidates) =
             watch::channel(ZakuraHeaderSyncCandidateState::default());
+        let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+        let _ = &backoff_deadlines_tx;
         (
             HeaderSyncHandle {
                 events,
@@ -596,6 +598,7 @@ mod tests {
                 tip,
                 peers,
                 candidates,
+                backoff_deadlines,
             },
             events_rx,
         )
@@ -614,6 +617,8 @@ mod tests {
         let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
         let (_candidates_tx, candidates) =
             watch::channel(ZakuraHeaderSyncCandidateState::default());
+        let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+        let _ = &backoff_deadlines_tx;
         (
             HeaderSyncHandle {
                 events,
@@ -621,6 +626,7 @@ mod tests {
                 tip,
                 peers,
                 candidates,
+                backoff_deadlines,
             },
             events_rx,
         )

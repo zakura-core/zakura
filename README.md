@@ -96,12 +96,7 @@ compiler. Below are quick summaries for installing these dependencies.
 sudo pacman -S rust clang protobuf
 ```
 
-Note that the package `clang` includes `libclang` as well. The GCC version on
-Arch Linux has a broken build script in a `rocksdb` dependency. A workaround is:
-
-```sh
-export CXXFLAGS="$CXXFLAGS -include cstdint"
-```
+Note that the package `clang` includes `libclang` as well.
 
 </details>
 
@@ -114,7 +109,7 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.0.3 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.0.5 zakura
 ```
 
 You can start Zakura by running

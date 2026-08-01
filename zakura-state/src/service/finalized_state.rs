@@ -22,6 +22,7 @@ use std::{
     },
 };
 
+use tokio::sync::oneshot;
 use zakura_chain::{
     block, ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
@@ -114,7 +115,12 @@ pub use vct::{
     generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
     GeneratorError, NextVctBlock,
 };
-pub use zakura_db::commitment_roots_db::COMMITMENT_ROOTS_BY_HEIGHT;
+#[allow(unused_imports)]
+pub use zakura_db::commitment_roots_db::{
+    AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,
+    HeaderRootAuthFrontier, HeaderRootAuthFrontierError, HeaderRootAuthState, HeaderRootAuthUpdate,
+    HeaderWitnessState, COMMITMENT_ROOTS_BY_HEIGHT, HEADER_ROOT_AUTH_FRONTIER,
+};
 pub use zakura_db::highest_completed_checkpoint::*;
 pub use zakura_db::ZakuraDb;
 
@@ -179,6 +185,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     BLOCK_INFO,
     // Verified-commitment-trees serving index
     COMMITMENT_ROOTS_BY_HEIGHT,
+    HEADER_ROOT_AUTH_FRONTIER,
     // Storage policy
     PRUNING_METADATA,
     VCT_SYNC_METADATA,
@@ -558,7 +565,11 @@ impl FinalizedState {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         next_vct_block: Option<NextVctBlock>,
     ) -> Result<
-        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (
+            CheckpointVerifiedBlock,
+            NoteCommitmentTrees,
+            oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
+        ),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
     > {
         let (checkpoint_verified, rsp_tx) = ordered_block;
@@ -587,9 +598,11 @@ impl FinalizedState {
         };
 
         match result {
-            Ok((hash, note_commitment_trees)) => {
-                let _ = rsp_tx.send(Ok(hash));
-                Ok((checkpoint_verified, note_commitment_trees))
+            // Leave the oneshot pending until the write loop publishes auth state and
+            // the chain tip. Callers that await the commit response then wait for a tip
+            // change must not resume between the DB commit and those notifications.
+            Ok((_hash, note_commitment_trees)) => {
+                Ok((checkpoint_verified, note_commitment_trees, rsp_tx))
             }
             Err(error) => Err(((checkpoint_verified, rsp_tx), error)),
         }
@@ -682,7 +695,7 @@ impl FinalizedState {
                         // Defense in depth: only a witness that links to this block can
                         // authenticate its roots — a non-successor's commitment binds a
                         // different parent tree, so verifying against it would fail and
-                        // wrongly evict a good supplied root. Treat a non-linking witness
+                        // wrongly reject a good supplied root. Treat a non-linking witness
                         // as absent, so the await-successor deferral below handles it. The
                         // header-store lookup only returns direct successors, so this
                         // should never fire in production.
@@ -711,8 +724,8 @@ impl FinalizedState {
                         // A successful look-ahead check authenticates both this header and
                         // its NU5+ auth-data root. A same-header body with a different root
                         // can never become valid by replacing the supplied note-commitment
-                        // roots, so reject the body without evicting those roots or entering
-                        // the write loop's retry path.
+                        // roots, so reject the body outright, without touching the stored
+                        // roots or entering the write loop's retry path.
                         if let (
                             Some((
                                 prevalidated_height,
@@ -918,7 +931,7 @@ impl FinalizedState {
                     } else if self.vct.is_below_last_checkpoint() {
                         // Frozen-frontier safety: a fast sync has already frozen the
                         // note-commitment frontier, but this height has no valid supplied root
-                        // (never fetched, or evicted after failing verification). Recomputing
+                        // (not yet authenticated, or rejected by verification). Recomputing
                         // here would fold a wrong root into the history MMR and corrupt state,
                         // so refuse with a retryable error and leave the database untouched —
                         // the block is committed once a verifiable root is fetched from a peer.
@@ -1175,17 +1188,24 @@ impl FinalizedState {
             return None;
         }
 
-        let roots = self
+        let auth_data_root = self
             .db
-            .zakura_header_commitment_roots_by_height_range(successor_height..=successor_height)
+            .commitment_roots_by_height_range(successor_height..=successor_height)
             .into_iter()
             .next()
-            .filter(|roots| roots.height == successor_height)?;
+            .filter(|roots| roots.height == successor_height)
+            .map(|roots| roots.auth_data_root)
+            .or_else(|| {
+                self.db.header_witness_auth_data_root(
+                    successor_height,
+                    block::Hash::from(header.as_ref()),
+                )
+            })?;
 
         Some(NextVctBlock::from_header(
             header,
             successor_height,
-            roots.auth_data_root,
+            auth_data_root,
         ))
     }
 
@@ -1217,13 +1237,12 @@ impl FinalizedState {
 
     /// Reject a supplied fast-path root that failed verification for `height`.
     ///
-    /// Evicts the bad root from the source so it is never re-read, and returns a typed,
-    /// retryable error. In fast mode the note-commitment frontier is frozen, so the
-    /// committer cannot recompute the root locally (that would fold a wrong root into the
-    /// history MMR); it must refuse and leave the database untouched rather than persist
-    /// or corrupt state. Roots are not individually re-requested: the hole is only filled
-    /// if the same header range is re-delivered (for example by another fanout peer's
-    /// in-flight response), otherwise the commit stays parked and the §8 stall
+    /// Returns a typed, retryable error. In fast mode the note-commitment frontier is
+    /// frozen, so the committer cannot recompute the root locally (that would fold a
+    /// wrong root into the history MMR); it must refuse and leave the database untouched
+    /// rather than persist or corrupt state. The stored row is authenticated durable
+    /// state and is not deleted — deleting it individually would create a gap below the
+    /// persisted authentication frontier — so the commit stays parked and the §8 stall
     /// metrics/logs surface it. A wrong root therefore never corrupts state, at the cost
     /// of stalling the sync at this height.
     fn vct_reject_supplied_root(
@@ -1231,14 +1250,11 @@ impl FinalizedState {
         height: block::Height,
         error: ValidateContextError,
     ) -> CommitCheckpointVerifiedError {
-        if let Some(v) = self.vct.source() {
-            v.invalidate_fast_root(height);
-        }
         metrics::counter!("state.vct.root.rejected.count").increment(1);
         tracing::warn!(
             ?height,
             ?error,
-            "VCT: supplied commitment root failed verification; evicted so it is never re-read"
+            "VCT: supplied commitment root failed verification; refusing to commit this block"
         );
         ValidateContextError::VctSuppliedRootUnavailable { height }.into()
     }

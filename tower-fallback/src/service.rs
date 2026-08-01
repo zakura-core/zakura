@@ -31,6 +31,14 @@ impl<S1, S2: Clone> Fallback<S1, S2> {
     pub fn new(svc1: S1, svc2: S2) -> Self {
         Self { svc1, svc2 }
     }
+
+    /// Returns the primary service.
+    ///
+    /// Requests are first attempted using this service, before retrying on the
+    /// fallback service.
+    pub fn primary(&self) -> &S1 {
+        &self.svc1
+    }
 }
 
 impl<S1, S2, Request> Service<Request> for Fallback<S1, S2>

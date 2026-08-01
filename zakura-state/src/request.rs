@@ -829,6 +829,42 @@ impl MappedRequest for CommitCheckpointVerifiedBlockRequest {
     }
 }
 
+/// Authenticate canonical supplied header roots through the serialized state writer.
+pub struct AuthenticateHeaderRootsRequest {
+    /// Exact compact state snapshot used to construct this request.
+    pub expected_state: crate::HeaderRootAuthState,
+    /// Current authenticated frontier hash.
+    pub anchor: block::Hash,
+    /// First supplied item height.
+    pub start: block::Height,
+    /// Canonical stored headers.
+    pub headers: Vec<Arc<block::Header>>,
+    /// Roots aligned with `headers`.
+    pub roots: Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>,
+}
+
+impl MappedRequest for AuthenticateHeaderRootsRequest {
+    type MappedResponse = crate::AuthenticatedHeaderRoots;
+    type Error = crate::AuthenticateHeaderRootsError;
+
+    fn map_request(self) -> Request {
+        Request::AuthenticateHeaderRoots {
+            expected_state: self.expected_state,
+            anchor: self.anchor,
+            start: self.start,
+            headers: self.headers,
+            roots: self.roots,
+        }
+    }
+
+    fn map_response(response: Response) -> Self::MappedResponse {
+        match response {
+            Response::AuthenticatedHeaderRoots(success) => success,
+            _ => unreachable!("wrong response variant for request"),
+        }
+    }
+}
+
 /// Request to invalidate a block in the state.
 ///
 /// See the [`crate`] documentation and [`Request::InvalidateBlock`] for details.
@@ -969,11 +1005,30 @@ pub enum Request {
         ///
         /// A `0` value means unknown. These hints are not consensus data.
         body_sizes: Vec<u32>,
-        /// Tree-aux roots, parallel to `headers`.
+        /// Legacy tree-aux payload, ignored by header validity and persistence.
         ///
-        /// Every non-empty Zakura header range must provide one root per header.
-        /// Roots are advisory until verified during block commit.
+        /// Call [`Request::AuthenticateHeaderRoots`] after the canonical headers
+        /// are durable to authenticate and promote aligned roots.
         tree_aux_roots: Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>,
+    },
+
+    /// Authenticate aligned roots for canonical stored headers and durably promote them.
+    ///
+    /// The range must start immediately after `expected_state`'s authenticated
+    /// height. Normal advancement includes at least one root plus its successor
+    /// header witness; an explicitly scheduled missing-witness recovery contains
+    /// exactly the terminal witness record.
+    AuthenticateHeaderRoots {
+        /// Exact compact state snapshot on which the caller built this request.
+        expected_state: crate::HeaderRootAuthState,
+        /// Current authenticated frontier hash.
+        anchor: block::Hash,
+        /// First supplied header and root height.
+        start: block::Height,
+        /// Canonical stored headers in ascending contiguous order.
+        headers: Vec<Arc<block::Header>>,
+        /// Roots aligned one-for-one with `headers`.
+        roots: Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>,
     },
 
     /// Computes the depth in the current best chain of the block identified by the given hash.
@@ -1189,6 +1244,7 @@ impl Request {
             Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::CommitHeaderRange { .. } => "commit_header_range",
+            Request::AuthenticateHeaderRoots { .. } => "authenticate_header_roots",
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Depth(_) => "depth",
             Request::Tip => "tip",
@@ -1233,9 +1289,10 @@ pub enum ReadRequest {
     /// with the current disk space usage in bytes.
     UsageInfo,
 
-    /// Returns [`ReadResponse::IsPruned(bool)`](ReadResponse::IsPruned)
-    /// with whether the database has pruned historical data.
-    IsPruned,
+    /// Returns [`ReadResponse::PruningInfo`](ReadResponse::PruningInfo) with
+    /// whether this node's block data is subject to pruning, and the lowest
+    /// height at and above which every block body is retained.
+    PruningInfo,
 
     /// Returns [`ReadResponse::Tip(Option<(Height, block::Hash)>)`](ReadResponse::Tip)
     /// with the current best chain tip.
@@ -1443,8 +1500,11 @@ pub enum ReadRequest {
         count: u32,
     },
 
-    /// Returns the highest header held on disk.
-    BestHeaderTip,
+    /// Returns the highest contiguous header held in the durable full-block/header database.
+    ///
+    /// This request never consults the in-memory non-finalized chain, so its
+    /// result is safe to use as a [`Request::CommitHeaderRange`] anchor.
+    BestDurableHeaderTip,
 
     /// Returns header-known, body-missing heights in `(verified_block_tip, best_header_tip]`.
     MissingBlockBodies {
@@ -1660,7 +1720,7 @@ impl ReadRequest {
     pub fn variant_name(&self) -> &'static str {
         match self {
             ReadRequest::UsageInfo => "usage_info",
-            ReadRequest::IsPruned => "is_pruned",
+            ReadRequest::PruningInfo => "pruning_info",
             ReadRequest::Tip => "tip",
             ReadRequest::FinalizedTip => "finalized_tip",
             ReadRequest::TipPoolValues => "tip_pool_values",
@@ -1681,7 +1741,7 @@ impl ReadRequest {
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
             ReadRequest::HeadersByHeightRange { .. } => "headers_by_height_range",
             ReadRequest::BlockRoots { .. } => "block_roots",
-            ReadRequest::BestHeaderTip => "best_header_tip",
+            ReadRequest::BestDurableHeaderTip => "best_durable_header_tip",
             ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",
             ReadRequest::MissingBlockBodyMetadata { .. } => "missing_block_body_metadata",
             ReadRequest::BlockSizeHints { .. } => "block_size_hints",
@@ -1762,6 +1822,7 @@ impl TryFrom<Request> for ReadRequest {
             Request::CommitSemanticallyVerifiedBlock(_)
             | Request::CommitCheckpointVerifiedBlock(_)
             | Request::CommitHeaderRange { .. }
+            | Request::AuthenticateHeaderRoots { .. }
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),
 
@@ -1784,6 +1845,53 @@ impl TryFrom<Request> for ReadRequest {
 pub struct TimedSpan {
     timer: CodeTimer,
     span: tracing::Span,
+}
+
+#[cfg(test)]
+mod header_root_auth_tests {
+    use super::*;
+
+    #[test]
+    fn typed_header_root_auth_request_dispatches_typed_response() {
+        let state = crate::HeaderRootAuthState {
+            authenticated_height: block::Height(10),
+            authenticated_hash: block::Hash([1; 32]),
+            completed_checkpoint_height: block::Height(20),
+            completed_checkpoint_hash: block::Hash([2; 32]),
+            header_witness: None,
+        };
+        let request = AuthenticateHeaderRootsRequest {
+            expected_state: state,
+            anchor: state.authenticated_hash,
+            start: block::Height(11),
+            headers: Vec::new(),
+            roots: Vec::new(),
+        }
+        .map_request();
+        assert_eq!(request.variant_name(), "authenticate_header_roots");
+        assert!(matches!(
+            request,
+            Request::AuthenticateHeaderRoots {
+                expected_state,
+                anchor,
+                start: block::Height(11),
+                ..
+            } if expected_state == state && anchor == state.authenticated_hash
+        ));
+
+        let success = crate::AuthenticatedHeaderRoots {
+            state,
+            update: crate::HeaderRootAuthUpdate::Advanced {
+                authenticated: block::Height(11)..=block::Height(19),
+            },
+        };
+        assert_eq!(
+            AuthenticateHeaderRootsRequest::map_response(Response::AuthenticatedHeaderRoots(
+                success.clone()
+            )),
+            success
+        );
+    }
 }
 
 impl TimedSpan {

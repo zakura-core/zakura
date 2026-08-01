@@ -1724,6 +1724,10 @@ where
 {
     /// Update the connection state metrics for this connection,
     /// using `extra_state_info` as additional state information.
+    ///
+    /// Counts live connections by `command` only. Per-addr gauges are not used:
+    /// setting them to zero after disconnect still leaves zombie series in the
+    /// Prometheus exporter and balloons `/metrics` during long syncs.
     fn update_state_metrics(&mut self, extra_state_info: impl Into<Option<String>>) {
         let current_metrics_state = if let Some(extra_state_info) = extra_state_info.into() {
             format!("{}::{extra_state_info}", self.state.command()).into()
@@ -1737,26 +1741,24 @@ where
 
         self.erase_state_metrics();
 
-        // Set the new state
+        // Count this connection in the aggregate live-state gauge.
         metrics::gauge!(
             "zakura.net.connection.state",
             "command" => current_metrics_state.clone(),
-            "addr" => self.addr_label.clone(),
         )
         .increment(1.0);
 
         self.last_metrics_state = Some(current_metrics_state);
     }
 
-    /// Erase the connection state metrics for this connection.
+    /// Decrement the aggregate connection state gauge for this connection.
     fn erase_state_metrics(&mut self) {
         if let Some(last_metrics_state) = self.last_metrics_state.take() {
             metrics::gauge!(
                 "zakura.net.connection.state",
                 "command" => last_metrics_state,
-                "addr" => self.addr_label.clone(),
             )
-            .set(0.0);
+            .decrement(1.0);
         }
     }
 

@@ -104,7 +104,7 @@ pub(super) fn mainnet_block(height: u32) -> Arc<Block> {
         .expect("mainnet test block deserializes")
 }
 
-/// Fabricates provisional commitment roots for `height`, with the zeroed
+/// Fabricates fixture commitment roots for `height`, with the zeroed
 /// auth-data root marking them as unverified.
 pub(super) fn root_at(height: Height) -> BlockCommitmentRoots {
     BlockCommitmentRoots {

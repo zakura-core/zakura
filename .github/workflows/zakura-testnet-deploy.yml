@@ -302,7 +302,7 @@ jobs:
           [Service]
           Type=simple
           WorkingDirectory=/opt/zakura-testnet-dashboard
-          ExecStart=/usr/bin/python3 /opt/zakura-testnet-dashboard/zakura-cluster-status.py --config /opt/zakura-testnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --interval 10 --stale-after 300 --upgrade-height 4134000 --target-spacing 7.5
+          ExecStart=/usr/bin/python3 /opt/zakura-testnet-dashboard/zakura-cluster-status.py --config /opt/zakura-testnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --network testnet --interval 10 --stale-after 300 --upgrade-height 4134000 --target-spacing 7.5 --state-file /var/lib/zakura-testnet-dashboard/orphan-pairs.json
           Restart=always
           RestartSec=5
 
@@ -350,6 +350,33 @@ jobs:
           sudo systemctl enable zakura-testnet-snapshots.service
           sudo systemctl restart zakura-testnet-snapshots.service
           sudo systemctl --no-pager --full status zakura-testnet-snapshots.service || true
+
+      - name: Install public broadcast gateway
+        if: always()
+        run: |
+          set -euo pipefail
+
+          gateway_dir="/opt/zakura-gateway-testnet"
+          sudo install -d -m 755 "$gateway_dir"
+          sudo install -m 755 deploy/gateway/broadcast.py "$gateway_dir/broadcast.py"
+          sudo install -m 644 deploy/gateway/testnet/backends.toml \
+            "$gateway_dir/backends.toml"
+          sudo install -m 644 deploy/gateway/testnet/broadcast.service \
+            /etc/systemd/system/zakura-broadcast-testnet.service
+
+          # Keep ironwood/status hosts and the broadcast TLS front door in sync.
+          sudo install -m 644 deploy/gateway/testnet/Caddyfile /etc/caddy/Caddyfile
+          sudo caddy validate --config /etc/caddy/Caddyfile
+          sudo systemctl reload caddy.service
+
+          sudo rm -rf /opt/zakura-broadcast-testnet
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable zakura-broadcast-testnet.service
+          sudo systemctl restart zakura-broadcast-testnet.service
+          sudo systemctl --no-pager --full status zakura-broadcast-testnet.service || true
+          curl -fsS "http://127.0.0.1:8092/healthz"
+          echo
 
       - name: Fetch recent logs on failure
         if: failure()

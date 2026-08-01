@@ -20,7 +20,7 @@ use zakura_chain::{
     parameters::{
         testnet::{self, Parameters},
         Network::*,
-        NetworkKind,
+        NetworkKind, POST_BLOSSOM_POW_TARGET_SPACING,
     },
     serialization::{DateTime32, ZcashDeserializeInto, ZcashSerialize},
     transaction::{zip317, UnminedTxId, VerifiedUnminedTx},
@@ -113,6 +113,189 @@ async fn rpc_getinfo() {
     // The queue task should continue without errors or panics
     let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
     assert!(rpc_tx_queue_task_result.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getdeprecationinfo_uses_latest_checkpoint_without_tip() {
+    let _init_guard = zakura_test::init();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let deprecation_info = rpc
+        .get_deprecation_info()
+        .await
+        .expect("getdeprecationinfo should succeed");
+    assert_eq!(deprecation_info.end_of_service, None);
+
+    let checkpoint_height = Mainnet.checkpoint_list().max_height();
+    let end_of_support_height = Height(
+        checkpoint_height
+            .0
+            .checked_add(100_000)
+            .expect("test checkpoint height is far below the maximum height"),
+    );
+    let rpc = rpc.with_end_of_support_height(Some(end_of_support_height));
+    let remaining_blocks = i64::from(end_of_support_height.0) - i64::from(checkpoint_height.0);
+    let expected_offset = remaining_blocks * i64::from(POST_BLOSSOM_POW_TARGET_SPACING)
+        - END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN;
+
+    let before = Utc::now().timestamp();
+    let end_of_service = rpc
+        .get_deprecation_info()
+        .await
+        .expect("getdeprecationinfo should succeed")
+        .end_of_service
+        .expect("end_of_service should be present when a height is set");
+    let after = Utc::now().timestamp();
+
+    assert_eq!(end_of_service.block_height, end_of_support_height.0);
+    assert!(end_of_service.estimated_time >= before + expected_offset);
+    assert!(end_of_service.estimated_time <= after + expected_offset);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getdeprecationinfo_estimates_time_from_tip_with_safety_margin() {
+    let _init_guard = zakura_test::init();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (latest_chain_tip, latest_chain_tip_sender) = MockChainTip::new();
+    let tip_height = Height(3_000_000);
+    latest_chain_tip_sender.send_best_tip_height(tip_height);
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        latest_chain_tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let end_of_support_height = Height(3_546_440);
+    let rpc = rpc.with_end_of_support_height(Some(end_of_support_height));
+    let remaining_blocks = i64::from(end_of_support_height.0 - tip_height.0);
+    let expected_offset = remaining_blocks * i64::from(POST_BLOSSOM_POW_TARGET_SPACING)
+        - END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN;
+
+    let before = Utc::now().timestamp();
+    let end_of_service = rpc
+        .get_deprecation_info()
+        .await
+        .expect("getdeprecationinfo should succeed")
+        .end_of_service
+        .expect("end_of_service should be present when a height is set");
+    let after = Utc::now().timestamp();
+
+    assert_eq!(end_of_service.block_height, end_of_support_height.0);
+    assert!(end_of_service.estimated_time >= before + expected_offset);
+    assert!(end_of_service.estimated_time <= after + expected_offset);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getdeprecationinfo_omits_end_of_service_off_mainnet() {
+    let _init_guard = zakura_test::init();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = RpcImpl::new(
+        Network::new_default_testnet(),
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let rpc = rpc.with_end_of_support_height(Some(Height(100)));
+    let deprecation_info = rpc
+        .get_deprecation_info()
+        .await
+        .expect("getdeprecationinfo should succeed");
+    assert_eq!(deprecation_info.end_of_service, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getdeprecationinfo_estimated_time_is_never_negative() {
+    let _init_guard = zakura_test::init();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (latest_chain_tip, latest_chain_tip_sender) = MockChainTip::new();
+    latest_chain_tip_sender.send_best_tip_height(Height::MAX);
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        latest_chain_tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+    let rpc = rpc.with_end_of_support_height(Some(Height(1)));
+
+    let end_of_service = rpc
+        .get_deprecation_info()
+        .await
+        .expect("getdeprecationinfo should succeed")
+        .end_of_service
+        .expect("end_of_service should be present when a height is set");
+
+    assert_eq!(end_of_service.block_height, 1);
+    assert_eq!(end_of_service.estimated_time, 0);
 }
 
 // Helper function that returns the nonce, final sapling root and

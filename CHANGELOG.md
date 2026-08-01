@@ -7,6 +7,161 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-07-27
+
+### Changed
+
+- Improved address-book metric collection performance, which was surprisingly
+  active in CPU profiles
+  ([#451](https://github.com/zakura-core/zakura/pull/451)).
+- Increased the number of peers returned in refreshed `GetAddr` responses from
+  approximately one quarter to one half of eligible address-book entries
+  ([#458](https://github.com/zakura-core/zakura/pull/458)).
+- Restored the legacy `FindBlocks` compatibility behavior while additional
+  peer-response and chain-head edge cases are validated
+  ([#459](https://github.com/zakura-core/zakura/pull/459)).
+
+### Fixed
+
+- Prevent banned peer addresses from blocking outbound reconnections
+  ([#439](https://github.com/zakura-core/zakura/pull/439)).
+- Fixed legacy genesis sync livelocking at height 0. Reverted the pruned-peer
+  block-routing filter from
+  [#440](https://github.com/zakura-core/zakura/pull/440), which failed
+  historical block requests with a `NoReadyPeers` error whenever no ready peer
+  advertised `NODE_NETWORK` — including under ordinary peer-set saturation. The
+  syncer treats that error as fatal, so every sync round was aborted about a
+  millisecond after dispatch and its in-flight downloads discarded
+  ([#448](https://github.com/zakura-core/zakura/pull/448)).
+- Avoid duplicate block advertisements when a mined-block notification and the
+  committed-tip fallback become ready together
+  ([#450](https://github.com/zakura-core/zakura/pull/450)).
+- Fixed legacy block sync stalling when a peer advertises only one new block
+  at the chain head
+  ([#452](https://github.com/zakura-core/zakura/pull/452)).
+- Replenish legacy outbound peers during periodic crawls when fewer than 27%
+  of the configured outbound connection slots are active
+  ([#462](https://github.com/zakura-core/zakura/pull/462)).
+- Fixed Mainnet genesis VCT sync failing closed at the handoff height by serving
+  embedded frontier roots from `PeerSource` when no authenticated DB root exists
+  at that height
+  ([#464](https://github.com/zakura-core/zakura/pull/464)).
+- Fixed Prometheus cardinality growth for `zakura.net.connection.state` by
+  aggregating live connections by command instead of retaining historical
+  per-peer address series
+  ([#467](https://github.com/zakura-core/zakura/pull/467)).
+- Extended the legacy syncer's near-tip stall grace from approximately 6
+  minutes to 20 minutes, reducing unnecessary peer disconnects during ordinary
+  block-time variance and propagation delay
+  ([#469](https://github.com/zakura-core/zakura/pull/469)).
+- Credit outbound peer replenishment demand when a failed dial restores
+  channel demand, so poor connectivity does not double-spend the timer budget
+  ([#474](https://github.com/zakura-core/zakura/pull/474)).
+
+## [1.0.4] - 2026-07-25
+
+### Added
+
+- Added `checkpoint.duplicate.newer_request` to count in-queue same-hash
+  replacements at the checkpoint verifier
+  ([#423](https://github.com/zakura-core/zakura/pull/423)).
+
+### Changed
+
+- Flush partial cryptographic verification batches at semantic block boundaries,
+  avoiding the global 100 ms batch delay during block execution when the
+  boundary signal succeeds
+  ([#417](https://github.com/zakura-core/zakura/pull/417)).
+
+### Removed
+
+- Removed the obsolete `block-template-to-proposal` and `search-issue-refs`
+  binaries and the `search-issue-refs`, `regex`, and `reqwest` Cargo feature
+  flags in `zakura-utils` 2.0.0
+  ([#406](https://github.com/zakura-core/zakura/pull/406)).
+- Removed the experimental embedded Elasticsearch exporter. If you use this
+  feature, please contact the Zakura maintainers so we can prioritize a safer,
+  external indexing API around your requirements
+  ([#409](https://github.com/zakura-core/zakura/pull/409)).
+
+### Fixed
+
+- Re-admit block-sync peers when a no-progress park expires instead of leaving
+  the connection without a block-sync session until reconnect, and keep a
+  healthy connection owned across the transport's stream-reopen backoff so a
+  finished discovery exchange cannot close it mid-gap
+  ([#166](https://github.com/zakura-core/zakura/pull/166)).
+- Harden the stream-reopen paths against teardown races: legacy-gossip session
+  removal is scoped to the exact stream session (and gossip connections now stay
+  owned across reopen gaps), block-sync park admission is atomic with the
+  routine's park write so an in-flight cooldown is never silently bypassed and a
+  dead connection can no longer record one, and header-sync gap claims survive
+  the reactor's stale post-disconnect peer snapshot
+  ([#166](https://github.com/zakura-core/zakura/pull/166)).
+- Bound the stream-reopen loops against unresponsive peers: a block-sync stream
+  EOF now parks or disconnects the peer like a liveness stall whenever
+  block-progress liveness is still armed — including after per-request timeouts
+  already drained the outstanding set — discovery sessions retire after
+  repeated silent or broken exchanges instead of reopening forever,
+  legacy-gossip reopen churn from zero-frame sessions is capped, and header-sync
+  reopen waits target the reactor's real advisory-backoff expiry
+  ([#166](https://github.com/zakura-core/zakura/pull/166)).
+- Let native Zakura peer sets converge beyond bootstrap nodes by advertising
+  reachable addresses, safely dialing valid gossiped discovery records, and
+  applying discovery IP safety and connection limits consistently across IPv4
+  transition encodings
+  ([#373](https://github.com/zakura-core/zakura/pull/373)).
+- Scope discovery cleanup and shared-connection ownership to the exact admitted
+  peer session to prevent stale teardown and unintended service disconnects
+  ([#374](https://github.com/zakura-core/zakura/pull/374)).
+- Refresh long-lived discovery sessions before service summaries expire and
+  remove service membership derived from expired signed records
+  ([#375](https://github.com/zakura-core/zakura/pull/375)).
+- Fixed VCT fast-sync handoffs after a restart from writing duplicate note
+  commitment trees that prevented the database from reopening
+  ([#401](https://github.com/zakura-core/zakura/pull/401)).
+- Fixed a checkpoint-sync stall where benign duplicate block resubmits
+  (`NewerRequest`) rewound verifier progress behind an already-verified
+  checkpoint and left a permanent queue gap
+  ([#423](https://github.com/zakura-core/zakura/pull/423)).
+- Prevent configured local zcashd-compat sidecars from starving behind a
+  saturated public legacy accept backlog by draining queued connections in
+  bounded, paced bursts and immediately handshaking accepted sidecars
+  ([#426](https://github.com/zakura-core/zakura/pull/426)).
+- Prevented Zakura header sync from stalling when a verified full-block tip is
+  not yet available as a durable header-range anchor
+  ([#427](https://github.com/zakura-core/zakura/pull/427)).
+- Fixed VCT checkpoint sync stalling immediately below the final checkpoint
+  by automatically recovering a missing terminal header witness at runtime
+  ([#432](https://github.com/zakura-core/zakura/pull/432)).
+- Prevented Zakura block sync from permanently stalling when a needed height
+  left the work queue while a higher height stayed claimed, which pinned the
+  block download floor and grew the reorder buffer without bound
+  ([#435](https://github.com/zakura-core/zakura/pull/435)).
+- Prevented Zakura header sync from livelocking or stalling root authentication
+  when durable reanchors discarded in-flight work or left fallback ranges
+  disconnected from the authenticated frontier
+  ([#438](https://github.com/zakura-core/zakura/pull/438)).
+- Avoided initial-sync delays from requesting historical block bodies from
+  pruned peers that do not advertise `NODE_NETWORK`
+  ([#440](https://github.com/zakura-core/zakura/pull/440)).
+
+### Security
+
+- Authenticate peer-supplied VCT commitment roots against checkpoint-covered
+  canonical headers before persisting or serving them, and delete unauthenticated
+  roots from existing databases during the state format upgrade
+  ([#352](https://github.com/zakura-core/zakura/pull/352)).
+- Reject locator hashes echoed inside legacy tip-extension responses
+  ([#372](https://github.com/zakura-core/zakura/pull/372)).
+- Harden the native discovery candidate dialer against untrusted gossip: charge
+  each dialed connection to the network path iroh actually confirms (so a record
+  cannot escape the per-IP connection cap by listing a decoy address first),
+  scope dial-failure backoff to `(node_id, ip)` instead of IP alone (so a signed
+  record cannot back an honest peer's IP off for every candidate that shares it),
+  and reject RFC 5737 / RFC 3849 documentation ranges as dial targets
+  ([#373](https://github.com/zakura-core/zakura/pull/373)).
+
 ## [1.0.3] - 2026-07-22
 
 ### Added
@@ -43,6 +198,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Re-admit deferred or ended ordered service streams on existing healthy
+  connections. Block sync resumes after no-progress cooldowns when body work
+  exists, header sync wakes when advisory backoff expires, retry scheduling is
+  bounded, and negotiated streams respect aggregate inbound queue limits
+  ([#166](https://github.com/zakura-core/zakura/pull/166)).
 - Treat IPv4 and IPv4-mapped IPv6 peer addresses as the same address when
   enforcing bans, inbound rate limits, and per-IP connection limits, preventing
   peers from bypassing them through the alternate representation

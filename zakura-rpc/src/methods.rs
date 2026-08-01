@@ -68,7 +68,8 @@ use zakura_chain::{
             block_subsidy, founders_reward, funding_stream_values, miner_subsidy,
             FundingStreamReceiver,
         },
-        ConsensusBranchId, Network, NetworkUpgrade, POW_AVERAGING_WINDOW,
+        ConsensusBranchId, Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING,
+        POW_AVERAGING_WINDOW,
     },
     serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     subtree::NoteCommitmentSubtreeIndex,
@@ -193,6 +194,31 @@ pub trait Rpc {
     /// [required for lightwalletd support.](https://github.com/zcash/lightwalletd/blob/v0.4.9/common/common.go#L91-L95)
     #[method(name = "getinfo")]
     async fn get_info(&self) -> Result<GetInfoResponse>;
+
+    /// Returns end-of-support information for this node release, as a
+    /// [`GetDeprecationInfoResponse`] JSON struct.
+    ///
+    /// zcashd reference:
+    /// [`getdeprecationinfo`](https://zcash.github.io/rpc/getdeprecationinfo.html)
+    /// method: post
+    /// tags: network
+    ///
+    /// # Notes
+    ///
+    /// As in zcashd, the `end_of_service` object is only present on Mainnet,
+    /// where end of support is enforced. Zakura reports the estimated last
+    /// height this release supports in `end_of_service.block_height`; the node
+    /// halts when the tip goes past it.
+    ///
+    /// Some fields from the zcashd response are missing from Zakura's response:
+    /// `version` and `subversion` are available from `getinfo`,
+    /// `deprecationheight` is deprecated in zcashd, and Zakura does not have
+    /// zcashd's feature deprecation framework.
+    ///
+    /// The estimate assumes the node is synced to the network tip; during
+    /// initial sync it is significantly overestimated.
+    #[method(name = "getdeprecationinfo")]
+    async fn get_deprecation_info(&self) -> Result<GetDeprecationInfoResponse>;
 
     /// Returns blockchain state information, as a [`GetBlockchainInfoResponse`] JSON struct.
     ///
@@ -810,6 +836,9 @@ where
     /// no matter what the estimated height or local clock is.
     debug_force_finished_sync: bool,
 
+    /// The estimated last height this release supports, if enforced.
+    end_of_support_height: Option<Height>,
+
     // Services
     //
     /// A handle to the mempool service.
@@ -924,6 +953,7 @@ where
             user_agent,
             network: network.clone(),
             debug_force_finished_sync,
+            end_of_support_height: None,
             mempool: mempool.clone(),
             state: state.clone(),
             read_state: read_state.clone(),
@@ -947,6 +977,14 @@ where
     /// Returns a reference to the configured network.
     pub fn network(&self) -> &Network {
         &self.network
+    }
+
+    /// Sets the end-of-support height reported by `getdeprecationinfo`.
+    ///
+    /// When unset, or set to `None`, the RPC omits `end_of_service`.
+    pub fn with_end_of_support_height(mut self, end_of_support_height: Option<Height>) -> Self {
+        self.end_of_support_height = end_of_support_height;
+        self
     }
 }
 
@@ -1013,31 +1051,73 @@ where
         Ok(response)
     }
 
+    async fn get_deprecation_info(&self) -> Result<GetDeprecationInfoResponse> {
+        let end_of_service = self
+            .end_of_support_height
+            // End of support is only enforced on Mainnet. Match zcashd by
+            // omitting `end_of_service` on other networks.
+            .filter(|_| self.network == Network::Mainnet)
+            .map(|end_of_support_height| {
+                // If the tip is unavailable, use the latest checkpoint so the
+                // estimate remains useful during startup.
+                let tip_height = self
+                    .latest_chain_tip
+                    .best_tip_height()
+                    .unwrap_or_else(|| self.network.checkpoint_list().max_height());
+                let remaining_blocks = i64::from(end_of_support_height.0) - i64::from(tip_height.0);
+                let estimated_time = Utc::now()
+                    .timestamp()
+                    .saturating_add(
+                        remaining_blocks.saturating_mul(i64::from(POST_BLOSSOM_POW_TARGET_SPACING)),
+                    )
+                    .saturating_sub(END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN)
+                    .max(0);
+
+                EndOfService {
+                    block_height: end_of_support_height.0,
+                    estimated_time,
+                }
+            });
+
+        Ok(GetDeprecationInfoResponse { end_of_service })
+    }
+
     #[allow(clippy::unwrap_in_result)]
     async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse> {
         let debug_force_finished_sync = self.debug_force_finished_sync;
         let network = &self.network;
 
-        let (usage_info_rsp, is_pruned_rsp, tip_pool_values_rsp, chain_tip_difficulty) = {
+        let (usage_info_rsp, pruning_info_rsp, tip_pool_values_rsp, chain_tip_difficulty) = {
             use zakura_state::ReadRequest::*;
             let state_call = |request| self.read_state.clone().oneshot(request);
             tokio::join!(
                 state_call(UsageInfo),
-                state_call(IsPruned),
+                state_call(PruningInfo),
                 state_call(TipPoolValues),
                 chain_tip_difficulty(network.clone(), self.read_state.clone(), true)
             )
         };
 
-        let (size_on_disk, is_pruned, (tip_height, tip_hash), value_balance, difficulty) = {
+        let (
+            size_on_disk,
+            is_pruned,
+            prune_height,
+            (tip_height, tip_hash),
+            value_balance,
+            difficulty,
+        ) = {
             use zakura_state::ReadResponse::*;
 
             let UsageInfo(size_on_disk) = usage_info_rsp.map_misc_error()? else {
                 unreachable!("unmatched response to a UsageInfo request")
             };
 
-            let IsPruned(is_pruned) = is_pruned_rsp.map_misc_error()? else {
-                unreachable!("unmatched response to an IsPruned request")
+            let PruningInfo {
+                pruned: is_pruned,
+                prune_height,
+            } = pruning_info_rsp.map_misc_error()?
+            else {
+                unreachable!("unmatched response to a PruningInfo request")
             };
 
             let (tip, value_balance) = match tip_pool_values_rsp {
@@ -1053,7 +1133,14 @@ where
             let difficulty = chain_tip_difficulty
                 .expect("should always be Ok when `should_use_default` is true");
 
-            (size_on_disk, is_pruned, tip, value_balance, difficulty)
+            (
+                size_on_disk,
+                is_pruned,
+                prune_height,
+                tip,
+                value_balance,
+                difficulty,
+            )
         };
 
         let now = Utc::now();
@@ -1143,6 +1230,7 @@ where
             // TODO: store work in the finalized state for each height (#7109)
             chain_work: 0,
             pruned: is_pruned,
+            prune_height,
             size_on_disk,
             // TODO: Investigate whether this needs to be implemented (it's sprout-only in zcashd)
             commitments: 0,
@@ -3456,6 +3544,39 @@ impl GetInfoResponse {
     }
 }
 
+/// Seconds subtracted from `getdeprecationinfo`'s estimated halt time.
+///
+/// Block times vary, so the halt can happen earlier than a spacing-based
+/// estimate. Reporting it a day early gives consumers time to act.
+const END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN: i64 = 24 * 60 * 60;
+
+/// Response to a `getdeprecationinfo` RPC request.
+///
+/// See the notes for [`Rpc::get_deprecation_info`].
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct GetDeprecationInfoResponse {
+    /// End-of-service information, only present on Mainnet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_of_service: Option<EndOfService>,
+}
+
+/// The `end_of_service` object in a [`GetDeprecationInfoResponse`].
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct EndOfService {
+    /// The estimated last height this server version supports.
+    ///
+    /// The node halts when the chain tip goes past this height.
+    #[getter(copy)]
+    block_height: u32,
+
+    /// Approximate halt time in seconds since the Unix epoch.
+    ///
+    /// This is reported 24 hours earlier than the spacing-based estimate, so
+    /// consumers are warned early when block times vary.
+    #[getter(copy)]
+    estimated_time: i64,
+}
+
 /// Type alias for the array of `GetBlockchainInfoBalance` objects
 pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 6];
 
@@ -3535,8 +3656,24 @@ pub struct GetBlockchainInfoResponse {
     #[serde(rename = "chainwork")]
     chain_work: u64,
 
-    /// Whether this node is pruned, currently always false in Zebra.
+    /// Whether this node's blocks are subject to pruning, that is, whether it
+    /// runs in pruned storage mode or has already pruned historical data.
     pruned: bool,
+
+    /// The lowest height whose block body this node still stores, omitted when
+    /// [`pruned`](Self::pruned) is false.
+    ///
+    /// Zakura prunes raw transaction data, so blocks below this height still
+    /// have their headers, transaction IDs, and consensus state — only their
+    /// bodies cannot be served. The genesis block is never pruned, so its body
+    /// is available below this height too.
+    #[serde(
+        default,
+        rename = "pruneheight",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[getter(copy)]
+    prune_height: Option<Height>,
 
     /// The estimated size of the block and undo files on disk
     size_on_disk: u64,
@@ -3592,6 +3729,7 @@ impl Default for GetBlockchainInfoResponse {
             verification_progress: 0.0,
             chain_work: 0,
             pruned: false,
+            prune_height: None,
             size_on_disk: 0,
             commitments: 0,
         }
@@ -3617,6 +3755,7 @@ impl GetBlockchainInfoResponse {
         verification_progress: f64,
         chain_work: u64,
         pruned: bool,
+        prune_height: Option<Height>,
         size_on_disk: u64,
         commitments: u64,
     ) -> Self {
@@ -3634,6 +3773,7 @@ impl GetBlockchainInfoResponse {
             verification_progress,
             chain_work,
             pruned,
+            prune_height,
             size_on_disk,
             commitments,
         }

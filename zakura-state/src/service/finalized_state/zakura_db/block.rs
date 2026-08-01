@@ -877,6 +877,45 @@ impl ZakuraDb {
         self.lowest_retained_height().is_some()
     }
 
+    /// Returns `true` if this node's block data is subject to pruning: either
+    /// pruned storage mode is configured, or the database has already pruned
+    /// historical data.
+    ///
+    /// This is what `getblockchaininfo.pruned` reports, matching `zcashd`, which
+    /// returns its prune-mode setting rather than whether any block has actually
+    /// been deleted yet:
+    /// <https://github.com/zcash/zcash/blob/v6.3.0/src/rpc/blockchain.cpp>
+    ///
+    ///     obj.pushKV("pruned", fPruneMode);
+    ///
+    /// A node configured with
+    /// [`StorageMode::Pruned`](crate::StorageMode::Pruned) prunes nothing until
+    /// its tip rises above the retention window, but it is still a pruned node,
+    /// and clients must not assume it can serve arbitrary historical blocks.
+    ///
+    /// Use [`is_pruned`](Self::is_pruned) instead for the one-way on-disk state
+    /// that decides whether a database may be reopened in archive mode.
+    pub fn prunes_historical_data(&self) -> bool {
+        self.config().pruning_config().is_some() || self.is_pruned()
+    }
+
+    /// Returns the lowest height at and above which every block body is
+    /// retained, or `None` if this node does not prune.
+    ///
+    /// A pruning node that has not deleted anything yet still retains every
+    /// body, so this is [`Height::MIN`] until the first prune. The genesis
+    /// block is never pruned, so its body is available even when this returns a
+    /// higher height.
+    ///
+    /// This is what `getblockchaininfo.pruneheight` reports. `zcashd` emits that
+    /// field only when `pruned` is true, and reports the lowest height whose
+    /// full block it still stores:
+    /// <https://github.com/zcash/zcash/blob/v6.3.0/src/rpc/blockchain.cpp>
+    pub fn prune_height(&self) -> Option<Height> {
+        self.prunes_historical_data()
+            .then(|| self.lowest_retained_height().unwrap_or(Height::MIN))
+    }
+
     // Verified-commitment-trees fast-sync methods
 
     /// Returns the checkpoint handoff height `H` of a verified-commitment-trees fast-synced
@@ -1580,7 +1619,7 @@ impl DiskWriteBatch {
             store_raw_transactions,
             precomputed_raw_txs,
         )?;
-        self.delete_legacy_header_commitment_root(zakura_db, finalized.height);
+        self.delete_superseded_header_commitment_root(zakura_db, finalized.height);
 
         // The consensus rules are silent on shielded transactions in the genesis block,
         // because there aren't any in the mainnet or testnet genesis blocks.
@@ -1878,7 +1917,19 @@ impl DiskWriteBatch {
                     self.zs_delete(&zakura_body_size_by_height, old_height);
                 }
 
-                self.delete_header_reorg_commitment_roots(zakura_db, height, best_header_tip);
+                if !zakura_db.has_header_root_auth_frontier_row() {
+                    self.delete_header_reorg_commitment_roots(zakura_db, height, best_header_tip);
+                } else if let Some(body_tip) = zakura_db.finalized_tip_height() {
+                    self.truncate_commitment_roots_after(zakura_db, body_tip);
+                    zakura_db
+                        .prepare_header_root_auth_frontier_from_body_tip(self)
+                        .map_err(|error| CommitHeaderRangeError::HeaderRootAuthFrontier {
+                            reason: error.to_string(),
+                        })?;
+                } else {
+                    self.truncate_all_commitment_roots(zakura_db);
+                    self.delete_header_root_auth_frontier(zakura_db);
+                }
             }
         } else if let Some(old_hash) =
             db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &height)
@@ -1977,7 +2028,7 @@ impl DiskWriteBatch {
         self.zs_delete(&zakura_hash_by_height, height);
         self.zs_delete(&zakura_header_by_height, height);
         self.zs_delete(&zakura_body_size_by_height, height);
-        self.delete_legacy_header_commitment_root(zakura_db, height);
+        self.delete_superseded_header_commitment_root(zakura_db, height);
 
         Ok(())
     }
@@ -1996,8 +2047,9 @@ impl DiskWriteBatch {
         self.prepare_header_range_batch_with_roots(zakura_db, anchor, headers, body_sizes, &roots)
     }
 
-    /// Prepare a database batch containing a contextually validated header range
-    /// and one provisional tree-aux root per header.
+    /// Prepare a database batch containing a contextually validated header range.
+    ///
+    /// Tree-aux roots are shape-checked but are not persisted until authenticated.
     #[allow(clippy::unwrap_in_result)]
     pub fn prepare_header_range_batch_with_roots(
         &mut self,
@@ -2005,7 +2057,7 @@ impl DiskWriteBatch {
         anchor: block::Hash,
         headers: &[Arc<block::Header>],
         body_sizes: &[u32],
-        tree_aux_roots: &[BlockCommitmentRoots],
+        _tree_aux_roots: &[BlockCommitmentRoots],
     ) -> Result<block::Hash, CommitHeaderRangeError> {
         if headers.is_empty() {
             return Err(CommitHeaderRangeError::EmptyRange);
@@ -2015,13 +2067,6 @@ impl DiskWriteBatch {
             return Err(CommitHeaderRangeError::BodySizeCountMismatch {
                 headers: headers.len(),
                 body_sizes: body_sizes.len(),
-            });
-        }
-
-        if headers.len() != tree_aux_roots.len() {
-            return Err(CommitHeaderRangeError::TreeAuxRootCountMismatch {
-                headers: headers.len(),
-                roots: tree_aux_roots.len(),
             });
         }
 
@@ -2095,7 +2140,6 @@ impl DiskWriteBatch {
                 .ok_or(CommitHeaderRangeError::HeightOverflow)?;
             let hash = block::Hash::from(&**header);
             let body_size = body_sizes[index];
-            let roots = &tree_aux_roots[index];
 
             if header.previous_block_hash != expected_parent {
                 return Err(CommitHeaderRangeError::UnlinkedRange {
@@ -2105,13 +2149,6 @@ impl DiskWriteBatch {
                 });
             }
             expected_parent = hash;
-
-            if roots.height != height {
-                return Err(CommitHeaderRangeError::TreeAuxRootHeightMismatch {
-                    expected_height: height,
-                    root_height: roots.height,
-                });
-            }
 
             if let Some(expected) = checkpoints.hash(height) {
                 if expected != hash {
@@ -2224,15 +2261,16 @@ impl DiskWriteBatch {
                 self.zs_delete(&body_size_by_height, height);
             }
 
-            self.delete_header_reorg_commitment_roots(
-                zakura_db,
-                first_conflicting_height,
-                best_header_tip,
-            );
+            if !zakura_db.has_header_root_auth_frontier_row() {
+                self.delete_header_reorg_commitment_roots(
+                    zakura_db,
+                    first_conflicting_height,
+                    best_header_tip,
+                );
+            }
         }
 
-        for (index, (height, hash, header, body_size)) in validated_headers.into_iter().enumerate()
-        {
+        for (height, hash, header, body_size) in validated_headers {
             // Finalized block heights already have authoritative block rows and
             // verified roots, even when pruning has removed their transactions.
             // Re-delivered headers must not recreate provisional zakura rows
@@ -2260,10 +2298,7 @@ impl DiskWriteBatch {
             } else {
                 self.zs_delete(&body_size_by_height, height);
             }
-            let roots = &tree_aux_roots[index];
-            self.insert_legacy_header_commitment_roots(zakura_db, roots);
         }
-
         Ok(block::Hash::from(
             &**headers.last().expect("headers is non-empty"),
         ))

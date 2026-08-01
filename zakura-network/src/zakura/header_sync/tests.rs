@@ -3,21 +3,26 @@ use super::{
     config::*,
     error::*,
     events::*,
+    header_root_auth::*,
     reactor::*,
     state::{
-        HeaderSyncCore, OutstandingPhase, OutstandingRange, PendingOperation, RangePriority,
-        RangePurpose, RangeRequest, VctRootRepair, VCT_ROOT_REPAIR_BACKOFFS,
-        VCT_ROOT_REPAIR_MAX_WALL_TIME,
+        BufferedHeaderRange, HeaderSyncCore, OutstandingPhase, OutstandingRange, PendingOperation,
+        PendingRootAuth, RangePriority, RangePurpose, RangeRequest, RootAuthSource, VctRootRepair,
+        HEADER_SYNC_ADVISORY_BACKOFF, RETAINED_ROOT_LOCAL_MAX_ATTEMPTS, ROOT_AUTH_MIN_BODY_LEAD,
+        VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME,
     },
     validation::*,
     wire::*,
+    work_queue::HeaderWorkState,
 };
 use crate::zakura::{
     framed_channel,
     testkit::{TraceCapture, TraceValue},
     trace::{header_sync_trace as hs_trace, HEADER_SYNC_TABLE},
-    FramedSend, HeaderSyncServiceSummary, Peer, Service, ServicePeerDirection, ServicePeerLimits,
-    ServicePeerSnapshot, ZakuraConnId, ZakuraHeaderSyncCandidateState, ZAKURA_CAP_HEADER_SYNC,
+    ChainFrontier, FramedSend, Frontier, FrontierChange, FrontierUpdate, HeaderSyncServiceSummary,
+    OrderedSessionDemand, Peer, Service, ServicePeerDirection, ServicePeerLimits,
+    ServicePeerSnapshot, ZakuraConnId, ZakuraHeaderSyncCandidateState, ZakuraSyncExchange,
+    ZAKURA_CAP_HEADER_SYNC,
 };
 use chrono::Duration;
 use metrics::{
@@ -547,6 +552,980 @@ fn startup_new_uses_configured_status_refresh_interval() {
     assert_eq!(startup.status_refresh_interval, status_refresh_interval);
 }
 
+#[test]
+fn root_auth_ranges_overlap_once_and_stay_checkpoint_covered() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(
+        network,
+        anchor,
+        Some((block::Height(10), block::Hash([10; 32]))),
+    );
+    startup.config.max_headers_per_response = 3;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(0),
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(6),
+        completed_checkpoint_hash: block::Hash([6; 32]),
+        header_witness: None,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
+
+    assert_eq!(
+        state.root_auth_hole_heights(
+            &startup,
+            startup
+                .header_root_auth
+                .expect("test authentication state exists")
+        ),
+        5
+    );
+    state.refresh_root_auth_range(&startup);
+    let first = state
+        .schedule
+        .authenticate_roots
+        .pop_front()
+        .expect("checkpoint covers a root and successor witness");
+    assert_eq!(first.start_height(), block::Height(1));
+    assert_eq!(first.end_height(), block::Height(3));
+
+    state.schedule.clear_root_auth();
+    state.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(2),
+        authenticated_hash: block::Hash([2; 32]),
+        ..startup
+            .header_root_auth
+            .expect("test authentication state exists")
+    });
+    state.refresh_root_auth_range(&startup);
+    let second = state
+        .schedule
+        .authenticate_roots
+        .front()
+        .copied()
+        .expect("next root-authentication batch is scheduled");
+    assert_eq!(second.start_height(), first.end_height());
+    assert_eq!(second.end_height(), block::Height(5));
+    assert!(second.end_height() <= block::Height(6));
+}
+
+#[test]
+fn root_auth_miss_prefetches_bounded_overlapping_ranges() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(
+        network,
+        anchor,
+        Some((block::Height(10), block::Hash([10; 32]))),
+    );
+    startup.config.max_headers_per_response = 3;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(0),
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(10),
+        completed_checkpoint_hash: block::Hash([10; 32]),
+        header_witness: None,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
+
+    assert_eq!(
+        state.root_auth_hole_heights(
+            &startup,
+            startup
+                .header_root_auth
+                .expect("test authentication state exists")
+        ),
+        9
+    );
+    state.refresh_root_auth_range(&startup);
+
+    let ranges: Vec<_> = state
+        .schedule
+        .authenticate_roots
+        .iter()
+        .map(|range| (range.start_height(), range.end_height(), range.anchor_hash))
+        .collect();
+    assert_eq!(
+        ranges,
+        vec![
+            (block::Height(1), block::Height(3), Some(anchor.1)),
+            (block::Height(3), block::Height(5), None),
+            (block::Height(5), block::Height(7), None),
+            (block::Height(7), block::Height(9), None),
+            (block::Height(9), block::Height(10), None),
+        ]
+    );
+}
+
+#[test]
+fn partial_root_auth_frontier_advance_rebases_fallback_at_exact_frontier() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(
+        network,
+        anchor,
+        Some((block::Height(100), block::Hash([100; 32]))),
+    );
+    startup.config.max_headers_per_response = 3;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(100),
+        completed_checkpoint_hash: block::Hash([100; 32]),
+        header_witness: None,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
+
+    state.refresh_root_auth_range(&startup);
+    let initial_resident = state
+        .schedule
+        .resident_heights_for(RangePriority::AuthenticateRoots);
+    let initial_end = state
+        .schedule
+        .highest_end(RangePriority::AuthenticateRoots)
+        .expect("initial fallback window is populated");
+
+    let advanced = HeaderRootAuthState {
+        authenticated_height: block::Height(3),
+        authenticated_hash: block::Hash([3; 32]),
+        ..startup
+            .header_root_auth
+            .expect("test authentication state exists")
+    };
+    state.header_root_auth = Some(advanced);
+    state.prune_root_auth_pipeline(advanced, true);
+
+    state.refresh_root_auth_range(&startup);
+    assert_eq!(
+        state
+            .schedule
+            .resident_heights_for(RangePriority::AuthenticateRoots),
+        initial_resident
+    );
+    assert!(
+        state
+            .schedule
+            .highest_end(RangePriority::AuthenticateRoots)
+            .expect("refilled fallback window has a high end")
+            > initial_end
+    );
+    let first = state
+        .schedule
+        .authenticate_roots
+        .front()
+        .expect("fallback is rebuilt from the new authentication frontier");
+    assert_eq!(first.start_height(), block::Height(4));
+    assert_eq!(first.anchor_hash, Some(advanced.authenticated_hash));
+    assert!(
+        !state
+            .schedule
+            .authenticate_roots
+            .iter()
+            .any(|range| range.start_height() == block::Height(5)),
+        "speculative ranges above the old partial-advance gap must be discarded"
+    );
+}
+
+#[test]
+fn root_auth_schedules_exact_terminal_witness_recovery() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(
+        network,
+        anchor,
+        Some((block::Height(5), block::Hash([5; 32]))),
+    );
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(4),
+        authenticated_hash: block::Hash([4; 32]),
+        completed_checkpoint_height: block::Height(5),
+        completed_checkpoint_hash: block::Hash([5; 32]),
+        header_witness: None,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
+
+    state.refresh_root_auth_range(&startup);
+
+    let recovery = state
+        .schedule
+        .authenticate_roots
+        .front()
+        .expect("missing terminal witness schedules recovery");
+    assert_eq!(recovery.start_height(), block::Height(5));
+    assert_eq!(recovery.end_height(), block::Height(5));
+    assert_eq!(recovery.count(), 1);
+}
+
+#[test]
+fn root_auth_does_not_repeat_or_fetch_unneeded_terminal_witness() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let best = (block::Height(5), block::Hash([5; 32]));
+    let mut startup = startup_for(network, anchor, Some(best));
+    let auth = HeaderRootAuthState {
+        authenticated_height: block::Height(4),
+        authenticated_hash: block::Hash([4; 32]),
+        completed_checkpoint_height: best.0,
+        completed_checkpoint_hash: best.1,
+        header_witness: Some(HeaderWitnessState {
+            height: best.0,
+            hash: best.1,
+        }),
+    };
+    startup.header_root_auth = Some(auth);
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
+    state.refresh_root_auth_range(&startup);
+    assert!(state.schedule.authenticate_roots.is_empty());
+
+    state.header_root_auth = Some(HeaderRootAuthState {
+        header_witness: None,
+        ..auth
+    });
+    state.verified_block_tip = auth.authenticated_height;
+    state.refresh_root_auth_range(&startup);
+    assert!(
+        state.schedule.authenticate_roots.is_empty(),
+        "a caught-up body tip no longer needs the witness"
+    );
+
+    state.verified_block_tip = block::Height(3);
+    state.refresh_root_auth_range(&startup);
+    assert_eq!(
+        state
+            .schedule
+            .authenticate_roots
+            .front()
+            .expect("a successor reorg makes witness recovery eligible again")
+            .count(),
+        1
+    );
+    state.verified_block_tip = auth.authenticated_height;
+    state.suppress_unneeded_witness_recovery();
+    assert!(
+        state.schedule.authenticate_roots.is_empty(),
+        "body catch-up retires an already scheduled recovery"
+    );
+}
+
+#[test]
+fn unneeded_witness_recovery_settles_after_driver_completion() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let best = (block::Height(5), block::Hash([5; 32]));
+    let mut startup = startup_for(network, anchor, Some(best));
+    let auth = HeaderRootAuthState {
+        authenticated_height: block::Height(4),
+        authenticated_hash: block::Hash([4; 32]),
+        completed_checkpoint_height: best.0,
+        completed_checkpoint_hash: best.1,
+        header_witness: None,
+    };
+    startup.header_root_auth = Some(auth);
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
+    state.verified_block_tip = auth.authenticated_height;
+
+    let range = RangeRequest {
+        range: CheckedHeaderRange::from_count(best.0, 1)
+            .expect("one-record recovery range is valid"),
+        anchor_hash: Some(auth.authenticated_hash),
+        finalized: true,
+        want_tree_aux_roots: true,
+        priority: RangePriority::AuthenticateRoots,
+    };
+    let operation = HeaderSyncOperationIdentity {
+        wire_request: HeaderSyncWireRequestIdentity {
+            peer: peer(254),
+            session_id: 1,
+            request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+        },
+        op_kind: HeaderSyncOperationKind::AuthenticateRoots,
+    };
+    state.schedule.mark_authenticating(operation.clone(), range);
+    state.pending_operations.insert(
+        operation.clone(),
+        PendingOperation {
+            range,
+            purpose: RangePurpose::AuthenticateRoots,
+            retention_candidate: None,
+            root_auth: Some(PendingRootAuth {
+                source: RootAuthSource::Fallback,
+                expected: auth,
+            }),
+            completion_observed: false,
+        },
+    );
+
+    state.suppress_unneeded_witness_recovery();
+    assert!(
+        state.pending_operations.contains_key(&operation),
+        "body catch-up must not release the state operation before its driver completion"
+    );
+
+    state
+        .pending_operations
+        .get_mut(&operation)
+        .expect("recovery remains pending until driver completion")
+        .completion_observed = true;
+    state.suppress_unneeded_witness_recovery();
+
+    assert!(
+        !state.pending_operations.contains_key(&operation),
+        "an obsolete completed recovery must not block later root authentication"
+    );
+    assert!(state.schedule.state(range).is_none());
+}
+
+#[test]
+fn witness_recovery_completion_waits_for_whichever_signal_arrives_second() {
+    let witness = HeaderWitnessState {
+        height: block::Height(5),
+        hash: block::Hash([5; 32]),
+    };
+    let update = HeaderRootAuthUpdate::WitnessRecovered { witness };
+    let range = RangeRequest {
+        range: CheckedHeaderRange::from_count(witness.height, 1)
+            .expect("one-record recovery range is valid"),
+        anchor_hash: Some(block::Hash([4; 32])),
+        finalized: true,
+        want_tree_aux_roots: true,
+        priority: RangePriority::AuthenticateRoots,
+    };
+    let without_witness = HeaderRootAuthState {
+        authenticated_height: block::Height(4),
+        authenticated_hash: block::Hash([4; 32]),
+        completed_checkpoint_height: witness.height,
+        completed_checkpoint_hash: witness.hash,
+        header_witness: None,
+    };
+
+    assert!(root_auth_update_matches_request(&update, range));
+    assert!(
+        !root_auth_update_is_visible(Some(without_witness), &update),
+        "response-first completion waits for the witness watch update"
+    );
+    assert!(
+        root_auth_update_is_visible(
+            Some(HeaderRootAuthState {
+                header_witness: Some(witness),
+                ..without_witness
+            }),
+            &update,
+        ),
+        "watch-first completion is visible when the response arrives"
+    );
+}
+
+#[test]
+fn root_auth_refresh_survives_authenticated_at_completed_checkpoint_tip() {
+    // Regtest e2e failure: after the final checkpoint commit, auth and completed
+    // heights are equal, so fallback start is past end. Refresh must not panic
+    // on an inverted retained-roots range query.
+    let network = Network::Mainnet;
+    let tip = (block::Height(160), block::Hash([160; 32]));
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some(tip));
+    startup.config.max_headers_per_response = 3;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: tip.0,
+        authenticated_hash: tip.1,
+        completed_checkpoint_height: tip.0,
+        completed_checkpoint_hash: tip.1,
+        header_witness: None,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is valid");
+    let auth = startup
+        .header_root_auth
+        .expect("test authentication state exists");
+
+    assert_eq!(state.root_auth_hole_heights(&startup, auth), 0);
+    state.refresh_root_auth_range(&startup);
+    assert!(state.schedule.authenticate_roots.is_empty());
+}
+
+#[test]
+fn clamped_root_auth_request_never_enqueues_non_overlapping_suffix() {
+    let auth = RangeRequest {
+        range: CheckedHeaderRange::from_count(block::Height(1), 5).expect("test range is bounded"),
+        anchor_hash: Some(Network::Mainnet.genesis_hash()),
+        finalized: true,
+        want_tree_aux_roots: true,
+        priority: RangePriority::AuthenticateRoots,
+    };
+    assert_eq!(clamped_request_suffix(auth, 2, block::Height(10)), None);
+
+    let forward = RangeRequest {
+        priority: RangePriority::Forward,
+        ..auth
+    };
+    let suffix = clamped_request_suffix(forward, 2, block::Height(10))
+        .expect("rooted forward work keeps its overlapping suffix");
+    assert_eq!(suffix.start_height(), block::Height(2));
+    assert_eq!(suffix.count(), 4);
+}
+
+#[test]
+fn retained_response_requires_exact_current_frontier_and_covered_witness() {
+    let headers = vec![
+        mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        mainnet_header(&BLOCK_MAINNET_2_BYTES),
+    ];
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(1),
+            headers,
+            vec![0, 0],
+            roots_from_height(block::Height(1), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test response is contiguous");
+    let auth = HeaderRootAuthState {
+        authenticated_height: block::Height(0),
+        authenticated_hash: Network::Mainnet.genesis_hash(),
+        completed_checkpoint_height: block::Height(2),
+        completed_checkpoint_hash: block::Hash([2; 32]),
+        header_witness: None,
+    };
+
+    let retained = retained_root_auth_range(auth, &payload, block::Height(2))
+        .expect("exact covered response is retained-auth eligible");
+    assert_eq!(retained.start_height(), block::Height(1));
+    assert_eq!(retained.end_height(), block::Height(2));
+
+    assert!(retained_root_auth_range(
+        HeaderRootAuthState {
+            authenticated_height: block::Height(1),
+            ..auth
+        },
+        &payload,
+        block::Height(2),
+    )
+    .is_none());
+    assert!(retained_root_auth_range(
+        HeaderRootAuthState {
+            completed_checkpoint_height: block::Height(1),
+            ..auth
+        },
+        &payload,
+        block::Height(2),
+    )
+    .is_none());
+    let one_entry = HeaderRangePayload::new(vec![payload.entries()[0].clone()])
+        .expect("single entry is structurally valid");
+    assert!(retained_root_auth_range(auth, &one_entry, block::Height(2)).is_none());
+}
+
+#[test]
+fn retained_payload_waits_for_checkpoint_and_suppresses_fallback() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(
+        network,
+        anchor,
+        Some((block::Height(4), block::Hash([4; 32]))),
+    );
+    let mut auth = HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(1),
+        completed_checkpoint_hash: block::Hash([1; 32]),
+        header_witness: None,
+    };
+    startup.header_root_auth = Some(auth);
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(1),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+            vec![0, 0],
+            roots_from_height(block::Height(1), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    let wire_request = HeaderSyncWireRequestIdentity {
+        peer: peer(230),
+        session_id: 1,
+        request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+    };
+
+    assert!(state.admit_retained_root_payload(wire_request, payload));
+    assert!(state.retained_ready(auth, Instant::now()).is_none());
+    state.refresh_root_auth_range(&startup);
+    assert!(
+        state.schedule.authenticate_roots.is_empty(),
+        "retained open-bracket coverage prevents a duplicate fallback"
+    );
+
+    auth.completed_checkpoint_height = block::Height(2);
+    auth.completed_checkpoint_hash = block::Hash([2; 32]);
+    assert!(state.retained_ready(auth, Instant::now()).is_some());
+    assert_eq!(state.retained_heights(), 2);
+}
+
+#[test]
+fn root_auth_fallback_stops_at_first_retained_start() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(
+        network,
+        anchor,
+        Some((block::Height(4), block::Hash([4; 32]))),
+    );
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(4),
+        completed_checkpoint_hash: block::Hash([4; 32]),
+        header_witness: None,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(3),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_3_BYTES),
+                mainnet_header(&BLOCK_MAINNET_4_BYTES),
+            ],
+            vec![0, 0],
+            roots_from_height(block::Height(3), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    assert!(state.admit_retained_root_payload(
+        HeaderSyncWireRequestIdentity {
+            peer: peer(233),
+            session_id: 1,
+            request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+        },
+        payload,
+    ));
+    assert_eq!(
+        state.root_auth_hole_heights(
+            &startup,
+            startup
+                .header_root_auth
+                .expect("test authentication state exists")
+        ),
+        2
+    );
+
+    state.refresh_root_auth_range(&startup);
+
+    let ranges: Vec<_> = state
+        .schedule
+        .authenticate_roots
+        .iter()
+        .map(|range| (range.start_height(), range.end_height()))
+        .collect();
+    assert_eq!(
+        ranges,
+        vec![
+            (block::Height(1), block::Height(2)),
+            (block::Height(2), block::Height(3)),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn body_target_waits_for_authenticated_lead() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let best = (block::Height(800), block::Hash([8; 32]));
+    let mut startup = startup_for(network, anchor, Some(best));
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: best.0,
+        completed_checkpoint_hash: best.1,
+        header_witness: None,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(
+            HeaderRootAuthState {
+                authenticated_height: block::Height(ROOT_AUTH_MIN_BODY_LEAD.saturating_sub(1)),
+                authenticated_hash: block::Hash([3; 32]),
+                completed_checkpoint_height: best.0,
+                completed_checkpoint_hash: best.1,
+                header_witness: None,
+            },
+        )))
+        .await
+        .unwrap();
+    while tokio::time::timeout(std::time::Duration::from_millis(20), fixture.actions.recv())
+        .await
+        .is_ok()
+    {}
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(
+            HeaderRootAuthState {
+                authenticated_height: block::Height(ROOT_AUTH_MIN_BODY_LEAD),
+                authenticated_hash: block::Hash([4; 32]),
+                completed_checkpoint_height: best.0,
+                completed_checkpoint_hash: best.1,
+                header_witness: None,
+            },
+        )))
+        .await
+        .unwrap();
+
+    loop {
+        if let HeaderSyncAction::HeaderAdvanced { height, hash } =
+            next_action(&mut fixture.actions).await
+        {
+            assert_eq!(height, block::Height(ROOT_AUTH_MIN_BODY_LEAD));
+            assert_eq!(hash, block::Hash([4; 32]));
+            break;
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn verified_full_block_does_not_advance_the_durable_header_tip() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let best = (block::Height(800), block::Hash([8; 32]));
+    let mined = (block::Height(3), block::Hash([3; 32]));
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: best.0,
+        completed_checkpoint_hash: best.1,
+        header_witness: None,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+
+    // Drain startup queries / any initial actions.
+    while tokio::time::timeout(std::time::Duration::from_millis(20), fixture.actions.recv())
+        .await
+        .is_ok()
+    {}
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::FullBlockCommitted {
+            height: mined.0,
+            hash: mined.1,
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(fixture.handle.best_header_tip(), anchor);
+    while let Ok(Some(action)) =
+        tokio::time::timeout(std::time::Duration::from_millis(20), fixture.actions.recv()).await
+    {
+        assert!(
+            !matches!(action, HeaderSyncAction::HeaderAdvanced { .. }),
+            "verified-body progress must not publish a durable header advance"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn root_auth_state_trace_records_exact_hole_height() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let best = (block::Height(4), block::Hash([4; 32]));
+    let auth = HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: best.0,
+        completed_checkpoint_hash: best.1,
+        header_witness: None,
+    };
+    let mut capture =
+        TraceCapture::for_test("root_auth_state_trace_records_exact_hole_height").unwrap();
+    let mut startup = startup_for(network, anchor, Some(best));
+    startup.header_root_auth = Some(auth);
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let fixture = spawn_test_reactor(startup);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(auth)))
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    capture.flush().await;
+    capture
+        .reader()
+        .unwrap()
+        .table(HEADER_SYNC_TABLE.table())
+        .assert_row(
+            hs_trace::HEADER_ROOT_AUTH_DIAGNOSTICS,
+            &[
+                (hs_trace::HEIGHT, TraceValue::U64(0)),
+                (hs_trace::BEST_HEADER_TIP, TraceValue::U64(4)),
+                (hs_trace::ROOT_AUTH_HOLE_HEIGHTS, TraceValue::U64(3)),
+            ],
+        );
+
+    let _ = capture.finish().await.unwrap();
+}
+
+#[test]
+fn retained_admission_keeps_farthest_same_start_payload() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, None);
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(0),
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(6),
+        completed_checkpoint_hash: block::Hash([6; 32]),
+        header_witness: None,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let wire_request = |request_id| HeaderSyncWireRequestIdentity {
+        peer: peer(231),
+        session_id: 1,
+        request_id: HeaderSyncRequestId::new(request_id).expect("request ID is non-zero"),
+    };
+    let payload = |count| {
+        HeaderRangePayload::new(
+            HeaderRangeEntry::from_parallel(
+                block::Height(1),
+                vec![mainnet_header(&BLOCK_MAINNET_1_BYTES); count],
+                vec![0; count],
+                roots_from_height(block::Height(1), count),
+            )
+            .expect("test response vectors align"),
+        )
+        .expect("test payload is contiguous")
+    };
+
+    let original_wire_request = wire_request(1);
+    assert!(state.admit_retained_root_payload(original_wire_request.clone(), payload(3)));
+    state
+        .retained_roots
+        .get_mut(&block::Height(1))
+        .expect("original retained entry exists")
+        .authenticating = true;
+    assert!(!state.admit_retained_root_payload(wire_request(2), payload(2)));
+    let replacement_wire_request = wire_request(3);
+    assert!(state.admit_retained_root_payload(replacement_wire_request.clone(), payload(4)));
+    assert!(
+        state
+            .remove_retained_root_if_owned(
+                block::Height(1),
+                &original_wire_request,
+                "invalid_roots",
+            )
+            .is_none(),
+        "an older authentication failure must not remove its replacement"
+    );
+    assert_eq!(
+        state
+            .retained_roots
+            .get(&block::Height(1))
+            .expect("same-start entry remains")
+            .wire_request,
+        replacement_wire_request
+    );
+}
+
+#[test]
+fn retained_admission_supersedes_queued_fallback() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(
+        network,
+        anchor,
+        Some((block::Height(4), block::Hash([4; 32]))),
+    );
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(2),
+        completed_checkpoint_hash: block::Hash([2; 32]),
+        header_witness: None,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    state.refresh_root_auth_range(&startup);
+    assert_eq!(state.schedule.authenticate_roots.len(), 1);
+
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(1),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+            vec![0, 0],
+            roots_from_height(block::Height(1), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    assert!(state.admit_retained_root_payload(
+        HeaderSyncWireRequestIdentity {
+            peer: peer(232),
+            session_id: 1,
+            request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+        },
+        payload,
+    ));
+
+    assert!(state.schedule.authenticate_roots.is_empty());
+}
+
+#[test]
+fn retained_store_does_not_pressure_evict_long_lead() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, None);
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(0),
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(40),
+        completed_checkpoint_hash: block::Hash([40; 32]),
+        header_witness: None,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+
+    for index in 0..16u32 {
+        let start = block::Height(index.saturating_mul(2).saturating_add(1));
+        let payload = HeaderRangePayload::new(
+            HeaderRangeEntry::from_parallel(
+                start,
+                vec![
+                    mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                    mainnet_header(&BLOCK_MAINNET_2_BYTES),
+                ],
+                vec![0, 0],
+                roots_from_height(start, 2),
+            )
+            .expect("test response vectors align"),
+        )
+        .expect("test payload is contiguous");
+        assert!(state.admit_retained_root_payload(
+            HeaderSyncWireRequestIdentity {
+                peer: peer(233),
+                session_id: 1,
+                request_id: HeaderSyncRequestId::new(u64::from(index) + 1)
+                    .expect("request ID is non-zero"),
+            },
+            payload,
+        ));
+    }
+
+    assert_eq!(state.retained_roots.len(), 16);
+    assert_eq!(state.retained_heights(), 32);
+}
+
+/// Without live auth state no consumption or pruning path runs, so retention
+/// must be refused: admitted payloads would accumulate unboundedly and the
+/// eventual `None -> Some` watch transition clears the retained store anyway.
+#[test]
+fn retained_admission_requires_live_auth_state() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let startup = startup_for(network, anchor, None);
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    assert!(state.header_root_auth.is_none());
+
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(1),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+            vec![0, 0],
+            roots_from_height(block::Height(1), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    let wire_request = HeaderSyncWireRequestIdentity {
+        peer: peer(234),
+        session_id: 1,
+        request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+    };
+
+    assert!(!state.admit_retained_root_payload(wire_request.clone(), payload.clone()));
+    assert!(state.retained_roots.is_empty());
+
+    // The identical payload is admitted once auth state is live.
+    state.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(0),
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(6),
+        completed_checkpoint_hash: block::Hash([6; 32]),
+        header_witness: None,
+    });
+    assert!(state.admit_retained_root_payload(wire_request, payload));
+    assert_eq!(state.retained_roots.len(), 1);
+}
+
+#[test]
+fn retained_local_retry_window_starts_on_failure_and_can_fallback_after_exhaustion() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(
+        network,
+        anchor,
+        Some((block::Height(4), block::Hash([4; 32]))),
+    );
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(2),
+        completed_checkpoint_hash: block::Hash([2; 32]),
+        header_witness: None,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let wire_request = HeaderSyncWireRequestIdentity {
+        peer: peer(237),
+        session_id: 1,
+        request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+    };
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(1),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+            vec![0, 0],
+            roots_from_height(block::Height(1), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    assert!(state.admit_retained_root_payload(wire_request.clone(), payload));
+    let now = Instant::now();
+    let retained = state
+        .retained_roots
+        .get_mut(&block::Height(1))
+        .expect("retained entry exists");
+    assert!(retained.local_retry_started_at.is_none());
+    assert!(retained.retry_local(now));
+    assert_eq!(retained.local_retry_started_at, Some(now));
+    retained.local_attempts = RETAINED_ROOT_LOCAL_MAX_ATTEMPTS.saturating_sub(1);
+    assert!(!retained.retry_local(now + std::time::Duration::from_secs(1)));
+    assert!(retained.local_retry_exhausted);
+
+    assert!(state
+        .remove_retained_root_if_owned(block::Height(1), &wire_request, "local_retry_exhausted",)
+        .is_some());
+    state.refresh_root_auth_range(&startup);
+    assert_eq!(state.schedule.authenticate_roots.len(), 1);
+}
+
 fn startup_with_timeout(
     network: Network,
     anchor: (block::Height, block::Hash),
@@ -577,24 +1556,20 @@ fn startup_rejects_anchor_above_verified_block_tip() {
 }
 
 #[test]
-fn startup_uses_verified_block_tip_when_stored_header_tip_is_stale() {
+fn startup_uses_stored_header_tip_when_verified_body_is_ahead() {
     let network = regtest_network();
-    let verified_tip = block::Height(5);
-    let verified_hash = block::Hash([5; 32]);
+    let durable_tip = (block::Height(3), block::Hash([3; 32]));
     let mut startup = startup_for(
         network.clone(),
         (block::Height(0), network.genesis_hash()),
-        Some((block::Height(3), block::Hash([3; 32]))),
+        Some(durable_tip),
     );
-    startup.frontiers.verified_block_tip = verified_tip;
-    startup.frontiers.verified_block_hash = verified_hash;
+    startup.frontiers.verified_block_tip = block::Height(5);
+    startup.frontiers.verified_block_hash = block::Hash([5; 32]);
 
     let state = HeaderSyncCore::new(&startup).expect("forward-only startup is coherent");
 
-    assert_eq!(
-        (state.best_header_tip, state.best_header_hash),
-        (verified_tip, verified_hash)
-    );
+    assert_eq!((state.best_header_tip, state.best_header_hash), durable_tip);
 }
 
 #[test]
@@ -631,14 +1606,575 @@ fn commit_and_authentication_operations_from_one_request_are_distinct() {
     let pending = PendingOperation {
         range,
         purpose: RangePurpose::Sync,
+        retention_candidate: None,
+        root_auth: None,
+        completion_observed: false,
     };
-    state.pending_operations.insert(commit.clone(), pending);
     state
         .pending_operations
-        .insert(authenticate.clone(), pending);
+        .insert(commit.clone(), pending.clone());
+    state
+        .pending_operations
+        .insert(authenticate.clone(), pending.clone());
 
-    assert_eq!(state.pending_operations.remove(&commit), Some(pending));
+    assert_eq!(
+        state.pending_operations.remove(&commit),
+        Some(pending.clone())
+    );
     assert_eq!(state.pending_operations.get(&authenticate), Some(&pending));
+}
+
+#[test]
+fn stale_root_auth_waits_for_watch_before_rescheduling() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(
+        network,
+        anchor,
+        Some((block::Height(3), block::Hash([3; 32]))),
+    );
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(0),
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(3),
+        completed_checkpoint_hash: block::Hash([3; 32]),
+        header_witness: None,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    state.root_auth_waiting_for_watch = true;
+
+    state.refresh_root_auth_range(&startup);
+
+    assert!(state.schedule.authenticate_roots.is_empty());
+}
+
+#[test]
+fn session_retirement_cleans_auth_and_retained_payloads() {
+    let network = Network::Mainnet;
+    let mut startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    );
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(0),
+        authenticated_hash: network.genesis_hash(),
+        completed_checkpoint_height: block::Height(6),
+        completed_checkpoint_hash: block::Hash([6; 32]),
+        header_witness: None,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let peer = peer(212);
+    let wire_request = HeaderSyncWireRequestIdentity {
+        peer: peer.clone(),
+        session_id: 7,
+        request_id: HeaderSyncRequestId::new(10).expect("request ID is non-zero"),
+    };
+    let auth_operation = HeaderSyncOperationIdentity {
+        wire_request: wire_request.clone(),
+        op_kind: HeaderSyncOperationKind::AuthenticateRoots,
+    };
+    let commit_operation = HeaderSyncOperationIdentity {
+        wire_request,
+        op_kind: HeaderSyncOperationKind::CommitHeaders,
+    };
+    let auth_range = RangeRequest {
+        range: CheckedHeaderRange::from_count(block::Height(1), 2).expect("test range is bounded"),
+        anchor_hash: Some(network.genesis_hash()),
+        finalized: true,
+        want_tree_aux_roots: true,
+        priority: RangePriority::AuthenticateRoots,
+    };
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(1),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+            vec![0, 0],
+            roots_from_height(block::Height(1), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    state
+        .schedule
+        .mark_authenticating(auth_operation.clone(), auth_range);
+    state.pending_operations.insert(
+        auth_operation.clone(),
+        PendingOperation {
+            range: auth_range,
+            purpose: RangePurpose::AuthenticateRoots,
+            retention_candidate: None,
+            root_auth: Some(PendingRootAuth {
+                source: RootAuthSource::Fallback,
+                expected: HeaderRootAuthState {
+                    authenticated_height: block::Height(0),
+                    authenticated_hash: network.genesis_hash(),
+                    completed_checkpoint_height: block::Height(0),
+                    completed_checkpoint_hash: network.genesis_hash(),
+                    header_witness: None,
+                },
+            }),
+            completion_observed: false,
+        },
+    );
+    state.pending_operations.insert(
+        commit_operation.clone(),
+        PendingOperation {
+            range: RangeRequest {
+                priority: RangePriority::Forward,
+                ..auth_range
+            },
+            purpose: RangePurpose::Sync,
+            retention_candidate: Some(payload.clone()),
+            root_auth: None,
+            completion_observed: false,
+        },
+    );
+    assert!(state.admit_retained_root_payload(auth_operation.wire_request.clone(), payload,));
+    let buffered_range = RangeRequest {
+        range: CheckedHeaderRange::from_count(block::Height(2), 2).expect("test range is bounded"),
+        anchor_hash: None,
+        ..auth_range
+    };
+    let buffered_peer = peer.clone();
+    state
+        .schedule
+        .mark_assigned(buffered_peer.clone(), buffered_range);
+    state.schedule.mark_buffered(buffered_peer, buffered_range);
+    state.buffered.insert(
+        (
+            RangePriority::AuthenticateRoots,
+            buffered_range.start_height(),
+        ),
+        BufferedHeaderRange {
+            wire_request: auth_operation.wire_request.clone(),
+            range: buffered_range,
+            purpose: RangePurpose::AuthenticateRoots,
+            payload: HeaderRangePayload::new(
+                HeaderRangeEntry::from_parallel(
+                    block::Height(2),
+                    vec![
+                        mainnet_header(&BLOCK_MAINNET_2_BYTES),
+                        mainnet_header(&BLOCK_MAINNET_3_BYTES),
+                    ],
+                    vec![0, 0],
+                    roots_from_height(block::Height(2), 2),
+                )
+                .expect("test response vectors align"),
+            )
+            .expect("test payload is contiguous"),
+        },
+    );
+
+    state.retire_peer_session_auth(&peer, Some(7));
+
+    assert!(!state.pending_operations.contains_key(&auth_operation));
+    assert!(state.schedule.state(auth_range).is_none());
+    assert!(state.schedule.authenticate_roots.contains(&auth_range));
+    assert!(!state.buffered.contains_key(&(
+        RangePriority::AuthenticateRoots,
+        buffered_range.start_height()
+    )));
+    assert!(state.schedule.authenticate_roots.contains(&buffered_range));
+    assert!(state
+        .pending_operations
+        .get(&commit_operation)
+        .expect("canonical commit remains pending")
+        .retention_candidate
+        .is_none());
+    assert!(state.retained_roots.is_empty());
+}
+
+#[test]
+fn clear_inflight_root_auth_completes_on_advancement() {
+    let network = Network::Mainnet;
+    let startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    );
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let peer = peer(220);
+    let auth_operation = HeaderSyncOperationIdentity {
+        wire_request: HeaderSyncWireRequestIdentity {
+            peer: peer.clone(),
+            session_id: 1,
+            request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+        },
+        op_kind: HeaderSyncOperationKind::AuthenticateRoots,
+    };
+    let commit_operation = HeaderSyncOperationIdentity {
+        wire_request: HeaderSyncWireRequestIdentity {
+            peer,
+            session_id: 1,
+            request_id: HeaderSyncRequestId::new(2).expect("request ID is non-zero"),
+        },
+        op_kind: HeaderSyncOperationKind::CommitHeaders,
+    };
+    let auth_range = RangeRequest {
+        range: CheckedHeaderRange::from_count(block::Height(1), 2).expect("test range is bounded"),
+        anchor_hash: Some(network.genesis_hash()),
+        finalized: true,
+        want_tree_aux_roots: true,
+        priority: RangePriority::AuthenticateRoots,
+    };
+    state
+        .schedule
+        .mark_authenticating(auth_operation.clone(), auth_range);
+    state.pending_operations.insert(
+        auth_operation.clone(),
+        PendingOperation {
+            range: auth_range,
+            purpose: RangePurpose::AuthenticateRoots,
+            retention_candidate: None,
+            root_auth: Some(PendingRootAuth {
+                source: RootAuthSource::Fallback,
+                expected: HeaderRootAuthState {
+                    authenticated_height: block::Height(0),
+                    authenticated_hash: network.genesis_hash(),
+                    completed_checkpoint_height: block::Height(0),
+                    completed_checkpoint_hash: network.genesis_hash(),
+                    header_witness: None,
+                },
+            }),
+            completion_observed: false,
+        },
+    );
+    state.pending_operations.insert(
+        commit_operation.clone(),
+        PendingOperation {
+            range: RangeRequest {
+                priority: RangePriority::Forward,
+                ..auth_range
+            },
+            purpose: RangePurpose::Sync,
+            retention_candidate: None,
+            root_auth: None,
+            completion_observed: false,
+        },
+    );
+
+    state.clear_inflight_root_auth(true);
+
+    assert!(!state.pending_operations.contains_key(&auth_operation));
+    assert!(state.pending_operations.contains_key(&commit_operation));
+    assert!(state.schedule.state(auth_range).is_none());
+    assert!(!state.schedule.authenticate_roots.contains(&auth_range));
+}
+
+#[test]
+fn completed_inflight_root_auth_waits_for_driver_completion() {
+    let network = Network::Mainnet;
+    let startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    );
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let auth_operation = HeaderSyncOperationIdentity {
+        wire_request: HeaderSyncWireRequestIdentity {
+            peer: peer(222),
+            session_id: 1,
+            request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+        },
+        op_kind: HeaderSyncOperationKind::AuthenticateRoots,
+    };
+    let auth_range = RangeRequest {
+        range: CheckedHeaderRange::from_count(block::Height(1), 2).expect("test range is bounded"),
+        anchor_hash: Some(network.genesis_hash()),
+        finalized: true,
+        want_tree_aux_roots: true,
+        priority: RangePriority::AuthenticateRoots,
+    };
+    state
+        .schedule
+        .mark_authenticating(auth_operation.clone(), auth_range);
+    state.pending_operations.insert(
+        auth_operation.clone(),
+        PendingOperation {
+            range: auth_range,
+            purpose: RangePurpose::AuthenticateRoots,
+            retention_candidate: None,
+            root_auth: Some(PendingRootAuth {
+                source: RootAuthSource::Fallback,
+                expected: HeaderRootAuthState {
+                    authenticated_height: block::Height(0),
+                    authenticated_hash: network.genesis_hash(),
+                    completed_checkpoint_height: block::Height(0),
+                    completed_checkpoint_hash: network.genesis_hash(),
+                    header_witness: None,
+                },
+            }),
+            completion_observed: false,
+        },
+    );
+
+    state.clear_completed_inflight_root_auth();
+
+    assert!(state.pending_operations.contains_key(&auth_operation));
+    assert!(matches!(
+        state.schedule.state(auth_range),
+        Some(HeaderWorkState::Committing { operation }) if operation == &auth_operation
+    ));
+
+    state
+        .pending_operations
+        .get_mut(&auth_operation)
+        .expect("authentication remains pending")
+        .completion_observed = true;
+    state.clear_completed_inflight_root_auth();
+
+    assert!(!state.pending_operations.contains_key(&auth_operation));
+    assert!(state.schedule.state(auth_range).is_none());
+}
+
+#[test]
+fn clear_inflight_root_auth_retires_without_requeue_on_rebase() {
+    let network = Network::Mainnet;
+    let startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    );
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let auth_operation = HeaderSyncOperationIdentity {
+        wire_request: HeaderSyncWireRequestIdentity {
+            peer: peer(221),
+            session_id: 1,
+            request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+        },
+        op_kind: HeaderSyncOperationKind::AuthenticateRoots,
+    };
+    let auth_range = RangeRequest {
+        range: CheckedHeaderRange::from_count(block::Height(1), 2).expect("test range is bounded"),
+        anchor_hash: Some(network.genesis_hash()),
+        finalized: true,
+        want_tree_aux_roots: true,
+        priority: RangePriority::AuthenticateRoots,
+    };
+    state
+        .schedule
+        .mark_authenticating(auth_operation.clone(), auth_range);
+    state.pending_operations.insert(
+        auth_operation.clone(),
+        PendingOperation {
+            range: auth_range,
+            purpose: RangePurpose::AuthenticateRoots,
+            retention_candidate: None,
+            root_auth: Some(PendingRootAuth {
+                source: RootAuthSource::Fallback,
+                expected: HeaderRootAuthState {
+                    authenticated_height: block::Height(0),
+                    authenticated_hash: network.genesis_hash(),
+                    completed_checkpoint_height: block::Height(0),
+                    completed_checkpoint_hash: network.genesis_hash(),
+                    header_witness: None,
+                },
+            }),
+            completion_observed: false,
+        },
+    );
+
+    state.clear_inflight_root_auth(false);
+
+    assert!(!state.pending_operations.contains_key(&auth_operation));
+    assert!(state.schedule.state(auth_range).is_none());
+    // Retire frees the slot without claiming success or retrying.
+    assert!(!state.schedule.authenticate_roots.contains(&auth_range));
+}
+
+#[test]
+fn prune_root_auth_pipeline_keeps_in_window_work() {
+    let network = Network::Mainnet;
+    let startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    );
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let behind = RangeRequest {
+        range: CheckedHeaderRange::from_count(block::Height(1), 2).expect("test range is bounded"),
+        anchor_hash: Some(network.genesis_hash()),
+        finalized: true,
+        want_tree_aux_roots: true,
+        priority: RangePriority::AuthenticateRoots,
+    };
+    let in_window = RangeRequest {
+        range: CheckedHeaderRange::from_count(block::Height(3), 2).expect("test range is bounded"),
+        anchor_hash: None,
+        finalized: true,
+        want_tree_aux_roots: true,
+        priority: RangePriority::AuthenticateRoots,
+    };
+    let past_checkpoint = RangeRequest {
+        range: CheckedHeaderRange::from_count(block::Height(5), 2).expect("test range is bounded"),
+        anchor_hash: None,
+        finalized: true,
+        want_tree_aux_roots: true,
+        priority: RangePriority::AuthenticateRoots,
+    };
+    let forward = RangeRequest {
+        range: CheckedHeaderRange::from_count(block::Height(1), 2).expect("test range is bounded"),
+        anchor_hash: Some(network.genesis_hash()),
+        finalized: false,
+        want_tree_aux_roots: false,
+        priority: RangePriority::Forward,
+    };
+    for range in [behind, in_window, past_checkpoint] {
+        state
+            .schedule
+            .ensure(range, RangePriority::AuthenticateRoots);
+    }
+    state.schedule.ensure_forward(forward);
+
+    let wire_request = HeaderSyncWireRequestIdentity {
+        peer: peer(222),
+        session_id: 1,
+        request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+    };
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(1),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+            vec![0, 0],
+            roots_from_height(block::Height(1), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    for range in [behind, in_window, past_checkpoint] {
+        state.buffered.insert(
+            (RangePriority::AuthenticateRoots, range.start_height()),
+            BufferedHeaderRange {
+                wire_request: wire_request.clone(),
+                range,
+                purpose: RangePurpose::AuthenticateRoots,
+                payload: payload.clone(),
+            },
+        );
+    }
+    state.buffered.insert(
+        (RangePriority::Forward, forward.start_height()),
+        BufferedHeaderRange {
+            wire_request: wire_request.clone(),
+            range: forward,
+            purpose: RangePurpose::Sync,
+            payload: payload.clone(),
+        },
+    );
+
+    state.prune_root_auth_pipeline(
+        HeaderRootAuthState {
+            authenticated_height: block::Height(2),
+            authenticated_hash: block::Hash([2; 32]),
+            completed_checkpoint_height: block::Height(4),
+            completed_checkpoint_hash: block::Hash([4; 32]),
+            header_witness: None,
+        },
+        true,
+    );
+
+    assert!(!state.schedule.authenticate_roots.contains(&behind));
+    assert!(state.schedule.authenticate_roots.contains(&in_window));
+    assert!(state.schedule.authenticate_roots.contains(&past_checkpoint));
+    assert!(state.schedule.forward.contains(&forward));
+    assert!(!state
+        .buffered
+        .contains_key(&(RangePriority::AuthenticateRoots, behind.start_height())));
+    assert!(state
+        .buffered
+        .contains_key(&(RangePriority::AuthenticateRoots, in_window.start_height())));
+    assert!(!state.buffered.contains_key(&(
+        RangePriority::AuthenticateRoots,
+        past_checkpoint.start_height()
+    )));
+    assert!(state
+        .buffered
+        .contains_key(&(RangePriority::Forward, forward.start_height())));
+}
+
+#[test]
+fn discard_root_auth_pipeline_clears_auth_lane_only() {
+    let network = Network::Mainnet;
+    let startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    );
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let auth_range = RangeRequest {
+        range: CheckedHeaderRange::from_count(block::Height(1), 2).expect("test range is bounded"),
+        anchor_hash: Some(network.genesis_hash()),
+        finalized: true,
+        want_tree_aux_roots: true,
+        priority: RangePriority::AuthenticateRoots,
+    };
+    let forward = RangeRequest {
+        range: CheckedHeaderRange::from_count(block::Height(1), 2).expect("test range is bounded"),
+        anchor_hash: Some(network.genesis_hash()),
+        finalized: false,
+        want_tree_aux_roots: false,
+        priority: RangePriority::Forward,
+    };
+    state
+        .schedule
+        .ensure(auth_range, RangePriority::AuthenticateRoots);
+    state.schedule.ensure_forward(forward);
+
+    let wire_request = HeaderSyncWireRequestIdentity {
+        peer: peer(223),
+        session_id: 1,
+        request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+    };
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(1),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+            vec![0, 0],
+            roots_from_height(block::Height(1), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    state.buffered.insert(
+        (RangePriority::AuthenticateRoots, auth_range.start_height()),
+        BufferedHeaderRange {
+            wire_request: wire_request.clone(),
+            range: auth_range,
+            purpose: RangePurpose::AuthenticateRoots,
+            payload: payload.clone(),
+        },
+    );
+    state.buffered.insert(
+        (RangePriority::Forward, forward.start_height()),
+        BufferedHeaderRange {
+            wire_request,
+            range: forward,
+            purpose: RangePurpose::Sync,
+            payload,
+        },
+    );
+
+    state.discard_root_auth_pipeline();
+
+    assert!(state.schedule.authenticate_roots.is_empty());
+    assert!(state.schedule.forward.contains(&forward));
+    assert!(!state
+        .buffered
+        .keys()
+        .any(|(priority, _)| { *priority == RangePriority::AuthenticateRoots }));
+    assert!(state
+        .buffered
+        .contains_key(&(RangePriority::Forward, forward.start_height())));
 }
 
 #[tokio::test]
@@ -809,6 +2345,87 @@ async fn advisory_summary_status_mismatch_uses_status_without_misbehavior_and_ba
         "repeated unconfirmed advisory usefulness enters local non-punitive backoff"
     );
     assert_no_commit_or_misbehavior(&mut fixture.actions).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn advisory_backoff_expiry_reopens_demand_without_an_unrelated_event() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let (peer_id, peer_node_id) = node_peer();
+    let mut candidates = fixture.handle.subscribe_candidate_state();
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::AdvisoryHeaderSummary {
+            peer: peer_id.clone(),
+            summary: advisory_header_summary(block::Height(10), 1),
+        })
+        .await
+        .unwrap();
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(1),
+        1,
+        1,
+    )
+    .await;
+
+    let (requested_peer, request_id, _, _) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, peer_id);
+    send_headers(&fixture, &peer_id, request_id, headers_message(Vec::new())).await;
+    while !candidates
+        .borrow_and_update()
+        .backed_off_node_ids
+        .contains(&peer_node_id)
+    {
+        candidates
+            .changed()
+            .await
+            .expect("the header-sync reactor keeps candidate state open");
+    }
+
+    let service = HeaderSyncService::new(fixture.handle.clone());
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer_id,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::RetryAt(_)
+    ));
+
+    tokio::time::advance(HEADER_SYNC_ADVISORY_BACKOFF).await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while candidates
+            .borrow_and_update()
+            .backed_off_node_ids
+            .contains(&peer_node_id)
+        {
+            candidates
+                .changed()
+                .await
+                .expect("the header-sync reactor keeps candidate state open");
+        }
+    })
+    .await
+    .expect("the advisory deadline publishes candidate expiry");
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer_id,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::OpenNow
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -984,7 +2601,7 @@ async fn next_non_query_action(actions: &mut mpsc::Receiver<HeaderSyncAction>) -
         let action = next_action(actions).await;
         if !matches!(
             action,
-            HeaderSyncAction::QueryBestHeaderTip
+            HeaderSyncAction::QueryBestHeaderTip { .. }
                 | HeaderSyncAction::QueryMissingBlockBodies { .. }
                 | HeaderSyncAction::QueryHeadersByHeightRange { .. }
                 | HeaderSyncAction::HeaderAdvanced { .. }
@@ -1100,6 +2717,1073 @@ async fn send_headers(
         .unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn rooted_forward_requests_overlap_once_through_handoff() {
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_4_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(4), checkpoint_hash);
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: anchor.0,
+        completed_checkpoint_hash: anchor.1,
+        header_witness: None,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(214);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id.clone(), anchor.0, block::Height(8), 2, 4).await;
+
+    let mut requests = BTreeMap::new();
+    for _ in 0..3 {
+        let (peer, request_id, start, count) =
+            next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(peer, peer_id);
+        assert_eq!(count, 2);
+        requests.insert(start, request_id);
+    }
+    assert_eq!(
+        requests.keys().copied().collect::<Vec<_>>(),
+        vec![block::Height(1), block::Height(2), block::Height(3)]
+    );
+
+    fixture.task.abort();
+}
+
+#[test]
+fn rooted_forward_overlap_advances_past_intermediate_checkpoint() {
+    let network = Parameters::build()
+        .with_network_name("HsIntermediateOverlapTest")
+        .expect("custom network name is valid")
+        .with_genesis_hash(Network::Mainnet.genesis_hash())
+        .expect("mainnet genesis hash is valid")
+        .with_activation_heights(ConfiguredActivationHeights {
+            overwinter: Some(1),
+            sapling: Some(2),
+            blossom: Some(3),
+            heartwood: Some(4),
+            canopy: Some(4),
+            ..Default::default()
+        })
+        .expect("custom activation heights are in order")
+        .clear_funding_streams()
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (block::Height(0), Network::Mainnet.genesis_hash()),
+            (block::Height(400), block::Hash([4; 32])),
+            (block::Height(1_200), block::Hash([12; 32])),
+        ]))
+        .expect("custom checkpoints are valid")
+        .to_network()
+        .expect("custom testnet parameters are valid");
+    let anchor = (block::Height(0), network.genesis_hash());
+    let checkpoint = (block::Height(400), block::Hash([4; 32]));
+    let mut startup = startup_for(network, anchor, Some(checkpoint));
+    startup.config.max_headers_per_response = 600;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: checkpoint.0,
+        completed_checkpoint_hash: checkpoint.1,
+        header_witness: None,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    let peer_id = peer(236);
+    let payload = HeaderRangePayload::new(
+        HeaderRangeEntry::from_parallel(
+            block::Height(399),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+            vec![0, 0],
+            roots_from_height(block::Height(399), 2),
+        )
+        .expect("test response vectors align"),
+    )
+    .expect("test payload is contiguous");
+    assert!(state.admit_retained_root_payload(
+        HeaderSyncWireRequestIdentity {
+            peer: peer_id.clone(),
+            session_id: 1,
+            request_id: HeaderSyncRequestId::new(1).expect("request ID is non-zero"),
+        },
+        payload,
+    ));
+    let (send, _recv) = crate::zakura::framed_channel(32);
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+    );
+    let mut peer_state = super::state::PeerHeaderState::new(
+        session,
+        anchor,
+        600,
+        2,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+    );
+    peer_state.received_status = true;
+    peer_state.advertised_tip = block::Height(1_000);
+    state.peers.insert(peer_id, peer_state);
+
+    state.refresh_forward_range(&startup);
+
+    let first = state
+        .schedule
+        .forward
+        .front()
+        .expect("forward scheduling continues from retained checkpoint overlap");
+    assert_eq!(first.start_height(), checkpoint.0);
+    assert_eq!(first.count(), 600);
+    assert_eq!(first.anchor_hash, None);
+}
+
+#[test]
+fn refresh_forward_range_skips_one_height_retained_overlap_at_scheduled_tip() {
+    // Reproduce the panic: retain-roots overlap continues from scheduled_end when
+    // that end already equals the peer tip, so the next batch would be length 1
+    // and `next_height(batch_start)..=batch_end` is inverted.
+    let network = Parameters::build()
+        .with_network_name("HsOneHeightOverlapPanic")
+        .expect("custom network name is valid")
+        .with_genesis_hash(Network::Mainnet.genesis_hash())
+        .expect("mainnet genesis hash is valid")
+        .with_activation_heights(ConfiguredActivationHeights {
+            overwinter: Some(1),
+            sapling: Some(2),
+            blossom: Some(3),
+            heartwood: Some(4),
+            canopy: Some(4),
+            ..Default::default()
+        })
+        .expect("custom activation heights are in order")
+        .clear_funding_streams()
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (block::Height(0), Network::Mainnet.genesis_hash()),
+            (block::Height(400), block::Hash([4; 32])),
+            (block::Height(1_200), block::Hash([12; 32])),
+        ]))
+        .expect("custom checkpoints are valid")
+        .to_network()
+        .expect("custom testnet parameters are valid");
+    let anchor = (block::Height(0), network.genesis_hash());
+    let tip = (block::Height(400), block::Hash([4; 32]));
+    let peer_tip = block::Height(500);
+    let mut startup = startup_for(network, anchor, Some(tip));
+    startup.config.max_headers_per_response = 100;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: tip.0,
+        authenticated_hash: tip.1,
+        completed_checkpoint_height: tip.0,
+        completed_checkpoint_hash: tip.1,
+        header_witness: None,
+    });
+    let mut state = HeaderSyncCore::new(&startup).expect("startup is coherent");
+    state.schedule.ensure_forward(RangeRequest {
+        range: CheckedHeaderRange::from_bounds(block::Height(401), peer_tip)
+            .expect("seeded forward range is bounded"),
+        anchor_hash: None,
+        finalized: false,
+        want_tree_aux_roots: true,
+        priority: RangePriority::Forward,
+    });
+    let peer_id = peer(237);
+    let (send, _recv) = crate::zakura::framed_channel(32);
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+    );
+    let mut peer_state = super::state::PeerHeaderState::new(
+        session,
+        tip,
+        100,
+        2,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+    );
+    peer_state.received_status = true;
+    peer_state.advertised_tip = peer_tip;
+    state.peers.insert(peer_id, peer_state);
+
+    state.refresh_forward_range(&startup);
+
+    assert_eq!(
+        state.schedule.highest_end(RangePriority::Forward),
+        Some(peer_tip),
+        "one-height retained overlap at the scheduled tip must stop without enqueueing"
+    );
+    assert_eq!(
+        state.schedule.range_count(RangePriority::Forward),
+        1,
+        "refresh must not add a degenerate one-height overlap batch"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn committed_forward_payload_authenticates_without_fallback_request() {
+    let header_2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    let header_2_hash = block::Hash::from(header_2.as_ref());
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(3),
+        completed_checkpoint_hash: checkpoint_hash,
+        header_witness: None,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(234);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id.clone(), anchor.0, block::Height(3), 2, 1).await;
+    let (requested_peer, request_id, start, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, peer_id);
+    assert_eq!((start, count), (block::Height(1), 2));
+
+    send_headers(
+        &fixture,
+        &peer_id,
+        request_id,
+        headers_message_from(
+            block::Height(1),
+            vec![mainnet_header(&BLOCK_MAINNET_1_BYTES), header_2],
+        ),
+    )
+    .await;
+
+    let commit_operation = loop {
+        if let HeaderSyncAction::CommitHeaderRange { operation, .. } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            break operation;
+        }
+    };
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeOperationCompleted {
+            operation: commit_operation.clone(),
+            tip_hash: header_2_hash,
+        })
+        .await
+        .unwrap();
+
+    let (auth_operation, payload) = loop {
+        if let HeaderSyncAction::AuthenticateHeaderRoots {
+            operation, payload, ..
+        } = next_non_query_action(&mut fixture.actions).await
+        {
+            break (operation, payload);
+        }
+    };
+    assert_eq!(auth_operation.wire_request, commit_operation.wire_request);
+    assert_eq!(payload.range().start(), block::Height(1));
+    assert_eq!(payload.range().end(), block::Height(2));
+
+    fixture.task.abort();
+}
+
+async fn reactor_with_pending_fallback_root_authentication(
+    additional_peer: Option<ZakuraPeerId>,
+) -> (ReactorFixture, HeaderSyncOperationIdentity, ZakuraPeerId) {
+    let header_1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let header_2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    let header_2_hash = block::Hash::from(header_2.as_ref());
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, checkpoint_hash) =
+        checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some((block::Height(2), header_2_hash)));
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(3),
+        completed_checkpoint_hash: checkpoint_hash,
+        header_witness: None,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let source_peer = peer(238);
+
+    connect_peer(&fixture, source_peer.clone()).await;
+    advertise_tip(
+        &fixture,
+        source_peer.clone(),
+        anchor.0,
+        block::Height(2),
+        2,
+        1,
+    )
+    .await;
+    let (requested_peer, request_id, start, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, source_peer);
+    assert_eq!((start, count), (block::Height(1), 2));
+    send_headers(
+        &fixture,
+        &source_peer,
+        request_id,
+        headers_message_from(block::Height(1), vec![header_1, header_2]),
+    )
+    .await;
+
+    let operation = loop {
+        if let HeaderSyncAction::AuthenticateHeaderRoots { operation, .. } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            break operation;
+        }
+    };
+
+    if let Some(peer_id) = additional_peer {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(&fixture, peer_id, anchor.0, block::Height(2), 2, 1).await;
+    }
+
+    (fixture, operation, source_peer)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_witness_recovery_requests_and_accepts_exactly_one_record() {
+    let header_1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let header_2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    let header_1_hash = block::Hash::from(header_1.as_ref());
+    let header_2_hash = block::Hash::from(header_2.as_ref());
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, checkpoint_hash) =
+        checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some((block::Height(2), header_2_hash)));
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(1),
+        authenticated_hash: header_1_hash,
+        completed_checkpoint_height: block::Height(3),
+        completed_checkpoint_hash: checkpoint_hash,
+        header_witness: None,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let source_peer = peer(252);
+
+    connect_peer(&fixture, source_peer.clone()).await;
+    advertise_tip(
+        &fixture,
+        source_peer.clone(),
+        anchor.0,
+        block::Height(2),
+        2,
+        1,
+    )
+    .await;
+    let (requested_peer, request_id, start, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, source_peer);
+    assert_eq!((start, count), (block::Height(2), 1));
+    send_headers(
+        &fixture,
+        &source_peer,
+        request_id,
+        headers_message_from(block::Height(2), vec![header_2]),
+    )
+    .await;
+
+    let action = next_non_query_action(&mut fixture.actions).await;
+    assert!(matches!(
+        action,
+        HeaderSyncAction::AuthenticateHeaderRoots { payload, .. }
+            if payload.range().start() == block::Height(2)
+                && payload.range().end() == block::Height(2)
+    ));
+    fixture.task.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn normal_root_auth_request_rejects_a_one_record_short_response() {
+    let header_1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let header_2_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_2_BYTES).as_ref());
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, checkpoint_hash) =
+        checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some((block::Height(2), header_2_hash)));
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(3),
+        completed_checkpoint_hash: checkpoint_hash,
+        header_witness: None,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let source_peer = peer(253);
+
+    connect_peer(&fixture, source_peer.clone()).await;
+    advertise_tip(
+        &fixture,
+        source_peer.clone(),
+        anchor.0,
+        block::Height(2),
+        2,
+        1,
+    )
+    .await;
+    let (_, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((start, count), (block::Height(1), 2));
+    send_headers(
+        &fixture,
+        &source_peer,
+        request_id,
+        headers_message_from(block::Height(1), vec![header_1]),
+    )
+    .await;
+
+    assert_no_root_authentication(&mut fixture.actions).await;
+    fixture.task.abort();
+}
+
+async fn reactor_with_pending_retained_root_authentication(
+    additional_peer: Option<ZakuraPeerId>,
+) -> (
+    ReactorFixture,
+    HeaderSyncOperationIdentity,
+    HeaderRootAuthState,
+    ZakuraPeerId,
+) {
+    let header_1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let header_2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    let header_2_hash = block::Hash::from(header_2.as_ref());
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, checkpoint_hash) =
+        checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let anchor = (block::Height(0), network.genesis_hash());
+    let auth = HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(3),
+        completed_checkpoint_hash: checkpoint_hash,
+        header_witness: None,
+    };
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(auth);
+    let mut fixture = spawn_test_reactor(startup);
+    let source_peer = peer(239);
+
+    connect_peer(&fixture, source_peer.clone()).await;
+    advertise_tip(
+        &fixture,
+        source_peer.clone(),
+        anchor.0,
+        block::Height(3),
+        2,
+        1,
+    )
+    .await;
+    let (requested_peer, request_id, start, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, source_peer);
+    assert_eq!((start, count), (block::Height(1), 2));
+    send_headers(
+        &fixture,
+        &source_peer,
+        request_id,
+        headers_message_from(block::Height(1), vec![header_1, header_2]),
+    )
+    .await;
+
+    let commit_operation = loop {
+        if let HeaderSyncAction::CommitHeaderRange { operation, .. } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            break operation;
+        }
+    };
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeOperationCompleted {
+            operation: commit_operation,
+            tip_hash: header_2_hash,
+        })
+        .await
+        .unwrap();
+    let mut auth_operation = None;
+    let mut next_range_observed = false;
+    while auth_operation.is_none() || !next_range_observed {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::AuthenticateHeaderRoots { operation, .. } => {
+                auth_operation = Some(operation);
+            }
+            HeaderSyncAction::SendMessage {
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height: block::Height(2),
+                        want_tree_aux_roots: true,
+                        ..
+                    },
+                ..
+            } => {
+                next_range_observed = true;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(peer_id) = additional_peer {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(&fixture, peer_id, anchor.0, block::Height(3), 2, 1).await;
+    }
+
+    (
+        fixture,
+        auth_operation.expect("root authentication action was observed"),
+        auth,
+        source_peer,
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_peer_root_auth_failure_scores_and_retries_avoiding_peer() {
+    let retry_peer = peer(240);
+    let (mut fixture, operation, _auth, source_peer) =
+        reactor_with_pending_retained_root_authentication(Some(retry_peer.clone())).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+            operation,
+            kind: HeaderRootAuthenticationFailureKind::InvalidPeerRange,
+        })
+        .await
+        .unwrap();
+
+    let mut scored = false;
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, source_peer);
+                assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+                scored = true;
+            }
+            HeaderSyncAction::SendMessage {
+                peer,
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                        want_tree_aux_roots: true,
+                    },
+                ..
+            } => {
+                assert!(scored, "invalid roots are scored before retrying");
+                assert_eq!(peer, retry_peer);
+                assert_eq!((start_height, count), (block::Height(1), 2));
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_root_auth_failure_waits_for_watch_without_scoring() {
+    let (mut fixture, operation, auth, _source_peer) =
+        reactor_with_pending_retained_root_authentication(None).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+            operation,
+            kind: HeaderRootAuthenticationFailureKind::Stale,
+        })
+        .await
+        .unwrap();
+    assert_no_root_authentication_or_misbehavior(&mut fixture.actions).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(auth)))
+        .await
+        .unwrap();
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::AuthenticateHeaderRoots { .. } => break,
+            HeaderSyncAction::Misbehavior { .. } => {
+                panic!("stale root authentication failure must not score a peer")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_root_auth_failure_reschedules_when_watch_already_advanced() {
+    let (mut fixture, operation, auth, _source_peer) =
+        reactor_with_pending_retained_root_authentication(None).await;
+
+    // Checkpoint-only watch update: auth tip unchanged so retained coverage stays
+    // valid, but the launch snapshot no longer matches reactor-local state.
+    let advanced = HeaderRootAuthState {
+        completed_checkpoint_height: block::Height(4),
+        completed_checkpoint_hash: block::Hash([4; 32]),
+        ..auth
+    };
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(advanced)))
+        .await
+        .unwrap();
+    assert_no_root_authentication_or_misbehavior(&mut fixture.actions).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+            operation,
+            kind: HeaderRootAuthenticationFailureKind::Stale,
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::AuthenticateHeaderRoots { expected_state, .. } => {
+                assert_eq!(expected_state, advanced);
+                break;
+            }
+            HeaderSyncAction::Misbehavior { .. } => {
+                panic!("stale root authentication failure must not score a peer")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fallback_canonical_mismatch_scores_and_retries_avoiding_peer() {
+    let retry_peer = peer(242);
+    let (mut fixture, operation, source_peer) =
+        reactor_with_pending_fallback_root_authentication(Some(retry_peer.clone())).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+            operation,
+            kind: HeaderRootAuthenticationFailureKind::CanonicalMismatch {
+                height: block::Height(1),
+            },
+        })
+        .await
+        .unwrap();
+
+    let mut scored = false;
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, source_peer);
+                assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+                scored = true;
+            }
+            HeaderSyncAction::SendMessage {
+                peer,
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                        want_tree_aux_roots: true,
+                    },
+                ..
+            } => {
+                assert!(scored, "canonical mismatch is scored before retrying");
+                assert_eq!(peer, retry_peer);
+                assert_eq!((start_height, count), (block::Height(1), 2));
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn canonical_mismatch_root_auth_failure_drops_retained_and_retries_without_scoring() {
+    let retry_peer = peer(241);
+    let (mut fixture, operation, _auth, _source_peer) =
+        reactor_with_pending_retained_root_authentication(Some(retry_peer.clone())).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+            operation,
+            kind: HeaderRootAuthenticationFailureKind::CanonicalMismatch {
+                height: block::Height(1),
+            },
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior { .. } => {
+                panic!("canonical mismatch must not score a peer")
+            }
+            HeaderSyncAction::SendMessage {
+                peer,
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                        want_tree_aux_roots: true,
+                    },
+                ..
+            } => {
+                assert_eq!(peer, retry_peer);
+                assert_eq!((start_height, count), (block::Height(1), 2));
+                break;
+            }
+            HeaderSyncAction::AuthenticateHeaderRoots { .. } => {
+                panic!("canonical mismatch must drop the retained payload")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn local_root_auth_failure_retries_retained_payload_without_scoring() {
+    let (mut fixture, operation, _auth, source_peer) =
+        reactor_with_pending_retained_root_authentication(None).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+            operation,
+            kind: HeaderRootAuthenticationFailureKind::Local,
+        })
+        .await
+        .unwrap();
+    assert_no_root_authentication_or_misbehavior(&mut fixture.actions).await;
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::AuthenticateHeaderRoots { operation, .. } => {
+                assert_eq!(operation.wire_request.peer, source_peer);
+                break;
+            }
+            HeaderSyncAction::Misbehavior { .. } => {
+                panic!("local root authentication failure must not score a peer")
+            }
+            HeaderSyncAction::SendMessage {
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        want_tree_aux_roots: true,
+                        ..
+                    },
+                ..
+            } => panic!("retained local failure must not immediately fall back to the network"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_reanchor_preserves_inflight_retained_root_authentication() {
+    let (mut fixture, operation, _auth, source_peer) =
+        reactor_with_pending_retained_root_authentication(None).await;
+    let durable_tip = (
+        block::Height(3),
+        block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref()),
+    );
+
+    // The retained authentication was dispatched after committing the first
+    // forward range, which advanced the frontier generation from zero to one.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: durable_tip.0,
+            tip_hash: durable_tip.1,
+            reanchor_from: Some(1),
+        })
+        .await
+        .unwrap();
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationFailed {
+            operation,
+            kind: HeaderRootAuthenticationFailureKind::Local,
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::AuthenticateHeaderRoots { operation, .. } => {
+                assert_eq!(operation.wire_request.peer, source_peer);
+                break;
+            }
+            HeaderSyncAction::SendMessage {
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height: block::Height(1),
+                        want_tree_aux_roots: true,
+                        ..
+                    },
+                ..
+            } => {
+                panic!("reanchor scheduled duplicate fallback over in-flight retained auth")
+            }
+            HeaderSyncAction::Misbehavior { .. } => {
+                panic!("local retained authentication failure must not score a peer")
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn reactor_with_two_retained_root_batches(
+) -> (ReactorFixture, HeaderSyncOperationIdentity, block::Hash) {
+    let header_1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let header_1_hash = block::Hash::from(header_1.as_ref());
+    let header_2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    let header_2_hash = block::Hash::from(header_2.as_ref());
+    let header_3 = mainnet_header(&BLOCK_MAINNET_3_BYTES);
+    let header_3_hash = block::Hash::from(header_3.as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), header_3_hash);
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: block::Height(3),
+        completed_checkpoint_hash: header_3_hash,
+        header_witness: None,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(238);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id.clone(), anchor.0, block::Height(3), 2, 1).await;
+    let (_, first_request_id, first_start, first_count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((first_start, first_count), (block::Height(1), 2));
+    send_headers(
+        &fixture,
+        &peer_id,
+        first_request_id,
+        headers_message_from(block::Height(1), vec![header_1, header_2.clone()]),
+    )
+    .await;
+
+    let first_commit = loop {
+        if let HeaderSyncAction::CommitHeaderRange { operation, .. } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            break operation;
+        }
+    };
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeOperationCompleted {
+            operation: first_commit,
+            tip_hash: header_2_hash,
+        })
+        .await
+        .unwrap();
+
+    let mut first_auth = None;
+    let mut second_request = None;
+    while first_auth.is_none() || second_request.is_none() {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::AuthenticateHeaderRoots { operation, .. } => {
+                first_auth = Some(operation);
+            }
+            HeaderSyncAction::SendMessage {
+                request_id,
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                        want_tree_aux_roots: true,
+                    },
+                ..
+            } => {
+                second_request = Some((
+                    request_id.expect("outbound root request has an ID"),
+                    start_height,
+                    count,
+                ));
+            }
+            _ => {}
+        }
+    }
+    let (second_request_id, second_start, second_count) =
+        second_request.expect("second request was observed");
+    assert_eq!((second_start, second_count), (block::Height(2), 2));
+    send_headers(
+        &fixture,
+        &peer_id,
+        second_request_id,
+        headers_message_from(block::Height(2), vec![header_2, header_3]),
+    )
+    .await;
+
+    let second_commit = loop {
+        if let HeaderSyncAction::CommitHeaderRange {
+            operation, payload, ..
+        } = next_non_query_action(&mut fixture.actions).await
+        {
+            if payload.range().start() == block::Height(2) {
+                break operation;
+            }
+        }
+    };
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeOperationCompleted {
+            operation: second_commit,
+            tip_hash: header_3_hash,
+        })
+        .await
+        .unwrap();
+
+    (
+        fixture,
+        first_auth.expect("first authentication was observed"),
+        header_1_hash,
+    )
+}
+
+async fn assert_no_root_authentication(actions: &mut mpsc::Receiver<HeaderSyncAction>) {
+    while let Ok(Some(action)) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), actions.recv()).await
+    {
+        assert!(
+            !matches!(action, HeaderSyncAction::AuthenticateHeaderRoots { .. }),
+            "a second durable root authentication was admitted early"
+        );
+    }
+}
+
+async fn assert_no_root_authentication_or_misbehavior(
+    actions: &mut mpsc::Receiver<HeaderSyncAction>,
+) {
+    while let Ok(Some(action)) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), actions.recv()).await
+    {
+        assert!(
+            !matches!(
+                action,
+                HeaderSyncAction::AuthenticateHeaderRoots { .. }
+                    | HeaderSyncAction::Misbehavior { .. }
+            ),
+            "unexpected root authentication or peer score: {action:?}"
+        );
+    }
+}
+
+async fn expect_second_retained_root_authentication(
+    actions: &mut mpsc::Receiver<HeaderSyncAction>,
+) {
+    loop {
+        if let HeaderSyncAction::AuthenticateHeaderRoots { payload, .. } =
+            next_non_query_action(actions).await
+        {
+            assert_eq!(payload.range().start(), block::Height(2));
+            assert_eq!(payload.range().end(), block::Height(3));
+            return;
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn root_auth_watch_waits_for_driver_completion_before_admitting_next_batch() {
+    let (mut fixture, first_auth, authenticated_hash) =
+        reactor_with_two_retained_root_batches().await;
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(
+            HeaderRootAuthState {
+                authenticated_height: block::Height(1),
+                authenticated_hash,
+                completed_checkpoint_height: block::Height(3),
+                completed_checkpoint_hash: block::Hash::from(
+                    mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref(),
+                ),
+                header_witness: Some(HeaderWitnessState {
+                    height: block::Height(2),
+                    hash: block::Hash::from(mainnet_header(&BLOCK_MAINNET_2_BYTES).as_ref()),
+                }),
+            },
+        )))
+        .await
+        .unwrap();
+
+    assert_no_root_authentication(&mut fixture.actions).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationCompleted {
+            operation: first_auth,
+            update: HeaderRootAuthUpdate::Advanced {
+                authenticated: block::Height(1)..=block::Height(1),
+            },
+        })
+        .await
+        .unwrap();
+    expect_second_retained_root_authentication(&mut fixture.actions).await;
+    fixture.task.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn root_auth_completion_waits_for_watch_before_admitting_next_batch() {
+    let (mut fixture, first_auth, authenticated_hash) =
+        reactor_with_two_retained_root_batches().await;
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthenticationCompleted {
+            operation: first_auth,
+            update: HeaderRootAuthUpdate::Advanced {
+                authenticated: block::Height(1)..=block::Height(1),
+            },
+        })
+        .await
+        .unwrap();
+
+    assert_no_root_authentication(&mut fixture.actions).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRootAuthStateChanged(Some(
+            HeaderRootAuthState {
+                authenticated_height: block::Height(1),
+                authenticated_hash,
+                completed_checkpoint_height: block::Height(3),
+                completed_checkpoint_hash: block::Hash::from(
+                    mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref(),
+                ),
+                header_witness: Some(HeaderWitnessState {
+                    height: block::Height(2),
+                    hash: block::Hash::from(mainnet_header(&BLOCK_MAINNET_2_BYTES).as_ref()),
+                }),
+            },
+        )))
+        .await
+        .unwrap();
+    expect_second_retained_root_authentication(&mut fixture.actions).await;
+    fixture.task.abort();
+}
+
 async fn assert_no_commit_or_misbehavior(actions: &mut mpsc::Receiver<HeaderSyncAction>) {
     while let Ok(Some(action)) =
         tokio::time::timeout(std::time::Duration::from_millis(50), actions.recv()).await
@@ -1146,6 +3830,8 @@ fn test_header_sync_handle() -> (HeaderSyncHandle, mpsc::UnboundedReceiver<Heade
     let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
     let (_candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
     (
         HeaderSyncHandle {
             events,
@@ -1153,9 +3839,300 @@ fn test_header_sync_handle() -> (HeaderSyncHandle, mpsc::UnboundedReceiver<Heade
             tip,
             peers,
             candidates,
+            backoff_deadlines,
         },
         lifecycle_rx,
     )
+}
+
+#[test]
+fn ordered_session_demand_bounds_advisory_backoff_and_waits_for_slots() {
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+        backoff_deadlines,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer, node_id) = node_peer();
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        backed_off_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+
+    let before = std::time::Instant::now();
+    let demand = service.ordered_session_demand(
+        1,
+        &peer,
+        ZAKURA_CAP_HEADER_SYNC,
+        ServicePeerDirection::Outbound,
+    );
+    let OrderedSessionDemand::RetryAt(retry_at) = demand else {
+        panic!("an advisory-backed-off candidate must use a bounded retry");
+    };
+    let after = std::time::Instant::now();
+    assert!(retry_at >= before + HEADER_SYNC_ADVISORY_BACKOFF);
+    assert!(retry_at <= after + HEADER_SYNC_ADVISORY_BACKOFF);
+
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState::default());
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::OpenNow
+    ));
+
+    peers_tx.send_replace(ServicePeerSnapshot {
+        outbound_slots_free: 0,
+        ..ServicePeerSnapshot::default()
+    });
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::WaitForChange(_)
+    ));
+}
+
+#[test]
+fn advisory_backoff_retry_targets_the_real_deadline() {
+    // The reactor owns the real `backoff_until`, and the transport never
+    // shortens a pending demand wait; a deadline invented at sampling time
+    // would overshoot by up to a full backoff period.
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+        backoff_deadlines,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer, node_id) = node_peer();
+
+    let before = std::time::Instant::now();
+    let deadline = before + std::time::Duration::from_secs(10);
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        backed_off_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+    backoff_deadlines_tx.send_replace(vec![(node_id, deadline)]);
+
+    let demand = service.ordered_session_demand(
+        1,
+        &peer,
+        ZAKURA_CAP_HEADER_SYNC,
+        ServicePeerDirection::Outbound,
+    );
+    let OrderedSessionDemand::RetryAt(retry_at) = demand else {
+        panic!("an advisory-backed-off candidate must use a bounded retry");
+    };
+    assert_eq!(
+        retry_at, deadline,
+        "the retry must target the reactor's published backoff expiry"
+    );
+}
+
+#[test]
+fn expired_advisory_backoff_opens_even_with_stale_candidate_state() {
+    // The reactor clears an expired backoff only on its next republish; time
+    // is authoritative, so a passed deadline must not keep gating reopens.
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+        backoff_deadlines,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer, node_id) = node_peer();
+
+    let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        backed_off_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+    backoff_deadlines_tx.send_replace(vec![(node_id, expired)]);
+
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::OpenNow
+    ));
+}
+
+#[tokio::test]
+async fn transient_session_exit_keeps_connection_ownership_across_reopen_gap() {
+    // Discovery samples `owns_connection_for_peer` to decide whether a finished
+    // exchange may close the connection. A header-sync stream that exits while
+    // the connection stays up leaves a reopen-backoff gap with no active
+    // session; the connection must stay owned across that gap, and the claim
+    // must release as soon as this service would no longer re-admit the peer.
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+        backoff_deadlines,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer_id, node_id) = node_peer();
+    let conn_id = 3;
+    let (peer, peer_send) =
+        header_sync_peer_with_conn(peer_id.clone(), conn_id, CancellationToken::new());
+
+    service.add_peer(peer);
+    match lifecycle_rx.recv().await {
+        Some(HeaderSyncEvent::PeerConnected(session)) if session.peer_id() == &peer_id => {}
+        event => panic!("expected header-sync peer connection, got {event:?}"),
+    }
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        admitted_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+    assert!(service.owns_connection_for_peer(&peer_id, conn_id));
+
+    // The peer's inbound stream ends while the connection stays up; the pipe
+    // exits, the reactor drops the peer from its admitted set, and the
+    // transport backs off before offering a replacement stream.
+    drop(peer_send);
+    match tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle_rx.recv()).await {
+        Ok(Some(HeaderSyncEvent::PeerDisconnected(disconnected))) if disconnected == peer_id => {}
+        event => panic!("expected header-sync peer disconnection, got {event:?}"),
+    }
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState::default());
+    assert!(
+        service.owns_connection_for_peer(&peer_id, conn_id),
+        "the reopen gap must keep the connection owned while the peer would be re-admitted"
+    );
+
+    // An advisory backoff means the peer would not be re-admitted, so the gap
+    // claim stops holding the connection open — and revives when it clears.
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        backed_off_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+    assert!(
+        !service.owns_connection_for_peer(&peer_id, conn_id),
+        "a claim for a peer that would not be re-admitted must not own the connection"
+    );
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState::default());
+    assert!(service.owns_connection_for_peer(&peer_id, conn_id));
+
+    // Closing the peer's own connection releases the claim for good.
+    service.remove_peer(&peer_id, conn_id);
+    assert!(!service.owns_connection_for_peer(&peer_id, conn_id));
+}
+
+#[tokio::test]
+async fn transient_session_exit_survives_stale_reactor_snapshot() {
+    // The reactor processes a session's `PeerDisconnected` asynchronously:
+    // right after the service-side teardown records a gap claim, the published
+    // slot snapshot can still count the just-exited session in the last free
+    // slot. While the reactor also still lists the node as admitted, that
+    // "occupied" slot is the session's own, so the claim must keep the
+    // connection owned instead of letting discovery close it mid-gap.
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let (backoff_deadlines_tx, backoff_deadlines) = watch::channel(Vec::new());
+    let _ = &backoff_deadlines_tx;
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+        backoff_deadlines,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer_id, node_id) = node_peer();
+    let conn_id = 4;
+    let (peer, peer_send) =
+        header_sync_peer_with_conn(peer_id.clone(), conn_id, CancellationToken::new());
+
+    service.add_peer(peer);
+    match lifecycle_rx.recv().await {
+        Some(HeaderSyncEvent::PeerConnected(session)) if session.peer_id() == &peer_id => {}
+        event => panic!("expected header-sync peer connection, got {event:?}"),
+    }
+    // The reactor's published view: this node admitted, and its session
+    // occupying the last outbound slot.
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        admitted_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+    peers_tx.send_replace(ServicePeerSnapshot {
+        outbound_slots_free: 0,
+        ..ServicePeerSnapshot::default()
+    });
+    assert!(service.owns_connection_for_peer(&peer_id, conn_id));
+
+    // The session exits while the reactor's snapshot is still stale: slots
+    // read full and the node still reads admitted.
+    drop(peer_send);
+    match tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle_rx.recv()).await {
+        Ok(Some(HeaderSyncEvent::PeerDisconnected(disconnected))) if disconnected == peer_id => {}
+        event => panic!("expected header-sync peer disconnection, got {event:?}"),
+    }
+    assert!(
+        service.owns_connection_for_peer(&peer_id, conn_id),
+        "a stale full-slots snapshot that still lists this node must not release the gap claim"
+    );
+
+    // Once the reactor catches up it publishes both watches together. If the
+    // node is gone from the admitted set while slots stay full, the slot is
+    // genuinely taken by someone else and the claim stops holding the
+    // connection.
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState::default());
+    assert!(
+        !service.owns_connection_for_peer(&peer_id, conn_id),
+        "full slots occupied by other sessions must release the gap claim"
+    );
 }
 
 fn header_sync_peer_with_conn(
@@ -1819,6 +4796,50 @@ async fn restart_rebuilds_schedule_from_durable_best_tip_and_peer_status() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn restart_prefetch_keeps_forward_tip_extension_active() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let best = (block::Height(4), block::Hash([4; 32]));
+    let mut startup = startup_for(network, anchor, Some(best));
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: anchor.0,
+        authenticated_hash: anchor.1,
+        completed_checkpoint_height: best.0,
+        completed_checkpoint_hash: best.1,
+        header_witness: None,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(42);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id,
+        block::Height(0),
+        block::Height(500),
+        2,
+        4,
+    )
+    .await;
+
+    let mut starts = Vec::new();
+    for _ in 0..4 {
+        let (_, _, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+        starts.push((start, count));
+    }
+    assert_eq!(
+        starts,
+        vec![
+            (block::Height(1), 2),
+            (block::Height(2), 2),
+            (block::Height(3), 2),
+            (block::Height(5), 2),
+        ]
+    );
+}
+
 fn mainnet_repair_event(generation: u64) -> HeaderSyncEvent {
     let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
@@ -2086,6 +5107,51 @@ async fn vct_repair_scheduler_skips_peers_with_insufficient_response_capacity() 
     let (requested_peer, _request_id, start_height, count) =
         next_outbound_get_headers(&mut fixture.actions).await;
     assert_eq!(requested_peer, capable_peer);
+    assert_eq!((start_height, count), (block::Height(1), 2));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn vct_repair_does_not_starve_root_auth_on_other_peer() {
+    let best = (
+        block::Height(4),
+        mainnet_block(&BLOCK_MAINNET_4_BYTES).hash(),
+    );
+    let mut startup = startup_for(
+        Network::Mainnet,
+        (block::Height(0), Network::Mainnet.genesis_hash()),
+        Some(best),
+    );
+    startup.config.max_headers_per_response = 2;
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: block::Height(0),
+        authenticated_hash: Network::Mainnet.genesis_hash(),
+        completed_checkpoint_height: best.0,
+        completed_checkpoint_hash: best.1,
+        header_witness: None,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let repair_peer = peer(107);
+    let auth_peer = peer(108);
+
+    fixture.handle.send(mainnet_repair_event(1)).await.unwrap();
+    connect_peer(&fixture, repair_peer.clone()).await;
+    advertise_tip(
+        &fixture,
+        repair_peer.clone(),
+        block::Height(0),
+        best.0,
+        2,
+        1,
+    )
+    .await;
+    let (assigned_repair_peer, _, _, _) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(assigned_repair_peer, repair_peer);
+
+    connect_peer(&fixture, auth_peer.clone()).await;
+    advertise_tip(&fixture, auth_peer.clone(), block::Height(0), best.0, 2, 1).await;
+    let (assigned_auth_peer, _, start_height, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(assigned_auth_peer, auth_peer);
     assert_eq!((start_height, count), (block::Height(1), 2));
 }
 
@@ -2679,7 +5745,7 @@ async fn work_queue_assigns_each_forward_range_to_one_peer() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn covered_outstanding_range_does_not_commit_late_response() {
+async fn durable_tip_coverage_does_not_commit_late_response() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -2699,16 +5765,15 @@ async fn covered_outstanding_range_does_not_commit_late_response() {
     assert_eq!(start_height, start);
     assert_eq!(count, 2);
 
-    for height in start.0..=tip.0 {
-        fixture
-            .handle
-            .send(HeaderSyncEvent::FullBlockCommitted {
-                height: block::Height(height),
-                hash: block::Hash([u8::try_from(height).expect("test height fits in u8"); 32]),
-            })
-            .await
-            .unwrap();
-    }
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: tip,
+            tip_hash: block::Hash([2; 32]),
+            reanchor_from: None,
+        })
+        .await
+        .unwrap();
 
     send_headers(
         &fixture,
@@ -2912,6 +5977,13 @@ async fn forward_ranges_below_checkpoint_handoff_request_tree_aux_roots() {
         (block::Height(0), Network::Mainnet.genesis_hash()),
         Some((first_checkpoint, first_checkpoint_hash)),
     );
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: first_checkpoint,
+        authenticated_hash: first_checkpoint_hash,
+        completed_checkpoint_height: first_checkpoint,
+        completed_checkpoint_hash: first_checkpoint_hash,
+        header_witness: None,
+    });
     startup.trace = ZakuraTrace::new(capture.tracer(), "01");
     let mut fixture = spawn_test_reactor(startup);
     let peer_id = peer(77);
@@ -2965,6 +6037,55 @@ async fn forward_ranges_below_checkpoint_handoff_request_tree_aux_roots() {
     );
 
     let _ = capture.finish().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn forward_ranges_above_handoff_still_request_tree_aux_roots() {
+    // Regtest e2e: after the final checkpoint tip, forward ranges past handoff
+    // must still request roots. Without them the serve path clears non-empty
+    // Headers replies and catch-up stalls at the handoff height.
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let checkpoint = (block::Height(3), checkpoint_hash);
+    let mut startup = startup_for(
+        network,
+        (block::Height(0), Network::Mainnet.genesis_hash()),
+        Some(checkpoint),
+    );
+    startup.header_root_auth = Some(HeaderRootAuthState {
+        authenticated_height: checkpoint.0,
+        authenticated_hash: checkpoint.1,
+        completed_checkpoint_height: checkpoint.0,
+        completed_checkpoint_hash: checkpoint.1,
+        header_witness: None,
+    });
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(235);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id, block::Height(0), block::Height(4), 1, 1).await;
+
+    loop {
+        if let HeaderSyncAction::SendMessage {
+            msg:
+                HeaderSyncMessage::GetHeaders {
+                    start_height,
+                    want_tree_aux_roots,
+                    ..
+                },
+            ..
+        } = next_non_query_action(&mut fixture.actions).await
+        {
+            assert_eq!(start_height, block::Height(4));
+            assert!(
+                want_tree_aux_roots,
+                "post-handoff forward ranges must request roots for non-empty Headers"
+            );
+            break;
+        }
+    }
+
+    fixture.task.abort();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3613,6 +6734,7 @@ async fn material_tip_advance_sends_rate_limited_unsolicited_status() {
                 tip_hash: block::Hash(
                     [u8::try_from(height.0).expect("test heights fit in u8"); 32],
                 ),
+                reanchor_from: None,
             })
             .await
             .unwrap();
@@ -3955,7 +7077,7 @@ async fn reconnect_clears_session_bound_outstanding_ranges() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn full_block_committed_covers_outstanding_height() {
+async fn full_block_committed_preserves_outstanding_header_repair() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -3970,35 +7092,61 @@ async fn full_block_committed_covers_outstanding_height() {
         &fixture,
         peer_id.clone(),
         block::Height(0),
-        block::Height(1),
-        1,
+        block::Height(2),
+        2,
         1,
     )
     .await;
-    let _request_id = next_get_headers_request_id(&mut fixture.actions).await;
+    let request_id = next_get_headers_request_id(&mut fixture.actions).await;
+
+    let mut header1 = *mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    header1.previous_block_hash = network.genesis_hash();
+    let header1 = Arc::new(header1);
+    let header1_hash = block::Hash::from(header1.as_ref());
+    let mut header2 = *mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    header2.previous_block_hash = header1_hash;
+    let header2 = Arc::new(header2);
 
     fixture
         .handle
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
-            hash: block::Hash([1; 32]),
+            hash: header1_hash,
         })
         .await
         .unwrap();
-    match next_action(&mut fixture.actions).await {
-        HeaderSyncAction::HeaderAdvanced { height, hash } => {
-            assert_eq!(height, block::Height(1));
-            assert_eq!(hash, block::Hash([1; 32]));
+    assert_eq!(
+        fixture.handle.best_header_tip(),
+        (block::Height(0), network.genesis_hash()),
+        "verified-body progress must leave the durable anchor unchanged"
+    );
+
+    send_headers(
+        &fixture,
+        &peer_id,
+        request_id,
+        headers_message_from(block::Height(1), vec![header1, header2]),
+    )
+    .await;
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::CommitHeaderRange {
+                anchor, payload, ..
+            } => {
+                assert_eq!(anchor, network.genesis_hash());
+                assert_eq!(payload.range().start(), block::Height(1));
+                assert_eq!(payload.range().end(), block::Height(2));
+                break;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("the preserved honest response must not score {peer:?}: {reason:?}")
+            }
+            _ => {}
         }
-        action => panic!("full block commit must publish a header advance, got {action:?}"),
     }
 
-    // The covered range's request ID is retired rather than the stream torn down: a
-    // late response to it is matched to the retired ID and dropped, so it cannot be
-    // mistaken for newer work. The peer therefore stays connected and usable.
     assert!(!cancel.is_cancelled());
     assert_eq!(fixture.handle.peer_snapshot().inbound_peers, 1);
-    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4894,6 +8042,146 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
         }
         action => panic!("unexpected action: {action:?}"),
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn two_peers_serving_the_same_range_complete_independently() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let first_peer = peer(242);
+    let second_peer = peer(243);
+    let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let (first_send, mut first_recv) = crate::zakura::framed_channel(8);
+    let (second_send, mut second_recv) = crate::zakura::framed_channel(8);
+
+    for (peer_id, send) in [
+        (first_peer.clone(), first_send),
+        (second_peer.clone(), second_send),
+    ] {
+        let session = HeaderSyncPeerSession::from_parts_with_direction(
+            peer_id.clone(),
+            ServicePeerDirection::Inbound,
+            send,
+            CancellationToken::new(),
+        );
+        fixture
+            .handle
+            .send(HeaderSyncEvent::PeerConnected(session))
+            .await
+            .unwrap();
+        advertise_tip(
+            &fixture,
+            peer_id,
+            block::Height(0),
+            block::Height(0),
+            DEFAULT_HS_RANGE,
+            1,
+        )
+        .await;
+    }
+    for recv in [&mut first_recv, &mut second_recv] {
+        tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
+            .await
+            .expect("initial status arrives")
+            .expect("v7 stream stays open");
+    }
+
+    for peer_id in [&first_peer, &second_peer] {
+        fixture
+            .handle
+            .send(HeaderSyncEvent::WireGetHeaders {
+                peer: peer_id.clone(),
+                session_id: 0,
+                request_id,
+                start_height: block::Height(1),
+                count: 2,
+                want_tree_aux_roots: true,
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut queried = std::collections::HashSet::new();
+    while queried.len() < 2 {
+        match next_query_headers_action(&mut fixture.actions).await {
+            HeaderSyncAction::QueryHeadersByHeightRange {
+                peer,
+                request_id: action_request_id,
+                start,
+                count,
+                want_tree_aux_roots,
+                ..
+            } => {
+                assert_eq!(action_request_id, request_id);
+                assert_eq!((start, count), (block::Height(1), 2));
+                assert!(want_tree_aux_roots);
+                queried.insert(peer);
+            }
+            action => panic!("unexpected action: {action:?}"),
+        }
+    }
+    assert_eq!(
+        queried,
+        std::collections::HashSet::from([first_peer.clone(), second_peer.clone()])
+    );
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeResponseReady {
+            peer: first_peer.clone(),
+            session_id: 0,
+            request_id,
+            start_height: block::Height(1),
+            requested_count: 2,
+            want_tree_aux_roots: true,
+            headers: Vec::new(),
+            body_sizes: Vec::new(),
+            tree_aux_roots: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let first_frame = tokio::time::timeout(std::time::Duration::from_secs(1), first_recv.recv())
+        .await
+        .expect("first response arrives")
+        .expect("first stream stays open");
+    assert_eq!(
+        HeaderSyncMessage::peek_headers_request_id(&first_frame.payload).unwrap(),
+        request_id
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), second_recv.recv())
+            .await
+            .is_err(),
+        "first peer completion must not settle the second peer request"
+    );
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeResponseReady {
+            peer: second_peer,
+            session_id: 0,
+            request_id,
+            start_height: block::Height(1),
+            requested_count: 2,
+            want_tree_aux_roots: true,
+            headers: Vec::new(),
+            body_sizes: Vec::new(),
+            tree_aux_roots: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let second_frame = tokio::time::timeout(std::time::Duration::from_secs(1), second_recv.recv())
+        .await
+        .expect("second response arrives")
+        .expect("second stream stays open");
+    assert_eq!(
+        HeaderSyncMessage::peek_headers_request_id(&second_frame.payload).unwrap(),
+        request_id
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -5827,8 +9115,189 @@ async fn commit_failure_after_source_disconnect_retries_without_blocking_the_lan
     assert_eq!((retry_start, retry_count), (start, count));
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn unknown_anchor_reloads_durable_tip_and_retries_with_backoff_without_scoring() {
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(3), checkpoint_hash)),
+    ));
+    let peer_id = peer(215);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(4),
+        1,
+        1,
+    )
+    .await;
+    let (_, request_id, _, _) = next_outbound_get_headers(&mut fixture.actions).await;
+    send_headers(
+        &fixture,
+        &peer_id,
+        request_id,
+        headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+    )
+    .await;
+    let operation = loop {
+        if let HeaderSyncAction::CommitHeaderRange { operation, .. } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            break operation;
+        }
+    };
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeOperationFailed {
+            operation,
+            kind: HeaderSyncCommitFailureKind::UnknownAnchor,
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_action(&mut fixture.actions).await {
+            HeaderSyncAction::QueryBestHeaderTip {
+                reanchor_from: Some(_),
+            } => break,
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("a local unknown anchor must not score {peer:?}: {reason:?}")
+            }
+            _ => {}
+        }
+    }
+
+    tokio::time::advance(std::time::Duration::from_millis(999)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        fixture.actions.try_recv().is_err(),
+        "the failed range must remain delayed before its retry deadline"
+    );
+
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    let (retry_peer, _, retry_start, retry_count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(retry_peer, peer_id);
+    assert_eq!((retry_start, retry_count), (block::Height(4), 1));
+}
+
 #[tokio::test(flavor = "current_thread")]
-async fn partial_full_block_coverage_retires_old_request_and_requests_suffix() {
+async fn stale_reanchor_response_cannot_retreat_a_newer_durable_frontier() {
+    let header1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let header2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    let anchor = (block::Height(0), Network::Mainnet.genesis_hash());
+    let durable = (block::Height(1), block::Hash::from(header1.as_ref()));
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let mut fixture = spawn_test_reactor(startup_for(network, anchor, Some(anchor)));
+    let mut tip = fixture.handle.subscribe_tip();
+    let peer_id = peer(239);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id.clone(), anchor.0, block::Height(3), 1, 2).await;
+    let mut requests = HashMap::new();
+    while requests.len() < 2 {
+        let (_, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(count, 1);
+        requests.insert(start, request_id);
+    }
+    assert!(requests.contains_key(&block::Height(1)));
+    assert!(requests.contains_key(&block::Height(2)));
+    send_headers(
+        &fixture,
+        &peer_id,
+        requests[&block::Height(1)],
+        finalized_headers_message(vec![header1]),
+    )
+    .await;
+    let operation = loop {
+        if let HeaderSyncAction::CommitHeaderRange { operation, .. } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            break operation;
+        }
+    };
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeOperationFailed {
+            operation,
+            kind: HeaderSyncCommitFailureKind::UnknownAnchor,
+        })
+        .await
+        .unwrap();
+
+    let stale_generation = loop {
+        match next_action(&mut fixture.actions).await {
+            HeaderSyncAction::QueryBestHeaderTip {
+                reanchor_from: Some(generation),
+            } => break generation,
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("a local unknown anchor must not score {peer:?}: {reason:?}")
+            }
+            _ => {}
+        }
+    };
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: durable.0,
+            tip_hash: durable.1,
+            reanchor_from: None,
+        })
+        .await
+        .unwrap();
+    tip.changed().await.unwrap();
+    assert_eq!(*tip.borrow(), durable);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: anchor.0,
+            tip_hash: anchor.1,
+            reanchor_from: Some(stale_generation),
+        })
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(fixture.handle.best_header_tip(), durable);
+
+    while let Ok(action) = fixture.actions.try_recv() {
+        assert!(
+            !matches!(action, HeaderSyncAction::HeaderReanchored { .. }),
+            "a stale reanchor response must not publish a retreat"
+        );
+    }
+
+    send_headers(
+        &fixture,
+        &peer_id,
+        requests[&block::Height(2)],
+        finalized_headers_message(vec![header2]),
+    )
+    .await;
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::CommitHeaderRange { payload, .. } => {
+                assert_eq!(payload.range().start(), block::Height(2));
+                break;
+            }
+            HeaderSyncAction::HeaderReanchored { old, new } => {
+                panic!("stale reanchor reset forward work: {old:?} -> {new:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn partial_durable_header_coverage_retires_old_request_and_requests_suffix() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -5851,9 +9320,10 @@ async fn partial_full_block_coverage_retires_old_request_and_requests_suffix() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::FullBlockCommitted {
-            height: block::Height(1),
-            hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: block::Height(1),
+            tip_hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -5898,9 +9368,10 @@ async fn partial_coverage_recreates_an_interior_hole_before_a_later_batch() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::FullBlockCommitted {
-            height: block::Height(1),
-            hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: block::Height(1),
+            tip_hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -5950,9 +9421,10 @@ async fn partial_coverage_trims_and_commits_an_already_buffered_suffix() {
     .await;
     fixture
         .handle
-        .send(HeaderSyncEvent::FullBlockCommitted {
-            height: block::Height(3),
-            hash: mainnet_block(&BLOCK_MAINNET_3_BYTES).hash(),
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: block::Height(3),
+            tip_hash: mainnet_block(&BLOCK_MAINNET_3_BYTES).hash(),
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -6024,6 +9496,7 @@ async fn loaded_best_tip_reconciles_outstanding_and_buffered_work() {
         .send(HeaderSyncEvent::BestHeaderTipLoaded {
             tip_height: block::Height(3),
             tip_hash: mainnet_block(&BLOCK_MAINNET_3_BYTES).hash(),
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -6099,9 +9572,10 @@ async fn partially_covered_failed_commit_requeues_its_uncovered_suffix() {
     };
     fixture
         .handle
-        .send(HeaderSyncEvent::FullBlockCommitted {
-            height: block::Height(1),
-            hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: block::Height(1),
+            tip_hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -6119,7 +9593,7 @@ async fn partially_covered_failed_commit_requeues_its_uncovered_suffix() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn buffered_successor_drains_after_full_block_covers_its_predecessor() {
+async fn buffered_successor_drains_after_durable_tip_covers_its_predecessor() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -6156,9 +9630,10 @@ async fn buffered_successor_drains_after_full_block_covers_its_predecessor() {
     .await;
     fixture
         .handle
-        .send(HeaderSyncEvent::FullBlockCommitted {
-            height: block::Height(1),
-            hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: block::Height(1),
+            tip_hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -6598,6 +10073,7 @@ async fn loaded_best_tip_updates_tip_watch_and_does_not_advance_finality() {
         .send(HeaderSyncEvent::BestHeaderTipLoaded {
             tip_height: block::Height(1),
             tip_hash,
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -6608,7 +10084,47 @@ async fn loaded_best_tip_updates_tip_watch_and_does_not_advance_finality() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
+async fn same_height_durable_reanchor_replaces_the_body_sync_target() {
+    let network = regtest_network();
+    let anchor = (block::Height(0), network.genesis_hash());
+    let old = (block::Height(1), block::Hash([11; 32]));
+    let new = (old.0, block::Hash([12; 32]));
+    let mut fixture = spawn_test_reactor(startup_for(network, anchor, Some(old)));
+    let mut tip = fixture.handle.subscribe_tip();
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: new.0,
+            tip_hash: new.1,
+            reanchor_from: Some(0),
+        })
+        .await
+        .unwrap();
+
+    tip.changed().await.unwrap();
+    assert_eq!(*tip.borrow(), new);
+
+    loop {
+        match next_action(&mut fixture.actions).await {
+            HeaderSyncAction::HeaderReanchored {
+                old: actual_old,
+                new: actual_new,
+            } => {
+                assert_eq!(actual_old, old);
+                assert_eq!(actual_new, new);
+                break;
+            }
+            HeaderSyncAction::HeaderAdvanced { height, hash } => {
+                panic!("same-height hash replacement advanced instead of reanchoring: {height:?} {hash:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn forward_link_wedge_reloads_the_durable_tip_without_banning() {
     let network = regtest_network();
     let verified = (block::Height(0), network.genesis_hash());
     let stranded_tip = (block::Height(3), block::Hash([3; 32]));
@@ -6656,6 +10172,27 @@ async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
         .await;
     }
 
+    let reanchor_from = loop {
+        match next_action(&mut fixture.actions).await {
+            HeaderSyncAction::QueryBestHeaderTip {
+                reanchor_from: Some(generation),
+            } => break generation,
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}");
+            }
+            _ => {}
+        }
+    };
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: verified.0,
+            tip_hash: verified.1,
+            reanchor_from: Some(reanchor_from),
+        })
+        .await
+        .unwrap();
+
     tip.changed().await.unwrap();
     assert_eq!(*tip.borrow(), verified);
     assert_eq!(fixture.handle.best_header_tip(), verified);
@@ -6688,6 +10225,219 @@ async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
         }
     }
     panic!("after re-anchor, header sync did not emit the reanchor action and request forward from the verified tip");
+}
+
+/// Drain reactor actions until the reactor stays quiet for `quiet` milliseconds,
+/// returning everything it emitted.
+async fn drain_actions_while_busy(
+    actions: &mut mpsc::Receiver<HeaderSyncAction>,
+    quiet: u64,
+) -> Vec<HeaderSyncAction> {
+    let mut drained = Vec::new();
+    while let Ok(Some(action)) =
+        tokio::time::timeout(std::time::Duration::from_millis(quiet), actions.recv()).await
+    {
+        drained.push(action);
+    }
+    drained
+}
+
+/// A durable reanchor that resolves to the anchor header sync already holds must
+/// leave forward work alone.
+///
+/// Continuous sync livelocked here: every verified-body reset queried the durable
+/// header tip, state answered with the unchanged tip, and the reanchor cancelled
+/// every outstanding forward range before any of them could commit. Over one
+/// 53-second window that cost 1,609 `GetHeaders` and zero committed ranges.
+#[tokio::test(flavor = "current_thread")]
+async fn no_op_durable_reanchor_keeps_outstanding_forward_work() {
+    let headers = [
+        mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        mainnet_header(&BLOCK_MAINNET_2_BYTES),
+        mainnet_header(&BLOCK_MAINNET_3_BYTES),
+    ];
+    let anchor = (block::Height(0), Network::Mainnet.genesis_hash());
+    let committed = (block::Height(3), block::Hash::from(headers[2].as_ref()));
+    let (network, _) = checkpoint_testnet_with_hash(committed.0, committed.1);
+    let mut fixture = spawn_test_reactor(startup_for(network, anchor, Some(anchor)));
+    let peer_id = peer(151);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id.clone(), anchor.0, committed.0, 3, 1).await;
+    let (_, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((start, count), (block::Height(1), 3));
+
+    // The durable header tip read answers with the anchor already in use.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: anchor.0,
+            tip_hash: anchor.1,
+            reanchor_from: Some(0),
+        })
+        .await
+        .unwrap();
+
+    // The peer answers the range that was already in flight when the reanchor ran.
+    send_headers(
+        &fixture,
+        &peer_id,
+        request_id,
+        finalized_headers_message(headers.to_vec()),
+    )
+    .await;
+
+    let mut requeued = false;
+    let mut committed_range = false;
+    for action in drain_actions_while_busy(&mut fixture.actions, 300).await {
+        match action {
+            HeaderSyncAction::CommitHeaderRange { .. } => committed_range = true,
+            HeaderSyncAction::SendMessage {
+                msg: HeaderSyncMessage::GetHeaders { start_height, .. },
+                ..
+            } if start_height == start => requeued = true,
+            _ => {}
+        }
+    }
+
+    assert!(
+        !requeued,
+        "a reanchor to the unchanged anchor re-requested a forward range that was already in flight"
+    );
+    assert!(
+        committed_range,
+        "a reanchor to the unchanged anchor discarded an in-flight forward range, so its response never committed"
+    );
+}
+
+/// A verified-body reset that moves nothing must not ask for a durable reanchor.
+///
+/// The state emits `TipAction::Reset` far more often than the verified tip
+/// actually moves; 191 of the 213 resets in the failing run changed no frontier
+/// at all. Each one still drove a full durable-tip query.
+#[tokio::test(flavor = "current_thread")]
+async fn unchanged_verified_reset_does_not_query_a_durable_reanchor() {
+    let network = regtest_network();
+    let anchor = (block::Height(0), network.genesis_hash());
+    let frontier = ChainFrontier {
+        finalized: Frontier::new(anchor.0, anchor.1),
+        verified_body: Frontier::new(anchor.0, anchor.1),
+        best_header: Frontier::new(anchor.0, anchor.1),
+    };
+    let exchange = ZakuraSyncExchange::new(
+        FrontierUpdate {
+            frontier,
+            change: FrontierChange::Snapshot,
+        },
+        ZakuraTrace::noop(),
+    );
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.frontier_updates = Some(exchange.subscribe_frontier());
+    let mut fixture = spawn_test_reactor(startup);
+
+    // Let the startup queries settle before measuring.
+    let _ = drain_actions_while_busy(&mut fixture.actions, 200).await;
+
+    // The chain-tip mirror republishes the same frontier on every state
+    // `TipAction::Reset`, which the state emits far more often than the verified
+    // tip actually moves.
+    for _ in 0..4 {
+        exchange.publish_frontier(
+            FrontierUpdate {
+                frontier,
+                change: FrontierChange::VerifiedReset,
+            },
+            "test_chain_tip_mirror",
+        );
+        tokio::task::yield_now().await;
+    }
+
+    let reanchor_queries = drain_actions_while_busy(&mut fixture.actions, 300)
+        .await
+        .into_iter()
+        .filter(|action| {
+            matches!(
+                action,
+                HeaderSyncAction::QueryBestHeaderTip {
+                    reanchor_from: Some(_)
+                }
+            )
+        })
+        .count();
+
+    assert_eq!(
+        reanchor_queries, 0,
+        "verified-body resets that moved nothing asked state to reanchor the header tip"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_reanchor_requeues_previously_covered_headers() {
+    let headers = [
+        mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        mainnet_header(&BLOCK_MAINNET_2_BYTES),
+        mainnet_header(&BLOCK_MAINNET_3_BYTES),
+    ];
+    let anchor = (block::Height(0), Network::Mainnet.genesis_hash());
+    let durable = (block::Height(1), block::Hash::from(headers[0].as_ref()));
+    let committed = (block::Height(3), block::Hash::from(headers[2].as_ref()));
+    let (network, _) = checkpoint_testnet_with_hash(committed.0, committed.1);
+    let mut fixture = spawn_test_reactor(startup_for(network, anchor, Some(anchor)));
+    let mut tip = fixture.handle.subscribe_tip();
+    let peer_id = peer(238);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id.clone(), anchor.0, committed.0, 3, 1).await;
+    let (_, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((start, count), (block::Height(1), 3));
+    send_headers(
+        &fixture,
+        &peer_id,
+        request_id,
+        finalized_headers_message(headers.to_vec()),
+    )
+    .await;
+    let operation = loop {
+        if let HeaderSyncAction::CommitHeaderRange { operation, .. } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            break operation;
+        }
+    };
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeOperationCompleted {
+            operation,
+            tip_hash: committed.1,
+        })
+        .await
+        .unwrap();
+
+    tip.changed().await.unwrap();
+    assert_eq!(*tip.borrow(), committed);
+
+    // The first committed frontier publication advances the initial generation
+    // from zero to one.
+    let committed_generation = 1;
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: durable.0,
+            tip_hash: durable.1,
+            reanchor_from: Some(committed_generation),
+        })
+        .await
+        .unwrap();
+
+    tip.changed().await.unwrap();
+    assert_eq!(*tip.borrow(), durable);
+
+    let (_, _, retry_start, retry_count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(
+        (retry_start, retry_count),
+        (block::Height(2), 2),
+        "reanchoring below committed coverage must request the now-missing headers again"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -93,7 +93,13 @@ else
   echo "building kresko at ${KRESKO_REF} (baked: ${BAKED_SHA:-none}, want: ${WANT_SHA:-unknown})"
   git clone "${KRESKO_REPO}" "$LOADGEN_DIR" 2>/dev/null || true
   git -C "$LOADGEN_DIR" fetch --no-tags origin "${KRESKO_REF}"
-  git -C "$LOADGEN_DIR" checkout --detach FETCH_HEAD
+  # Force the checkout: the baked image's clone carries a `.baked-ref` marker
+  # (written by pr-node-bake.sh, and tracked in the kresko repo), so a plain
+  # checkout to a ref other than the baked one aborts with "would be
+  # overwritten". This rebuild path runs precisely when the wanted ref differs
+  # from the baked one -- e.g. any kresko main commit after the weekly bake --
+  # so it must not choke on that marker. It is rewritten below anyway.
+  git -C "$LOADGEN_DIR" checkout -f --detach FETCH_HEAD
   # No patch step: Kresko builds against the zakura crates upstream.
   # Own target dir: CARGO_TARGET_DIR is exported for the zakura build, and
   # inheriting it puts the binary somewhere KRESKO_BIN does not point --

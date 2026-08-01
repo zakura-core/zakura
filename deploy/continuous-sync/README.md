@@ -163,6 +163,12 @@ Alert ownership matches the original temporary-node script:
 The status helper reports service state, metrics reachability, current block
 height, controller state, and the diagnostic paths included in Slack alerts.
 
+Down alerts fire when the controller is halted or `zakura.service` is inactive
+while a sync is expected. A metrics scrape timeout or error alone does not page
+as down while the service stays active (those are logged as
+`metrics-degraded`), because `/metrics` can grow large during long genesis
+syncs when historical per-peer series accumulate.
+
 ## Completion Criteria
 
 The controller requires several consecutive `/ready` successes before declaring

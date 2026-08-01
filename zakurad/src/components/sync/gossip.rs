@@ -2,7 +2,7 @@
 //!
 //! [`block::Hash`]: zakura_chain::block::Hash
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use futures::TryFutureExt;
 use thiserror::Error;
@@ -28,6 +28,49 @@ use BlockGossipError::*;
 /// try to send marks. A capacity of 16 with 25-75s block times
 /// is chosen arbitrarily high to be safe.
 const MINED_BLOCK_MARK_CHANNEL_CAPACITY: usize = 16;
+
+#[derive(Debug, Eq, PartialEq)]
+enum GossipEvent<T> {
+    MinedBlockBroadcastCompleted(block::Hash),
+    MinedBlockSubmitted((block::Hash, block::Height)),
+    CommittedTip(T),
+}
+
+async fn next_gossip_event<T>(
+    mined_block_receiver: Option<&mut mpsc::Receiver<(block::Hash, block::Height)>>,
+    mined_block_mark_receiver: &mut mpsc::Receiver<block::Hash>,
+    committed_tip_fut: impl Future<Output = T>,
+) -> GossipEvent<T> {
+    if let Some(mined_block_receiver) = mined_block_receiver {
+        tokio::select! {
+            biased;
+
+            Some(mark_hash) = mined_block_mark_receiver.recv() => {
+                GossipEvent::MinedBlockBroadcastCompleted(mark_hash)
+            },
+
+            Some(tip_change) = mined_block_receiver.recv() => {
+                GossipEvent::MinedBlockSubmitted(tip_change)
+            },
+
+            committed_tip = committed_tip_fut => {
+                GossipEvent::CommittedTip(committed_tip)
+            },
+        }
+    } else {
+        tokio::select! {
+            biased;
+
+            Some(mark_hash) = mined_block_mark_receiver.recv() => {
+                GossipEvent::MinedBlockBroadcastCompleted(mark_hash)
+            },
+
+            committed_tip = committed_tip_fut => {
+                GossipEvent::CommittedTip(committed_tip)
+            },
+        }
+    }
+}
 
 /// Errors that can occur when gossiping committed blocks
 #[derive(Error, Debug)]
@@ -130,32 +173,28 @@ where
         .in_current_span();
 
         // TODO: Move this logic for selecting the first ready future and updating `chain_state` to its own method.
+        //
+        // Prefer mined-block completions and submissions when multiple
+        // branches are ready. The committed-tip path is a fallback, so
+        // selecting it first can duplicate a mined-block broadcast.
         let (((hash, height), log_msg, updated_chain_state), is_block_submission) =
-            if let Some(mined_block_receiver) = mined_block_receiver.as_mut() {
-                tokio::select! {
-                    tip_change_close_to_network_tip = tip_change_close_to_network_tip_fut => {
-                        (tip_change_close_to_network_tip?, false)
-                    },
-
-                    Some(tip_change) = mined_block_receiver.recv() => {
-                       ((tip_change, "sending mined block broadcast", chain_state), true)
-                    },
-
-                    Some(mark_hash) = mined_block_mark_receiver.recv() => {
-                        chain_state.mark_last_change_hash(mark_hash);
-                        continue;
-                    },
+            match next_gossip_event(
+                mined_block_receiver.as_mut(),
+                &mut mined_block_mark_receiver,
+                tip_change_close_to_network_tip_fut,
+            )
+            .await
+            {
+                GossipEvent::MinedBlockBroadcastCompleted(mark_hash) => {
+                    chain_state.mark_last_change_hash(mark_hash);
+                    continue;
                 }
-            } else {
-                tokio::select! {
-                    tip_change_close_to_network_tip = tip_change_close_to_network_tip_fut => {
-                        (tip_change_close_to_network_tip?, false)
-                    },
-
-                    Some(mark_hash) = mined_block_mark_receiver.recv() => {
-                        chain_state.mark_last_change_hash(mark_hash);
-                        continue;
-                    },
+                GossipEvent::MinedBlockSubmitted(tip_change) => (
+                    (tip_change, "sending mined block broadcast", chain_state),
+                    true,
+                ),
+                GossipEvent::CommittedTip(tip_change_close_to_network_tip) => {
+                    (tip_change_close_to_network_tip?, false)
                 }
             };
 
@@ -191,6 +230,63 @@ where
             });
         } else {
             tokio::spawn(broadcast_fut);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_gossip_event, GossipEvent};
+
+    use std::future;
+
+    use tokio::sync::mpsc;
+    use zakura_chain::block;
+
+    // Repeat the vector so removing `biased;` reliably exposes randomized
+    // selection among the ready events.
+    const READY_EVENT_ATTEMPTS: usize = 64;
+
+    #[tokio::test]
+    async fn ready_gossip_events_are_selected_in_priority_order() {
+        let submitted_block = (block::Hash([1; 32]), block::Height(1));
+
+        for _ in 0..READY_EVENT_ATTEMPTS {
+            let (mined_block_sender, mut mined_block_receiver) = mpsc::channel(1);
+            let (mark_sender, mut mark_receiver) = mpsc::channel(1);
+
+            mined_block_sender.send(submitted_block).await.unwrap();
+            mark_sender.send(submitted_block.0).await.unwrap();
+
+            let event = next_gossip_event(
+                Some(&mut mined_block_receiver),
+                &mut mark_receiver,
+                future::ready(()),
+            )
+            .await;
+
+            assert_eq!(
+                event,
+                GossipEvent::MinedBlockBroadcastCompleted(submitted_block.0)
+            );
+
+            let event = next_gossip_event(
+                Some(&mut mined_block_receiver),
+                &mut mark_receiver,
+                future::ready(()),
+            )
+            .await;
+
+            assert_eq!(event, GossipEvent::MinedBlockSubmitted(submitted_block));
+
+            let event = next_gossip_event(
+                Some(&mut mined_block_receiver),
+                &mut mark_receiver,
+                future::ready("committed tip"),
+            )
+            .await;
+
+            assert_eq!(event, GossipEvent::CommittedTip("committed tip"));
         }
     }
 }

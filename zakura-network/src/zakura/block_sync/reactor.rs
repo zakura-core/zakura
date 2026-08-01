@@ -1243,18 +1243,27 @@ impl BlockSyncReactor {
         dispatched
     }
 
+    /// Where the next producer query starts: the lowest height above the request
+    /// floor that the WorkQueue does not already hold.
+    ///
+    /// This is deliberately *not* `max_claimed() + 1`. A forward-only cursor can
+    /// never re-offer a height that left `pending`/`in_flight` while a higher
+    /// height stayed claimed, so a single such height permanently pins the
+    /// download floor one below it and the reorder buffer grows without bound.
+    /// Both observed stalls reached that state: a destructive `reset_above` racing
+    /// an unreceived request, and a refill batch whose surviving heights advanced
+    /// `max_claimed` past the one the `has_outstanding_request` filter dropped.
     fn next_needed_block_query_start(&self) -> Option<block::Height> {
-        let last_claimed = self
+        let from = self
             .state
             .work_queue
-            .max_claimed()
-            .unwrap_or(self.request_floor);
+            .first_unclaimed_above(self.request_floor)?;
 
-        if last_claimed >= self.state.best_header_tip {
+        if from > self.state.best_header_tip {
             return None;
         }
 
-        last_claimed.next().ok()
+        Some(from)
     }
 
     fn refill_query_limit_blocks(&self, from: block::Height) -> u32 {

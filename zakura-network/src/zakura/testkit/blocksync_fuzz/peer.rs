@@ -83,7 +83,7 @@ async fn serve_loop(
         // A `Wedge` degradation stops the peer reading our stream entirely once it has
         // been connected for `degrade.at`: it neither drains the node's outbound queue nor
         // answers. The node's `outbound_capacity()` then falls to zero and stays there —
-        // the truly-wedged connection the liveness timer must still disconnect. Park on
+        // the truly-wedged session the liveness timer must still park. Wait on
         // shutdown/disconnect only; never read again.
         let wedged = spec.serve.degrade.is_some_and(|degrade| {
             matches!(degrade.mode, DegradeMode::Wedge) && started.elapsed() >= degrade.at

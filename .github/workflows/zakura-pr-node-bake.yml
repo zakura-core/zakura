@@ -4,7 +4,8 @@ name: PR node image bake
 #   - one base droplet image: build deps + rustup + repo clone + warm cargo
 #     release cache + a loopback SSH identity for deploy.py,
 #   - one volume snapshot per network with extracted chain state
-#     (mainnet: tip/ + sandblast/, testnet: tip/).
+#     (mainnet: tip/ + sandblast/, testnet: tip/),
+#   - one small Mainnet pruned-state snapshot rolled back below the VCT handoff.
 # Runs weekly so the tip states and the cargo cache never drift far from main;
 # PR-node runs sync the remaining gap during their hour.
 
@@ -23,6 +24,10 @@ on:
         description: "DO region (must host the run droplets too)"
         required: false
         default: nyc3
+      rebuild_approach_from_sandblast:
+        description: "One-time: sync the historical Mainnet state to C-100 for the VCT canary"
+        type: boolean
+        default: false
   schedule:
     - cron: "0 4 * * 1" # weekly Monday 04:00 UTC
 
@@ -37,29 +42,21 @@ jobs:
   bake:
     runs-on: ubuntu-latest
     # Cold cargo build + three snapshot downloads + a ~50GB image snapshot.
-    timeout-minutes: 210
+    timeout-minutes: 420
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Install doctl
-        env:
-          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-        run: |
-          set -euo pipefail
-          DOCTL_VERSION=1.120.0
-          curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
-          sudo install /tmp/doctl /usr/local/bin/doctl
-          doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
+      - name: Install doctl and the fleet SSH key
+        uses: ./.github/actions/do-cli
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
 
-      - name: Write SSH key
-        env:
-          DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
-        run: |
-          install -m 600 /dev/null /tmp/do_ssh
-          printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh
-
+      # Not the shared do-droplet action: the bake starts from a stock Ubuntu
+      # image (it is what produces the baked one) and attaches blank tip-state
+      # and VCT-approach volumes that it later snapshots.
       - name: Create state volumes + bake droplet
         id: droplet
         env:
@@ -70,18 +67,23 @@ jobs:
           set -euo pipefail
           MAINNET_VOL="zakura-pr-bake-mainnet-${GITHUB_RUN_ID}"
           TESTNET_VOL="zakura-pr-bake-testnet-${GITHUB_RUN_ID}"
-          MAINNET_VOL_ID=$(doctl compute volume create "$MAINNET_VOL" \
-            --region "${REGION}" --size 300GiB --format ID --no-header)
-          TESTNET_VOL_ID=$(doctl compute volume create "$TESTNET_VOL" \
-            --region "${REGION}" --size 100GiB --format ID --no-header)
+          APPROACH_VOL="zakura-pr-bake-approach-${GITHUB_RUN_ID}"
           {
             echo "mainnet_vol=$MAINNET_VOL"
             echo "testnet_vol=$TESTNET_VOL"
-            echo "mainnet_vol_id=$MAINNET_VOL_ID"
-            echo "testnet_vol_id=$TESTNET_VOL_ID"
+            echo "approach_vol=$APPROACH_VOL"
           } >> "$GITHUB_OUTPUT"
-
+          MAINNET_VOL_ID=$(doctl compute volume create "$MAINNET_VOL" \
+            --region "${REGION}" --size 300GiB --format ID --no-header)
+          echo "mainnet_vol_id=$MAINNET_VOL_ID" >> "$GITHUB_OUTPUT"
+          TESTNET_VOL_ID=$(doctl compute volume create "$TESTNET_VOL" \
+            --region "${REGION}" --size 100GiB --format ID --no-header)
+          echo "testnet_vol_id=$TESTNET_VOL_ID" >> "$GITHUB_OUTPUT"
+          APPROACH_VOL_ID=$(doctl compute volume create "$APPROACH_VOL" \
+            --region "${REGION}" --size 100GiB --format ID --no-header)
+          echo "approach_vol_id=$APPROACH_VOL_ID" >> "$GITHUB_OUTPUT"
           NAME="zakura-pr-bake-${GITHUB_RUN_ID}"
+          echo "droplet_name=$NAME" >> "$GITHUB_OUTPUT"
           doctl compute droplet create "$NAME" \
             --region "${REGION}" \
             --size "${DROPLET_SIZE}" \
@@ -89,23 +91,16 @@ jobs:
             --ssh-keys "${SSH_FINGERPRINT}" \
             --volumes "${MAINNET_VOL_ID}" \
             --volumes "${TESTNET_VOL_ID}" \
+            --volumes "${APPROACH_VOL_ID}" \
             --tag-name zakura-image-bake \
             --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
           echo "id=$(awk '{print $1}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
           echo "ip=$(awk '{print $2}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Wait for SSH
-        env:
-          IP: ${{ steps.droplet.outputs.ip }}
-        run: |
-          set -euo pipefail
-          for _ in $(seq 1 30); do
-            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i /tmp/do_ssh "root@${IP}" true 2>/dev/null; then
-              echo "SSH up"; exit 0
-            fi
-            sleep 10
-          done
-          echo "SSH did not come up in time"; exit 1
+        uses: ./.github/actions/do-wait-ssh
+        with:
+          ip: ${{ steps.droplet.outputs.ip }}
 
       - name: Run bake script
         env:
@@ -117,6 +112,8 @@ jobs:
           KRESKO_BAKE_REF: ${{ inputs.kresko_ref || vars.KRESKO_BAKE_REF || 'main' }}
           MAINNET_VOLUME_NAME: ${{ steps.droplet.outputs.mainnet_vol }}
           TESTNET_VOLUME_NAME: ${{ steps.droplet.outputs.testnet_vol }}
+          APPROACH_VOLUME_NAME: ${{ steps.droplet.outputs.approach_vol }}
+          REBUILD_APPROACH_FROM_SANDBLAST: ${{ inputs.rebuild_approach_from_sandblast || false }}
           TIP_MAINNET_LATEST_JSON: ${{ vars.ZAKURA_PR_NODE_TIP_LATEST_JSON || 'https://zakura.valargroup.dev/mainnet-pruned/latest.json' }}
           # Pre-spam-region archive snapshot; same artifact checkpoint-sync-bench pins.
           SANDBLAST_URL: ${{ vars.ZAKURA_PR_NODE_SANDBLAST_URL || 'https://zakura.valargroup.dev/mainnet/historical/zakura-mainnet-20260717T095333Z-1707210.tar.zst' }}
@@ -130,6 +127,8 @@ jobs:
             printf 'GH_CLONE_TOKEN=%q\n'          "${GH_CLONE_TOKEN}"
             printf 'MAINNET_VOLUME_NAME=%q\n'     "${MAINNET_VOLUME_NAME}"
             printf 'TESTNET_VOLUME_NAME=%q\n'     "${TESTNET_VOLUME_NAME}"
+            printf 'APPROACH_VOLUME_NAME=%q\n'    "${APPROACH_VOLUME_NAME}"
+            printf 'REBUILD_APPROACH_FROM_SANDBLAST=%q\n' "${REBUILD_APPROACH_FROM_SANDBLAST}"
             printf 'TIP_MAINNET_LATEST_JSON=%q\n' "${TIP_MAINNET_LATEST_JSON}"
             printf 'SANDBLAST_URL=%q\n'           "${SANDBLAST_URL}"
             printf 'SANDBLAST_SHA256=%q\n'        "${SANDBLAST_SHA256}"
@@ -146,15 +145,49 @@ jobs:
 
       - name: Snapshot state volumes
         env:
+          IP: ${{ steps.droplet.outputs.ip }}
           MAINNET_VOL_ID: ${{ steps.droplet.outputs.mainnet_vol_id }}
           TESTNET_VOL_ID: ${{ steps.droplet.outputs.testnet_vol_id }}
+          APPROACH_VOL_ID: ${{ steps.droplet.outputs.approach_vol_id }}
+          REBUILD_APPROACH_FROM_SANDBLAST: ${{ inputs.rebuild_approach_from_sandblast || false }}
         run: |
           set -euo pipefail
+          # The -h<height> suffix lets the pr-node pre-checkpoint mode pick the
+          # newest snapshot whose state is below a branch's max checkpoint.
+          fetch_height() {
+            local height
+            height=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+              "root@${IP}" "cat $1")
+            [[ "$height" =~ ^[0-9]+$ ]] || {
+              echo "bake did not produce a numeric height in $1" >&2
+              return 1
+            }
+            printf '%s\n' "$height"
+          }
+          APPROACH_H=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            "root@${IP}" "cat /root/mainnet-approach-height 2>/dev/null" || true)
+          if [ -n "$APPROACH_H" ] && [[ ! "$APPROACH_H" =~ ^[0-9]+$ ]]; then
+            echo "bake produced a non-numeric approach height" >&2
+            exit 1
+          fi
           STAMP=$(date -u +%Y%m%d-%H%M)
-          doctl compute volume snapshot "${MAINNET_VOL_ID}" --snapshot-name "zakura-pr-state-mainnet-${STAMP}"
-          doctl compute volume snapshot "${TESTNET_VOL_ID}" --snapshot-name "zakura-pr-state-testnet-${STAMP}"
+          if [ "$REBUILD_APPROACH_FROM_SANDBLAST" != "true" ]; then
+            MAINNET_H=$(fetch_height /root/mainnet-state-height)
+            TESTNET_H=$(fetch_height /root/testnet-state-height)
+            doctl compute volume snapshot "${MAINNET_VOL_ID}" \
+              --snapshot-name "zakura-pr-state-mainnet-${STAMP}-h${MAINNET_H}"
+            doctl compute volume snapshot "${TESTNET_VOL_ID}" \
+              --snapshot-name "zakura-pr-state-testnet-${STAMP}-h${TESTNET_H}"
+          fi
+          if [ -n "$APPROACH_H" ]; then
+            doctl compute volume snapshot "${APPROACH_VOL_ID}" \
+              --snapshot-name "zakura-vct-approach-mainnet-${STAMP}-h${APPROACH_H}"
+          else
+            echo "::warning::approach state was not refreshed; retaining the existing pinned snapshot"
+          fi
 
       - name: Snapshot droplet image
+        if: ${{ !inputs.rebuild_approach_from_sandblast }}
         env:
           DROPLET_ID: ${{ steps.droplet.outputs.id }}
         run: |
@@ -177,37 +210,24 @@ jobs:
           done
           echo "image snapshot did not complete in time"; exit 1
 
-      - name: Cleanup droplet + volumes, prune old assets
+      - name: Cleanup droplet + volumes
         if: always()
-        env:
-          DROPLET_ID: ${{ steps.droplet.outputs.id }}
-          MAINNET_VOL_ID: ${{ steps.droplet.outputs.mainnet_vol_id }}
-          TESTNET_VOL_ID: ${{ steps.droplet.outputs.testnet_vol_id }}
+        uses: ./.github/actions/do-teardown
+        with:
+          droplet_id: ${{ steps.droplet.outputs.id }}
+          droplet_name: ${{ steps.droplet.outputs.droplet_name || format('zakura-pr-bake-{0}', github.run_id) }}
+          volume_ids: ${{ steps.droplet.outputs.mainnet_vol_id }} ${{ steps.droplet.outputs.testnet_vol_id }} ${{ steps.droplet.outputs.approach_vol_id }}
+          volume_names: ${{ steps.droplet.outputs.mainnet_vol || format('zakura-pr-bake-mainnet-{0}', github.run_id) }} ${{ steps.droplet.outputs.testnet_vol || format('zakura-pr-bake-testnet-{0}', github.run_id) }} ${{ steps.droplet.outputs.approach_vol || format('zakura-pr-bake-approach-{0}', github.run_id) }}
+
+      - name: Prune old images
+        if: always()
         run: |
           set +e
-          if [ -n "${DROPLET_ID}" ]; then
-            for _ in 1 2 3; do
-              doctl compute droplet delete "${DROPLET_ID}" -f && break
-              sleep 5
-            done
-          fi
-          # Volumes detach asynchronously after the droplet delete.
-          for VOL_ID in "${MAINNET_VOL_ID}" "${TESTNET_VOL_ID}"; do
-            [ -z "${VOL_ID}" ] && continue
-            for _ in $(seq 1 12); do
-              doctl compute volume delete "${VOL_ID}" -f && break
-              sleep 10
-            done
-          done
-          # Keep the newest 2 images and 2 volume snapshots per network so runs
-          # never depend on the latest bake having succeeded.
+          # Keep the newest 2 images so runs never depend on the latest bake
+          # having succeeded. The hourly reaper owns volume-snapshot retention:
+          # it keeps 6 Mainnet and 3 Testnet generations, plus the dynamically
+          # pinned Mainnet snapshot immediately below the current VCT handoff.
           doctl compute image list-user --format ID,Name --no-header | \
             awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | head -n -2 | \
             while read -r _name id; do doctl compute image delete "$id" -f; done
-          for NET in mainnet testnet; do
-            doctl compute snapshot list --resource volume --format ID,Name --no-header | \
-              awk -v pre="zakura-pr-state-${NET}-" 'index($2, pre) == 1 {print $2, $1}' | \
-              sort | head -n -2 | \
-              while read -r _name id; do doctl compute snapshot delete "$id" -f; done
-          done
           true

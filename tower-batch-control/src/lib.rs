@@ -125,6 +125,9 @@ pub use self::service::Batch;
 pub trait RequestWeight {
     /// Returns the weight of a request relative to the maximum threshold for flushing
     /// requests to the underlying service.
+    ///
+    /// Batch bookkeeping treats every queued item as having a weight of at least 1,
+    /// so zero-weight items still start the batch timer and are flushed.
     fn request_weight(&self) -> usize {
         1
     }

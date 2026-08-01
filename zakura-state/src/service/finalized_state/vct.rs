@@ -229,12 +229,6 @@ impl VctState {
             && Some(height) >= NetworkUpgrade::Heartwood.activation_height(network)
     }
 
-    /// Discard the supplied root for `height` after it failed verification, so a re-fetch
-    /// can replace it. See [`CommitmentRootSource::invalidate`].
-    pub(super) fn invalidate_fast_root(&self, height: block::Height) {
-        self.source.invalidate(height);
-    }
-
     /// The checkpoint handoff height: the boundary below which the fast path skips
     /// per-height note-commitment trees.
     pub(super) fn vct_sync_last_checkpoint_height(&self) -> block::Height {

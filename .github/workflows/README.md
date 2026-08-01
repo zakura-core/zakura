@@ -35,8 +35,8 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 
 ## Release pipeline
 
-- **`create-release.yml`** — the only supported path for creating `v*` release tags. Calls `release-binaries.yml` (as a reusable workflow) to build and verify every asset, then a protected environment lets the release GitHub App publish the draft and create the immutable tag. See the release runbook before using it.
-- **`release-binaries.yml`** — builds and publishes `zakurad` release assets and Docker images when a `v*` tag is pushed. Also callable from `create-release.yml` for pre-tag staging, and manually dispatchable to repair assets on an existing tag. Gated on the tag matching the `zakura` package version.
+- **`create-release.yml`** — the only supported path for creating `v*` release tags. Before a normal release, it requires the Mainnet VCT handoff canary and calls `release-binaries.yml` to build and verify every asset; then a protected environment lets the release GitHub App publish the draft and create the immutable tag. Emergency source-first releases skip both pre-tag gates. See the release runbook before using it.
+- **`release-binaries.yml`** — builds and publishes `zakurad` release assets and Docker images when a `v*` tag is pushed. Also callable from `create-release.yml` for pre-tag staging, and manually dispatchable to repair assets on an existing tag. The canonical repository uses Depot builders by default; set the `RELEASE_BUILD_BACKEND` repository variable to `github` for an immediate fallback. Gated on the tag matching the `zakura` package version.
 - **`release-drafter.yml`** — manual: compiles PR titles since the last release
   into a draft GitHub release note.
 - **Changelog assembly** — `make prepare-release-changelog` consumes reviewed
@@ -53,12 +53,28 @@ Deploys are manual, SSH-based, and run from self-hosted deployer runners; there 
 - **`zakura-testnet-deploy.yml`** — the same for the testnet fleet, from the `zakura-testnet-deployer` runner. Includes the zcashd-compat host, where Zakura runs alongside a sidecar `zcashd`.
 - **`zakura-mainnet-rollback.yml`** — emergency rollback for a single mainnet node: captures diagnostics, restores `<bin_path>.bak`, restarts the service.
 - **`zakura-continuous-sync.yml`** — twice-hourly audit (plus manual deploy/status/resume actions) of the continuous genesis-sync fleet, which permanently re-syncs from genesis to catch sync regressions.
-- **`zakura-pr-node.yml`** — ephemeral one-hour real-node test of a PR or ref: boots a droplet from the pre-baked image, attaches a chain-state snapshot clone (`tip`, `sandblast`, or `genesis`), builds the branch incrementally, runs it, and posts a metrics summary as a PR comment. The droplet stays up for SSH inspection until the reaper removes it.
-- **`zakura-pr-node-bake.yml`** — weekly bake of the golden PR-node droplet image (build deps, warm cargo cache) and per-network chain-state volume snapshots.
-- **`zakura-pr-node-reaper.yml`** — hourly TTL cleanup backstop for PR-node droplets, volumes, images, and snapshots.
-- **`checkpoint-sync-bench.yml`** — manual checkpoint-zone sync benchmark on the `zakura-bench` self-hosted runner, with a persistent metrics dashboard. See the workflow header for one-time runner setup.
+- **`zakura-pr-node.yml`** — reusable ephemeral real-node test of a PR or ref: boots a droplet from the pre-baked image, attaches a chain-state snapshot clone (`tip`, `pre-checkpoint`, `sandblast`, or `genesis`), builds the branch incrementally, runs it, and posts a metrics summary as a PR comment. `pre-checkpoint` picks the highest retained snapshot below the branch's max checkpoint, then independently reads the restored database tip before networking starts. It fails unless C is finalized, the best chain reaches C+1, and `state.vct.fast.block.count` confirms the Zakura `tree_aux` fast path processed blocks.
+- **`zakura-pr-node-bake.yml`** — weekly bake of the golden PR-node droplet image (build deps, warm cargo cache), per-network chain-state volume snapshots, and an optional dedicated Mainnet pruned snapshot 100 blocks below the current VCT handoff. Set `rebuild_approach_from_sandblast` on a manual dispatch to build that rare fixture forward from the retained historical archive; ordinary weekly bakes leave the pinned approach snapshots in place.
+- **`zakura-pr-node-reaper.yml`** — hourly TTL cleanup backstop for PR-node resources. It keeps six Mainnet snapshot generations, two dedicated VCT approach snapshots, and dynamically pins the newest ordinary height-stamped snapshot below the current handoff as a fallback.
+- **`zakura-vct-handoff-canary.yml`** — daily, manual, and reusable Mainnet test that forces the Zakura P2P `tree_aux` path from the pinned pre-checkpoint state and exits after C is finalized and the best chain reaches C+1 with VCT fast-path activity. Failures alert `#zakura-alerts`; normal releases call it before publishing.
+- **`checkpoint-sync-bench.yml`** — manual fixed-height sync benchmark with checkpoint or semantic verification on the `zakura-bench` self-hosted runner, with a persistent metrics dashboard. See the workflow header for one-time runner setup.
+- **`zakura-perf-bench.yml`** — CPU profiles mainnet workloads on ephemeral droplets. Historical mode restores `sandblast` state for fixed-height throughput and optional parallel A/B; live-head mode uses the production default P2P stack, catches up from the baked pruned tip, and requires head health throughout one observational profile window. Both produce flamegraphs, CPU counters, metrics, available traces, and block-latency digests (see `docs/cpu-profiling.md`).
 
-These workflows use the helper scripts in `.github/workflows/scripts/` (`pr-node-bake.sh`, `pr-node-run.sh`, `pr-node-monitor.py`).
+These workflows use the helper scripts in `.github/workflows/scripts/` (`pr-node-bake.sh`, `pr-node-run.sh`, `pr-node-monitor.py`, `perf-bench-run.sh`, `perf-bench-compare.py`).
+
+After initially deploying this automation, manually dispatch the PR-node bake
+with `rebuild_approach_from_sandblast` enabled. This creates the first
+`zakura-vct-approach-mainnet-*` snapshot without depending on rollback data
+that pruned state snapshots do not retain.
+
+Droplet lifecycle is shared, not copy-pasted, through the composite actions in `.github/actions/`:
+
+- **`do-cli`** — installs the pinned `doctl`, authenticates it for the rest of the job, and optionally writes the fleet SSH key to `/tmp/do_ssh`.
+- **`do-droplet`** — resolves the newest `zakura-pr-node-*` baked image and optionally clones either the newest network state or an exact volume snapshot, then creates the tagged droplet. Outputs `id`, `ip`, `image_id`, `volume_id`, `volume_name`.
+- **`do-wait-ssh`** — polls a new droplet until it accepts SSH. Give the step an `id` if teardown needs to distinguish "unreachable" from "ran".
+- **`do-teardown`** — best-effort delete of a droplet and its volumes, recovering missing IDs from deterministic names and retrying volumes while the detach settles. Never fails a job; `enabled: false` keeps the resources and says so.
+
+`zakura-pr-node-bake.yml` uses `do-cli`/`do-wait-ssh`/`do-teardown` but creates its droplet inline: it starts from a stock Ubuntu image (it is what produces the baked one) and attaches blank tip-state and VCT-approach volumes that it later snapshots.
 
 ## Fork maintenance
 

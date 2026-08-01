@@ -12,6 +12,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+# Full /metrics scrapes can exceed several MB during long syncs when historical
+# per-peer series accumulate. Prefer a generous timeout and read the whole body
+# so height gauges near the end of the exposition are still visible.
+METRICS_TIMEOUT_SECONDS = 15
+
 
 def load_config(path: Path) -> dict[str, Any]:
     with path.open("rb") as config_file:
@@ -109,8 +114,8 @@ def status(config: dict[str, Any]) -> dict[str, Any]:
     metrics_status = "unavailable"
     height = None
     try:
-        with urllib.request.urlopen(metrics_url, timeout=3) as response:
-            metrics = response.read(2_000_000).decode("utf-8", "replace")
+        with urllib.request.urlopen(metrics_url, timeout=METRICS_TIMEOUT_SECONDS) as response:
+            metrics = response.read().decode("utf-8", "replace")
         metrics_status = "ok"
         height = metric_height(metrics)
     except Exception as exc:

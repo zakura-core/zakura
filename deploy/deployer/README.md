@@ -123,6 +123,25 @@ ETA for Ironwood testnet activation height `4134000`. The ETA uses observed
 cluster block movement when enough samples are available, otherwise it falls back
 to `--target-spacing 7.5`.
 
+The same service exposes the narrow public website API at
+`/ironwood-status.json` and its liveness check at `/healthz`. The public response
+selects one healthy node from the highest agreed tip and contains only the
+network, Ironwood activation and balance data, observation time, and source
+client metadata. It never proxies caller-supplied RPC requests.
+
+It also installs the public broadcast-only JSON-RPC gateway on
+`zakura-testnet-1` (see `deploy/gateway/`):
+
+- service: `zakura-broadcast-testnet.service`
+- public URL: `https://zakura-broadcast.testnet.valargroup.dev/`
+- origin: `http://127.0.0.1:8092/`
+- install dir: `/opt/zakura-gateway-testnet`
+- TLS front door: `/etc/caddy/Caddyfile` from `deploy/gateway/testnet/Caddyfile`
+
+The gateway allowlists `sendrawtransaction`, rate-limits at 30 req/min/IP, and
+load-balances across the testnet `:18232` backends listed in
+`deploy/gateway/testnet/backends.toml`.
+
 The workflow also refreshes a static Zakura Ironwood testnet snapshots website on
 `zakura-testnet-1`:
 
@@ -156,6 +175,7 @@ python3 deploy/runner/zakura-cluster-status.py \
   --config deploy/deployer/nodes.toml \
   --host 0.0.0.0 \
   --port 8090 \
+  --network testnet \
   --upgrade-height 4134000 \
   --target-spacing 7.5
 ```
@@ -211,16 +231,33 @@ The workflow refreshes a fleet status dashboard on `us-east-0`:
 - URL: `http://159.65.183.89:8090/`
 - install dir: `/opt/zakura-mainnet-dashboard`
 
+It also installs the public broadcast-only JSON-RPC gateway on the same host
+(see `deploy/gateway/`):
+
+- service: `zakura-broadcast-mainnet.service`
+- public URL: `https://zakura-broadcast.valargroup.dev/`
+- origin: `http://127.0.0.1:8092/`
+- install dir: `/opt/zakura-gateway-mainnet`
+- TLS front door: `/etc/caddy/Caddyfile` from `deploy/gateway/mainnet/Caddyfile`
+
+The gateway allowlists `sendrawtransaction`, rate-limits at 30 req/min/IP, and
+load-balances across the mainnet `:8232` backends listed in
+`deploy/gateway/mainnet/backends.toml`.
+
 It is the same `zakura-cluster-status.py` as testnet, launched with
-`--upgrade-height 0`, which hides the upgrade-ETA cards (mainnet has no pending
-Zakura activation to count down to). Manual run:
+`--upgrade-height 3428143` for the Ironwood mainnet activation height. The ETA
+uses observed cluster block movement when enough samples are available,
+otherwise it falls back to `--target-spacing 75` (post-Blossom mainnet spacing).
+Manual run:
 
 ```bash
 python3 deploy/runner/zakura-cluster-status.py \
   --config deploy/deployer/nodes.toml \
   --host 0.0.0.0 \
   --port 8090 \
-  --upgrade-height 0
+  --network mainnet \
+  --upgrade-height 3428143 \
+  --target-spacing 75
 ```
 
 The mainnet workflow also installs a Slack watchdog on `us-east-0`:

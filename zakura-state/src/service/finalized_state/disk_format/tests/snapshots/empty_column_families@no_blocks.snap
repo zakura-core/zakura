@@ -1,5 +1,6 @@
 ---
-source: zebra-state/src/service/finalized_state/disk_format/tests/snapshot.rs
+source: zakura-state/src/service/finalized_state/disk_format/tests/snapshot.rs
+assertion_line: 154
 expression: empty_column_families
 ---
 [
@@ -9,6 +10,7 @@ expression: empty_column_families
   "commitment_roots_by_height: no entries",
   "hash_by_height: no entries",
   "hash_by_tx_loc: no entries",
+  "header_root_auth_frontier: no entries",
   "height_by_hash: no entries",
   "history_tree: no entries",
   "ironwood_anchors: no entries",

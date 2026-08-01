@@ -141,6 +141,72 @@ fn header_range_commit_keeps_body_availability_separate() {
 }
 
 #[test]
+fn header_range_commit_does_not_persist_raw_peer_roots() {
+    let _init_guard = zakura_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+    let peer_roots = root_at(Height(1));
+
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch_with_roots(
+            &state,
+            genesis.hash(),
+            std::slice::from_ref(&block1.header),
+            &[0],
+            &[peer_roots],
+        )
+        .expect("header range is contextually valid");
+    state
+        .write_batch(batch)
+        .expect("header range batch writes successfully");
+
+    assert_eq!(state.commitment_roots(Height(1)), None);
+}
+
+#[test]
+fn root_auth_cutover_deletes_header_ahead_rows_and_initializes_frontier() {
+    use crate::service::finalized_state::disk_format::upgrade::{
+        header_root_auth_frontier, DiskFormatUpgrade,
+    };
+
+    let _init_guard = zakura_test::init();
+    let (state, genesis, _block1) = mainnet_state_with_genesis();
+    let body_root = root_at(Height(0));
+    let mut body_batch = DiskWriteBatch::new();
+    body_batch.insert_body_derived_commitment_roots(&state, &body_root);
+    state
+        .write_batch(body_batch)
+        .expect("body-derived root fixture writes");
+    state
+        .insert_zakura_header_commitment_roots([root_at(Height(1)), root_at(Height(2))])
+        .expect("legacy header-ahead root fixture writes");
+    state.delete_header_root_auth_frontier_for_test();
+    assert!(state
+        .try_header_root_auth_frontier()
+        .expect("absent frontier is a valid legacy state")
+        .is_none());
+
+    let (_cancel_sender, cancel_receiver) = crossbeam_channel::bounded(1);
+    DiskFormatUpgrade::run(
+        &header_root_auth_frontier::Upgrade,
+        Height(0),
+        &state,
+        &cancel_receiver,
+    )
+    .expect("cutover is not cancelled");
+
+    assert_eq!(state.commitment_roots(Height(0)), Some(body_root));
+    assert_eq!(state.commitment_roots(Height(1)), None);
+    let frontier = state
+        .try_header_root_auth_frontier()
+        .expect("frontier snapshot decodes")
+        .expect("non-empty state has a frontier");
+    assert_eq!(frontier.confirmed_height(), Height(0));
+    assert_eq!(frontier.confirmed_hash(), genesis.hash());
+    assert_eq!(frontier.history_tree(), &Default::default());
+}
+
+#[test]
 fn header_range_commit_stores_advertised_body_sizes_with_zero_as_unknown() {
     let _init_guard = zakura_test::init();
     let (state, genesis, block1) = mainnet_state_with_genesis();
@@ -547,7 +613,7 @@ fn committed_body_releases_only_its_height_and_keeps_the_frontier() {
 }
 
 #[test]
-fn write_block_replaces_matching_provisional_zakura_roots_with_verified_row() {
+fn write_block_replaces_matching_header_supplied_roots_with_verified_row() {
     let _init_guard = zakura_test::init();
     let genesis = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
@@ -567,24 +633,24 @@ fn write_block_replaces_matching_provisional_zakura_roots_with_verified_row() {
         false,
     )
     .expect("opening the finalized state database should succeed");
-    // Provisional rows are distinguishable from the verified row the body commit
-    // writes: `root_at` uses a zeroed auth-data root, the commit stores the real one.
+    // Header-supplied rows are distinguishable from the verified row the body
+    // commit writes: `root_at` uses a zeroed auth-data root, the commit stores the real one.
     let roots = [root_at(Height(1)), root_at(Height(2))];
 
     write_full_block(&mut state, genesis);
     state
         .insert_zakura_header_commitment_roots(roots.clone())
-        .expect("provisional roots write");
+        .expect("header-supplied roots write");
     assert_eq!(
-        state.zakura_header_commitment_roots_by_height_range(Height(1)..=Height(2)),
+        state.commitment_roots_by_height_range(Height(1)..=Height(2)),
         roots.to_vec()
     );
 
     write_full_block(&mut state, block1.clone());
 
-    // The body commit replaces the provisional row at its height with the verified
-    // row derived from the committed treestate, and leaves higher provisional rows
-    // untouched.
+    // The body commit replaces the header-supplied row at its height with the
+    // verified row derived from the committed treestate, and leaves higher
+    // header-supplied rows untouched.
     let verified_row = BlockCommitmentRoots {
         height: Height(1),
         sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
@@ -596,11 +662,11 @@ fn write_block_replaces_matching_provisional_zakura_roots_with_verified_row() {
         auth_data_root: block1.auth_data_root(),
     };
     assert_eq!(
-        state.zakura_header_commitment_roots_by_height_range(Height(1)..=Height(1)),
+        state.commitment_roots_by_height_range(Height(1)..=Height(1)),
         vec![verified_row]
     );
     assert_eq!(
-        state.zakura_header_commitment_roots_by_height_range(Height(2)..=Height(2)),
+        state.commitment_roots_by_height_range(Height(2)..=Height(2)),
         vec![root_at(Height(2))]
     );
 }
@@ -608,7 +674,7 @@ fn write_block_replaces_matching_provisional_zakura_roots_with_verified_row() {
 /// A header range re-delivered over a height whose body is already committed (a
 /// header store behind the body store, or a late range response racing body sync)
 /// must not overwrite the verified serving-index row with peer-supplied roots:
-/// committed roots win on any overlap (design §9).
+/// committed roots win on any overlap (design §13.1).
 #[test]
 fn header_range_roots_do_not_overwrite_committed_serving_index_rows() {
     let _init_guard = zakura_test::init();
@@ -634,7 +700,7 @@ fn header_range_roots_do_not_overwrite_committed_serving_index_rows() {
     write_full_block(&mut state, genesis.clone());
     write_full_block(&mut state, block1.clone());
 
-    let verified_rows = state.zakura_header_commitment_roots_by_height_range(Height(1)..=Height(1));
+    let verified_rows = state.commitment_roots_by_height_range(Height(1)..=Height(1));
     assert_eq!(
         verified_rows.len(),
         1,
@@ -663,7 +729,7 @@ fn header_range_roots_do_not_overwrite_committed_serving_index_rows() {
         .expect("header range batch writes successfully");
 
     assert_eq!(
-        state.zakura_header_commitment_roots_by_height_range(Height(1)..=Height(1)),
+        state.commitment_roots_by_height_range(Height(1)..=Height(1)),
         verified_rows,
         "peer-supplied roots must not overwrite the verified committed row"
     );

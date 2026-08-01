@@ -238,6 +238,7 @@ log "using zakurad binary: ${ZAKURAD_BIN}"
 log "writing Zakura traces under: ${ZAKURA_E2E_TRACE_DIR}"
 
 ORACLE_RAN=0
+OPTIONAL_NODE4_QUIESCED=0
 
 trace_dir_has_jsonl() {
   [[ -d "${ZAKURA_E2E_TRACE_DIR}" ]] \
@@ -317,6 +318,24 @@ wait_for_trace_flush() {
     sleep 3
   done
   log "trace flush wait timed out after ${TRACE_FLUSH_TIMEOUT}s; running oracle anyway"
+}
+
+wait_for_commit_trace_balance() {
+  local node="$1" label="$2"
+  local file="${ZAKURA_E2E_TRACE_DIR}/${node}/commit_state.jsonl"
+  local deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT)) starts finishes
+
+  [[ -s "${file}" ]] || fail "${label} commit trace is missing"
+  log "waiting for ${label} commit trace to flush before reset"
+  while (( SECONDS < deadline )); do
+    starts=$(grep -c 'commit_start' "${file}" 2>/dev/null || true)
+    finishes=$(grep -c 'commit_finish' "${file}" 2>/dev/null || true)
+    printf '  %s commit_state starts=%s finishes=%s\n' \
+      "${label}" "${starts}" "${finishes}"
+    (( starts == finishes )) && return 0
+    sleep 3
+  done
+  fail "${label} commit trace did not balance within ${TRACE_FLUSH_TIMEOUT}s"
 }
 
 run_trace_oracle() {
@@ -507,13 +526,19 @@ wait_ready() {
   fail "${name} RPC did not become ready within ${READY_TIMEOUT}s"
 }
 
-reset_node2_from_scratch() {
+stop_node2_for_reset() {
   local label="$1"
   docker compose -f "${COMPOSE_FILE}" stop zakura-node-2 \
     || fail "could not stop node2 for ${label}"
   if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
     docker compose -f "${COMPOSE_FILE}" rm -f zakura-node-2 \
       || fail "could not remove node2 container for ${label}"
+  fi
+}
+
+start_node2_after_reset() {
+  local label="$1"
+  if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
     docker compose -f "${COMPOSE_FILE}" up -d zakura-node-2 \
       || fail "could not recreate node2 for ${label}"
   else
@@ -521,6 +546,12 @@ reset_node2_from_scratch() {
       || fail "could not restart node2 for ${label}"
   fi
   wait_ready 18332 "node2 (${label})"
+}
+
+reset_node2_from_scratch() {
+  local label="$1"
+  stop_node2_for_reset "${label}"
+  start_node2_after_reset "${label}"
 }
 
 restart_node2_preserving_state() {
@@ -536,6 +567,34 @@ peer_count() { rpc "$1" getpeerinfo | jq -r 'if .result then (.result | length) 
 block_count() { rpc "$1" getblockcount | jq -r '.result // 0'; }
 block_hash() { rpc "$1" getblockhash "[$2]" | jq -r '.result // empty'; }
 strict_upgrade() { [[ "${ZAKURA_REGTEST_E2E_STRICT_UPGRADE:-0}" == "1" ]]; }
+
+# The restart matrix only stresses node2. Stop the known-optional upgraded peer
+# at a verified idle trace boundary so its unrelated catch-up cannot outlive it.
+quiesce_optional_node4_for_restart_matrix() {
+  [[ "${ZAKURA_E2E_MODE}" == "restart-matrix" ]] || return 0
+  strict_upgrade && return 0
+
+  log "quiescing optional node4 before the node2 restart matrix"
+  wait_metric_zero 19004 sync_block_budget_reserved_bytes "node4 pre-matrix budget"
+  wait_metric_zero 19004 sync_block_reorder_buffered_bytes "node4 pre-matrix reorder"
+  wait_metric_zero 19004 sync_block_applying "node4 pre-matrix applying"
+  wait_metric_zero 19004 sync_block_outstanding "node4 pre-matrix outstanding"
+  wait_for_commit_trace_balance node4 "node4 pre-matrix"
+  wait_for_trace_flush
+
+  local file="${ZAKURA_E2E_TRACE_DIR}/node4/block_sync.jsonl" last leak
+  last=$(grep 'block_sync_state' "${file}" 2>/dev/null | tail -1 || true)
+  [[ -n "${last}" ]] || fail "node4 pre-matrix block-sync trace is missing"
+  leak=$(printf '%s' "${last}" \
+    | jq -er '[(.applying//0),(.budget_reserved//0),(.reorder//0),(.outstanding//0)]|add') \
+    || fail "could not read node4 pre-matrix block-sync trace"
+  [[ "${leak}" == "0" ]] \
+    || fail "node4 pre-matrix block-sync trace is not drained (total ${leak})"
+
+  docker compose -f "${COMPOSE_FILE}" stop zakura-node-4 \
+    || fail "could not stop optional node4 before the restart matrix"
+  OPTIONAL_NODE4_QUIESCED=1
+}
 
 invalidate_block_if_present() {
   local port="$1" height="$2" hash="$3" label="$4"
@@ -606,6 +665,8 @@ wait_zakura_body_frontiers_at_tip() {
   wait_zakura_body_frontier_at_tip 19002 18332 "${target}" "node2 ${phase}"
   if strict_upgrade; then
     wait_zakura_body_frontier_at_tip 19004 18532 "${target}" "node4 ${phase}"
+  elif [[ "${OPTIONAL_NODE4_QUIESCED}" == "1" ]]; then
+    printf '  node4 %s quiesced after upgrade smoke coverage\n' "${phase}"
   else
     h4=$(block_count 18532)
     header4=$(metric 19004 sync_block_best_header_tip_height)
@@ -630,6 +691,8 @@ assert_block_sync_budget_empty() {
     wait_metric_zero 19004 sync_block_reorder_buffered_bytes "node4 ${phase} reorder"
     wait_metric_zero 19004 sync_block_applying "node4 ${phase} applying"
     wait_metric_zero 19004 sync_block_outstanding "node4 ${phase} outstanding"
+  elif [[ "${OPTIONAL_NODE4_QUIESCED}" == "1" ]]; then
+    printf '  node4 %s quiesced after upgrade smoke coverage\n' "${phase}"
   else
     printf '  node4 %s optional budget=%s reorder=%s applying=%s outstanding=%s\n' \
       "${phase}" \
@@ -860,6 +923,11 @@ log "asserting Zakura body frontier reached the header tip after gossip propagat
 wait_zakura_body_frontiers_at_tip "${target}" "post-generate"
 assert_block_sync_budget_empty "post-generate"
 snapshot_timeline "post-generate"
+quiesce_optional_node4_for_restart_matrix
+
+log "stopping pure-Zakura node2 before the from-scratch catch-up setup"
+wait_for_commit_trace_balance node2 "node2 pre-reset"
+stop_node2_for_reset "post-reset catch-up"
 
 # ---------------------------------------------------------------------------
 # Deepen the chain before the from-scratch reset so the kind-6 catch-up below
@@ -868,8 +936,7 @@ snapshot_timeline "post-generate"
 # wedged in production (a full queue silently dropping solicited bodies, then a
 # checkpoint-range commit waiting forever on the gap). A 3-block catch-up never
 # fills that queue, so the earlier topology could not reproduce the stall. node2
-# is still connected and tracks these via gossip, but it is wiped by the reset
-# below, forcing a real kind-6 re-download of the whole deepened chain.
+# is stopped before this deepening, so it cannot prefetch any of these bodies.
 if (( CATCHUP_BLOCKS > 0 )); then
   log "deepening node1 chain by ${CATCHUP_BLOCKS} block(s) before the reset catch-up"
   remaining=${CATCHUP_BLOCKS}
@@ -896,16 +963,12 @@ fi
 # ---------------------------------------------------------------------------
 # Exercise kind-6 block sync via a from-scratch reset of the pure-Zakura node.
 #
-# Above, node2 reached the tip while connected — but it got there through inbound
-# gossip (advertisement -> download), not kind-6 block sync: in this tiny topology
-# gossip delivers every body the instant it is mined, so no body gap ever forms.
-# The only way to force kind-6 is to remove gossip as a source. node2 has ephemeral
-# state, so stopping its container discards its chain; node1 keeps the chain and
-# mines nothing more. On reconnect node2 has a real, gossip-unfillable gap (node1
-# re-advertises nothing), so it must re-download every existing block over the
-# dedicated block-sync stream. This is the production Mainnet-from-0 /
-# restart-catch-up path.
-log "resetting pure-Zakura node2 to force a from-scratch kind-6 catch-up"
+# Above, node2 reached the initial tip through inbound gossip, then was stopped
+# and its state discarded before node1 deepened the chain. On reconnect node2
+# has a real, gossip-unfillable gap (node1 re-advertises nothing), so it must
+# re-download every existing block over the dedicated block-sync stream. This
+# is the production Mainnet-from-0 / restart-catch-up path.
+log "starting pure-Zakura node2 for a from-scratch kind-6 catch-up"
 catchup_target=$(block_count 18232)
 [[ "${catchup_target}" -ge 1 ]] || fail \
   "node1 has no chain for node2 to catch up to (height ${catchup_target})"
@@ -965,7 +1028,7 @@ else
   log "chain too short (tip ${catchup_target}, interval ${CHECKPOINT_INTERVAL}); node2 catches up with the genesis-only checkpoint list"
 fi
 
-reset_node2_from_scratch "post-reset catch-up"
+start_node2_after_reset "post-reset catch-up"
 snapshot_timeline "post-reset-catch-up-started"
 
 # node2's own counters restart from zero, so assert absolute kind-6 activity, not a
@@ -997,7 +1060,11 @@ old_tip_hash=$(block_hash 18232 "${target}")
 invalidate_block_if_present 18232 "${target}" "${old_tip_hash}" node1
 invalidate_block_if_present 18332 "${target}" "${old_tip_hash}" node2
 invalidate_block_if_present 18432 "${target}" "${old_tip_hash}" node3
-invalidate_block_if_present 18532 "${target}" "${old_tip_hash}" node4
+if [[ "${OPTIONAL_NODE4_QUIESCED}" == "1" ]]; then
+  printf '  node4 skipping invalidate: quiesced after upgrade smoke coverage\n'
+else
+  invalidate_block_if_present 18532 "${target}" "${old_tip_hash}" node4
+fi
 reorg_base=$((target - 1))
 wait_block_count_equal 18232 "${reorg_base}" node1
 wait_block_count_equal 18332 "${reorg_base}" node2

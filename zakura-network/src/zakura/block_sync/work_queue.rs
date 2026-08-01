@@ -632,14 +632,76 @@ impl WorkQueue {
         self.lock().in_flight.keys().next_back().copied()
     }
 
-    pub(super) fn max_claimed(&self) -> Option<block::Height> {
+    /// The lowest height above the floor that is in neither `pending` nor
+    /// `in_flight` — the producer's query cursor.
+    ///
+    /// Anchored to the floor rather than to the highest claimed height, so a
+    /// height that leaves the claimed set while higher heights stay claimed is
+    /// offered to the next query instead of being stranded below a forward-only
+    /// cursor. That happens whenever a destructive `reset_above` races an
+    /// unreceived request, and whenever a refill batch is filtered down but its
+    /// surviving heights still push `max_claimed` past the filtered one.
+    ///
+    /// `floor` is the caller's mirror of the download floor; the queue's own floor
+    /// wins when the mirror lags, since heights at or below it are already GC'd.
+    ///
+    /// O(1) in the gap-free case: `pending`/`in_flight` are disjoint, so once the
+    /// lowest claimed height is known to be `anchor + 1`, the claimed set spans
+    /// `(anchor, max_claimed]` contiguously exactly when its size equals that span.
+    /// Only a real gap pays for the merge walk, which stops at the first hole.
+    pub(super) fn first_unclaimed_above(&self, floor: block::Height) -> Option<block::Height> {
         let inner = self.lock();
-        inner
+        let anchor = inner.floor.max(floor);
+        let start = anchor.next().ok()?;
+
+        let max_claimed = inner
             .pending
             .keys()
             .next_back()
             .copied()
-            .max(inner.in_flight.keys().next_back().copied())
+            .max(inner.in_flight.keys().next_back().copied());
+        let Some(max_claimed) = max_claimed.filter(|max| *max >= start) else {
+            return Some(start);
+        };
+
+        // The length check only decides contiguity when *every* key is above the
+        // anchor, so it is gated on the lowest claimed height being `start` itself.
+        // Entries at or below the anchor otherwise inflate the count and make a
+        // sparse range look contiguous: a forward `reset_above` pins the floor and
+        // pops only the `> floor` suffix, so it leaves the whole
+        // `(old_floor, new_floor]` prefix claimed at or below the new floor. A
+        // lagging caller `floor` mirror is excluded the same way.
+        let min_claimed = match (
+            inner.pending.keys().next().copied(),
+            inner.in_flight.keys().next().copied(),
+        ) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (single, None) | (None, single) => single,
+        };
+        if min_claimed == Some(start) {
+            let span = u64::from(max_claimed.0 - anchor.0);
+            let claimed = inner.pending.len().saturating_add(inner.in_flight.len()) as u64;
+            if claimed == span {
+                return max_claimed.next().ok();
+            }
+        }
+
+        let mut pending = inner.pending.range(start..).peekable();
+        let mut in_flight = inner.in_flight.range(start..).peekable();
+        let mut expected = start;
+        loop {
+            let next = match (pending.peek(), in_flight.peek()) {
+                (None, None) => return Some(expected),
+                (Some((height, _)), None) | (None, Some((height, _))) => **height,
+                (Some((left, _)), Some((right, _))) => **left.min(right),
+            };
+            if next > expected {
+                return Some(expected);
+            }
+            pending.next_if(|(height, _)| **height == next);
+            in_flight.next_if(|(height, _)| **height == next);
+            expected = next.next().ok()?;
+        }
     }
 
     /// Expected hash for a height in `pending` or `in_flight` (late-response

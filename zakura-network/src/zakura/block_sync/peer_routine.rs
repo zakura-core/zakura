@@ -55,7 +55,7 @@ use super::{
 };
 use crate::zakura::{
     trace::{block_sync_trace as bs_trace, BLOCK_SYNC_TABLE},
-    Admit, FramedRecv, OrderedSendError, SinkReject,
+    Admit, FramedRecv, OrderedSendError, SinkReject, ZakuraConnId,
 };
 use std::{sync::Arc, time::Duration, time::Instant};
 use tokio::time;
@@ -124,13 +124,27 @@ impl FillStop {
         }
     }
 }
-const CLOSE_BLOCK_SYNC_NO_BLOCK_PROGRESS: &str = "block_sync_no_block_progress";
+const PARK_BLOCK_SYNC_NO_BLOCK_PROGRESS: &str = "block_sync_no_block_progress";
 
-/// Whether a due block-liveness deadline gets one bounded grace instead of disconnecting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoProgressResponse {
+    Park,
+    Disconnect,
+}
+
+fn no_progress_response(allow_no_progress_park: bool) -> NoProgressResponse {
+    if allow_no_progress_park {
+        NoProgressResponse::Park
+    } else {
+        NoProgressResponse::Disconnect
+    }
+}
+
+/// Whether a due block-liveness deadline gets one bounded grace instead of parking the session.
 /// Granted only for *our own* transient outbound write congestion: outbound full **and**
 /// continuously full for less than `request_timeout`. A peer that stopped reading holds
 /// our outbound full indefinitely, so once the full stretch reaches `request_timeout` the
-/// grace is denied and the peer is disconnected — it can no longer dodge the timer by
+/// grace is denied and the session is parked — it can no longer dodge the timer by
 /// refusing to read (the previous unbounded `outbound_capacity() == 0 → extend` escape let
 /// a wedged peer survive to the ~180 s transport idle timeout).
 fn liveness_grace_allowed(
@@ -193,8 +207,13 @@ impl Disposition {
 /// (`service::add_peer`) so a protocol reject cancels the whole connection.
 pub(super) struct PeerRoutine {
     peer: ZakuraPeerId,
+    conn_id: ZakuraConnId,
     session: BlockSyncPeerSession,
     config: ZakuraBlockSyncConfig,
+    /// A connection gets one local no-progress park/re-admission cycle. A
+    /// repeated stall is connection-fatal so it cannot reclaim download slots
+    /// indefinitely without paying the redial cost.
+    allow_no_progress_park: bool,
 
     // ---- transport inbound (the pipe half) ----
     /// This peer's ordered stream-6 frame reader. Decoded in the routine's own
@@ -254,7 +273,7 @@ pub(super) struct PeerRoutine {
     /// When our outbound queue to this peer *first* filled in the current continuous full
     /// stretch (`None` while it has capacity). Lets the liveness check tell transient local
     /// write congestion (just filled) from a peer that stopped reading for `request_timeout`
-    /// — the latter is disconnected at the liveness deadline rather than excused indefinitely.
+    /// — the latter is parked at the liveness deadline rather than excused indefinitely.
     outbound_full_since: Option<Instant>,
 
     /// Cancellation: the peer's service session token. Fires on disconnect, park,
@@ -267,13 +286,15 @@ impl PeerRoutine {
     /// Build a pipe-routine for `peer`. The caller (`service::add_peer`) drives
     /// `run()` inside `spawn_supervised_pipe` so a protocol reject cancels the
     /// whole connection. `generation` is the value obtained from
-    /// [`PeerRegistry::admit`](super::peer_registry::PeerRegistry::admit).
+    /// [`PeerRegistry::admit_session`](super::peer_registry::PeerRegistry::admit_session).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         peer: ZakuraPeerId,
+        conn_id: ZakuraConnId,
         session: BlockSyncPeerSession,
         recv: FramedRecv,
         config: ZakuraBlockSyncConfig,
+        allow_no_progress_park: bool,
         generation: u64,
         budget: super::state::ByteBudget,
         work: Arc<WorkQueue>,
@@ -298,8 +319,10 @@ impl PeerRoutine {
         let max_response_bytes = config.advertised_max_response_bytes();
         PeerRoutine {
             peer,
+            conn_id,
             session,
             config,
+            allow_no_progress_park,
             recv,
             window,
             received_status: false,
@@ -365,7 +388,7 @@ impl PeerRoutine {
             // Track the start of the current continuous outbound-full stretch so the
             // liveness check can bound the write-congestion grace: a peer that stopped
             // reading holds this full until `outbound_full_since` ages past
-            // `request_timeout`, at which point it is disconnected rather than excused.
+            // `request_timeout`, at which point it is parked rather than excused.
             if outbound_queue_has_capacity {
                 self.outbound_full_since = None;
             } else if self.outbound_full_since.is_none() {
@@ -388,9 +411,11 @@ impl PeerRoutine {
                         // the supervised pipe cancels the connection; the `Drop`
                         // guard returns unreceived work on the way out.
                         Some(frame) => self.handle_frame(&mut guard, frame).await?,
-                        // Stream closed (peer gone): exit cleanly. `Drop` returns
+                        // Stream closed by the peer. With no outstanding work this
+                        // is a clean exit; with unanswered requests it is a
+                        // no-progress stall (park or disconnect). `Drop` returns
                         // unreceived outstanding heights and releases their budget.
-                        None => return Ok(()),
+                        None => return self.handle_remote_stream_closed(Instant::now()),
                     }
                 }
                 changed = self.sequencer_view.changed() => {
@@ -1131,7 +1156,7 @@ impl PeerRoutine {
                 self.window.clear_liveness_if_idle();
                 Ok(())
             }
-            LivenessOutcome::Disconnect
+            LivenessOutcome::Park
                 if liveness_grace_allowed(
                     self.session.outbound_capacity() == 0,
                     self.outbound_full_since,
@@ -1145,28 +1170,69 @@ impl PeerRoutine {
                 // frames (`if outbound_queue_has_capacity`), so a block the peer already sent
                 // may be waiting behind our write side. Grant one short, BOUNDED grace. This
                 // is the *only* liveness extension: a peer that stopped reading holds outbound
-                // full past `request_timeout`, falls through to the disconnect arm, and is
-                // disconnected at the liveness deadline — it cannot dodge the timer.
+                // full past `request_timeout`, falls through to the park arm, and is
+                // parked at the liveness deadline — it cannot dodge the timer.
                 self.window
                     .extend_liveness_deadline(now, self.config.request_timeout);
                 Ok(())
             }
-            LivenessOutcome::Disconnect => {
-                let error =
-                    "block-sync peer made no accepted block progress before liveness deadline";
-                self.registry.park_peer_until(
-                    &self.peer,
-                    now + self.config.effective_no_progress_peer_cooldown(),
-                );
-                self.trace_protocol_reject_liveness(error);
-                tracing::debug!(
-                    peer = ?self.peer,
-                    outstanding = self.window.outstanding.len(),
-                    "disconnecting Zakura block-sync peer after no accepted block progress"
-                );
-                Err(SinkReject::protocol(error))
-            }
+            LivenessOutcome::Park => self.no_progress_stall(
+                now,
+                "block-sync peer made no accepted block progress before liveness deadline",
+            ),
         }
+    }
+
+    /// Apply the no-progress stall protocol: disconnect on a repeated stall,
+    /// otherwise park the session for the cooldown and exit locally (the
+    /// connection survives).
+    fn no_progress_stall(&mut self, now: Instant, error: &'static str) -> Result<(), SinkReject> {
+        if no_progress_response(self.allow_no_progress_park) == NoProgressResponse::Disconnect {
+            tracing::debug!(
+                peer = ?self.peer,
+                outstanding = self.window.outstanding.len(),
+                "disconnecting Zakura block-sync peer after repeated no-progress stall"
+            );
+            return Err(SinkReject::protocol(error));
+        }
+        self.registry.park_session(
+            &self.peer,
+            self.conn_id,
+            self.generation,
+            now + self.config.effective_no_progress_peer_cooldown(),
+        );
+        self.trace_liveness_park(error);
+        tracing::debug!(
+            peer = ?self.peer,
+            outstanding = self.window.outstanding.len(),
+            "parking Zakura block-sync session after no accepted block progress"
+        );
+        Err(SinkReject::local(error))
+    }
+
+    /// Handle the peer closing its send side of the stream. Honest peers close
+    /// *connections*, not lone streams; a stream-only EOF while block-progress
+    /// liveness is still armed is the same signal as the liveness stall and must
+    /// not reset the park/second-stall state machine — otherwise a peer could
+    /// take work, deliver nothing, let its requests time out (which drains
+    /// `outstanding` without disarming liveness), EOF before the liveness
+    /// deadline, and be readmitted fresh forever. An armed deadline with empty
+    /// `outstanding` can only mean charged requests were consumed without
+    /// accepted progress — every answered-everything path disarms it — and
+    /// `DownloadWindow::check_liveness` parks at that deadline
+    /// regardless of `outstanding`, so parking here only moves the already
+    /// scheduled outcome earlier. Frames are processed in-order in this task, so
+    /// at EOF everything the peer sent has already been counted. The liveness
+    /// grace does not apply: it waits for in-flight frames stuck behind our full
+    /// outbound queue, and a closed stream has none.
+    fn handle_remote_stream_closed(&mut self, now: Instant) -> Result<(), SinkReject> {
+        if self.window.outstanding.is_empty() && self.window.block_liveness_deadline.is_none() {
+            return Ok(());
+        }
+        self.no_progress_stall(
+            now,
+            "block-sync peer closed the stream with its requests unanswered",
+        )
     }
 
     /// Drop this routine's outstanding requests whose whole range is at or below
@@ -1915,12 +1981,12 @@ impl PeerRoutine {
         });
     }
 
-    fn trace_protocol_reject_liveness(&self, error: &str) {
-        self.emit(bs_trace::BLOCK_PEER_PROTOCOL_REJECT, |row| {
+    fn trace_liveness_park(&self, error: &str) {
+        self.emit(bs_trace::BLOCK_PEER_PARKED, |row| {
             bs_insert_peer(row, bs_trace::PEER, &self.peer);
             row.insert(
                 bs_trace::REASON.to_string(),
-                serde_json::Value::String(CLOSE_BLOCK_SYNC_NO_BLOCK_PROGRESS.to_string()),
+                serde_json::Value::String(PARK_BLOCK_SYNC_NO_BLOCK_PROGRESS.to_string()),
             );
             row.insert(
                 bs_trace::ERROR.to_string(),
@@ -2427,9 +2493,11 @@ mod tests {
 
         let mut routine = PeerRoutine::new(
             peer,
+            0,
             session,
             in_recv,
             config,
+            true,
             0,
             budget.clone(),
             work.clone(),
@@ -2518,9 +2586,11 @@ mod tests {
 
         let mut routine = PeerRoutine::new(
             peer,
+            0,
             session,
             in_recv,
             config,
+            true,
             0,
             budget,
             Arc::clone(&work),
@@ -2597,7 +2667,7 @@ mod tests {
         ));
 
         // Outbound has been full for a full `request_timeout` (the peer has stopped
-        // reading): NO grace — the peer is disconnected at the liveness deadline.
+        // reading): NO grace — the session is parked at the liveness deadline.
         let sustained = now - request_timeout;
         assert!(!super::liveness_grace_allowed(
             true,
@@ -2613,7 +2683,7 @@ mod tests {
             request_timeout
         ));
 
-        // Outbound has capacity (not full): the escape does not apply — disconnects normally.
+        // Outbound has capacity (not full): the escape does not apply — parks normally.
         assert!(!super::liveness_grace_allowed(
             false,
             Some(fresh),
@@ -2627,5 +2697,17 @@ mod tests {
             now,
             request_timeout
         ));
+    }
+
+    #[test]
+    fn repeated_no_progress_stall_disconnects_instead_of_parking_again() {
+        assert_eq!(
+            super::no_progress_response(true),
+            super::NoProgressResponse::Park
+        );
+        assert_eq!(
+            super::no_progress_response(false),
+            super::NoProgressResponse::Disconnect
+        );
     }
 }

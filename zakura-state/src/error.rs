@@ -918,6 +918,7 @@ impl ValidateContextError {
             | ValidateContextError::UnknownIronwoodAnchor { .. } => 100,
 
             ValidateContextError::MissingSproutTipTree(_)
+            | ValidateContextError::HeaderRootAuthFrontier { .. }
             | ValidateContextError::BlockPreviouslyInvalidated { .. }
             | ValidateContextError::NotReadyToBeCommitted
             | ValidateContextError::InvalidAncestorBlock(_)
@@ -1159,6 +1160,13 @@ mod tests {
                 finalized_tip_height: height,
             }));
         assert_eq!(stale_fork_error.misbehavior_score(), 0);
+
+        let local_frontier_error = CommitBlockError::ValidateContextError(Box::new(
+            ValidateContextError::HeaderRootAuthFrontier {
+                reason: "test frontier failure".to_string(),
+            },
+        ));
+        assert_eq!(local_frontier_error.misbehavior_score(), 0);
 
         let dup_err = CommitBlockError::Duplicate {
             hash_or_height: None,

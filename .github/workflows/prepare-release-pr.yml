@@ -1,8 +1,9 @@
 # Prepare a release PR mechanically and open it as a draft for human review.
 #
 # Runs scripts/prepare-release.sh on a fresh checkout of main (crate bumps via
-# cargo-semver-checks, zakura version, lockfile, config fixture, README tag,
-# end-of-support floor, changelog assembly), verifies the result with
+# cargo-semver-checks, Zakura release-level validation, lockfile, config
+# fixture, README tag, projected end-of-support height, release-state freshness,
+# and changelog assembly), verifies the result with
 # `make pre-release`, and opens or updates a draft PR through the release
 # GitHub App. Nothing merges, tags, or publishes from this workflow: the PR is
 # always a draft, judgment items (bump-level review, authoritative
@@ -38,6 +39,15 @@ on:
         required: false
         type: boolean
         default: false
+      expected_tag_delay_days:
+        description: "Expected days between preparation and tagging; used to project ESTIMATED_RELEASE_HEIGHT"
+        required: false
+        type: number
+        default: 0
+      release_state_waiver:
+        description: "Urgent RC only: reason for releasing behind the latest verified Mainnet release-state bundle"
+        required: false
+        type: string
 
 permissions: {}
 
@@ -102,6 +112,36 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Preparing ${RELEASE_TAG} from ${BASE_TAG} (rc: ${IS_RC}, flags: '${NO_CRATES_FLAG}')"
 
+      - name: Resolve the latest verified Mainnet release state
+        id: release-state
+        env:
+          EXPECTED_TAG_DELAY_DAYS: ${{ inputs.expected_tag_delay_days }}
+          LATEST_URL: ${{ vars.MAINNET_RELEASE_STATE_LATEST_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$LATEST_URL" ]; then
+            echo "Set the MAINNET_RELEASE_STATE_LATEST_URL repository variable." >&2
+            exit 1
+          fi
+          python3 .github/scripts/fetch-release-state.py --self-test
+          python3 scripts/release-readiness.py self-test
+          python3 .github/scripts/fetch-release-state.py \
+            --latest-url "$LATEST_URL" \
+            --output-dir "$RUNNER_TEMP/release-state-bundle" \
+            --metadata-out "$RUNNER_TEMP/release-state-resolution.json" \
+            --max-age-hours 48
+          report="$(
+            python3 scripts/release-readiness.py height \
+              --resolution "$RUNNER_TEMP/release-state-resolution.json" \
+              --expected-tag-delay-days "$EXPECTED_TAG_DELAY_DAYS"
+          )"
+          {
+            echo "bundle_height=$(jq -r '.bundle_height' <<<"$report")"
+            echo "estimated_release_height=$(jq -r '.estimated_release_height' <<<"$report")"
+            echo "generated_at=$(jq -r '.generated_at' <<<"$report")"
+          } >> "$GITHUB_OUTPUT"
+          jq . <<<"$report" >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         id: toolchain
         with:
@@ -122,10 +162,11 @@ jobs:
           restore-keys: prepare-release-baselines-${{ steps.toolchain.outputs.cachekey }}-
 
       # Deliberately unpinned (like semver-checks.yml): cargo-semver-checks
-      # must track new stable rustdoc formats.
+      # must track new stable rustdoc formats. cargo-public-api supplies
+      # independent API-diff evidence for each changed published library.
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
         with:
-          tool: cargo-release,cargo-semver-checks
+          tool: cargo-release,cargo-semver-checks,cargo-public-api
 
       - uses: ./.github/actions/setup-zakura-build
 
@@ -135,13 +176,21 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           BASE_TAG: ${{ steps.params.outputs.base_tag }}
           NO_CRATES_FLAG: ${{ steps.params.outputs.no_crates_flag }}
+          ESTIMATED_RELEASE_HEIGHT: ${{ steps.release-state.outputs.estimated_release_height }}
+          LATEST_RELEASE_STATE_HEIGHT: ${{ steps.release-state.outputs.bundle_height }}
+          RELEASE_STATE_WAIVER: ${{ inputs.release_state_waiver }}
         run: |
-          # shellcheck disable=SC2086 # NO_CRATES_FLAG is deliberately unquoted
-          scripts/prepare-release.sh \
-            --release-tag "$RELEASE_TAG" \
-            --base-tag "$BASE_TAG" \
-            $NO_CRATES_FLAG \
+          args=(
+            --release-tag "$RELEASE_TAG"
+            --base-tag "$BASE_TAG"
+            --estimated-release-height "$ESTIMATED_RELEASE_HEIGHT"
+            --latest-release-state-height "$LATEST_RELEASE_STATE_HEIGHT"
             --summary-json "$RUNNER_TEMP/prep-summary.json"
+          )
+          [ -z "$NO_CRATES_FLAG" ] || args+=("$NO_CRATES_FLAG")
+          [ -z "$RELEASE_STATE_WAIVER" ] \
+            || args+=(--release-state-waiver "$RELEASE_STATE_WAIVER")
+          scripts/prepare-release.sh "${args[@]}"
 
       - name: Save baseline rustdoc cache
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
@@ -192,6 +241,30 @@ jobs:
         continue-on-error: true
         run: cargo fmt --all -- --check
 
+      - name: Record public API diffs
+        id: verify-public-api
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          packages="$(
+            jq -r '
+              .crates[]
+              | select(.level != "manual" and .target != null and .target != "")
+              | .name
+            ' \
+              "$RUNNER_TEMP/prep-summary.json"
+          )"
+          if [ -z "$packages" ]; then
+            echo "No changed library crates are being published."
+            exit 0
+          fi
+          while IFS= read -r package; do
+            [ -n "$package" ] || continue
+            echo "::group::cargo public-api diff latest -p ${package}"
+            cargo public-api diff latest -p "$package" -sss
+            echo "::endgroup::"
+          done <<<"$packages"
+
       - name: Write the PR body
         id: body
         env:
@@ -200,6 +273,7 @@ jobs:
           VERIFY_PRERELEASE: ${{ steps.verify-prerelease.outcome }}
           VERIFY_CONFIG: ${{ steps.verify-config.outcome }}
           VERIFY_FMT: ${{ steps.verify-fmt.outcome }}
+          VERIFY_PUBLIC_API: ${{ steps.verify-public-api.outcome }}
         run: |
           python3 - "$RUNNER_TEMP/prep-summary.json" > "$RUNNER_TEMP/pr-body.md" <<'PY'
           import json, os, sys
@@ -209,6 +283,8 @@ jobs:
           base = summary["base_tag"]
           zakura = summary["zakura"]
           eos = summary["eos"]
+          release_state = summary["release_state"]
+          version_readiness = summary["version_readiness"]
 
           def mark(outcome):
               return "x" if outcome == "success" else " "
@@ -239,6 +315,10 @@ jobs:
               "Bump policy: breaking → major; any other change → minor. Patch is",
               "never auto-selected — downgrade during review where warranted.",
               "",
+              f"Zakura release-level gate: **{version_readiness['minimum_level']}** "
+              f"(minimum `{version_readiness['minimum_version']}` from "
+              f"{', '.join(version_readiness['categories']) or 'no user-visible categories'}).",
+              "",
               "## Also updated",
               "",
               f"- Config fixture regenerated: `{summary['fixture']}` "
@@ -246,13 +326,23 @@ jobs:
           ]
           if eos["floored"]:
               lines.append(
-                  f"- `ESTIMATED_RELEASE_HEIGHT` floored: {eos['old']} → {eos['floor']} "
-                  "(committed checkpoint height + 3456)."
+                  f"- `ESTIMATED_RELEASE_HEIGHT` updated: {eos['old']} → "
+                  f"{eos['target']} ({eos['basis']})."
               )
           else:
               lines.append(
                   f"- `ESTIMATED_RELEASE_HEIGHT` kept at {eos['old']} "
-                  f"(already at or above the {eos['floor']} floor)."
+                  f"(already at or above {eos['target']}, {eos['basis']})."
+              )
+          lines.append(
+              f"- Mainnet release state: committed "
+              f"{release_state['committed_height']}, latest verified "
+              f"{release_state['latest_verified_height']}."
+          )
+          if release_state["waiver"]:
+              lines.append(
+                  f"- ⚠️ Rapid-RC release-state waiver: "
+                  f"{release_state['waiver']}"
               )
           lines.append(
               f"- README install tag updated to {tag}." if summary["readme_updated"]
@@ -268,6 +358,8 @@ jobs:
               ("cargo test -p zakura --test acceptance config_tests -- --exact",
                os.environ["VERIFY_CONFIG"]),
               ("cargo fmt --all -- --check", os.environ["VERIFY_FMT"]),
+              ("cargo public-api diff latest for changed published libraries",
+               os.environ["VERIFY_PUBLIC_API"]),
           ]
           lines += ["", "## Verification", ""]
           lines += [f"- [{mark(o)}] `{cmd}`" for cmd, o in checks]
@@ -283,15 +375,28 @@ jobs:
               "",
               "## Remaining manual judgment (before undrafting)",
               "",
-              "- [ ] Set the authoritative `ESTIMATED_RELEASE_HEIGHT` from the "
-              "current Mainnet tip and expected tag date (the automated value "
-              "is only a staleness floor).",
-              "- [ ] Curate the assembled changelog (dedupe, trim trivial "
-              "entries, check categories).",
-              "- [ ] Review semver bump levels; downgrade minor → patch where "
-              "appropriate; choose initial versions for any new crates.",
-              "- [ ] Confirm no release hold is in effect (an embargoed hotfix "
-              "may be in flight for the same version).",
+              "- [ ] <!-- release-judgment:changelog --> Curate the assembled "
+              "changelog (dedupe, trim trivial entries, check categories).",
+          ]
+          manual_crates = [
+              crate["name"] for crate in summary["crates"]
+              if crate["level"] == "manual"
+          ]
+          if manual_crates:
+              lines.append(
+                  "- [ ] <!-- release-judgment:new-crate-versions --> Choose "
+                  "initial publish versions for new crates: "
+                  + ", ".join(manual_crates) + "."
+              )
+          else:
+              lines.append(
+                  "- [x] <!-- release-judgment:new-crate-versions --> No new "
+                  "crates require initial publish versions."
+              )
+          lines += [
+              "- [ ] <!-- release-judgment:release-hold --> Confirm no release "
+              "hold is in effect (an embargoed hotfix may be in flight for "
+              "the same version).",
               "",
               "### AI Disclosure",
               "",
@@ -358,7 +463,8 @@ jobs:
         if: >-
           steps.verify-prerelease.outcome == 'failure' ||
           steps.verify-config.outcome == 'failure' ||
-          steps.verify-fmt.outcome == 'failure'
+          steps.verify-fmt.outcome == 'failure' ||
+          steps.verify-public-api.outcome == 'failure'
         run: |
           echo "Release preparation verification failed; see the step logs above." >&2
           exit 1

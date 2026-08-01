@@ -1,0 +1,79 @@
+name: Release PR readiness
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  manual-judgment:
+    name: Release PR manual judgment
+    if: startsWith(github.event.pull_request.head.ref, 'release/v')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Check release preparation attestations
+        id: attestations
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          body = os.environ.get("PR_BODY", "")
+          manual_heading = "## Remaining manual judgment (before undrafting)"
+          required = {
+              "changelog",
+              "new-crate-versions",
+              "release-hold",
+          }
+
+          if manual_heading not in body:
+              raise SystemExit(
+                  "Release PR body lacks the manual judgment checklist."
+              )
+          section = body.split(manual_heading, 1)[1]
+          section = re.split(r"^## ", section, maxsplit=1, flags=re.MULTILINE)[0]
+          markers = re.findall(
+              r"^- \[([ xX])\] <!-- release-judgment:([a-z0-9-]+) -->",
+              section,
+              re.MULTILINE,
+          )
+          found = [marker for _, marker in markers]
+          duplicates = sorted(
+              marker for marker in set(found) if found.count(marker) > 1
+          )
+          if duplicates:
+              raise SystemExit(
+                  "Release PR has duplicate judgment markers: "
+                  + ", ".join(duplicates)
+              )
+          missing = sorted(required - set(found))
+          unexpected = sorted(set(found) - required)
+          if missing or unexpected:
+              details = []
+              if missing:
+                  details.append("missing: " + ", ".join(missing))
+              if unexpected:
+                  details.append("unexpected: " + ", ".join(unexpected))
+              raise SystemExit(
+                  "Release PR judgment markers are invalid (" + "; ".join(details) + ")."
+              )
+          unchecked = sorted(marker for state, marker in markers if state == " ")
+          if unchecked:
+              raise SystemExit(
+                  "Release PR still has unchecked judgment items: "
+                  + ", ".join(unchecked)
+              )
+          PY
+
+      - name: Return an incomplete release PR to draft
+        if: failure() && !github.event.pull_request.draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr ready "$PR_URL" --undo

@@ -16,6 +16,7 @@ from pathlib import Path
 FRAGMENT_DIRECTORY = "changelog-unreleased"
 NO_CHANGELOG_MARKER = "<!-- changelog: none -->"
 ROOT_CHANGELOG = "CHANGELOG.md"
+CANONICAL_TAG_REMOTE = "https://github.com/zakura-core/zakura.git"
 STANDARD_CATEGORIES = (
     "Added",
     "Changed",
@@ -277,7 +278,11 @@ def render_release(
 
 
 def release_plan(
-    repo_root: Path, release_tag: str, release_date: str
+    repo_root: Path,
+    release_tag: str,
+    release_date: str,
+    retarget_latest: bool = False,
+    tag_remote: str = CANONICAL_TAG_REMOTE,
 ) -> tuple[dict[Path, str], list[Path]]:
     tag_match = RELEASE_TAG.match(release_tag)
     if not tag_match:
@@ -326,11 +331,24 @@ def release_plan(
         rendered = render_unreleased(prefix, body, suffix)
     else:
         if not body:
-            raise ChangelogError(
-                f"{path}: release version is {root_version}, latest changelog "
-                f"version is {latest}, but Unreleased is empty"
+            if not retarget_latest:
+                raise ChangelogError(
+                    f"{path}: release version is {root_version}, latest changelog "
+                    f"version is {latest}, but Unreleased is empty"
+                )
+            ensure_retargetable(repo_root, latest, tag_remote)
+            latest_heading = VERSION_HEADING.search(suffix)
+            if latest_heading is None or latest_heading.group(1) != latest:
+                raise ChangelogError(f"{path}: could not retarget latest release {latest}")
+            replacement = f"## [{root_version}] - {release_date}"
+            suffix = (
+                suffix[: latest_heading.start()]
+                + replacement
+                + suffix[latest_heading.end() :]
             )
-        rendered = render_release(prefix, body, suffix, root_version, release_date)
+            rendered = render_unreleased(prefix, body, suffix)
+        else:
+            rendered = render_release(prefix, body, suffix, root_version, release_date)
 
     writes = {path: rendered} if rendered != original else {}
 
@@ -348,6 +366,45 @@ def run_git(repo_root: Path, arguments: list[str]) -> str:
     if result.returncode:
         raise ChangelogError(result.stderr.strip() or "git command failed")
     return result.stdout
+
+
+def git_ref_exists(repo_root: Path, ref: str) -> bool:
+    result = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", ref],
+        cwd=repo_root,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        raise ChangelogError(f"git could not check {ref}")
+    return result.returncode == 0
+
+
+def git_remote_ref_exists(repo_root: Path, remote: str, ref: str) -> bool:
+    result = subprocess.run(
+        ["git", "ls-remote", "--exit-code", "--refs", remote, ref],
+        cwd=repo_root,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 2:
+        return False
+    raise ChangelogError(
+        result.stderr.strip() or f"git could not check {ref} on remote {remote}"
+    )
+
+
+def ensure_retargetable(repo_root: Path, version: str, remote: str) -> None:
+    shallow = run_git(repo_root, ["rev-parse", "--is-shallow-repository"]).strip()
+    if shallow != "false":
+        raise ChangelogError(
+            "cannot retarget an unpublished release from a shallow repository"
+        )
+    ref = f"refs/tags/v{version}"
+    if git_ref_exists(repo_root, ref) or git_remote_ref_exists(repo_root, remote, ref):
+        raise ChangelogError(f"cannot retarget {version}: git tag v{version} exists")
 
 
 def check_pull_request(
@@ -421,6 +478,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="fail if release assembly would change tracked files",
     )
+    release.add_argument(
+        "--retarget-unpublished",
+        action="store_true",
+        help=(
+            "rename the latest changelog section if it has no git tag "
+            "and there are no new changes"
+        ),
+    )
+    release.add_argument(
+        "--tag-remote",
+        default=CANONICAL_TAG_REMOTE,
+        help="canonical remote URL checked before retargeting",
+    )
     return parser.parse_args()
 
 
@@ -442,7 +512,13 @@ def main() -> int:
             )
             print("pull request changelog fragment is valid")
         elif args.command == "release":
-            writes, removals = release_plan(repo_root, args.release_tag, args.date)
+            writes, removals = release_plan(
+                repo_root,
+                args.release_tag,
+                args.date,
+                retarget_latest=args.retarget_unpublished,
+                tag_remote=args.tag_remote,
+            )
             if args.check:
                 if writes or removals:
                     changed = [str(path.relative_to(repo_root)) for path in writes]

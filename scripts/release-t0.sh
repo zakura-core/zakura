@@ -42,6 +42,8 @@
 #                      publish; pins merge, push, and dispatch verification)
 #   --source-first     Mode B: pass source_first_release=true to the workflow
 #   --allow-bootstrap-release-state  pass the emergency workflow input through
+#   --release-state-waiver REASON  urgent RC only: record why the committed
+#                      release state may trail the latest verified bundle
 #   --repo OWNER/NAME  default zakura-core/zakura (or $REPOSITORY); any other
 #                      value needs --allow-nondefault-repo (staging drills)
 #   --allow-nondefault-repo  explicit staging-repo override
@@ -65,6 +67,7 @@ PR_NUM=""
 HEAD_SHA=""
 SOURCE_FIRST=0
 ALLOW_BOOTSTRAP=0
+RELEASE_STATE_WAIVER=""
 ALLOW_NONDEFAULT_REPO=0
 RUN_ID_ARG=""
 DRY_RUN=0
@@ -521,9 +524,10 @@ step_merge_or_push() {
   local merge_args=(gh pr merge "$PR_NUM" --repo "$REPO" --squash
     --match-head-commit "$HEAD_SHA")
   if ! act "squash-merging PR #${PR_NUM}" "${merge_args[@]}"; then
-    warn "plain squash-merge refused (review requirements?)"
-    confirm "Retry with --admin (bypasses review requirements)?"
-    act "squash-merging PR #${PR_NUM} with --admin" "${merge_args[@]}" --admin
+    die "$step" "gh pr merge ${PR_NUM}" "refused by repository rules" \
+      "all release-readiness, review, and merge requirements satisfied" \
+      "inspect the PR's failed or pending checks and unresolved review requirements;" \
+      "do not bypass release readiness with an admin merge"
   fi
   [ "$DRY_RUN" = 1 ] && { MERGE_SHA="$HEAD_SHA"; return 0; }
 
@@ -575,6 +579,8 @@ step_dispatch() {
     --ref "$dispatch_ref" -f "release_tag=${TAG}")
   [ "$SOURCE_FIRST" = 1 ] && dispatch_args+=(-f source_first_release=true)
   [ "$ALLOW_BOOTSTRAP" = 1 ] && dispatch_args+=(-f allow_bootstrap_release_state=true)
+  [ -z "$RELEASE_STATE_WAIVER" ] \
+    || dispatch_args+=(-f "release_state_waiver=${RELEASE_STATE_WAIVER}")
   act "dispatching Create release for ${TAG} from ${dispatch_ref}" "${dispatch_args[@]}"
   [ "$DRY_RUN" = 1 ] && return 0
 
@@ -909,6 +915,7 @@ main() {
       --head-sha) HEAD_SHA="$2"; shift 2 ;;
       --source-first) SOURCE_FIRST=1; shift ;;
       --allow-bootstrap-release-state) ALLOW_BOOTSTRAP=1; shift ;;
+      --release-state-waiver) RELEASE_STATE_WAIVER="$2"; shift 2 ;;
       --repo) REPO="$2"; shift 2 ;;
       --allow-nondefault-repo) ALLOW_NONDEFAULT_REPO=1; shift ;;
       --run-id) RUN_ID_ARG="$2"; shift 2 ;;

@@ -7,20 +7,27 @@
 #   3. Refresh Cargo.lock.
 #   4. Regenerate the stored config fixture for the new version.
 #   5. Update the README install tag (stable releases only).
-#   6. Floor ESTIMATED_RELEASE_HEIGHT from the committed checkpoint list.
-#   7. Assemble the changelog from pending fragments.
+#   6. Validate the requested Zakura release level from the changelog.
+#   7. Update ESTIMATED_RELEASE_HEIGHT from a verified release-state projection.
+#   8. Require the committed release state to match the latest verified bundle.
+#   9. Assemble the changelog from pending fragments.
 #
-# Judgment calls stay with the reviewer: minor is never downgraded to patch,
-# new crates are reported but not versioned, and the authoritative
-# end-of-support estimate still comes from the release checklist. The
-# "Prepare release PR" workflow runs this script and opens a draft PR; it is
-# equally runnable locally.
+# Judgment calls stay with the reviewer where they cannot be derived safely:
+# minor is never downgraded to patch for library crates, new crates are
+# reported but not versioned, and changelog wording still needs review. The
+# "Prepare release PR" workflow supplies verified release-state inputs; local
+# callers without them retain the committed-checkpoint floor.
 #
 # Usage:
 #   ./scripts/prepare-release.sh --release-tag v1.2.3-rc0 [--base-tag v1.2.2]
+#       [--estimated-release-height HEIGHT]
+#       [--latest-release-state-height HEIGHT]
+#       [--release-state-waiver REASON]
+#       [--tag-remote URL]
 #       [--no-crates] [--dry-run] [--summary-json PATH]
 #
 #   --base-tag      defaults to the most recent v* tag reachable from HEAD
+#   --tag-remote    canonical tag source checked before retargeting
 #   --no-crates     GitHub-only release candidate: bump only the zakura package
 #   --dry-run       print the bump plan and intended edits; modify nothing
 #   --summary-json  write a machine-readable summary (used for the PR body)
@@ -34,9 +41,13 @@ base_tag=""
 no_crates=0
 dry_run=0
 summary_json=""
+estimated_release_height=""
+latest_release_state_height=""
+release_state_waiver=""
+tag_remote="https://github.com/zakura-core/zakura.git"
 
 usage() {
-  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -44,6 +55,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --release-tag) release_tag="${2:?--release-tag needs a value}"; shift 2 ;;
     --base-tag) base_tag="${2:?--base-tag needs a value}"; shift 2 ;;
+    --estimated-release-height) estimated_release_height="${2:?--estimated-release-height needs a value}"; shift 2 ;;
+    --latest-release-state-height) latest_release_state_height="${2:?--latest-release-state-height needs a value}"; shift 2 ;;
+    --release-state-waiver) release_state_waiver="${2:?--release-state-waiver needs a value}"; shift 2 ;;
+    --tag-remote) tag_remote="${2:?--tag-remote needs a value}"; shift 2 ;;
     --no-crates) no_crates=1; shift ;;
     --dry-run) dry_run=1; shift ;;
     --summary-json) summary_json="${2:?--summary-json needs a value}"; shift 2 ;;
@@ -70,8 +85,12 @@ if [ "$no_crates" = 1 ] && [ -z "$suffix" ]; then
   echo "ERROR: --no-crates is only valid for release candidates; stable releases always version the full crate graph." >&2
   exit 1
 fi
+if [ -n "$release_state_waiver" ] && [ -z "$suffix" ]; then
+  echo "ERROR: --release-state-waiver is only valid for urgent release candidates." >&2
+  exit 1
+fi
 
-for cmd in cargo git jq awk perl; do
+for cmd in cargo git jq awk perl python3; do
   command -v "$cmd" >/dev/null || { echo "Missing required tool: $cmd" >&2; exit 1; }
 done
 cargo release --version >/dev/null 2>&1 \
@@ -97,6 +116,14 @@ if ! git merge-base --is-ancestor "$base_tag" HEAD; then
   echo "ERROR: base tag '${base_tag}' is not an ancestor of HEAD." >&2
   exit 1
 fi
+
+for height_arg in "$estimated_release_height" "$latest_release_state_height"; do
+  if [ -n "$height_arg" ] && ! [[ "$height_arg" =~ ^[0-9]+$ ]] \
+    || [ -n "$height_arg" ] && { [ "$height_arg" -le 0 ] || [ "$height_arg" -ge 4294967296 ]; }; then
+    echo "ERROR: release-state heights must be positive u32 integers, got '${height_arg}'." >&2
+    exit 1
+  fi
+done
 
 if [ "$dry_run" = 0 ] && [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
   echo "ERROR: the working tree is not clean; commit or stash before preparing a release." >&2
@@ -160,6 +187,66 @@ plan_currents=()
 plan_manifests=()
 
 metadata="$(cargo metadata --format-version 1 --no-deps)"
+zakura_old="$(
+  jq -r '.packages[] | select(.name == "zakura") | .version' <<<"$metadata"
+)"
+
+base_zakura_version="$(
+  git show "${base_tag}:zakurad/Cargo.toml" \
+    | awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }'
+)"
+if [ -z "$base_zakura_version" ]; then
+  echo "ERROR: could not read the zakura package version at ${base_tag}." >&2
+  exit 1
+fi
+version_readiness="$(
+  python3 scripts/release-readiness.py version \
+    --repo-root "$repo_root" \
+    --base-version "$base_zakura_version" \
+    --release-tag "$release_tag"
+)"
+echo "Zakura release level: $(jq -r \
+  '"target \(.target), minimum \(.minimum_version) (\(.minimum_level)); categories: \(.categories | join(", "))"' \
+  <<<"$version_readiness")"
+
+retarget_unpublished=0
+latest_changelog_version="$(jq -r '.changelog.latest_version' <<<"$version_readiness")"
+pending_fragments="$(jq -r '.changelog.pending_fragments' <<<"$version_readiness")"
+unreleased_category_count="$(
+  jq -r '.changelog.unreleased_categories | length' <<<"$version_readiness"
+)"
+if [ -n "$suffix" ] \
+  && [ "$zakura_old" != "$version" ] \
+  && [ "$latest_changelog_version" = "$zakura_old" ] \
+  && [ "$pending_fragments" -eq 0 ] \
+  && [ "$unreleased_category_count" -eq 0 ]; then
+  old_tag_ref="refs/tags/v${zakura_old}"
+  if git show-ref --verify --quiet "$old_tag_ref"; then
+    echo "ERROR: cannot retarget v${zakura_old}; the local tag exists." >&2
+    exit 1
+  fi
+  if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
+    echo "ERROR: cannot retarget an unpublished release from a shallow repository." >&2
+    exit 1
+  fi
+  remote_tag_status=0
+  git ls-remote --exit-code --refs "$tag_remote" "$old_tag_ref" >/dev/null 2>&1 \
+    || remote_tag_status=$?
+  case "$remote_tag_status" in
+    0)
+      echo "ERROR: cannot retarget v${zakura_old}; the tag exists on ${tag_remote}." >&2
+      exit 1
+      ;;
+    2)
+      retarget_unpublished=1
+      echo "Retargeting unpublished release preparation v${zakura_old} to ${release_tag}."
+      ;;
+    *)
+      echo "ERROR: could not verify ${old_tag_ref} against ${tag_remote}." >&2
+      exit 1
+      ;;
+  esac
+fi
 
 add_to_plan() {
   # add_to_plan name target current manifest_rel
@@ -210,6 +297,13 @@ if [ "$no_crates" = 0 ]; then
     if [ -z "$base_version" ]; then
       echo "ERROR: could not read ${crate}'s package version at ${base_tag}." >&2
       exit 1
+    fi
+
+    if [ "$retarget_unpublished" = 1 ] \
+      && [ "$current_version" = "$base_version" ]; then
+      add_crate_row "$crate" "$base_version" "$current_version" "$current_version" \
+        "kept" "unchanged in the existing unpublished release preparation"
+      continue
     fi
 
     if [ "$current_version" != "$base_version" ]; then
@@ -284,24 +378,39 @@ if [ "$no_crates" = 0 ]; then
   )
 fi
 
-zakura_old="$(
-  cargo metadata --format-version 1 --no-deps \
-    | jq -r '.packages[] | select(.name == "zakura") | .version'
-)"
-
-# End-of-support floor: committed checkpoint height plus ~3 days of blocks.
-# The release checklist's manual estimate from the live chain tip stays
-# authoritative; this only keeps a skipped step from shipping a stale value.
+# The workflow projects the release height from a fresh, digest-verified
+# release-state bundle. Local callers retain the committed checkpoint plus
+# three days as a fail-safe floor.
 eos_file="zakurad/src/components/sync/end_of_support.rs"
 checkpoint_file="zakura-chain/src/parameters/checkpoint/main-checkpoints.txt"
 committed_height="$(tail -1 "$checkpoint_file" | cut -d' ' -f1)"
 eos_floor=$((committed_height + 3456))
+if [ -n "$latest_release_state_height" ] \
+  && [ "$latest_release_state_height" -gt "$committed_height" ] \
+  && [ -z "$release_state_waiver" ]; then
+  cat >&2 <<EOF
+ERROR: committed Mainnet release state ends at ${committed_height}, but the
+latest verified bundle ends at ${latest_release_state_height}.
+
+Run the Update Mainnet release state workflow, review and merge its PR, then
+retry release preparation. For an urgent release candidate only, pass a
+non-empty --release-state-waiver reason so the exception is recorded.
+EOF
+  exit 1
+fi
 eos_old="$(
   grep -oE 'ESTIMATED_RELEASE_HEIGHT: u32 = [0-9_]+' "$eos_file" \
     | grep -oE '[0-9_]+$' | tr -d '_'
 )"
+eos_target="$eos_floor"
+eos_basis="committed checkpoint ${committed_height} + 3456"
+if [ -n "$estimated_release_height" ] \
+  && [ "$estimated_release_height" -gt "$eos_target" ]; then
+  eos_target="$estimated_release_height"
+  eos_basis="fresh verified release-state projection"
+fi
 eos_floored=0
-[ "$eos_old" -lt "$eos_floor" ] && eos_floored=1
+[ "$eos_old" -lt "$eos_target" ] && eos_floored=1
 
 fragment_count="$(find changelog-unreleased -name '*.md' ! -name 'README.md' | wc -l | tr -d ' ')"
 
@@ -314,9 +423,15 @@ jq -r '.[] | "  \(.name): \(.base // "-") -> \(.target // "?") [\(.level)] (\(.r
 [ "$(jq 'length' <<<"$crates_json")" != 0 ] || echo "  (no publishable crate changes)"
 echo "  zakura: ${zakura_old} -> ${version} (release tag)"
 if [ "$eos_floored" = 1 ]; then
-  echo "  ESTIMATED_RELEASE_HEIGHT: ${eos_old} -> ${eos_floor} (checkpoint ${committed_height} + 3456)"
+  echo "  ESTIMATED_RELEASE_HEIGHT: ${eos_old} -> ${eos_target} (${eos_basis})"
 else
-  echo "  ESTIMATED_RELEASE_HEIGHT: ${eos_old} already at or above the ${eos_floor} floor"
+  echo "  ESTIMATED_RELEASE_HEIGHT: ${eos_old} already at or above ${eos_target} (${eos_basis})"
+fi
+if [ -n "$latest_release_state_height" ]; then
+  echo "  Release state: committed ${committed_height}, latest verified ${latest_release_state_height}"
+fi
+if [ -n "$release_state_waiver" ]; then
+  echo "  Release-state waiver: ${release_state_waiver}"
 fi
 echo "  Changelog fragments to consume: ${fragment_count}"
 if [ -z "$suffix" ]; then
@@ -333,17 +448,31 @@ write_summary() {
     --argjson no_crates "$([ "$no_crates" = 1 ] && echo true || echo false)" \
     --argjson dry_run "$([ "$dry_run" = 1 ] && echo true || echo false)" \
     --argjson crates "$crates_json" \
+    --argjson version_readiness "$version_readiness" \
     --arg zakura_old "$zakura_old" \
     --arg zakura_new "$version" \
     --argjson eos_old "$eos_old" \
-    --argjson eos_floor "$eos_floor" \
+    --argjson eos_target "$eos_target" \
+    --arg eos_basis "$eos_basis" \
     --argjson eos_floored "$([ "$eos_floored" = 1 ] && echo true || echo false)" \
+    --argjson committed_release_state_height "$committed_height" \
+    --argjson latest_release_state_height "${latest_release_state_height:-$committed_height}" \
+    --arg release_state_waiver "$release_state_waiver" \
+    --argjson retargeted_unpublished "$([ "$retarget_unpublished" = 1 ] && echo true || echo false)" \
     --argjson readme_updated "$([ -z "$suffix" ] && echo true || echo false)" \
     --argjson fragments_consumed "$fragment_count" \
     '{release_tag: $release_tag, base_tag: $base_tag, no_crates: $no_crates,
       dry_run: $dry_run, crates: $crates,
+      version_readiness: $version_readiness,
+      retargeted_unpublished: $retargeted_unpublished,
       zakura: {old: $zakura_old, new: $zakura_new},
-      eos: {old: $eos_old, floor: $eos_floor, floored: $eos_floored},
+      eos: {old: $eos_old, target: $eos_target, basis: $eos_basis,
+            floored: $eos_floored},
+      release_state: {
+        committed_height: $committed_release_state_height,
+        latest_verified_height: $latest_release_state_height,
+        waiver: $release_state_waiver
+      },
       fixture: ("zakurad/tests/common/configs/v" + $zakura_new + ".toml"),
       readme_updated: $readme_updated,
       fragments_consumed: $fragments_consumed}' \
@@ -443,8 +572,8 @@ fi
 
 if [ "$eos_floored" = 1 ]; then
   echo
-  echo "==> Flooring ESTIMATED_RELEASE_HEIGHT at ${eos_floor}"
-  formatted="$(echo "$eos_floor" | awk '{n=$0; r=""; for(i=length(n);i>0;i--) { r=substr(n,i,1) r; if((length(n)-i)%3==2 && i>1) r="_" r }; print r}')"
+  echo "==> Updating ESTIMATED_RELEASE_HEIGHT to ${eos_target}"
+  formatted="$(echo "$eos_target" | awk '{n=$0; r=""; for(i=length(n);i>0;i--) { r=substr(n,i,1) r; if((length(n)-i)%3==2 && i>1) r="_" r }; print r}')"
   # sed -i needs a suffix argument on macOS; keep the script runnable locally.
   sed -i.prepare-release.bak \
     "s/ESTIMATED_RELEASE_HEIGHT: u32 = [0-9_]*/ESTIMATED_RELEASE_HEIGHT: u32 = ${formatted}/" \
@@ -454,7 +583,10 @@ fi
 
 echo
 echo "==> Assembling the changelog"
-make prepare-release-changelog RELEASE_TAG="$release_tag"
+make prepare-release-changelog \
+  RELEASE_TAG="$release_tag" \
+  RETARGET_UNPUBLISHED="$retarget_unpublished" \
+  TAG_REMOTE="$tag_remote"
 
 echo
 echo "Release preparation for ${release_tag} is complete; review with 'git diff'."

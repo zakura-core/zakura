@@ -4,18 +4,23 @@
 
 PRE_RELEASE_WARN_CRATE_VERSION_BUMPS ?= $(if $(CI),0,1)
 CRATE_PACKAGING_VERIFY ?= 0
+TAG_REMOTE ?= https://github.com/zakura-core/zakura.git
 
 prepare-release:
 	@test -n "$(RELEASE_TAG)" || { echo "RELEASE_TAG is required, e.g. make prepare-release RELEASE_TAG=v1.0.0" >&2; exit 1; }
 	./scripts/prepare-release.sh --release-tag "$(RELEASE_TAG)" \
 		$(if $(BASE_TAG),--base-tag "$(BASE_TAG)") \
+		--tag-remote "$(TAG_REMOTE)" \
 		$(if $(filter 1,$(NO_CRATES)),--no-crates) \
 		$(if $(filter 1,$(DRY_RUN)),--dry-run)
 
 prepare-release-changelog:
 	@test -n "$(RELEASE_TAG)" || { echo "RELEASE_TAG is required, e.g. make prepare-release-changelog RELEASE_TAG=v1.0.0" >&2; exit 1; }
 	./scripts/check-release-version.sh "$(RELEASE_TAG)"
-	./scripts/changelog.py release "$(RELEASE_TAG)" $(if $(CHANGELOG_DATE),--date "$(CHANGELOG_DATE)")
+	./scripts/changelog.py release "$(RELEASE_TAG)" \
+		$(if $(CHANGELOG_DATE),--date "$(CHANGELOG_DATE)") \
+		--tag-remote "$(TAG_REMOTE)" \
+		$(if $(filter 1,$(RETARGET_UNPUBLISHED)),--retarget-unpublished)
 
 pre-release:
 	@test -n "$(RELEASE_TAG)" || { echo "RELEASE_TAG is required, e.g. make pre-release RELEASE_TAG=v1.0.0" >&2; exit 1; }

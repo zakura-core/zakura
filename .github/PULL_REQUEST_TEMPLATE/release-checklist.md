@@ -88,6 +88,9 @@ fastmod --fixed-strings '1.58' '1.65'
       `hotfix/v*` — that namespace is reserved for the
       [hotfix release process](https://github.com/zakura-core/zakura/blob/main/docs/security-hotfix-release.md)).
 - [ ] Create a release PR by adding `&template=release-checklist.md` to the comparing url ([Example](https://github.com/zakura-core/zakura/compare/release/v1.0.0?expand=1&template=release-checklist.md)).
+- [ ] Complete every generated manual-judgment checkbox before marking the PR
+      ready; the release-readiness workflow returns incomplete `release/v*`
+      PRs to draft.
 - [ ] Freeze the [`batched` queue](https://dashboard.mergify.com/github/valargroup/repo/zakura/queues) using Mergify.
 - [ ] Mark all the release PRs as `Critical` priority, so they go in the `urgent` Mergify queue.
 - [ ] Mark all non-release PRs with `do-not-merge`, because Mergify checks approved PRs against every commit, even when a queue is frozen.
@@ -104,10 +107,12 @@ This check runs automatically on pull requests with the `A-release` label. It mu
 > **Automation**: the
 > [Prepare release PR workflow](https://github.com/zakura-core/zakura/actions/workflows/prepare-release-pr.yml)
 > performs the mechanical steps in this section (crate and zakura version
-> bumps, lockfile, stored config, changelog assembly, end-of-support floor)
-> and opens a draft PR. The judgment items remain manual either way: review
-> the chosen bump levels, curate the assembled changelog, and set the
-> authoritative end-of-support height below.
+> bumps, lockfile, stored config, changelog assembly, release-level validation,
+> public-API reports, and a projected end-of-support height from the latest
+> verified release-state bundle) and opens a draft PR. It also refuses stale
+> committed release state unless an urgent-RC waiver reason is supplied. The
+> remaining judgment items are changelog curation and confirmation that no
+> release hold is active.
 
 ## Update Zakura Version
 
@@ -131,6 +136,12 @@ version.
 ```sh
 cargo release version --verbose --execute --allow-branch '*' -p zakura patch # [ major | minor ]
 ```
+
+The preparation workflow rejects a requested tag below the conservative
+release level implied by the pending changelog: `Added`, `Changed`,
+`Deprecated`, or `Removed` entries require at least a minor release; a
+Mainnet network upgrade requires a major release; otherwise the floor is a
+patch release. It never silently changes the requested tag.
 
 - [ ] Generate and commit the stored config for the new version — the
       `last_config_is_stored` acceptance test derives the expected filename
@@ -166,7 +177,8 @@ Check that the release will work:
       a package version bump. This warning is local-only and advisory; unchanged
       crates are not bumped or published.
 - [ ] Update (or install) `semver-checks`: `cargo +stable install cargo-semver-checks --locked`
-- [ ] Update (or install) `public-api`: `cargo +stable install cargo-public-api --locked`
+- [ ] Confirm the preparation workflow's `cargo public-api diff latest` reports
+      completed successfully for every changed library being published.
 - [ ] For each crate that requires a release:
   - [ ] Determine which type of release to make. Run `semver-checks` to list API
         changes: `cargo semver-checks -p <crate> --default-features`. If there are
@@ -210,12 +222,17 @@ make prepare-release-changelog RELEASE_TAG=v<version>
       For example:
       `make pre-release RELEASE_TAG=v1.0.3 BASE_TAG=v1.0.2`.
 
-## Update End of Support
+## Verify End of Support
 
-The end of support height is calculated from the current blockchain height:
+The preparation workflow calculates the release height from a fresh,
+digest-verified Mainnet release-state bundle, projects it to the expected tag
+date, and updates `ESTIMATED_RELEASE_HEIGHT` when needed:
 
-- [ ] Find where the Zcash blockchain tip is now by using a [Zcash Block Explorer](https://mainnet.zcashexplorer.app/) or other tool.
-- [ ] Replace `ESTIMATED_RELEASE_HEIGHT` in [`end_of_support.rs`](https://github.com/zakura-core/zakura/blob/main/zakurad/src/components/sync/end_of_support.rs) with the height you estimate the release will be tagged. (The release-state PR floors this value near its bundle height, but this manual estimate is authoritative — with an 18-day support window, days matter.)
+- [ ] Review the bundle height, generation time, expected tag delay, and
+      resulting `ESTIMATED_RELEASE_HEIGHT` recorded in the release PR.
+- [ ] If tagging is delayed, re-run preparation with the new expected delay;
+      `Create release` currently warns when the estimate is below its freshly
+      resolved projection.
 
 <details>
 
@@ -242,16 +259,17 @@ The end of support height is calculated from the current blockchain height:
       published tag, release, and assets (resumable — re-runs skip
       completed steps):
 
-      ```sh
-      ./scripts/release-t0.sh publish --tag v<version> --mode main \
-          --head-sha <merged-main-commit>
-      ```
+```sh
+./scripts/release-t0.sh publish --tag v<version> --mode main \
+    --head-sha <merged-main-commit>
+```
 
-      Manual fallback: run the
-      [Create release workflow](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml)
-      from `main`, entering the exact version tag, for example `v1.0.0-rc2`.
-      The workflow verifies that the tag matches the `zakura` package version,
-      then builds and verifies the assets without creating a tag.
+Manual fallback: run the
+[Create release workflow](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml)
+from `main`, entering the exact version tag, for example `v1.0.0-rc2`.
+The workflow verifies that the tag matches the `zakura` package version,
+then builds and verifies the assets without creating a tag.
+
 - [ ] Wait for the build and no-push Docker checks to pass, then approve the
       `release` environment deployment when the script announces it. The
       workflow publishes a complete pre-release and creates the protected

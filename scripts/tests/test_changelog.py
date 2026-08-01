@@ -166,6 +166,50 @@ class ChangelogTests(unittest.TestCase):
         with self.assertRaisesRegex(changelog.ChangelogError, "Unreleased is empty"):
             changelog.release_plan(self.root, "v1.1.0", "2026-07-21")
 
+    def test_release_retargets_unpublished_version_without_new_entries(self):
+        with mock.patch.object(changelog, "ensure_retargetable") as safety_check:
+            writes, removals = changelog.release_plan(
+                self.root,
+                "v1.1.0-rc0",
+                "2026-07-21",
+                retarget_latest=True,
+            )
+
+        rendered = writes[self.root / "CHANGELOG.md"]
+        safety_check.assert_called_once_with(
+            self.root,
+            "1.0.0",
+            changelog.CANONICAL_TAG_REMOTE,
+        )
+        self.assertIn("## [1.1.0-rc0] - 2026-07-21", rendered)
+        self.assertNotIn("## [1.0.0]", rendered)
+        self.assertIn("- Previous release.", rendered)
+        self.assertEqual(removals, [])
+
+    def test_retarget_rejects_shallow_repository(self):
+        with mock.patch.object(changelog, "run_git", return_value="true\n"):
+            with self.assertRaisesRegex(changelog.ChangelogError, "shallow"):
+                changelog.ensure_retargetable(self.root, "1.0.0", "origin")
+
+    def test_retarget_rejects_remote_tag(self):
+        with (
+            mock.patch.object(changelog, "run_git", return_value="false\n"),
+            mock.patch.object(changelog, "git_ref_exists", return_value=False),
+            mock.patch.object(changelog, "git_remote_ref_exists", return_value=True),
+        ):
+            with self.assertRaisesRegex(changelog.ChangelogError, "tag .* exists"):
+                changelog.ensure_retargetable(self.root, "1.0.0", "origin")
+
+    def test_retarget_rejects_local_tag(self):
+        with (
+            mock.patch.object(changelog, "run_git", return_value="false\n"),
+            mock.patch.object(changelog, "git_ref_exists", return_value=True),
+            mock.patch.object(changelog, "git_remote_ref_exists") as remote_check,
+        ):
+            with self.assertRaisesRegex(changelog.ChangelogError, "tag .* exists"):
+                changelog.ensure_retargetable(self.root, "1.0.0", "origin")
+        remote_check.assert_not_called()
+
     def test_stable_release_combines_and_removes_release_candidates(self):
         first = self.root / "changelog-unreleased" / "101.md"
         first.write_text("## Added\n\n- Added the first feature.\n")

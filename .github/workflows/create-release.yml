@@ -25,6 +25,15 @@ on:
         required: false
         default: false
         type: boolean
+      expected_tag_delay_days:
+        description: "Expected days before tagging; used to validate ESTIMATED_RELEASE_HEIGHT"
+        required: false
+        default: 0
+        type: number
+      release_state_waiver:
+        description: "Urgent RC only: reason for releasing behind the latest verified Mainnet release-state bundle"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -45,6 +54,7 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
+          fetch-depth: 0
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
@@ -87,6 +97,97 @@ jobs:
 
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check release readiness advisories
+        env:
+          EXPECTED_TAG_DELAY_DAYS: ${{ inputs.expected_tag_delay_days }}
+          LATEST_URL: ${{ vars.MAINNET_RELEASE_STATE_LATEST_URL }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_STATE_WAIVER: ${{ inputs.release_state_waiver }}
+        run: |
+          advisory_exit() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ]; then
+              echo "::warning title=Release readiness advisory unavailable::An unexpected readiness-check failure occurred (exit ${status}); continuing temporarily."
+            fi
+            exit 0
+          }
+          # These checks are intentionally advisory. Convert any unanticipated
+          # shell, parsing, or data error into a warning as a final safeguard.
+          trap advisory_exit EXIT
+          set -euo pipefail
+          if [ -z "$LATEST_URL" ]; then
+            echo "::warning title=Release-state advisory unavailable::Set the MAINNET_RELEASE_STATE_LATEST_URL repository variable."
+            exit 0
+          fi
+          if [ -n "$RELEASE_STATE_WAIVER" ] && [[ "$RELEASE_TAG" != *-rc* ]]; then
+            echo "::warning title=Ignored release-state waiver::release_state_waiver is only valid for urgent release candidates."
+            RELEASE_STATE_WAIVER=""
+          fi
+          if ! python3 .github/scripts/fetch-release-state.py --self-test \
+            || ! python3 scripts/release-readiness.py self-test; then
+            echo "::warning title=Release readiness advisory unavailable::A release-readiness self-test failed; continuing without these advisory checks."
+            exit 0
+          fi
+          base_tag="$(git describe --tags --match 'v*' --abbrev=0 HEAD)"
+          base_version="$(
+            git show "${base_tag}:zakurad/Cargo.toml" \
+              | awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }'
+          )"
+          version_report=""
+          if ! version_report="$(
+            python3 scripts/release-readiness.py version \
+              --base-version "$base_version" \
+              --release-tag "$RELEASE_TAG"
+          )"; then
+            echo "::warning title=Release level advisory::The requested tag is below the changelog-derived release level; continuing temporarily."
+          fi
+          if ! python3 .github/scripts/fetch-release-state.py \
+            --latest-url "$LATEST_URL" \
+            --output-dir "$RUNNER_TEMP/release-state-bundle" \
+            --metadata-out "$RUNNER_TEMP/release-state-resolution.json" \
+            --max-age-hours 48; then
+            echo "::warning title=Release-state advisory unavailable::The latest Mainnet release-state bundle could not be verified; continuing temporarily."
+            exit 0
+          fi
+          report=""
+          if ! report="$(
+            python3 scripts/release-readiness.py height \
+              --resolution "$RUNNER_TEMP/release-state-resolution.json" \
+              --expected-tag-delay-days "$EXPECTED_TAG_DELAY_DAYS"
+          )"; then
+            echo "::warning title=Support-height advisory unavailable::The projected release height could not be calculated; continuing temporarily."
+            exit 0
+          fi
+          latest_height="$(jq -r '.bundle_height' <<<"$report")"
+          estimated_height="$(jq -r '.estimated_release_height' <<<"$report")"
+          committed_height="$(
+            jq -r '.finalized_height' \
+              zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+          )"
+          configured_height="$(
+            grep -oE 'ESTIMATED_RELEASE_HEIGHT: u32 = [0-9_]+' \
+              zakurad/src/components/sync/end_of_support.rs \
+              | grep -oE '[0-9_]+$' | tr -d '_'
+          )"
+          minimum_height=$((committed_height + 3456))
+          if [ "$estimated_height" -gt "$minimum_height" ]; then
+            minimum_height="$estimated_height"
+          fi
+
+          if [ "$latest_height" -gt "$committed_height" ]; then
+            if [ -z "$RELEASE_STATE_WAIVER" ]; then
+              echo "::warning title=Stale committed release state::Committed height ${committed_height} trails verified bundle ${latest_height}; update the release state before the next release."
+            else
+              echo "::warning title=Release-state waiver::${RELEASE_STATE_WAIVER}"
+            fi
+          fi
+          if [ "$configured_height" -lt "$minimum_height" ]; then
+            echo "::warning title=Stale support height::ESTIMATED_RELEASE_HEIGHT ${configured_height} trails the projected floor ${minimum_height}; re-run release preparation."
+          fi
+          [ -z "$version_report" ] || jq . <<<"$version_report" >> "$GITHUB_STEP_SUMMARY"
+          jq . <<<"$report" >> "$GITHUB_STEP_SUMMARY"
 
   handoff-canary:
     name: Verify VCT handoff crossing

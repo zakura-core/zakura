@@ -33,6 +33,8 @@ Submit-only JSON-RPC reverse proxy for Vizor and other clients that need
 | Redirects | none (HTTP returns `400 HTTPS required`) |
 | Body logging | never |
 | Rate limit | 30 req/min/client IP |
+| Concurrency | 64 in-flight requests total, 8 per client IP |
+| Read timeouts | headers 10 s, body 30 s (enforced by both Caddy and the gateway) |
 
 ### Mainnet
 

@@ -2,6 +2,17 @@
 # Source: deploy/gateway/mainnet/Caddyfile
 # Installs via zakura-mainnet-deploy.yml; do not hand-edit on the host.
 
+{
+	servers {
+		# Caddy defaults to no read timeouts; bound them so a client that
+		# stalls its headers or body cannot hold connections open forever.
+		timeouts {
+			read_header 10s
+			read_body 30s
+		}
+	}
+}
+
 status.mainnet.zakura.valargroup.dev {
 	reverse_proxy 127.0.0.1:8090
 }

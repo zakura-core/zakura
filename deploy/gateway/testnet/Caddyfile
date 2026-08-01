@@ -2,6 +2,17 @@
 # Source: deploy/gateway/testnet/Caddyfile
 # Installs via zakura-testnet-deploy.yml; do not hand-edit on the host.
 
+{
+	servers {
+		# Caddy defaults to no read timeouts; bound them so a client that
+		# stalls its headers or body cannot hold connections open forever.
+		timeouts {
+			read_header 10s
+			read_body 30s
+		}
+	}
+}
+
 ironwood.zakura.valargroup.dev {
 	reverse_proxy 127.0.0.1:8091
 }

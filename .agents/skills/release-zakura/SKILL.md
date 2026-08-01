@@ -185,7 +185,8 @@ watches to the approval gate, and verifies the published release; it is
 resumable and re-runs skip completed steps:
 
 ```bash
-./scripts/release-t0.sh publish --tag <tag> --mode main --head-sha <merged-commit>
+./scripts/release-t0.sh publish --tag <tag> --mode main \
+  --head-sha <merged-commit> --expected-tag-delay-days <days>
 ```
 
 Raw dispatch fallback:

@@ -261,7 +261,7 @@ date, and updates `ESTIMATED_RELEASE_HEIGHT` when needed:
 
 ```sh
 ./scripts/release-t0.sh publish --tag v<version> --mode main \
-    --head-sha <merged-main-commit>
+    --head-sha <merged-main-commit> --expected-tag-delay-days <days>
 ```
 
 Manual fallback: run the

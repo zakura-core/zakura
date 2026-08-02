@@ -47,8 +47,8 @@ canary soak, announcement) apply on top of this checklist.
 Hotfixes are `patch` releases of the `zakura` package, plus semver bumps for
 each changed crate — follow the "Update Versions" sections of the
 [regular checklist](https://github.com/zakura-core/zakura/blob/main/.github/PULL_REQUEST_TEMPLATE/release-checklist.md)
-for the commands, using the branch checkout (release.toml allows
-`hotfix/v*`).
+for the commands, using the branch checkout (`[workspace.metadata.release]`
+allows `hotfix/v*`).
 
 - [ ] Bump the `zakura` package version and changed-crate versions.
 - [ ] De-rc'ing an rc line to its stable version? Re-run `cargo

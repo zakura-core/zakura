@@ -29,8 +29,6 @@ keywords = ["zakura", "zcash"]
 rust-version = "1.91"
 edition = "2021"
 
-# `cargo release` settings
-
 [workspace.dependencies]
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 orchard = "0.15.4"
@@ -178,10 +176,36 @@ zcash_script = "0.4.5"
 config = { version = "0.15.14", default-features = false, features = ["toml"] }
 which = "8.0.0"
 
+# All cargo-release configuration lives in this table. Do not add a root
+# release.toml: it would silently shadow every setting here (cargo-release
+# reads a workspace release.toml in preference to this metadata table).
 [workspace.metadata.release]
 
-# We always do releases from the main branch
-allow-branch = ["main"]
+# Only allow releases from the main branch or a hotfix release branch
+# (see docs/security-hotfix-release.md)
+allow-branch = ["main", "hotfix/v*"]
+
+# Workspace crate versions are deliberately independent: a crate is bumped and
+# published only when it has changes to publish. Do not configure
+# `shared-version` groups.
+
+# Verify releases with release features
+#
+# TODO: add this feature to all crates
+#enable-features = ["default-release-binaries"]
+
+# Don't do a git push or tag: `v*` tags are created only by the release App
+# via the `Create release` workflow (see docs/release-tag-protection.md)
+push = false
+tag = false
+
+# Owners for new crates
+owners = ["valardragon", "p0mvn", "evan-forbes", "czarcas7ic", "ebfull"]
+
+# Only rewrite dependent version requirements when the existing requirement
+# no longer matches: unchanged crates must stay untouched (and unpublished)
+# when a dependency takes a compatible bump.
+dependent-version = "fix"
 
 # Compilation settings
 

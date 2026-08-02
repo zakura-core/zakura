@@ -364,7 +364,8 @@ From a fresh checkout of the new tag, per the standard checklist: `cargo
 login`, then the publish loop in dependency order (`zakura-test … zakura`),
 edited to the crates that changed. Hotfix notes: crates.io is **public and
 irreversible from the first crate** — it's part of T-0, never earlier;
-`release.toml` allows publishing from `hotfix/v*` checkouts; a mid-loop
+`[workspace.metadata.release]` in the root `Cargo.toml` allows publishing
+from `hotfix/v*` checkouts; a mid-loop
 failure is fixed forward by publishing the remainder, not by yanking.
 
 ### Pre-announcement

@@ -721,7 +721,8 @@ fi
 # --- Phase B: apply ---------------------------------------------------------
 
 # --allow-branch '*' because CI runs on a detached HEAD (and local prep may
-# run on a scratch branch); release.toml's dependent-version = "fix" rewrites
+# run on a scratch branch); the workspace's dependent-version = "fix" release
+# setting rewrites
 # workspace-internal requirements alongside each cargo-release bump.
 if [ "${#plan_names[@]}" -gt 0 ]; then
   for i in "${!plan_names[@]}"; do
@@ -764,7 +765,7 @@ fi
 assert_version zakura "$version"
 echo "All applied versions match the plan."
 
-# Requirement rewrites (release.toml's dependent-version = "fix") must stay
+# Requirement rewrites (the workspace's dependent-version = "fix") must stay
 # inside the bump plan: a published crate whose manifest is rewritten but
 # not republished leaves the published graph unresolvable, because
 # dependents resolve the unmodified index copy. The cascade planning above

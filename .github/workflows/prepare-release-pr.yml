@@ -266,7 +266,9 @@ jobs:
           while IFS= read -r package; do
             [ -n "$package" ] || continue
             echo "::group::cargo public-api diff latest -p ${package}"
-            cargo public-api diff latest -p "$package" -sss
+            # Public API evidence must build both current and previously
+            # published crates; nightly-only warnings are not a lint gate.
+            RUSTFLAGS='' cargo public-api diff latest -p "$package" -sss
             echo "::endgroup::"
           done <<<"$packages"
 

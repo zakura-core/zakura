@@ -135,7 +135,7 @@ connect=127.0.0.1:8233
 listen=0
 ```
 
-`make compat-zcashd-start-standalone` (see `make/zcashd-compat.mk`) wraps
+`make compat-zcashd-start-standalone` (see `scripts/make/zcashd-compat.mk`) wraps
 this command, and `make compat-zakurad-start-unsupervised` starts the
 matching front node.
 

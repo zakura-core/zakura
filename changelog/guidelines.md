@@ -6,11 +6,11 @@ How and when to update the changelogs in this repository.
 
 | File | Records | Audience |
 | --- | --- | --- |
-| `docs/changelog/unreleased/<PR>.md` | Unreleased root entries owned by one PR | Reviewers and release tooling |
+| `changelog/unreleased/<PR>.md` | Unreleased root entries owned by one PR | Reviewers and release tooling |
 | `CHANGELOG.md` (root) | User-visible `zakurad` changes | Node operators |
-| `docs/changelog/params.md` | Parameter re-tunings (constants, defaults, timeouts, limits) | Reviewers and operators |
+| `changelog/params.md` | Parameter re-tunings (constants, defaults, timeouts, limits) | Reviewers and operators |
 
-`docs/changelog/params.md` is a compact ledger that complements the prose
+`changelog/params.md` is a compact ledger that complements the prose
 changelogs; it stays maintained at all times, including through the pre-1.0.0
 freeze described below.
 
@@ -37,7 +37,7 @@ After v1.0.0, normal changelog maintenance (everything below) resumes.
 
 PRs that change a Rust source file or any `Cargo.toml` do not edit the shared
 root changelog. After opening a draft PR, add exactly one
-`docs/changelog/unreleased/<PR-number>.md` file. Keeping each PR in its own file
+`changelog/unreleased/<PR-number>.md` file. Keeping each PR in its own file
 avoids merge conflicts while preserving the link between the change, its
 review, and its release note. Other PRs do not need a fragment.
 
@@ -66,7 +66,7 @@ replace the explicit fragment for Rust or `Cargo.toml` PRs.
 Run `./scripts/changelog.py check` locally. CI validates the syntax and checks
 that the fragment filename matches the PR number. The concise format reference
 is in
-[`docs/changelog/unreleased/README.md`](unreleased/README.md).
+[`changelog/unreleased/README.md`](unreleased/README.md).
 
 ## Root `CHANGELOG.md`
 
@@ -83,7 +83,7 @@ is in
   `- Fixed X so that Y ([#123](https://github.com/zakura-core/zakura/pull/123))`.
 - Label PRs accurately (`C-feature`, `C-bug`, `C-security`, …) so repository
   triage agrees with the fragment category.
-- A change to a tunable parameter gets a row in `docs/changelog/params.md` _in
+- A change to a tunable parameter gets a row in `changelog/params.md` _in
   addition to_ a changelog entry when it is user-visible.
 
 ## Library crates

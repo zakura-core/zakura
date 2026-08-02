@@ -4,7 +4,7 @@ This directory stores the artifacts the project uses to record and track
 changes between and across releases. It exists for development, review, and
 release tooling — it is not user documentation. Node operators looking for
 what changed in a release should read the root
-[`CHANGELOG.md`](../../CHANGELOG.md).
+[`CHANGELOG.md`](../CHANGELOG.md).
 
 Contents:
 

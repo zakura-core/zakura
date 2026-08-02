@@ -116,7 +116,7 @@ In `zakura-core/zakura`:
   `adam/update-release-state` PR.
 - `.github/workflows/tests-unit.yml` includes the checkpoint, frontier, and
   provenance paths, so generated update PRs run Unit Tests.
-- `.github/workflows/create-release.yml` and `make/release.mk` validate only
+- `.github/workflows/create-release.yml` and `scripts/make/release.mk` validate only
   committed release state before creating a tag.
 - `scripts/check-release-state.sh` is the non-Cargo release gate and rejects
   bootstrap provenance unless the documented emergency override is explicit.

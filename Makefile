@@ -1,10 +1,10 @@
 .PHONY: help
 
-include make/zcashd-compat.mk
-include make/perf.mk
-include make/zakura-dev.mk
-include make/release.mk
-include make/install.mk
+include scripts/make/zcashd-compat.mk
+include scripts/make/perf.mk
+include scripts/make/zakura-dev.mk
+include scripts/make/release.mk
+include scripts/make/install.mk
 
 help:
 	@echo "Available targets:"

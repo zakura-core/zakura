@@ -28,15 +28,15 @@ class ChangelogTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
-        (self.root / "docs" / "changelog" / "unreleased").mkdir(parents=True)
-        (self.root / "docs" / "changelog" / "unreleased" / "README.md").write_text("# Fragments\n")
+        (self.root / "changelog" / "unreleased").mkdir(parents=True)
+        (self.root / "changelog" / "unreleased" / "README.md").write_text("# Fragments\n")
         (self.root / "CHANGELOG.md").write_text(CHANGELOG.format(version="1.0.0"))
 
     def tearDown(self):
         self.temporary_directory.cleanup()
 
     def test_parses_multi_category_fragment(self):
-        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
+        path = self.root / "changelog" / "unreleased" / "123.md"
         path.write_text(
             "## Fixed\n\n- Fixed a bug.\n\n## Added\n\n- Added a feature.\n"
         )
@@ -47,14 +47,14 @@ class ChangelogTests(unittest.TestCase):
         self.assertEqual(fragment.entries["Added"], "- Added a feature.")
 
     def test_requires_reason_for_no_changelog_fragment(self):
-        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
+        path = self.root / "changelog" / "unreleased" / "123.md"
         path.write_text("<!-- changelog: none -->\n<!-- not a reason -->\n")
 
         with self.assertRaisesRegex(changelog.ChangelogError, "explain why"):
             changelog.load_fragments(self.root)
 
     def test_accepts_no_changelog_fragment_with_reason(self):
-        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
+        path = self.root / "changelog" / "unreleased" / "123.md"
         path.write_text("<!-- changelog: none -->\n\nThis PR only changes tests.\n")
 
         fragment = changelog.load_fragments(self.root)[0]
@@ -62,26 +62,26 @@ class ChangelogTests(unittest.TestCase):
         self.assertEqual(fragment.entries, {})
 
     def test_rejects_fragment_without_pull_request_number(self):
-        path = self.root / "docs" / "changelog" / "unreleased" / "my-change.md"
+        path = self.root / "changelog" / "unreleased" / "my-change.md"
         path.write_text("## Fixed\n\n- Fixed a bug.\n")
 
         with self.assertRaisesRegex(changelog.ChangelogError, "pull request number"):
             changelog.load_fragments(self.root)
 
     def test_rejects_nested_fragment_directory(self):
-        (self.root / "docs" / "changelog" / "unreleased" / "123").mkdir()
+        (self.root / "changelog" / "unreleased" / "123").mkdir()
 
         with self.assertRaisesRegex(changelog.ChangelogError, "Markdown files"):
             changelog.load_fragments(self.root)
 
     def test_pull_request_owns_its_numbered_fragment(self):
-        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
+        path = self.root / "changelog" / "unreleased" / "123.md"
         path.write_text("<!-- changelog: none -->\n\nThis PR only changes tests.\n")
 
         with mock.patch.object(
             changelog,
             "run_git",
-            return_value="A\tdocs/changelog/unreleased/123.md\n",
+            return_value="A\tchangelog/unreleased/123.md\n",
         ) as run_git:
             changelog.check_pull_request(self.root, "base", "head", "123", False, False)
 
@@ -91,14 +91,14 @@ class ChangelogTests(unittest.TestCase):
         )
 
     def test_pull_request_cannot_delete_another_fragment(self):
-        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
+        path = self.root / "changelog" / "unreleased" / "123.md"
         path.write_text("<!-- changelog: none -->\n\nThis PR only changes tests.\n")
 
         with mock.patch.object(
             changelog,
             "run_git",
             return_value=(
-                "A\tdocs/changelog/unreleased/123.md\nD\tdocs/changelog/unreleased/122.md\n"
+                "A\tchangelog/unreleased/123.md\nD\tchangelog/unreleased/122.md\n"
             ),
         ):
             with self.assertRaisesRegex(changelog.ChangelogError, "unexpected"):
@@ -111,8 +111,8 @@ class ChangelogTests(unittest.TestCase):
             changelog,
             "run_git",
             return_value=(
-                "R100\told-fragments/122.md\tdocs/changelog/unreleased/122.md\n"
-                "R100\told-fragments/README.md\tdocs/changelog/unreleased/README.md\n"
+                "R100\told-fragments/122.md\tchangelog/unreleased/122.md\n"
+                "R100\told-fragments/README.md\tchangelog/unreleased/README.md\n"
             ),
         ):
             changelog.check_pull_request(self.root, "base", "head", "123", False, False)
@@ -161,7 +161,7 @@ class ChangelogTests(unittest.TestCase):
             )
 
     def test_release_versions_root_changelog_and_consumes_fragments(self):
-        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
+        path = self.root / "changelog" / "unreleased" / "123.md"
         path.write_text(
             "## Fixed\n\n- Fixed a bug.\n\n## Added\n\n- Added a feature.\n"
         )
@@ -235,7 +235,7 @@ class ChangelogTests(unittest.TestCase):
         remote_check.assert_not_called()
 
     def test_stable_release_combines_and_removes_release_candidates(self):
-        first = self.root / "docs" / "changelog" / "unreleased" / "101.md"
+        first = self.root / "changelog" / "unreleased" / "101.md"
         first.write_text("## Added\n\n- Added the first feature.\n")
 
         writes, removals = changelog.release_plan(self.root, "v1.1.0-rc1", "2026-07-21")
@@ -244,7 +244,7 @@ class ChangelogTests(unittest.TestCase):
         for target in removals:
             target.unlink()
 
-        second = self.root / "docs" / "changelog" / "unreleased" / "102.md"
+        second = self.root / "changelog" / "unreleased" / "102.md"
         second.write_text("## Added\n\n- Added the second feature.\n")
 
         writes, removals = changelog.release_plan(self.root, "v1.1.0-rc2", "2026-07-22")

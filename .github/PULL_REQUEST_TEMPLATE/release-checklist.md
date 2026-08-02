@@ -39,13 +39,13 @@ These steps can be done a few days before the release, in the same PR:
 ## Change Log
 
 Changelog policy lives in
-[`docs/changelog/guidelines.md`](https://github.com/zakura-core/zakura/blob/main/docs/changelog/guidelines.md) —
+[`changelog/guidelines.md`](https://github.com/zakura-core/zakura/blob/main/changelog/guidelines.md) —
 follow it if it and these steps ever disagree. In particular, `v1.0.0` and its
 release candidates take a single "Initial release" entry (already in place)
 and **skip** the fragment-assembly steps below; they apply to releases after
 `v1.0.0`.
 
-Unreleased notes live in one `docs/changelog/unreleased/<PR-number>.md` fragment per
+Unreleased notes live in one `changelog/unreleased/<PR-number>.md` fragment per
 PR. To prepare them for assembly:
 
 - [ ] Run `./scripts/changelog.py check`.
@@ -222,9 +222,9 @@ cargo release replace --verbose --execute --allow-branch '*' -p zakura
 make prepare-release-changelog RELEASE_TAG=v<version>
 ```
 
-- [ ] Confirm the `make/release.mk` target consumed every numbered
-      `docs/changelog/unreleased/<PR-number>.md` file, including no-changelog
-      fragments. Keep `docs/changelog/unreleased/README.md`; it documents the
+- [ ] Confirm the `scripts/make/release.mk` target consumed every numbered
+      `changelog/unreleased/<PR-number>.md` file, including no-changelog
+      fragments. Keep `changelog/unreleased/README.md`; it documents the
       fragment format.
 - [ ] Review the generated root changelog.
 - [ ] For a stable release, confirm the generated section combines and replaces

@@ -7,7 +7,7 @@ ZAKURA_DEV_HOME ?= $(HOME)/.local/zakura-dev
 ZAKURA_DEV_CACHE ?= $(ZAKURA_DEV_HOME)/cache
 ZAKURA_DEV_IDENTITY ?= $(ZAKURA_DEV_HOME)/identity
 ZAKURA_DEV_CONFIG ?= $(ZAKURA_DEV_HOME)/zakura.toml
-ZAKURA_DEV_CONFIG_TEMPLATE ?= $(CURDIR)/make/zakura-dev.toml
+ZAKURA_DEV_CONFIG_TEMPLATE ?= $(CURDIR)/scripts/make/zakura-dev.toml
 
 ZAKURA_DEV_ZAKURAD_BIN ?= $(CURDIR)/target/release/zakurad
 ifneq ($(filter command line environment override,$(origin ZAKURAD_BIN)),)

@@ -286,6 +286,51 @@ fn full_context_at_averaging_window_height_uses_pow_limit_threshold() {
     assert_eq!(expected, difficulty);
 }
 
+#[test]
+fn regtest_pins_difficulty_to_pow_limit_instead_of_retargeting() {
+    let _init_guard = zakura_test::init();
+
+    let network = Network::new_regtest(Default::default());
+    let pow_limit = network.target_difficulty_limit().to_compact();
+
+    // Past the averaging window, so `threshold_bits` runs a full retarget instead of
+    // returning the powLimit for an early-chain height.
+    let previous_block_height = block::Height(
+        u32::try_from(difficulty::POW_ADJUSTMENT_BLOCK_SPAN)
+            .expect("adjustment block span fits in u32"),
+    );
+    let candidate_height = previous_block_height
+        .next()
+        .expect("test candidate height is valid");
+    let candidate_time = DateTime::from_timestamp(10_000, 0).expect("test timestamp is in-range");
+    let target_spacing = NetworkUpgrade::target_spacing_for_height(&network, candidate_height);
+
+    // Regtest blocks are mined far faster than the target spacing, so the averaging
+    // window's actual timespan is well below the target and retargeting would raise
+    // the difficulty above the powLimit.
+    let actual_spacing = target_spacing / 4;
+    let context: Vec<_> = (0..difficulty::POW_ADJUSTMENT_BLOCK_SPAN)
+        .map(|offset| {
+            let offset = i32::try_from(offset + 1).expect("test offset fits in i32");
+            (pow_limit, candidate_time - actual_spacing * offset)
+        })
+        .collect();
+
+    let expected = difficulty::AdjustedDifficulty::new_from_header_time(
+        candidate_time,
+        previous_block_height,
+        &network,
+        context,
+    )
+    .expected_difficulty_threshold();
+
+    assert_eq!(
+        expected, pow_limit,
+        "Regtest must stay at the powLimit like zcashd's `fPowNoRetargeting`, \
+         so a following zcashd sidecar does not reject the headers as bad-diffbits"
+    );
+}
+
 fn daa_context(
     network: &Network,
     previous_block_height: block::Height,

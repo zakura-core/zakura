@@ -109,7 +109,7 @@ fn run_zakura_regtest_e2e(mode: Option<&str>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let script =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docker/zakura-regtest-e2e/run.sh");
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docker/zakura-regtest-e2e/run.sh");
 
     let mut command = Command::new("bash");
     command.arg(&script);

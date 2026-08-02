@@ -23,9 +23,9 @@ import struct
 import sys
 from datetime import datetime, timedelta, timezone
 
-CHECKPOINTS = "zakura-chain/src/parameters/checkpoint/main-checkpoints.txt"
-FRONTIER = "zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin"
-PROVENANCE = "zakura-state/src/service/finalized_state/vct/mainnet-frontier.json"
+CHECKPOINTS = "crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt"
+FRONTIER = "crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin"
+PROVENANCE = "crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json"
 REQUIRED_KEYS = {
     "schema_version",
     "network",
@@ -40,7 +40,7 @@ REQUIRED_KEYS = {
 OPTIONAL_KEYS = {"meta_sha256"}
 STALE_WARNING = timedelta(days=14)
 # NetworkUpgrade::Nu6_3 (Ironwood) activation on Mainnet; kept in sync with
-# zakura-chain/src/parameters/constants.rs. Frontiers at or above activation
+# crates/zakura-chain/src/parameters/constants.rs. Frontiers at or above activation
 # must carry the fourth (Ironwood) tree blob, because the node parser defaults
 # a missing fourth blob to the empty tree.
 IRONWOOD_ACTIVATION_HEIGHT = 3_428_143

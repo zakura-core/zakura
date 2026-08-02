@@ -157,7 +157,7 @@ $RECYCLE.BIN/
 __pycache__/
 
 # RPC tests cache
-zakura-rpc/qa/cache/
+crates/zakura-rpc/qa/cache/
 
 # Lychee link checker cache
 .lycheecache
@@ -168,8 +168,8 @@ zakura-rpc/qa/cache/
 local_data/**
 
 # fuzzing artifacts
-zakura-chain/fuzz/artifacts
-zakura-chain/fuzz/corpus
+crates/zakura-chain/fuzz/artifacts
+crates/zakura-chain/fuzz/corpus
 stako/**/*
 perf-artifacts/**/*
 

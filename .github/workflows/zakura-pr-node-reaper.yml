@@ -107,7 +107,7 @@ jobs:
               echo "deleting image $name (id $id)"
               doctl compute image delete "$id" -f || true
             done
-          MAINNET_C=$(tail -1 zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
+          MAINNET_C=$(tail -1 crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
           [[ "$MAINNET_C" =~ ^[0-9]+$ ]] || {
             echo "could not determine the current Mainnet handoff height" >&2
             exit 1

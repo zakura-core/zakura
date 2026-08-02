@@ -61,10 +61,10 @@ jobs:
         env:
           BUNDLE: ${{ runner.temp }}/release-state-bundle
           RESOLUTION: ${{ runner.temp }}/release-state-resolution.json
-          CHECKPOINTS: zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
-          FRONTIER: zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-          PROVENANCE: zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
-          EOS_FILE: zakurad/src/components/sync/end_of_support.rs
+          CHECKPOINTS: crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+          FRONTIER: crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
+          PROVENANCE: crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+          EOS_FILE: crates/zakurad/src/components/sync/end_of_support.rs
         run: |
           set -euo pipefail
 
@@ -138,7 +138,7 @@ jobs:
         run: |
           set -euo pipefail
           .github/scripts/validate-checkpoints.sh \
-            zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+            crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
           ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=0 scripts/check-release-state.sh
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
@@ -166,10 +166,10 @@ jobs:
             git ls-files --others --exclude-standard
           } | sort -u > "$RUNNER_TEMP/actual-files"
           sort > "$RUNNER_TEMP/allowed-files" <<'EOF'
-          zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
-          zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-          zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
-          zakurad/src/components/sync/end_of_support.rs
+          crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+          crates/zakurad/src/components/sync/end_of_support.rs
           EOF
           UNEXPECTED=$(comm -23 "$RUNNER_TEMP/actual-files" "$RUNNER_TEMP/allowed-files")
           if [ -n "$UNEXPECTED" ]; then
@@ -180,7 +180,7 @@ jobs:
 
           # The checkpoint diff must be append-only.
           REMOVED=$(git diff --numstat HEAD -- \
-            zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -f2)
+            crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -f2)
           if [ "${REMOVED:-0}" != "0" ]; then
             echo "Checkpoint update removed ${REMOVED} committed lines; refusing." >&2
             exit 1

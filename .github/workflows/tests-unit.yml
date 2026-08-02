@@ -8,9 +8,9 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
-      - zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
-      - zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-      - zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+      - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
+      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
       - .config/nextest.toml
       - .github/workflows/tests-unit.yml
 
@@ -20,9 +20,9 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
-      - zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
-      - zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-      - zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+      - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
+      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
       - .config/nextest.toml
       - .github/workflows/tests-unit.yml
 
@@ -117,18 +117,18 @@ jobs:
           while IFS= read -r path; do
             case "$path" in
               Cargo.toml | Cargo.lock | rust-toolchain.toml | \
-              zakurad/Cargo.toml | zakura-chain/Cargo.toml | \
-              zakura-consensus/Cargo.toml | zakura-network/Cargo.toml | \
-              zakura-rpc/Cargo.toml | zakura-state/Cargo.toml | \
+              crates/zakurad/Cargo.toml | crates/zakura-chain/Cargo.toml | \
+              crates/zakura-consensus/Cargo.toml | crates/zakura-network/Cargo.toml | \
+              crates/zakura-rpc/Cargo.toml | crates/zakura-state/Cargo.toml | \
               */build.rs | \
-              zakurad/src/* | \
-              zakura-chain/src/parameters/* | \
-              zakura-consensus/src/config.rs | \
-              zakura-network/src/config.rs | zakura-network/src/config/* | \
-              zakura-network/src/zakura/handler.rs | \
-              zakura-rpc/src/config.rs | zakura-rpc/src/config/* | \
-              zakura-state/src/config.rs | \
-              zakurad/tests/acceptance.rs | zakurad/tests/common/* | \
+              crates/zakurad/src/* | \
+              crates/zakura-chain/src/parameters/* | \
+              crates/zakura-consensus/src/config.rs | \
+              crates/zakura-network/src/config.rs | crates/zakura-network/src/config/* | \
+              crates/zakura-network/src/zakura/handler.rs | \
+              crates/zakura-rpc/src/config.rs | crates/zakura-rpc/src/config/* | \
+              crates/zakura-state/src/config.rs | \
+              crates/zakurad/tests/acceptance.rs | crates/zakurad/tests/common/* | \
               .config/nextest.toml | \
               .github/actions/setup-zakura-build/* | \
               .github/workflows/tests-unit.yml)

@@ -178,7 +178,7 @@ fetch_state "$SANDBLAST_URL" "$SANDBLAST_SHA256" "$MAINNET_MNT/sandblast" mainne
 # Mainnet VCT approach state. Existing pruned snapshots cannot be rolled back
 # reliably because pruning removes transaction data rollback-state needs.
 # Build the rare handoff fixture forward from the retained archive instead.
-MAX_CKPT=$(tail -1 zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
+MAX_CKPT=$(tail -1 crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
 [[ "$MAX_CKPT" =~ ^[0-9]+$ ]] || {
   echo "could not determine Mainnet max checkpoint" >&2
   exit 1

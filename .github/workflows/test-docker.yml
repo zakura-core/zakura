@@ -5,12 +5,12 @@ on:
     branches: [main, "feat/**", "release/**"]
     types: [opened, synchronize, reopened]
     paths:
-      - "zakurad/src/**"
-      - "zakura-network/src/config.rs"
-      - "zakura-network/src/config/**"
-      - "zakura-rpc/src/config.rs"
-      - "zakura-rpc/src/config/**"
-      - "zakura-state/src/config.rs"
+      - "crates/zakurad/src/**"
+      - "crates/zakura-network/src/config.rs"
+      - "crates/zakura-network/src/config/**"
+      - "crates/zakura-rpc/src/config.rs"
+      - "crates/zakura-rpc/src/config/**"
+      - "crates/zakura-state/src/config.rs"
       - "**/build.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
@@ -18,7 +18,7 @@ on:
       - docker/Dockerfile
       - docker/entrypoint.sh
       - docker/**/*.toml
-      - zakurad/tests/common/configs/**
+      - crates/zakurad/tests/common/configs/**
       - .github/workflows/release-binaries.yml
       - .github/workflows/test-docker.yml
 
@@ -31,12 +31,12 @@ on:
   push:
     branches: [main, "feat/**", "release/**"]
     paths:
-      - "zakurad/src/**"
-      - "zakura-network/src/config.rs"
-      - "zakura-network/src/config/**"
-      - "zakura-rpc/src/config.rs"
-      - "zakura-rpc/src/config/**"
-      - "zakura-state/src/config.rs"
+      - "crates/zakurad/src/**"
+      - "crates/zakura-network/src/config.rs"
+      - "crates/zakura-network/src/config/**"
+      - "crates/zakura-rpc/src/config.rs"
+      - "crates/zakura-rpc/src/config/**"
+      - "crates/zakura-state/src/config.rs"
       - "**/build.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
@@ -44,7 +44,7 @@ on:
       - docker/Dockerfile
       - docker/entrypoint.sh
       - docker/**/*.toml
-      - zakurad/tests/common/configs/**
+      - crates/zakurad/tests/common/configs/**
       - .github/workflows/release-binaries.yml
       - .github/workflows/test-docker.yml
 
@@ -165,7 +165,7 @@ jobs:
           docker run \
             --detach \
             --name "$container" \
-            --volume "$GITHUB_WORKSPACE/zakurad/tests/common/configs/custom-conf.toml:/tmp/custom-conf.toml:ro" \
+            --volume "$GITHUB_WORKSPACE/crates/zakurad/tests/common/configs/custom-conf.toml:/tmp/custom-conf.toml:ro" \
             --env CONFIG_FILE_PATH=/tmp/custom-conf.toml \
             --env ZAKURA_NETWORK__NETWORK=Testnet \
             --env ZAKURA_RPC__LISTEN_ADDR=127.0.0.1:28232 \

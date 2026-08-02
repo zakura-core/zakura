@@ -140,7 +140,10 @@ jobs:
           fi
           base_tag="$(git describe --tags --match 'v*' --abbrev=0 HEAD)"
           base_version="$(
-            git show "${base_tag}:zakurad/Cargo.toml" \
+            # Transition fallback: tags created before the crates/ move keep
+            # zakurad/Cargo.toml at the repo root; remove once a post-move tag exists.
+            { git show "${base_tag}:crates/zakurad/Cargo.toml" 2>/dev/null \
+              || git show "${base_tag}:zakurad/Cargo.toml"; } \
               | awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }'
           )"
           version_report=""
@@ -172,11 +175,11 @@ jobs:
           estimated_height="$(jq -r '.estimated_release_height' <<<"$report")"
           committed_height="$(
             jq -r '.finalized_height' \
-              zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+              crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
           )"
           configured_height="$(
             grep -oE 'ESTIMATED_RELEASE_HEIGHT: u32 = [0-9_]+' \
-              zakurad/src/components/sync/end_of_support.rs \
+              crates/zakurad/src/components/sync/end_of_support.rs \
               | grep -oE '[0-9_]+$' | tr -d '_'
           )"
           minimum_height=$((committed_height + 3456))

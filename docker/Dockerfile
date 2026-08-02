@@ -147,21 +147,21 @@ WORKDIR ${HOME}
 ARG CARGO_HOME
 ARG CARGO_TARGET_DIR
 
-RUN --mount=type=bind,source=tower-batch-control,target=tower-batch-control \
-    --mount=type=bind,source=tower-fallback,target=tower-fallback \
+RUN --mount=type=bind,source=crates/tower-batch-control,target=crates/tower-batch-control \
+    --mount=type=bind,source=crates/tower-fallback,target=crates/tower-fallback \
     --mount=type=bind,source=deploy/zakura-watchdog,target=deploy/zakura-watchdog \
-    --mount=type=bind,source=xtask,target=xtask \
-    --mount=type=bind,source=zakura-chain,target=zakura-chain \
-    --mount=type=bind,source=zakura-consensus,target=zakura-consensus \
-    --mount=type=bind,source=zakura-jsonl-trace,target=zakura-jsonl-trace \
-    --mount=type=bind,source=zakura-network,target=zakura-network \
-    --mount=type=bind,source=zakura-node-services,target=zakura-node-services \
-    --mount=type=bind,source=zakura-rpc,target=zakura-rpc \
-    --mount=type=bind,source=zakura-script,target=zakura-script \
-    --mount=type=bind,source=zakura-state,target=zakura-state \
-    --mount=type=bind,source=zakura-test,target=zakura-test \
-    --mount=type=bind,source=zakura-utils,target=zakura-utils \
-    --mount=type=bind,source=zakurad,target=zakurad \
+    --mount=type=bind,source=crates/xtask,target=crates/xtask \
+    --mount=type=bind,source=crates/zakura-chain,target=crates/zakura-chain \
+    --mount=type=bind,source=crates/zakura-consensus,target=crates/zakura-consensus \
+    --mount=type=bind,source=crates/zakura-jsonl-trace,target=crates/zakura-jsonl-trace \
+    --mount=type=bind,source=crates/zakura-network,target=crates/zakura-network \
+    --mount=type=bind,source=crates/zakura-node-services,target=crates/zakura-node-services \
+    --mount=type=bind,source=crates/zakura-rpc,target=crates/zakura-rpc \
+    --mount=type=bind,source=crates/zakura-script,target=crates/zakura-script \
+    --mount=type=bind,source=crates/zakura-state,target=crates/zakura-state \
+    --mount=type=bind,source=crates/zakura-test,target=crates/zakura-test \
+    --mount=type=bind,source=crates/zakura-utils,target=crates/zakura-utils \
+    --mount=type=bind,source=crates/zakurad,target=crates/zakurad \
     --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
     --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
     --mount=type=cache,target=${CARGO_TARGET_DIR} \

@@ -166,8 +166,8 @@ jobs:
           MAX_CKPT=""
           if [ "${MODE}" = "pre-checkpoint" ]; then
             case "${NETWORK}" in
-              mainnet) CKPT_PATH=zakura-chain/src/parameters/checkpoint/main-checkpoints.txt ;;
-              testnet) CKPT_PATH=zakura-chain/src/parameters/checkpoint/test-checkpoints.txt ;;
+              mainnet) CKPT_PATH=crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt ;;
+              testnet) CKPT_PATH=crates/zakura-chain/src/parameters/checkpoint/test-checkpoints.txt ;;
             esac
             MAX_CKPT=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${CKPT_PATH}?ref=${SHA}" \
               -H "Accept: application/vnd.github.raw" | tail -1 | cut -d' ' -f1)

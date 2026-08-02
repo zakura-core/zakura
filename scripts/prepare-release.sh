@@ -262,7 +262,10 @@ zakura_old="$(
 )"
 
 base_zakura_version="$(
-  git show "${base_tag}:zakurad/Cargo.toml" \
+  # Transition fallback: tags created before the crates/ move keep
+  # zakurad/Cargo.toml at the repo root; remove once a post-move tag exists.
+  { git show "${base_tag}:crates/zakurad/Cargo.toml" 2>/dev/null \
+    || git show "${base_tag}:zakurad/Cargo.toml"; } \
     | awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }'
 )"
 if [ -z "$base_zakura_version" ]; then
@@ -609,8 +612,8 @@ fi
 # The workflow projects the release height from a fresh, digest-verified
 # release-state bundle. Local callers retain the committed checkpoint plus
 # three days as a fail-safe floor.
-eos_file="zakurad/src/components/sync/end_of_support.rs"
-checkpoint_file="zakura-chain/src/parameters/checkpoint/main-checkpoints.txt"
+eos_file="crates/zakurad/src/components/sync/end_of_support.rs"
+checkpoint_file="crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt"
 committed_height="$(tail -1 "$checkpoint_file" | cut -d' ' -f1)"
 eos_floor=$((committed_height + 3456))
 if [ -n "$latest_release_state_height" ] \
@@ -701,7 +704,7 @@ write_summary() {
         latest_verified_height: $latest_release_state_height,
         waiver: $release_state_waiver
       },
-      fixture: ("zakurad/tests/common/configs/v" + $zakura_new + ".toml"),
+      fixture: ("crates/zakurad/tests/common/configs/v" + $zakura_new + ".toml"),
       readme_updated: $readme_updated,
       fragments_consumed: $fragments_consumed}' \
     > "$summary_json"
@@ -734,7 +737,7 @@ fi
 if [ "$zakura_old" != "$version" ]; then
   echo
   echo "==> Bumping zakura to ${version}"
-  set_crate_version zakura zakurad/Cargo.toml "$zakura_old" "$version"
+  set_crate_version zakura crates/zakurad/Cargo.toml "$zakura_old" "$version"
 else
   echo "zakura package is already at ${version}."
 fi
@@ -825,7 +828,7 @@ cargo metadata --format-version 1 --locked >/dev/null
 # fields such as cookie_dir.
 echo
 echo "==> Regenerating the stored config fixture"
-rm -f zakurad/tests/common/configs/v*.toml
+rm -f crates/zakurad/tests/common/configs/v*.toml
 cargo build --bin zakurad
 generated="$(./target/debug/zakurad generate)"
 default_cache_dir="$(printf '%s\n' "$generated" | awk -F'"' '/^cache_dir = "/ { print $2; exit }')"
@@ -837,11 +840,11 @@ fi
 printf '%s\n' "$generated" \
   | sed "s#${default_cache_dir}#cache_dir#g" \
   | sed "s#${default_identity_dir}#identity_dir#g" \
-  > "zakurad/tests/common/configs/v${version}.toml"
+  > "crates/zakurad/tests/common/configs/v${version}.toml"
 
 if [ -z "$suffix" ]; then
   # Stable releases move the README source-install example to the new tag via
-  # the committed pre-release-replacements rule in zakurad/Cargo.toml
+  # the committed pre-release-replacements rule in crates/zakurad/Cargo.toml
   # (cargo release version deliberately skips the replace step).
   echo
   echo "==> Updating the README install tag"

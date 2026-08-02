@@ -74,7 +74,7 @@ unset GH_CLONE_TOKEN GIT_AUTH
 # Preflight: baked state DB format vs the PR tree's format
 # ---------------------------------------------------------------------------- #
 
-CODE_VER=$(grep -oE 'DATABASE_FORMAT_VERSION: .* [0-9]+' zakura-state/src/constants.rs | grep -oE '[0-9]+' | tail -n1)
+CODE_VER=$(grep -oE 'DATABASE_FORMAT_VERSION: .* [0-9]+' crates/zakura-state/src/constants.rs | grep -oE '[0-9]+' | tail -n1)
 if [ "$MODE" != "genesis" ]; then
   DIR_VER=$(find "$STATE_CACHE_DIR/state" -mindepth 1 -maxdepth 1 -type d -name 'v*' 2>/dev/null | \
     sed 's#.*/v##' | sort -n | tail -1)

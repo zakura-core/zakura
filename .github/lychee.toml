@@ -48,7 +48,7 @@ exclude_path = [
     "node_modules",
     "target",
     ".git",
-    "zakura-rpc/qa/rpc-tests",
+    "crates/zakura-rpc/qa/rpc-tests",
     "supply-chain",
     # Contains intentionally unresolved ADR filename placeholders.
     "docs/decisions/template.md",

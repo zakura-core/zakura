@@ -4247,7 +4247,7 @@ async fn invalidate_and_reconsider_block() -> Result<()> {
 #[ignore]
 fn check_no_git_dependencies() {
     let cargo_lock_contents =
-        fs::read_to_string("../Cargo.lock").expect("should have Cargo.lock file in root dir");
+        fs::read_to_string("../../Cargo.lock").expect("should have Cargo.lock file in root dir");
 
     if cargo_lock_contents.contains(r#"source = "git+"#) {
         panic!("Cargo.lock includes git sources")

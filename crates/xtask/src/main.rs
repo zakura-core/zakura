@@ -106,7 +106,8 @@ fn repo_root() -> Result<PathBuf, BoxError> {
     let xtask_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let repo_root = xtask_dir
         .parent()
-        .ok_or("xtask crate should live directly under the workspace root")?;
+        .and_then(Path::parent)
+        .ok_or("xtask crate should live at crates/xtask under the workspace root")?;
 
     Ok(repo_root.to_path_buf())
 }

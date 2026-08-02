@@ -13,7 +13,7 @@ description = "Zakura, an independent, consensus-compatible implementation of a 
 license.workspace = true
 repository.workspace = true
 
-readme = "../README.md"
+readme = "../../README.md"
 homepage.workspace = true
 # crates.io is limited to 5 keywords and categories
 keywords.workspace = true
@@ -53,7 +53,7 @@ test = false
 # `cargo release` settings
 [package.metadata.release]
 pre-release-replacements = [
-  {file="../README.md", search="--tag [a-z0-9\\.-]+", replace="--tag v{{version}}"},
+  {file="../../README.md", search="--tag [a-z0-9\\.-]+", replace="--tag v{{version}}"},
 ]
 
 [package.metadata.docs.rs]

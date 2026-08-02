@@ -6,7 +6,7 @@ on:
     paths:
       - "**.md"
       - "book/**"
-      - ".lychee.toml"
+      - ".github/lychee.toml"
       - ".github/codespellrc"
       - ".trunk/configs/.markdownlint.yaml"
       - ".github/workflows/docs-check.yml"
@@ -14,7 +14,7 @@ on:
     paths:
       - "**.md"
       - "book/**"
-      - ".lychee.toml"
+      - ".github/lychee.toml"
       - ".github/codespellrc"
       - ".trunk/configs/.markdownlint.yaml"
       - ".github/workflows/docs-check.yml"
@@ -58,7 +58,7 @@ jobs:
             --no-progress
             --cache
             --max-cache-age 2d
-            --config .lychee.toml
+            --config .github/lychee.toml
             "**/*.md"
           fail: true
         env:

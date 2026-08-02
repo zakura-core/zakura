@@ -613,7 +613,7 @@ where
             tx
         });
         let nonces = Arc::new(futures::lock::Mutex::new(IndexSet::new()));
-        let user_agent = configured_user_agent(&config, self.user_agent.unwrap_or_default());
+        let user_agent = self.user_agent.unwrap_or_default();
         let our_services = configured_advertised_services(
             &config,
             self.our_services.unwrap_or_else(PeerServices::empty),
@@ -673,29 +673,6 @@ fn configured_advertised_services(config: &Config, mut services: PeerServices) -
     }
 
     services
-}
-
-/// Return the user-agent Zakura should advertise for this handshake.
-fn configured_user_agent(config: &Config, user_agent: String) -> String {
-    if !config.v2_p2p() {
-        return user_agent;
-    }
-
-    let zakura_token = format!("Zakura:{}", env!("CARGO_PKG_VERSION"));
-    let trimmed_user_agent = user_agent.trim_matches('/');
-
-    if trimmed_user_agent.is_empty() {
-        format!("/{zakura_token}/")
-    } else if trimmed_user_agent
-        .split('/')
-        .any(|token| token == zakura_token)
-    {
-        // The default user agent already carries the Zakura token, so
-        // prepending it again would advertise `/Zakura:x/Zakura:x/`.
-        format!("/{trimmed_user_agent}/")
-    } else {
-        format!("/{zakura_token}/{trimmed_user_agent}/")
-    }
 }
 
 /// Returns true when the legacy handshake should try to route this peer to Zakura P2P v2.

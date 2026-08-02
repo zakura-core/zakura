@@ -26,6 +26,9 @@ use zakura_chain::{block, chain_tip::NoChainTip};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 static TEST_ZAKURA_SECRET_KEY_COUNTER: AtomicUsize = AtomicUsize::new(1);
+const TEST_HANDSHAKE_USER_AGENT: &str = "/Zebra:handshake-test/";
+const TEST_LOCAL_USER_AGENT: &str = "/Zebra:local-test/";
+const TEST_REMOTE_USER_AGENT: &str = "/Zebra:remote-test/";
 
 impl<S, C> Handshake<S, C>
 where
@@ -96,9 +99,8 @@ async fn negotiate_test_pair(
     let local_services = configured_advertised_services(&local_config, PeerServices::NODE_NETWORK);
     let remote_services =
         configured_advertised_services(&remote_config, PeerServices::NODE_NETWORK);
-    let local_user_agent = configured_user_agent(&local_config, "/Zebra:local-test/".to_string());
-    let remote_user_agent =
-        configured_user_agent(&remote_config, "/Zebra:remote-test/".to_string());
+    let local_user_agent = TEST_LOCAL_USER_AGENT.to_string();
+    let remote_user_agent = TEST_REMOTE_USER_AGENT.to_string();
 
     let local_task = tokio::spawn(async move {
         negotiate_version(
@@ -150,7 +152,7 @@ fn test_handshake(
         .with_inbound_service(inbound_service)
         .with_address_book_updater(address_book_updater)
         .with_advertised_services(PeerServices::NODE_NETWORK)
-        .with_user_agent("/Zebra:handshake-test/".to_string())
+        .with_user_agent(TEST_HANDSHAKE_USER_AGENT.to_string())
         .with_zakura_handshake_connector(crate::zakura::ZakuraHandshakeConnector::for_test(
             calls, outcome,
         ))
@@ -171,7 +173,7 @@ fn test_handshake_without_zakura_connector(
         .with_inbound_service(inbound_service)
         .with_address_book_updater(address_book_updater)
         .with_advertised_services(PeerServices::NODE_NETWORK)
-        .with_user_agent("/Zebra:handshake-test/".to_string())
+        .with_user_agent(TEST_HANDSHAKE_USER_AGENT.to_string())
         .want_transactions(true)
         .finish()
         .unwrap()
@@ -190,7 +192,7 @@ fn test_handshake_with_connector(
         .with_inbound_service(inbound_service)
         .with_address_book_updater(address_book_updater)
         .with_advertised_services(PeerServices::NODE_NETWORK)
-        .with_user_agent("/Zebra:handshake-test/".to_string())
+        .with_user_agent(TEST_HANDSHAKE_USER_AGENT.to_string())
         .with_zakura_handshake_connector(connector)
         .want_transactions(true)
         .finish()
@@ -599,7 +601,7 @@ async fn initiator_upgrade_disconnects_on_malformed_prelude() {
 }
 
 #[tokio::test]
-async fn p2p_v2_service_bit_advertisement_follows_config() {
+async fn p2p_v2_service_bit_advertisement_preserves_user_agent() {
     let _init_guard = zakura_test::init();
 
     assert!(!configured_advertised_services(
@@ -620,6 +622,10 @@ async fn p2p_v2_service_bit_advertisement_follows_config() {
         .address_from
         .untrusted_services()
         .contains(PeerServices::NODE_P2P_V2));
+    assert_eq!(
+        disabled_peer_seen_by_enabled.remote.user_agent,
+        TEST_REMOTE_USER_AGENT
+    );
 
     assert!(enabled_peer_seen_by_disabled
         .remote
@@ -630,56 +636,25 @@ async fn p2p_v2_service_bit_advertisement_follows_config() {
         .address_from
         .untrusted_services()
         .contains(PeerServices::NODE_P2P_V2));
-    assert!(enabled_peer_seen_by_disabled
-        .remote
-        .user_agent
-        .starts_with("/Zakura:"));
-    assert!(enabled_peer_seen_by_disabled
-        .remote
-        .user_agent
-        .contains("/Zebra:local-test/"));
+    assert_eq!(
+        enabled_peer_seen_by_disabled.remote.user_agent,
+        TEST_LOCAL_USER_AGENT
+    );
 }
 
-/// The Zakura token is prepended for the v2 stack, but never doubled when the
-/// user agent (like zakurad's default) already carries it.
 #[test]
-fn configured_user_agent_deduplicates_zakura_token() {
+fn handshake_preserves_configured_user_agent_for_every_stack() {
     let _init_guard = zakura_test::init();
+    let (address_book_tx, _address_book_rx) = tokio::sync::mpsc::channel(8);
 
-    let zakura_token = format!("Zakura:{}", env!("CARGO_PKG_VERSION"));
-    let default_user_agent = format!("/{zakura_token}/");
+    for p2p_stack in [P2pStack::Legacy, P2pStack::Dual, P2pStack::Zakura] {
+        let handshake = test_handshake_without_zakura_connector(
+            test_config(p2p_stack),
+            address_book_tx.clone(),
+        );
 
-    // The legacy stack passes the configured user agent through unchanged.
-    assert_eq!(
-        configured_user_agent(&test_config(P2pStack::Legacy), default_user_agent.clone()),
-        default_user_agent,
-    );
-
-    // The v2 stack advertises the token on its own or before a foreign agent.
-    assert_eq!(
-        configured_user_agent(&test_config(P2pStack::Dual), String::new()),
-        default_user_agent,
-    );
-    assert_eq!(
-        configured_user_agent(
-            &test_config(P2pStack::Dual),
-            "/MagicBean:6.3.0/".to_string()
-        ),
-        format!("/{zakura_token}/MagicBean:6.3.0/"),
-    );
-
-    // A user agent that already carries the token is not doubled.
-    assert_eq!(
-        configured_user_agent(&test_config(P2pStack::Dual), default_user_agent.clone()),
-        default_user_agent,
-    );
-    assert_eq!(
-        configured_user_agent(
-            &test_config(P2pStack::Dual),
-            format!("/{zakura_token}/MagicBean:6.3.0/"),
-        ),
-        format!("/{zakura_token}/MagicBean:6.3.0/"),
-    );
+        assert_eq!(handshake.user_agent, TEST_HANDSHAKE_USER_AGENT);
+    }
 }
 
 #[test]

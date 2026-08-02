@@ -150,7 +150,7 @@ If you want to chat with us, use the GitHub issues for now.
 ## Security
 
 Zakura has a [responsible disclosure
-policy](https://github.com/zakura-core/zakura/blob/main/SECURITY.md), which
+policy](https://github.com/zakura-core/zakura/blob/main/docs/security.md), which
 we encourage security researchers to follow.
 
 ## License

@@ -3,7 +3,7 @@
 This document describes how we ship a release for a **significant security
 issue**: the fix is developed under embargo, and the public goes from "no
 information" to "signed, tagged GitHub release + crates.io release" in one
-coordinated event. It complements [`SECURITY.md`](../SECURITY.md) (how
+coordinated event. It complements [`security.md`](security.md) (how
 vulnerabilities are reported and disclosed), the
 [release checklist](../.github/PULL_REQUEST_TEMPLATE/release-checklist.md)
 (the standard runbook), and the
@@ -143,11 +143,11 @@ Actions minutes), caches differ, and attestation is skipped — see caveat 6.
 
 For each incident, open a **draft security advisory** on the public repo
 (visible only to maintainers and invitees). It is the reporter channel (per
-`SECURITY.md`, reports already arrive there), the CVE request vehicle, the
+`security.md`, reports already arrive there), the CVE request vehicle, the
 canonical description published at T-0 — and, solo, the **continuity record**:
 keep it current enough (state, branch name in the staging repo, planned T-0)
 that another maintainer could pick up the incident if you become unavailable.
-Detail level at publication is per-incident; `SECURITY.md` already reserves
+Detail level at publication is per-incident; `security.md` already reserves
 the right to withhold reproduction details for counterfeiting-class bugs.
 
 ## Developing the fix
@@ -288,7 +288,7 @@ are what made that survivable.
       wrong moment.
 - [ ] Optional [pre-announcement](#pre-announcement) published.
 - [ ] Main-base only: freeze the Mergify `batched` queue.
-- [ ] Partner/upstream notifications sent per `SECURITY.md`
+- [ ] Partner/upstream notifications sent per `security.md`
       (see [Coordination](#coordination-with-upstream-and-the-ecosystem)).
 - [ ] Block ~2 hours of uninterrupted time. Every step below is resumable
       (`Create release` reuses drafts and is safe to re-dispatch; the crates
@@ -374,7 +374,7 @@ security release will be published at \<date, time UTC\>** — nothing else — 
 operators are watching when it lands. Long-standing ecosystem practice (Zcash
 2018; Bitcoin Core CVE-2018-17144). Trade-off: it also tells attackers when to
 start diffing; net positive when operator reaction time dominates. If
-severity warrants partner notifications under `SECURITY.md`, it usually
+severity warrants partner notifications under `security.md`, it usually
 warrants a pre-announcement.
 
 ### Post-release
@@ -422,16 +422,16 @@ time-to-source when it matters.
 
 Zakura is a Zebra fork; incidents come in three shapes:
 
-- **Inherited from Zebra**: `SECURITY.md` obliges responsible disclosure with
+- **Inherited from Zebra**: `security.md` obliges responsible disclosure with
   the Zcash Foundation and ECC; T-0 is then chosen _jointly_ (expect the
   slower party to set it).
 - **Zebra ships a fix first**: the clock is already running — this process
   executes compressed (base decision, port, soak as severity allows, release;
   skip the pre-announcement — upstream's release was it).
 - **Zakura-only code** (e.g. the P2P v2 stack): we control timing; notify
-  upstream/partners per `SECURITY.md` where relevant.
+  upstream/partners per `security.md` where relevant.
 
-Partner notifications follow `SECURITY.md`'s RD-Crypto-Spec commitments,
+Partner notifications follow `security.md`'s RD-Crypto-Spec commitments,
 including the counterfeiting-bug deviation (partners may be told to upgrade
 without full detail).
 

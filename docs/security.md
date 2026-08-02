@@ -30,7 +30,7 @@ For significant vulnerabilities, the fix is developed and validated under
 embargo and shipped as a coordinated hotfix release; the process — private
 staging and rehearsal, canary soak, the release-day runbook, and how the
 advisory is published — is documented in
-[`docs/security-hotfix-release.md`](docs/security-hotfix-release.md).
+[`docs/security-hotfix-release.md`](security-hotfix-release.md).
 
 ## Sending Disclosures
 

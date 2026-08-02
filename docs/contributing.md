@@ -23,7 +23,7 @@ PRs are welcome. Please:
 2. **Keep PRs focused.** Prefer one logical change per PR and avoid unrelated refactors.
 3. **Test the change.** Run checks appropriate to the affected code. Explain how the tests exercise the root cause and verify the solution, rather than only listing commands.
 4. **Follow conventional commits.** PRs are squash-merged to `main`, so the PR title becomes the commit message. Follow the [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) standard.
-5. **Carry semver bumps with API changes.** The `Semver checks` CI job compares publishable crates against their latest stable crates.io releases; a PR that changes a published API must bump the affected crate's version in the same PR (see [`docs/changelog/guidelines.md`](docs/changelog/guidelines.md), "Library crates").
+5. **Carry semver bumps with API changes.** The `Semver checks` CI job compares publishable crates against their latest stable crates.io releases; a PR that changes a published API must bump the affected crate's version in the same PR (see [`docs/changelog/guidelines.md`](changelog/guidelines.md), "Library crates").
 
 Zakura is a validator node — it excludes features not strictly needed for block validation and chain sync. Features like wallets, block explorers, and mining pools belong in [Zaino](https://github.com/zingolabs/zaino), [Zallet](https://github.com/zcash/wallet), or [librustzcash](https://github.com/zcash/librustzcash).
 
@@ -34,7 +34,7 @@ Check out the [help wanted][hw] or [good first issue][gfi] labels if you're look
 
 ## Code Standards
 
-Zakura enforces code quality through review. For the full list of architecture rules, code patterns, testing requirements, and security considerations, see [`AGENTS.md`](AGENTS.md). The key points:
+Zakura enforces code quality through review. For the full list of architecture rules, code patterns, testing requirements, and security considerations, see [`AGENTS.md`](../AGENTS.md). The key points:
 
 - **Build requirements**: Run `cargo fmt` and the relevant `cargo clippy` and `cargo test` commands
 - **Architecture**: Dependencies flow downward only; `zakura-chain` is sync-only
@@ -44,4 +44,4 @@ Zakura enforces code quality through review. For the full list of architecture r
 - **Changelog**: After opening a draft PR, add one
   `docs/changelog/unreleased/<PR-number>.md` fragment. Internal-only PRs use an
   explicit no-changelog marker (see
-  [`docs/changelog/guidelines.md`](docs/changelog/guidelines.md)).
+  [`docs/changelog/guidelines.md`](changelog/guidelines.md)).

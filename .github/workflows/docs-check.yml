@@ -7,14 +7,14 @@ on:
       - "**.md"
       - ".github/lychee.toml"
       - ".github/codespellrc"
-      - ".trunk/configs/.markdownlint.yaml"
+      - ".github/.markdownlint.yaml"
       - ".github/workflows/docs-check.yml"
   pull_request:
     paths:
       - "**.md"
       - ".github/lychee.toml"
       - ".github/codespellrc"
-      - ".trunk/configs/.markdownlint.yaml"
+      - ".github/.markdownlint.yaml"
       - ".github/workflows/docs-check.yml"
 
 # Ensures that only one workflow task will run at a time. Previous builds, if
@@ -111,7 +111,7 @@ jobs:
             --ignore node_modules \
             --ignore target \
             --ignore .git \
-            --config .trunk/configs/.markdownlint.yaml
+            --config .github/.markdownlint.yaml
 
   docs-check-success:
     name: docs check success

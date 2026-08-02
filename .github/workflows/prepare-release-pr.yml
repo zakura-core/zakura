@@ -241,11 +241,6 @@ jobs:
         continue-on-error: true
         run: cargo fmt --all -- --check
 
-      # cargo-public-api builds rustdoc JSON with nightly even when the
-      # workspace itself is built and verified with stable.
-      - name: Install nightly for public API diffs
-        run: rustup toolchain install nightly --profile minimal
-
       - name: Record public API diffs
         id: verify-public-api
         continue-on-error: true
@@ -263,6 +258,11 @@ jobs:
             echo "No changed library crates are being published."
             exit 0
           fi
+          # cargo-public-api builds rustdoc JSON with nightly even when the
+          # workspace itself is built and verified with stable. Keep setup in
+          # this continue-on-error step so a toolchain outage is recorded in
+          # the generated draft PR instead of preventing PR creation.
+          rustup toolchain install nightly --profile minimal
           while IFS= read -r package; do
             [ -n "$package" ] || continue
             echo "::group::cargo public-api diff latest -p ${package}"

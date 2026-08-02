@@ -10,7 +10,7 @@ on:
       - clippy.toml
       - .cargo/config.toml
       - .github/workflows/lint.yml
-      - supply-chain/**
+      - qa/supply-chain/**
       - "scripts/**.sh"
       - ".github/workflows/scripts/**"
       - ".github/actions/**"
@@ -27,7 +27,7 @@ on:
       - clippy.toml
       - .cargo/config.toml
       - .github/workflows/lint.yml
-      - supply-chain/**
+      - qa/supply-chain/**
       - "scripts/**.sh"
       - ".github/workflows/scripts/**"
       - ".github/actions/**"
@@ -295,7 +295,7 @@ jobs:
 
       - name: Run cargo-vet check
         if: ${{ !cancelled() }}
-        run: cargo vet check
+        run: cargo vet check --store-path ./qa/supply-chain/
 
   lint-success:
     name: lint success

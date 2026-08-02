@@ -17,7 +17,7 @@ on:
       - '**/Cargo.lock'
       - .cargo/config.toml
       - '**/clippy.toml'
-      - supply-chain/**
+      - qa/supply-chain/**
       - .config/nextest.toml
       - .github/workflows/lint.yml
       - .github/workflows/tests-unit.yml

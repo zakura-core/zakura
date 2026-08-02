@@ -54,7 +54,7 @@ exclude_path = [
     "target",
     ".git",
     "crates/zakura-rpc/qa/rpc-tests",
-    "supply-chain",
+    "qa/supply-chain",
     # Contains intentionally unresolved ADR filename placeholders.
     "docs/decisions/template.md",
     # CHANGELOG contains historical references to deprecated URLs

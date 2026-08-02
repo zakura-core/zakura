@@ -7,7 +7,7 @@ on:
       - "**.md"
       - "book/**"
       - ".lychee.toml"
-      - ".codespellrc"
+      - ".github/codespellrc"
       - ".trunk/configs/.markdownlint.yaml"
       - ".github/workflows/docs-check.yml"
   pull_request:
@@ -15,7 +15,7 @@ on:
       - "**.md"
       - "book/**"
       - ".lychee.toml"
-      - ".codespellrc"
+      - ".github/codespellrc"
       - ".trunk/configs/.markdownlint.yaml"
       - ".github/workflows/docs-check.yml"
 
@@ -86,7 +86,7 @@ jobs:
         run: pip install codespell
 
       - name: Run codespell
-        run: codespell --config .codespellrc
+        run: codespell --config .github/codespellrc
 
   markdown-lint:
     name: markdown-lint

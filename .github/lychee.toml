@@ -38,6 +38,11 @@ exclude = [
     # Remove after the stable Zakura crates have been published to docs.rs.
     "^https://docs\\.rs/zakura(?:-[a-z0-9-]+)?/latest/",
 
+    # Remove after the crates/ directory move lands on main: these URLs only
+    # resolve once the move is merged (GitHub does not serve PR-branch paths
+    # under /main/).
+    "^https://github\\.com/zakura-core/zakura/(blob|tree)/main/crates/",
+
     # Dead upstream links in historical audit document (zebra-dependencies-for-audit.md)
     "^https://github.com/iqlusioninc/abscissa/tree/develop",
     "^https://github.com/servo/bincode/releases/tag/v1\\.3\\.3",

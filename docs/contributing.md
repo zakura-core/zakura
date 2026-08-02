@@ -8,7 +8,7 @@
 
 ## Running and Debugging
 
-See the [getting started guide](README.md#getting-started) for details on how to
+See the [getting started guide](../README.md#getting-started) for details on how to
 build and run Zakura.
 
 ## Bug Reports

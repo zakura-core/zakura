@@ -706,19 +706,19 @@ The implementation must share code with or remain differential-test equivalent t
 
 | Concern | Local source |
 | --- | --- |
-| Canonical header/version encoding and local future-time rule | `zakura-chain/src/block/serialize.rs`, `zakura-chain/src/block/header.rs` |
-| Height-dependent header commitment-field interpretation | `zakura-chain/src/block/header.rs` (`Header::commitment`), `zakura-chain/src/block/commitment.rs` (`Commitment::from_bytes`) |
-| Compact target, work formula, and integer ordering | `zakura-chain/src/work/difficulty.rs`; its target conversion remains authoritative, but the redesign replaces the existing `u128` `Work` and `PartialCumulativeWork` storage with the exact 256-bit representation required by LC-VAL-10 and LC-WORKCALC-01 |
-| Equihash and context-free PoW checks | `zakura-consensus/src/block/check.rs` |
-| Contextual 28-header difficulty, 11-header MTP, and MTP+90-minute rule | `zakura-state/src/service/check/difficulty.rs`, `zakura-state/src/service/check.rs` |
-| Full-state greatest-work/raw-tip-hash ordering | `zakura-state/src/service/non_finalized_state/chain.rs` (`impl Ord for Chain`) |
-| Local 1,000-block finality horizon | `zakura-chain/src/parameters/constants.rs`, `zakura-state/src/constants.rs` |
-| Shared non-finalized fork cap | `MAX_NON_FINALIZED_CHAIN_FORKS` (today `zakura-state/src/constants.rs`; the redesign MUST hoist one shared definition into `zakura-chain::parameters` consumed by both full state and the header engine) |
-| Checkpoint hashes and verification | `zakura-chain/src/parameters/checkpoint/`, `zakura-consensus/src/checkpoint.rs` |
-| Existing v7 framing/bounds/correlation | `zakura-network/src/zakura/header_sync/wire.rs`, `config.rs`, `validation.rs` |
-| Existing reactor, scheduling, coverage, and repair ownership | `zakura-network/src/zakura/header_sync/reactor.rs`, `state.rs`, `work_queue.rs`, `events.rs` |
-| Current provisional persistence/startup audit | `zakura-state/src/service/finalized_state/zakura_db/block.rs`, `.../block/tests/header_store_coherence/` |
-| ZIP 221/244 auxiliary authentication | `zakura-chain/src/parallel/commitment_aux.rs`, `commitment_aux_verify.rs`, `block/commitment.rs` |
+| Canonical header/version encoding and local future-time rule | `crates/zakura-chain/src/block/serialize.rs`, `crates/zakura-chain/src/block/header.rs` |
+| Height-dependent header commitment-field interpretation | `crates/zakura-chain/src/block/header.rs` (`Header::commitment`), `crates/zakura-chain/src/block/commitment.rs` (`Commitment::from_bytes`) |
+| Compact target, work formula, and integer ordering | `crates/zakura-chain/src/work/difficulty.rs`; its target conversion remains authoritative, but the redesign replaces the existing `u128` `Work` and `PartialCumulativeWork` storage with the exact 256-bit representation required by LC-VAL-10 and LC-WORKCALC-01 |
+| Equihash and context-free PoW checks | `crates/zakura-consensus/src/block/check.rs` |
+| Contextual 28-header difficulty, 11-header MTP, and MTP+90-minute rule | `crates/zakura-state/src/service/check/difficulty.rs`, `crates/zakura-state/src/service/check.rs` |
+| Full-state greatest-work/raw-tip-hash ordering | `crates/zakura-state/src/service/non_finalized_state/chain.rs` (`impl Ord for Chain`) |
+| Local 1,000-block finality horizon | `crates/zakura-chain/src/parameters/constants.rs`, `crates/zakura-state/src/constants.rs` |
+| Shared non-finalized fork cap | `MAX_NON_FINALIZED_CHAIN_FORKS` (today `crates/zakura-state/src/constants.rs`; the redesign MUST hoist one shared definition into `zakura-chain::parameters` consumed by both full state and the header engine) |
+| Checkpoint hashes and verification | `crates/zakura-chain/src/parameters/checkpoint/`, `crates/zakura-consensus/src/checkpoint.rs` |
+| Existing v7 framing/bounds/correlation | `crates/zakura-network/src/zakura/header_sync/wire.rs`, `config.rs`, `validation.rs` |
+| Existing reactor, scheduling, coverage, and repair ownership | `crates/zakura-network/src/zakura/header_sync/reactor.rs`, `state.rs`, `work_queue.rs`, `events.rs` |
+| Current provisional persistence/startup audit | `crates/zakura-state/src/service/finalized_state/zakura_db/block.rs`, `.../block/tests/header_store_coherence/` |
+| ZIP 221/244 auxiliary authentication | `crates/zakura-chain/src/parallel/commitment_aux.rs`, `commitment_aux_verify.rs`, `block/commitment.rs` |
 
 Non-normative provenance: the production failure evidence that motivated the audit scenarios (the latest-v2-fails root-cause and audit notes) lives outside this repository. No normative requirement depends on those files; sections 7.2–7.4 fully specify every behavior and race extracted from them.
 

@@ -194,7 +194,7 @@ T-0 involves zero authoring — only pushing and clicking. The branch carries:
      leaves stale `^X.Y.Z-rcN` requirements in place when the stable version
      still matches them (`make pre-release` fails on any left behind);
    - the stored config snapshot
-     (`zakurad/tests/common/configs/v<version>.toml` — `last_config_is_stored`
+     (`crates/zakurad/tests/common/configs/v<version>.toml` — `last_config_is_stored`
      fails without it);
    - the assembled changelog section. There is no public PR to hang a
      fragment on, so write the release section by hand, exactly as fragment

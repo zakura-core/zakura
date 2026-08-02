@@ -11,13 +11,13 @@
 
 ## Project Structure & Module Organization
 
-Zakura is a Rust workspace. Main crates include:
+Zakura is a Rust workspace; the member crates live under `crates/` (except `deploy/zakura-watchdog`). Main crates include:
 
-- `zakurad/` (node CLI/orchestration),
-- core libraries like `zakura-chain/`, `zakura-consensus/`, `zakura-network/`, `zakura-state/`, `zakura-rpc/`, `zakura-script/`,
-- support crates like `zakura-node-services/`, `zakura-test/`, `zakura-utils/`, `zakura-jsonl-trace/`, `tower-batch-control/`, `tower-fallback/`, and `xtask/`.
+- `crates/zakurad/` (node CLI/orchestration),
+- core libraries like `crates/zakura-chain/`, `crates/zakura-consensus/`, `crates/zakura-network/`, `crates/zakura-state/`, `crates/zakura-rpc/`, `crates/zakura-script/`,
+- support crates like `crates/zakura-node-services/`, `crates/zakura-test/`, `crates/zakura-utils/`, `crates/zakura-jsonl-trace/`, `crates/tower-batch-control/`, `crates/tower-fallback/`, and `crates/xtask/`.
 
-Code is primarily in each crate's `src/`; integration tests are in `*/tests/`; many unit/property tests are colocated in `src/**/tests/` (for example `prop.rs`, `vectors.rs`, `preallocate.rs`). Documentation is in `docs/`, crate READMEs, and `book/src/user/zcashd-compat.md`. CI and policy automation live in `.github/workflows/`.
+Code is primarily in each crate's `src/`; integration tests are in `crates/*/tests/`; many unit/property tests are colocated in `src/**/tests/` (for example `prop.rs`, `vectors.rs`, `preallocate.rs`). Documentation is in `docs/`, crate READMEs, and `book/src/user/zcashd-compat.md`. CI and policy automation live in `.github/workflows/`.
 
 ## Build, Test, and Development Commands
 
@@ -61,7 +61,7 @@ Zakura is a Zcash full node implementation in Rust. It is a validator node — i
 
 - **Rust edition**: 2021
 - **MSRV**: 1.91 (unified across the library crates and the zakurad binary)
-- **Database format version**: defined in `zakura-state/src/constants.rs`
+- **Database format version**: defined in `crates/zakura-state/src/constants.rs`
 
 ## Crate Architecture
 

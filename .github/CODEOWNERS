@@ -11,27 +11,27 @@
 # to stop GitHub assigning multiple reviewers
 #
 # lightwalletd epic
-# /zakurad/src/commands/start.rs           @ZcashFoundation/general-rust-reviewers
+# /crates/zakurad/src/commands/start.rs           @ZcashFoundation/general-rust-reviewers
 
 # Network and Async Code
-# /tower-batch-control/                   @ZcashFoundation/network-reviewers
-# /tower-fallback/                        @ZcashFoundation/network-reviewers
-# /zakura-network/                         @ZcashFoundation/network-reviewers
-# /zakura-node-services/                   @ZcashFoundation/network-reviewers
+# /crates/tower-batch-control/                   @ZcashFoundation/network-reviewers
+# /crates/tower-fallback/                        @ZcashFoundation/network-reviewers
+# /crates/zakura-network/                         @ZcashFoundation/network-reviewers
+# /crates/zakura-node-services/                   @ZcashFoundation/network-reviewers
 # /zakura-tests/src/mock_service.rs        @ZcashFoundation/network-reviewers
 # /zakura-tests/src/service_extensions.rs  @ZcashFoundation/network-reviewers
 # /zakura-tests/src/transcript.rs          @ZcashFoundation/network-reviewers
-# /zakurad/src/components/                 @ZcashFoundation/network-reviewers
+# /crates/zakurad/src/components/                 @ZcashFoundation/network-reviewers
 
 # Cryptographic Code
-# /zakura-consensus/src/primitives/        @ZcashFoundation/cryptographic-reviewers
-# /zakura-chain/src/primitives/            @ZcashFoundation/cryptographic-reviewers
-# /zakura-chain/src/orchard/               @ZcashFoundation/cryptographic-reviewers
-# /zakura-chain/src/sapling/               @ZcashFoundation/cryptographic-reviewers
-# /zakura-chain/src/sprout/                @ZcashFoundation/cryptographic-reviewers
-# /zakura-chain/src/transparent/           @ZcashFoundation/cryptographic-reviewers
-# /zakura-chain/src/history_tree.rs        @ZcashFoundation/cryptographic-reviewers
-# /zakura-chain/src/history_tree/          @ZcashFoundation/cryptographic-reviewers
+# /crates/zakura-consensus/src/primitives/        @ZcashFoundation/cryptographic-reviewers
+# /crates/zakura-chain/src/primitives/            @ZcashFoundation/cryptographic-reviewers
+# /crates/zakura-chain/src/orchard/               @ZcashFoundation/cryptographic-reviewers
+# /crates/zakura-chain/src/sapling/               @ZcashFoundation/cryptographic-reviewers
+# /crates/zakura-chain/src/sprout/                @ZcashFoundation/cryptographic-reviewers
+# /crates/zakura-chain/src/transparent/           @ZcashFoundation/cryptographic-reviewers
+# /crates/zakura-chain/src/history_tree.rs        @ZcashFoundation/cryptographic-reviewers
+# /crates/zakura-chain/src/history_tree/          @ZcashFoundation/cryptographic-reviewers
 
 # Devops Code
 # /.github/workflows/                     @ZcashFoundation/devops-reviewers
@@ -41,4 +41,4 @@
 # /.github/codecov.yml                    @ZcashFoundation/devops-reviewers
 
 # Unsafe Code
-# /zakura-script/                          @ZcashFoundation/unsafe-rust-reviewers
+# /crates/zakura-script/                          @ZcashFoundation/unsafe-rust-reviewers

@@ -1,6 +1,10 @@
 You are triaging merged upstream Zebra pull requests for the current fork
 checkout. Import only important production bug fixes.
 
+This fork renames upstream crates (`zebra-*` → `zakura-*`, `zebrad` → `zakurad`)
+and keeps them under `crates/`: upstream `zebra-state/src/…` corresponds to
+`crates/zakura-state/src/…` in this checkout.
+
 Read these files before acting:
 
 - `.github/upstream-sync/work/candidate.json`

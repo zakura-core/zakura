@@ -63,8 +63,8 @@ cargo install --locked --features zakura-checkpoints --git https://github.com/za
 You can update the checkpoints using these commands:
 
 ```sh
-zakura-checkpoints --last-checkpoint $(tail -1 zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d" " -f1) | tee --append zakura-chain/src/parameters/checkpoint/main-checkpoints.txt &
-zakura-checkpoints --last-checkpoint $(tail -1 zakura-chain/src/parameters/checkpoint/test-checkpoints.txt | cut -d" " -f1) -- -testnet | tee --append zakura-chain/src/parameters/checkpoint/test-checkpoints.txt &
+zakura-checkpoints --last-checkpoint $(tail -1 crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d" " -f1) | tee --append crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt &
+zakura-checkpoints --last-checkpoint $(tail -1 crates/zakura-chain/src/parameters/checkpoint/test-checkpoints.txt | cut -d" " -f1) -- -testnet | tee --append crates/zakura-chain/src/parameters/checkpoint/test-checkpoints.txt &
 wait
 ```
 
@@ -84,7 +84,7 @@ You can see all the `zakura-checkpoints` options using:
 target/release/zakura-checkpoints --help
 ```
 
-For more details about checkpoint lists, see the [`zakura-checkpoints` README.](https://github.com/zakura-core/zakura/tree/main/zakura-chain/src/parameters/checkpoint/README.md)
+For more details about checkpoint lists, see the [`zakura-checkpoints` README.](https://github.com/zakura-core/zakura/tree/main/crates/zakura-chain/src/parameters/checkpoint/README.md)
 
 #### Checkpoint Generation for Testnet
 
@@ -156,7 +156,7 @@ The script:
 Assuming `zakurad`'s RPC port is 28232, you should be able to run:
 
 ```sh
-$ zakura-utils/zcash-rpc-diff 28232 getinfo
+$ crates/zakura-utils/zcash-rpc-diff 28232 getinfo
 Checking zakurad network and tip height...
 Checking zcashd network and tip height...
 

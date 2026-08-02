@@ -170,7 +170,7 @@ jobs:
           rpc_listen_addr = "0.0.0.0:8232"
           log_file        = "/root/logs/zakura-tracing.log"
 
-          # Public mainnet node ids (zakura-network/src/zakura/handler.rs). Used by
+          # Public mainnet node ids (crates/zakura-network/src/zakura/handler.rs). Used by
           # the dashboard to label each host; not deployed to the nodes.
           [defaults.zakura]
           bootstrap_peers = [

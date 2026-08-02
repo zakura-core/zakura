@@ -266,7 +266,7 @@ the downloaded body is verified, as does the pre-NU5 auth-data root.
 Fast mode never advances the running Sapling/Orchard/Ironwood frontiers below the checkpoint,
 so the real frontiers at the checkpoint must be supplied for the resume. `FinalFrontiers {
 height, sapling, orchard, sprout, ironwood }` is embedded in the binary
-(`zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin`, via `include_bytes!`),
+(`crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin`, via `include_bytes!`),
 tied to the network's max checkpoint height (validated on load:
 `embedded VCT final frontier height must match the network's max checkpoint height`). When the
 Mainnet checkpoint list advances, this file is regenerated alongside the checkpoint artifacts
@@ -292,7 +292,7 @@ by the maintenance tool described in §16.
 
 ### 5.3 The `CommitmentRootSource` seam
 
-`CommitmentRootSource` (`zakura-state/.../finalized_state/commitment_aux.rs`) abstracts _where_
+`CommitmentRootSource` (`crates/zakura-state/.../finalized_state/commitment_aux.rs`) abstracts _where_
 the fast path's roots and last checkpoint height frontier come from. The committer (`VctState.source`) reads
 through this one seam regardless of source:
 
@@ -338,7 +338,7 @@ boundary.
 ### 5.4 Roots on the header-sync message
 
 There is no separate roots stream. The header-sync `HeaderSyncMessage` carries roots in two
-places (`zakura-network/src/zakura/header_sync/wire.rs`):
+places (`crates/zakura-network/src/zakura/header_sync/wire.rs`):
 
 - `GetHeaders { start_height, count, want_tree_aux_roots }` — header sync sets
   `want_tree_aux_roots` on its range requests (finalized and non-finalized alike; only roots
@@ -771,26 +771,26 @@ asserts to prove roots actually came over the wire rather than a silent legacy s
 
 | Area | File |
 | --- | --- |
-| Wire payload (`BlockCommitmentRoots`) | `zakura-chain/src/parallel/commitment_aux.rs` |
-| Source seam, `PeerSource`, producers, bulk root invalidation | `zakura-state/src/service/finalized_state/commitment_aux.rs` |
-| Verify-before-commit logic | `zakura-state/src/service/finalized_state/commitment_aux_verify.rs` |
-| Embedded frontier plumbing, `select_source_mode`, counters | `zakura-state/src/service/finalized_state/vct.rs` |
-| `checkpoint_sync` mirror field (mode input) | `zakura-state/src/config.rs`; set in `zakurad/src/commands/start.rs` |
-| Embedded Mainnet frontier and provenance | `zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin`, `.../mainnet-frontier.json` |
-| Commit-path hook, last checkpoint height, frozen-frontier policy | `zakura-state/src/service/finalized_state.rs` |
-| `BlockRoots` serving read (authoritative index) | `zakura-state/src/service.rs` |
-| Root-index lifecycle (`commitment_roots_by_height`, authentication frontier, body-commit/rollback policies) | `zakura-state/src/service/finalized_state/zakura_db/commitment_roots_db.rs`, `.../block.rs`, `.../rollback.rs` |
-| `CommitHeaderRange` with roots, fast-path hit/miss metrics | `zakura-state/src/service/write.rs` |
-| Header-sync wire (`GetHeaders`/`Headers` roots, markers, byte budget) | `zakura-network/src/zakura/header_sync/wire.rs` |
-| Header-sync root validation (count, height alignment, markers) | `zakura-network/src/zakura/header_sync/validation.rs`, `.../error.rs` |
-| Header-sync reactor (request/serve/receive roots, misbehavior) | `zakura-network/src/zakura/header_sync/reactor.rs` |
-| Header-sync driver: serve `BlockRoots`, all-or-nothing helper, route received roots | `zakurad/src/commands/start/zakura/header_sync_driver.rs` |
+| Wire payload (`BlockCommitmentRoots`) | `crates/zakura-chain/src/parallel/commitment_aux.rs` |
+| Source seam, `PeerSource`, producers, bulk root invalidation | `crates/zakura-state/src/service/finalized_state/commitment_aux.rs` |
+| Verify-before-commit logic | `crates/zakura-state/src/service/finalized_state/commitment_aux_verify.rs` |
+| Embedded frontier plumbing, `select_source_mode`, counters | `crates/zakura-state/src/service/finalized_state/vct.rs` |
+| `checkpoint_sync` mirror field (mode input) | `crates/zakura-state/src/config.rs`; set in `crates/zakurad/src/commands/start.rs` |
+| Embedded Mainnet frontier and provenance | `crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin`, `.../mainnet-frontier.json` |
+| Commit-path hook, last checkpoint height, frozen-frontier policy | `crates/zakura-state/src/service/finalized_state.rs` |
+| `BlockRoots` serving read (authoritative index) | `crates/zakura-state/src/service.rs` |
+| Root-index lifecycle (`commitment_roots_by_height`, authentication frontier, body-commit/rollback policies) | `crates/zakura-state/src/service/finalized_state/zakura_db/commitment_roots_db.rs`, `.../block.rs`, `.../rollback.rs` |
+| `CommitHeaderRange` with roots, fast-path hit/miss metrics | `crates/zakura-state/src/service/write.rs` |
+| Header-sync wire (`GetHeaders`/`Headers` roots, markers, byte budget) | `crates/zakura-network/src/zakura/header_sync/wire.rs` |
+| Header-sync root validation (count, height alignment, markers) | `crates/zakura-network/src/zakura/header_sync/validation.rs`, `.../error.rs` |
+| Header-sync reactor (request/serve/receive roots, misbehavior) | `crates/zakura-network/src/zakura/header_sync/reactor.rs` |
+| Header-sync driver: serve `BlockRoots`, all-or-nothing helper, route received roots | `crates/zakurad/src/commands/start/zakura/header_sync_driver.rs` |
 
 ## 16. Mainnet release-state pipeline
 
 The embedded Mainnet frontier is a release artifact coupled to the terminal Mainnet checkpoint:
 whenever `main-checkpoints.txt`'s max height advances, the matching
-`zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin` must be regenerated from a
+`crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin` must be regenerated from a
 synced Zakura state at the new max height, and both must land in the same PR. The offline
 exporter below produces that coupled pair; the publisher, refresh workflow, and release gate
 below consume it.

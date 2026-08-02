@@ -9,7 +9,7 @@ name: zcashd-compat Regtest
 # (miner RPCs removed, -regtestacceptunvalidatedpow support), but the managed
 # download manifest still pins the previous RPC-ingest build. Re-enable the
 # push trigger once a sidecar zcashd release is cut and
-# zakurad/zcashd-compat-manifest.json is bumped. Until then run locally with
+# crates/zakurad/zcashd-compat-manifest.json is bumped. Until then run locally with
 # `make compat-test-regtest TEST_ZCASHD_PATH=/path/to/sidecar/zcashd`.
 on:
   workflow_dispatch:

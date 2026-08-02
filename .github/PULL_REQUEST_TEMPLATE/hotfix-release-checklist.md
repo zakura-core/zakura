@@ -59,7 +59,7 @@ for the commands, using the branch checkout (release.toml allows
       requirements in place when the stable version still matches them
       (`make pre-release` fails on any left behind).
 - [ ] Generate and commit the stored config snapshot
-      (`zakurad/tests/common/configs/v<version>.toml`) — `last_config_is_stored`
+      (`crates/zakurad/tests/common/configs/v<version>.toml`) — `last_config_is_stored`
       fails without it.
 - [ ] Assemble the changelog section for `v<version>`:
   - public hotfix with fragments on the branch: run

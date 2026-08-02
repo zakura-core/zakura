@@ -15,7 +15,7 @@ For performance and security, every release should carry a current Mainnet check
 - [ ] Run the [Update Mainnet release state workflow](https://github.com/zakura-core/zakura/actions/workflows/update-release-state.yml) from `main`. It imports the newest publisher bundle and opens or updates a draft PR (it exits green with no PR when the committed state is already current).
 - [ ] Review and merge that draft PR: the diff is append-only over the committed checkpoint list; spot-check a few new heights and the terminal hash against an independent node or explorer.
 - [ ] `make pre-release` verifies the committed pairing and rejects pre-pipeline `legacy-bootstrap` state; for an emergency release with a broken publisher, export `ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=1` locally, check the `allow_bootstrap_release_state` input when dispatching the Create release workflow, and note it in the release PR.
-- [ ] Testnet checkpoints are still updated manually when needed, per [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/zakura-utils/README.md#zakura-checkpoints).
+- [ ] Testnet checkpoints are still updated manually when needed, per [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/crates/zakura-utils/README.md#zakura-checkpoints).
 
 # Missed Dependency Updates
 
@@ -152,7 +152,7 @@ cargo build --bin zakurad &&
 ./target/debug/zakurad generate |
 sed "s#${XDG_CACHE_HOME:-$HOME/.cache}/zakura#cache_dir#g" |
 sed "s#$HOME/.zakura#identity_dir#g" \
-  > zakurad/tests/common/configs/v<version>.toml
+  > crates/zakurad/tests/common/configs/v<version>.toml
 ```
 
 The replacements are global path-string substitutions, mirroring
@@ -333,7 +333,7 @@ for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakur
 ## Publish Docker Images
 
 - [ ] Confirm the pinned zcashd compat manifest is ready before publishing:
-  - [ ] Update [`zakurad/zcashd-compat-manifest.json`](https://github.com/zakura-core/zakura/blob/main/zakurad/zcashd-compat-manifest.json) to the intended `zcashd` compat release (it is the single source of truth: zakurad embeds it at compile time and CI/Docker builds read it directly).
+  - [ ] Update [`crates/zakurad/zcashd-compat-manifest.json`](https://github.com/zakura-core/zakura/blob/main/crates/zakurad/zcashd-compat-manifest.json) to the intended `zcashd` compat release (it is the single source of truth: zakurad embeds it at compile time and CI/Docker builds read it directly).
   - [ ] Confirm the manifest contains only the `x86_64-pc-linux-gnu` artifact before publishing zcashd-compat Docker images.
   - [ ] Confirm the workflow logs show the expected `/usr/local/bin/zcashd --version` for the zcashd-compat linux/amd64 image variant.
 - [ ] Wait for the [the Docker images to be published successfully](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush).

@@ -31,7 +31,7 @@ TEST_ZCASHD_COMPAT=1 \
 
 In CI, the suite runs automatically on every merge to `main` that touches the
 zcashd-compat implementation or test harness — see
-[`.github/workflows/zcashd-compat-regtest.yml`](../../../../.github/workflows/zcashd-compat-regtest.yml).
+[`.github/workflows/zcashd-compat-regtest.yml`](../../../../../.github/workflows/zcashd-compat-regtest.yml).
 
 ### Reorg Stress Tests
 
@@ -195,7 +195,7 @@ straightforward way to authenticate.
 ## Module Structure
 
 ```
-zakurad/tests/common/
+crates/zakurad/tests/common/
 ├── zcashd_compat.rs          module root — skip guard, ZcashdRpcClient,
 │                              env var constants, setup_zcashd_compat()
 └── zcashd_compat/
@@ -223,7 +223,7 @@ zakurad/tests/common/
 ```
 
 Entry points are the `#[tokio::test] #[ignore]` functions in
-`zakurad/tests/acceptance.rs` (all prefixed `zcashd_compat_`).
+`crates/zakurad/tests/acceptance.rs` (all prefixed `zcashd_compat_`).
 
 ## Adding a New Test
 
@@ -250,7 +250,7 @@ Entry points are the `#[tokio::test] #[ignore]` functions in
    }
    ```
 
-3. Add a corresponding entry point in `zakurad/tests/acceptance.rs`:
+3. Add a corresponding entry point in `crates/zakurad/tests/acceptance.rs`:
 
    ```rust
    #[tokio::test]

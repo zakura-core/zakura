@@ -70,7 +70,7 @@ what prevents collisions with an embargoed hotfix.
 
 ### Package versions
 
-Always update the `zakura` package version in `zakurad/Cargo.toml`; release
+Always update the `zakura` package version in `crates/zakurad/Cargo.toml`; release
 binaries self-report `CARGO_PKG_VERSION`.
 
 Stable releases always publish to crates.io. Release candidates decide
@@ -112,7 +112,7 @@ Update:
 - the README `cargo install --git ... --tag` example for stable releases only;
   while preparing a release candidate, keep the general install example on the
   latest stable tag
-- `zakurad/tests/common/configs/<version>.toml`, then remove stale generated
+- `crates/zakurad/tests/common/configs/<version>.toml`, then remove stale generated
   release fixtures so the directory retains only the current release fixture
   and custom test configurations
 - `ESTIMATED_RELEASE_HEIGHT` from the current chain tip and expected tag date

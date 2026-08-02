@@ -8,7 +8,6 @@ on:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
       - .cargo/config.toml
-      - "**/clippy.toml"
       - .github/workflows/test-crates.yml
 
   push:
@@ -18,7 +17,6 @@ on:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
       - .cargo/config.toml
-      - "**/clippy.toml"
       - .github/workflows/test-crates.yml
 
   # Run the full crate-build suite when a PR is queued so the merge queue

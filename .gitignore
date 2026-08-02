@@ -1,8 +1,6 @@
 # Cargo files
 /coverage-target/
 /out/
-# Legacy Zebra state (alpha versions only)
-.zakura-state/
 # Nix configs
 shell.nix
 # Docker compose env files
@@ -155,9 +153,6 @@ $RECYCLE.BIN/
 
 # Python pycache
 __pycache__/
-
-# RPC tests cache
-crates/zakura-rpc/qa/cache/
 
 # Lychee link checker cache
 .lycheecache

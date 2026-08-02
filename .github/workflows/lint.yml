@@ -7,7 +7,6 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
-      - clippy.toml
       - .cargo/config.toml
       - .github/workflows/lint.yml
       - qa/supply-chain/**
@@ -24,7 +23,6 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
-      - clippy.toml
       - .cargo/config.toml
       - .github/workflows/lint.yml
       - qa/supply-chain/**

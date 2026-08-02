@@ -10,7 +10,7 @@
 #   MINISIGN_KEY  Path to the minisign secret key (default: minisign's default)
 set -euo pipefail
 
-# Must match the key published in VERIFY.md; the signature is verified against
+# Must match the key published in docs/verify.md; the signature is verified against
 # this before upload so a signature from the wrong key never ships.
 MAINTAINER_PUBKEY="RWTZkHOmfhxdQf43RZJyOawUNvMSlbPH539O9Y2Sir/ZHTihqnSO1RZn"
 REPOSITORY="${REPOSITORY:-zakura-core/zakura}"

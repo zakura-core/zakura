@@ -353,7 +353,7 @@ What Mode B trades, explicitly:
   rehearsal of the same commit is what keeps this risk small — and juggling a
   repair alone is exactly the failure mode Mode A avoids;
 - until signing, the release page has no `SHA256SUMS.txt`/signature, so
-  `VERIFY.md` verification is impossible;
+  `docs/verify.md` verification is impossible;
 - it saves ~15–25 minutes to tag/source/crates and does **not** meaningfully
   accelerate signed binaries. Worth it under active exploitation; not
   otherwise. **Solo default is Mode A.**
@@ -412,7 +412,7 @@ release exists. Mode B: ~10 minutes before a tag + source release, ~35–50
 before signed binaries. The window cannot be zero: binaries are
 provenance-attested by public-repo CI and the release manifest embeds the
 repository and URLs (verified at publish) — attaching private-built binaries
-would permanently weaken what `VERIFY.md` means, on exactly the release where
+would permanently weaken what `docs/verify.md` means, on exactly the release where
 it matters most — and GitHub has no "staged but hidden" state for commits.
 Mitigations: the private dress rehearsal makes the public run one-shot;
 pre-announcement compresses operator reaction time; Mode B compresses

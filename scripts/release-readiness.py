@@ -228,7 +228,7 @@ class SelfTests(unittest.TestCase):
     def test_assembled_untagged_section_still_sets_release_floor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "changelog-unreleased").mkdir()
+            (root / "docs" / "changelog" / "unreleased").mkdir(parents=True)
             (root / "CHANGELOG.md").write_text(
                 "# Changelog\n\n"
                 "## [Unreleased]\n\n"

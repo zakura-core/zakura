@@ -6,7 +6,7 @@ shared changelogs and makes the unreleased notes reviewable with the change
 that introduced them. Other pull requests do not need a fragment.
 
 After opening a draft Rust or `Cargo.toml` PR, create
-`changelog-unreleased/<PR-number>.md`. Put each operator-visible change under
+`docs/changelog/unreleased/<PR-number>.md`. Put each operator-visible change under
 its Keep a Changelog category:
 
 ```markdown
@@ -22,7 +22,7 @@ preparation uses semver and public-API checks to choose crate version bumps.
 
 Write complete Keep a Changelog list items, including the PR link. Multiple
 changes and categories belong in the same fragment. Parameter changes still
-need a row in `CHANGELOG_PARAMS.md`.
+need a row in `docs/changelog/params.md`.
 
 For an internal-only Rust or `Cargo.toml` PR, use an explicit marker and
 explain the exclusion:

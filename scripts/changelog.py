@@ -13,7 +13,7 @@ from datetime import date
 from pathlib import Path
 
 
-FRAGMENT_DIRECTORY = "changelog-unreleased"
+FRAGMENT_DIRECTORY = "docs/changelog/unreleased"
 NO_CHANGELOG_MARKER = "<!-- changelog: none -->"
 ROOT_CHANGELOG = "CHANGELOG.md"
 CANONICAL_TAG_REMOTE = "https://github.com/zakura-core/zakura.git"

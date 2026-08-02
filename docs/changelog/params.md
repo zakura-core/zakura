@@ -4,7 +4,7 @@ A focused ledger of deliberate changes to **tunable parameters** in this fork �
 constants, config defaults, timeouts, window/limit sizes, and congestion-control
 coefficients.
 
-This complements `CHANGELOG.md`. The changelog records user-visible behavior in
+This complements the root `CHANGELOG.md`. The changelog records user-visible behavior in
 prose; this file is a compact table of every parameter value we have re-tuned, so
 reviewers and operators can see — at a glance — what changed, where it lives, and
 why.

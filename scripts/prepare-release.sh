@@ -640,7 +640,7 @@ fi
 eos_floored=0
 [ "$eos_old" -lt "$eos_target" ] && eos_floored=1
 
-fragment_count="$(find changelog-unreleased -name '*.md' ! -name 'README.md' | wc -l | tr -d ' ')"
+fragment_count="$(find docs/changelog/unreleased -name '*.md' ! -name 'README.md' | wc -l | tr -d ' ')"
 
 # --- Report the plan --------------------------------------------------------
 

@@ -1,6 +1,6 @@
 [package]
 name = "zakura-utils"
-version = "2.1.0-rc0"
+version = "2.1.0-rc1"
 authors.workspace = true
 description = "Developer tools for Zakura maintenance and testing. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -64,7 +64,7 @@ tracing-error = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 
-zakura-node-services = { path = "../zakura-node-services", version = "3.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "3.1.0-rc1" }
 zakura-chain = { path = "../zakura-chain", version = "3.1.0-rc0" }
 
 # These crates are needed for the zakura-checkpoints binary

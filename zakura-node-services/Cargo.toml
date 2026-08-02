@@ -1,6 +1,6 @@
 [package]
 name = "zakura-node-services"
-version = "3.0.0"
+version = "3.1.0-rc1"
 authors.workspace = true
 description = "The interfaces of some Zakura node services. Internal crate, published to support cargo install zakura"
 license.workspace = true

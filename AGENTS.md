@@ -14,8 +14,8 @@
 Zakura is a Rust workspace. Main crates include:
 
 - `zakurad/` (node CLI/orchestration),
-- core libraries like `zakura-chain/`, `zakura-consensus/`, `zakura-network/`, `zakura-state/`, `zakura-rpc/`,
-- support crates like `zakura-node-services/`, `zakura-test/`, `zakura-utils/`, `tower-batch-control/`, and `tower-fallback/`.
+- core libraries like `zakura-chain/`, `zakura-consensus/`, `zakura-network/`, `zakura-state/`, `zakura-rpc/`, `zakura-script/`,
+- support crates like `zakura-node-services/`, `zakura-test/`, `zakura-utils/`, `zakura-jsonl-trace/`, `tower-batch-control/`, `tower-fallback/`, and `xtask/`.
 
 Code is primarily in each crate's `src/`; integration tests are in `*/tests/`; many unit/property tests are colocated in `src/**/tests/` (for example `prop.rs`, `vectors.rs`, `preallocate.rs`). Documentation is in `docs/`, crate READMEs, and `book/src/user/zcashd-compat.md`. CI and policy automation live in `.github/workflows/`.
 
@@ -43,7 +43,7 @@ cargo test -p zakura-chain -- test_name
 cargo nextest run --profile all-tests --locked --release --features default-release-binaries --run-ignored=all
 
 # Run with nextest (integration profiles)
-cargo nextest run --profile sync-large-checkpoints-empty
+cargo nextest run --profile zakura-integration
 ```
 
 ## Commit & Pull Request Guidelines
@@ -99,7 +99,7 @@ zakurad (CLI orchestration)
 
 - Rust 2021 conventions and `rustfmt` defaults apply across the workspace (4-space indentation).
 - Naming: `snake_case` for functions/modules/files, `CamelCase` for types/traits, `SCREAMING_SNAKE_CASE` for constants.
-- Respect workspace lint policy in `.cargo/config.toml` and the crate-level lint attributes at the top of each crate's `lib.rs`.
+- Respect the workspace lint policy (`[workspace.lints]` in the root `Cargo.toml`) and the crate-level lint attributes at the top of each crate's `lib.rs`.
 - Keep dependencies flowing downward across crates; maintain `zakura-chain` as sync-only.
 
 ## Code Patterns
@@ -165,7 +165,7 @@ S::Future: Send + 'static,
 cargo test --workspace
 
 # Integration tests with nextest
-cargo nextest run --profile sync-large-checkpoints-empty
+cargo nextest run --profile zakura-integration
 ```
 
 ## Metrics & Observability

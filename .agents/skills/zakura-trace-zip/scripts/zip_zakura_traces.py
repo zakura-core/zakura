@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a shareable zip archive from a Zebra Zakura trace directory."""
+"""Create a shareable zip archive from a Zakura trace directory."""
 
 from __future__ import annotations
 

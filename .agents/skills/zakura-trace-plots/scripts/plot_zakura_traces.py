@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate metrics-aware SVG plots from Zebra Zakura trace directories."""
+"""Generate metrics-aware SVG plots from Zakura trace directories."""
 
 from __future__ import annotations
 

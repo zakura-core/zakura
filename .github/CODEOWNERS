@@ -38,7 +38,7 @@
 # /.github/mergify.yml                    @ZcashFoundation/devops-reviewers
 # /docker/                                @ZcashFoundation/devops-reviewers
 # cloudbuild.yaml                         @ZcashFoundation/devops-reviewers
-# codecov.yml                             @ZcashFoundation/devops-reviewers
+# /.github/codecov.yml                    @ZcashFoundation/devops-reviewers
 
 # Unsafe Code
 # /zakura-script/                          @ZcashFoundation/unsafe-rust-reviewers

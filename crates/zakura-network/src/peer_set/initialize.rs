@@ -1342,7 +1342,15 @@ where
                 );
                 remaining_replenishment_demand.store(replenishment_demand, Ordering::Relaxed);
 
-                debug!(
+                // This is the only place the crawler's view of its own outbound
+                // connections is visible, and a node that stops replenishing looks
+                // exactly like a node that has enough peers from the outside. It is
+                // logged at info because release builds enable the `max_level_info`
+                // tracing feature, which compiles debug records out entirely: a
+                // debug record here cannot be read on a deployed node, whatever the
+                // configured filter says. One record per
+                // `crawl_new_peer_interval` bounds the volume.
+                info!(
                     active_outbound_connections,
                     peerset_target_size,
                     outbound_connection_limit,

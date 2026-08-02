@@ -162,8 +162,9 @@ zakura-rpc/qa/cache/
 # Lychee link checker cache
 .lycheecache
 /.agent-shell/
-.claude/*
-!.claude/skills
+# .claude is a symlink to .agents; keep agent-local state out of git
+.agents/*
+!.agents/skills
 local_data/**
 
 # fuzzing artifacts

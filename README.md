@@ -24,7 +24,7 @@ Zakura is forked from [Zebra](https://github.com/ZcashFoundation/zebra). This fi
 
 - Performance: Blockchain sync is nearly 5× faster than Zebra. Block execution is notably faster than Zebra, especially on worst-case sandblast attacks.
 - Pruning and snapshots: Native block pruning with configurable retention lets you operate a full node with substantially less disk space. We also publish snapshots (~11 GB pruned) that let you bootstrap a node 680× faster than syncing over the standard P2P network. See the [snapshots page](https://zakura.com/snapshots/).
-- [zcashd compatibility](book/src/user/zcashd-compat.md): A compatibility mode
+- [zcashd compatibility](docs/zcashd-compat.md): A compatibility mode
   reproduces the legacy zcashd RPC interface, so existing wallets and
   integrations keep working.
 - Experimental P2P v2: We are building a new P2P transport layer for Zakura nodes, currently off by default on Mainnet. The goals are sub-500ms worst-case block propagation, mempool aggregation (used in Tachyon), sync at the speed of your bandwidth, and a future-proofed gossip protocol. The v2 stack has known DoS risks and is not yet production-hardened.
@@ -42,7 +42,7 @@ curl -fsSL https://zakura.com/install.sh | bash
 ```
 
 The installer can set up either standard Zakura or its
-[zcashd-compatible variant](book/src/user/zcashd-compat.md).
+[zcashd-compatible variant](docs/zcashd-compat.md).
 
 ### Docker
 

@@ -427,14 +427,21 @@ def check_pull_request(
 
     # Compare from the merge base so fragments added to a moving base branch do
     # not look like deletions made by a stale pull request branch.
-    changed_paths = run_git(
+    diff_lines = run_git(
         repo_root,
-        ["diff", "--name-only", f"{base}...{head}"],
+        ["diff", "--name-status", "--find-renames=100%", f"{base}...{head}"],
     ).splitlines()
+    diff_entries = [
+        (line.split("\t")[0], line.split("\t")[-1]) for line in diff_lines
+    ]
+    changed_paths = [path for _, path in diff_entries]
+    # An exact rename keeps a fragment's content intact, so repository moves
+    # are not fragment changes owned by this pull request.
     changed = [
         path
-        for path in changed_paths
-        if path.startswith(f"{FRAGMENT_DIRECTORY}/")
+        for status, path in diff_entries
+        if not status.startswith("R")
+        and path.startswith(f"{FRAGMENT_DIRECTORY}/")
         and path != f"{FRAGMENT_DIRECTORY}/README.md"
     ]
     expected = f"{FRAGMENT_DIRECTORY}/{pull_request}.md"

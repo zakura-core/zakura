@@ -81,13 +81,13 @@ class ChangelogTests(unittest.TestCase):
         with mock.patch.object(
             changelog,
             "run_git",
-            return_value="changelog-unreleased/123.md\n",
+            return_value="A\tchangelog-unreleased/123.md\n",
         ) as run_git:
             changelog.check_pull_request(self.root, "base", "head", "123", False, False)
 
         run_git.assert_called_once_with(
             self.root,
-            ["diff", "--name-only", "base...head"],
+            ["diff", "--name-status", "--find-renames=100%", "base...head"],
         )
 
     def test_pull_request_cannot_delete_another_fragment(self):
@@ -97,9 +97,33 @@ class ChangelogTests(unittest.TestCase):
         with mock.patch.object(
             changelog,
             "run_git",
-            return_value=("changelog-unreleased/123.md\nchangelog-unreleased/122.md\n"),
+            return_value=(
+                "A\tchangelog-unreleased/123.md\nD\tchangelog-unreleased/122.md\n"
+            ),
         ):
             with self.assertRaisesRegex(changelog.ChangelogError, "unexpected"):
+                changelog.check_pull_request(
+                    self.root, "base", "head", "123", False, False
+                )
+
+    def test_pull_request_may_move_fragments_without_content_changes(self):
+        with mock.patch.object(
+            changelog,
+            "run_git",
+            return_value=(
+                "R100\told-fragments/122.md\tchangelog-unreleased/122.md\n"
+                "R100\told-fragments/README.md\tchangelog-unreleased/README.md\n"
+            ),
+        ):
+            changelog.check_pull_request(self.root, "base", "head", "123", False, False)
+
+    def test_renamed_rust_file_still_requires_fragment(self):
+        with mock.patch.object(
+            changelog,
+            "run_git",
+            return_value="R100\tzakura-chain/src/old.rs\tzakura-chain/src/new.rs\n",
+        ):
+            with self.assertRaisesRegex(changelog.ChangelogError, "add .*123.md"):
                 changelog.check_pull_request(
                     self.root, "base", "head", "123", False, False
                 )
@@ -108,7 +132,7 @@ class ChangelogTests(unittest.TestCase):
         with mock.patch.object(
             changelog,
             "run_git",
-            return_value="zakura-chain/src/lib.rs\n",
+            return_value="M\tzakura-chain/src/lib.rs\n",
         ):
             with self.assertRaisesRegex(changelog.ChangelogError, "add .*123.md"):
                 changelog.check_pull_request(
@@ -119,7 +143,7 @@ class ChangelogTests(unittest.TestCase):
         with mock.patch.object(
             changelog,
             "run_git",
-            return_value="zakura-chain/Cargo.toml\n",
+            return_value="M\tzakura-chain/Cargo.toml\n",
         ):
             with self.assertRaisesRegex(changelog.ChangelogError, "add .*123.md"):
                 changelog.check_pull_request(
@@ -130,7 +154,7 @@ class ChangelogTests(unittest.TestCase):
         with mock.patch.object(
             changelog,
             "run_git",
-            return_value=".github/workflows/changelog.yml\nCargo.lock\n",
+            return_value="M\t.github/workflows/changelog.yml\nM\tCargo.lock\n",
         ):
             changelog.check_pull_request(
                 self.root, "base", "head", "123", False, False

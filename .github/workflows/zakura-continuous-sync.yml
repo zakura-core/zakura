@@ -150,15 +150,47 @@ jobs:
           fi
           python3 deploy/continuous-sync/deploy.py --node "${NODE}" resume
 
+      # The audit runs every 30 minutes but must not re-page an unchanged failure
+      # that often, so its alert state is carried between runs through the cache.
+      # Each run saves under a unique key and restores the most recent one by prefix.
+      - name: Restore audit alert state
+        if: env.ACTION == 'audit'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
+        with:
+          path: .audit-alert-state
+          key: continuous-sync-audit-state-${{ github.run_id }}
+          restore-keys: |
+            continuous-sync-audit-state-
+
       - name: Audit controllers
         if: env.ACTION == 'audit'
-        env:
-          SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
         run: |
           set -euo pipefail
+          mkdir -p .audit-alert-state
           args=(audit)
+          args+=(--state-file .audit-alert-state/state.json)
+          args+=(--reminder-interval "${REMINDER_INTERVAL}")
+          args+=(--max-completion-age "${MAX_COMPLETION_AGE}")
           if [ -n "${NODE}" ]; then
             python3 deploy/continuous-sync/deploy.py --node "${NODE}" "${args[@]}"
           else
             python3 deploy/continuous-sync/deploy.py "${args[@]}"
           fi
+        env:
+          SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
+          # Remind about an unresolved failure every 6 hours.
+          REMINDER_INTERVAL: "21600"
+          # A run is capped at 48h, so only flag a node that has not completed one
+          # in four days -- long enough that a legitimately long run cannot trip it.
+          MAX_COMPLETION_AGE: "345600"
+
+      # Runs even when the audit exits non-zero, or a persistent failure would
+      # never record its `last_sent` and would re-page on every cycle.
+      - name: Save audit alert state
+        if: always() && env.ACTION == 'audit'
+        # A lost state save only costs one duplicate reminder; never fail the job for it.
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
+        with:
+          path: .audit-alert-state
+          key: continuous-sync-audit-state-${{ github.run_id }}

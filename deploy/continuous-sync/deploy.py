@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import concurrent.futures
 import json
 import os
 import shlex
 import subprocess
 import sys
+import time
 import tomllib
 import urllib.error
 import urllib.request
@@ -412,7 +414,7 @@ def audit_problem(data: dict[str, Any], max_completion_age: int) -> str | None:
     if last_success and max_completion_age > 0:
         try:
             parsed = int(time_from_stamp(str(last_success)))
-            if int(__import__("time").time()) - parsed > max_completion_age:
+            if now() - parsed > max_completion_age:
                 return f"last successful run is older than {max_completion_age}s"
         except ValueError:
             return f"invalid last_success_at: {last_success}"
@@ -420,9 +422,21 @@ def audit_problem(data: dict[str, Any], max_completion_age: int) -> str | None:
 
 
 def time_from_stamp(stamp: str) -> float:
-    import time
+    # The controller writes UTC stamps, so interpret them as UTC. `time.mktime`
+    # would read the struct as local time and skew the age by the runner offset.
+    return calendar.timegm(time.strptime(stamp, "%Y%m%dT%H%M%SZ"))
 
-    return time.mktime(time.strptime(stamp, "%Y%m%dT%H%M%SZ"))
+
+def now() -> int:
+    return int(time.time())
+
+
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    if hours >= 24:
+        return f"{hours // 24}d{hours % 24}h"
+    return f"{hours}h{remainder // 60}m"
 
 
 def post_slack(text: str) -> bool:
@@ -450,27 +464,138 @@ def post_slack(text: str) -> bool:
     return 200 <= response.status < 300 and body == "ok"
 
 
+AUDIT_STATE_VERSION = 1
+
+
+def load_audit_state(path: Path | None) -> dict[str, Any]:
+    fresh: dict[str, Any] = {"version": AUDIT_STATE_VERSION, "problems": {}}
+    if path is None or not path.exists():
+        return fresh
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"audit state unreadable ({error}); starting fresh", file=sys.stderr)
+        return fresh
+    if not isinstance(data, dict) or data.get("version") != AUDIT_STATE_VERSION:
+        return fresh
+    problems = data.get("problems")
+    if not isinstance(problems, dict):
+        return fresh
+    return {"version": AUDIT_STATE_VERSION, "problems": problems}
+
+
+def save_audit_state(path: Path | None, state: dict[str, Any]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp.replace(path)
+
+
+def audit_transitions(
+    problems: dict[str, str],
+    previous: dict[str, Any],
+    reminder_interval: int,
+    timestamp: int,
+) -> tuple[list[str], list[str], list[str], dict[str, Any]]:
+    """Split current problems into new/reminder/recovered lines.
+
+    A problem alerts immediately the first time it is seen, and again only once
+    `reminder_interval` has elapsed, so a node that stays broken reminds on a slow
+    cadence instead of re-paging every audit cycle.
+    """
+    prior = previous.get("problems", {})
+    new_lines: list[str] = []
+    reminder_lines: list[str] = []
+    current: dict[str, Any] = {}
+
+    for name in sorted(problems):
+        problem = problems[name]
+        record = prior.get(name)
+        if not isinstance(record, dict) or record.get("problem") != problem:
+            # First sighting, or the failure changed to a different one.
+            new_lines.append(f"{name}: {problem}")
+            current[name] = {
+                "problem": problem,
+                "first_seen": timestamp,
+                "last_sent": timestamp,
+            }
+            continue
+        first_seen = int(record.get("first_seen", timestamp))
+        last_sent = int(record.get("last_sent", timestamp))
+        if timestamp - last_sent >= reminder_interval:
+            reminder_lines.append(
+                f"{name}: {problem} (unresolved for {format_duration(timestamp - first_seen)})"
+            )
+            last_sent = timestamp
+        current[name] = {
+            "problem": problem,
+            "first_seen": first_seen,
+            "last_sent": last_sent,
+        }
+
+    recovered_lines = [
+        f"{name}: was {prior[name].get('problem')}"
+        for name in sorted(prior)
+        if name not in problems and isinstance(prior.get(name), dict)
+    ]
+    return new_lines, reminder_lines, recovered_lines, {
+        "version": AUDIT_STATE_VERSION,
+        "problems": current,
+    }
+
+
+def audit_message(
+    new_lines: list[str], reminder_lines: list[str], recovered_lines: list[str]
+) -> str:
+    sections = []
+    if new_lines:
+        sections.append(":rotating_light: Zakura continuous sync audit failed\n" + "\n".join(new_lines))
+    if reminder_lines:
+        sections.append(":alarm_clock: Zakura continuous sync still failing\n" + "\n".join(reminder_lines))
+    if recovered_lines:
+        sections.append(":white_check_mark: Zakura continuous sync recovered\n" + "\n".join(recovered_lines))
+    return "\n\n".join(sections)
+
+
 def cmd_audit(args: argparse.Namespace) -> int:
     nodes = load_nodes(args.config, args.node)
-    failures = []
+    problems: dict[str, str] = {}
     for node in nodes:
         ok, data = remote_json(node, "/usr/local/sbin/zakura-continuous-sync.py status")
         if not ok:
-            failures.append(f"{node.name}: unreachable or invalid status: {data}")
+            problems[node.name] = f"unreachable or invalid status: {data}"
             continue
         assert isinstance(data, dict)
         problem = audit_problem(data, args.max_completion_age)
         if problem:
-            failures.append(f"{node.name}: {problem}")
+            problems[node.name] = problem
 
-    if failures:
-        text = ":rotating_light: Zakura continuous sync audit failed\n" + "\n".join(failures)
+    state_file = Path(args.state_file) if args.state_file else None
+    previous = load_audit_state(state_file)
+    timestamp = now()
+    new_lines, reminder_lines, recovered_lines, state = audit_transitions(
+        problems, previous, args.reminder_interval, timestamp
+    )
+    text = audit_message(new_lines, reminder_lines, recovered_lines)
+
+    if text:
         if not args.dry_run:
             post_slack(text)
         print(text)
-        return 1
-    print(f"audit ok: {len(nodes)} node(s)")
-    return 0
+    elif problems:
+        print(
+            f"audit failing on {len(problems)} node(s); alert throttled "
+            f"(reminder every {format_duration(args.reminder_interval)})"
+        )
+    else:
+        print(f"audit ok: {len(nodes)} node(s)")
+
+    if not args.dry_run:
+        save_audit_state(state_file, state)
+
+    return 1 if problems else 0
 
 
 def summarize_parallel(nodes: list[Node], fn) -> int:
@@ -509,6 +634,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="alert if last successful cycle is older than this many seconds; 0 disables",
+    )
+    audit.add_argument(
+        "--state-file",
+        type=Path,
+        default=None,
+        help="persist alert state here so an unchanged failure is not re-sent every cycle",
+    )
+    audit.add_argument(
+        "--reminder-interval",
+        type=int,
+        default=21600,
+        help="re-send an unresolved failure at most this often, in seconds (default 6h)",
     )
     return parser.parse_args()
 

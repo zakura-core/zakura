@@ -233,6 +233,74 @@ class ContinuousSyncTests(unittest.TestCase):
     def test_deploy_creates_zakurad_config_parent_directory(self):
         self.assertIn('dirname "$config_path"', deploy.INSTALL_SCRIPT)
 
+    def test_audit_alerts_once_then_throttles_until_reminder_interval(self):
+        problems = {"temp-zakura-sync-test-6": "controller halted: build failed"}
+        interval = 21600
+
+        new, reminder, recovered, state = deploy.audit_transitions(problems, {}, interval, 1000)
+        self.assertEqual(new, ["temp-zakura-sync-test-6: controller halted: build failed"])
+        self.assertEqual((reminder, recovered), ([], []))
+
+        # Same failure one cycle later: silent.
+        new, reminder, recovered, state = deploy.audit_transitions(
+            problems, state, interval, 1000 + 1800
+        )
+        self.assertEqual((new, reminder, recovered), ([], [], []))
+
+        # Still silent just under the reminder interval.
+        new, reminder, _, state = deploy.audit_transitions(
+            problems, state, interval, 1000 + interval - 1
+        )
+        self.assertEqual((new, reminder), ([], []))
+
+        # Reminds once the interval elapses, and reports how long it has been broken.
+        new, reminder, _, state = deploy.audit_transitions(
+            problems, state, interval, 1000 + interval
+        )
+        self.assertEqual(new, [])
+        self.assertEqual(len(reminder), 1)
+        self.assertIn("unresolved for 6h0m", reminder[0])
+
+        # Then goes quiet again until the next interval.
+        new, reminder, _, _ = deploy.audit_transitions(
+            problems, state, interval, 1000 + interval + 60
+        )
+        self.assertEqual((new, reminder), ([], []))
+
+    def test_audit_realerts_when_the_failure_changes(self):
+        first = {"node": "controller halted: build failed"}
+        second = {"node": "controller halted: stalled"}
+        _, _, _, state = deploy.audit_transitions(first, {}, 21600, 1000)
+        new, reminder, recovered, _ = deploy.audit_transitions(second, state, 21600, 1100)
+        self.assertEqual(new, ["node: controller halted: stalled"])
+        self.assertEqual((reminder, recovered), ([], []))
+
+    def test_audit_reports_recovery_once(self):
+        _, _, _, state = deploy.audit_transitions({"node": "boom"}, {}, 21600, 1000)
+        new, reminder, recovered, state = deploy.audit_transitions({}, state, 21600, 1100)
+        self.assertEqual(recovered, ["node: was boom"])
+        self.assertEqual((new, reminder), ([], []))
+        # The recovery is not repeated on the next cycle.
+        new, reminder, recovered, _ = deploy.audit_transitions({}, state, 21600, 1200)
+        self.assertEqual((new, reminder, recovered), ([], [], []))
+
+    def test_audit_state_roundtrips_and_rejects_corrupt_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nested" / "state.json"
+            _, _, _, state = deploy.audit_transitions({"node": "boom"}, {}, 21600, 1000)
+            deploy.save_audit_state(path, state)
+            self.assertEqual(deploy.load_audit_state(path), state)
+
+            path.write_text("{not json")
+            self.assertEqual(deploy.load_audit_state(path), {"version": 1, "problems": {}})
+
+            path.write_text(json.dumps({"version": 999, "problems": {"node": {}}}))
+            self.assertEqual(deploy.load_audit_state(path), {"version": 1, "problems": {}})
+
+    def test_audit_stamp_is_parsed_as_utc(self):
+        # `time.mktime` would shift this by the runner's UTC offset.
+        self.assertEqual(deploy.time_from_stamp("19700102T000000Z"), 86400)
+
     def test_forced_ssh_wrapper_uses_current_status_script(self):
         self.assertIn(
             "exec /usr/local/sbin/zakura-monitor-status.py",

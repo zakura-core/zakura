@@ -361,6 +361,65 @@ class TipAgreementTests(unittest.TestCase):
             self.assertEqual(event["discarded_hash"], "a" * 64)
             self.assertEqual(event["canonical_hash"], "b" * 64)
 
+    def test_stall_timer_survives_a_collector_restart(self):
+        # A restart used to reseed last_advanced_at to "now", reporting every
+        # node as freshly advanced and clearing in-flight stall alerts.
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            first = status.ClusterCollector(
+                [node()],
+                interval=10,
+                stale_after=300,
+                upgrade_height=0,
+                target_spacing=7.5,
+                network="testnet",
+                state_file=state_file,
+            )
+            first.last_height["node-a"] = 4_129_396
+            first.last_advanced_at["node-a"] = 1_000.0
+            first.persist_state()
+
+            second = status.ClusterCollector(
+                [node()],
+                interval=10,
+                stale_after=300,
+                upgrade_height=0,
+                target_spacing=7.5,
+                network="testnet",
+                state_file=state_file,
+            )
+            self.assertEqual(second.last_advanced_at["node-a"], 1_000.0)
+            self.assertEqual(second.last_height["node-a"], 4_129_396)
+
+            # The node is still pinned at the same height long after the
+            # restart, so the row must still report a large stall age.
+            row = second.row_for(
+                node(),
+                {
+                    "height": 4_129_396,
+                    "active_state": "active",
+                    "process_running": True,
+                },
+                now=4_000.0,
+            )
+            self.assertEqual(row["seconds_since_advanced"], 3_000.0)
+            self.assertEqual(row["health"], "stale")
+
+    def test_progress_state_tolerates_a_missing_or_corrupt_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "absent.json"
+            self.assertEqual(status.load_progress(missing), {})
+            self.assertEqual(status.load_progress(None), {})
+
+            corrupt = Path(tmp) / "corrupt.json"
+            corrupt.write_text("{not json", encoding="utf-8")
+            self.assertEqual(status.load_progress(corrupt), {})
+
+            # A pre-existing file written before progress was persisted.
+            legacy = Path(tmp) / "legacy.json"
+            legacy.write_text(json.dumps({"orphan_pairs": []}), encoding="utf-8")
+            self.assertEqual(status.load_progress(legacy), {})
+
     def test_fork_depth_from_ancestor_samples(self):
         depth = status.estimate_fork_depth_from_ancestors(
             {"1": "x", "2": "y", "5": "same"},

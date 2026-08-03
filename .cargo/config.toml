@@ -1,4 +1,4 @@
-# Zebra cargo configuration
+# Zakura cargo configuration
 
 [alias]
 xtask = "run --package xtask --"

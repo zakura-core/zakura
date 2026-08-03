@@ -1,6 +1,6 @@
 ---
 name: zakura-trace-plots
-description: Generate metrics-aware plots and summaries from Zebra Zakura perf trace directories. Use when the user asks to plot or analyze Zakura traces, block_sync.jsonl, commit_state.jsonl, feedrun CSVs, applying/reorder/stalls, HoL stalls, throughput, or commit metrics from a trace_dir.
+description: Generate metrics-aware plots and summaries from Zakura perf trace directories. Use when the user asks to plot or analyze Zakura traces, block_sync.jsonl, commit_state.jsonl, feedrun CSVs, applying/reorder/stalls, HoL stalls, throughput, or commit metrics from a trace_dir.
 ---
 
 # Zakura Trace Plots

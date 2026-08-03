@@ -1,6 +1,6 @@
 ---
 name: zakura-trace-zip
-description: Create shareable zip archives from Zebra Zakura perf trace directories. Use when the user asks to zip, package, archive, share, or export a trace_dir such as feedrun-*-traces or Zakura JSONL traces.
+description: Create shareable zip archives from Zakura perf trace directories. Use when the user asks to zip, package, archive, share, or export a trace_dir such as feedrun-*-traces or Zakura JSONL traces.
 ---
 
 # Zakura Trace Zip

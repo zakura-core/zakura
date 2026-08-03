@@ -1,8 +1,6 @@
 # Cargo files
 /coverage-target/
 /out/
-# Legacy Zebra state (alpha versions only)
-.zakura-state/
 # Nix configs
 shell.nix
 # Docker compose env files
@@ -156,19 +154,17 @@ $RECYCLE.BIN/
 # Python pycache
 __pycache__/
 
-# RPC tests cache
-zakura-rpc/qa/cache/
-
 # Lychee link checker cache
 .lycheecache
 /.agent-shell/
-.claude/*
-!.claude/skills
+# .claude is a symlink to .agents; keep agent-local state out of git
+.agents/*
+!.agents/skills
 local_data/**
 
 # fuzzing artifacts
-zakura-chain/fuzz/artifacts
-zakura-chain/fuzz/corpus
+crates/zakura-chain/fuzz/artifacts
+crates/zakura-chain/fuzz/corpus
 stako/**/*
 perf-artifacts/**/*
 

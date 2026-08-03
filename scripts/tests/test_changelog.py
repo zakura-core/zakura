@@ -28,15 +28,15 @@ class ChangelogTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
-        (self.root / "changelog-unreleased").mkdir()
-        (self.root / "changelog-unreleased" / "README.md").write_text("# Fragments\n")
+        (self.root / "docs" / "changelog" / "unreleased").mkdir(parents=True)
+        (self.root / "docs" / "changelog" / "unreleased" / "README.md").write_text("# Fragments\n")
         (self.root / "CHANGELOG.md").write_text(CHANGELOG.format(version="1.0.0"))
 
     def tearDown(self):
         self.temporary_directory.cleanup()
 
     def test_parses_multi_category_fragment(self):
-        path = self.root / "changelog-unreleased" / "123.md"
+        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
         path.write_text(
             "## Fixed\n\n- Fixed a bug.\n\n## Added\n\n- Added a feature.\n"
         )
@@ -47,14 +47,14 @@ class ChangelogTests(unittest.TestCase):
         self.assertEqual(fragment.entries["Added"], "- Added a feature.")
 
     def test_requires_reason_for_no_changelog_fragment(self):
-        path = self.root / "changelog-unreleased" / "123.md"
+        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
         path.write_text("<!-- changelog: none -->\n<!-- not a reason -->\n")
 
         with self.assertRaisesRegex(changelog.ChangelogError, "explain why"):
             changelog.load_fragments(self.root)
 
     def test_accepts_no_changelog_fragment_with_reason(self):
-        path = self.root / "changelog-unreleased" / "123.md"
+        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
         path.write_text("<!-- changelog: none -->\n\nThis PR only changes tests.\n")
 
         fragment = changelog.load_fragments(self.root)[0]
@@ -62,44 +62,68 @@ class ChangelogTests(unittest.TestCase):
         self.assertEqual(fragment.entries, {})
 
     def test_rejects_fragment_without_pull_request_number(self):
-        path = self.root / "changelog-unreleased" / "my-change.md"
+        path = self.root / "docs" / "changelog" / "unreleased" / "my-change.md"
         path.write_text("## Fixed\n\n- Fixed a bug.\n")
 
         with self.assertRaisesRegex(changelog.ChangelogError, "pull request number"):
             changelog.load_fragments(self.root)
 
     def test_rejects_nested_fragment_directory(self):
-        (self.root / "changelog-unreleased" / "123").mkdir()
+        (self.root / "docs" / "changelog" / "unreleased" / "123").mkdir()
 
         with self.assertRaisesRegex(changelog.ChangelogError, "Markdown files"):
             changelog.load_fragments(self.root)
 
     def test_pull_request_owns_its_numbered_fragment(self):
-        path = self.root / "changelog-unreleased" / "123.md"
+        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
         path.write_text("<!-- changelog: none -->\n\nThis PR only changes tests.\n")
 
         with mock.patch.object(
             changelog,
             "run_git",
-            return_value="changelog-unreleased/123.md\n",
+            return_value="A\tdocs/changelog/unreleased/123.md\n",
         ) as run_git:
             changelog.check_pull_request(self.root, "base", "head", "123", False, False)
 
         run_git.assert_called_once_with(
             self.root,
-            ["diff", "--name-only", "base...head"],
+            ["diff", "--name-status", "--find-renames=100%", "base...head"],
         )
 
     def test_pull_request_cannot_delete_another_fragment(self):
-        path = self.root / "changelog-unreleased" / "123.md"
+        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
         path.write_text("<!-- changelog: none -->\n\nThis PR only changes tests.\n")
 
         with mock.patch.object(
             changelog,
             "run_git",
-            return_value=("changelog-unreleased/123.md\nchangelog-unreleased/122.md\n"),
+            return_value=(
+                "A\tdocs/changelog/unreleased/123.md\nD\tdocs/changelog/unreleased/122.md\n"
+            ),
         ):
             with self.assertRaisesRegex(changelog.ChangelogError, "unexpected"):
+                changelog.check_pull_request(
+                    self.root, "base", "head", "123", False, False
+                )
+
+    def test_pull_request_may_move_fragments_without_content_changes(self):
+        with mock.patch.object(
+            changelog,
+            "run_git",
+            return_value=(
+                "R100\told-fragments/122.md\tdocs/changelog/unreleased/122.md\n"
+                "R100\told-fragments/README.md\tdocs/changelog/unreleased/README.md\n"
+            ),
+        ):
+            changelog.check_pull_request(self.root, "base", "head", "123", False, False)
+
+    def test_renamed_rust_file_still_requires_fragment(self):
+        with mock.patch.object(
+            changelog,
+            "run_git",
+            return_value="R100\tzakura-chain/src/old.rs\tzakura-chain/src/new.rs\n",
+        ):
+            with self.assertRaisesRegex(changelog.ChangelogError, "add .*123.md"):
                 changelog.check_pull_request(
                     self.root, "base", "head", "123", False, False
                 )
@@ -108,7 +132,7 @@ class ChangelogTests(unittest.TestCase):
         with mock.patch.object(
             changelog,
             "run_git",
-            return_value="zakura-chain/src/lib.rs\n",
+            return_value="M\tzakura-chain/src/lib.rs\n",
         ):
             with self.assertRaisesRegex(changelog.ChangelogError, "add .*123.md"):
                 changelog.check_pull_request(
@@ -119,7 +143,7 @@ class ChangelogTests(unittest.TestCase):
         with mock.patch.object(
             changelog,
             "run_git",
-            return_value="zakura-chain/Cargo.toml\n",
+            return_value="M\tzakura-chain/Cargo.toml\n",
         ):
             with self.assertRaisesRegex(changelog.ChangelogError, "add .*123.md"):
                 changelog.check_pull_request(
@@ -130,14 +154,14 @@ class ChangelogTests(unittest.TestCase):
         with mock.patch.object(
             changelog,
             "run_git",
-            return_value=".github/workflows/changelog.yml\nCargo.lock\n",
+            return_value="M\t.github/workflows/changelog.yml\nM\tCargo.lock\n",
         ):
             changelog.check_pull_request(
                 self.root, "base", "head", "123", False, False
             )
 
     def test_release_versions_root_changelog_and_consumes_fragments(self):
-        path = self.root / "changelog-unreleased" / "123.md"
+        path = self.root / "docs" / "changelog" / "unreleased" / "123.md"
         path.write_text(
             "## Fixed\n\n- Fixed a bug.\n\n## Added\n\n- Added a feature.\n"
         )
@@ -166,8 +190,52 @@ class ChangelogTests(unittest.TestCase):
         with self.assertRaisesRegex(changelog.ChangelogError, "Unreleased is empty"):
             changelog.release_plan(self.root, "v1.1.0", "2026-07-21")
 
+    def test_release_retargets_unpublished_version_without_new_entries(self):
+        with mock.patch.object(changelog, "ensure_retargetable") as safety_check:
+            writes, removals = changelog.release_plan(
+                self.root,
+                "v1.1.0-rc0",
+                "2026-07-21",
+                retarget_latest=True,
+            )
+
+        rendered = writes[self.root / "CHANGELOG.md"]
+        safety_check.assert_called_once_with(
+            self.root,
+            "1.0.0",
+            changelog.CANONICAL_TAG_REMOTE,
+        )
+        self.assertIn("## [1.1.0-rc0] - 2026-07-21", rendered)
+        self.assertNotIn("## [1.0.0]", rendered)
+        self.assertIn("- Previous release.", rendered)
+        self.assertEqual(removals, [])
+
+    def test_retarget_rejects_shallow_repository(self):
+        with mock.patch.object(changelog, "run_git", return_value="true\n"):
+            with self.assertRaisesRegex(changelog.ChangelogError, "shallow"):
+                changelog.ensure_retargetable(self.root, "1.0.0", "origin")
+
+    def test_retarget_rejects_remote_tag(self):
+        with (
+            mock.patch.object(changelog, "run_git", return_value="false\n"),
+            mock.patch.object(changelog, "git_ref_exists", return_value=False),
+            mock.patch.object(changelog, "git_remote_ref_exists", return_value=True),
+        ):
+            with self.assertRaisesRegex(changelog.ChangelogError, "tag .* exists"):
+                changelog.ensure_retargetable(self.root, "1.0.0", "origin")
+
+    def test_retarget_rejects_local_tag(self):
+        with (
+            mock.patch.object(changelog, "run_git", return_value="false\n"),
+            mock.patch.object(changelog, "git_ref_exists", return_value=True),
+            mock.patch.object(changelog, "git_remote_ref_exists") as remote_check,
+        ):
+            with self.assertRaisesRegex(changelog.ChangelogError, "tag .* exists"):
+                changelog.ensure_retargetable(self.root, "1.0.0", "origin")
+        remote_check.assert_not_called()
+
     def test_stable_release_combines_and_removes_release_candidates(self):
-        first = self.root / "changelog-unreleased" / "101.md"
+        first = self.root / "docs" / "changelog" / "unreleased" / "101.md"
         first.write_text("## Added\n\n- Added the first feature.\n")
 
         writes, removals = changelog.release_plan(self.root, "v1.1.0-rc1", "2026-07-21")
@@ -176,7 +244,7 @@ class ChangelogTests(unittest.TestCase):
         for target in removals:
             target.unlink()
 
-        second = self.root / "changelog-unreleased" / "102.md"
+        second = self.root / "docs" / "changelog" / "unreleased" / "102.md"
         second.write_text("## Added\n\n- Added the second feature.\n")
 
         writes, removals = changelog.release_plan(self.root, "v1.1.0-rc2", "2026-07-22")

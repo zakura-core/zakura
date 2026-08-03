@@ -12,10 +12,6 @@ yanked = "deny"
 # Advisory ignores are for transitive dependencies with no immediate safe upgrade in this branch.
 # Remove each ignore entry as the dependency chain is upgraded.
 ignore = [
-    "RUSTSEC-2021-0139", # ansi_term — transitive via abscissa_core -> structopt
-    "RUSTSEC-2022-0104", # structopt (unmaintained) — transitive via abscissa_core and direct dep of zakura-utils
-    "RUSTSEC-2024-0375", # atty (unmaintained) — transitive via abscissa_core -> structopt
-    "RUSTSEC-2024-0370", # proc-macro-error — transitive via abscissa_core -> structopt
     "RUSTSEC-2025-0119", # number_prefix — transitive via indicatif
     "RUSTSEC-2025-0141", # bincode — direct dependency
     "RUSTSEC-2026-0118", # hickory-proto — transitive via iroh
@@ -23,7 +19,6 @@ ignore = [
     "RUSTSEC-2024-0384", # instant — transitive via iroh
     "RUSTSEC-2024-0436", # paste — transitive via iroh/netdev/stun-rs
     "RUSTSEC-2023-0089", # atomic-polyfill — transitive via iroh-metrics/postcard
-    "RUSTSEC-2025-0134", # rustls-pemfile (unmaintained) — transitive via zakura-rpc; also present on main
 ]
 
 # This section is considered when running `cargo deny check licenses`.
@@ -109,17 +104,11 @@ skip-tree = [
     # wait for ordered-map to release a dependency fix
     { name = "ordered-map", version = "=0.4.2" },
 
-    # wait for structopt upgrade (or upgrade to clap 4)
-    { name = "clap", version = "=2.34.0" },
-
     # wait for abscissa_core to upgrade
     {name = "tracing-log", version = "=0.1.4" },
 
     # wait for abscissa_core to update toml
     { name = "toml", version = "=0.5.11" },
-
-    # wait for structopt-derive to update heck
-    { name = "heck", version = "=0.3.3" },
 
     # wait for halo2_gadgets and primitive-types to update uint
     { name = "uint", version = "=0.9.5" },

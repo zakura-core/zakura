@@ -42,6 +42,7 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 - **Changelog assembly** — `make prepare-release-changelog` consumes reviewed
   PR fragments into the versioned root changelog before the release PR runs
   the protected release gate.
+- **`prepare-release-pr.yml`** — manual: mechanically prepares a release PR for a given tag (crate bumps chosen by `cargo-semver-checks` against the base tag, zakura version, lockfile, config fixture, end-of-support floor, changelog assembly via `scripts/prepare-release.sh`), verifies with `make pre-release`, and opens a draft PR through the release GitHub App. Judgment items (bump-level review, authoritative end-of-support height, changelog curation) stay with the reviewer; a `dry_run` input uploads the diff as an artifact instead of opening a PR.
 - **`update-release-state.yml`** — manual + weekly: imports the newest Mainnet checkpoint/VCT-frontier bundle from the release-state publisher (digest-verified, append-only over the committed list) and opens a draft PR for human review. Release creation itself never fetches from R2; `make pre-release` validates only the committed state.
 
 ## Fleet operations (DigitalOcean)
@@ -85,4 +86,4 @@ Droplet lifecycle is shared, not copy-pasted, through the composite actions in `
 - **Patch workflows.** When a required check is skipped by path filters, GitHub leaves it "Expected" forever. The `.patch.yml` pattern provides an empty job with the same name on the inverse path set. If you change `paths` in a gating workflow, update `status-checks.patch.yml` to match.
 - **Label-gated heavy jobs.** `C-benchmark` runs benchmarks on a PR; `run-zakura-e2e` forces the e2e suite on a PR that wouldn't otherwise trigger it.
 - **Fork PRs.** Repository secrets and variables are not available to workflows on PRs from forks, so fleet and PR-node workflows are dispatch-only from this repository.
-- **Checkpoints are updated manually.** The upstream automated checkpoint pipeline depended on the removed GCP integration tests. Until a replacement exists, follow the [`zakura-checkpoints` instructions](../../zakura-utils/README.md#zakura-checkpoints); checkpoint PRs remain consensus-critical and need careful review.
+- **Checkpoints are updated manually.** The upstream automated checkpoint pipeline depended on the removed GCP integration tests. Until a replacement exists, follow the [`zakura-checkpoints` instructions](../../crates/zakura-utils/README.md#zakura-checkpoints); checkpoint PRs remain consensus-critical and need careful review.

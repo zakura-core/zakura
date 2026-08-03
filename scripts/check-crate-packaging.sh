@@ -16,6 +16,12 @@
 # [patch.crates-io] or git dependencies for consumers of published crates
 # (enforced by the check-no-git-dependencies CI job on A-release pull requests).
 #
+# The overlay resolves every crate against local manifests, so this check
+# cannot tell that an already-published crate would be skipped at publish
+# time and resolved from the index instead. That gap is covered by
+# scripts/check-crate-publish-graph.sh, which dry-run-publishes only the
+# crates actually absent from the index.
+#
 # Usage:
 #   ./scripts/check-crate-packaging.sh           # package all, skip verify builds
 #   ./scripts/check-crate-packaging.sh --verify  # package all, build each from its archive

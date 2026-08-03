@@ -94,7 +94,7 @@ When the PR adds abstraction, flags, generics, or refactors:
 
 ### Changelog & Release Process
 
-- Every ordinary PR needs one `changelog-unreleased/<PR-number>.md` fragment;
+- Every ordinary PR needs one `docs/changelog/unreleased/<PR-number>.md` fragment;
   use the explicit no-changelog marker for internal-only work
 - User-visible changes use the appropriate Keep a Changelog category
 - Ordinary PRs do not directly edit the root changelog; release preparation

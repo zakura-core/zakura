@@ -25,7 +25,7 @@
 ## Changelog
 
 <!--
-- For Rust or Cargo.toml changes, add changelog-unreleased/<PR-number>.md after
+- For Rust or Cargo.toml changes, add docs/changelog/unreleased/<PR-number>.md after
   opening the draft PR.
 - Use the explicit no-changelog marker for internal-only changes.
 -->

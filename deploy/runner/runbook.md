@@ -92,7 +92,7 @@ the nodes.
 - Warm master: `/mnt/roman-dev-2-data/zebra-ckpt-1800000-warm` (tip 1,802,000).
   `feed_run.sh` makes a hard-link fork per run and breaks links on the
   RocksDB metadata + `version`. If the branch DB format changes, re-check
-  `zakura-state/src/constants.rs` and relabel the warm master `version`.
+  `crates/zakura-state/src/constants.rs` and relabel the warm master `version`.
 
 ## Gotchas
 

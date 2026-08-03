@@ -15,7 +15,7 @@ They can be skipped for urgent releases.
 
 For performance and security, we want to update the Zakura checkpoints in every release.
 
-- [ ] You can copy the latest checkpoints from CI by following [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/zakura-utils/README.md#zakura-checkpoints).
+- [ ] You can copy the latest checkpoints from CI by following [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/crates/zakura-utils/README.md#zakura-checkpoints).
 
 ## Missed Dependency Updates
 

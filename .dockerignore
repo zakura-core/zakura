@@ -21,13 +21,8 @@
 !deploy
 !deploy/zakura-watchdog
 !deploy/zakura-watchdog/**
-!tower-*
-!xtask
-!deploy
-!deploy/zakura-watchdog
-!deploy/zakura-watchdog/**
-!zakura-*
-!zakurad
+!crates
+!crates/**
 !docker/entrypoint.sh
 !docker/default-zakura-config.toml
 !docker/ubuntu-package.Dockerfile

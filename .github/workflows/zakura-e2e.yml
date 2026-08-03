@@ -89,7 +89,7 @@ jobs:
             fi
           fi
 
-          if printf '%s\n' "$changed" | grep -qE '^(zakura-network/|zakurad/src/components/sync/|zakurad/tests/zakura_regtest_e2e\.rs|docker/zakura-regtest-e2e/|docker/docker-compose\.zakura-regtest-e2e\.yml|\.github/workflows/zakura-e2e\.yml)'; then
+          if printf '%s\n' "$changed" | grep -qE '^(crates/zakura-network/|crates/zakurad/src/components/sync/|crates/zakurad/tests/zakura_regtest_e2e\.rs|docker/zakura-regtest-e2e/|docker/docker-compose\.zakura-regtest-e2e\.yml|\.github/workflows/zakura-e2e\.yml)'; then
             echo "zakura=true" >> "$GITHUB_OUTPUT"
           else
             echo "zakura=false" >> "$GITHUB_OUTPUT"

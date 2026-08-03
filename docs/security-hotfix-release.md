@@ -3,7 +3,7 @@
 This document describes how we ship a release for a **significant security
 issue**: the fix is developed under embargo, and the public goes from "no
 information" to "signed, tagged GitHub release + crates.io release" in one
-coordinated event. It complements [`SECURITY.md`](../SECURITY.md) (how
+coordinated event. It complements [`security.md`](security.md) (how
 vulnerabilities are reported and disclosed), the
 [release checklist](../.github/PULL_REQUEST_TEMPLATE/release-checklist.md)
 (the standard runbook), and the
@@ -143,11 +143,11 @@ Actions minutes), caches differ, and attestation is skipped — see caveat 6.
 
 For each incident, open a **draft security advisory** on the public repo
 (visible only to maintainers and invitees). It is the reporter channel (per
-`SECURITY.md`, reports already arrive there), the CVE request vehicle, the
+`security.md`, reports already arrive there), the CVE request vehicle, the
 canonical description published at T-0 — and, solo, the **continuity record**:
 keep it current enough (state, branch name in the staging repo, planned T-0)
 that another maintainer could pick up the incident if you become unavailable.
-Detail level at publication is per-incident; `SECURITY.md` already reserves
+Detail level at publication is per-incident; `security.md` already reserves
 the right to withhold reproduction details for counterfeiting-class bugs.
 
 ## Developing the fix
@@ -194,7 +194,7 @@ T-0 involves zero authoring — only pushing and clicking. The branch carries:
      leaves stale `^X.Y.Z-rcN` requirements in place when the stable version
      still matches them (`make pre-release` fails on any left behind);
    - the stored config snapshot
-     (`zakurad/tests/common/configs/v<version>.toml` — `last_config_is_stored`
+     (`crates/zakurad/tests/common/configs/v<version>.toml` — `last_config_is_stored`
      fails without it);
    - the assembled changelog section. There is no public PR to hang a
      fragment on, so write the release section by hand, exactly as fragment
@@ -288,7 +288,7 @@ are what made that survivable.
       wrong moment.
 - [ ] Optional [pre-announcement](#pre-announcement) published.
 - [ ] Main-base only: freeze the Mergify `batched` queue.
-- [ ] Partner/upstream notifications sent per `SECURITY.md`
+- [ ] Partner/upstream notifications sent per `security.md`
       (see [Coordination](#coordination-with-upstream-and-the-ecosystem)).
 - [ ] Block ~2 hours of uninterrupted time. Every step below is resumable
       (`Create release` reuses drafts and is safe to re-dispatch; the crates
@@ -353,7 +353,7 @@ What Mode B trades, explicitly:
   rehearsal of the same commit is what keeps this risk small — and juggling a
   repair alone is exactly the failure mode Mode A avoids;
 - until signing, the release page has no `SHA256SUMS.txt`/signature, so
-  `VERIFY.md` verification is impossible;
+  `docs/verify.md` verification is impossible;
 - it saves ~15–25 minutes to tag/source/crates and does **not** meaningfully
   accelerate signed binaries. Worth it under active exploitation; not
   otherwise. **Solo default is Mode A.**
@@ -364,7 +364,8 @@ From a fresh checkout of the new tag, per the standard checklist: `cargo
 login`, then the publish loop in dependency order (`zakura-test … zakura`),
 edited to the crates that changed. Hotfix notes: crates.io is **public and
 irreversible from the first crate** — it's part of T-0, never earlier;
-`release.toml` allows publishing from `hotfix/v*` checkouts; a mid-loop
+`[workspace.metadata.release]` in the root `Cargo.toml` allows publishing
+from `hotfix/v*` checkouts; a mid-loop
 failure is fixed forward by publishing the remainder, not by yanking.
 
 ### Pre-announcement
@@ -374,7 +375,7 @@ security release will be published at \<date, time UTC\>** — nothing else — 
 operators are watching when it lands. Long-standing ecosystem practice (Zcash
 2018; Bitcoin Core CVE-2018-17144). Trade-off: it also tells attackers when to
 start diffing; net positive when operator reaction time dominates. If
-severity warrants partner notifications under `SECURITY.md`, it usually
+severity warrants partner notifications under `security.md`, it usually
 warrants a pre-announcement.
 
 ### Post-release
@@ -412,7 +413,7 @@ release exists. Mode B: ~10 minutes before a tag + source release, ~35–50
 before signed binaries. The window cannot be zero: binaries are
 provenance-attested by public-repo CI and the release manifest embeds the
 repository and URLs (verified at publish) — attaching private-built binaries
-would permanently weaken what `VERIFY.md` means, on exactly the release where
+would permanently weaken what `docs/verify.md` means, on exactly the release where
 it matters most — and GitHub has no "staged but hidden" state for commits.
 Mitigations: the private dress rehearsal makes the public run one-shot;
 pre-announcement compresses operator reaction time; Mode B compresses
@@ -422,16 +423,16 @@ time-to-source when it matters.
 
 Zakura is a Zebra fork; incidents come in three shapes:
 
-- **Inherited from Zebra**: `SECURITY.md` obliges responsible disclosure with
+- **Inherited from Zebra**: `security.md` obliges responsible disclosure with
   the Zcash Foundation and ECC; T-0 is then chosen _jointly_ (expect the
   slower party to set it).
 - **Zebra ships a fix first**: the clock is already running — this process
   executes compressed (base decision, port, soak as severity allows, release;
   skip the pre-announcement — upstream's release was it).
 - **Zakura-only code** (e.g. the P2P v2 stack): we control timing; notify
-  upstream/partners per `SECURITY.md` where relevant.
+  upstream/partners per `security.md` where relevant.
 
-Partner notifications follow `SECURITY.md`'s RD-Crypto-Spec commitments,
+Partner notifications follow `security.md`'s RD-Crypto-Spec commitments,
 including the counterfeiting-bug deviation (partners may be told to upgrade
 without full detail).
 

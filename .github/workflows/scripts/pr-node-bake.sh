@@ -41,7 +41,18 @@ apt-get -o DPkg::Lock::Timeout=600 install -y -qq libc6-dbg 2>/dev/null || true
 # Rust toolchain + repo clone + warm release build
 # --------------------------------------------------------------------------- #
 
-curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+RUSTUP_INIT_VERSION=1.29.0
+# From rustup/archive/1.29.0/x86_64-unknown-linux-gnu/rustup-init.sha256.
+RUSTUP_INIT_SHA256=4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10
+rustup_tmp="$(mktemp -d)"
+rustup_init="${rustup_tmp}/rustup-init"
+trap 'rm -rf "${rustup_tmp}"' EXIT
+curl --fail --silent --show-error --location \
+  "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/x86_64-unknown-linux-gnu/rustup-init" \
+  --output "${rustup_init}"
+printf '%s  %s\n' "${RUSTUP_INIT_SHA256}" "${rustup_init}" | sha256sum --check --strict -
+chmod 0755 "${rustup_init}"
+"${rustup_init}" -y --profile minimal --default-toolchain stable
 # deploy.py runs bare `cargo` from a non-login SSH shell where ~/.cargo/env has
 # not been sourced, so the toolchain must be reachable from the default PATH.
 ln -sf /root/.cargo/bin/cargo /root/.cargo/bin/rustc /root/.cargo/bin/rustup /usr/local/bin/
@@ -167,7 +178,7 @@ fetch_state "$SANDBLAST_URL" "$SANDBLAST_SHA256" "$MAINNET_MNT/sandblast" mainne
 # Mainnet VCT approach state. Existing pruned snapshots cannot be rolled back
 # reliably because pruning removes transaction data rollback-state needs.
 # Build the rare handoff fixture forward from the retained archive instead.
-MAX_CKPT=$(tail -1 zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
+MAX_CKPT=$(tail -1 crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
 [[ "$MAX_CKPT" =~ ^[0-9]+$ ]] || {
   echo "could not determine Mainnet max checkpoint" >&2
   exit 1

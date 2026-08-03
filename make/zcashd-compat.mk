@@ -31,7 +31,7 @@ ZAKURA_COOKIE_FILE ?= $(ZAKURA_STATE_CACHE_DIR)/.cookie
 HEIGHT_MAX_DRIFT ?= 10
 
 ZAKURA_DOCKER_IMAGE ?= zakura:zcashd-compat
-ZCASHD_COMPAT_MANIFEST ?= $(CURDIR)/zakurad/zcashd-compat-manifest.json
+ZCASHD_COMPAT_MANIFEST ?= $(CURDIR)/crates/zakurad/zcashd-compat-manifest.json
 ZCASHD_COMPAT_TARGET_TRIPLE ?= x86_64-pc-linux-gnu
 ZCASHD_COMPAT_RELEASE_TAG ?= $(shell jq -er '.release_tag' $(ZCASHD_COMPAT_MANIFEST))
 ZCASHD_COMPAT_URL ?= $(shell jq -er --arg target '$(ZCASHD_COMPAT_TARGET_TRIPLE)' '.artifacts[] | select(.target_triple == $$target) | .runtime_archive_url' $(ZCASHD_COMPAT_MANIFEST))

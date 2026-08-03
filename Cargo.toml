@@ -1,35 +1,33 @@
 [workspace]
 members = [
-        "zakurad",
-        "zakura-chain",
-        "zakura-network",
-        "zakura-state",
-        "zakura-script",
-        "zakura-consensus",
-        "zakura-rpc",
-        "zakura-node-services",
-        "zakura-test",
-        "zakura-utils",
-        "tower-batch-control",
-        "tower-fallback",
+        "crates/zakurad",
+        "crates/zakura-chain",
+        "crates/zakura-network",
+        "crates/zakura-state",
+        "crates/zakura-script",
+        "crates/zakura-consensus",
+        "crates/zakura-rpc",
+        "crates/zakura-node-services",
+        "crates/zakura-test",
+        "crates/zakura-utils",
+        "crates/tower-batch-control",
+        "crates/tower-fallback",
         "deploy/zakura-watchdog",
-        "xtask",
-        "zakura-jsonl-trace",
+        "crates/xtask",
+        "crates/zakura-jsonl-trace",
 ]
 
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
 resolver = "2"
 
 [workspace.package]
-authors = ["Zakura contributors"]
+authors = ["Zakura Contributors"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zakura-core/zakura"
 homepage = "https://github.com/zakura-core/zakura"
 keywords = ["zakura", "zcash"]
 rust-version = "1.91"
 edition = "2021"
-
-# `cargo release` settings
 
 [workspace.dependencies]
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
@@ -138,7 +136,6 @@ sha2 = "0.10"
 schemars = "1"
 spandoc = "0.2"
 static_assertions = "1.1"
-structopt = "0.3"
 anyhow = "1.0"
 strum = "0.27"
 strum_macros = "0.27"
@@ -176,13 +173,39 @@ vergen-git2 = { version = "9", default-features = false }
 x25519-dalek = "2.0.1"
 zcash_note_encryption = "0.4.1"
 zcash_script = "0.4.5"
-config = { version = "0.15.14", features = ["toml"] }
+config = { version = "0.15.14", default-features = false, features = ["toml"] }
 which = "8.0.0"
 
+# All cargo-release configuration lives in this table. Do not add a root
+# release.toml: it would silently shadow every setting here (cargo-release
+# reads a workspace release.toml in preference to this metadata table).
 [workspace.metadata.release]
 
-# We always do releases from the main branch
-allow-branch = ["main"]
+# Only allow releases from the main branch or a hotfix release branch
+# (see docs/security-hotfix-release.md)
+allow-branch = ["main", "hotfix/v*"]
+
+# Workspace crate versions are deliberately independent: a crate is bumped and
+# published only when it has changes to publish. Do not configure
+# `shared-version` groups.
+
+# Verify releases with release features
+#
+# TODO: add this feature to all crates
+#enable-features = ["default-release-binaries"]
+
+# Don't do a git push or tag: `v*` tags are created only by the release App
+# via the `Create release` workflow (see docs/release-tag-protection.md)
+push = false
+tag = false
+
+# Owners for new crates
+owners = ["valardragon", "p0mvn", "evan-forbes", "czarcas7ic", "ebfull"]
+
+# Only rewrite dependent version requirements when the existing requirement
+# no longer matches: unchanged crates must stay untouched (and unpublished)
+# when a dependency takes a compatible bump.
+dependent-version = "fix"
 
 # Compilation settings
 

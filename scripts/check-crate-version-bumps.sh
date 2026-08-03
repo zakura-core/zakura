@@ -8,7 +8,11 @@
 # It does not query the registry, so it cannot detect different content already
 # published under the same name and version. It also only checks changes inside
 # each crate directory, missing workspace-level changes that affect packaging.
-# Publish-time registry content validation remains the hard-error gate.
+# scripts/check-crate-publish-graph.sh queries the registry, warns when a
+# published crate's local requirements diverge from the index copy, and
+# hard-fails unless the publishable graph resolves every workspace crate at
+# its workspace version; publish-time registry content validation remains
+# the final gate.
 #
 # Usage:
 #   ./scripts/check-crate-version-bumps.sh

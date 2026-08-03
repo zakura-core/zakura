@@ -23,8 +23,18 @@ runs:
       run: |
         set -euo pipefail
         DOCTL_VERSION=1.120.0
-        curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
-        sudo install /tmp/doctl /usr/local/bin/doctl
+        # From doctl-1.120.0-checksums.sha256 in the upstream release assets.
+        DOCTL_SHA256=4d6bddfa2480ff10a7704a26eddf5a9d1c568653fc50cc2eb033522486b9c7cd
+        tmp_dir="$(mktemp -d)"
+        archive="${tmp_dir}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz"
+        trap 'rm -rf "${tmp_dir}"' EXIT
+
+        curl --fail --silent --show-error --location \
+          "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" \
+          --output "${archive}"
+        printf '%s  %s\n' "${DOCTL_SHA256}" "${archive}" | sha256sum --check --strict -
+        tar -xzf "${archive}" -C "${tmp_dir}" doctl
+        sudo install "${tmp_dir}/doctl" /usr/local/bin/doctl
         doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
 
     # /tmp/do_ssh is hardcoded here and in do-wait-ssh because every calling

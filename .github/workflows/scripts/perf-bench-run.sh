@@ -135,7 +135,7 @@ unset GH_CLONE_TOKEN GIT_AUTH
 
 # DB-format preflight: a mismatched volume state would silently sync from
 # scratch and invalidate the numbers, so fail loudly instead.
-CODE_VER=$(grep -oE 'DATABASE_FORMAT_VERSION: .* [0-9]+' zakura-state/src/constants.rs | grep -oE '[0-9]+' | tail -n1)
+CODE_VER=$(grep -oE 'DATABASE_FORMAT_VERSION: .* [0-9]+' crates/zakura-state/src/constants.rs | grep -oE '[0-9]+' | tail -n1)
 DIR_VER=$(find "$STATE_CACHE_DIR/state" -mindepth 1 -maxdepth 1 -type d -name 'v*' 2>/dev/null | \
   sed 's#.*/v##' | sort -n | tail -1)
 if [ -z "$DIR_VER" ]; then

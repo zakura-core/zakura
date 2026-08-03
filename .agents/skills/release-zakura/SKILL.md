@@ -55,6 +55,14 @@ git diff --stat <previous-tag>
 
 ## Prepare the release branch
 
+The `Prepare release PR` workflow (`prepare-release-pr.yml`, wrapping
+`scripts/prepare-release.sh` / `make prepare-release`) performs the mechanical
+preparation below for a given tag and opens a draft PR through the release
+bot. Prefer dispatching it, then finish the judgment items it lists in the PR
+body (bump-level review, authoritative end-of-support height, changelog
+curation). The manual steps below remain the fallback and the reference for
+what the automation must produce.
+
 Name the branch `release/v<version>`. Never use `hotfix/v*` — that namespace
 is reserved for the hotfix release process
 (`docs/security-hotfix-release.md`), and keeping the namespaces disjoint is
@@ -62,7 +70,7 @@ what prevents collisions with an embargoed hotfix.
 
 ### Package versions
 
-Always update the `zakura` package version in `zakurad/Cargo.toml`; release
+Always update the `zakura` package version in `crates/zakurad/Cargo.toml`; release
 binaries self-report `CARGO_PKG_VERSION`.
 
 Stable releases always publish to crates.io. Release candidates decide
@@ -75,8 +83,24 @@ For crates.io publishing:
 1. Identify changed publishable crates.
 2. Bump those crates before their dependents.
 3. Update every direct dependency requirement that must select the new crate.
-4. Refresh `Cargo.lock`.
-5. Confirm unchanged published versions still satisfy the resulting graph.
+4. Cascade-republish dependents: a crate already published at its
+   workspace version is skipped at publish time, and its **index** manifest
+   is what dependents resolve. A prerelease bump makes those manifests
+   unresolvable (a requirement without a pre-release tag never matches a
+   pre-release). A new major never fails resolution at all: a skipped crate
+   pinning the old major makes cargo select both majors side by side, and
+   consumers get a duplicated crate with mismatched types. Either way,
+   every published crate that depends on the bumped crate — directly or
+   transitively — must republish with a patch bump. `prepare-release.sh`
+   plans that dependent closure as `cascade` rows; never drop them from a
+   crates.io-publishing release.
+5. Refresh `Cargo.lock`.
+6. Confirm unchanged published versions still satisfy the resulting graph:
+   `./scripts/check-crate-publish-graph.sh` dry-run-publishes the publish
+   set against the live index, then asserts that the Cargo.lock cargo
+   writes into each packaged archive resolves every workspace crate at its
+   workspace version — a duplicated major passes the dry-run itself. It is
+   step 5 of `make pre-release`.
 
 Partial version graphs are allowed, but all tooling must handle them. Do not
 assume every publishable crate has the `zakura` package version.
@@ -88,11 +112,11 @@ Update:
 - the README `cargo install --git ... --tag` example for stable releases only;
   while preparing a release candidate, keep the general install example on the
   latest stable tag
-- `zakurad/tests/common/configs/<version>.toml`, then remove stale generated
+- `crates/zakurad/tests/common/configs/<version>.toml`, then remove stale generated
   release fixtures so the directory retains only the current release fixture
   and custom test configurations
 - `ESTIMATED_RELEASE_HEIGHT` from the current chain tip and expected tag date
-- pending `changelog-unreleased/<PR-number>.md` fragments according to project
+- pending `docs/changelog/unreleased/<PR-number>.md` fragments according to project
   policy
 - the root changelog by running the fragment assembler after the `zakura`
   package version bump is final
@@ -114,9 +138,9 @@ make prepare-release-changelog RELEASE_TAG=<tag>
 ```
 
 This target is defined in `make/release.mk`. It must consume every numbered
-`changelog-unreleased/<PR-number>.md` fragment into the root changelog,
+`docs/changelog/unreleased/<PR-number>.md` fragment into the root changelog,
 including explicit no-changelog fragments. Keep
-`changelog-unreleased/README.md`; it documents the fragment format and is not a
+`docs/changelog/unreleased/README.md`; it documents the fragment format and is not a
 pending fragment.
 
 Review and commit the generated root changelog and numbered fragment deletions.
@@ -131,8 +155,16 @@ Run:
 ```bash
 cargo metadata --no-deps --format-version 1 --locked
 make pre-release RELEASE_TAG=<tag> BASE_TAG=<previous-tag>
+./scripts/check-crate-publish-graph.sh
 ./scripts/check-crate-packaging.sh --verify
 ```
+
+`check-crate-publish-graph.sh` needs network access and is the only check
+that resolves the publish set against the live index — packaging checks
+resolve every crate locally and cannot see that a published crate would be
+skipped. For a deliberately GitHub-only release candidate the documented
+override is `ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH=1` (workflow input
+`allow_unpublishable_crate_graph`); crates must not be published under it.
 
 Also:
 
@@ -158,7 +190,7 @@ checks and why.
   a skipped result usually means the label is missing.
 - Include motivation, solution, test evidence, issue/reference links, risk
   classification, follow-up work, and AI disclosure.
-- Confirm all `changelog-unreleased/<PR-number>.md` files were consumed and the
+- Confirm all `docs/changelog/unreleased/<PR-number>.md` files were consumed and the
   generated root changelog was committed.
 - Verify the release graph independently; a green ordinary PR build does not
   prove crates.io packaging.
@@ -177,7 +209,8 @@ watches to the approval gate, and verifies the published release; it is
 resumable and re-runs skip completed steps:
 
 ```bash
-./scripts/release-t0.sh publish --tag <tag> --mode main --head-sha <merged-commit>
+./scripts/release-t0.sh publish --tag <tag> --mode main \
+  --head-sha <merged-commit> --expected-tag-delay-days <days>
 ```
 
 Raw dispatch fallback:

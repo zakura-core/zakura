@@ -5,18 +5,16 @@ on:
     branches: [main]
     paths:
       - "**.md"
-      - "book/**"
-      - ".lychee.toml"
-      - ".codespellrc"
-      - ".trunk/configs/.markdownlint.yaml"
+      - ".github/lychee.toml"
+      - ".github/codespellrc"
+      - ".github/.markdownlint.yaml"
       - ".github/workflows/docs-check.yml"
   pull_request:
     paths:
       - "**.md"
-      - "book/**"
-      - ".lychee.toml"
-      - ".codespellrc"
-      - ".trunk/configs/.markdownlint.yaml"
+      - ".github/lychee.toml"
+      - ".github/codespellrc"
+      - ".github/.markdownlint.yaml"
       - ".github/workflows/docs-check.yml"
 
 # Ensures that only one workflow task will run at a time. Previous builds, if
@@ -58,7 +56,7 @@ jobs:
             --no-progress
             --cache
             --max-cache-age 2d
-            --config .lychee.toml
+            --config .github/lychee.toml
             "**/*.md"
           fail: true
         env:
@@ -86,7 +84,7 @@ jobs:
         run: pip install codespell
 
       - name: Run codespell
-        run: codespell --config .codespellrc
+        run: codespell --config .github/codespellrc
 
   markdown-lint:
     name: markdown-lint
@@ -113,7 +111,7 @@ jobs:
             --ignore node_modules \
             --ignore target \
             --ignore .git \
-            --config .trunk/configs/.markdownlint.yaml
+            --config .github/.markdownlint.yaml
 
   docs-check-success:
     name: docs check success

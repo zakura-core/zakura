@@ -58,9 +58,14 @@ ruleset administration must remain limited.
 
 1. Merge the release version bump into `main`.
 2. Open **Actions > Create release > Run workflow**.
-3. Select the `main` branch and enter the exact release tag.
-4. Wait for the workflow to build and verify the release assets and no-push
-   Docker builds. Nothing is tagged or published during this stage.
+3. Select the `main` branch, enter the exact release tag, and set the expected
+   tag delay. Dispatching the workflow acknowledges that no release hold is
+   active.
+4. The workflow resolves the latest digest-verified Mainnet release-state
+   bundle and warns about release-level, committed-state, or
+   `ESTIMATED_RELEASE_HEIGHT` readiness problems. Then wait for it to build and
+   verify the release assets and no-push Docker builds. Nothing is tagged or
+   published during this stage.
 5. Approve the `release` environment deployment. The workflow publishes the
    complete pre-release, creating the protected tag as its final step.
 6. Confirm that `Release binaries` starts from the new tag, skips rebuilding

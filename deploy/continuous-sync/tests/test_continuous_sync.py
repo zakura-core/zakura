@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -450,6 +452,34 @@ class ContinuousSyncTests(unittest.TestCase):
                 (tmp_path / "monitor.log").read_text(encoding="utf-8"),
             )
 
+    def test_unknown_local_sample_restarts_down_confirmation(self):
+        hostname = "temp-zakura-sync-test-1"
+        inactive = alert_status_fixture(hostname, service_active=False)
+        unknown = alert_status_fixture(hostname, service_active=None)
+        unknown["query_error"] = "status command timed out"
+        with tempfile.TemporaryDirectory() as tmp:
+            config = alert_config(Path(tmp), [hostname])
+            with (
+                patch.object(
+                    alert,
+                    "query_node",
+                    side_effect=[inactive, unknown, inactive, inactive],
+                ),
+                patch.object(alert.socket, "gethostname", return_value=hostname),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                # Service state unknown: the streak restarts rather than being
+                # carried across a gap that may have lasted hours.
+                alert.run_once(config)
+                alert.run_once(config)
+                post_alert.assert_not_called()
+
+                # Two genuinely consecutive inactive samples still page.
+                alert.run_once(config)
+                post_alert.assert_called_once()
+                self.assertEqual(post_alert.call_args.args[1], "NODE DOWN")
+
     def test_remote_node_down_does_not_page(self):
         local = "temp-zakura-sync-test-1"
         remote = "temp-zakura-sync-test-2"
@@ -813,6 +843,26 @@ class ContinuousSyncTests(unittest.TestCase):
 
             self.assertEqual(sync.load_state(state_path), original)
             post_slack.assert_not_called()
+
+    def test_resume_reports_a_dropped_slack_notification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp))
+            state_path = config.paths.state_dir / "state.json"
+            sync.save_state(state_path, {"failed": True, "failure": "boom", "phase": "failed"})
+
+            stdout = io.StringIO()
+            with (
+                patch.object(sync, "run"),
+                patch.object(sync, "post_slack", return_value=False),
+                contextlib.redirect_stdout(stdout),
+            ):
+                self.assertEqual(sync.resume(config), 0)
+
+            # The resume itself worked, so the latch stays cleared and the exit
+            # code stays 0; only the notification was lost, and `deploy.py
+            # resume` reads stdout to tell the operator about it.
+            self.assertNotIn("failed", sync.load_state(state_path))
+            self.assertIn("slack notification failed", stdout.getvalue())
 
 
 def alert_status_fixture(

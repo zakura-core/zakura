@@ -817,8 +817,12 @@ def resume(config: Config) -> int:
     except Exception:
         save_state(state_path, previous_state)
         raise
-    if was_failed:
-        post_slack(config, resumed_text(config))
+    if was_failed and not post_slack(config, resumed_text(config)):
+        # `resume` is a one-shot operator action, so nothing retries a dropped
+        # notification. Report it on stdout, where `deploy.py resume` surfaces
+        # it to the operator who is already watching the command.
+        print("resumed (slack notification failed)")
+        return 0
     print("resumed")
     return 0
 

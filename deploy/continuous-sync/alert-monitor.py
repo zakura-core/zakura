@@ -173,6 +173,17 @@ def expects_node_service(status: dict[str, Any]) -> bool:
     return phase in ("syncing", "unknown")
 
 
+def reset_down_confirmation(state: dict[str, Any], hostname: str) -> None:
+    """Drop the node-down confirmation streak after an unusable local sample.
+
+    The streak must be built from consecutive *explicitly inactive* readings.
+    Carrying it across a sample where the service state is unknown would let a
+    single inactive reading page, no matter how long the unknown gap lasted.
+    """
+    record = state.setdefault("nodes", {}).setdefault(hostname, {})
+    record["consecutive_down_samples"] = 0
+
+
 def height_text(status: dict[str, Any]) -> str:
     return "unknown" if status.get("height") is None else str(status["height"])
 
@@ -387,11 +398,13 @@ def run_once(config: dict[str, Any]) -> int:
 
     if local_status is None:
         log(config, f"local-status-missing host={local_host}")
+        reset_down_confirmation(state, local_host)
         save_state(state_file, state)
         return 0
 
     if local_status.get("query_error"):
         log(config, f"local-query-failed host={local_host} err={local_status.get('query_error')}")
+        reset_down_confirmation(state, local_host)
         save_state(state_file, state)
         return 0
 

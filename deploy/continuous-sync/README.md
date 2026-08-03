@@ -176,8 +176,11 @@ explicitly inactive and the controller phase is `syncing` or unknown. Build,
 install, cleanup, cooldown, complete, and failed controller phases can
 intentionally leave the service inactive and do not produce node-down alerts.
 Local status-query failures and metrics scrape failures also do not page as
-down; metrics degradation is logged because `/metrics` can grow large during
-long genesis syncs when historical per-peer series accumulate.
+down, and a failed local query restarts the confirmation streak so that the two
+inactive samples are genuinely consecutive rather than separated by an
+arbitrarily long gap of unknown service state. Metrics degradation is logged
+because `/metrics` can grow large during long genesis syncs when historical
+per-peer series accumulate.
 
 The controller owns lifecycle alerts. It posts an immediate failure with a
 bounded reason, posts one recovery after an explicit `resume` successfully

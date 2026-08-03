@@ -188,15 +188,6 @@ def height_text(status: dict[str, Any]) -> str:
     return "unknown" if status.get("height") is None else str(status["height"])
 
 
-def alert_mode(status: dict[str, Any]) -> str:
-    raw = str(status.get("mode") or status.get("p2p_stack") or "").lower()
-    if "zakura" in raw or "v2" in raw:
-        return "v2p2p"
-    if "zebra" in raw or "legacy" in raw:
-        return "legacy"
-    return "dual" if "dual" in raw else raw or "unknown"
-
-
 def ssh_target(status: dict[str, Any]) -> str:
     public_ip = str(status.get("public_ip") or "").strip()
     if public_ip and public_ip != "unknown":

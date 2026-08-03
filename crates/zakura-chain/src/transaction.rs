@@ -15,6 +15,8 @@ mod txid;
 mod unmined;
 pub(crate) mod zip244;
 
+const NON_CANONICAL_ORCHARD_PROOF_SIZE: &str = "non-canonical Orchard-protocol proof size";
+
 #[cfg(any(test, feature = "proptest-impl"))]
 #[allow(clippy::unwrap_in_result)]
 pub mod arbitrary;

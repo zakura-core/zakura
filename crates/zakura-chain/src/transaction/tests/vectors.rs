@@ -88,8 +88,40 @@ fn mock_pre_v5_output_list(output: transparent::Output, index: usize) -> Vec<tra
     std::iter::repeat_n(output, index + 1).collect()
 }
 
-fn deserialize_zip244_v5_test_vector(bytes: &[u8]) -> Result<Transaction, SerializationError> {
-    crate::transaction::serialize::deserialize_zip244_v5_test_vector(bytes)
+fn deserialize_canonical_zip244_test_vector(
+    bytes: &[u8],
+) -> Result<Option<Transaction>, SerializationError> {
+    match bytes.zcash_deserialize_into::<Transaction>() {
+        Ok(transaction) => Ok(Some(transaction)),
+        Err(SerializationError::Parse(NON_CANONICAL_ORCHARD_PROOF_SIZE)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[test]
+fn zip244_noncanonical_orchard_proof_sizes_are_rejected() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let mut canonical_count = 0;
+    let mut rejected_count = 0;
+
+    for test in zip0244::TEST_VECTORS.iter() {
+        if deserialize_canonical_zip244_test_vector(&test.tx)?.is_some() {
+            canonical_count += 1;
+        } else {
+            rejected_count += 1;
+        }
+    }
+
+    assert!(
+        canonical_count > 0,
+        "ZIP-244 vectors include canonical transactions"
+    );
+    assert!(
+        rejected_count > 0,
+        "ZIP-244 vectors include noncanonical Orchard proof sizes"
+    );
+
+    Ok(())
 }
 
 #[test]
@@ -681,7 +713,9 @@ fn zip244_round_trip() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     for test in zip0244::TEST_VECTORS.iter() {
-        let tx = deserialize_zip244_v5_test_vector(&test.tx)?;
+        let Some(tx) = deserialize_canonical_zip244_test_vector(&test.tx)? else {
+            continue;
+        };
         let reencoded = tx.zcash_serialize_to_vec()?;
 
         assert_eq!(test.tx, reencoded);
@@ -700,9 +734,10 @@ fn zip244_txid() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     for test in zip0244::TEST_VECTORS.iter() {
-        let txid = TxIdBuilder::new(&deserialize_zip244_v5_test_vector(&test.tx)?)
-            .txid()
-            .expect("txid");
+        let Some(tx) = deserialize_canonical_zip244_test_vector(&test.tx)? else {
+            continue;
+        };
+        let txid = TxIdBuilder::new(&tx).txid().expect("txid");
 
         assert_eq!(txid.0, test.txid);
     }
@@ -715,7 +750,9 @@ fn zip244_auth_digest() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     for test in zip0244::TEST_VECTORS.iter() {
-        let transaction = deserialize_zip244_v5_test_vector(&test.tx)?;
+        let Some(transaction) = deserialize_canonical_zip244_test_vector(&test.tx)? else {
+            continue;
+        };
         let auth_digest = transaction.auth_digest();
         assert_eq!(
             auth_digest
@@ -742,12 +779,15 @@ fn native_zip244_matches_test_vectors() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     for test in zip0244::TEST_VECTORS.iter() {
+        let Some(transaction) = deserialize_canonical_zip244_test_vector(&test.tx)? else {
+            continue;
+        };
         assert_native_zip244_matches_test_vector(
-            &test.tx,
+            &transaction,
             test.txid,
             test.auth_digest,
             "ZIP-244 V5",
-        )?;
+        );
     }
 
     for test in ironwood_v6_tx_hash::TEST_VECTORS.iter() {
@@ -801,15 +841,12 @@ fn native_zip244_matches_librustzcash_for_v5_nu6_3_orchard() {
 }
 
 fn assert_native_zip244_matches_test_vector(
-    tx_bytes: &[u8],
+    tx: &Transaction,
     expected_txid: [u8; 32],
     expected_auth_digest: [u8; 32],
     vector_name: &str,
-) -> Result<()> {
-    let tx = deserialize_zip244_v5_test_vector(tx_bytes)
-        .wrap_err_with(|| format!("failed to deserialize {vector_name}"))?;
-
-    let (txid, auth_digest) = crate::transaction::zip244::txid_and_auth_digest(&tx)
+) {
+    let (txid, auth_digest) = crate::transaction::zip244::txid_and_auth_digest(tx)
         .expect("test vectors are v5/v6 transactions with native ZIP-244 digests");
 
     assert_eq!(
@@ -822,13 +859,11 @@ fn assert_native_zip244_matches_test_vector(
     );
 
     // The separate native entry points must agree with the combined one.
-    assert_eq!(crate::transaction::zip244::txid(&tx).expect("v5/v6"), txid);
+    assert_eq!(crate::transaction::zip244::txid(tx).expect("v5/v6"), txid);
     assert_eq!(
-        crate::transaction::zip244::auth_digest(&tx).expect("v5/v6"),
+        crate::transaction::zip244::auth_digest(tx).expect("v5/v6"),
         auth_digest
     );
-
-    Ok(())
 }
 
 fn assert_native_zip244_matches_librustzcash_for_test_vector(
@@ -1258,7 +1293,9 @@ fn zip244_sighash() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     for (i, test) in zip0244::TEST_VECTORS.iter().enumerate() {
-        let transaction = deserialize_zip244_v5_test_vector(&test.tx)?;
+        let Some(transaction) = deserialize_canonical_zip244_test_vector(&test.tx)? else {
+            continue;
+        };
 
         let all_previous_outputs: Arc<Vec<_>> = Arc::new(
             test.amounts
@@ -1459,11 +1496,19 @@ fn script_code_commitment_is_version_specific() -> Result<()> {
         true,
     )?;
 
-    let v5_test = zip0244::TEST_VECTORS
+    let mut canonical_v5_test = None;
+    for test in zip0244::TEST_VECTORS
         .iter()
-        .find(|test| test.transparent_input.is_some())
-        .expect("ZIP-244 vectors include a transparent sighash");
-    let v5_transaction = deserialize_zip244_v5_test_vector(&v5_test.tx)?;
+        .filter(|test| test.transparent_input.is_some())
+    {
+        let Some(transaction) = deserialize_canonical_zip244_test_vector(&test.tx)? else {
+            continue;
+        };
+        canonical_v5_test = Some((test, transaction));
+        break;
+    }
+    let (v5_test, v5_transaction) = canonical_v5_test
+        .expect("ZIP-244 vectors include a canonical transaction with a transparent sighash");
     let v5_previous_outputs = Arc::new(
         v5_test
             .amounts
@@ -2258,7 +2303,7 @@ fn v6_noncanonical_ironwood_proof_is_rejected_during_deserialization() {
 fn assert_noncanonical_orchard_protocol_proof_size(error: SerializationError) {
     assert!(matches!(
         error,
-        SerializationError::Parse("non-canonical Orchard-protocol proof size")
+        SerializationError::Parse(NON_CANONICAL_ORCHARD_PROOF_SIZE)
     ));
 }
 

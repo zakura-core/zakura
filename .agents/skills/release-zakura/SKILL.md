@@ -116,8 +116,8 @@ Update:
   release fixtures so the directory retains only the current release fixture
   and custom test configurations
 - `ESTIMATED_RELEASE_HEIGHT` from the current chain tip and expected tag date
-- pending `changelog/unreleased/<PR-number>.md` fragments according to
-  project policy
+- pending `docs/changelog/unreleased/<PR-number>.md` fragments according to project
+  policy
 - the root changelog by running the fragment assembler after the `zakura`
   package version bump is final
 - examples in release documentation only when they are intended to track the
@@ -138,10 +138,10 @@ make prepare-release-changelog RELEASE_TAG=<tag>
 ```
 
 This target is defined in `scripts/make/release.mk`. It must consume every
-numbered `changelog/unreleased/<PR-number>.md` fragment into the root
-changelog, including explicit no-changelog fragments. Keep
-`changelog/unreleased/README.md`; it documents the fragment format and is not
-a pending fragment.
+`docs/changelog/unreleased/<PR-number>.md` fragment into the root changelog,
+including explicit no-changelog fragments. Keep
+`docs/changelog/unreleased/README.md`; it documents the fragment format and is not a
+pending fragment.
 
 Review and commit the generated root changelog and numbered fragment deletions.
 For a stable release, confirm the generated section combines and replaces all
@@ -190,8 +190,8 @@ checks and why.
   a skipped result usually means the label is missing.
 - Include motivation, solution, test evidence, issue/reference links, risk
   classification, follow-up work, and AI disclosure.
-- Confirm all `changelog/unreleased/<PR-number>.md` files were consumed and
-  the generated root changelog was committed.
+- Confirm all `docs/changelog/unreleased/<PR-number>.md` files were consumed and the
+  generated root changelog was committed.
 - Verify the release graph independently; a green ordinary PR build does not
   prove crates.io packaging.
 - Post-1.0.0 releases only: confirm the assembled root changelog contains

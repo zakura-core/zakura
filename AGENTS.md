@@ -17,7 +17,7 @@ Zakura is a Rust workspace; the member crates live under `crates/` (except `depl
 - core libraries like `crates/zakura-chain/`, `crates/zakura-consensus/`, `crates/zakura-network/`, `crates/zakura-state/`, `crates/zakura-rpc/`, `crates/zakura-script/`,
 - support crates like `crates/zakura-node-services/`, `crates/zakura-test/`, `crates/zakura-utils/`, `crates/zakura-jsonl-trace/`, `crates/tower-batch-control/`, `crates/tower-fallback/`, and `crates/xtask/`.
 
-Code is primarily in each crate's `src/`; integration tests are in `crates/*/tests/`; many unit/property tests are colocated in `src/**/tests/` (for example `prop.rs`, `vectors.rs`, `preallocate.rs`). Documentation is in `docs/` and crate READMEs. Changelog development artifacts are in `changelog/`. CI and policy automation live in `.github/workflows/`.
+Code is primarily in each crate's `src/`; integration tests are in `crates/*/tests/`; many unit/property tests are colocated in `src/**/tests/` (for example `prop.rs`, `vectors.rs`, `preallocate.rs`). Documentation is in `docs/` and crate READMEs. CI and policy automation live in `.github/workflows/`.
 
 ## Build, Test, and Development Commands
 
@@ -51,9 +51,9 @@ cargo nextest run --profile zakura-integration
 - PR titles must follow [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) (PRs are squash-merged — the PR title becomes the commit message)
 - Use `.github/pull_request_template.md`. For fixes, connect the root cause to both the solution and the test coverage.
 - Every PR that changes a Rust source file or any `Cargo.toml` adds one
-  `changelog/unreleased/<PR-number>.md` fragment, including an explicit
+  `docs/changelog/unreleased/<PR-number>.md` fragment, including an explicit
   no-changelog fragment for internal-only work. Do not edit the shared
-  changelog in ordinary PRs. See `changelog/guidelines.md`.
+  changelog in ordinary PRs. See `docs/changelog/guidelines.md`.
 
 ## Project Overview
 
@@ -177,7 +177,7 @@ cargo nextest run --profile zakura-integration
 ## Changelog
 
 - After opening a draft PR that changes a Rust source file or any `Cargo.toml`,
-  add exactly one `changelog/unreleased/<PR-number>.md` file for that PR.
+  add exactly one `docs/changelog/unreleased/<PR-number>.md` file for that PR.
 - Put user-visible `zakurad` entries under the appropriate Keep a Changelog
   category heading.
 - For internal-only work, use `<!-- changelog: none -->` and explain why.
@@ -185,8 +185,8 @@ cargo nextest run --profile zakura-integration
   assembles fragments into the root changelog.
 - Apply the appropriate PR label (`C-feature`, `C-bug`, `C-security`, etc.)
 - Run `./scripts/changelog.py check` and see
-  `changelog/unreleased/README.md` and
-  `changelog/guidelines.md` for the exact format.
+  `docs/changelog/unreleased/README.md` and
+  `docs/changelog/guidelines.md` for the exact format.
 
 ## Configuration
 

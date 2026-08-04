@@ -92,8 +92,8 @@ impl ShieldedData {
     /// present but not canonically sized can be padded with arbitrary trailing data
     /// without affecting its validity. Whole-transaction parsing enforces this
     /// rule for every V5 and V6 transaction, while semantic verification repeats
-    /// the NU6.2-onward consensus rule for defense-in-depth and in-memory
-    /// transactions. See `GHSA-jfw5-j458-pfv6`.
+    /// it for defense-in-depth and in-memory transactions. See
+    /// `GHSA-jfw5-j458-pfv6`.
     pub fn proof_size_is_canonical(&self) -> bool {
         self.proof.0.len() == expected_proof_size(self.actions.len())
     }

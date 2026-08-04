@@ -464,25 +464,16 @@ where
                 return Err(TransactionError::Other("transaction has Orchard actions (temporarily disabled)".into()));
             }
 
-            // From the network upgrade that re-enables Orchard actions (NU6.2), require
-            // that any Orchard proof has the canonical length for its number of actions.
+            // Require every Orchard or Ironwood proof to have the canonical length for
+            // its number of actions.
             // A proof that is present but not canonically sized can be padded with
             // arbitrary trailing data without affecting its validity, allowing excess
             // bandwidth and storage costs to be imposed while paying only fees sized to a
             // canonical proof (GHSA-jfw5-j458-pfv6).
             //
-            // This is a constricting rule, so it is gated on that network upgrade:
-            // Orchard actions mined before it, under earlier rules that did not enforce
-            // the proof size, must remain valid so that nodes can sync and reindex the
-            // chain before the soft fork that temporarily disabled Orchard. Whole-
-            // transaction parsing applies a stricter canonical-size policy to every V5
-            // and V6 transaction; repeat the consensus rule here using the block height
-            // for defense-in-depth and in-memory transactions.
-            //
-            // The gate activates at the NU6.2 activation height committed in
-            // MAINNET/TESTNET_ACTIVATION_HEIGHTS. See
-            // `Network::orchard_canonical_proof_size_rule_active`.
-            check::shielded_proof_size_is_canonical(&tx, req.height(), &network)?;
+            // Transaction parsing enforces the same rule. Repeat it here for
+            // defense-in-depth and transactions constructed in memory.
+            check::shielded_proof_size_is_canonical(&tx)?;
 
             // Validate the coinbase input consensus rules
             if req.is_mempool() && tx.is_coinbase() {

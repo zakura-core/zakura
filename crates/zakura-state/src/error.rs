@@ -87,9 +87,8 @@ pub struct HistoricalTreeUnavailable {
 /// chain has no subtrees here" and seed nothing, failing later without a clear cause.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[error(
-    "historical {pool} note commitment subtree {index:?} is unavailable: this node was fast-synced \
-     with verified commitment trees, so subtrees completed at or below the checkpoint handoff \
-     {handoff:?} were never recorded"
+    "historical {pool} note commitment subtree {index:?} is unavailable at checkpoint handoff \
+     {handoff:?}: {reason}"
 )]
 pub struct HistoricalSubtreeUnavailable {
     /// The shielded pool whose subtree was requested, in `z_getsubtreesbyindex` spelling.
@@ -100,6 +99,24 @@ pub struct HistoricalSubtreeUnavailable {
 
     /// The checkpoint handoff height `H`, below which no subtree roots were recorded.
     pub handoff: block::Height,
+
+    /// Whether the subtree can become available as this node continues syncing.
+    pub reason: HistoricalSubtreeUnavailableReason,
+}
+
+/// Why a requested historical subtree is currently unavailable.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum HistoricalSubtreeUnavailableReason {
+    /// The node has not reached the fast-sync checkpoint handoff yet.
+    #[error("this node is still syncing toward the checkpoint handoff; retry after sync advances")]
+    Syncing,
+
+    /// The node has passed the handoff without recording the requested subtree.
+    #[error(
+        "this node did not record the subtree and continuing synchronization will not restore it; \
+         use another node"
+    )]
+    NotStored,
 }
 
 /// An error describing why opening the finalized state database failed.

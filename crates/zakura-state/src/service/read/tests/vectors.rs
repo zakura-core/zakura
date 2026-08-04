@@ -35,7 +35,7 @@ use crate::{
             },
         },
     },
-    Config, ReadRequest, ReadResponse,
+    Config, HistoricalSubtreeUnavailableReason, ReadRequest, ReadResponse,
 };
 
 /// Test that ReadStateService responds correctly when empty.
@@ -707,6 +707,37 @@ fn handoff_tree_is_only_expected_after_sync_reaches_handoff() {
     assert!(!is_syncing_below_last_checkpoint(None, handoff));
 }
 
+/// A missing subtree is transient while the finalized tip is still below the handoff.
+#[tokio::test]
+async fn missing_subtree_while_syncing_reports_transient_reason() {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .take(2)
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Mainnet).await;
+    let handoff = Height(10);
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, handoff);
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding a future handoff succeeds");
+
+    let error = sapling_subtrees(
+        None::<Arc<Chain>>,
+        &read_state.db,
+        NoteCommitmentSubtreeIndex(0)..1.into(),
+    )
+    .expect_err("a subtree below an unreached handoff must fail closed");
+
+    assert_eq!(error.reason, HistoricalSubtreeUnavailableReason::Syncing);
+    assert!(error.to_string().contains("retry after sync advances"));
+}
+
 /// A missing handoff tree is an error once the finalized tip has reached the handoff.
 #[tokio::test]
 async fn missing_handoff_tree_fails_closed_after_sync_reaches_handoff() {
@@ -742,6 +773,8 @@ async fn missing_handoff_tree_fails_closed_after_sync_reaches_handoff() {
     assert_eq!(error.pool, "sapling");
     assert_eq!(error.index, NoteCommitmentSubtreeIndex(0));
     assert_eq!(error.handoff, handoff);
+    assert_eq!(error.reason, HistoricalSubtreeUnavailableReason::NotStored);
+    assert!(error.to_string().contains("use another node"));
 }
 
 /// Missing pre-activation trees are returned as consensus-defined empty frontiers.

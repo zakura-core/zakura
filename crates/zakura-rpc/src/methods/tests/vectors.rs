@@ -1420,6 +1420,40 @@ async fn rpc_z_get_subtrees_by_index_absent_band_is_an_error() {
     );
 
     let start_index = NoteCommitmentSubtreeIndex(0);
+    let subtrees_rpc = rpc.clone();
+    let subtrees_future = tokio::spawn(async move {
+        subtrees_rpc
+            .z_get_subtrees_by_index("sapling".to_string(), start_index, Some(1u16.into()))
+            .await
+    });
+
+    read_state
+        .expect_request(ReadRequest::SaplingSubtrees {
+            start_index,
+            limit: Some(1u16.into()),
+        })
+        .await
+        .respond_error(Box::new(zakura_state::HistoricalSubtreeUnavailable {
+            pool: "sapling",
+            index: start_index,
+            handoff: Height(3_418_406),
+            reason: zakura_state::HistoricalSubtreeUnavailableReason::NotStored,
+        }));
+
+    let subtrees_response = subtrees_future
+        .await
+        .expect("subtrees future should not panic")
+        .expect_err("an absent-band subtree list must be an error, not an empty list");
+
+    assert_eq!(subtrees_response.code(), ErrorCode::ServerError(-1).code());
+    assert!(
+        subtrees_response
+            .message()
+            .contains("continuing synchronization will not restore it"),
+        "the error must identify the failure as permanent, got: {}",
+        subtrees_response.message()
+    );
+
     let subtrees_future = tokio::spawn(async move {
         rpc.z_get_subtrees_by_index("sapling".to_string(), start_index, Some(1u16.into()))
             .await
@@ -1435,19 +1469,23 @@ async fn rpc_z_get_subtrees_by_index_absent_band_is_an_error() {
             pool: "sapling",
             index: start_index,
             handoff: Height(3_418_406),
+            reason: zakura_state::HistoricalSubtreeUnavailableReason::Syncing,
         }));
 
-    let subtrees_response = subtrees_future
+    let syncing_response = subtrees_future
         .await
         .expect("subtrees future should not panic")
-        .expect_err("an absent-band subtree list must be an error, not an empty list");
+        .expect_err("a subtree missing during sync must be an error, not an empty list");
 
-    assert_eq!(subtrees_response.code(), ErrorCode::ServerError(-1).code());
+    assert_eq!(syncing_response.code(), ErrorCode::ServerError(-1).code());
     assert!(
-        subtrees_response.message().contains("fast-synced"),
-        "the error must name the cause, got: {}",
-        subtrees_response.message()
+        syncing_response
+            .message()
+            .contains("retry after sync advances"),
+        "the error must identify the failure as transient, got: {}",
+        syncing_response.message()
     );
+    assert_ne!(subtrees_response.message(), syncing_response.message());
 
     read_state.expect_no_requests().await;
 

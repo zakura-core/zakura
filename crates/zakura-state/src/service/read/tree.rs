@@ -21,7 +21,9 @@ use zakura_chain::{
 };
 
 use crate::{
-    error::{HistoricalSubtreeUnavailable, HistoricalTreeUnavailable},
+    error::{
+        HistoricalSubtreeUnavailable, HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable,
+    },
     service::{finalized_state::ZakuraDb, non_finalized_state::Chain},
     HashOrHeight,
 };
@@ -136,6 +138,7 @@ fn check_historical_subtree_available(
             pool,
             index: first_missing,
             handoff,
+            reason: HistoricalSubtreeUnavailableReason::Syncing,
         });
     }
 
@@ -157,6 +160,7 @@ fn check_historical_subtree_available(
             pool,
             index: first_missing,
             handoff,
+            reason: HistoricalSubtreeUnavailableReason::NotStored,
         });
     };
 
@@ -165,6 +169,7 @@ fn check_historical_subtree_available(
             pool,
             index: first_missing,
             handoff,
+            reason: HistoricalSubtreeUnavailableReason::NotStored,
         })
     } else {
         Ok(())

@@ -47,8 +47,8 @@ pub use constants::{state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGH
 pub use error::{
     BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError, CommitHeaderRangeError,
     CommitSemanticallyVerifiedError, DuplicateNullifierError, HistoricalSubtreeUnavailable,
-    HistoricalTreeUnavailable, MissingSproutTipTree, StateInitError, StoreIncoherentError,
-    ValidateContextError,
+    HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable, MissingSproutTipTree,
+    StateInitError, StoreIncoherentError, ValidateContextError,
 };
 pub use request::{
     AuthenticateHeaderRootsRequest, CheckpointVerifiedBlock,

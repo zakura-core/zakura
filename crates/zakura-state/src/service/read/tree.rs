@@ -14,7 +14,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use zakura_chain::{
-    block, ironwood, orchard, sapling,
+    block, ironwood, orchard,
+    parameters::NetworkUpgrade,
+    sapling,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex, TRACKED_SUBTREE_HEIGHT},
 };
 
@@ -36,10 +38,25 @@ use zakura_chain::subtree::NoteCommitmentSubtree;
 /// (below `U`, or at or above the handoff) is never rejected. Distinguishing the absent band
 /// from an ordinary miss is what stops a client from reading the miss as the empty tree; see
 /// [`HistoricalTreeUnavailable`].
+///
+/// A missing tree before `pool_activation` is the consensus-defined empty frontier, so it is not
+/// historical data that the fast-sync path failed to store.
 fn check_historical_tree_available(
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
+    pool_activation: NetworkUpgrade,
 ) -> Result<(), HistoricalTreeUnavailable> {
+    let Some(height) = hash_or_height.height_or_else(|hash| db.height(hash)) else {
+        return Ok(());
+    };
+
+    if pool_activation
+        .activation_height(&db.network())
+        .is_none_or(|activation| height < activation)
+    {
+        return Ok(());
+    }
+
     match db.vct_synced_below() {
         Some(handoff) if db.vct_historical_tree_unavailable(hash_or_height) => {
             Err(HistoricalTreeUnavailable {
@@ -269,7 +286,7 @@ where
         .or_else(|| db.sapling_tree_by_hash_or_height(hash_or_height));
 
     if tree.is_none() {
-        check_historical_tree_available(db, hash_or_height)?;
+        check_historical_tree_available(db, hash_or_height, NetworkUpgrade::Sapling)?;
     }
 
     Ok(tree)
@@ -328,7 +345,7 @@ where
         .or_else(|| db.orchard_tree_by_hash_or_height(hash_or_height));
 
     if tree.is_none() {
-        check_historical_tree_available(db, hash_or_height)?;
+        check_historical_tree_available(db, hash_or_height, NetworkUpgrade::Nu5)?;
     }
 
     Ok(tree)
@@ -382,7 +399,7 @@ where
         .or_else(|| db.ironwood_tree_by_hash_or_height(hash_or_height));
 
     if tree.is_none() {
-        check_historical_tree_available(db, hash_or_height)?;
+        check_historical_tree_available(db, hash_or_height, NetworkUpgrade::Nu6_3)?;
     }
 
     Ok(tree)

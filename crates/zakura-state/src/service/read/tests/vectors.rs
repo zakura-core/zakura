@@ -744,6 +744,55 @@ async fn missing_handoff_tree_fails_closed_after_sync_reaches_handoff() {
     assert_eq!(error.handoff, handoff);
 }
 
+/// Missing pre-activation trees are consensus-defined empty frontiers, not unavailable history.
+#[tokio::test]
+async fn pre_activation_tree_requests_do_not_report_archive_errors() {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .take(2)
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Mainnet).await;
+    let requested_height = Height::MIN;
+    let handoff = Height(10);
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, handoff);
+    batch.delete_sapling_tree(&read_state.db, &requested_height);
+    batch.delete_orchard_tree(&read_state.db, &requested_height);
+    batch.delete_ironwood_tree(&read_state.db, &requested_height);
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding missing pre-activation trees succeeds");
+
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::SaplingTree(requested_height.into()))
+            .await
+            .expect("pre-activation Sapling tree request succeeds"),
+        ReadResponse::SaplingTree(None)
+    );
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::OrchardTree(requested_height.into()))
+            .await
+            .expect("pre-activation Orchard tree request succeeds"),
+        ReadResponse::OrchardTree(None)
+    );
+    assert_eq!(
+        read_state
+            .oneshot(ReadRequest::IronwoodTree(requested_height.into()))
+            .await
+            .expect("pre-activation Ironwood tree request succeeds"),
+        ReadResponse::IronwoodTree(None)
+    );
+}
+
 /// The served run must be checked to its end, not just at its start.
 ///
 /// `z_getsubtreesbyindex` returns one contiguous run, so a gap anywhere truncates the response.

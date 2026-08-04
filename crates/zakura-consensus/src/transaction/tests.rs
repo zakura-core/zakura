@@ -3901,6 +3901,10 @@ async fn v5_with_duplicate_orchard_action() {
         actions_vec.push(duplicate_action.clone());
         orchard_shielded_data.actions = AtLeastOne::from_vec(actions_vec)
             .expect("pushing one element never breaks at least one constraints");
+        orchard_shielded_data.proof.0.resize(
+            ::orchard::Proof::expected_proof_size(orchard_shielded_data.actions.len()),
+            0,
+        );
 
         let verifier = Verifier::new_for_tests(
             &net,

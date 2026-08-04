@@ -562,6 +562,9 @@ impl StartCmd {
                 Inbound::new(
                     config.sync.full_verify_concurrency_limit,
                     config.network.expose_peer_addresses,
+                    crate::components::block_verify_trace::BlockVerifyTrace::new(
+                        config.network.zakura.trace_dir.clone(),
+                    ),
                     zcashd_compat_pruning_retention,
                     zcashd_compat_block_gossip_peer_ips.clone(),
                     setup_rx,

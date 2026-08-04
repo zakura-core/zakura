@@ -39,7 +39,9 @@ use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
 use crate::{
-    components::sync::downloads::BlockDownloadVerifyError, config::ZakuradConfig, BoxError,
+    components::{block_verify_trace::BlockVerifyTrace, sync::downloads::BlockDownloadVerifyError},
+    config::ZakuradConfig,
+    BoxError,
 };
 
 mod downloads;
@@ -1079,6 +1081,7 @@ where
             config.network.network.clone(),
             max_checkpoint_height,
             trace.clone(),
+            BlockVerifyTrace::new(config.network.zakura.trace_dir.clone()),
         ));
 
         let new_syncer = Self {

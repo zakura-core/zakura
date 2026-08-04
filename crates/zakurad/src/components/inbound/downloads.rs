@@ -32,6 +32,7 @@ use zakura_state as zs;
 use crate::components::{
     auth_download_height::tip_child_mismatch,
     sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
+    block_verify_trace::{BlockSource, BlockVerifyTrace},
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -278,6 +279,9 @@ where
     /// The configured full verification concurrency limit, after applying the minimum limit.
     full_verify_concurrency_limit: usize,
 
+    /// Per-block download and verification timing.
+    verify_trace: BlockVerifyTrace,
+
     /// Whether legacy peer address labels in logs are unredacted.
     expose_peer_addresses: bool,
 
@@ -411,6 +415,7 @@ where
         state: ZS,
         latest_chain_tip: zs::LatestChainTip,
         chain_network: Network,
+        verify_trace: BlockVerifyTrace,
     ) -> Self {
         // The syncer already warns about the minimum.
         let full_verify_concurrency_limit =
@@ -418,6 +423,7 @@ where
 
         Self {
             full_verify_concurrency_limit,
+            verify_trace,
             expose_peer_addresses,
             network,
             verifier,
@@ -631,6 +637,11 @@ where
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
+        let verify_trace = self.verify_trace.clone();
+
+        // Gossip is the path a freshly mined block takes, so this timer
+        // measures how quickly a node can build on a competing block.
+        let download_start = std::time::Instant::now();
 
         let fut = async move {
             // Check if the full block body is already in the state. `KnownBlock`
@@ -811,11 +822,34 @@ where
                 None => None,
             };
 
+            let download_duration = download_start.elapsed();
+            let verify_start = std::time::Instant::now();
+
             verifier
                 .oneshot(zakura_consensus::Request::Commit(block))
                 .await
-                .map(|hash| (hash, block_height))
-                .map_err(|e| (e, advertiser_addr))
+                .map(|hash| {
+                    verify_trace.record(
+                        BlockSource::Gossip,
+                        Some(block_height),
+                        hash,
+                        download_duration,
+                        verify_start.elapsed(),
+                        None,
+                    );
+                    (hash, block_height)
+                })
+                .map_err(|e| {
+                    verify_trace.record(
+                        BlockSource::Gossip,
+                        Some(block_height),
+                        hash,
+                        download_duration,
+                        verify_start.elapsed(),
+                        Some(&e as &dyn std::fmt::Display),
+                    );
+                    (e, advertiser_addr)
+                })
         }
         .map_ok(|(hash, height)| {
             info!(?height, "downloaded and verified gossiped block");
@@ -907,6 +941,7 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
+            BlockVerifyTrace::noop(),
         )
     }
 
@@ -1028,6 +1063,7 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
+            BlockVerifyTrace::noop(),
         );
 
         for index in 0..MIN_CONCURRENCY_LIMIT {
@@ -1130,6 +1166,7 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
+            BlockVerifyTrace::noop(),
         );
 
         assert_eq!(
@@ -1239,6 +1276,7 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
+            BlockVerifyTrace::noop(),
         );
 
         assert_eq!(
@@ -1314,6 +1352,7 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
+            BlockVerifyTrace::noop(),
         );
 
         assert_eq!(
@@ -1416,6 +1455,7 @@ mod tests {
             })),
             latest_chain_tip,
             Network::Mainnet,
+            BlockVerifyTrace::noop(),
         )
     }
 

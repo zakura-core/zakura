@@ -3616,6 +3616,7 @@ async fn empty_block_response_is_retryable_download_failure() {
         Network::Mainnet,
         Height(0),
         LegacySyncTrace::new(None, false),
+        crate::components::block_verify_trace::BlockVerifyTrace::noop(),
     );
 
     let block0: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
@@ -3698,6 +3699,7 @@ fn setup_downloads(
         Network::Mainnet,
         Height(0),
         LegacySyncTrace::new(None, false),
+        crate::components::block_verify_trace::BlockVerifyTrace::noop(),
     )
 }
 

@@ -946,6 +946,7 @@ async fn setup(
     let inbound_service = Inbound::new(
         MAX_INBOUND_CONCURRENCY,
         false,
+        crate::components::block_verify_trace::BlockVerifyTrace::noop(),
         zcashd_compat_pruning_retention,
         protected_peer_ips.clone(),
         setup_rx,
@@ -1195,8 +1196,14 @@ mod submitblock_test {
 
         // Inbound
         let (_setup_tx, setup_rx) = oneshot::channel();
-        let inbound_service =
-            Inbound::new(MAX_INBOUND_CONCURRENCY, false, None, Vec::new(), setup_rx);
+        let inbound_service = Inbound::new(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            crate::components::block_verify_trace::BlockVerifyTrace::noop(),
+            None,
+            Vec::new(),
+            setup_rx,
+        );
         let inbound_service = ServiceBuilder::new()
             .load_shed()
             .buffer(10)

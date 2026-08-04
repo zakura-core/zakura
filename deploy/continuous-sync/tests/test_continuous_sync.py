@@ -334,11 +334,18 @@ class ContinuousSyncTests(unittest.TestCase):
             deploy.save_audit_state(path, state)
             self.assertEqual(deploy.load_audit_state(path), state)
 
+            fresh = {"version": deploy.AUDIT_STATE_VERSION, "problems": {}}
+
             path.write_text("{not json")
-            self.assertEqual(deploy.load_audit_state(path), {"version": 1, "problems": {}})
+            self.assertEqual(deploy.load_audit_state(path), fresh)
 
             path.write_text(json.dumps({"version": 999, "problems": {"node": {}}}))
-            self.assertEqual(deploy.load_audit_state(path), {"version": 1, "problems": {}})
+            self.assertEqual(deploy.load_audit_state(path), fresh)
+
+            # A record written before `kind`/`detail` replaced `problem` cannot be
+            # compared against a current problem, so the whole file is discarded.
+            path.write_text(json.dumps({"version": 1, "problems": {"node": {"problem": "boom"}}}))
+            self.assertEqual(deploy.load_audit_state(path), fresh)
 
     def test_audit_stamp_is_parsed_as_utc(self):
         # `time.mktime` would shift this by the runner's UTC offset.

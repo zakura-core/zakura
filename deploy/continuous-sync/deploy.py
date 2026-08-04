@@ -492,7 +492,10 @@ def post_slack(text: str) -> bool:
     return 200 <= response.status < 300 and body == "ok"
 
 
-AUDIT_STATE_VERSION = 1
+# Bump whenever a stored record's shape changes, so incompatible state is
+# discarded wholesale instead of being half-read. v2 replaced the single
+# `problem` string with the `kind`/`detail` pair.
+AUDIT_STATE_VERSION = 2
 
 
 def load_audit_state(path: Path | None) -> dict[str, Any]:
@@ -568,7 +571,7 @@ def audit_transitions(
         }
 
     recovered_lines = [
-        f"{name}: was {prior[name].get('detail') or prior[name].get('kind')}"
+        f"{name}: was {prior[name].get('detail')}"
         for name in sorted(prior)
         if name not in problems and isinstance(prior.get(name), dict)
     ]

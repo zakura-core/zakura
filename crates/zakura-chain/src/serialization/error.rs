@@ -19,6 +19,11 @@ pub enum SerializationError {
     #[error("parse error: {0}")]
     Parse(&'static str),
 
+    /// A shielded protocol proof did not have the canonical size for its
+    /// action count.
+    #[error("non-canonical shielded protocol proof size")]
+    NonCanonicalShieldedProofSize,
+
     /// A string was not UTF-8.
     ///
     /// Note: Rust `String` and `str` are always UTF-8.
@@ -72,6 +77,9 @@ impl From<SerializationError> for io::Error {
                 Arc::try_unwrap(e).unwrap_or_else(|e| io::Error::new(e.kind(), e.to_string()))
             }
             SerializationError::Parse(msg) => io::Error::new(io::ErrorKind::InvalidData, msg),
+            error @ SerializationError::NonCanonicalShieldedProofSize => {
+                io::Error::new(io::ErrorKind::InvalidData, error)
+            }
             SerializationError::Utf8Error(e) => io::Error::new(io::ErrorKind::InvalidData, e),
             SerializationError::TryFromSliceError(e) => {
                 io::Error::new(io::ErrorKind::InvalidData, e)

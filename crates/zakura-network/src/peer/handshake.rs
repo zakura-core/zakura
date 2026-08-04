@@ -675,6 +675,20 @@ fn configured_advertised_services(config: &Config, mut services: PeerServices) -
     services
 }
 
+fn inbound_error_address_change(
+    addr: PeerSocketAddr,
+    remote_services: PeerServices,
+    error: &SerializationError,
+) -> MetaAddrChange {
+    // Strict parsing rejects this fault before semantic verification can assign
+    // its existing ban score, so preserve the same peer penalty here.
+    if matches!(error, SerializationError::NonCanonicalShieldedProofSize) {
+        MetaAddr::new_misbehavior(addr, constants::MAX_PEER_MISBEHAVIOR_SCORE)
+    } else {
+        MetaAddr::new_errored(addr, remote_services)
+    }
+}
+
 /// Returns true when the legacy handshake should try to route this peer to Zakura P2P v2.
 fn should_attempt_zakura_upgrade(config: &Config, connection_info: &ConnectionInfo) -> bool {
     config.v2_p2p()
@@ -1695,9 +1709,12 @@ where
                                 // - the number of connections is limited
                                 // - after the first error, the peer is disconnected
                                 if let Some(book_addr) = connected_addr.get_address_book_addr() {
-                                    let _ = inbound_ts_collector
-                                        .send(MetaAddr::new_errored(book_addr, remote_services))
-                                        .await;
+                                    let change = inbound_error_address_change(
+                                        book_addr,
+                                        remote_services,
+                                        err,
+                                    );
+                                    let _ = inbound_ts_collector.send(change).await;
                                 }
                             }
                         }

@@ -93,7 +93,7 @@ fn deserialize_canonical_zip244_test_vector(
 ) -> Result<Option<Transaction>, SerializationError> {
     match bytes.zcash_deserialize_into::<Transaction>() {
         Ok(transaction) => Ok(Some(transaction)),
-        Err(SerializationError::Parse(NON_CANONICAL_ORCHARD_PROOF_SIZE)) => Ok(None),
+        Err(SerializationError::NonCanonicalShieldedProofSize) => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -2132,7 +2132,7 @@ fn standalone_orchard_proof_size_is_enforced_during_deserialization() {
             .expect("serialize");
         let error = Option::<orchard::ShieldedData>::zcash_deserialize(&bytes[..])
             .expect_err("standalone Orchard proof size must be canonical");
-        assert_noncanonical_orchard_protocol_proof_size(error);
+        assert_noncanonical_shielded_protocol_proof_size(error);
     }
 }
 
@@ -2195,7 +2195,7 @@ fn v5_orchard_proof_size_is_always_enforced_during_deserialization() {
             let bytes = tx.zcash_serialize_to_vec().expect("serialize");
             let error = Transaction::zcash_deserialize(&bytes[..])
                 .expect_err("V5 Orchard proof size is always enforced during parsing");
-            assert_noncanonical_orchard_protocol_proof_size(error);
+            assert_noncanonical_shielded_protocol_proof_size(error);
         }
     }
 }
@@ -2245,7 +2245,7 @@ fn v6_noncanonical_orchard_proof_is_rejected_during_deserialization() {
         let bytes = tx.zcash_serialize_to_vec().expect("serialize");
         let error = Transaction::zcash_deserialize(&bytes[..])
             .expect_err("V6 Orchard proof size must be canonical");
-        assert_noncanonical_orchard_protocol_proof_size(error);
+        assert_noncanonical_shielded_protocol_proof_size(error);
     }
 }
 
@@ -2296,14 +2296,14 @@ fn v6_noncanonical_ironwood_proof_is_rejected_during_deserialization() {
         let bytes = tx.zcash_serialize_to_vec().expect("serialize");
         let error = Transaction::zcash_deserialize(&bytes[..])
             .expect_err("V6 Ironwood proof size must be canonical");
-        assert_noncanonical_orchard_protocol_proof_size(error);
+        assert_noncanonical_shielded_protocol_proof_size(error);
     }
 }
 
-fn assert_noncanonical_orchard_protocol_proof_size(error: SerializationError) {
+fn assert_noncanonical_shielded_protocol_proof_size(error: SerializationError) {
     assert!(matches!(
         error,
-        SerializationError::Parse(NON_CANONICAL_ORCHARD_PROOF_SIZE)
+        SerializationError::NonCanonicalShieldedProofSize
     ));
 }
 

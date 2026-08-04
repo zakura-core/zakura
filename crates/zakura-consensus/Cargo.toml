@@ -1,6 +1,6 @@
 [package]
 name = "zakura-consensus"
-version = "5.1.0-rc1"
+version = "6.0.0-rc1"
 authors.workspace = true
 description = "Implementation of Zcash consensus checks for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -71,7 +71,7 @@ tower-batch-control = { package = "zakura-tower-batch-control", path = "../tower
 zakura-script = { path = "../zakura-script", version = "3.1.0-rc1" }
 zakura-state = { path = "../zakura-state", version = "6.0.0-rc0" }
 zakura-node-services = { path = "../zakura-node-services", version = "3.1.0-rc1" }
-zakura-chain = { path = "../zakura-chain", version = "3.1.0-rc0" }
+zakura-chain = { path = "../zakura-chain", version = "4.0.0-rc0" }
 
 zcash_protocol.workspace = true
 
@@ -97,7 +97,7 @@ tracing-error = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 zakura-state = { path = "../zakura-state", version = "6.0.0-rc0", features = ["proptest-impl"] }
-zakura-chain = { path = "../zakura-chain", version = "3.1.0-rc0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "4.0.0-rc0", features = ["proptest-impl"] }
 zakura-test = { path = "../zakura-test/", version = "2.1.0-rc1" }
 
 criterion = { workspace = true, features = ["html_reports"] }

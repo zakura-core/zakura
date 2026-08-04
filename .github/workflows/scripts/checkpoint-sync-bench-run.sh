@@ -25,10 +25,12 @@ log() { printf '[ckpt-bench-run %(%H:%M:%S)T] %s\n' -1 "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
 
 scrub_secrets() {
+  local ec=$?
   git config --global --unset credential.helper 2>/dev/null || true
-  gh auth logout --hostname github.com >/dev/null 2>&1 || true
+  command -v gh >/dev/null 2>&1 && gh auth logout --hostname github.com >/dev/null 2>&1 || true
   rm -f /root/run.env
-  return 0
+  # Preserve the script's real status: EXIT-trap failures would otherwise mask it.
+  exit "$ec"
 }
 trap scrub_secrets EXIT INT TERM
 

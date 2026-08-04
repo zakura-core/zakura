@@ -168,11 +168,13 @@ fi
 
 # Always tear down a launched node + its fork, even on FATAL/interrupt, so a failed
 # run never leaves an orphan zakurad thrashing the box or a fork eating disk.
+# Each step is `|| true` so a dead PID (clean debug_stop_at_height exit) cannot
+# trip `set -e` inside the EXIT trap and flip a successful run to failure.
 CUR_PID=""; CUR_FORK=""; CUR_REC=""
 cleanup() {
-  [[ -n "$CUR_REC" ]] && kill "$CUR_REC" 2>/dev/null
-  [[ -n "$CUR_PID" ]] && kill -9 "$CUR_PID" 2>/dev/null
-  [[ -n "$CUR_FORK" ]] && rm -rf "$CUR_FORK" 2>/dev/null
+  [[ -n "$CUR_REC" ]] && kill "$CUR_REC" 2>/dev/null || true
+  [[ -n "$CUR_PID" ]] && kill -9 "$CUR_PID" 2>/dev/null || true
+  [[ -n "$CUR_FORK" ]] && rm -rf "$CUR_FORK" 2>/dev/null || true
   return 0
 }
 trap cleanup EXIT INT TERM

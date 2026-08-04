@@ -415,7 +415,8 @@ jobs:
           sudo systemctl enable zakura-broadcast-mainnet.service
           sudo systemctl restart zakura-broadcast-mainnet.service
           sudo systemctl --no-pager --full status zakura-broadcast-mainnet.service || true
-          curl -fsS "http://127.0.0.1:8092/healthz"
+          curl --retry 10 --retry-delay 1 --retry-connrefused \
+            --max-time 2 -fsS "http://127.0.0.1:8092/healthz"
           echo
 
       - name: Install fleet watchdog

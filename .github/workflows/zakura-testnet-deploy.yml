@@ -375,7 +375,8 @@ jobs:
           sudo systemctl enable zakura-broadcast-testnet.service
           sudo systemctl restart zakura-broadcast-testnet.service
           sudo systemctl --no-pager --full status zakura-broadcast-testnet.service || true
-          curl -fsS "http://127.0.0.1:8092/healthz"
+          curl --retry 10 --retry-delay 1 --retry-connrefused \
+            --max-time 2 -fsS "http://127.0.0.1:8092/healthz"
           echo
 
       - name: Fetch recent logs on failure

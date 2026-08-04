@@ -24,10 +24,14 @@ mkdir -p "$OUT_DIR" "$BENCH_HOME"
 log() { printf '[ckpt-bench-run %(%H:%M:%S)T] %s\n' -1 "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
 
+# Invoked via trap below; shellcheck cannot see indirect calls.
+# shellcheck disable=SC2317,SC2329
 scrub_secrets() {
   local ec=$?
   git config --global --unset credential.helper 2>/dev/null || true
-  command -v gh >/dev/null 2>&1 && gh auth logout --hostname github.com >/dev/null 2>&1 || true
+  if command -v gh >/dev/null 2>&1; then
+    gh auth logout --hostname github.com >/dev/null 2>&1 || true
+  fi
   rm -f /root/run.env
   # Preserve the script's real status: EXIT-trap failures would otherwise mask it.
   exit "$ec"

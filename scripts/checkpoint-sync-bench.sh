@@ -172,9 +172,15 @@ fi
 # trip `set -e` inside the EXIT trap and flip a successful run to failure.
 CUR_PID=""; CUR_FORK=""; CUR_REC=""
 cleanup() {
-  [[ -n "$CUR_REC" ]] && kill "$CUR_REC" 2>/dev/null || true
-  [[ -n "$CUR_PID" ]] && kill -9 "$CUR_PID" 2>/dev/null || true
-  [[ -n "$CUR_FORK" ]] && rm -rf "$CUR_FORK" 2>/dev/null || true
+  if [[ -n "$CUR_REC" ]]; then
+    kill "$CUR_REC" 2>/dev/null || true
+  fi
+  if [[ -n "$CUR_PID" ]]; then
+    kill -9 "$CUR_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$CUR_FORK" ]]; then
+    rm -rf "$CUR_FORK" 2>/dev/null || true
+  fi
   return 0
 }
 trap cleanup EXIT INT TERM

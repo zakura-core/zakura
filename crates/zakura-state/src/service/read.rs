@@ -43,8 +43,6 @@ pub use find::{
     non_finalized_state_contains_block_hash, tip, tip_height, tip_with_value_balance,
 };
 pub use tree::{
-    check_historical_ironwood_subtrees_available, check_historical_orchard_subtrees_available,
-    check_historical_sapling_subtrees_available, check_historical_tree_available,
     ironwood_subtrees, ironwood_tree, orchard_subtrees, orchard_tree, sapling_subtrees,
     sapling_tree,
 };

@@ -1,12 +1,6 @@
 //! Randomised property tests for the finalized state.
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    env,
-    error::Error,
-    fs,
-    sync::Arc,
-};
+use std::{collections::HashMap, env, error::Error, fs, sync::Arc};
 
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -24,6 +18,7 @@ use zakura_chain::{
     primitives::Groth16Proof,
     serialization::{BytesInDisplayOrder, ZcashDeserializeInto},
     sprout::JoinSplit,
+    subtree::NoteCommitmentSubtreeIndex,
     transaction::{JoinSplitData, LockTime, Transaction, UnminedTx},
     LedgerState,
 };
@@ -35,7 +30,8 @@ use crate::{
     service::{
         arbitrary::PreparedChain,
         check::anchors::tx_anchors_refer_to_final_treestates,
-        read::{check_historical_sapling_subtrees_available, check_historical_tree_available},
+        non_finalized_state::Chain,
+        read::{sapling_subtrees, sapling_tree},
     },
     tests::FakeChainHelper,
     HashOrHeight,
@@ -1670,28 +1666,31 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             // lightwalletd-style clients read as the *empty* tree.
             let below_handoff_height = HashOrHeight::Height(Height(last as u32 - 1));
             prop_assert_eq!(
-                check_historical_tree_available(&fast.db, below_handoff_height),
+                sapling_tree(None::<Arc<Chain>>, &fast.db, below_handoff_height),
                 Err(HistoricalTreeUnavailable { hash_or_height: below_handoff_height, handoff }),
                 "a below-handoff tree read is a typed archive-mode error, not an absent tree"
             );
-            prop_assert_eq!(
-                check_historical_tree_available(&fast.db, HashOrHeight::Height(handoff)),
-                Ok(()),
+            prop_assert!(
+                sapling_tree(None::<Arc<Chain>>, &fast.db, HashOrHeight::Height(handoff))
+                    .expect("the handoff tree is available")
+                    .is_some(),
                 "the handoff height itself is served normally"
             );
             // A legacy node never reports the archive-mode error, whatever the height.
-            prop_assert_eq!(
-                check_historical_tree_available(&legacy.db, below_handoff_height),
-                Ok(()),
+            prop_assert!(
+                sapling_tree(None::<Arc<Chain>>, &legacy.db, below_handoff_height)
+                    .expect("legacy tree reads do not report an absent band")
+                    .is_some(),
                 "a legacy-synced node has the tree and must not report an absent band"
             );
 
             // The subtree gate must not fire just because a node is fast-synced. This chain is
             // far too short to complete a subtree, so `z_getsubtreesbyindex` at index 0 is an
             // ordinary "nothing here yet" empty list, exactly as on a legacy node.
-            prop_assert_eq!(
-                check_historical_sapling_subtrees_available(&fast.db, 0.into(), None, &BTreeMap::new()),
-                Ok(()),
+            prop_assert!(
+                sapling_subtrees(None::<Arc<Chain>>, &fast.db, NoteCommitmentSubtreeIndex(0)..)
+                    .expect("an index past the last completed subtree is available")
+                    .is_empty(),
                 "an index past the last completed subtree stays an empty list, not an error"
             );
 

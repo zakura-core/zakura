@@ -2063,30 +2063,20 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::SaplingTree(hash_or_height) => {
-                let tree = read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height);
-                if tree.is_none() {
-                    read::check_historical_tree_available(&state.db, hash_or_height)?;
-                }
-
+                let tree =
+                    read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
                 Ok(ReadResponse::SaplingTree(tree))
             }
 
             ReadRequest::OrchardTree(hash_or_height) => {
-                let tree = read::orchard_tree(state.latest_best_chain(), &state.db, hash_or_height);
-                if tree.is_none() {
-                    read::check_historical_tree_available(&state.db, hash_or_height)?;
-                }
-
+                let tree =
+                    read::orchard_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
                 Ok(ReadResponse::OrchardTree(tree))
             }
 
             ReadRequest::IronwoodTree(hash_or_height) => {
                 let tree =
-                    read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height);
-                if tree.is_none() {
-                    read::check_historical_tree_available(&state.db, hash_or_height)?;
-                }
-
+                    read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
                 Ok(ReadResponse::IronwoodTree(tree))
             }
 
@@ -2104,14 +2094,7 @@ impl Service<ReadRequest> for ReadStateService {
                     // `zcashd` does. (It never calculates an end bound, so it just keeps iterating until
                     // the trees run out.)
                     read::sapling_subtrees(best_chain, &state.db, start_index..)
-                };
-
-                read::check_historical_sapling_subtrees_available(
-                    &state.db,
-                    start_index,
-                    end_index,
-                    &sapling_subtrees,
-                )?;
+                }?;
 
                 Ok(ReadResponse::SaplingSubtrees(sapling_subtrees))
             }
@@ -2130,14 +2113,7 @@ impl Service<ReadRequest> for ReadStateService {
                     // `zcashd` does. (It never calculates an end bound, so it just keeps iterating until
                     // the trees run out.)
                     read::orchard_subtrees(best_chain, &state.db, start_index..)
-                };
-
-                read::check_historical_orchard_subtrees_available(
-                    &state.db,
-                    start_index,
-                    end_index,
-                    &orchard_subtrees,
-                )?;
+                }?;
 
                 Ok(ReadResponse::OrchardSubtrees(orchard_subtrees))
             }
@@ -2152,14 +2128,7 @@ impl Service<ReadRequest> for ReadStateService {
                     read::ironwood_subtrees(best_chain, &state.db, start_index..end_index)
                 } else {
                     read::ironwood_subtrees(best_chain, &state.db, start_index..)
-                };
-
-                read::check_historical_ironwood_subtrees_available(
-                    &state.db,
-                    start_index,
-                    end_index,
-                    &ironwood_subtrees,
-                )?;
+                }?;
 
                 Ok(ReadResponse::IronwoodSubtrees(ironwood_subtrees))
             }

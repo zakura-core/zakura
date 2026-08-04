@@ -36,7 +36,7 @@ use zakura_chain::subtree::NoteCommitmentSubtree;
 /// (below `U`, or at or above the handoff) is never rejected. Distinguishing the absent band
 /// from an ordinary miss is what stops a client from reading the miss as the empty tree; see
 /// [`HistoricalTreeUnavailable`].
-pub fn check_historical_tree_available(
+fn check_historical_tree_available(
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
 ) -> Result<(), HistoricalTreeUnavailable> {
@@ -186,7 +186,7 @@ pub(crate) fn first_missing_subtree_index<Node>(
 /// completed inside the verified-commitment-trees absent band.
 ///
 /// See [`check_historical_subtree_available`].
-pub fn check_historical_sapling_subtrees_available(
+fn check_historical_sapling_subtrees_available(
     db: &ZakuraDb,
     start_index: NoteCommitmentSubtreeIndex,
     end_index: Option<NoteCommitmentSubtreeIndex>,
@@ -207,7 +207,7 @@ pub fn check_historical_sapling_subtrees_available(
 /// completed inside the verified-commitment-trees absent band.
 ///
 /// See [`check_historical_subtree_available`].
-pub fn check_historical_orchard_subtrees_available(
+fn check_historical_orchard_subtrees_available(
     db: &ZakuraDb,
     start_index: NoteCommitmentSubtreeIndex,
     end_index: Option<NoteCommitmentSubtreeIndex>,
@@ -225,7 +225,7 @@ pub fn check_historical_orchard_subtrees_available(
 /// completed inside the verified-commitment-trees absent band.
 ///
 /// See [`check_historical_subtree_available`].
-pub fn check_historical_ironwood_subtrees_available(
+fn check_historical_ironwood_subtrees_available(
     db: &ZakuraDb,
     start_index: NoteCommitmentSubtreeIndex,
     end_index: Option<NoteCommitmentSubtreeIndex>,
@@ -249,7 +249,7 @@ pub fn sapling_tree<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<Arc<sapling::tree::NoteCommitmentTree>>
+) -> Result<Option<Arc<sapling::tree::NoteCommitmentTree>>, HistoricalTreeUnavailable>
 where
     C: AsRef<Chain>,
 {
@@ -258,9 +258,15 @@ where
     // Since sapling treestates are the same in the finalized and non-finalized
     // state, we check the most efficient alternative first. (`chain` is always
     // in memory, but `db` stores blocks on disk, with a memory cache.)
-    chain
+    let tree = chain
         .and_then(|chain| chain.as_ref().sapling_tree(hash_or_height))
-        .or_else(|| db.sapling_tree_by_hash_or_height(hash_or_height))
+        .or_else(|| db.sapling_tree_by_hash_or_height(hash_or_height));
+
+    if tree.is_none() {
+        check_historical_tree_available(db, hash_or_height)?;
+    }
+
+    Ok(tree)
 }
 
 /// Returns a list of Sapling [`NoteCommitmentSubtree`]s with indexes in the provided range.
@@ -273,16 +279,26 @@ pub fn sapling_subtrees<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     range: impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex> + Clone,
-) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>>
+) -> Result<
+    BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>>,
+    HistoricalSubtreeUnavailable,
+>
 where
     C: AsRef<Chain>,
 {
-    subtrees(
+    let (start_index, end_index) = subtree_range_bounds(&range);
+    let subtrees = subtrees(
         chain,
         range,
         |chain, range| chain.sapling_subtrees_in_range(range),
         |range| db.sapling_subtree_list_by_index_range(range),
-    )
+    );
+
+    if let Some(start_index) = start_index {
+        check_historical_sapling_subtrees_available(db, start_index, end_index, &subtrees)?;
+    }
+
+    Ok(subtrees)
 }
 
 /// Returns the Orchard
@@ -292,7 +308,7 @@ pub fn orchard_tree<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<Arc<orchard::tree::NoteCommitmentTree>>
+) -> Result<Option<Arc<orchard::tree::NoteCommitmentTree>>, HistoricalTreeUnavailable>
 where
     C: AsRef<Chain>,
 {
@@ -301,9 +317,15 @@ where
     // Since orchard treestates are the same in the finalized and non-finalized
     // state, we check the most efficient alternative first. (`chain` is always
     // in memory, but `db` stores blocks on disk, with a memory cache.)
-    chain
+    let tree = chain
         .and_then(|chain| chain.as_ref().orchard_tree(hash_or_height))
-        .or_else(|| db.orchard_tree_by_hash_or_height(hash_or_height))
+        .or_else(|| db.orchard_tree_by_hash_or_height(hash_or_height));
+
+    if tree.is_none() {
+        check_historical_tree_available(db, hash_or_height)?;
+    }
+
+    Ok(tree)
 }
 
 /// Returns a list of Orchard [`NoteCommitmentSubtree`]s with indexes in the provided range.
@@ -316,16 +338,26 @@ pub fn orchard_subtrees<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     range: impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex> + Clone,
-) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>
+) -> Result<
+    BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
+    HistoricalSubtreeUnavailable,
+>
 where
     C: AsRef<Chain>,
 {
-    subtrees(
+    let (start_index, end_index) = subtree_range_bounds(&range);
+    let subtrees = subtrees(
         chain,
         range,
         |chain, range| chain.orchard_subtrees_in_range(range),
         |range| db.orchard_subtree_list_by_index_range(range),
-    )
+    );
+
+    if let Some(start_index) = start_index {
+        check_historical_orchard_subtrees_available(db, start_index, end_index, &subtrees)?;
+    }
+
+    Ok(subtrees)
 }
 
 /// Returns the Ironwood
@@ -335,13 +367,19 @@ pub fn ironwood_tree<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<Arc<ironwood::tree::NoteCommitmentTree>>
+) -> Result<Option<Arc<ironwood::tree::NoteCommitmentTree>>, HistoricalTreeUnavailable>
 where
     C: AsRef<Chain>,
 {
-    chain
+    let tree = chain
         .and_then(|chain| chain.as_ref().ironwood_tree(hash_or_height))
-        .or_else(|| db.ironwood_tree_by_hash_or_height(hash_or_height))
+        .or_else(|| db.ironwood_tree_by_hash_or_height(hash_or_height));
+
+    if tree.is_none() {
+        check_historical_tree_available(db, hash_or_height)?;
+    }
+
+    Ok(tree)
 }
 
 /// Returns a list of Ironwood [`NoteCommitmentSubtree`]s with indexes in the
@@ -355,16 +393,49 @@ pub fn ironwood_subtrees<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     range: impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex> + Clone,
-) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>>
+) -> Result<
+    BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>>,
+    HistoricalSubtreeUnavailable,
+>
 where
     C: AsRef<Chain>,
 {
-    subtrees(
+    let (start_index, end_index) = subtree_range_bounds(&range);
+    let subtrees = subtrees(
         chain,
         range,
         |chain, range| chain.ironwood_subtrees_in_range(range),
         |range| db.ironwood_subtree_list_by_index_range(range),
-    )
+    );
+
+    if let Some(start_index) = start_index {
+        check_historical_ironwood_subtrees_available(db, start_index, end_index, &subtrees)?;
+    }
+
+    Ok(subtrees)
+}
+
+/// Returns the first requested subtree index and the exclusive end bound.
+fn subtree_range_bounds(
+    range: &impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex>,
+) -> (
+    Option<NoteCommitmentSubtreeIndex>,
+    Option<NoteCommitmentSubtreeIndex>,
+) {
+    use std::ops::Bound::*;
+
+    let start = match range.start_bound().cloned() {
+        Included(start) => Some(start),
+        Excluded(start) => start.0.checked_add(1).map(Into::into),
+        Unbounded => Some(0.into()),
+    };
+    let end = match range.end_bound().cloned() {
+        Included(end) => end.0.checked_add(1).map(Into::into),
+        Excluded(end) => Some(end),
+        Unbounded => None,
+    };
+
+    (start, end)
 }
 
 /// Returns a list of [`NoteCommitmentSubtree`]s in the provided range.

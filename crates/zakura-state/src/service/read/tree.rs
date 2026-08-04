@@ -64,6 +64,14 @@ pub(crate) fn subtree_completed_by_handoff(
     u64::from(start_index) < (handoff_leaves >> TRACKED_SUBTREE_HEIGHT)
 }
 
+/// Returns `true` while the finalized tip has not reached the checkpoint handoff.
+pub(crate) fn is_syncing_below_last_checkpoint(
+    finalized_tip: Option<block::Height>,
+    handoff: block::Height,
+) -> bool {
+    finalized_tip.is_some_and(|tip| tip < handoff)
+}
+
 /// Returns an error if the served run stops short of a subtree that exists on this chain but
 /// this node cannot supply.
 ///
@@ -95,12 +103,29 @@ fn check_historical_subtree_available(
         return Ok(());
     };
 
+    // The durable handoff marker is written by the first fast-path commit, so it exists throughout
+    // an ordinary fast sync even though the handoff height is still above the finalized tip. The
+    // tree lookup necessarily returns `None` in that state; refuse the incomplete response without
+    // reporting a database invariant failure.
+    if is_syncing_below_last_checkpoint(db.finalized_tip_height(), handoff) {
+        tracing::debug!(
+            pool,
+            ?handoff,
+            "checkpoint handoff has not been reached; refusing to serve incomplete subtrees",
+        );
+
+        return Err(HistoricalSubtreeUnavailable {
+            pool,
+            index: first_missing,
+            handoff,
+        });
+    }
+
     // Without the handoff leaf count there is no way to tell a skipped subtree from one that
     // never existed, so fail closed. Reporting the archive-mode error for a subtree that was
     // genuinely never completed is a visible, diagnosable wrong answer; serving a truncated list
-    // is the silent one this whole path exists to remove. The tree at the handoff is outside the
-    // absent band and at or below the tip, so this is not expected to happen — but "not expected"
-    // is the wrong thing to lean on when the failure is silent.
+    // is the silent one this whole path exists to remove. Once the tip reaches the handoff, its
+    // tree is outside the absent band and must be present.
     let Some(leaves) = handoff_leaves(db, handoff) else {
         tracing::error!(
             pool,

@@ -29,7 +29,10 @@ use crate::{
         non_finalized_state::Chain,
         read::{
             ironwood_subtrees, orchard_subtrees, sapling_subtrees,
-            tree::{first_missing_subtree_index, subtree_completed_by_handoff},
+            tree::{
+                first_missing_subtree_index, is_syncing_below_last_checkpoint,
+                subtree_completed_by_handoff,
+            },
         },
     },
     Config, ReadRequest, ReadResponse,
@@ -686,6 +689,20 @@ fn subtree_absent_band_bound_is_exact() {
         1128.into(),
         sapling_leaves_at_handoff
     ));
+}
+
+/// A persisted handoff marker does not mean the handoff tree should exist before sync reaches it.
+#[test]
+fn handoff_tree_is_only_expected_after_sync_reaches_handoff() {
+    let handoff = Height(10);
+
+    assert!(is_syncing_below_last_checkpoint(Some(Height(9)), handoff));
+    assert!(!is_syncing_below_last_checkpoint(Some(handoff), handoff));
+    assert!(!is_syncing_below_last_checkpoint(Some(Height(11)), handoff));
+
+    // A marker without any finalized block cannot be produced by the atomic commit path, so keep
+    // treating that state as an invariant failure rather than ordinary sync progress.
+    assert!(!is_syncing_below_last_checkpoint(None, handoff));
 }
 
 /// The served run must be checked to its end, not just at its start.

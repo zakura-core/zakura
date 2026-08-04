@@ -116,6 +116,52 @@ class StallRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(self.posted, [])
 
+    def test_a_node_resynced_from_a_lower_tip_can_still_recover(self):
+        # Wiping and resyncing is a normal fix for a stuck node. Anchored at the
+        # pre-stall tip the alert would stay latched for the whole resync and no
+        # recovery would ever post, so the anchor follows the node down.
+        bucket = {}
+        self.fire_stall(bucket)
+        self.posted.clear()
+
+        watchdog.update_alert_state(
+            bucket, "fleet/node-a", "ok", 3000.0, 0.0,
+            "STALLED", "RECOVERED", 3000.0, False, make_args(), 5_000,
+        )
+        self.assertEqual(self.posted, [], "a lower tip is not forward progress")
+        self.assertTrue(bucket["fleet/node-a"]["alerting"])
+        self.assertEqual(bucket["fleet/node-a"]["alert_height"], 5_000)
+
+        # It is now climbing again, so the recovery posts on the next sample.
+        watchdog.update_alert_state(
+            bucket, "fleet/node-a", "ok", 3600.0, 0.0,
+            "STALLED", "RECOVERED", 3600.0, False, make_args(), 5_100,
+        )
+        self.assertEqual(self.posted, ["RECOVERED"])
+        self.assertFalse(bucket["fleet/node-a"]["alerting"])
+
+    def test_alert_height_is_backfilled_when_it_was_unknown_at_fire_time(self):
+        # A row can alert without a usable height. With no anchor the latch has
+        # nothing to compare against and the first reset timer clears it.
+        bucket = {}
+        self.fire_stall(bucket, height=None)
+        self.assertEqual(len(self.posted), 1)
+        self.assertIsNone(bucket["fleet/node-a"].get("alert_height"))
+        self.posted.clear()
+
+        watchdog.update_alert_state(
+            bucket, "fleet/node-a", "stalled", 300.0, 600.0,
+            "STALLED", "RECOVERED", 1100.0, False, make_args(), 4129396,
+        )
+        self.assertEqual(bucket["fleet/node-a"]["alert_height"], 4129396)
+
+        watchdog.update_alert_state(
+            bucket, "fleet/node-a", "ok", 2000.0, 0.0,
+            "STALLED", "RECOVERED", 2000.0, False, make_args(), 4129396,
+        )
+        self.assertEqual(self.posted, [], "cleared at an unchanged height")
+        self.assertTrue(bucket["fleet/node-a"]["alerting"])
+
     def test_down_alerts_still_recover_without_height_progress(self):
         # Only stalls are height-gated; a restarted node legitimately recovers
         # at whatever height it comes back on.

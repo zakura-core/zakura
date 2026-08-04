@@ -249,6 +249,13 @@ def update_alert_state(
         if was_alerting:
             if not stall_cleared(entry, height):
                 # Keep the alert latched; the timer reset but the node did not move.
+                anchor = coerce_float(entry.get("alert_height"))
+                if height is not None and anchor is not None and height < anchor:
+                    # The node was wiped, rolled back, or restarted onto a shorter
+                    # chain. Follow it down: anchored at the old tip the alert could
+                    # only clear once it re-synced past it, so a node that was fixed
+                    # by a resync would never post a recovery.
+                    entry = {**entry, "alert_height": height}
                 state_bucket[key] = entry
                 return
             if post_slack(recovery_text, args):
@@ -272,8 +279,15 @@ def update_alert_state(
         "last_seen": now,
     }
 
-    if alerting and entry.get("alert_height") is not None:
-        next_entry["alert_height"] = entry["alert_height"]
+    if alerting:
+        anchor = entry.get("alert_height")
+        if anchor is None and condition == "stalled":
+            # The alert fired on a sample with no usable height, so it has nothing
+            # to compare against and would clear on the first reset timer. Anchor
+            # on the first sample that does report one.
+            anchor = height
+        if anchor is not None:
+            next_entry["alert_height"] = anchor
 
     if not alerting and age >= threshold:
         if suppressed:

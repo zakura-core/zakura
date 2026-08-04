@@ -2,13 +2,12 @@
 #
 # checkpoint-sync-bench.sh — repeatable checkpoint-zone sync benchmark.
 #
-# Downloads a pre-synced ~1.7M mainnet state snapshot once, hard-link-forks it per
-# run (cp -al), runs a prebuilt release zakurad forward through the checkpoint zone
-# pinned to a single peer, and prints: time taken, blocks covered, blocks/s.
+# Hard-link-forks a ~1.7M mainnet state master, runs zakurad forward through the
+# checkpoint zone, and prints: time taken, blocks covered, blocks/s.
 #
-# No build: the zakurad binary comes from a published GitHub release tarball.
-# Designed to run on the roman-zakura-3 self-hosted runner, but it is self-contained
-# and can be run by hand on any Linux box with enough disk.
+# Primary CI path (checkpoint-sync-bench.yml): an ephemeral DigitalOcean droplet
+# mounts a baked sandblast volume and sets STATE_MASTER so no archive download is
+# needed. Local/manual runs can still stream-download a snapshot into BENCH_HOME.
 #
 # Binary source (pick one; BUILD_REF wins):
 #   BUILD_REF             git branch/tag/SHA to build ON THIS HOST, cached by commit
@@ -32,16 +31,22 @@
 #   TARGET_P2P_STACK            legacy | zakura | dual
 #                               default: zakura
 #   BASELINE_P2P_STACK          same as TARGET_P2P_STACK for the baseline run (default: legacy)
-#   SNAPSHOT_URL          primary snapshot .tar.zst URL
+#   STATE_MASTER          pre-mounted immutable state tree (skips SNAPSHOT_URL download)
+#   FORKS_DIR             hard-link fork root (default $BENCH_HOME/forks; must share
+#                         a filesystem with STATE_MASTER / MASTER for cp -al)
+#   SNAPSHOT_URL          primary snapshot .tar.zst URL (ignored when STATE_MASTER set)
 #   SNAPSHOT_SHA256       expected sha256 of the .tar.zst
 #   START_HEIGHT          snapshot tip height                  (default 1707210)
-#   BENCH_HOME            persistent cache root                (default /opt/zakura-bench)
+#   BENCH_HOME            cache root (bins / optional master)  (default /opt/zakura-bench)
+#   BUILD_SRC             source checkout for host builds      (default $BENCH_HOME/src)
+#   BUILD_TARGET          cargo target dir                     (default $BENCH_HOME/build-target)
+#   BUILD_CARGO_HOME      cargo home                           (default $BENCH_HOME/cargo-home)
 #   GH_REPO               releases repo                        (default zakura-core/zakura)
 #   OUT_DIR               artifact output dir                  (default ./bench-out)
 #   METRICS_PORT          Prometheus port (auto-bumps if busy) (default 19999)
 #   LISTEN_PORT           P2P listen port  (auto-bumps if busy)(default 18233)
 #   DASHBOARD             1 = record metrics + emit bottleneck verdict (default 1)
-#   DASHBOARD_ARCHIVE     recorded-run dir the dashboard serves (default $BENCH_HOME/dashboard/runs)
+#   DASHBOARD_ARCHIVE     recorded-run dir for local replay    (default $OUT_DIR/dashboard-runs)
 #   BUILD_FEATURES        cargo features for host builds (default prometheus,commit-metrics)
 #
 # Ports default high and auto-skip busy ones so the bench can coexist with another
@@ -49,8 +54,8 @@
 #
 # Observability: each run records a Prometheus time series via scripts/zakura-metrics-dashboard.py
 # into DASHBOARD_ARCHIVE, classifies it into a commit/download/verify bottleneck verdict
-# (summary banner + verdict-*.json), and the always-on dashboard (scripts/zakura-dashboard.service)
-# replays every recorded run at http://<box>:8090/. See that unit file for one-time setup.
+# (summary banner + verdict-*.json), and copies the series into OUT_DIR. Replay locally with:
+#   python3 scripts/zakura-metrics-dashboard.py --archive <downloaded>/dashboard-runs --port 8090
 set -euo pipefail
 
 # ---- inputs / defaults -------------------------------------------------------
@@ -74,17 +79,18 @@ PEERSET_SIZE="${PEERSET_SIZE:-1}"   # 1 = strict single pinned peer; raise to al
 TARGET_P2P_STACK="${TARGET_P2P_STACK:-}"
 BASELINE_P2P_STACK="${BASELINE_P2P_STACK:-}"
 START_HEIGHT="${START_HEIGHT:-1707210}"
+STATE_MASTER="${STATE_MASTER:-}"
 SNAPSHOT_URL="${SNAPSHOT_URL:-https://zakura.valargroup.dev/mainnet/historical/zakura-mainnet-20260717T095333Z-1707210.tar.zst}"
 SNAPSHOT_SHA256="${SNAPSHOT_SHA256:-2bcb3786252300b4163b38a49b2d3a8015ba581d7d3efc854e6ed662a18258ac}"
 SNAPSHOT_MIRROR="${SNAPSHOT_MIRROR:-}"
 BENCH_HOME="${BENCH_HOME:-/opt/zakura-bench}"
 GH_REPO="${GH_REPO:-zakura-core/zakura}"
 OUT_DIR="${OUT_DIR:-$PWD/bench-out}"
-# Observability dashboard: record a per-run metrics time series + emit a bottleneck
-# verdict (commit / download / verify). DASHBOARD_ARCHIVE is where the always-on
-# dashboard service (scripts/zakura-dashboard.service) reads recorded runs from.
+# Observability: record a per-run metrics time series + emit a bottleneck
+# verdict (commit / download / verify). CI uploads DASHBOARD_ARCHIVE in the
+# artifact for local replay; there is no persistent host dashboard.
 DASHBOARD="${DASHBOARD:-1}"
-DASHBOARD_ARCHIVE="${DASHBOARD_ARCHIVE:-$BENCH_HOME/dashboard/runs}"
+DASHBOARD_ARCHIVE="${DASHBOARD_ARCHIVE:-$OUT_DIR/dashboard-runs}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DASHBOARD_PY="${DASHBOARD_PY:-$SCRIPT_DIR/zakura-metrics-dashboard.py}"
 GITHUB_RUN_URL="${GITHUB_RUN_URL:-}"
@@ -92,7 +98,15 @@ if [[ -z "$GITHUB_RUN_URL" && -n "${GITHUB_RUN_ID:-}" ]]; then
   GITHUB_RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-$GH_REPO}/actions/runs/$GITHUB_RUN_ID"
 fi
 
-MASTER="$BENCH_HOME/master-${START_HEIGHT}"
+if [[ -n "$STATE_MASTER" ]]; then
+  MASTER="$STATE_MASTER"
+else
+  MASTER="$BENCH_HOME/master-${START_HEIGHT}"
+fi
+FORKS_DIR="${FORKS_DIR:-$BENCH_HOME/forks}"
+BUILD_SRC="${BUILD_SRC:-$BENCH_HOME/src}"
+BUILD_TARGET="${BUILD_TARGET:-$BENCH_HOME/build-target}"
+BUILD_CARGO_HOME="${BUILD_CARGO_HOME:-$BENCH_HOME/cargo-home}"
 SAMPLE_INTERVAL=5
 ZAKURAD_BIN=""
 ZAKURA_BOOTSTRAP_PEERS=(
@@ -194,24 +208,40 @@ ensure_deps() {
 
 ensure_bench_home() {
   if [[ ! -d "$BENCH_HOME" ]]; then
-    sudo mkdir -p "$BENCH_HOME" || die "cannot create $BENCH_HOME"
-    sudo chown "$(id -u):$(id -g)" "$BENCH_HOME" || die "cannot own $BENCH_HOME"
+    mkdir -p "$BENCH_HOME" 2>/dev/null \
+      || { sudo mkdir -p "$BENCH_HOME" || die "cannot create $BENCH_HOME"
+           sudo chown "$(id -u):$(id -g)" "$BENCH_HOME" || die "cannot own $BENCH_HOME"; }
   fi
   [[ -w "$BENCH_HOME" ]] || die "$BENCH_HOME not writable"
-  mkdir -p "$BENCH_HOME/snapshots" "$BENCH_HOME/bins" "$BENCH_HOME/forks"
-  local avail_gib
-  avail_gib=$(df -B1G --output=avail "$BENCH_HOME" | tail -1 | tr -dc '0-9')
-  log "free space at $BENCH_HOME: ${avail_gib}GiB"
-  # streaming extract needs room for the ~40GiB extracted master + per-run fork divergence
-  (( avail_gib >= 45 )) || die "need >=45GiB free at $BENCH_HOME, have ${avail_gib}GiB"
+  mkdir -p "$BENCH_HOME/snapshots" "$BENCH_HOME/bins" "$FORKS_DIR"
+  local avail_gib disk_root
+  # When STATE_MASTER is set, free space for forks matters on that filesystem.
+  disk_root="$BENCH_HOME"
+  [[ -n "$STATE_MASTER" ]] && disk_root="$FORKS_DIR"
+  avail_gib=$(df -B1G --output=avail "$disk_root" | tail -1 | tr -dc '0-9')
+  log "free space at $disk_root: ${avail_gib}GiB"
+  if [[ -n "$STATE_MASTER" ]]; then
+    # baked volume already holds the master; only fork divergence needs headroom
+    (( avail_gib >= 20 )) || die "need >=20GiB free at $disk_root for forks, have ${avail_gib}GiB"
+  else
+    # streaming extract needs room for the ~40GiB extracted master + fork divergence
+    (( avail_gib >= 45 )) || die "need >=45GiB free at $BENCH_HOME, have ${avail_gib}GiB"
+  fi
 }
 
-# ---- 1. snapshot (stream download+extract once, cached) ----------------------
-# Streams the .tar.zst straight through zstd|tar so the compressed tarball is never
-# stored on disk (the box has only ~one disk and can't hold tarball + extracted state).
-# sha256 is computed over the compressed stream via tee and checked after extraction.
+# ---- 1. snapshot (pre-mounted master, or stream download+extract once) -------
+# When STATE_MASTER is set (ephemeral CI), the baked volume already holds the
+# immutable tree. Otherwise streams the .tar.zst through zstd|tar so the
+# compressed tarball is never stored on disk.
 ensure_snapshot() {
   local version_file
+  if [[ -n "$STATE_MASTER" ]]; then
+    [[ -d "$MASTER/state" ]] || die "STATE_MASTER missing state/: $MASTER"
+    version_file="$(find "$MASTER/state" -mindepth 3 -maxdepth 3 -type f -path '*/mainnet/version' -print -quit 2>/dev/null || true)"
+    [[ -n "$version_file" ]] || die "STATE_MASTER missing state/v*/mainnet/version: $MASTER"
+    log "using pre-mounted state master: $MASTER (db v$(cat "$version_file"))"
+    return
+  fi
   version_file="$(find "$MASTER/state" -mindepth 3 -maxdepth 3 -type f -path '*/mainnet/version' -print -quit 2>/dev/null || true)"
   if [[ -n "$version_file" ]]; then
     log "snapshot master present: $MASTER (db v$(cat "$version_file"))"
@@ -280,11 +310,8 @@ ensure_binary() {
 }
 
 # ---- 2b. build a git ref on this host, cached by commit SHA -------------------
-# Persistent build state lives on the bench disk so a new commit on the same branch
-# is an incremental (fast) rebuild, and a cache hit on the same SHA skips the build.
-BUILD_SRC="$BENCH_HOME/src"
-BUILD_TARGET="$BENCH_HOME/build-target"
-BUILD_CARGO_HOME="$BENCH_HOME/cargo-home"
+# Build state lives under BUILD_SRC / BUILD_TARGET (baked paths on ephemeral CI,
+# or BENCH_HOME defaults for local runs). A cache hit on the same SHA skips the build.
 
 # validate a cached binary really is the one we built for $2=sha: integrity (sha256
 # matches the stored value) AND provenance (zakurad --version embeds the git short sha).
@@ -317,7 +344,11 @@ ensure_source() {
     gh auth setup-git 2>/dev/null || true
     git clone "https://github.com/$GH_REPO.git" "$BUILD_SRC" >&2 || die "git clone failed"
   fi
-  git -C "$BUILD_SRC" fetch --tags --force origin >&2 || die "git fetch failed"
+  # Ephemeral CI prefetches the needed commits; a credential helper may still be
+  # configured. Fall back to a tagged fetch for local persistent hosts.
+  if ! git -C "$BUILD_SRC" fetch --no-tags --force origin >&2; then
+    git -C "$BUILD_SRC" fetch --tags --force origin >&2 || die "git fetch failed"
+  fi
 }
 
 # build $1=ref; sets ZAKURAD_BIN. Skips the build (with revalidation) on a SHA cache hit.
@@ -436,13 +467,14 @@ run_one() {
   resolve_binary "$tag"; local zakurad="$ZAKURAD_BIN"
   local run_id
   run_id="${prefix}-$$-$(date +%s)"
-  local fork="$BENCH_HOME/forks/$run_id"
+  local fork="$FORKS_DIR/$run_id"
   local logf="/dev/shm/zakura-bench-$run_id.log"
   local csv="$OUT_DIR/samples-$prefix.csv"
   local trace_dir="$OUT_DIR/zakura-traces-$prefix"
   local cfg="$fork.config.toml"
 
   log "fork: cp -al master -> $fork"
+  mkdir -p "$FORKS_DIR"
   rm -rf "$fork"; cp -al "$MASTER" "$fork"; CUR_FORK="$fork"
   find "$fork" -name LOCK -delete 2>/dev/null || true
   rm -rf "$trace_dir"; mkdir -p "$trace_dir"
@@ -542,9 +574,9 @@ run_one() {
     die "startup failure for $tag"
   fi
 
-  # Dashboard recorder sidecar: scrape this node's /metrics into a per-run series the
-  # always-on dashboard (scripts/zakura-dashboard.service) replays, and the classifier
-  # reads for the bottleneck verdict. Best-effort: a missing python3 never fails a bench.
+  # Dashboard recorder sidecar: scrape this node's /metrics into a per-run series
+  # copied into the CI artifact for local replay, and classified for the bottleneck
+  # verdict. Best-effort: a missing python3 never fails a bench.
   local rec_dir=""
   if [[ "$DASHBOARD" == "1" ]] && command -v python3 >/dev/null 2>&1 && [[ -f "$DASHBOARD_PY" ]]; then
     rec_dir="$DASHBOARD_ARCHIVE/$run_id"
@@ -690,6 +722,11 @@ SUMMARY="${GITHUB_STEP_SUMMARY:-$OUT_DIR/summary.md}"
   echo "## Checkpoint-sync benchmark"
   echo ""
   echo "- binary source: $MODE \`$PRIMARY_SPEC\`"
+  if [[ -n "$STATE_MASTER" ]]; then
+    echo "- state: pre-mounted \`$STATE_MASTER\` (baked sandblast)"
+  else
+    echo "- state: downloaded snapshot master"
+  fi
   echo "- snapshot start height: **$START_HEIGHT**, stop height: **$STOP_HEIGHT**, feed: \`${FEED_PEER:-DNS seeders}\` (peerset=$PEERSET_SIZE)"
   echo "- sync knobs: checkpoint_verify=$CKPT_LIMIT, download=$DL_LIMIT, full_verify=$FULL_VERIFY_LIMIT"
   if [[ "$VERIFY_MODE" == "semantic" ]]; then

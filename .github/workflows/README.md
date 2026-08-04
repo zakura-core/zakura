@@ -57,10 +57,10 @@ Deploys are manual, SSH-based, and run from self-hosted deployer runners; there 
 - **`zakura-pr-node-bake.yml`** — weekly bake of the golden PR-node droplet image (build deps, warm cargo cache), per-network chain-state volume snapshots, and an optional dedicated Mainnet pruned snapshot 100 blocks below the current VCT handoff. Set `rebuild_approach_from_sandblast` on a manual dispatch to build that rare fixture forward from the retained historical archive; ordinary weekly bakes leave the pinned approach snapshots in place.
 - **`zakura-pr-node-reaper.yml`** — hourly TTL cleanup backstop for PR-node resources. It keeps six Mainnet snapshot generations, two dedicated VCT approach snapshots, and dynamically pins the newest ordinary height-stamped snapshot below the current handoff as a fallback.
 - **`zakura-vct-handoff-canary.yml`** — daily, manual, and reusable Mainnet test that forces the Zakura P2P `tree_aux` path from the pinned pre-checkpoint state and exits after C is finalized and the best chain reaches C+1 with VCT fast-path activity. Failures alert `#zakura-alerts`; normal releases call it before publishing.
-- **`checkpoint-sync-bench.yml`** — manual fixed-height sync benchmark with checkpoint or semantic verification on the `zakura-bench` self-hosted runner, with a persistent metrics dashboard. See the workflow header for one-time runner setup.
+- **`checkpoint-sync-bench.yml`** — manual fixed-height sync benchmark with checkpoint or semantic verification on an ephemeral DigitalOcean droplet (baked image + Mainnet sandblast state). Uploads metrics series, bottleneck verdicts, and logs as artifacts for local dashboard replay; tears down the droplet and volume when the run ends (hourly reaper as backstop).
 - **`zakura-perf-bench.yml`** — CPU profiles mainnet workloads on ephemeral droplets. Historical mode restores `sandblast` state for fixed-height throughput and optional parallel A/B; live-head mode uses the production default P2P stack, catches up from the baked pruned tip, and requires head health throughout one observational profile window. Both produce flamegraphs, CPU counters, metrics, available traces, and block-latency digests (see `docs/cpu-profiling.md`).
 
-These workflows use the helper scripts in `.github/workflows/scripts/` (`pr-node-bake.sh`, `pr-node-run.sh`, `pr-node-monitor.py`, `perf-bench-run.sh`, `perf-bench-compare.py`).
+These workflows use the helper scripts in `.github/workflows/scripts/` (`pr-node-bake.sh`, `pr-node-run.sh`, `pr-node-monitor.py`, `perf-bench-run.sh`, `perf-bench-compare.py`, `checkpoint-sync-bench-run.sh`).
 
 After initially deploying this automation, manually dispatch the PR-node bake
 with `rebuild_approach_from_sandblast` enabled. This creates the first
@@ -70,7 +70,7 @@ that pruned state snapshots do not retain.
 Droplet lifecycle is shared, not copy-pasted, through the composite actions in `.github/actions/`:
 
 - **`do-cli`** — installs the pinned `doctl`, authenticates it for the rest of the job, and optionally writes the fleet SSH key to `/tmp/do_ssh`.
-- **`do-droplet`** — resolves the newest `zakura-pr-node-*` baked image and optionally clones either the newest network state or an exact volume snapshot, then creates the tagged droplet. Outputs `id`, `ip`, `image_id`, `volume_id`, `volume_name`.
+- **`do-droplet`** — resolves the newest `zakura-pr-node-*` baked image (or an exact `image_id`) and optionally clones either the newest network state or an exact volume snapshot, then creates the tagged droplet. Outputs `id`, `ip`, `image_id`, `state_snapshot_id`, `volume_id`, `volume_name`.
 - **`do-wait-ssh`** — polls a new droplet until it accepts SSH. Give the step an `id` if teardown needs to distinguish "unreachable" from "ran".
 - **`do-teardown`** — best-effort delete of a droplet and its volumes, recovering missing IDs from deterministic names and retrying volumes while the detach settles. Never fails a job; `enabled: false` keeps the resources and says so.
 

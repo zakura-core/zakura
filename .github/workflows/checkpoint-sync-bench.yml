@@ -1,31 +1,24 @@
 name: Checkpoint-sync benchmark
 
-# Manual, on-demand checkpoint-zone sync benchmark.
+# Manual, on-demand checkpoint-zone sync benchmark on an ephemeral DigitalOcean
+# droplet restored from the PR-node bake (image + Mainnet sandblast state).
 #
-# Picks a published release of this repo (no build in CI), runs zakurad forward from a
-# pre-synced ~1.7M mainnet state snapshot through the checkpoint zone pinned to a single
-# peer, and reports: time taken, blocks covered, blocks/s. Demonstrates the checkpoint-sync
-# throughput work (CHECKPOINT_SYNC_FINDINGS.md / PARALLEL_IDEA.md).
+# Builds or downloads a selected zakurad, hard-link-forks the baked ~1.7M state,
+# syncs through the checkpoint zone, and reports time / blocks / blocks/s plus a
+# bottleneck verdict (commit-starved / download-bound / verify-bound). Metrics
+# series and verdicts land in the GitHub Actions artifact for local dashboard
+# replay; there is no persistent host dashboard.
 #
-# Each run also records a Prometheus time series and classifies the run into a single
-# bottleneck verdict — commit-starved / download-bound / verify-bound — shown in the step
-# summary and saved as verdict-*.json. The recorded series feed an always-on dashboard
-# on the runner (scripts/zakura-dashboard.service) at http://<box>:8090/, where you can log
-# in and replay any past run's charts.
-#
-# Runs on the roman-zakura-3 self-hosted runner (label `zakura-bench`). One-time setup:
-# register the runner, set the BENCH_* repo Actions variables (see
-# scripts/checkpoint-sync-bench.sh header and the repo runbook), and install the dashboard
-# service once: `sudo cp scripts/zakura-dashboard.service /etc/systemd/system/ &&
-# sudo systemctl enable --now zakura-dashboard` (see that file's header).
+# Droplets are tagged `zakura-pr-node`, so the hourly reaper removes anything a
+# failed teardown leaves behind. Requires the same DO secrets as zakura-pr-node.yml.
 
 on:
   workflow_dispatch:
     inputs:
       build_ref:
-        description: "Git branch/tag/SHA to build on the host (cached by commit SHA). Primary mode."
+        description: "Git branch/tag/SHA to build on the droplet (cached by commit SHA). Primary mode."
         required: false
-        default: "feat/pre-release-main"
+        default: "main"
       force_rebuild:
         description: "Rebuild even if a binary for this commit SHA is already cached"
         type: boolean
@@ -45,7 +38,7 @@ on:
         required: false
         default: ""
       stop_height:
-        description: "Sync stops after committing this height (snapshot tip is 1,707,210)"
+        description: "Sync stops after committing this height (sandblast tip is 1,707,210)"
         required: true
         default: "1730000"
       wall_cap_seconds:
@@ -68,27 +61,64 @@ on:
         default: "150"
       verify_mode:
         description: "Verification mode: checkpoint, or semantic (consensus.checkpoint_sync=false; full script+proof verification past the mandatory checkpoints)"
+        type: choice
         required: false
         default: "checkpoint"
+        options:
+          - checkpoint
+          - semantic
       full_verify_concurrency_limit:
         description: "Concurrent semantic block verifications (1 approximates near-tip block-at-a-time)"
         required: false
         default: "20"
       target_p2p_stack:
         description: "Target/primary P2P stack: legacy | zakura | dual"
+        type: choice
         required: false
         default: "zakura"
+        options:
+          - legacy
+          - zakura
+          - dual
       baseline_p2p_stack:
         description: "Baseline/base P2P stack: legacy | zakura | dual"
+        type: choice
         required: false
         default: "legacy"
+        options:
+          - legacy
+          - zakura
+          - dual
       baseline_tag:
         description: "Optional (download mode): baseline release tag for a speedup comparison. Ignored when skip_baseline is true."
         required: false
         default: ""
+      droplet_size:
+        description: "Droplet size (disk must be >= the baked image's disk)"
+        type: choice
+        required: false
+        default: "g-8vcpu-32gb-intel"
+        options:
+          - g-8vcpu-32gb-intel
+          - c-8
+          - c-16
+          - c-32
+      image_id:
+        description: "Optional exact baked image ID (default: newest zakura-pr-node-*)"
+        required: false
+        default: ""
+      state_snapshot_id:
+        description: "Optional exact Mainnet state volume snapshot ID (default: newest zakura-pr-state-mainnet-*)"
+        required: false
+        default: ""
+      teardown_after_run:
+        description: "Delete the droplet + volume when the run ends (else the reaper removes them within 24h)"
+        type: boolean
+        required: false
+        default: true
 
 concurrency:
-  group: checkpoint-sync-bench   # one bench at a time (single host, single snapshot)
+  group: checkpoint-sync-bench
   cancel-in-progress: false
 
 permissions:
@@ -97,18 +127,42 @@ permissions:
 jobs:
   bench:
     name: "checkpoint sync ${{ inputs.build_ref || inputs.release_tag }}"
-    runs-on: [self-hosted, "${{ vars.BENCH_RUNNER_LABEL || 'zakura-bench' }}"]
-    timeout-minutes: 360   # allow long self-hosted benchmark runs; WALL_CAP controls zakurad runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
-      - name: Checkout (for the bench script)
+      - name: Checkout (for the run + bench scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           persist-credentials: false
 
+      - name: Install doctl and the fleet SSH key
+        uses: ./.github/actions/do-cli
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+
+      - name: Create droplet (+ sandblast state volume)
+        id: droplet
+        uses: ./.github/actions/do-droplet
+        with:
+          name: zakura-ckpt-bench-${{ github.run_id }}
+          size: ${{ inputs.droplet_size || 'g-8vcpu-32gb-intel' }}
+          ssh_fingerprint: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+          tag: zakura-pr-node
+          image_id: ${{ inputs.image_id }}
+          state_network: mainnet
+          state_snapshot_id: ${{ inputs.state_snapshot_id }}
+          volume_name: zakura-pr-ckpt-vol-${{ github.run_id }}
+
+      - name: Wait for SSH
+        uses: ./.github/actions/do-wait-ssh
+        with:
+          ip: ${{ steps.droplet.outputs.ip }}
+
       - name: Run checkpoint-sync benchmark
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+          IP: ${{ steps.droplet.outputs.ip }}
+          GH_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BUILD_REF: ${{ inputs.build_ref }}
           BASELINE_REF: ${{ inputs.baseline_ref }}
           SKIP_BASELINE: ${{ inputs.skip_baseline && '1' || '0' }}
@@ -117,7 +171,7 @@ jobs:
           BASELINE_TAG: ${{ inputs.baseline_tag }}
           STOP_HEIGHT: ${{ inputs.stop_height }}
           WALL_CAP: ${{ inputs.wall_cap_seconds }}
-          FEED_PEER: ${{ inputs.feed_peer }}    # blank = public DNS-seeder peers
+          FEED_PEER: ${{ inputs.feed_peer }}
           PEERSET_SIZE: ${{ inputs.peerset_size }}
           CKPT_LIMIT: ${{ inputs.checkpoint_verify_concurrency_limit }}
           DL_LIMIT: ${{ inputs.download_concurrency_limit }}
@@ -125,16 +179,71 @@ jobs:
           FULL_VERIFY_LIMIT: ${{ inputs.full_verify_concurrency_limit }}
           TARGET_P2P_STACK: ${{ inputs.target_p2p_stack }}
           BASELINE_P2P_STACK: ${{ inputs.baseline_p2p_stack }}
-          SNAPSHOT_URL: ${{ vars.BENCH_SNAPSHOT_URL || 'https://zakura.valargroup.dev/mainnet/historical/zakura-mainnet-20260717T095333Z-1707210.tar.zst' }}
-          SNAPSHOT_SHA256: ${{ vars.BENCH_SNAPSHOT_SHA256 || '2bcb3786252300b4163b38a49b2d3a8015ba581d7d3efc854e6ed662a18258ac' }}
           START_HEIGHT: ${{ vars.BENCH_SNAPSHOT_START_HEIGHT || '1707210' }}
-          BENCH_HOME: ${{ vars.BENCH_HOME || '/opt/zakura-bench' }}
-          OUT_DIR: ${{ github.workspace }}/bench-out
-          # record metrics + emit the bottleneck verdict; the always-on dashboard service
-          # serves this archive dir. Disable with the BENCH_DASHBOARD repo var = '0'.
+          VOLUME_NAME: ${{ steps.droplet.outputs.volume_name }}
+          IMAGE_ID: ${{ steps.droplet.outputs.image_id }}
+          STATE_SNAPSHOT_ID: ${{ steps.droplet.outputs.state_snapshot_id }}
+          DROPLET_SIZE: ${{ inputs.droplet_size || 'g-8vcpu-32gb-intel' }}
+          DROPLET_ID: ${{ steps.droplet.outputs.id }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           DASHBOARD: ${{ vars.BENCH_DASHBOARD || '1' }}
-          DASHBOARD_ARCHIVE: ${{ vars.BENCH_DASHBOARD_ARCHIVE || '/opt/zakura-bench/dashboard/runs' }}
-        run: bash scripts/checkpoint-sync-bench.sh
+        run: |
+          set -euo pipefail
+          umask 077
+          {
+            printf 'GH_REPO=%q\n'          "${GITHUB_REPOSITORY}"
+            printf 'GH_CLONE_TOKEN=%q\n'   "${GH_CLONE_TOKEN}"
+            printf 'BUILD_REF=%q\n'        "${BUILD_REF}"
+            printf 'BASELINE_REF=%q\n'     "${BASELINE_REF}"
+            printf 'SKIP_BASELINE=%q\n'    "${SKIP_BASELINE}"
+            printf 'FORCE_REBUILD=%q\n'    "${FORCE_REBUILD}"
+            printf 'RELEASE_TAG=%q\n'      "${RELEASE_TAG}"
+            printf 'BASELINE_TAG=%q\n'     "${BASELINE_TAG}"
+            printf 'STOP_HEIGHT=%q\n'      "${STOP_HEIGHT}"
+            printf 'WALL_CAP=%q\n'         "${WALL_CAP}"
+            printf 'FEED_PEER=%q\n'        "${FEED_PEER}"
+            printf 'PEERSET_SIZE=%q\n'     "${PEERSET_SIZE}"
+            printf 'CKPT_LIMIT=%q\n'       "${CKPT_LIMIT}"
+            printf 'DL_LIMIT=%q\n'         "${DL_LIMIT}"
+            printf 'VERIFY_MODE=%q\n'      "${VERIFY_MODE}"
+            printf 'FULL_VERIFY_LIMIT=%q\n' "${FULL_VERIFY_LIMIT}"
+            printf 'TARGET_P2P_STACK=%q\n' "${TARGET_P2P_STACK}"
+            printf 'BASELINE_P2P_STACK=%q\n' "${BASELINE_P2P_STACK}"
+            printf 'START_HEIGHT=%q\n'     "${START_HEIGHT}"
+            printf 'VOLUME_NAME=%q\n'      "${VOLUME_NAME}"
+            printf 'IMAGE_ID=%q\n'         "${IMAGE_ID}"
+            printf 'STATE_SNAPSHOT_ID=%q\n' "${STATE_SNAPSHOT_ID}"
+            printf 'DROPLET_SIZE=%q\n'     "${DROPLET_SIZE}"
+            printf 'DROPLET_ID=%q\n'       "${DROPLET_ID}"
+            printf 'GITHUB_RUN_URL=%q\n'   "${GITHUB_RUN_URL}"
+            printf 'GITHUB_RUN_ID=%q\n'    "${GITHUB_RUN_ID}"
+            printf 'DASHBOARD=%q\n'        "${DASHBOARD}"
+          } > /tmp/run.env
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            /tmp/run.env \
+            .github/workflows/scripts/checkpoint-sync-bench-run.sh \
+            scripts/checkpoint-sync-bench.sh \
+            scripts/zakura-metrics-dashboard.py \
+            "root@${IP}:/root/"
+          rm -f /tmp/run.env
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh "root@${IP}" \
+            'set -euo pipefail; set -a; . /root/run.env; set +a; bash /root/checkpoint-sync-bench-run.sh'
+
+      - name: Collect benchmark outputs
+        if: always() && steps.droplet.outputs.ip != ''
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+        run: |
+          set -euo pipefail
+          mkdir -p bench-out
+          scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            "root@${IP}:/root/out/." bench-out/ || true
+          if [ -f bench-out/summary.md ]; then
+            cat bench-out/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Checkpoint-sync benchmark — no outputs collected" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Build artifact name
         id: artifact-name
@@ -153,3 +262,14 @@ jobs:
           path: bench-out/
           if-no-files-found: ignore
           retention-days: 30
+
+      - name: Teardown droplet + volume
+        if: always()
+        uses: ./.github/actions/do-teardown
+        with:
+          droplet_id: ${{ steps.droplet.outputs.id }}
+          droplet_name: zakura-ckpt-bench-${{ github.run_id }}
+          volume_ids: ${{ steps.droplet.outputs.volume_id }}
+          volume_names: ${{ steps.droplet.outputs.volume_name }}
+          # string-compare: keep teardown on when the boolean input is unset/true
+          enabled: ${{ format('{0}', inputs.teardown_after_run) == 'false' && 'false' || 'true' }}

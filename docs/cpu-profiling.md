@@ -62,7 +62,7 @@ macOS: `perf` does not exist; use [samply](https://github.com/mstange/samply) (`
 
 ## Related instrumentation (what this is not)
 
-- `checkpoint-sync-bench.yml` is the older fixed-host sync bench on the `zakura-bench` runner (persistent dashboard, warm caches, serialized runs); this lane is the ephemeral, parallel, profiled successor for CPU/latency questions.
+- `checkpoint-sync-bench.yml` is the fixed-height sync throughput bench on an ephemeral droplet (baked sandblast state, bottleneck verdicts, artifact replay); this lane adds CPU profiling, flamegraphs, and optional parallel A/B legs for latency questions.
 - `cargo bench` criterion microbenches (`benchmarks.yml`, `C-benchmark` PR label) time the crypto primitives in isolation; this lane shows their share of a real sync.
 - The `deploy/runner/` cohort harness (`make perf-*`) is the deterministic isolated-cohort deep-dive with per-phase commit attribution.
 - The `flamegraph` cargo feature (`tracing.flamegraph` config) renders span wall-time, not sampled CPU, and needs a special build; prefer this lane for CPU questions.

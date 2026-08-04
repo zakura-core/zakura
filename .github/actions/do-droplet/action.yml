@@ -16,6 +16,10 @@ inputs:
   tag:
     description: "Droplet tag. Must be one the reaper sweeps, and is applied at creation so a later failure cannot leak an untagged droplet."
     required: true
+  image_id:
+    description: "Exact baked image ID. Empty resolves the newest zakura-pr-node-* image."
+    required: false
+    default: ""
   state_network:
     description: "Attach a clone of the newest zakura-pr-state-<network>-* snapshot (mainnet/testnet). Empty starts with no state volume."
     required: false
@@ -39,6 +43,9 @@ outputs:
   image_id:
     description: "Image the droplet was created from"
     value: ${{ steps.image.outputs.image_id }}
+  state_snapshot_id:
+    description: "Volume snapshot the state clone was restored from, empty when no state is requested"
+    value: ${{ steps.image.outputs.vol_snap_id }}
   volume_id:
     description: "Cloned state volume ID, empty when no state snapshot is requested"
     value: ${{ steps.create.outputs.volume_id }}
@@ -53,14 +60,19 @@ runs:
       id: image
       shell: bash
       env:
+        IMAGE_ID: ${{ inputs.image_id }}
         STATE_NETWORK: ${{ inputs.state_network }}
         STATE_SNAPSHOT_ID: ${{ inputs.state_snapshot_id }}
         VOLUME_NAME: ${{ inputs.volume_name }}
       run: |
         set -euo pipefail
-        # Image names are timestamped, so the lexical max is the newest bake.
-        IMAGE=$(doctl compute image list-user --format ID,Name --no-header | \
-          awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | tail -1 | awk '{print $2}')
+        if [ -n "${IMAGE_ID}" ]; then
+          IMAGE="${IMAGE_ID}"
+        else
+          # Image names are timestamped, so the lexical max is the newest bake.
+          IMAGE=$(doctl compute image list-user --format ID,Name --no-header | \
+            awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | tail -1 | awk '{print $2}')
+        fi
         if [ -z "${IMAGE}" ]; then
           echo "no zakura-pr-node-* image found; run the 'PR node image bake' workflow first" >&2
           exit 1

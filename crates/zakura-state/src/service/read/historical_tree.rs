@@ -30,7 +30,9 @@ use zakura_chain::{
 
 use zakura_chain::subtree::NoteCommitmentSubtreeIndex;
 
-use crate::service::finalized_state::{TransactionLocation, ZakuraDb};
+use crate::service::finalized_state::{
+    treestate_artifact::SubtreeArtifact, TransactionLocation, ZakuraDb,
+};
 
 /// The most derived frontiers to keep memoized per node.
 ///
@@ -189,9 +191,42 @@ pub enum HistoricalTreeDerivationError {
 pub struct HistoricalTreeCache {
     /// Verified frontiers, keyed by the height they are the state at the end of.
     frontiers: BTreeMap<Height, Arc<DerivedFrontiers>>,
+
+    /// Published subtree roots to check against as replays pass completion positions.
+    ///
+    /// Nothing here anchors a derivation; it exists only so the published roots are checked. A
+    /// derivation crosses subtree boundaries anyway, so verifying the ones it passes is free, and
+    /// wallet sweeps cross every boundary in the band — which is what makes the published list
+    /// converge from trusted to verified over a node's lifetime (design §4.6).
+    subtrees: Option<Arc<SubtreeArtifact>>,
 }
 
 impl HistoricalTreeCache {
+    /// Adds published subtree roots for the opportunistic completion check.
+    pub fn with_subtrees(mut self, subtrees: Arc<SubtreeArtifact>) -> Self {
+        self.subtrees = Some(subtrees);
+        self
+    }
+
+    /// Returns the published root for `pool`'s subtree `index`, if the artifact carries one.
+    fn published_subtree_root(
+        &self,
+        pool: ShieldedPool,
+        index: NoteCommitmentSubtreeIndex,
+    ) -> Option<[u8; 32]> {
+        let artifact = self.subtrees.as_ref()?;
+        let records = match pool {
+            ShieldedPool::Sapling => &artifact.sapling,
+            ShieldedPool::Orchard => &artifact.orchard,
+            ShieldedPool::Ironwood => &artifact.ironwood,
+        };
+
+        records
+            .binary_search_by_key(&index, |record| record.index)
+            .ok()
+            .map(|position| records[position].root)
+    }
+
     /// Returns the highest memoized frontier at or below `height`, if any.
     fn anchor_at_or_below(&self, height: Height) -> Option<(Height, Arc<DerivedFrontiers>)> {
         self.frontiers
@@ -313,7 +348,7 @@ pub fn derive_historical_frontiers_measured(
     let frontiers = anchor.map_or_else(DerivedFrontiers::empty, |(_, frontiers)| {
         (*frontiers).clone()
     });
-    let frontiers = replay(db, height, replay_from, frontiers)?;
+    let frontiers = replay_checking_subtrees(db, cache, height, replay_from, frontiers)?;
 
     verify_against_index(db, height, &frontiers)?;
 
@@ -377,14 +412,58 @@ fn anchor_for(
     )))
 }
 
-/// Appends the note commitments of blocks `replay_from..=height` to `frontiers`.
-fn replay(
+/// Replays `replay_from..=height`, checking every subtree completed on the way against the
+/// published roots.
+///
+/// The published subtree roots cannot be checked cheaply on demand — that is why they ship at
+/// review-level trust — but a derivation passes completion positions anyway, so checking the ones
+/// it crosses costs nothing. Over a node's lifetime, wallet sweeps cross every boundary in the
+/// band, so the published list converges from trusted to verified (design §4.6).
+///
+/// A mismatch is a *serving* failure, not a consensus one: the derived frontier is still checked
+/// against the authenticated root, so what a mismatch means is that the published artifact is
+/// wrong. It is reported loudly and the artifact's subtree data is dropped, rather than failing
+/// the request, because the treestate the caller asked for is unaffected.
+fn replay_checking_subtrees(
     db: &ZakuraDb,
+    cache: &Mutex<HistoricalTreeCache>,
     height: Height,
     replay_from: u32,
     frontiers: DerivedFrontiers,
 ) -> Result<DerivedFrontiers, HistoricalTreeDerivationError> {
-    replay_with_subtrees(db, height, replay_from, frontiers, |_, _| {})
+    let mut mismatched = Vec::new();
+
+    let derived = replay_with_subtrees(db, height, replay_from, frontiers, |pool, completed| {
+        let published = lock(cache).published_subtree_root(pool, completed.index);
+
+        if let Some(published) = published {
+            if published == completed.root {
+                metrics::counter!("state.historical_tree.subtree_root_confirmed").increment(1);
+            } else {
+                mismatched.push((pool, completed.index));
+            }
+        }
+    })?;
+
+    if !mismatched.is_empty() {
+        for (pool, index) in &mismatched {
+            tracing::error!(
+                ?pool,
+                index = index.0,
+                "a published subtree root does not match the one this node derived; \
+                 dropping the published subtree data",
+            );
+        }
+        metrics::counter!("state.historical_tree.subtree_root_mismatch")
+            .increment(mismatched.len() as u64);
+
+        // Refusing to serve the rest of the artifact is the conservative response: one wrong
+        // record means the file cannot be trusted, and `z_getsubtreesbyindex` reporting the
+        // absent band beats serving roots that would build wrong witnesses.
+        lock(cache).subtrees = None;
+    }
+
+    Ok(derived)
 }
 
 /// Appends the note commitments of blocks `replay_from..=height` to `frontiers`, reporting every
@@ -562,4 +641,70 @@ fn authenticated_roots(
         .next()
         .filter(|roots| roots.height == height)
         .ok_or(HistoricalTreeDerivationError::MissingAuthenticatedRoot { height })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::service::finalized_state::treestate_artifact::SubtreeRecord;
+
+    fn record(index: u16, root: u8) -> SubtreeRecord {
+        SubtreeRecord {
+            index: NoteCommitmentSubtreeIndex(index),
+            end_height: Height(1000 + u32::from(index)),
+            root: [root; 32],
+        }
+    }
+
+    /// The opportunistic check (§4.6) has to find the published root for a given pool and index.
+    /// Subtree indexes are sparse in principle and the lookup is a binary search, so a wrong
+    /// result here would either silently skip the check or compare against another pool's root.
+    #[test]
+    fn published_subtree_lookup_finds_the_right_pool_and_index() {
+        let artifact = SubtreeArtifact {
+            handoff: Height(9_000),
+            sapling: vec![record(0, 0xaa), record(1, 0xbb), record(5, 0xcc)],
+            orchard: vec![record(0, 0xdd)],
+            ironwood: Vec::new(),
+        };
+        let cache = HistoricalTreeCache::default().with_subtrees(Arc::new(artifact));
+
+        assert_eq!(
+            cache.published_subtree_root(ShieldedPool::Sapling, NoteCommitmentSubtreeIndex(1)),
+            Some([0xbb; 32])
+        );
+        assert_eq!(
+            cache.published_subtree_root(ShieldedPool::Sapling, NoteCommitmentSubtreeIndex(5)),
+            Some([0xcc; 32]),
+            "a gap below an index must not hide it"
+        );
+        assert_eq!(
+            cache.published_subtree_root(ShieldedPool::Sapling, NoteCommitmentSubtreeIndex(2)),
+            None,
+            "an index the artifact does not carry is not checked against a neighbour"
+        );
+        assert_eq!(
+            cache.published_subtree_root(ShieldedPool::Orchard, NoteCommitmentSubtreeIndex(0)),
+            Some([0xdd; 32]),
+            "pools are looked up independently"
+        );
+        assert_eq!(
+            cache.published_subtree_root(ShieldedPool::Ironwood, NoteCommitmentSubtreeIndex(0)),
+            None,
+            "a pool with no published subtrees checks nothing"
+        );
+    }
+
+    /// Without an artifact the check is inert, so a node serving without published subtree roots
+    /// pays nothing for it.
+    #[test]
+    fn published_subtree_lookup_is_inert_without_an_artifact() {
+        let cache = HistoricalTreeCache::default();
+
+        assert_eq!(
+            cache.published_subtree_root(ShieldedPool::Sapling, NoteCommitmentSubtreeIndex(0)),
+            None
+        );
+    }
 }

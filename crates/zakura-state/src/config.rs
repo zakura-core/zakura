@@ -145,6 +145,13 @@ pub struct Config {
     #[serde(skip)]
     pub vct_fast_sync: bool,
 
+    /// Path to a subtree-root artifact used to serve `z_getsubtreesbyindex` below the handoff.
+    ///
+    /// Set to `None` by default. Unlike the frontier artifact, a node cannot check these records
+    /// against a stored root without replaying each subtree's 65,536 leaves, so this file is
+    /// trusted after its framing and digest validate.
+    pub historical_subtree_artifact: Option<PathBuf>,
+
     /// Whether to delete the old database directories when present.
     ///
     /// Set to `true` by default. If this is set to `false`,
@@ -430,6 +437,7 @@ impl Default for Config {
             enable_zakura_header_seed_from_committed_blocks: false,
             checkpoint_sync: true,
             vct_fast_sync: true,
+            historical_subtree_artifact: None,
             delete_old_database: true,
             storage_mode: StorageMode::default(),
             debug_stop_at_height: None,

@@ -47,8 +47,8 @@ pub use historical_tree::{
     derive_historical_frontiers, DerivedFrontiers, HistoricalTreeCache, MAX_MEMOIZED_FRONTIERS,
 };
 pub use tree::{
-    ironwood_subtrees, ironwood_tree, orchard_subtrees, orchard_tree, sapling_subtrees,
-    sapling_tree,
+    contiguous_subtrees_from, ironwood_subtrees, ironwood_tree, merge_published_subtrees,
+    orchard_subtrees, orchard_tree, sapling_subtrees, sapling_tree,
 };
 
 #[cfg(any(test, feature = "proptest-impl"))]

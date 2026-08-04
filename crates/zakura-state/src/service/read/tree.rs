@@ -77,6 +77,56 @@ fn resolve_historical_tree<Tree: Default>(
     }
 }
 
+/// Trims `subtrees` to the contiguous run beginning at `start_index`.
+///
+/// `z_getsubtreesbyindex` serves a continuous list: a client builds witnesses by walking indexes in
+/// order, so anything past a gap is unusable and a missing `start_index` means there is nothing to
+/// serve at all. Callers that merge two sources — the node's own rows and a published artifact —
+/// use this to re-establish that contract over the union.
+pub fn contiguous_subtrees_from<Node>(
+    mut subtrees: BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+    start_index: NoteCommitmentSubtreeIndex,
+) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>> {
+    if !subtrees.contains_key(&start_index) {
+        return BTreeMap::new();
+    }
+
+    subtrees.retain(|index, _| *index >= start_index);
+
+    let mut expected = start_index.0;
+    let mut contiguous = BTreeMap::new();
+    for (index, data) in subtrees {
+        if index.0 != expected {
+            break;
+        }
+
+        contiguous.insert(index, data);
+        let Some(next) = expected.checked_add(1) else {
+            break;
+        };
+        expected = next;
+    }
+
+    contiguous
+}
+
+/// Merges published subtree records into `stored`, keeping the node's own row wherever both carry
+/// an index.
+///
+/// The node computed and verified its own rows; a published record is trusted only after a digest
+/// the artifact carries itself, which is not a signature. A correct artifact holds only subtrees
+/// completed at or below the handoff and so never overlaps what the node stores, which means an
+/// overlap is precisely the corrupt-or-hostile case where precedence decides whether a wrong root
+/// reaches a client.
+pub fn merge_published_subtrees<Node>(
+    stored: &mut BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+    published: impl IntoIterator<Item = (NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>)>,
+) {
+    for (index, data) in published {
+        stored.entry(index).or_insert(data);
+    }
+}
+
 /// Returns `true` if the subtree at `start_index` completed at or below the last checkpoint,
 /// given `last_checkpoint_leaves`, the pool's note commitment count at the last checkpoint height.
 ///

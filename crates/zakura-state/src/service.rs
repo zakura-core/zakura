@@ -17,6 +17,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    ops::Bound,
     pin::Pin,
     sync::{Arc, OnceLock},
     task::{Context, Poll},
@@ -258,6 +259,12 @@ pub struct ReadStateService {
     block_write_task: Option<Arc<std::thread::JoinHandle<write::BlockWriteTaskExit>>>,
     /// Shared fail-closed attachment result, visible to every clone without joining the worker.
     block_write_failure: Arc<OnceLock<write::BlockWriteTaskFailure>>,
+
+    /// Published completed subtree roots for heights below the checkpoint handoff.
+    ///
+    /// `None` when no artifact is configured or it failed to validate, in which case
+    /// `z_getsubtreesbyindex` keeps reporting the absent band rather than serving unchecked data.
+    historical_subtrees: Option<Arc<finalized_state::SubtreeArtifact>>,
 
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
     vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
@@ -1210,12 +1217,18 @@ impl ReadStateService {
         vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
         header_chain: HeaderChainSubscriptions,
     ) -> Self {
+        let historical_subtrees = load_historical_subtree_artifact(
+            &finalized_state.network(),
+            finalized_state.db.config(),
+        );
+
         let read_service = Self {
             network: finalized_state.network(),
             db: finalized_state.db.clone(),
             non_finalized_state_receiver,
             block_write_task,
             block_write_failure,
+            historical_subtrees,
             vct_root_repair_receiver,
             header_chain_snapshot_receiver: header_chain.snapshots,
             header_runtime_status_receiver: header_chain.runtime_status,
@@ -1829,6 +1842,61 @@ where
     })
 }
 
+/// Returns the index range a subtree request covers, as a concrete range type.
+///
+/// Mirrors the read path's handling of an absent or overflowing end bound, where the request is
+/// served to the end of what exists.
+fn range_for(
+    start_index: NoteCommitmentSubtreeIndex,
+    end_index: Option<NoteCommitmentSubtreeIndex>,
+) -> (
+    Bound<NoteCommitmentSubtreeIndex>,
+    Bound<NoteCommitmentSubtreeIndex>,
+) {
+    (
+        Bound::Included(start_index),
+        end_index.map_or(Bound::Unbounded, Bound::Excluded),
+    )
+}
+
+/// Loads the subtree-root artifact named in `config`, if any.
+///
+/// A missing or invalid artifact is logged and skipped rather than fatal: the node still works, it
+/// just keeps reporting the absent band for `z_getsubtreesbyindex`. Refusing to start over a
+/// serving-only input would be a worse trade.
+fn load_historical_subtree_artifact(
+    network: &Network,
+    config: &Config,
+) -> Option<Arc<finalized_state::SubtreeArtifact>> {
+    let subtrees = config
+        .historical_subtree_artifact
+        .as_ref()
+        .and_then(|path| match std::fs::read(path) {
+            Ok(bytes) => match finalized_state::SubtreeArtifact::decode(&bytes, network) {
+                Ok(artifact) => {
+                    tracing::info!(
+                        ?path,
+                        sapling = artifact.sapling.len(),
+                        orchard = artifact.orchard.len(),
+                        ironwood = artifact.ironwood.len(),
+                        "loaded historical subtree-root artifact"
+                    );
+                    Some(Arc::new(artifact))
+                }
+                Err(error) => {
+                    tracing::warn!(?path, %error, "ignoring invalid historical subtree-root artifact");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(?path, %error, "cannot read historical subtree-root artifact");
+                None
+            }
+        });
+
+    subtrees
+}
+
 fn block_roots_by_height_range<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -2406,7 +2474,36 @@ impl Service<ReadRequest> for ReadStateService {
                     // `zcashd` does. (It never calculates an end bound, so it just keeps iterating until
                     // the trees run out.)
                     read::sapling_subtrees(best_chain, &state.db, start_index..)
-                }?;
+                };
+
+                // The read above already applies the continuity contract and reports the absent
+                // band, so it answers on its own whenever the node's own rows cover
+                // `start_index`. Only when they do not is the published artifact consulted: the
+                // union of the raw range and the published records, with continuity re-applied
+                // over the whole thing, because a client asking from index 0 must get one list
+                // spanning both halves rather than just the published one. If that union still
+                // does not reach `start_index`, the original result stands — including its typed
+                // absent-band error.
+                let sapling_subtrees = match sapling_subtrees {
+                    Ok(subtrees) if subtrees.contains_key(&start_index) => subtrees,
+                    result => {
+                        let published = state.historical_subtrees.as_ref().map(|artifact| {
+                            let range = range_for(start_index, end_index);
+                            let mut merged = state.db.sapling_subtree_list_by_index_range(range);
+                            read::merge_published_subtrees(
+                                &mut merged,
+                                artifact.sapling_range(range),
+                            );
+
+                            read::contiguous_subtrees_from(merged, start_index)
+                        });
+
+                        match published {
+                            Some(merged) if merged.contains_key(&start_index) => merged,
+                            _ => result?,
+                        }
+                    }
+                };
 
                 Ok(ReadResponse::SaplingSubtrees(sapling_subtrees))
             }
@@ -2425,7 +2522,36 @@ impl Service<ReadRequest> for ReadStateService {
                     // `zcashd` does. (It never calculates an end bound, so it just keeps iterating until
                     // the trees run out.)
                     read::orchard_subtrees(best_chain, &state.db, start_index..)
-                }?;
+                };
+
+                // The read above already applies the continuity contract and reports the absent
+                // band, so it answers on its own whenever the node's own rows cover
+                // `start_index`. Only when they do not is the published artifact consulted: the
+                // union of the raw range and the published records, with continuity re-applied
+                // over the whole thing, because a client asking from index 0 must get one list
+                // spanning both halves rather than just the published one. If that union still
+                // does not reach `start_index`, the original result stands — including its typed
+                // absent-band error.
+                let orchard_subtrees = match orchard_subtrees {
+                    Ok(subtrees) if subtrees.contains_key(&start_index) => subtrees,
+                    result => {
+                        let published = state.historical_subtrees.as_ref().map(|artifact| {
+                            let range = range_for(start_index, end_index);
+                            let mut merged = state.db.orchard_subtree_list_by_index_range(range);
+                            read::merge_published_subtrees(
+                                &mut merged,
+                                artifact.orchard_range(range),
+                            );
+
+                            read::contiguous_subtrees_from(merged, start_index)
+                        });
+
+                        match published {
+                            Some(merged) if merged.contains_key(&start_index) => merged,
+                            _ => result?,
+                        }
+                    }
+                };
 
                 Ok(ReadResponse::OrchardSubtrees(orchard_subtrees))
             }
@@ -2440,7 +2566,36 @@ impl Service<ReadRequest> for ReadStateService {
                     read::ironwood_subtrees(best_chain, &state.db, start_index..end_index)
                 } else {
                     read::ironwood_subtrees(best_chain, &state.db, start_index..)
-                }?;
+                };
+
+                // The read above already applies the continuity contract and reports the absent
+                // band, so it answers on its own whenever the node's own rows cover
+                // `start_index`. Only when they do not is the published artifact consulted: the
+                // union of the raw range and the published records, with continuity re-applied
+                // over the whole thing, because a client asking from index 0 must get one list
+                // spanning both halves rather than just the published one. If that union still
+                // does not reach `start_index`, the original result stands — including its typed
+                // absent-band error.
+                let ironwood_subtrees = match ironwood_subtrees {
+                    Ok(subtrees) if subtrees.contains_key(&start_index) => subtrees,
+                    result => {
+                        let published = state.historical_subtrees.as_ref().map(|artifact| {
+                            let range = range_for(start_index, end_index);
+                            let mut merged = state.db.ironwood_subtree_list_by_index_range(range);
+                            read::merge_published_subtrees(
+                                &mut merged,
+                                artifact.ironwood_range(range),
+                            );
+
+                            read::contiguous_subtrees_from(merged, start_index)
+                        });
+
+                        match published {
+                            Some(merged) if merged.contains_key(&start_index) => merged,
+                            _ => result?,
+                        }
+                    }
+                };
 
                 Ok(ReadResponse::IronwoodSubtrees(ironwood_subtrees))
             }

@@ -486,6 +486,9 @@ impl StateService {
         let skip_backup_task = config.debug_skip_non_finalized_state_backup_task;
         let (non_finalized_state, non_finalized_state_sender, non_finalized_state_receiver) =
             NonFinalizedState::new(network)
+                .with_fork_trace(non_finalized_state::fork_trace::ForkTrace::new(
+                    config.trace_dir.clone(),
+                ))
                 .with_backup(
                     backup_dir_path.clone(),
                     &finalized_state.db,

@@ -444,6 +444,9 @@ impl StartCmd {
         // State owns the VCT commit path, but users configure its checkpoint-sync controls
         // together under `[consensus]`.
         state_config.checkpoint_sync = config.consensus.checkpoint_sync;
+        // Mirror the single operator-facing trace key, so enabling tracing does
+        // not require remembering a second one.
+        state_config.trace_dir = config.network.zakura.trace_dir.clone();
         state_config.vct_fast_sync = config.consensus.vct_fast_sync_enabled();
 
         let (

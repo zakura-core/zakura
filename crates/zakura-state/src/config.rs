@@ -31,6 +31,15 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
+    /// Directory for structured fork trace tables, when tracing is enabled.
+    ///
+    /// Not read from the config file. `zakurad` mirrors
+    /// `[network.zakura] trace_dir` into this field so that one key enables
+    /// every on-node trace table; a second operator-facing key would be one
+    /// more thing to forget to set on a fleet.
+    #[serde(skip)]
+    pub trace_dir: Option<std::path::PathBuf>,
+
     /// The root directory for storing cached block data.
     ///
     /// If you change this directory, you might also want to change `network.cache_dir`.
@@ -457,6 +466,7 @@ impl Default for PruningConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            trace_dir: None,
             cache_dir: default_cache_dir(),
             ephemeral: false,
             should_backup_non_finalized_state: true,

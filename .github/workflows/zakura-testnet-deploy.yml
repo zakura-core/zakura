@@ -5,8 +5,7 @@ name: Deploy Zakura testnet fleet
 # Runs on a self-hosted Linux x86_64 runner, expected to be installed on
 # zakura-testnet-1 with the `zakura-testnet-deployer` label. The deployer builds
 # a native zakurad binary on that runner, then uses deploy/deployer/deploy.py to
-# scp/install it across the fleet. The zcashd-compat Zakura process is deployed
-# as a process-managed node because it shares a host with the sidecar zcashd.
+# scp/install it across the fleet.
 
 on:
   workflow_dispatch:
@@ -104,8 +103,7 @@ jobs:
             167.99.110.145 \
             138.68.229.254 \
             164.92.209.78 \
-            206.189.148.0 \
-            206.189.208.228; do
+            206.189.148.0; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -180,23 +178,6 @@ jobs:
           network_cache_dir = "/mnt/data/zakura-cache"
           state_cache_dir = "/mnt/data/zakura-cache"
           log_file = "/mnt/data/logs/zakura.log"
-
-          [[nodes]]
-          name       = "zakura-compat"
-          ssh_string = "root@206.189.208.228"
-          commit     = "${{ inputs.ref }}"
-          deploy_kind = "process"
-          service_name = ""
-          bin_path = "/root/unity/zakura/target/release/zakurad"
-          config_path = "/root/unity/zakura-testnet.toml"
-          network_cache_dir = "/mnt/data/zakura-cache"
-          state_cache_dir = "/mnt/data/zakura-cache"
-          log_file = "/mnt/data/logs/zakura.log"
-          working_dir = "/root/unity/zakura"
-          start_command = "target/release/zakurad -c /root/unity/zakura-testnet.toml start"
-          process_pattern = "target/release/zakurad -c /root/unity/zakura-testnet.toml start"
-          p2p_stack = "legacy"
-          checkpoint_sync = true
           EOF
 
       - name: Build deployer binary
@@ -232,29 +213,6 @@ jobs:
 
           python3 deploy.py deploy "${args[@]}"
 
-      - name: Verify zcashd-compat sidecar sync
-        if: ${{ !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
-        run: |
-          set -euo pipefail
-
-          scp deploy/zcashd-compat/sync-check.sh root@206.189.208.228:/tmp/zcashd-compat-sync-check.sh
-          ssh root@206.189.208.228 'chmod 755 /tmp/zcashd-compat-sync-check.sh'
-          ssh root@206.189.208.228 '
-            ZAKURA_RPC_URL=http://127.0.0.1:18232
-            ZAKURA_COOKIE_FILE=
-            ZCASHD_RPC_URL=http://127.0.0.1:18231
-            ZCASHD_COOKIE_FILE=
-            ZCASHD_RPC_CONF=/root/unity/zcashd-testnet.toml
-            ZAKURAD_PROCESS_PATTERN="target/release/zakurad -c /root/unity/zakura-testnet.toml start"
-            ZCASHD_PROCESS_PATTERN="zcashd .*zcashd-testnet.toml"
-            HEIGHT_MAX_DRIFT=10
-            SYNC_CHECK_TIMEOUT=600
-            SYNC_CHECK_INTERVAL=15
-            export ZAKURA_RPC_URL ZAKURA_COOKIE_FILE ZCASHD_RPC_URL ZCASHD_COOKIE_FILE ZCASHD_RPC_CONF
-            export ZAKURAD_PROCESS_PATTERN ZCASHD_PROCESS_PATTERN HEIGHT_MAX_DRIFT SYNC_CHECK_TIMEOUT SYNC_CHECK_INTERVAL
-            /tmp/zcashd-compat-sync-check.sh
-          '
-
       - name: Show fleet status
         if: always()
         working-directory: deploy/deployer
@@ -276,22 +234,7 @@ jobs:
           dashboard_dir="/opt/zakura-testnet-dashboard"
           sudo install -d -m 755 "$dashboard_dir"
           sudo install -m 755 deploy/runner/zakura-cluster-status.py "$dashboard_dir/zakura-cluster-status.py"
-          cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
-          cat >> "$RUNNER_TEMP/dashboard.nodes.toml" <<'EOF'
-
-          [[nodes]]
-          name       = "zcashd-compat"
-          ssh_string = "root@206.189.208.228"
-          probe_kind = "zcashd"
-          service_name = ""
-          bin_path = "/root/unity/zcash/src/zcashd"
-          log_file = ""
-          rpc_listen_addr = "127.0.0.1:18231"
-          rpc_auth = "zcash_conf"
-          rpc_config_path = "/root/unity/zcashd-testnet.toml"
-          process_pattern = "zcashd.*zcashd-testnet.toml"
-          EOF
-          sudo install -m 644 "$RUNNER_TEMP/dashboard.nodes.toml" "$dashboard_dir/nodes.toml"
+          sudo install -m 644 deploy/deployer/nodes.ci.toml "$dashboard_dir/nodes.toml"
 
           sudo tee /etc/systemd/system/zakura-testnet-dashboard.service >/dev/null <<'EOF'
           [Unit]

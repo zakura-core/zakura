@@ -63,13 +63,8 @@ then deploys it to:
 - `zakura-testnet-3` — `root@138.68.229.254`
 - `zakura-testnet-eu` — `root@164.92.209.78`
 - `zakura-testnet-as` — `root@206.189.148.0`
-- `zakura-compat` — `root@206.189.208.228`
 
-The first five nodes are systemd-managed `zakurad.service` nodes. `zakura-compat`
-is process-managed because it shares the compat host with a manually supervised
-`zcashd` sidecar; the deployer updates `/root/unity/zakura/target/release/zakurad`,
-rewrites `/root/unity/zakura-testnet.toml`, restarts only the Zakura process, and
-then the workflow verifies the sidecar with `deploy/zcashd-compat/sync-check.sh`.
+All five nodes are systemd-managed `zakurad.service` nodes.
 
 One-time runner bootstrap from an operator machine with SSH access and CI
 credentials in `~/agents-env`:
@@ -96,15 +91,13 @@ The workflow is manual (`workflow_dispatch`). Inputs:
 
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
-while forcing the legacy non-VCT path. Fleet nodes use `p2p_stack = "dual"`;
-`zakura-compat` uses `p2p_stack = "legacy"` (legacy TCP only). It also writes
-`/etc/zakura/zakura.toml` and uses each node's existing
+while forcing the legacy non-VCT path. Fleet nodes use `p2p_stack = "dual"`.
+It also writes `/etc/zakura/zakura.toml` and uses each node's existing
 `/mnt/data/zakura-cache` snapshot directory, so CI restarts the current
 `zakurad.service` against the existing state instead of creating a fresh
 database. Volume-backed fleet hosts mount their attached DigitalOcean block
 volume at `/mnt/data`; legacy `/mnt/<node-name>-data` paths are compatibility
-symlinks only. The compat Zakura process uses the same snapshot layout on its
-host.
+symlinks only.
 
 The `"dual"` setting enables the experimental Zakura P2P v2 stack alongside the
 legacy stack.
@@ -196,10 +189,12 @@ and deploys it to:
 - `europe-central-0` — `root@161.35.156.226`
 - `asia-south-0` — `root@139.59.64.115`
 - `asia-pacific-0` — `root@168.144.173.250`
+- `zakura-compat` — `root@159.203.113.196`
 
-All nine run a hand-provisioned `zakurad` systemd service. One-time runner
-bootstrap from an operator machine with SSH access and CI credentials in
-`~/agents-env`:
+The first nine run a hand-provisioned `zakurad` systemd service.
+`zakura-compat` runs `zakurad-compat` alongside a native `zcashd` sidecar on the
+same host. One-time runner bootstrap from an operator machine with SSH access
+and CI credentials in `~/agents-env`:
 
 ```bash
 cd deploy/deployer

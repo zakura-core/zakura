@@ -30,17 +30,17 @@ blank.
 Testnet:
 
 1. `zakura-testnet-1`, `zakura-testnet-2`, `zakura-testnet-3`
-2. `zakura-testnet-eu`, `zakura-testnet-as`, `zakura-compat`
+2. `zakura-testnet-eu`, `zakura-testnet-as`
 
 Mainnet:
 
 1. `asia-0`, `us-0`, `us-west-0`, `canada-0`, `europe-west-0`
 2. `us-east-0`, `europe-central-0`, `asia-south-0`,
-   `asia-pacific-0`, `zakura-compat`, `zakura-compat-docker`
+   `asia-pacific-0`, `zakura-compat`
 
-These batches cover all 6 testnet and all 11 mainnet nodes. Keep compatibility
-nodes in the second half so ordinary nodes establish the candidate version
-first.
+These batches cover all 5 testnet and all 10 mainnet nodes. Keep the
+compatibility node in the second half so ordinary nodes establish the candidate
+version first.
 
 ## Preflight
 
@@ -99,7 +99,7 @@ deploy_batch zakura-testnet-deploy.yml \
 # Complete the testnet first-half health gate.
 
 deploy_batch zakura-testnet-deploy.yml \
-  zakura-testnet-eu zakura-testnet-as zakura-compat
+  zakura-testnet-eu zakura-testnet-as
 
 # Complete the full-testnet health gate and obtain explicit mainnet confirmation.
 
@@ -110,7 +110,7 @@ deploy_batch zakura-mainnet-deploy.yml \
 
 deploy_batch zakura-mainnet-deploy.yml \
   us-east-0 europe-central-0 asia-south-0 asia-pacific-0 \
-  zakura-compat zakura-compat-docker
+  zakura-compat
 ```
 
 Append `-f force_rebuild=true` only when explicitly needed. Use
@@ -121,11 +121,9 @@ does not satisfy a completed deployment.
 
 - Confirm every workflow run succeeded, including its final fleet status.
 - Confirm each deployed node reports the expected commit/version and healthy
-  service or container state.
+  service state.
 - Confirm RPC height is current and advances after the restart.
-- For testnet `zakura-compat`, confirm the workflow's zcashd sidecar sync check
-  passes.
-- For compatibility nodes, confirm both Zakura and zcashd remain healthy.
+- For mainnet `zakura-compat`, confirm both Zakura and zcashd remain healthy.
 - Record failed nodes and run URLs. Stop rather than rolling forward around a
   failed node.
 
@@ -137,7 +135,7 @@ Dashboards:
 ## Completion report
 
 Report the immutable ref, the four batches, run URLs, health verification, any
-retries, and whether all 17 nodes completed successfully.
+retries, and whether all 15 nodes completed successfully.
 
 ## References
 

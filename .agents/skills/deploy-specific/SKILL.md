@@ -21,7 +21,6 @@ Require or confirm:
 
 - `ref`: Git branch, tag, or SHA to build and deploy.
 - `nodes`: one or more exact names from the inventories below.
-- `network`: required when a node name is ambiguous, such as `zakura-compat`.
 - `force_rebuild`: optional; defaults to `false`.
 - `no_restart`: optional; defaults to `false`.
 
@@ -37,7 +36,6 @@ Testnet:
 - `zakura-testnet-3`
 - `zakura-testnet-eu`
 - `zakura-testnet-as`
-- `zakura-compat`
 
 Mainnet:
 
@@ -51,10 +49,8 @@ Mainnet:
 - `asia-south-0`
 - `asia-pacific-0`
 - `zakura-compat`
-- `zakura-compat-docker`
 
-Reject unknown names rather than guessing. If `zakura-compat` is requested
-without a network, ask which network.
+Reject unknown names rather than guessing.
 
 ## Preflight
 
@@ -123,7 +119,7 @@ Append these workflow fields only when requested:
 - Confirm every workflow run succeeded and its final node status is healthy.
 - Confirm each node reports the expected commit/version.
 - For restarted nodes, confirm RPC height is current and advances.
-- For testnet `zakura-compat`, confirm the zcashd sidecar sync check passes.
+- For mainnet `zakura-compat`, confirm both Zakura and zcashd remain healthy.
 - Stop on failure; do not continue to additional requested nodes.
 - Report each requested node and its workflow run URL.
 

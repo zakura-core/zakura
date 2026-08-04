@@ -715,6 +715,14 @@ fn first_missing_subtree_index_finds_the_end_of_the_run() {
         Some(NoteCommitmentSubtreeIndex(3))
     );
 
+    // An upgraded database can contain a pre-U row and a post-handoff row around a subtree
+    // skipped by VCT fast sync. The later row must not hide the internal gap.
+    assert_eq!(
+        first_missing_subtree_index(&map(&[0, 2]), NoteCommitmentSubtreeIndex(0), None),
+        Some(NoteCommitmentSubtreeIndex(1)),
+        "the first internal gap must be reported instead of one past the last key"
+    );
+
     // Nothing served at all: the requested start is the first missing index.
     assert_eq!(
         first_missing_subtree_index(&map(&[]), NoteCommitmentSubtreeIndex(7), None),

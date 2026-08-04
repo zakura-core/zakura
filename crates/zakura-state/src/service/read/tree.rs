@@ -131,19 +131,24 @@ fn check_historical_subtree_available(
 /// Returns the lowest index in `[start_index, end_index)` that `subtrees` does not serve, or
 /// `None` when the run covers the whole request.
 ///
-/// `subtrees` is contiguous from `start_index` by the time this runs, so the first index it fails
-/// to cover is one past its last key.
+/// Scans the returned keys in order so an internal gap is detected even when later subtrees are
+/// present.
 pub(crate) fn first_missing_subtree_index<Node>(
     subtrees: &BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
     start_index: NoteCommitmentSubtreeIndex,
     end_index: Option<NoteCommitmentSubtreeIndex>,
 ) -> Option<NoteCommitmentSubtreeIndex> {
-    let first_missing = match subtrees.keys().next_back() {
+    let mut first_missing = start_index;
+
+    for index in subtrees.keys() {
+        if *index != first_missing {
+            break;
+        }
+
         // `u16::MAX` is the last index that can exist, so a run reaching it has no successor to
         // be missing.
-        Some(last) => NoteCommitmentSubtreeIndex(last.0.checked_add(1)?),
-        None => start_index,
-    };
+        first_missing = NoteCommitmentSubtreeIndex(first_missing.0.checked_add(1)?);
+    }
 
     // An index the client did not ask for is not missing from its answer.
     match end_index {

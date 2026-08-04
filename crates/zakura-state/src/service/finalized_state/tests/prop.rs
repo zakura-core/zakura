@@ -1694,7 +1694,6 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 "an index past the last completed subtree stays an empty list, not an error"
             );
 
-
             // Negative: a peer can supply a wrong root exactly at the handoff height,
             // where there is no buffered checkpoint successor to authenticate it. The
             // final embedded frontier still binds the expected root, so the committer

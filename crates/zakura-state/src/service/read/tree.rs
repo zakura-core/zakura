@@ -199,7 +199,10 @@ fn check_historical_sapling_subtrees_available(
         db,
         "sapling",
         first_missing_subtree_index(subtrees, start_index, end_index),
-        |db, handoff| db.sapling_tree_by_height(&handoff).map(|tree| tree.count()),
+        |db, handoff| {
+            db.latest_stored_sapling_tree(&handoff)
+                .map(|tree| tree.count())
+        },
     )
 }
 
@@ -217,7 +220,10 @@ fn check_historical_orchard_subtrees_available(
         db,
         "orchard",
         first_missing_subtree_index(subtrees, start_index, end_index),
-        |db, handoff| db.orchard_tree_by_height(&handoff).map(|tree| tree.count()),
+        |db, handoff| {
+            db.latest_stored_orchard_tree(&handoff)
+                .map(|tree| tree.count())
+        },
     )
 }
 
@@ -236,7 +242,7 @@ fn check_historical_ironwood_subtrees_available(
         "ironwood",
         first_missing_subtree_index(subtrees, start_index, end_index),
         |db, handoff| {
-            db.ironwood_tree_by_height(&handoff)
+            db.latest_stored_ironwood_tree(&handoff)
                 .map(|tree| tree.count())
         },
     )

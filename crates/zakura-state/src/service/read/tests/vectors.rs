@@ -707,6 +707,43 @@ fn handoff_tree_is_only_expected_after_sync_reaches_handoff() {
     assert!(!is_syncing_below_last_checkpoint(None, handoff));
 }
 
+/// A missing handoff tree is an error once the finalized tip has reached the handoff.
+#[tokio::test]
+async fn missing_handoff_tree_fails_closed_after_sync_reaches_handoff() {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .take(2)
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Mainnet).await;
+    let handoff = read_state
+        .db
+        .finalized_tip_height()
+        .expect("the populated state has a finalized tip");
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, handoff);
+    batch.delete_range_sapling_tree(&read_state.db, &Height::MIN, &handoff);
+    batch.delete_sapling_tree(&read_state.db, &handoff);
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding a missing handoff tree succeeds");
+
+    let error = sapling_subtrees(
+        None::<Arc<Chain>>,
+        &read_state.db,
+        NoteCommitmentSubtreeIndex(0)..1.into(),
+    )
+    .expect_err("a reached handoff without its tree must fail closed");
+
+    assert_eq!(error.pool, "sapling");
+    assert_eq!(error.index, NoteCommitmentSubtreeIndex(0));
+    assert_eq!(error.handoff, handoff);
+}
+
 /// The served run must be checked to its end, not just at its start.
 ///
 /// `z_getsubtreesbyindex` returns one contiguous run, so a gap anywhere truncates the response.

@@ -328,8 +328,9 @@ impl ZakuraDb {
         Some(Arc::new(tree))
     }
 
+    /// Returns the latest stored Sapling tree at or below `height`, without asserting its presence.
     #[allow(clippy::unwrap_in_result)]
-    fn latest_stored_sapling_tree(
+    pub(crate) fn latest_stored_sapling_tree(
         &self,
         height: &Height,
     ) -> Option<Arc<sapling::tree::NoteCommitmentTree>> {
@@ -482,8 +483,9 @@ impl ZakuraDb {
         Some(Arc::new(tree))
     }
 
+    /// Returns the latest stored Orchard tree at or below `height`, without asserting its presence.
     #[allow(clippy::unwrap_in_result)]
-    fn latest_stored_orchard_tree(
+    pub(crate) fn latest_stored_orchard_tree(
         &self,
         height: &Height,
     ) -> Option<Arc<orchard::tree::NoteCommitmentTree>> {
@@ -636,8 +638,9 @@ impl ZakuraDb {
         Some(Arc::new(tree))
     }
 
+    /// Returns the latest stored Ironwood tree at or below `height`, without asserting its presence.
     #[allow(clippy::unwrap_in_result)]
-    fn latest_stored_ironwood_tree(
+    pub(crate) fn latest_stored_ironwood_tree(
         &self,
         height: &Height,
     ) -> Option<Arc<ironwood::tree::NoteCommitmentTree>> {

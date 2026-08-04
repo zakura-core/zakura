@@ -7,7 +7,7 @@ name = "zakura"
 # [package.metadata.release] below does it automatically, but only under the
 # full `cargo release` flow (`cargo release version` skips the replace step) -
 # keep the two in sync when bumping by hand.
-version = "2.0.0-rc1"
+version = "1.1.0-rc1"
 authors.workspace = true
 description = "Zakura, an independent, consensus-compatible implementation of a Zcash node"
 license.workspace = true
@@ -356,8 +356,15 @@ workspace = true
 # Removing the experimental `elasticsearch` feature is intentional. It never
 # provided a supported downstream library API, so do not require a major
 # version solely to remove its Cargo feature name.
+#
+# `ZakuradCmd` is likewise not a supported downstream library API: it is the
+# clap subcommand enum for the `zakurad` binary, and its variants track the
+# CLI, not a consumer contract. Retiring a subcommand is an operator-visible
+# change recorded in the changelog, and must not require a major version
+# solely because the enum happens to be reachable from the crate root.
 [package.metadata.cargo-semver-checks.lints]
 feature_missing = "warn"
+enum_variant_missing = "warn"
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 libc = "0.2.186"

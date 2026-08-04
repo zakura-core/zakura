@@ -58,7 +58,7 @@ jobs:
             --metadata-out "$RUNNER_TEMP/release-state-resolution.json" \
             --max-age-hours "$MAX_AGE_HOURS"
 
-      - name: Import checkpoints, frontier, and provenance
+      - name: Import checkpoints, frontier, subtrees, and provenance
         id: import
         env:
           BUNDLE: ${{ runner.temp }}/release-state-bundle
@@ -112,6 +112,7 @@ jobs:
           crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
           crates/zakurad/src/components/sync/end_of_support.rs
           EOF
           UNEXPECTED=$(comm -23 "$RUNNER_TEMP/actual-files" "$RUNNER_TEMP/allowed-files")

@@ -744,9 +744,9 @@ async fn missing_handoff_tree_fails_closed_after_sync_reaches_handoff() {
     assert_eq!(error.handoff, handoff);
 }
 
-/// Missing pre-activation trees are consensus-defined empty frontiers, not unavailable history.
+/// Missing pre-activation trees are returned as consensus-defined empty frontiers.
 #[tokio::test]
-async fn pre_activation_tree_requests_do_not_report_archive_errors() {
+async fn pre_activation_tree_requests_return_empty_frontiers() {
     let _init_guard = zakura_test::init();
     let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
         .values()
@@ -774,7 +774,7 @@ async fn pre_activation_tree_requests_do_not_report_archive_errors() {
             .oneshot(ReadRequest::SaplingTree(requested_height.into()))
             .await
             .expect("pre-activation Sapling tree request succeeds"),
-        ReadResponse::SaplingTree(None)
+        ReadResponse::SaplingTree(Some(Default::default()))
     );
     assert_eq!(
         read_state
@@ -782,14 +782,23 @@ async fn pre_activation_tree_requests_do_not_report_archive_errors() {
             .oneshot(ReadRequest::OrchardTree(requested_height.into()))
             .await
             .expect("pre-activation Orchard tree request succeeds"),
-        ReadResponse::OrchardTree(None)
+        ReadResponse::OrchardTree(Some(Default::default()))
     );
     assert_eq!(
         read_state
+            .clone()
             .oneshot(ReadRequest::IronwoodTree(requested_height.into()))
             .await
             .expect("pre-activation Ironwood tree request succeeds"),
-        ReadResponse::IronwoodTree(None)
+        ReadResponse::IronwoodTree(Some(Default::default()))
+    );
+    assert_eq!(
+        read_state
+            .oneshot(ReadRequest::SaplingTree(handoff.into()))
+            .await
+            .expect("missing pre-activation block request succeeds"),
+        ReadResponse::SaplingTree(None),
+        "an empty frontier is only returned for a block that exists"
     );
 }
 

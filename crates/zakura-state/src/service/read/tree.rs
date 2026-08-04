@@ -30,31 +30,32 @@ use crate::{
 #[allow(unused_imports)]
 use zakura_chain::subtree::NoteCommitmentSubtree;
 
-/// Returns an error if the per-height note commitment tree for `hash_or_height` was never
-/// written, because `db` was built by the verified-commitment-trees fast-sync path and
-/// `hash_or_height` falls in the absent band `[U, H)`.
+/// Returns `tree` if it exists, or the consensus-defined empty frontier before `pool_activation`.
 ///
-/// Read handlers call this only after a tree read came back empty, so a tree that is present
-/// (below `U`, or at or above the handoff) is never rejected. Distinguishing the absent band
-/// from an ordinary miss is what stops a client from reading the miss as the empty tree; see
-/// [`HistoricalTreeUnavailable`].
-///
-/// A missing tree before `pool_activation` is the consensus-defined empty frontier, so it is not
-/// historical data that the fast-sync path failed to store.
-fn check_historical_tree_available(
+/// Returns an error if the tree was never written because `db` was built by the
+/// verified-commitment-trees fast-sync path and `hash_or_height` falls in the absent band `[U, H)`.
+fn resolve_historical_tree<Tree: Default>(
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
     pool_activation: NetworkUpgrade,
-) -> Result<(), HistoricalTreeUnavailable> {
-    let Some(height) = hash_or_height.height_or_else(|hash| db.height(hash)) else {
-        return Ok(());
+    tree: Option<Tree>,
+) -> Result<Option<Tree>, HistoricalTreeUnavailable> {
+    if tree.is_some() {
+        return Ok(tree);
+    }
+
+    let Some(height) = hash_or_height
+        .hash_or_else(|height| db.hash(height))
+        .and_then(|hash| db.height(hash))
+    else {
+        return Ok(None);
     };
 
     if pool_activation
         .activation_height(&db.network())
         .is_none_or(|activation| height < activation)
     {
-        return Ok(());
+        return Ok(Some(Default::default()));
     }
 
     match db.vct_synced_below() {
@@ -64,7 +65,7 @@ fn check_historical_tree_available(
                 handoff,
             })
         }
-        _ => Ok(()),
+        _ => Ok(None),
     }
 }
 
@@ -285,11 +286,7 @@ where
         .and_then(|chain| chain.as_ref().sapling_tree(hash_or_height))
         .or_else(|| db.sapling_tree_by_hash_or_height(hash_or_height));
 
-    if tree.is_none() {
-        check_historical_tree_available(db, hash_or_height, NetworkUpgrade::Sapling)?;
-    }
-
-    Ok(tree)
+    resolve_historical_tree(db, hash_or_height, NetworkUpgrade::Sapling, tree)
 }
 
 /// Returns a list of Sapling [`NoteCommitmentSubtree`]s with indexes in the provided range.
@@ -344,11 +341,7 @@ where
         .and_then(|chain| chain.as_ref().orchard_tree(hash_or_height))
         .or_else(|| db.orchard_tree_by_hash_or_height(hash_or_height));
 
-    if tree.is_none() {
-        check_historical_tree_available(db, hash_or_height, NetworkUpgrade::Nu5)?;
-    }
-
-    Ok(tree)
+    resolve_historical_tree(db, hash_or_height, NetworkUpgrade::Nu5, tree)
 }
 
 /// Returns a list of Orchard [`NoteCommitmentSubtree`]s with indexes in the provided range.
@@ -398,11 +391,7 @@ where
         .and_then(|chain| chain.as_ref().ironwood_tree(hash_or_height))
         .or_else(|| db.ironwood_tree_by_hash_or_height(hash_or_height));
 
-    if tree.is_none() {
-        check_historical_tree_available(db, hash_or_height, NetworkUpgrade::Nu6_3)?;
-    }
-
-    Ok(tree)
+    resolve_historical_tree(db, hash_or_height, NetworkUpgrade::Nu6_3, tree)
 }
 
 /// Returns a list of Ironwood [`NoteCommitmentSubtree`]s with indexes in the

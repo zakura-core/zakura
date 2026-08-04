@@ -42,9 +42,8 @@ use zakura_chain::{
 
 use crate::{
     constants::{
-        state_database_format_version_in_code, MAX_FIND_BLOCK_HASHES_RESULTS,
-        MAX_FIND_BLOCK_HEADERS_RESULTS, MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_LEGACY_CHAIN_BLOCKS,
-        STATE_DATABASE_KIND,
+        MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS,
+        MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_LEGACY_CHAIN_BLOCKS,
     },
     error::{CommitBlockError, CommitCheckpointVerifiedError, InvalidateError, ReconsiderError},
     request::TimedSpan,
@@ -2394,28 +2393,6 @@ pub fn init_read_only(
         finalized_state.db.clone(),
         non_finalized_state_sender,
     ))
-}
-
-/// Opens an existing database read-only and audits its completed VCT Sprout-history repair.
-pub fn validate_vct_sprout_history(
-    config: Config,
-    network: &Network,
-) -> Result<
-    finalized_state::VctSproutHistoryValidationSummary,
-    finalized_state::VctSproutHistoryValidationError,
-> {
-    let db = ZakuraDb::new_for_vct_sprout_history_validation(
-        &config,
-        STATE_DATABASE_KIND,
-        &state_database_format_version_in_code(),
-        network,
-        finalized_state::STATE_COLUMN_FAMILIES_IN_CODE
-            .iter()
-            .map(ToString::to_string),
-    )
-    .map_err(finalized_state::VctSproutHistoryValidationError::OpenDatabase)?;
-
-    finalized_state::validate_completed_repair(&db)
 }
 
 /// Calls [`init_read_only`] with the provided [`Config`] and [`Network`] from a blocking task.

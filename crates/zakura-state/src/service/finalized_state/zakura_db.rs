@@ -29,7 +29,6 @@ use crate::{
     write_database_format_version_to_disk, BoxError, Config, StateInitError,
 };
 
-use super::disk_format::upgrade::repair_vct_sprout_history;
 use super::disk_format::upgrade::restorable_db_versions;
 
 pub mod block;
@@ -107,23 +106,6 @@ pub struct ZakuraDb {
     db: DiskDb,
 }
 
-#[derive(Clone, Copy)]
-enum DbOpenMode {
-    Writable,
-    ReadOnly,
-    VctSproutValidation,
-}
-
-impl DbOpenMode {
-    fn is_read_only(self) -> bool {
-        !matches!(self, Self::Writable)
-    }
-
-    fn enforces_vct_repair_guard(self) -> bool {
-        !matches!(self, Self::VctSproutValidation)
-    }
-}
-
 impl ZakuraDb {
     /// Opens or creates the database at a path based on the kind, major version and network,
     /// with the supplied column families, preserving any existing column families,
@@ -145,59 +127,6 @@ impl ZakuraDb {
         column_families_in_code: impl IntoIterator<Item = String>,
         read_only: bool,
     ) -> Result<ZakuraDb, StateInitError> {
-        let open_mode = if read_only {
-            DbOpenMode::ReadOnly
-        } else {
-            DbOpenMode::Writable
-        };
-
-        Self::new_with_vct_repair_guard(
-            config,
-            db_kind,
-            format_version_in_code,
-            network,
-            debug_skip_format_upgrades,
-            column_families_in_code,
-            open_mode,
-        )
-    }
-
-    /// Opens a read-only database for the explicit VCT Sprout-history audit.
-    ///
-    /// Unlike normal read-only callers, the audit must inspect databases that predate the repair
-    /// format. The returned database remains read-only; only the startup rejection of an
-    /// unrepaired VCT database is skipped.
-    /// This method is temporary and can be removed after the VCT Sprout-history repair is complete.
-    pub(crate) fn new_for_vct_sprout_history_validation(
-        config: &Config,
-        db_kind: impl AsRef<str>,
-        format_version_in_code: &Version,
-        network: &Network,
-        column_families_in_code: impl IntoIterator<Item = String>,
-    ) -> Result<ZakuraDb, StateInitError> {
-        Self::new_with_vct_repair_guard(
-            config,
-            db_kind,
-            format_version_in_code,
-            network,
-            false,
-            column_families_in_code,
-            DbOpenMode::VctSproutValidation,
-        )
-    }
-
-    #[allow(clippy::unwrap_in_result)]
-    fn new_with_vct_repair_guard(
-        config: &Config,
-        db_kind: impl AsRef<str>,
-        format_version_in_code: &Version,
-        network: &Network,
-        debug_skip_format_upgrades: bool,
-        column_families_in_code: impl IntoIterator<Item = String>,
-        open_mode: DbOpenMode,
-    ) -> Result<ZakuraDb, StateInitError> {
-        let read_only = open_mode.is_read_only();
-
         // A read-only secondary follows another process's primary database and must never delete
         // it, whereas an ephemeral database deletes its files on drop, so the two modes are
         // mutually exclusive. Reject the combination up front, before the read-only branch below
@@ -250,8 +179,6 @@ impl ZakuraDb {
             return Err(StateInitError::ReadOnlyDatabaseNotFound { path: db_path });
         }
 
-        let upgrades_explicitly_disabled = debug_skip_format_upgrades;
-
         // Format upgrades try to write to the database, so we always skip them
         // if `read_only` is `true`.
         //
@@ -280,34 +207,13 @@ impl ZakuraDb {
             db: disk_db,
         };
 
-        // The original Mainnet VCT fast path did not persist historical Sprout frontiers.
-        // Never expose an affected database unless this writable startup can synchronously
-        // complete the authenticated repair.
-        let prepared_vct_repair = if open_mode.enforces_vct_repair_guard()
-            && repair_vct_sprout_history::is_repair_eligible(&db, disk_version_before_open.as_ref())
-        {
-            if read_only || upgrades_explicitly_disabled {
-                let reason = if read_only {
-                    "read-only databases cannot be repaired"
-                } else {
-                    "database format upgrades are disabled"
-                };
-                return Err(StateInitError::VctSproutHistoryRepairRequired {
-                    mode: if read_only { "read-only" } else { "writable" },
-                    reason,
-                });
-            }
-
-            Some(
-                repair_vct_sprout_history::prepare_startup_repair(&db).map_err(|error| {
-                    StateInitError::VctSproutHistoryRepairInvalid {
-                        reason: error.to_string(),
-                    }
-                })?,
-            )
-        } else {
-            None
-        };
+        // The original Mainnet VCT fast path did not persist historical Sprout frontiers, so an
+        // affected database silently rejects JoinSplits that spend a historical Sprout anchor.
+        // The repair that used to fix this in place has been removed, so such a database can no
+        // longer be made safe: refuse to expose it at all, in every open mode.
+        if is_unrepairable_vct_database(&db, disk_version_before_open.as_ref()) {
+            return Err(StateInitError::VctSproutHistoryUnrepairable);
+        }
 
         let zero_location_utxos =
             db.address_utxo_locations(AddressLocation::from_usize(Height(0), 0, 0));
@@ -330,18 +236,14 @@ impl ZakuraDb {
                 .unwrap_or_else(|error| panic!("startup header-store repair failed: {error}"));
         }
 
-        db.run_startup_format_change(format_change, prepared_vct_repair);
+        db.run_startup_format_change(format_change);
 
         Ok(db)
     }
 
     /// Complete the startup format change before exposing the database, then launch only
     /// configured periodic current-format checks in the background.
-    pub(crate) fn run_startup_format_change(
-        &mut self,
-        format_change: DbFormatChange,
-        prepared_vct_repair: Option<Arc<repair_vct_sprout_history::RepairInput>>,
-    ) {
+    pub(crate) fn run_startup_format_change(&mut self, format_change: DbFormatChange) {
         if self.debug_skip_format_upgrades {
             return;
         }
@@ -350,12 +252,7 @@ impl ZakuraDb {
         let initial_tip_height = self.finalized_tip_height();
         let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
         format_change
-            .run_format_change_or_check(
-                self,
-                initial_tip_height,
-                &never_cancel_receiver,
-                prepared_vct_repair,
-            )
+            .run_format_change_or_check(self, initial_tip_height, &never_cancel_receiver)
             .expect("startup format change cannot be cancelled");
 
         let format_change_handle =
@@ -519,7 +416,6 @@ impl ZakuraDb {
                             // The initial tip height is not used by the new blocks format check.
                             None,
                             &never_cancel_receiver,
-                            None,
                         )
                         .expect("cancel handle is never used");
                 }
@@ -576,8 +472,135 @@ impl ZakuraDb {
     }
 }
 
+/// The first database format version whose Mainnet VCT databases are guaranteed to hold the
+/// historical Sprout anchors that JoinSplit verification needs.
+///
+/// Databases below this version that were written by the VCT fast path are missing those anchors.
+const VCT_SPROUT_HISTORY_VERSION: Version = Version::new(28, 0, 1);
+
+/// Returns true if `db` was written by the original Mainnet VCT fast path, before it persisted
+/// historical Sprout frontiers.
+///
+/// Such a database cannot verify a JoinSplit that spends a historical Sprout anchor, and there is
+/// no longer any in-place repair for it, so it must never be used.
+fn is_unrepairable_vct_database(db: &ZakuraDb, disk_version: Option<&Version>) -> bool {
+    db.network() == Network::Mainnet
+        && db.is_vct_synced()
+        && disk_version.is_some_and(|version| version < &VCT_SPROUT_HISTORY_VERSION)
+}
+
 impl Drop for ZakuraDb {
     fn drop(&mut self) {
         self.shutdown(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use crate::{
+        constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+        service::finalized_state::{DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE},
+    };
+
+    use super::*;
+
+    fn persistent_config() -> (TempDir, Config) {
+        let cache = tempfile::tempdir().expect("temporary cache directory is created");
+        let config = Config {
+            cache_dir: cache.path().to_path_buf(),
+            ephemeral: false,
+            ..Config::default()
+        };
+        (cache, config)
+    }
+
+    fn open(
+        config: &Config,
+        network: &Network,
+        read_only: bool,
+    ) -> Result<ZakuraDb, StateInitError> {
+        ZakuraDb::new(
+            config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            network,
+            false,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            read_only,
+        )
+    }
+
+    /// Creates a database at `disk_version`, optionally marked as built by the VCT fast path.
+    fn seed_db(config: &Config, network: &Network, disk_version: Version, vct_synced: bool) {
+        let db = ZakuraDb::new(
+            config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            network,
+            // Skip format upgrades so the seeded version survives until the guard runs.
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+        .expect("fixture database opens");
+
+        if vct_synced {
+            let mut batch = DiskWriteBatch::new();
+            batch.update_vct_sync_marker(&db, Height(1));
+            db.write_batch(batch).expect("VCT marker write succeeds");
+        }
+
+        db.update_format_version_on_disk(&disk_version)
+            .expect("fixture version write succeeds");
+    }
+
+    /// A Mainnet database written by the original VCT fast path is missing historical Sprout
+    /// anchors and can no longer be repaired, so it must be refused in every open mode.
+    #[test]
+    fn unrepairable_vct_database_is_rejected_in_every_open_mode() {
+        let network = Network::Mainnet;
+        let old = Version::new(28, 0, 0);
+
+        for read_only in [false, true] {
+            let (_cache, config) = persistent_config();
+            seed_db(&config, &network, old.clone(), true);
+
+            assert!(
+                matches!(
+                    open(&config, &network, read_only),
+                    Err(StateInitError::VctSproutHistoryUnrepairable)
+                ),
+                "read_only = {read_only} startup must refuse an unrepairable VCT database"
+            );
+        }
+    }
+
+    /// The guard is narrow: it must not reject databases that are not missing Sprout history.
+    #[test]
+    fn databases_without_missing_sprout_history_open_normally() {
+        let old = Version::new(28, 0, 0);
+        let repaired = Version::new(28, 0, 1);
+
+        // Mainnet, old format, but never built by the VCT fast path.
+        let (_cache, config) = persistent_config();
+        seed_db(&config, &Network::Mainnet, old.clone(), false);
+        assert!(open(&config, &Network::Mainnet, false).is_ok());
+
+        // Mainnet, VCT-synced, but already at or above the version that persists Sprout history.
+        let (_cache, config) = persistent_config();
+        seed_db(&config, &Network::Mainnet, repaired, true);
+        assert!(open(&config, &Network::Mainnet, false).is_ok());
+
+        // A non-Mainnet network is never affected: the fast path is Mainnet-only.
+        let regtest = Network::new_regtest(Default::default());
+        let (_cache, config) = persistent_config();
+        seed_db(&config, &regtest, old, true);
+        assert!(open(&config, &regtest, false).is_ok());
     }
 }

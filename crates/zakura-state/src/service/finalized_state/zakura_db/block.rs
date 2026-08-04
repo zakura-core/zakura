@@ -886,7 +886,9 @@ impl ZakuraDb {
     /// been deleted yet:
     /// <https://github.com/zcash/zcash/blob/v6.3.0/src/rpc/blockchain.cpp>
     ///
-    ///     obj.pushKV("pruned", fPruneMode);
+    /// ```text
+    /// obj.pushKV("pruned", fPruneMode);
+    /// ```
     ///
     /// A node configured with
     /// [`StorageMode::Pruned`](crate::StorageMode::Pruned) prunes nothing until
@@ -1274,11 +1276,6 @@ impl ZakuraDb {
     /// Writes the given batch to the database.
     pub fn write_batch(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
         self.db.write(batch)
-    }
-
-    /// Writes the given batch and synchronizes its write-ahead log before returning.
-    pub(crate) fn write_batch_sync(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
-        self.db.write_sync(batch)
     }
 
     /// Flushes pending writes to SST files.

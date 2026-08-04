@@ -884,108 +884,22 @@ cargo test -p zakura-state --lib -- frontier sprout_change
 cargo test -p zakura-utils --features zakura-checkpoints-offline
 ```
 
-## 17. VCT Sprout-history repair artifact
-
-### 17.1 Purpose and trust boundary
+## 17. Historical note: the VCT Sprout-history repair artifact
 
 The original VCT fast path advanced Sprout locally but omitted the historical
-`Sprout root → frontier` anchor entries. A later JoinSplit can spend one of those roots, so an
-affected database must be repaired before it is used for validation. The repair artifact is a
-canonical, Mainnet-only history of **only the blocks that change Sprout**; it is unrelated to
-peer-delivered VCT roots and is never accepted from peers.
+`Sprout root -> frontier` anchor entries, so an affected Mainnet database could not verify a
+later JoinSplit that spends one of those roots. Two things addressed this:
 
-The SHA-256 digest in the artifact detects accidental or malicious byte changes, but does not
-establish provenance. Provenance comes from release review and embedding the approved bytes in
-the binary. The loader must never substitute downloaded, locally generated, or guessed bytes.
-Each record is bound to its canonical block hash, and the header is bound to the canonical
-handoff block hash. The artifact's historical handoff height, block hash, terminal Sprout root,
-length, and complete digest are independently pinned in the loader. This identity remains frozen
-while the release-state checkpoint and frontier advance, until the temporary repair is removed.
-CI separately requires the frozen terminal Sprout root to equal the latest embedded frontier's
-Sprout root. Ordinary checkpoint advances therefore pass without regenerating the artifact, but
-a new Sprout-changing JoinSplit intentionally blocks the update until the artifact is regenerated
-or the temporary repair is removed.
+- The forward fix (section 7): the fast commit path now updates the Sprout tree for every block,
+  so databases built by current releases are never affected.
+- A temporary repair: database format version 28.0.1 replayed a reviewed, embedded, Mainnet-only
+  artifact of every Sprout-changing block to backfill the missing anchors.
 
-### 17.2 Binary format (version 1)
+**The repair artifact has been removed.** With the forward fix long shipped, carrying a 71 MB
+embedded blob and its replay machinery was pure cost. Version 28.0.1 is now a no-op format bump.
 
-All integers are little-endian. The fixed 115-byte header is:
-
-| Bytes | Field |
-| --- | --- |
-| 0–7 | ASCII magic `ZKVCTSP1` |
-| 8–9 | `u16` format version (`1`) |
-| 10 | network tag (`1`, Mainnet) |
-| 11–14 | `u32` handoff height |
-| 15–46 | canonical handoff block hash |
-| 47–50 | `u32` record count |
-| 51–82 | 32-byte terminal Sprout root |
-| 83–114 | SHA-256 digest of the remaining payload |
-
-The payload contains exactly `record_count` records. Each record is `height_delta: u32`,
-the canonical 32-byte block hash, `commitment_count: u16`, `commitment_count` 32-byte Sprout
-commitments, and one 32-byte resulting Sprout root. The digest covers these canonical hashes.
-Heights are delta-coded from an initial height of zero. The current implementation permits at
-most 1M records and 65,535 commitments per record. Because no bytes using the earlier
-unshipped layout were published, this corrected layout remains version 1 and has no compatibility
-decoder.
-
-### 17.3 Validation and generation
-
-The decoder rejects a wrong magic, version, or network; truncation; digest mismatches; excess
-counts; zero or overflowing/non-increasing height deltas; heights above the handoff; empty
-records; record-root mismatches while replaying commitments from an empty Sprout tree; a
-terminal-root mismatch; trailing bytes; or a mismatch with the frozen reviewed artifact identity.
-The production loader does not derive that identity from the moving embedded final frontier; the
-unit test couples only their Sprout roots to detect a divergence at the latest checkpoint.
-
-The offline generator opens a complete current-format Mainnet archive read-only, scans canonical
-block bodies from genesis through the embedded handoff, emits only Sprout-changing blocks with
-their canonical hashes, and then decodes, replays, canonical-index-validates, and handoff-validates
-its own output:
-
-```console
-cargo run -p zakura-state --bin generate-vct-sprout-artifact -- \
-  /path/to/zakura-cache /path/to/vct-sprout-history.bin
-```
-
-Reviewers must reproduce and compare the emitted bytes, SHA-256 digest, terminal root, and
-the last checkpoint identity before updating the artifact package. Running the tool never installs or enables
-its output. The reviewed contiguous output is split in the
-[`zakura-vct-sprout-history`](https://github.com/zakura-core/zakura-vct-sprout-history)
-repository, whose release tooling reconstructs the full stream and verifies its identity before
-publishing exact-versioned crates.io packages. Those packages must be published before Zakura
-updates its pinned facade version and independent digest.
-
-### 17.4 Embedding, availability, and replay
-
-The Mainnet bytes are compiled into the final binary from the exact-versioned
-`zakura-vct-sprout-history` facade crate and loaded only through `embedded_mainnet()`. Its part
-crates keep every crates.io archive below the registry limit without reconstructing a second
-contiguous buffer at runtime. `zakura-state` independently verifies the complete byte length and
-SHA-256 before applying the format and semantic checks above. The guard rejects affected
-read-only databases and writable opens with upgrades disabled: operators must reopen writable
-to repair or discard/resync. Non-Mainnet databases never load or replay this Mainnet artifact.
-Normally synced databases and databases already marked at the repair format are unaffected.
-An eligible writable startup decodes and validates the artifact once, then reuses that prepared
-input for the repair and its immediate post-write validation.
-
-The initial startup format change now runs synchronously before `ZakuraDb` or `FinalizedState`
-is exposed; only periodic current-format checks remain in the background. Therefore no block
-commit can race the migration or observe partially repaired anchors. The 28.0.1 format upgrade
-validates artifact records against both retained canonical indexes only through the local
-finalized tip. If the tip has reached the database marker, it also requires the local block hash
-at that marker to equal the checkpoint list's canonical hash; a prefix database below the marker
-does not yet need that local entry. It then replays records through
-`min(finalized_tip, database_marker)` into one
-`DiskWriteBatch`, first inserting the empty Sprout anchor and then every recorded resulting
-anchor. If the tip is below the database marker, it also replaces the stale Sprout **tip** with
-the replayed prefix frontier. If the tip is at or above the marker, it deliberately leaves the
-tip unchanged: post-marker commits may have advanced truthful state, while the replay only
-reconstructs the originally broken fast region. Artifact handoff and database marker equality is
-never required.
-
-Cancellation is checked before work, between records, and before the write. The anchor inserts
-and any prefix-tip update commit atomically. The database format version is marked complete
-only after the upgrade succeeds, so a crash or cancellation leaves the old version and safely
-replays the same deterministic batch on the next startup. This makes the migration
-crash-safe and idempotent at the format-upgrade boundary; it does not alter post-marker state.
+Databases still missing that history are no longer repairable, so they fail closed instead: a
+Mainnet database that is VCT-synced and below format version 28.0.1 is rejected at startup with
+`StateInitError::VctSproutHistoryUnrepairable`, in every open mode. Operators must discard and
+resync, or restore a snapshot taken with a current release. See `is_unrepairable_vct_database` in
+`crates/zakura-state/src/service/finalized_state/zakura_db.rs`.

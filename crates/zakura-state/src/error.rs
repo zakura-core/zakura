@@ -106,28 +106,15 @@ pub enum StateInitError {
     )]
     ReadOnlyEphemeralConflict,
 
-    /// A Mainnet VCT database written before the Sprout-history repair format is unsafe to use.
+    /// A Mainnet database written by the original VCT fast path is missing historical Sprout
+    /// anchors, and the in-place repair for it no longer exists.
     #[error(
-        "cannot open {mode} state: this verified-commitment-tree database may be missing historical Sprout anchors. \
-         {reason}. Hint: reopen the database writable with a build containing the reviewed repair artifact, or discard it and resync"
+        "cannot open state: this database was written by an early verified-commitment-trees fast \
+         sync and is missing historical Sprout anchors, so it cannot verify JoinSplits that spend \
+         a historical Sprout anchor. \
+         Hint: discard the database and resync, or restore a snapshot taken with a current release"
     )]
-    VctSproutHistoryRepairRequired {
-        /// Whether this was a writable primary or read-only secondary open.
-        mode: &'static str,
-        /// Why startup could not perform the repair.
-        reason: &'static str,
-    },
-
-    /// The embedded repair inputs or the local marker-scoped canonical state did not validate.
-    #[error(
-        "cannot open state: verified-commitment-tree Sprout-history repair validation failed: {reason}. \
-         Hint: use a build with mutually consistent checkpoint, frontier, and repair artifacts; \
-         if the local canonical marker binding is invalid, discard the database and resync"
-    )]
-    VctSproutHistoryRepairInvalid {
-        /// The failed build-level or database-level validation.
-        reason: String,
-    },
+    VctSproutHistoryUnrepairable,
 }
 
 /// An error describing why a block could not be queued to be committed to the state.

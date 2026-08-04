@@ -73,7 +73,6 @@ tower = { workspace = true, features = ["buffer", "util"] }
 tracing = { workspace = true }
 
 sapling-crypto = { workspace = true }
-zakura-vct-sprout-history = { workspace = true }
 
 zakura-node-services = { path = "../zakura-node-services", version = "3.1.0-rc1" }
 zakura-chain = { path = "../zakura-chain", version = "3.1.0-rc0", features = ["async-error"] }

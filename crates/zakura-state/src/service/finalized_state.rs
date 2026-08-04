@@ -102,19 +102,12 @@ pub use commitment_aux::{
 };
 #[allow(unused_imports)]
 pub use disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk};
-pub(crate) use disk_format::upgrade::repair_vct_sprout_history::validate_completed_repair;
-pub use disk_format::upgrade::repair_vct_sprout_history::{
-    VctSproutHistoryValidationError, VctSproutHistoryValidationSummary,
-};
 #[allow(unused_imports)]
 pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
     MAX_ON_DISK_HEIGHT,
 };
-pub use vct::{
-    generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
-    GeneratorError, NextVctBlock,
-};
+pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, NextVctBlock};
 #[allow(unused_imports)]
 pub use zakura_db::commitment_roots_db::{
     AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,

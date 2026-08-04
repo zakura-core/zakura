@@ -1,6 +1,12 @@
 //! Randomised property tests for the finalized state.
 
-use std::{collections::HashMap, env, error::Error, fs, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    env,
+    error::Error,
+    fs,
+    sync::{Arc, Mutex},
+};
 
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -9,6 +15,7 @@ use zakura_chain::{
     amount::Amount,
     block::{Block, Height},
     history_tree::HistoryTree,
+    orchard,
     parallel::commitment_aux::BlockCommitmentRoots,
     parallel::commitment_aux_verify::verify_supplied_roots_from_parts,
     parameters::{
@@ -16,6 +23,7 @@ use zakura_chain::{
         NetworkUpgrade,
     },
     primitives::Groth16Proof,
+    sapling,
     serialization::{BytesInDisplayOrder, ZcashDeserializeInto},
     sprout::JoinSplit,
     transaction::{JoinSplitData, LockTime, Transaction, UnminedTx},
@@ -25,9 +33,18 @@ use zakura_test::prelude::*;
 
 use crate::{
     config::Config,
-    service::{arbitrary::PreparedChain, check::anchors::tx_anchors_refer_to_final_treestates},
+    error::HistoricalTreeUnavailable,
+    service::{
+        arbitrary::PreparedChain,
+        check::anchors::tx_anchors_refer_to_final_treestates,
+        read::{
+            check_historical_sapling_subtrees_available, check_historical_tree_available,
+            derive_historical_frontiers, historical_tree::HistoricalTreeDerivationError,
+            HistoricalTreeCache,
+        },
+    },
     tests::FakeChainHelper,
-    HashOrHeight,
+    HashOrHeight, ReadRequest, ReadResponse,
 };
 
 use super::super::{
@@ -1653,6 +1670,169 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             prop_assert!(fast.db.vct_historical_tree_unavailable(HashOrHeight::Height(Height(last as u32 - 1))), "RPC gate: below-handoff treestate is unavailable");
             prop_assert!(!fast.db.vct_historical_tree_unavailable(HashOrHeight::Height(handoff)), "RPC gate: handoff treestate is available");
 
+            // The read handlers turn that predicate into the typed archive-mode error the
+            // RPC boundary reports, carrying the handoff so the failure is diagnosable.
+            // Without it, a below-handoff `z_gettreestate` returns a JSON `null`, which
+            // lightwalletd-style clients read as the *empty* tree.
+            let below_handoff_height = HashOrHeight::Height(Height(last as u32 - 1));
+            prop_assert_eq!(
+                check_historical_tree_available(&fast.db, below_handoff_height),
+                Err(HistoricalTreeUnavailable { hash_or_height: below_handoff_height, handoff }),
+                "a below-handoff tree read is a typed archive-mode error, not an absent tree"
+            );
+            prop_assert_eq!(
+                check_historical_tree_available(&fast.db, HashOrHeight::Height(handoff)),
+                Ok(()),
+                "the handoff height itself is served normally"
+            );
+            // A legacy node never reports the archive-mode error, whatever the height.
+            prop_assert_eq!(
+                check_historical_tree_available(&legacy.db, below_handoff_height),
+                Ok(()),
+                "a legacy-synced node has the tree and must not report an absent band"
+            );
+
+            // The subtree gate must not fire just because a node is fast-synced. This chain is
+            // far too short to complete a subtree, so `z_getsubtreesbyindex` at index 0 is an
+            // ordinary "nothing here yet" empty list, exactly as on a legacy node.
+            prop_assert_eq!(
+                check_historical_sapling_subtrees_available(&fast.db, 0.into(), None, &BTreeMap::new()),
+                Ok(()),
+                "an index past the last completed subtree stays an empty list, not an error"
+            );
+
+            // On-demand derivation rebuilds the absent band from retained block bodies. `U` is 0
+            // here, so every derivation replays from empty genesis frontiers — the cold path.
+            // Each result is accepted only after reproducing the authenticated root, so agreeing
+            // with the legacy node's own per-height trees is what proves the replay is faithful
+            // rather than merely self-consistent.
+            let cache = Mutex::new(HistoricalTreeCache::default());
+            for height in (seed as u32 + 1)..(last as u32) {
+                let height = Height(height);
+                let derived = derive_historical_frontiers(&fast.db, &cache, height, u64::MAX)
+                    .expect("every absent-band height derives from retained bodies");
+
+                prop_assert_eq!(
+                    derived.sapling.root(),
+                    legacy.db.sapling_tree_by_height(&height).expect("the legacy node stores every tree").root(),
+                    "derived Sapling frontier matches the legacy node at {:?}", height
+                );
+                prop_assert_eq!(
+                    derived.orchard.root(),
+                    legacy.db.orchard_tree_by_height(&height).expect("the legacy node stores every tree").root(),
+                    "derived Orchard frontier matches the legacy node at {:?}", height
+                );
+                prop_assert_eq!(
+                    derived.ironwood.root(),
+                    legacy.db.ironwood_tree_by_height(&height).expect("the legacy node stores every tree").root(),
+                    "derived Ironwood frontier matches the legacy node at {:?}", height
+                );
+            }
+
+            // The replay bound is a serving limit: with the memo primed by the loop above, the
+            // last height is already derived, so it costs nothing. A cold height below every memo
+            // entry still has to replay, and refuses rather than running unbounded.
+            prop_assert!(
+                derive_historical_frontiers(&fast.db, &cache, Height(last as u32 - 1), 0).is_ok(),
+                "a memoized height is served without replaying, whatever the bound"
+            );
+            // Artifact generation (design §4.1, §5) is the same replay, stopping at a grid. Its
+            // entries must agree with the legacy node's own per-height trees, and the artifact
+            // must survive a byte round trip, since consumers only ever see the encoded form.
+            let export = super::super::export_treestate_artifacts(&fast.db, super::super::GridSpacing::Uniform { blocks: 4 }, |_, _| {})
+                .expect("the fast-synced fixture exports");
+
+            prop_assert_eq!(export.frontiers.handoff, handoff);
+            prop_assert!(!export.frontiers.entries.is_empty(), "the grid is not empty");
+            prop_assert_eq!(
+                export.frontiers.entries.last().expect("the grid is not empty").height,
+                Height(handoff.0 - 1),
+                "the grid ends on the last height of the band"
+            );
+
+            for entry in &export.frontiers.entries {
+                prop_assert_eq!(
+                    entry.sapling.root(),
+                    legacy.db.sapling_tree_by_height(&entry.height).expect("legacy stores every tree").root(),
+                    "exported Sapling entry matches the legacy node at {:?}", entry.height
+                );
+                prop_assert_eq!(
+                    entry.orchard.root(),
+                    legacy.db.orchard_tree_by_height(&entry.height).expect("legacy stores every tree").root(),
+                    "exported Orchard entry matches the legacy node at {:?}", entry.height
+                );
+            }
+
+            let encoded = export.frontiers.encode(&network);
+            let decoded = super::super::FrontierArtifact::decode(&encoded, &network)
+                .expect("a freshly generated artifact decodes");
+            prop_assert_eq!(decoded.entries.len(), export.frontiers.entries.len());
+            for (decoded, original) in decoded.entries.iter().zip(&export.frontiers.entries) {
+                prop_assert_eq!(decoded.sapling.root(), original.sapling.root());
+                prop_assert_eq!(decoded.orchard.root(), original.orchard.root());
+                prop_assert_eq!(decoded.ironwood.root(), original.ironwood.root());
+            }
+
+            // Two runs must agree byte for byte: that reproducibility is the determinism gate
+            // phase C relies on, and for the subtree artifact it carries the whole trust argument.
+            let second = super::super::export_treestate_artifacts(&fast.db, super::super::GridSpacing::Uniform { blocks: 4 }, |_, _| {})
+                .expect("a second export succeeds");
+            prop_assert_eq!(
+                second.frontiers.encode(&network),
+                encoded,
+                "two independent exports must be byte-identical"
+            );
+            prop_assert_eq!(
+                second.subtrees.encode(&network),
+                export.subtrees.encode(&network),
+                "two independent subtree exports must be byte-identical"
+            );
+
+            // A node configured with the published grid anchors on it instead of replaying from
+            // genesis, which is the whole point of §4.1: the artifact turns a cold request into a
+            // short replay.
+            let artifact = Arc::new(decoded);
+            let anchored = Mutex::new(HistoricalTreeCache::with_artifact(artifact.clone()));
+            let probe = Height(handoff.0 - 1);
+            let from_artifact = derive_historical_frontiers(&fast.db, &anchored, probe, u64::MAX)
+                .expect("an artifact-anchored derivation succeeds");
+            prop_assert_eq!(
+                from_artifact.sapling.root(),
+                legacy.db.sapling_tree_by_height(&probe).expect("legacy stores every tree").root(),
+                "an artifact-anchored derivation agrees with the legacy node"
+            );
+
+            // §4.2 is the security claim: the artifact carries no trust. Corrupt every entry and
+            // the node must still answer correctly, by rejecting the bad anchors and replaying
+            // further — not by trusting them, and not by refusing to serve.
+            let mut corrupt = (*artifact).clone();
+            for entry in &mut corrupt.entries {
+                entry.sapling = Arc::new(sapling::tree::NoteCommitmentTree::default());
+                entry.orchard = Arc::new(orchard::tree::NoteCommitmentTree::default());
+            }
+            let corrupted = Mutex::new(HistoricalTreeCache::with_artifact(Arc::new(corrupt)));
+            let from_corrupt = derive_historical_frontiers(&fast.db, &corrupted, probe, u64::MAX)
+                .expect("a corrupt artifact must not stop the node from serving");
+            prop_assert_eq!(
+                from_corrupt.sapling.root(),
+                from_artifact.sapling.root(),
+                "a corrupt artifact is ignored, not absorbed"
+            );
+
+            let cold_cache = Mutex::new(HistoricalTreeCache::default());
+            let cold_height = Height(last as u32 - 1);
+            prop_assert_eq!(
+                derive_historical_frontiers(&fast.db, &cold_cache, cold_height, 1).err(),
+                Some(HistoricalTreeDerivationError::ReplayTooLong {
+                    height: cold_height,
+                    // From empty genesis frontiers, reaching `cold_height` replays every block up
+                    // to and including it.
+                    blocks: u64::from(cold_height.0) + 1,
+                    limit: 1,
+                }),
+                "a cold derivation past the replay bound refuses instead of running unbounded"
+            );
+
             // Negative: a peer can supply a wrong root exactly at the handoff height,
             // where there is no buffered checkpoint successor to authenticate it. The
             // final embedded frontier still binds the expected root, so the committer
@@ -2730,6 +2910,162 @@ fn vct_peer_source_handoff_without_db_root_at_c() -> Result<()> {
                 golden_tip.sprout.root(),
                 "tip sprout frontier must match legacy"
             );
+    });
+
+    Ok(())
+}
+
+/// Builds a [`ReadStateService`] over `finalized_state`, so tests can exercise the real read
+/// handlers rather than the helpers underneath them.
+///
+/// The config gating, the artifact load and the typed-error fallback all live in the handler, so
+/// testing only the helpers would leave the seam that actually serves clients unproven.
+#[cfg(test)]
+fn read_service_over(finalized_state: &FinalizedState) -> crate::ReadStateService {
+    use crate::service::{watch_receiver::WatchReceiver, VctRootRepairStatus};
+
+    let (_non_finalized_sender, non_finalized_receiver) = tokio::sync::watch::channel(
+        crate::service::non_finalized_state::NonFinalizedState::new(&finalized_state.network()),
+    );
+    let (_repair_sender, repair_receiver) =
+        tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let (completed, completed_receiver) =
+        super::super::HighestCompletedCheckpointTracker::open(&finalized_state.db);
+    let (_auth_sender, auth_receiver) = tokio::sync::watch::channel(None);
+
+    crate::ReadStateService::new(
+        finalized_state,
+        None,
+        WatchReceiver::new(non_finalized_receiver),
+        completed_receiver,
+        Some(completed.keepalive_sender()),
+        repair_receiver,
+        auth_receiver,
+    )
+}
+
+/// The read service must serve absent-band treestates when derivation is enabled, and report the
+/// typed archive-mode error when it is not.
+///
+/// This exercises the handler itself — config gating, derivation, and the fallback to
+/// `HistoricalTreeUnavailable` — rather than the helpers underneath it, because that handler is
+/// what a wallet's `z_gettreestate` actually reaches.
+#[test]
+#[allow(clippy::needless_range_loop)] // the loops index blocks[i + 1] for the successor witness
+fn vct_read_service_serves_or_refuses_absent_band_treestates() -> Result<()> {
+    use tower::ServiceExt;
+
+    let _init_guard = zakura_test::init();
+
+    let network = spaced_upgrade_network();
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("NU5 activation height is configured");
+    let tested_block_count =
+        usize::try_from(nu5_height.0 + 4).expect("test activation height fits in usize");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
+
+        let blocks: Vec<_> = chain.iter().collect();
+        let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+        let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
+        let last = (nu5 + 3) as usize;
+        prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+        let handoff = Height(last as u32);
+        let seed = (heartwood - 1) as usize;
+
+        // Legacy pass: the per-block fixture, and the golden trees to compare against.
+        let mut legacy = FinalizedState::new(&Config::ephemeral(), &network)
+            .expect("opening an ephemeral database should succeed");
+        let mut fixture = TestRootMap::new();
+        let mut handoff_trees = None;
+        for i in 0..=last {
+            let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+            let (_h, trees) = legacy
+                .commit_finalized_direct(cv.into(), None, None, "vct legacy")
+                .unwrap();
+            if i > seed {
+                fixture.insert(
+                    i as u32,
+                    (trees.sapling.root(), trees.orchard.root(), trees.ironwood.root()),
+                );
+            }
+            if i == last {
+                handoff_trees = Some(trees);
+            }
+        }
+        let handoff_trees = handoff_trees.expect("the handoff produced trees");
+
+        // Fast pass with derivation turned on, so the handler takes the serving path.
+        let deriving = Config { derive_historical_trees: true, ..Config::ephemeral() };
+        let mut fast = FinalizedState::new(&deriving, &network)
+            .expect("opening an ephemeral database should succeed");
+        enable_vct_test_fixture_source_with_handoff(
+            &mut fast,
+            fixture.clone(),
+            handoff,
+            handoff_trees.sapling.clone(),
+            handoff_trees.orchard.clone(),
+            handoff_trees.sprout.clone(),
+            handoff_trees.ironwood.clone(),
+        );
+        for i in 0..=last {
+            let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+            let successor = blocks.get(i + 1).and_then(|b| next_vct_block(b.block.clone()));
+            fast.commit_finalized_direct(cv.into(), None, successor, "vct fast")
+                .unwrap();
+        }
+
+        let probe = Height(last as u32 - 1);
+        prop_assert!(fast.db.vct_tree_absent(probe), "the probe height is in the absent band");
+
+        let runtime = tokio::runtime::Runtime::new().expect("a test runtime starts");
+
+        // Derivation enabled: the handler serves a tree matching the legacy node's.
+        let read_state = read_service_over(&fast);
+        let response = runtime
+            .block_on(read_state.oneshot(ReadRequest::SaplingTree(probe.into())))
+            .expect("the read service answers");
+        let ReadResponse::SaplingTree(Some(tree)) = response else {
+            panic!("derivation is enabled, so the absent band must be served, got {response:?}")
+        };
+        prop_assert_eq!(
+            tree.root(),
+            legacy.db.sapling_tree_by_height(&probe).expect("legacy stores every tree").root(),
+            "the served treestate matches the legacy node"
+        );
+
+        // Derivation disabled: the handler reports the typed archive-mode error rather than a
+        // `None` tree, which a lightwalletd-style client would read as the empty tree.
+        let mut plain = FinalizedState::new(&Config::ephemeral(), &network)
+            .expect("opening an ephemeral database should succeed");
+        enable_vct_test_fixture_source_with_handoff(
+            &mut plain,
+            fixture,
+            handoff,
+            handoff_trees.sapling.clone(),
+            handoff_trees.orchard.clone(),
+            handoff_trees.sprout.clone(),
+            handoff_trees.ironwood.clone(),
+        );
+        for i in 0..=last {
+            let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+            let successor = blocks.get(i + 1).and_then(|b| next_vct_block(b.block.clone()));
+            plain.commit_finalized_direct(cv.into(), None, successor, "vct fast")
+                .unwrap();
+        }
+
+        let read_state = read_service_over(&plain);
+        let error = runtime
+            .block_on(read_state.oneshot(ReadRequest::SaplingTree(probe.into())))
+            .expect_err("without derivation the absent band must be an error");
+        prop_assert!(
+            error.to_string().contains("fast-synced"),
+            "the error names the cause, got: {}", error
+        );
     });
 
     Ok(())

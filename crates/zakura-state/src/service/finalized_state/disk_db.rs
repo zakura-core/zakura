@@ -11,7 +11,7 @@
 //! each time the database format (column, serialization, etc) changes.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::{Debug, Write},
     fs,
     ops::RangeBounds,
@@ -593,7 +593,7 @@ impl DiskDb {
         let mut total_size_in_mem = 0;
         let db: &Arc<DB> = &self.db;
         let db_options = DiskDb::options();
-        let column_families = DiskDb::construct_column_families(db_options, db.path(), []);
+        let column_families = DiskDb::construct_column_families(db_options, db.path(), [], false);
         let mut column_families_log_string = String::from("");
 
         write!(column_families_log_string, "Column families and sizes: ").unwrap();
@@ -649,7 +649,7 @@ impl DiskDb {
     pub(crate) fn export_metrics(&self) {
         let db: &Arc<DB> = &self.db;
         let db_options = DiskDb::options();
-        let column_families = DiskDb::construct_column_families(db_options, db.path(), []);
+        let column_families = DiskDb::construct_column_families(db_options, db.path(), [], false);
 
         let mut total_disk: u64 = 0;
         let mut total_live: u64 = 0;
@@ -717,7 +717,7 @@ impl DiskDb {
         let db: &Arc<DB> = &self.db;
         let db_options = DiskDb::options();
         let mut total_size_on_disk = 0;
-        for cf_descriptor in DiskDb::construct_column_families(db_options, db.path(), []) {
+        for cf_descriptor in DiskDb::construct_column_families(db_options, db.path(), [], false) {
             let cf_name = &cf_descriptor.name();
             let cf_handle = db
                 .cf_handle(cf_name)
@@ -989,6 +989,7 @@ impl DiskDb {
         db_options: Options,
         path: &Path,
         column_families_in_code: impl IntoIterator<Item = String>,
+        read_only: bool,
     ) -> impl Iterator<Item = ColumnFamilyDescriptor> {
         // When opening the database in read/write mode, all column families must be opened.
         //
@@ -1000,9 +1001,21 @@ impl DiskDb {
         let column_families_on_disk = DB::list_cf(&db_options, path).unwrap_or_default();
         let column_families_in_code = column_families_in_code.into_iter();
 
+        // A read-only secondary cannot create column families, so naming one the database does
+        // not have fails the open outright. Restricting to what is actually on disk is what lets
+        // read-only tooling inspect a database written by an older version, which is exactly when
+        // some newer column family is missing. Nothing is lost: a column family that does not
+        // exist holds no data to read, and the accessors for one already handle its absence.
+        let missing_is_fatal = !read_only;
+        let on_disk: HashSet<String> = column_families_on_disk.iter().cloned().collect();
+
         column_families_on_disk
+            .clone()
             .into_iter()
-            .chain(column_families_in_code)
+            .chain(
+                column_families_in_code
+                    .filter(move |cf_name| missing_is_fatal || on_disk.contains(cf_name)),
+            )
             .unique()
             .map(move |cf_name: String| {
                 let mut cf_options = db_options.clone();
@@ -1068,8 +1081,12 @@ impl DiskDb {
 
         let db_options = DiskDb::options();
 
-        let column_families =
-            DiskDb::construct_column_families(db_options.clone(), &path, column_families_in_code);
+        let column_families = DiskDb::construct_column_families(
+            db_options.clone(),
+            &path,
+            column_families_in_code,
+            read_only,
+        );
 
         let db_result = if read_only {
             // Use a tempfile for the secondary instance cache directory

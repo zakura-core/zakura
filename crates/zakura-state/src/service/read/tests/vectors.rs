@@ -8,7 +8,10 @@ use zakura_chain::{
     ironwood, orchard,
     parameters::Network::*,
     serialization::ZcashDeserializeInto,
-    subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
+    subtree::{
+        NoteCommitmentSubtree, NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex,
+        TRACKED_SUBTREE_HEIGHT,
+    },
     transaction,
 };
 
@@ -24,7 +27,11 @@ use crate::{
     service::{
         finalized_state::{DiskWriteBatch, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE},
         non_finalized_state::Chain,
-        read::{ironwood_subtrees, orchard_subtrees, sapling_subtrees},
+        read::{
+            contiguous_subtrees_from, ironwood_subtrees, merge_published_subtrees,
+            orchard_subtrees, sapling_subtrees,
+            tree::{first_missing_subtree_index, subtree_completed_by_handoff},
+        },
     },
     Config, ReadRequest, ReadResponse,
 };
@@ -636,4 +643,205 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
     assert_eq!(found.unwrap().hash(), best_hash);
 
     Ok(())
+}
+
+/// The absent-band subtree bound must cover exactly the subtrees the fast path skipped.
+///
+/// The bound is what keeps [`crate::HistoricalSubtreeUnavailable`] from firing on an ordinary
+/// "you asked past the tip" query: only indices that completed at or below the handoff were
+/// skipped, everything at or above that is genuinely absent on any node.
+#[test]
+fn subtree_absent_band_bound_is_exact() {
+    const LEAVES_PER_SUBTREE: u64 = 1 << TRACKED_SUBTREE_HEIGHT;
+
+    // No subtree has completed yet, so no index is in the band, whatever the client asks for.
+    for leaves in [0, 1, LEAVES_PER_SUBTREE - 1] {
+        assert!(
+            !subtree_completed_by_handoff(0.into(), leaves),
+            "no subtree completes before {LEAVES_PER_SUBTREE} leaves, but {leaves} claimed one"
+        );
+    }
+
+    // Exactly one subtree (index 0) completed. Index 1 has not, so it stays an empty list.
+    assert!(subtree_completed_by_handoff(0.into(), LEAVES_PER_SUBTREE));
+    assert!(!subtree_completed_by_handoff(1.into(), LEAVES_PER_SUBTREE));
+
+    // A partly-filled second subtree does not count as completed.
+    assert!(subtree_completed_by_handoff(
+        0.into(),
+        LEAVES_PER_SUBTREE + 1
+    ));
+    assert!(!subtree_completed_by_handoff(
+        1.into(),
+        LEAVES_PER_SUBTREE + 1
+    ));
+
+    // Mainnet-scale: 73,934,658 Sapling commitments at the handoff is 1,128 completed subtrees,
+    // indexes 0..=1127. Index 1128 is the one still filling.
+    let sapling_leaves_at_handoff = 73_934_658;
+    assert!(subtree_completed_by_handoff(
+        1127.into(),
+        sapling_leaves_at_handoff
+    ));
+    assert!(!subtree_completed_by_handoff(
+        1128.into(),
+        sapling_leaves_at_handoff
+    ));
+}
+
+/// Merging the node's own subtree rows with published ones must still serve a continuous list.
+///
+/// The gated read drops everything when it has no row at the requested start, so a node holding
+/// rows only *above* the handoff contributes nothing until the published records below it are
+/// merged in. A client doing spend-before-sync asks from index 0 and needs one list spanning both
+/// halves; serving only the published half would silently truncate its witness data.
+#[test]
+fn contiguous_subtrees_spans_published_and_stored_rows() {
+    let data = |height: u32| {
+        NoteCommitmentSubtreeData::new(
+            Height(height),
+            sapling_crypto::Node::from_bytes([0; 32]).unwrap(),
+        )
+    };
+
+    let merged: std::collections::BTreeMap<_, _> = [0u16, 1, 2, 3]
+        .into_iter()
+        .map(|index| (NoteCommitmentSubtreeIndex(index), data(index as u32 + 1)))
+        .collect();
+
+    let served = contiguous_subtrees_from(merged.clone(), NoteCommitmentSubtreeIndex(0));
+    assert_eq!(served.len(), 4, "a gapless union is served whole");
+
+    // A gap makes everything past it unusable, so it is dropped rather than served.
+    let mut holed = merged.clone();
+    holed.remove(&NoteCommitmentSubtreeIndex(2));
+    let served = contiguous_subtrees_from(holed, NoteCommitmentSubtreeIndex(0));
+    assert_eq!(
+        served.keys().copied().collect::<Vec<_>>(),
+        vec![NoteCommitmentSubtreeIndex(0), NoteCommitmentSubtreeIndex(1)],
+        "the run stops at the first gap"
+    );
+
+    // A missing start index means there is nothing to serve, not a list starting later.
+    let mut no_start = merged.clone();
+    no_start.remove(&NoteCommitmentSubtreeIndex(0));
+    assert!(
+        contiguous_subtrees_from(no_start, NoteCommitmentSubtreeIndex(0)).is_empty(),
+        "a missing start index serves nothing"
+    );
+
+    // Indexes below the request are not served.
+    let served = contiguous_subtrees_from(merged, NoteCommitmentSubtreeIndex(2));
+    assert_eq!(
+        served.keys().copied().collect::<Vec<_>>(),
+        vec![NoteCommitmentSubtreeIndex(2), NoteCommitmentSubtreeIndex(3)],
+        "the run starts at the requested index"
+    );
+}
+
+/// The served run must be checked to its end, not just at its start.
+///
+/// `z_getsubtreesbyindex` returns one contiguous run, so a gap anywhere truncates the response.
+/// A single unbounded request from index 0 against a truncated artifact would otherwise return a
+/// short list with no error, which a client reads as "that is every subtree on this chain" — the
+/// same silent-truncation failure the typed errors exist to remove.
+#[test]
+fn first_missing_subtree_index_finds_the_end_of_the_run() {
+    let data = || {
+        NoteCommitmentSubtreeData::new(
+            Height(1),
+            sapling_crypto::Node::from_bytes([0; 32]).unwrap(),
+        )
+    };
+    let map = |indexes: &[u16]| {
+        indexes
+            .iter()
+            .map(|i| (NoteCommitmentSubtreeIndex(*i), data()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+
+    // A run that stops early reports the index just past its end, not "nothing missing".
+    assert_eq!(
+        first_missing_subtree_index(&map(&[0, 1, 2]), NoteCommitmentSubtreeIndex(0), None),
+        Some(NoteCommitmentSubtreeIndex(3))
+    );
+
+    // Nothing served at all: the requested start is the first missing index.
+    assert_eq!(
+        first_missing_subtree_index(&map(&[]), NoteCommitmentSubtreeIndex(7), None),
+        Some(NoteCommitmentSubtreeIndex(7))
+    );
+
+    // An index the client did not ask for is not missing from its answer.
+    assert_eq!(
+        first_missing_subtree_index(
+            &map(&[0, 1, 2]),
+            NoteCommitmentSubtreeIndex(0),
+            Some(NoteCommitmentSubtreeIndex(3))
+        ),
+        None,
+        "a fully satisfied bounded request has no gap"
+    );
+    assert_eq!(
+        first_missing_subtree_index(
+            &map(&[0, 1]),
+            NoteCommitmentSubtreeIndex(0),
+            Some(NoteCommitmentSubtreeIndex(5))
+        ),
+        Some(NoteCommitmentSubtreeIndex(2)),
+        "a bounded request served short still reports the gap"
+    );
+
+    // `u16::MAX` is the last index that can exist, so a run reaching it has no successor.
+    assert_eq!(
+        first_missing_subtree_index(
+            &map(&[u16::MAX]),
+            NoteCommitmentSubtreeIndex(u16::MAX),
+            None
+        ),
+        None,
+        "the final index must not overflow into a phantom gap"
+    );
+}
+
+/// A published subtree record must never displace the node's own row.
+///
+/// The node computed and verified its rows; a published record is trusted only after a digest the
+/// artifact carries itself, which is not a signature. A correct artifact never overlaps, so an
+/// overlap is exactly the corrupt-or-hostile case where precedence decides whether a wrong root
+/// reaches a client and builds a wrong witness.
+#[test]
+fn published_subtrees_never_displace_the_nodes_own_rows() {
+    let node = |root: u8| {
+        NoteCommitmentSubtreeData::new(
+            Height(11),
+            sapling_crypto::Node::from_bytes([root; 32]).unwrap(),
+        )
+    };
+
+    let mut stored = std::collections::BTreeMap::new();
+    stored.insert(NoteCommitmentSubtreeIndex(0), node(1));
+    stored.insert(NoteCommitmentSubtreeIndex(1), node(2));
+
+    merge_published_subtrees(
+        &mut stored,
+        [
+            // Collides with a row the node holds.
+            (NoteCommitmentSubtreeIndex(1), node(4)),
+            // Fills a genuine gap, which is what the artifact is for.
+            (NoteCommitmentSubtreeIndex(2), node(3)),
+        ],
+    );
+
+    assert_eq!(
+        stored[&NoteCommitmentSubtreeIndex(1)].root,
+        node(2).root,
+        "the node's own row wins on collision"
+    );
+    assert_eq!(
+        stored[&NoteCommitmentSubtreeIndex(2)].root,
+        node(3).root,
+        "a published record still fills an index the node lacks"
+    );
+    assert_eq!(stored.len(), 3);
 }

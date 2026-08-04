@@ -43,11 +43,15 @@ pub use config::{
     database_format_version_on_disk, state_database_format_version_on_disk, Config, PruningConfig,
     StorageMode,
 };
-pub use constants::{state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT};
+pub use constants::{
+    state_database_format_version_in_code, DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+    MAX_BLOCK_REORG_HEIGHT,
+};
 pub use error::{
     BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError, CommitHeaderRangeError,
-    CommitSemanticallyVerifiedError, DuplicateNullifierError, MissingSproutTipTree, StateInitError,
-    StoreIncoherentError, ValidateContextError,
+    CommitSemanticallyVerifiedError, DuplicateNullifierError, HistoricalSubtreeUnavailable,
+    HistoricalTreeUnavailable, MissingSproutTipTree, StateInitError, StoreIncoherentError,
+    ValidateContextError,
 };
 pub use request::{
     AuthenticateHeaderRootsRequest, CheckpointVerifiedBlock,
@@ -78,6 +82,15 @@ pub use service::{
 pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch};
 
 pub use service::finalized_state::{
+    derived_roots_in_display_order, inventory as vct_treestate_inventory, measure_derivations,
+    replay_inputs, verify_subtrees_against_stored, DerivationSample, ReplayInputs,
+    SubtreeVerification, VctTreestateInventory,
+};
+pub use service::finalized_state::{
+    export_treestate_artifacts, FrontierArtifact, FrontierEntry, GridSpacing, SubtreeArtifact,
+    SubtreeRecord, TreestateArtifactError, TreestateExport, TreestateExportError,
+};
+pub use service::finalized_state::{
     generate_mainnet_from_archive, produce_final_frontiers_bytes,
     produce_settled_final_frontiers_bytes, validate_final_frontiers_bytes,
     AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,
@@ -95,6 +108,7 @@ pub use service::finalized_state::{
 pub use service::finalized_state::{
     VctSproutHistoryValidationError, VctSproutHistoryValidationSummary,
 };
+pub use service::read::{HistoricalTreeCache, MAX_MEMOIZED_FRONTIERS};
 pub use service::{
     finalized_state::{
         DiskWriteBatch, FromDisk, HighestCompletedCheckpoint, HighestCompletedCheckpointError,

@@ -13,12 +13,37 @@ Production host wiring, operations, and rollback:
   has stopped its synced Mainnet node,
   `publish-release-state.sh <stopped-node-cache-dir>` runs
   the offline export and uploads one immutable bundle
-  (`release-state/v1/<height>/{meta.json, main-checkpoints.txt, mainnet-frontier.bin}`),
+  (`release-state/v1/<height>/{meta.json, main-checkpoints.txt, mainnet-frontier.bin,
+  mainnet-treestate-frontiers.bin, mainnet-treestate-subtrees.bin}`),
   then atomically replaces `release-state/latest.json`. Bundles are retained
-  newest-4 by default (`RELEASE_STATE_KEEP`).
+  newest-4 by default (`RELEASE_STATE_KEEP`). `meta.json` lists whichever files the
+  bundle actually contains, so consumers read the list rather than assuming a fixed set.
 - **GitHub (repository):** the workflow resolves `latest.json` over a pinned
   HTTPS host, verifies every digest, and opens a draft PR. Humans review and
   merge; releases build only committed source.
+
+## The historical-treestate artifacts
+
+`mainnet-treestate-frontiers.bin` and `mainnet-treestate-subtrees.bin` let a
+verified-commitment-trees fast-synced node serve `z_gettreestate`,
+`z_getsubtreesbyindex` and the `trees` sizes below its checkpoint handoff. A node
+loads them through `state.historical_frontier_artifact` and
+`state.historical_subtree_artifact`; both are optional, and a node without them
+falls back to replaying from genesis. See
+`docs/design/historical-treestate-serving.md`.
+
+Two operational notes:
+
+- **Generation is expensive.** It replays every block in the absent band, which takes
+  hours on Mainnet. Set `SKIP_TREESTATE_ARTIFACTS=1` to publish a bundle without them;
+  the bundle stays valid, and `meta.json` records what it holds.
+- **Either state directory works.** Every grid entry is checked against the
+  authenticated roots the exporting node already stores, so generation does not need a
+  legacy-synced node with per-height trees — a fast-synced state directory produces the
+  same artifact, and a mismatch fails the export rather than publishing a bad entry.
+
+`TREESTATE_BUDGET_MS` sets the per-entry replay budget: smaller means more entries, a
+larger artifact, and a shorter worst-case cold request on consumers.
 
 ## One-time host setup
 

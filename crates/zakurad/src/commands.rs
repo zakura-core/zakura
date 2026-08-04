@@ -11,15 +11,18 @@ use crate::config::ZakuradConfig;
 pub use self::{entry_point::EntryPoint, start::StartCmd};
 
 use self::{
-    copy_state::CopyStateCmd, generate::GenerateCmd, prune_state::PruneStateCmd,
-    rollback_state::RollbackStateCmd, tip_height::TipHeightCmd,
+    audit_historical_treestates::AuditHistoricalTreestatesCmd, copy_state::CopyStateCmd,
+    export_historical_treestates::ExportHistoricalTreestatesCmd, generate::GenerateCmd,
+    prune_state::PruneStateCmd, rollback_state::RollbackStateCmd, tip_height::TipHeightCmd,
     validate_vct_sprout_history::ValidateVctSproutHistoryCmd,
 };
 
 pub mod start;
 
+mod audit_historical_treestates;
 mod copy_state;
 mod entry_point;
+mod export_historical_treestates;
 mod generate;
 pub mod prune_state;
 pub mod rollback_state;
@@ -40,6 +43,12 @@ const LEGACY_CONFIG_FILE: &str = "zebrad.toml";
 /// Zakurad Subcommands
 #[derive(Command, Debug, clap::Subcommand)]
 pub enum ZakuradCmd {
+    /// Audit historical note commitment treestate serving in the state database
+    AuditHistoricalTreestates(AuditHistoricalTreestatesCmd),
+
+    /// Generate the historical-treestate artifacts from the state database
+    ExportHistoricalTreestates(ExportHistoricalTreestatesCmd),
+
     /// The `copy-state` subcommand, used to debug cached chain state (expert users only)
     // TODO: hide this command from users in release builds (#3279)
     CopyState(CopyStateCmd),
@@ -76,7 +85,9 @@ impl ZakuradCmd {
             CopyState(_) | Start(_) => true,
 
             // Utility commands that don't use server components
-            Generate(_)
+            AuditHistoricalTreestates(_)
+            | ExportHistoricalTreestates(_)
+            | Generate(_)
             | PruneState(_)
             | RollbackState(_)
             | TipHeight(_)
@@ -94,7 +105,9 @@ impl ZakuradCmd {
             Start(_) => true,
 
             // Utility commands
-            CopyState(_)
+            AuditHistoricalTreestates(_)
+            | CopyState(_)
+            | ExportHistoricalTreestates(_)
             | Generate(_)
             | PruneState(_)
             | RollbackState(_)
@@ -118,7 +131,9 @@ impl ZakuradCmd {
             // This output:
             // - is used by automated tools, or
             // - needs to be read easily.
-            Generate(_)
+            AuditHistoricalTreestates(_)
+            | ExportHistoricalTreestates(_)
+            | Generate(_)
             | PruneState(_)
             | RollbackState(_)
             | TipHeight(_)
@@ -141,6 +156,8 @@ impl ZakuradCmd {
 impl Runnable for ZakuradCmd {
     fn run(&self) {
         match self {
+            AuditHistoricalTreestates(cmd) => cmd.run(),
+            ExportHistoricalTreestates(cmd) => cmd.run(),
             CopyState(cmd) => cmd.run(),
             Generate(cmd) => cmd.run(),
             PruneState(cmd) => cmd.run(),

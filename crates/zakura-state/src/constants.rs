@@ -38,6 +38,15 @@ pub const STATE_DATABASE_KIND: &str = "state";
 /// get the network-specific floor.
 pub const MIN_PRUNING_RETENTION: u32 = 10_000;
 
+/// The default bound on how many blocks one historical note commitment tree derivation may
+/// replay, used by [`Config::max_historical_tree_replay_blocks`](crate::Config).
+///
+/// Sized to cover a cold request anywhere in a from-genesis fast-synced node's absent band on
+/// Mainnet, so the first request of a wallet sweep succeeds rather than failing at a limit. Later
+/// requests in the sweep replay only from the previous memoized frontier, so the bound applies to
+/// the cold case alone.
+pub const DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS: u64 = 4_000_000;
+
 /// The minimum retention window allowed in pruned storage mode on `network`.
 ///
 /// Every network's floor stays strictly greater than [`MAX_BLOCK_REORG_HEIGHT`],

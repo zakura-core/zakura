@@ -265,6 +265,17 @@ impl ZakuraDb {
         self.db.zs_get(&hash_by_height, &height)
     }
 
+    /// Returns the first height in `[start, end]` whose block body is not retained, if any.
+    ///
+    /// A body is absent because it was pruned, or because the height was never committed. Replaying
+    /// note commitments needs every body in the replay range, so this reports whether a range is
+    /// replayable at all.
+    pub fn first_missing_block_body(&self, start: Height, end: Height) -> Option<Height> {
+        (start.0..=end.0)
+            .map(Height)
+            .find(|height| !self.contains_body_at_height(*height))
+    }
+
     /// Returns the height of the given block if it exists.
     #[allow(clippy::unwrap_in_result)]
     pub fn height(&self, hash: block::Hash) -> Option<block::Height> {

@@ -10,7 +10,9 @@ use zakura_chain::{
     amount::{self, NegativeAllowed, NonNegative},
     block,
     history_tree::HistoryTreeError,
-    ironwood, orchard, sapling, sprout, transaction, transparent,
+    ironwood, orchard, sapling, sprout,
+    subtree::NoteCommitmentSubtreeIndex,
+    transaction, transparent,
     value_balance::{ValueBalance, ValueBalanceError},
     work::difficulty::CompactDifficulty,
 };
@@ -51,6 +53,53 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub struct MissingSproutTipTree {
     /// The finalized tip whose Sprout frontier is missing.
     pub tip: block::Height,
+}
+
+/// The per-height note commitment tree for a historical block was never written, because this
+/// database was built by the verified-commitment-trees fast-sync path.
+///
+/// Fast sync skips per-height trees across the half-open band `[U, H)`, where `U` is the first
+/// height this binary committed and `H` is the checkpoint handoff. Read handlers return this
+/// instead of an absent tree so the RPC boundary reports a diagnosable archive-mode failure:
+/// clients following the lightwalletd contract read an absent treestate as the *empty* tree, and
+/// would silently derive a wallet birthday anchor asserting an empty commitment tree deep in the
+/// chain.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error(
+    "historical note commitment tree at {hash_or_height} is unavailable: this node was fast-synced \
+     with verified commitment trees, so per-height trees below the checkpoint handoff {handoff:?} \
+     were never written"
+)]
+pub struct HistoricalTreeUnavailable {
+    /// The block whose per-height tree was requested.
+    pub hash_or_height: HashOrHeight,
+
+    /// The checkpoint handoff height `H`: the exclusive upper bound of the absent band.
+    pub handoff: block::Height,
+}
+
+/// A completed note commitment subtree root was never recorded, because this database was built
+/// by the verified-commitment-trees fast-sync path.
+///
+/// Subtree roots are a by-product of the per-height tree maintenance the fast path skips, so
+/// every subtree that completed at or below the checkpoint handoff is missing. Read handlers
+/// return this instead of an empty subtree list, which a client would otherwise read as "this
+/// chain has no subtrees here" and seed nothing, failing later without a clear cause.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error(
+    "historical {pool} note commitment subtree {index:?} is unavailable: this node was fast-synced \
+     with verified commitment trees, so subtrees completed at or below the checkpoint handoff \
+     {handoff:?} were never recorded"
+)]
+pub struct HistoricalSubtreeUnavailable {
+    /// The shielded pool whose subtree was requested, in `z_getsubtreesbyindex` spelling.
+    pub pool: &'static str,
+
+    /// The requested starting subtree index.
+    pub index: NoteCommitmentSubtreeIndex,
+
+    /// The checkpoint handoff height `H`, below which no subtree roots were recorded.
+    pub handoff: block::Height,
 }
 
 /// An error describing why opening the finalized state database failed.

@@ -16,6 +16,16 @@
 # Optional environment:
 #   ZAKURA_CHECKPOINTS_BIN    zakura-checkpoints binary (default: on PATH),
 #                             built with --features zakura-checkpoints-offline
+#   ZAKURAD_BIN               zakurad binary (default: on PATH), used to export the
+#                             historical-treestate artifacts
+#   TREESTATE_BUDGET_MS       per-entry replay budget for the frontier grid
+#                             (default 2000); smaller means a larger artifact and a
+#                             shorter worst-case cold request
+#   SKIP_TREESTATE_ARTIFACTS  set to 1 to omit the historical-treestate artifacts.
+#                             Generating them replays the whole absent band, which
+#                             takes hours; a bundle without them is still valid, but
+#                             fast-synced consumers fall back to replaying from
+#                             genesis. See docs/design/historical-treestate-serving.md
 #   RELEASE_STATE_KEEP        immutable bundles to retain (default 4)
 #   RELEASE_STATE_LOCK_FILE   host-local publisher lock
 #                             (default: /tmp/zakura-release-state-publish.lock)
@@ -26,6 +36,9 @@ STATE_DIR=${1:?usage: publish-release-state.sh <stopped-node-zakura-cache-dir>}
 : "${RELEASE_STATE_R2_REMOTE:?set RELEASE_STATE_R2_REMOTE to an rclone destination}"
 : "${RELEASE_STATE_PUBLIC_BASE:?set RELEASE_STATE_PUBLIC_BASE to the public HTTPS base URL}"
 BIN=${ZAKURA_CHECKPOINTS_BIN:-zakura-checkpoints}
+ZAKURAD=${ZAKURAD_BIN:-zakurad}
+TREESTATE_BUDGET_MS=${TREESTATE_BUDGET_MS:-2000}
+SKIP_TREESTATE_ARTIFACTS=${SKIP_TREESTATE_ARTIFACTS:-0}
 KEEP=${RELEASE_STATE_KEEP:-4}
 LOCK_FILE=${RELEASE_STATE_LOCK_FILE:-/tmp/zakura-release-state-publish.lock}
 # A zero or malformed KEEP would make `head -n -"$KEEP"` select every bundle,
@@ -83,6 +96,25 @@ list_remote_object() {
     --mainnet-frontier-output "$STAGE/mainnet-frontier.bin" \
     > "$STAGE/main-checkpoints.txt"
 
+# The historical-treestate artifacts (docs/design/historical-treestate-serving.md).
+# Generation replays the whole absent band and root-checks every grid entry, so it
+# fails rather than publishing an entry that does not match this node's own
+# authenticated roots. It works against either a fast-synced or a legacy-synced
+# state directory, because the entries are verified rather than read from stored trees.
+TREESTATE_FILES=()
+if [ "$SKIP_TREESTATE_ARTIFACTS" != "1" ]; then
+    "$ZAKURAD" export-historical-treestates \
+        --cache-dir "$STATE_DIR" \
+        --network Mainnet \
+        --target-cost-ms "$TREESTATE_BUDGET_MS" \
+        --frontier-output "$STAGE/mainnet-treestate-frontiers.bin" \
+        --subtree-output "$STAGE/mainnet-treestate-subtrees.bin" \
+        >&2
+    TREESTATE_FILES=(mainnet-treestate-frontiers.bin mainnet-treestate-subtrees.bin)
+else
+    echo "skipping historical-treestate artifacts (SKIP_TREESTATE_ARTIFACTS=1)" >&2
+fi
+
 HEIGHT=$(tail -1 "$STAGE/main-checkpoints.txt" | cut -d' ' -f1)
 BLOCK_HASH=$(tail -1 "$STAGE/main-checkpoints.txt" | cut -d' ' -f2)
 GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -102,12 +134,17 @@ if [ -n "$POINTER_LISTING" ]; then
 fi
 
 HEIGHT="$HEIGHT" BLOCK_HASH="$BLOCK_HASH" GENERATED_AT="$GENERATED_AT" \
+TREESTATE_FILES="${TREESTATE_FILES[*]-}" \
     python3 - "$STAGE" <<'PY'
 import hashlib, json, os, sys
 
 stage = sys.argv[1]
 files = {}
-for name in ("main-checkpoints.txt", "mainnet-frontier.bin"):
+# The treestate artifacts are optional, so a bundle generated without them stays
+# self-describing: consumers read the file list rather than assuming a fixed set.
+names = ["main-checkpoints.txt", "mainnet-frontier.bin"]
+names += [n for n in os.environ.get("TREESTATE_FILES", "").split() if n]
+for name in names:
     data = open(os.path.join(stage, name), "rb").read()
     files[name] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
@@ -152,6 +189,9 @@ else
     # never resolvable through a pointer.
     rclone copyto "$STAGE/main-checkpoints.txt" "$BUNDLE_REMOTE/main-checkpoints.txt"
     rclone copyto "$STAGE/mainnet-frontier.bin" "$BUNDLE_REMOTE/mainnet-frontier.bin"
+    for name in ${TREESTATE_FILES[@]+"${TREESTATE_FILES[@]}"}; do
+        rclone copyto "$STAGE/$name" "$BUNDLE_REMOTE/$name"
+    done
     rclone copyto "$STAGE/meta.json" "$BUNDLE_REMOTE/meta.json"
     echo "published bundle v1/$HEIGHT ($BLOCK_HASH)" >&2
 fi

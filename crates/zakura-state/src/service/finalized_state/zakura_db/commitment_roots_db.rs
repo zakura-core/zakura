@@ -1045,6 +1045,36 @@ impl ZakuraDb {
         self.write_batch(batch)
     }
 
+    /// Returns the first height in `range` that has no stored roots row, if any.
+    ///
+    /// Streams the index keys instead of materialising rows, so this stays usable across a whole
+    /// fast-synced absent band, where [`Self::commitment_roots_by_height_range`] would build a
+    /// multi-hundred-megabyte vector.
+    pub fn first_commitment_root_gap(&self, range: impl RangeBounds<Height>) -> Option<Height> {
+        let (start, end) = inclusive_bounds(range)?;
+
+        let mut expected = start;
+        for (height, _row) in self
+            .commitment_roots_cf()
+            .zs_forward_range_iter(start..=end)
+        {
+            if height != expected {
+                return Some(expected);
+            }
+
+            // The last height in the range has no successor to expect, and `next()` would
+            // overflow at `Height::MAX`.
+            if height == end {
+                return None;
+            }
+
+            expected = height.next().ok()?;
+        }
+
+        // The iterator ran out before reaching `end`, so the gap starts wherever it stopped.
+        Some(expected)
+    }
+
     /// Returns at most `limit` root heights for startup repair.
     pub(crate) fn commitment_root_heights_for_repair(
         &self,
@@ -2711,5 +2741,66 @@ mod tests {
                 height: Height(1),
             });
         assert_eq!(error.outcome(), AuthenticateHeaderRootsOutcome::Local);
+    }
+
+    /// A gap scan across the absent band is what tells a fast-synced node whether it can derive
+    /// historical treestates at all: every derived frontier is checked against the row at its own
+    /// height, so a single missing row makes that height unservable.
+    #[test]
+    fn first_commitment_root_gap_finds_the_first_missing_height() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_mainnet_db();
+
+        let roots = |height: u32| BlockCommitmentRoots {
+            height: Height(height),
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0; 32]),
+            sapling_tx: 0,
+            orchard_tx: 0,
+            ironwood_tx: 0,
+        };
+
+        db.insert_zakura_header_commitment_roots((1..=5).map(roots))
+            .expect("seeding roots succeeds");
+
+        assert_eq!(
+            db.first_commitment_root_gap(Height(1)..=Height(5)),
+            None,
+            "a fully stored range has no gap"
+        );
+        assert_eq!(
+            db.first_commitment_root_gap(Height(1)..=Height(7)),
+            Some(Height(6)),
+            "a range running past the stored rows reports where they stop"
+        );
+        assert_eq!(
+            db.first_commitment_root_gap(Height(0)..=Height(5)),
+            Some(Height(0)),
+            "a missing first height is reported, not skipped"
+        );
+
+        // Punch a hole in the middle: this is the case that would silently serve a wrong
+        // treestate if the scan only checked the range's endpoints.
+        let mut batch = DiskWriteBatch::new();
+        batch.delete_range_commitment_roots_by_height(&db, &Height(3), &Height(4));
+        db.write_batch(batch).expect("deleting a row succeeds");
+
+        assert_eq!(
+            db.first_commitment_root_gap(Height(1)..=Height(5)),
+            Some(Height(3)),
+            "an interior hole is found"
+        );
+        assert_eq!(
+            db.first_commitment_root_gap(Height(4)..=Height(5)),
+            None,
+            "a range above the hole is still gap-free"
+        );
+        assert_eq!(
+            db.first_commitment_root_gap(Height(5)..=Height(4)),
+            None,
+            "an empty range has no gap"
+        );
     }
 }

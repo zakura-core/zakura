@@ -930,6 +930,31 @@ mod tests {
         }
     }
 
+    /// Replaying note commitments needs every block body in the replay range, so the audit has to
+    /// report the first height that would stop a replay rather than discovering it mid-derivation.
+    #[test]
+    fn first_missing_block_body_finds_the_first_unreplayable_height() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_mainnet_db();
+        seed_block_bodies(&db, [1, 2]);
+
+        assert_eq!(
+            db.first_missing_block_body(block::Height(1), block::Height(2)),
+            None,
+            "a fully seeded range is replayable"
+        );
+        assert_eq!(
+            db.first_missing_block_body(block::Height(1), block::Height(4)),
+            Some(block::Height(3)),
+            "a range running past the seeded bodies reports where they stop"
+        );
+        assert_eq!(
+            db.first_missing_block_body(block::Height(0), block::Height(2)),
+            Some(block::Height(0)),
+            "a missing first height is reported, not skipped"
+        );
+    }
+
     #[test]
     fn produce_block_roots_derives_contiguous_tree_roots() {
         let _init_guard = zakura_test::init();

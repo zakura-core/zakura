@@ -128,8 +128,20 @@ python3 deploy/continuous-sync/deploy.py --node temp-zakura-sync-test-3 status
 
 The scheduled workflow runs `audit` twice per hour. It alerts when a host is
 unreachable, the controller is halted, the node service is inactive while a run
-claims to be syncing, metrics are unavailable during sync, or disk free space is
-below the configured 10 GiB floor.
+claims to be syncing, metrics are unavailable during sync, disk free space is
+below the configured 10 GiB floor, or the node has not completed a run in four
+days. A run is capped at 48 hours, so that last check cannot be tripped by a
+legitimately long sync.
+
+Each problem pages once when it appears, reminds every six hours while it is
+still unresolved, and posts a recovery when it clears. Continuity is judged on
+the kind of problem, not on the rendered message, because details such as free
+bytes and SSH error text change between samples and would otherwise look like a
+new problem on every cycle. Alert state is carried between workflow runs in the
+Actions cache, so a lost cache entry costs at most one duplicate page. A Slack
+post that fails is not recorded as sent; the next audit retries it. The audit
+job still exits non-zero on every cycle a problem is present, so the workflow
+run history remains an unthrottled signal.
 
 On a host:
 

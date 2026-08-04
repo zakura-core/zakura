@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = SCRIPT_DIR / "templates"
@@ -399,25 +399,53 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return summarize_parallel(nodes, work)
 
 
-def audit_problem(data: dict[str, Any], max_completion_age: int) -> str | None:
+class Problem(NamedTuple):
+    """One node's audit failure.
+
+    `kind` is the throttle identity: it must stay byte-identical for as long as
+    the same underlying failure persists, or every cycle looks like a brand-new
+    problem and pages again. `detail` is the line posted to Slack and may embed
+    volatile values -- free bytes, SSH stderr, an exception message -- that must
+    therefore stay out of `kind`.
+    """
+
+    kind: str
+    detail: str
+
+
+def audit_problem(data: dict[str, Any], max_completion_age: int) -> Problem | None:
     state = data.get("controller_state") or {}
     sample = data.get("sample") or {}
     if state.get("failed"):
-        return f"controller halted: {state.get('failure')}"
+        # The halt reason is latched by the controller, so it is stable while the
+        # halt lasts and a genuinely different halt should page again.
+        failure = state.get("failure")
+        return Problem(f"controller-halted:{failure}", f"controller halted: {failure}")
     if not data.get("service_active") and state.get("phase") == "syncing":
-        return "node service inactive while controller says syncing"
+        return Problem(
+            "service-inactive", "node service inactive while controller says syncing"
+        )
     if sample.get("metrics_status") != "ok" and state.get("phase") == "syncing":
-        return f"metrics unavailable: {sample.get('metrics_status')}"
+        # The status embeds the scrape exception, which varies between samples.
+        return Problem(
+            "metrics-unavailable", f"metrics unavailable: {sample.get('metrics_status')}"
+        )
     if int(data.get("disk_free_bytes") or 0) < 10 * 1024 * 1024 * 1024:
-        return f"low disk: {data.get('disk_free_bytes')} bytes free"
+        # Free bytes move on every sample, so they cannot be part of the identity.
+        return Problem("low-disk", f"low disk: {data.get('disk_free_bytes')} bytes free")
     last_success = state.get("last_success_at")
     if last_success and max_completion_age > 0:
         try:
             parsed = int(time_from_stamp(str(last_success)))
             if now() - parsed > max_completion_age:
-                return f"last successful run is older than {max_completion_age}s"
+                return Problem(
+                    "stale-success",
+                    f"last successful run is older than {max_completion_age}s",
+                )
         except ValueError:
-            return f"invalid last_success_at: {last_success}"
+            return Problem(
+                "invalid-last-success", f"invalid last_success_at: {last_success}"
+            )
     return None
 
 
@@ -494,7 +522,7 @@ def save_audit_state(path: Path | None, state: dict[str, Any]) -> None:
 
 
 def audit_transitions(
-    problems: dict[str, str],
+    problems: dict[str, Problem],
     previous: dict[str, Any],
     reminder_interval: int,
     timestamp: int,
@@ -503,7 +531,8 @@ def audit_transitions(
 
     A problem alerts immediately the first time it is seen, and again only once
     `reminder_interval` has elapsed, so a node that stays broken reminds on a slow
-    cadence instead of re-paging every audit cycle.
+    cadence instead of re-paging every audit cycle. Continuity is judged on
+    `Problem.kind`, never on the rendered detail, which changes between samples.
     """
     prior = previous.get("problems", {})
     new_lines: list[str] = []
@@ -513,11 +542,12 @@ def audit_transitions(
     for name in sorted(problems):
         problem = problems[name]
         record = prior.get(name)
-        if not isinstance(record, dict) or record.get("problem") != problem:
+        if not isinstance(record, dict) or record.get("kind") != problem.kind:
             # First sighting, or the failure changed to a different one.
-            new_lines.append(f"{name}: {problem}")
+            new_lines.append(f"{name}: {problem.detail}")
             current[name] = {
-                "problem": problem,
+                "kind": problem.kind,
+                "detail": problem.detail,
                 "first_seen": timestamp,
                 "last_sent": timestamp,
             }
@@ -526,17 +556,19 @@ def audit_transitions(
         last_sent = int(record.get("last_sent", timestamp))
         if timestamp - last_sent >= reminder_interval:
             reminder_lines.append(
-                f"{name}: {problem} (unresolved for {format_duration(timestamp - first_seen)})"
+                f"{name}: {problem.detail} "
+                f"(unresolved for {format_duration(timestamp - first_seen)})"
             )
             last_sent = timestamp
         current[name] = {
-            "problem": problem,
+            "kind": problem.kind,
+            "detail": problem.detail,
             "first_seen": first_seen,
             "last_sent": last_sent,
         }
 
     recovered_lines = [
-        f"{name}: was {prior[name].get('problem')}"
+        f"{name}: was {prior[name].get('detail') or prior[name].get('kind')}"
         for name in sorted(prior)
         if name not in problems and isinstance(prior.get(name), dict)
     ]
@@ -561,11 +593,15 @@ def audit_message(
 
 def cmd_audit(args: argparse.Namespace) -> int:
     nodes = load_nodes(args.config, args.node)
-    problems: dict[str, str] = {}
+    problems: dict[str, Problem] = {}
     for node in nodes:
         ok, data = remote_json(node, "/usr/local/sbin/zakura-continuous-sync.py status")
         if not ok:
-            problems[node.name] = f"unreachable or invalid status: {data}"
+            # `data` is raw ssh stderr, which differs between attempts at the same
+            # outage, so only the category identifies the problem.
+            problems[node.name] = Problem(
+                "unreachable", f"unreachable or invalid status: {data}"
+            )
             continue
         assert isinstance(data, dict)
         problem = audit_problem(data, args.max_completion_age)
@@ -580,9 +616,10 @@ def cmd_audit(args: argparse.Namespace) -> int:
     )
     text = audit_message(new_lines, reminder_lines, recovered_lines)
 
+    posted = True
     if text:
         if not args.dry_run:
-            post_slack(text)
+            posted = post_slack(text)
         print(text)
     elif problems:
         print(
@@ -592,8 +629,18 @@ def cmd_audit(args: argparse.Namespace) -> int:
     else:
         print(f"audit ok: {len(nodes)} node(s)")
 
-    if not args.dry_run:
+    if args.dry_run:
+        pass
+    elif posted:
         save_audit_state(state_file, state)
+    else:
+        # Advancing `last_sent` here would record an undelivered page as sent and
+        # stay silent until the reminder interval elapsed. Leave the old state so
+        # the next audit re-derives these same lines and retries.
+        print(
+            "slack post failed; leaving alert state unchanged so the next audit retries",
+            file=sys.stderr,
+        )
 
     return 1 if problems else 0
 

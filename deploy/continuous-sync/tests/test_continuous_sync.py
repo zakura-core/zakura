@@ -1,3 +1,4 @@
+import argparse
 import importlib.util
 import json
 import os
@@ -234,7 +235,11 @@ class ContinuousSyncTests(unittest.TestCase):
         self.assertIn('dirname "$config_path"', deploy.INSTALL_SCRIPT)
 
     def test_audit_alerts_once_then_throttles_until_reminder_interval(self):
-        problems = {"temp-zakura-sync-test-6": "controller halted: build failed"}
+        problems = {
+            "temp-zakura-sync-test-6": deploy.Problem(
+                "controller-halted:build failed", "controller halted: build failed"
+            )
+        }
         interval = 21600
 
         new, reminder, recovered, state = deploy.audit_transitions(problems, {}, interval, 1000)
@@ -268,15 +273,52 @@ class ContinuousSyncTests(unittest.TestCase):
         self.assertEqual((new, reminder), ([], []))
 
     def test_audit_realerts_when_the_failure_changes(self):
-        first = {"node": "controller halted: build failed"}
-        second = {"node": "controller halted: stalled"}
+        first = {"node": deploy.Problem("controller-halted:build", "controller halted: build failed")}
+        second = {"node": deploy.Problem("controller-halted:stalled", "controller halted: stalled")}
         _, _, _, state = deploy.audit_transitions(first, {}, 21600, 1000)
         new, reminder, recovered, _ = deploy.audit_transitions(second, state, 21600, 1100)
         self.assertEqual(new, ["node: controller halted: stalled"])
         self.assertEqual((reminder, recovered), ([], []))
 
+    def test_audit_throttles_a_problem_whose_detail_keeps_changing(self):
+        # Free disk moves on every sample and ssh stderr differs between attempts
+        # at one outage. Keying continuity on the rendered line would classify each
+        # cycle as a brand-new problem and page every 30 minutes -- the exact
+        # behaviour the reminder interval exists to stop.
+        interval = 21600
+        first = {"node": deploy.Problem("low-disk", "low disk: 9000000000 bytes free")}
+        second = {"node": deploy.Problem("low-disk", "low disk: 8912345678 bytes free")}
+
+        new, _, _, state = deploy.audit_transitions(first, {}, interval, 1000)
+        self.assertEqual(new, ["node: low disk: 9000000000 bytes free"])
+
+        new, reminder, recovered, state = deploy.audit_transitions(
+            second, state, interval, 1000 + 1800
+        )
+        self.assertEqual((new, reminder, recovered), ([], [], []))
+
+        # The reminder still reports the freshest detail, not the stale one.
+        _, reminder, _, _ = deploy.audit_transitions(second, state, interval, 1000 + interval)
+        self.assertEqual(len(reminder), 1)
+        self.assertIn("8912345678", reminder[0])
+
+    def test_audit_problem_kinds_are_stable_across_samples(self):
+        def status(free_bytes):
+            return {
+                "controller_state": {"phase": "syncing"},
+                "service_active": True,
+                "sample": {"metrics_status": "ok"},
+                "disk_free_bytes": free_bytes,
+            }
+
+        first = deploy.audit_problem(status(9_000_000_000), 0)
+        second = deploy.audit_problem(status(8_912_345_678), 0)
+        self.assertEqual(first.kind, second.kind)
+        self.assertNotEqual(first.detail, second.detail)
+
     def test_audit_reports_recovery_once(self):
-        _, _, _, state = deploy.audit_transitions({"node": "boom"}, {}, 21600, 1000)
+        boom = {"node": deploy.Problem("boom", "boom")}
+        _, _, _, state = deploy.audit_transitions(boom, {}, 21600, 1000)
         new, reminder, recovered, state = deploy.audit_transitions({}, state, 21600, 1100)
         self.assertEqual(recovered, ["node: was boom"])
         self.assertEqual((new, reminder), ([], []))
@@ -287,7 +329,8 @@ class ContinuousSyncTests(unittest.TestCase):
     def test_audit_state_roundtrips_and_rejects_corrupt_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "nested" / "state.json"
-            _, _, _, state = deploy.audit_transitions({"node": "boom"}, {}, 21600, 1000)
+            boom = {"node": deploy.Problem("boom", "boom")}
+            _, _, _, state = deploy.audit_transitions(boom, {}, 21600, 1000)
             deploy.save_audit_state(path, state)
             self.assertEqual(deploy.load_audit_state(path), state)
 
@@ -300,6 +343,37 @@ class ContinuousSyncTests(unittest.TestCase):
     def test_audit_stamp_is_parsed_as_utc(self):
         # `time.mktime` would shift this by the runner's UTC offset.
         self.assertEqual(deploy.time_from_stamp("19700102T000000Z"), 86400)
+
+    def test_audit_does_not_record_an_undelivered_alert_as_sent(self):
+        # Recording `last_sent` for a page Slack never accepted would silence the
+        # audit until the 6h reminder elapsed, so the state must not advance.
+        node = deploy.Node({"name": "node", "ssh_string": "root@host"})
+        args = argparse.Namespace(
+            config=Path("unused.toml"),
+            node=None,
+            dry_run=False,
+            max_completion_age=0,
+            reminder_interval=21600,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            args.state_file = Path(tmp) / "state.json"
+            with patch.object(deploy, "load_nodes", return_value=[node]), patch.object(
+                deploy, "remote_json", return_value=(False, "connection timed out")
+            ), patch.object(deploy, "post_slack", return_value=False) as post:
+                self.assertEqual(deploy.cmd_audit(args), 1)
+            self.assertEqual(post.call_count, 1)
+            self.assertFalse(args.state_file.exists(), "recorded an undelivered page")
+
+            # The next audit retries the same page, and a successful post commits.
+            with patch.object(deploy, "load_nodes", return_value=[node]), patch.object(
+                deploy, "remote_json", return_value=(False, "connection timed out")
+            ), patch.object(deploy, "post_slack", return_value=True) as post:
+                self.assertEqual(deploy.cmd_audit(args), 1)
+            self.assertIn("unreachable", post.call_args[0][0])
+            self.assertEqual(
+                deploy.load_audit_state(args.state_file)["problems"]["node"]["kind"],
+                "unreachable",
+            )
 
     def test_forced_ssh_wrapper_uses_current_status_script(self):
         self.assertIn(

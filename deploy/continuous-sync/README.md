@@ -131,7 +131,8 @@ unreachable, the controller is halted, the node service is inactive while a run
 claims to be syncing, metrics are unavailable during sync, disk free space is
 below the configured 10 GiB floor, or the node has not completed a run in four
 days. A run is capped at 48 hours, so that last check cannot be tripped by a
-legitimately long sync.
+legitimately long sync. These external audit checks intentionally remain
+independent of the per-host minute monitor.
 
 Each problem pages once when it appears, reminds every six hours while it is
 still unresolved, and posts a recovery when it clears. Continuity is judged on
@@ -142,6 +143,10 @@ Actions cache, so a lost cache entry costs at most one duplicate page. A Slack
 post that fails is not recorded as sent; the next audit retries it. The audit
 job still exits non-zero on every cycle a problem is present, so the workflow
 run history remains an unthrottled signal.
+
+A completely unreachable host cannot run its local minute monitor. Its fallback
+alert therefore comes from the audit, with an expected maximum detection delay
+of about 30 minutes, plus GitHub Actions scheduling and job startup time.
 
 On a host:
 
@@ -165,21 +170,33 @@ Alerts are posted through `/etc/zakura-alerts.env`, which should define one of
 `SLACK_WEB_HOOK`, `SLACK_WEBHOOK_URL`, or `SLACK_WEBHOOK`. The file is a
 root-only host secret and is not managed by the repository.
 
-Alert ownership matches the original temporary-node script:
+Alert ownership is local-only:
 
-- a node emits its own local down alert;
-- the elected healthy leader emits peer down and peer-evidence stall alerts;
+- each node emits alerts only for its own `zakura.service` and sync progress;
+- peer queries are used only as evidence that the local node is stalled;
+- no minute monitor emits down or stall alerts for another host;
 - repeated alerts are throttled by `alert_throttle_seconds`;
 - recovery messages are posted when a condition clears.
 
 The status helper reports service state, metrics reachability, current block
 height, controller state, and the diagnostic paths included in Slack alerts.
 
-Down alerts fire when the controller is halted or `zakura.service` is inactive
-while a sync is expected. A metrics scrape timeout or error alone does not page
-as down while the service stays active (those are logged as
-`metrics-degraded`), because `/metrics` can grow large during long genesis
-syncs when historical per-peer series accumulate.
+Node-down alerts require two consecutive samples where `zakura.service` is
+explicitly inactive and the controller phase is `syncing` or unknown. Build,
+install, cleanup, cooldown, complete, and failed controller phases can
+intentionally leave the service inactive and do not produce node-down alerts.
+Local status-query failures and metrics scrape failures also do not page as
+down, and a failed local query restarts the confirmation streak so that the two
+inactive samples are genuinely consecutive rather than separated by an
+arbitrarily long gap of unknown service state. Metrics degradation is logged
+because `/metrics` can grow large during long genesis syncs when historical
+per-peer series accumulate.
+
+The controller owns lifecycle alerts. It posts an immediate failure with a
+bounded reason, posts one recovery after an explicit `resume` successfully
+starts `zakura-continuous-sync.service`, and continues to own sync-completion
+messages. The twice-hourly external audit still reports controller, service,
+metrics, disk, unreachable-host, and stale-run problems by design.
 
 ## Completion Criteria
 

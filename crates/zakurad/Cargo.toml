@@ -168,8 +168,8 @@ tokio-console = ["console-subscriber"]
 comparison-interpreter = ["zakura-script/comparison-interpreter"]
 
 [dependencies]
-zakura-chain = { path = "../zakura-chain", version = "3.1.0-rc0" }
-zakura-consensus = { path = "../zakura-consensus", version = "5.1.0-rc0" }
+zakura-chain = { path = "../zakura-chain", version = "4.0.0-rc0" }
+zakura-consensus = { path = "../zakura-consensus", version = "6.0.0-rc0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.1.0-rc1" }
 zakura-network = { path = "../zakura-network", version = "5.1.0-rc0" }
 zakura-node-services = { path = "../zakura-node-services", version = "3.1.0-rc1", features = ["rpc-client"] }
@@ -322,8 +322,8 @@ proptest-derive = { workspace = true }
 # enable span traces and track caller in tests
 color-eyre = { workspace = true }
 
-zakura-chain = { path = "../zakura-chain", version = "3.1.0-rc0", features = ["proptest-impl"] }
-zakura-consensus = { path = "../zakura-consensus", version = "5.1.0-rc0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "4.0.0-rc0", features = ["proptest-impl"] }
+zakura-consensus = { path = "../zakura-consensus", version = "6.0.0-rc0", features = ["proptest-impl"] }
 zakura-network = { path = "../zakura-network", version = "5.1.0-rc0", features = ["proptest-impl", "zakura-testkit"] }
 zakura-state = { path = "../zakura-state", version = "6.0.0-rc0", features = ["proptest-impl"] }
 

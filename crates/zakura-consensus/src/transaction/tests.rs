@@ -87,6 +87,65 @@ fn v5_transactions_basic_check() -> Result<(), Report> {
     Ok(())
 }
 
+#[test]
+fn shielded_proof_sizes_are_enforced_for_in_memory_transactions() {
+    let _init_guard = zakura_test::init();
+
+    let shielded_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+
+    let make_v5 = |orchard_shielded_data| Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(orchard_shielded_data),
+    };
+    let make_v6 = |ironwood_shielded_data| Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood_shielded_data),
+    };
+
+    assert_eq!(
+        check::shielded_proof_size_is_canonical(&make_v5(shielded_data.clone())),
+        Ok(())
+    );
+    assert_eq!(
+        check::shielded_proof_size_is_canonical(&make_v6(shielded_data.clone())),
+        Ok(())
+    );
+
+    let mut short = shielded_data.clone();
+    short
+        .proof
+        .0
+        .pop()
+        .expect("real Orchard proof is not empty");
+    let mut padded = shielded_data;
+    padded.proof.0.push(0);
+
+    for noncanonical in [short, padded] {
+        assert_eq!(
+            check::shielded_proof_size_is_canonical(&make_v5(noncanonical.clone())),
+            Err(TransactionError::OrchardProofSize)
+        );
+        assert_eq!(
+            check::shielded_proof_size_is_canonical(&make_v6(noncanonical)),
+            Err(TransactionError::IronwoodProofSize)
+        );
+    }
+}
+
 /// Orchard and Ironwood nullifiers are separate namespaces: a V6 transaction
 /// whose Orchard and Ironwood bundles happen to contain bit-identical
 /// nullifiers must not be rejected as a double-spend, because each pool tracks
@@ -3842,6 +3901,10 @@ async fn v5_with_duplicate_orchard_action() {
         actions_vec.push(duplicate_action.clone());
         orchard_shielded_data.actions = AtLeastOne::from_vec(actions_vec)
             .expect("pushing one element never breaks at least one constraints");
+        orchard_shielded_data.proof.0.resize(
+            ::orchard::Proof::expected_proof_size(orchard_shielded_data.actions.len()),
+            0,
+        );
 
         let verifier = Verifier::new_for_tests(
             &net,

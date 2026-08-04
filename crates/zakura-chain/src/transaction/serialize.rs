@@ -521,6 +521,10 @@ fn deserialize_orchard_shielded_data_with_flags<R: io::Read>(
     // https://zips.z.cash/protocol/protocol.pdf#halo2encoding
     let proof: Halo2Proof = (&mut reader).zcash_deserialize_into()?;
 
+    if proof.0.len() != orchard::shielded_data::expected_proof_size(actions.len()) {
+        return Err(SerializationError::NonCanonicalShieldedProofSize);
+    }
+
     // Denoted as `vSpendAuthSigsOrchard` in the spec.
     // Consensus: this validates the `spendAuthSig` elements, whose type is
     // SpendAuthSig^{Orchard}.Signature, i.e.

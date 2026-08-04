@@ -76,7 +76,7 @@ sapling-crypto = { workspace = true }
 zakura-vct-sprout-history = { workspace = true }
 
 zakura-node-services = { path = "../zakura-node-services", version = "3.1.0-rc1" }
-zakura-chain = { path = "../zakura-chain", version = "3.1.0-rc0", features = ["async-error"] }
+zakura-chain = { path = "../zakura-chain", version = "4.0.0-rc0", features = ["async-error"] }
 
 # prod feature progress-bar
 howudoin = { workspace = true, optional = true }
@@ -105,10 +105,11 @@ rand = { workspace = true }
 
 halo2 = { package = "halo2_proofs", version = "0.3" }
 jubjub = { workspace = true }
+orchard = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
-zakura-chain = { path = "../zakura-chain", version = "3.1.0-rc0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "4.0.0-rc0", features = ["proptest-impl"] }
 zakura-test = { path = "../zakura-test/", version = "2.1.0-rc1" }
 
 [lints]

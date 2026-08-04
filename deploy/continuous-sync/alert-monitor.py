@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cluster Slack alerter for the permanent Zakura sync nodes."""
+"""Host-local Slack alerter for the permanent Zakura sync nodes."""
 
 from __future__ import annotations
 
@@ -14,6 +14,9 @@ import tomllib
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+
+STATE_VERSION = 2
 
 
 def now() -> int:
@@ -40,9 +43,28 @@ def load_env(path: Path) -> None:
 
 def load_state(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        state = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {"nodes": {}, "alerts": {}}
+        state = {"nodes": {}, "alerts": {}}
+
+    if state.get("version") != STATE_VERSION:
+        alerts = state.get("alerts")
+        if not isinstance(alerts, dict):
+            alerts = {}
+        state["alerts"] = {
+            key: value
+            for key, value in alerts.items()
+            if not key.startswith(("node-down:", "cluster-stall:"))
+        }
+        nodes = state.get("nodes")
+        if isinstance(nodes, dict):
+            for record in nodes.values():
+                if isinstance(record, dict):
+                    record.pop("consecutive_down_samples", None)
+        state["version"] = STATE_VERSION
+    state.setdefault("nodes", {})
+    state.setdefault("alerts", {})
+    return state
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
@@ -151,22 +173,19 @@ def expects_node_service(status: dict[str, Any]) -> bool:
     return phase in ("syncing", "unknown")
 
 
-def elected_leader(statuses: list[dict[str, Any]]) -> str | None:
-    healthy = sorted(status["hostname"] for status in statuses if node_healthy(status))
-    return healthy[0] if healthy else None
+def reset_down_confirmation(state: dict[str, Any], hostname: str) -> None:
+    """Drop the node-down confirmation streak after an unusable local sample.
+
+    The streak must be built from consecutive *explicitly inactive* readings.
+    Carrying it across a sample where the service state is unknown would let a
+    single inactive reading page, no matter how long the unknown gap lasted.
+    """
+    record = state.setdefault("nodes", {}).setdefault(hostname, {})
+    record["consecutive_down_samples"] = 0
 
 
 def height_text(status: dict[str, Any]) -> str:
     return "unknown" if status.get("height") is None else str(status["height"])
-
-
-def alert_mode(status: dict[str, Any]) -> str:
-    raw = str(status.get("mode") or status.get("p2p_stack") or "").lower()
-    if "zakura" in raw or "v2" in raw:
-        return "v2p2p"
-    if "zebra" in raw or "legacy" in raw:
-        return "legacy"
-    return "dual" if "dual" in raw else raw or "unknown"
 
 
 def ssh_target(status: dict[str, Any]) -> str:
@@ -183,13 +202,12 @@ def short_reason(reason: str, limit: int = 96) -> str:
 
 
 def main_alert_text(kind: str, status: dict[str, Any], reason: str) -> str:
-    label = kind.lower().replace(" recovered", " recovered")
-    if label == "test alert":
-        label = "continuous sync alert"
-    elif label == "test recovered":
-        label = "continuous sync recovered"
+    label = kind.lower()
     icon = ":white_check_mark:" if "recovered" in label else ":rotating_light:"
-    return f"{icon} Zakura {label}: {status['hostname']} | {alert_mode(status)} | {ssh_target(status)}"
+    return (
+        f"{icon} Zakura {label}: {status['hostname']} | height: {height_text(status)} | "
+        f"reason: {short_reason(reason)} | ssh: {ssh_target(status)}"
+    )
 
 
 def status_line(status: dict[str, Any]) -> str:
@@ -267,12 +285,29 @@ def post_alert(
 def update_progress_state(state: dict[str, Any], statuses: list[dict[str, Any]], ts: int) -> None:
     nodes = state.setdefault("nodes", {})
     for status in statuses:
+        record = nodes.setdefault(status["hostname"], {})
+        controller_state = status.get("controller_state")
+        run_id = (
+            controller_state.get("current_run")
+            if isinstance(controller_state, dict)
+            else None
+        )
+        previous_run_id = record.get("controller_run")
+        if run_id:
+            if previous_run_id is not None and previous_run_id != run_id:
+                record["progress_reset_pending"] = True
+            record["controller_run"] = run_id
+
         height = status.get("height")
         if height is None:
             continue
-        record = nodes.setdefault(status["hostname"], {})
-        if record.get("height") != height:
-            record["height"] = height
+        previous_height = record.get("height")
+        record["height"] = height
+        if (
+            record.pop("progress_reset_pending", False)
+            or previous_height is None
+            or height > previous_height
+        ):
             record["last_progress"] = ts
         else:
             record.setdefault("last_progress", ts)
@@ -287,6 +322,8 @@ def maybe_alert(
     status: dict[str, Any],
     statuses: list[dict[str, Any]],
     reason: str,
+    recovery_kind: str,
+    recovery_reason: str,
     ts: int,
 ) -> None:
     defaults = config.get("defaults", {})
@@ -294,6 +331,7 @@ def maybe_alert(
     alerts = state.setdefault("alerts", {})
     record = alerts.setdefault(key, {"active": False, "last_sent": 0})
     if active:
+        record.pop("recovery_pending", None)
         if not record.get("active") or ts - int(record.get("last_sent", 0)) >= throttle:
             if post_alert(config, kind, status, statuses, reason):
                 record["last_sent"] = ts
@@ -302,10 +340,30 @@ def maybe_alert(
             log(config, f"alert-throttled key={key} host={status['hostname']}")
         record["active"] = True
     elif record.get("active"):
-        if post_alert(config, f"{kind} RECOVERED", status, statuses, "condition cleared"):
+        if post_alert(config, recovery_kind, status, statuses, recovery_reason):
             record["last_sent"] = ts
+            record["active"] = False
+            record.pop("recovery_pending", None)
             log(config, f"recovery-sent key={key} host={status['hostname']}")
-        record["active"] = False
+        else:
+            record["recovery_pending"] = True
+
+
+def retire_alert(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    key: str,
+    hostname: str,
+    reason: str,
+) -> None:
+    record = state.setdefault("alerts", {}).get(key)
+    if not isinstance(record, dict) or not (
+        record.get("active") or record.get("recovery_pending")
+    ):
+        return
+    record["active"] = False
+    record.pop("recovery_pending", None)
+    log(config, f"alert-retired key={key} host={hostname} reason={reason}")
 
 
 def run_once(config: dict[str, Any]) -> int:
@@ -313,115 +371,149 @@ def run_once(config: dict[str, Any]) -> int:
     state_file = Path(str(defaults.get("alert_state_file", "/var/lib/zakura-monitor/cluster-state.json")))
     statuses = [query_node(config, node) for node in config.get("nodes", [])]
     ts = now()
-    leader = elected_leader(statuses)
     local_host = socket.gethostname().split(".", 1)[0]
     state = load_state(state_file)
+    previous_local_height = state.get("nodes", {}).get(local_host, {}).get("height")
     update_progress_state(state, statuses, ts)
     log(
         config,
-        "status leader=%s local=%s %s"
-        % (leader, local_host, " | ".join(status_line(status) for status in statuses)),
+        "status local=%s %s"
+        % (local_host, " | ".join(status_line(status) for status in statuses)),
     )
 
     service_name = str(defaults.get("service_name", "zakura.service"))
+    local_status = next((status for status in statuses if status["hostname"] == local_host), None)
     for status in statuses:
-        name = status["hostname"]
-        query_failed = bool(status.get("query_error"))
-        down = False
-        reasons = []
-        if query_failed and name != local_host:
-            log(config, f"peer-query-failed host={name} err={status.get('query_error')}")
-        else:
-            if controller_failed(status):
-                down = True
-                controller_state = status.get("controller_state") or {}
-                reasons.append(f"controller halted: {controller_state.get('failure', 'unknown')}")
-            if expects_node_service(status) and status.get("service_active") is not True:
-                down = True
-                reasons.append(f"{service_name} is not active")
-            # Metrics scrape failures alone are not "node down": long genesis syncs
-            # can make /metrics large/slow while zakurad keeps syncing. Treat those
-            # as degraded and log them; only inactive service / controller halt page.
-            if expects_node_service(status) and metrics_degraded(status):
-                log(
-                    config,
-                    f"metrics-degraded host={name} "
-                    f"metrics={status.get('metrics_status')} service_active=True",
-                )
-        node_record = state.setdefault("nodes", {}).setdefault(name, {})
-        if down:
-            node_record["consecutive_down_samples"] = int(
-                node_record.get("consecutive_down_samples", 0)
-            ) + 1
-        else:
-            node_record["consecutive_down_samples"] = 0
-        required_samples = int(defaults.get("down_confirmation_samples", 2))
-        confirmed_down = down and (
-            controller_failed(status)
-            or int(node_record["consecutive_down_samples"]) >= required_samples
-        )
-        if down and not confirmed_down:
-            log(
-                config,
-                f"down-pending-confirmation host={name} "
-                f"samples={node_record['consecutive_down_samples']}/{required_samples}",
-            )
-        should_process = name == local_host or (leader == local_host and not query_failed)
-        if should_process:
-            maybe_alert(
-                config,
-                state,
-                f"node-down:{name}",
-                confirmed_down,
-                "DOWN",
-                status,
-                statuses,
-                "; ".join(reasons) or "healthy",
-                ts,
-            )
+        if status["hostname"] != local_host and status.get("query_error"):
+            log(config, f"peer-query-failed host={status['hostname']} err={status.get('query_error')}")
 
-    if leader == local_host:
-        stall_seconds = int(defaults.get("cluster_stall_seconds", 600))
-        for status in statuses:
-            if status.get("query_error"):
+    if local_status is None:
+        log(config, f"local-status-missing host={local_host}")
+        reset_down_confirmation(state, local_host)
+        save_state(state_file, state)
+        return 0
+
+    if local_status.get("query_error"):
+        log(config, f"local-query-failed host={local_host} err={local_status.get('query_error')}")
+        reset_down_confirmation(state, local_host)
+        save_state(state_file, state)
+        return 0
+
+    if expects_node_service(local_status) and metrics_degraded(local_status):
+        log(
+            config,
+            f"metrics-degraded host={local_host} "
+            f"metrics={local_status.get('metrics_status')} service_active=True",
+        )
+
+    node_record = state.setdefault("nodes", {}).setdefault(local_host, {})
+    down = (
+        not controller_failed(local_status)
+        and expects_node_service(local_status)
+        and local_status.get("service_active") is False
+    )
+    if down:
+        node_record["consecutive_down_samples"] = int(
+            node_record.get("consecutive_down_samples", 0)
+        ) + 1
+    else:
+        node_record["consecutive_down_samples"] = 0
+    required_samples = int(defaults.get("down_confirmation_samples", 2))
+    confirmed_down = down and int(node_record["consecutive_down_samples"]) >= required_samples
+    if down and not confirmed_down:
+        log(
+            config,
+            f"down-pending-confirmation host={local_host} "
+            f"samples={node_record['consecutive_down_samples']}/{required_samples}",
+        )
+    controller_owns_lifecycle = controller_failed(local_status) or not expects_node_service(
+        local_status
+    )
+    node_down_key = f"node-service-down:{local_host}"
+    if controller_owns_lifecycle:
+        retire_alert(
+            config,
+            state,
+            node_down_key,
+            local_host,
+            f"controller phase is {controller_phase(local_status)}",
+        )
+    elif confirmed_down or local_status.get("service_active") is True:
+        maybe_alert(
+            config,
+            state,
+            node_down_key,
+            confirmed_down,
+            "NODE DOWN",
+            local_status,
+            statuses,
+            f"{service_name} is inactive while controller phase is {controller_phase(local_status)}",
+            "NODE RECOVERED",
+            f"{service_name} is active again",
+            ts,
+        )
+
+    stall_seconds = int(defaults.get("cluster_stall_seconds", 600))
+    record = state.get("nodes", {}).get(local_host, {})
+    height = local_status.get("height")
+    last_progress = int(record.get("last_progress", ts))
+    age = ts - last_progress
+    peer_evidence = []
+    if node_healthy(local_status) and height is not None:
+        for peer in statuses:
+            if peer["hostname"] == local_host or not node_healthy(peer):
                 continue
-            name = status["hostname"]
-            record = state.get("nodes", {}).get(name, {})
-            height = status.get("height")
-            last_progress = int(record.get("last_progress", ts))
-            age = ts - last_progress
-            peer_evidence = []
-            if node_healthy(status) and height is not None:
-                for peer in statuses:
-                    if peer["hostname"] == name or not node_healthy(peer):
-                        continue
-                    peer_height = peer.get("height")
-                    peer_record = state.get("nodes", {}).get(peer["hostname"], {})
-                    if (
-                        peer_height is not None
-                        and peer_height > height
-                        and int(peer_record.get("last_progress", 0)) >= last_progress
-                    ):
-                        peer_evidence.append(
-                            f"{peer['hostname']} height={peer_height} "
-                            f"last_progress={peer_record.get('last_progress')}"
-                        )
-            stalled = node_healthy(status) and height is not None and age >= stall_seconds and bool(peer_evidence)
-            reason = (
-                f"height {height} has not progressed for {age}s "
-                f"(threshold {stall_seconds}s); peer evidence: {', '.join(peer_evidence)}"
-            )
-            maybe_alert(
-                config,
-                state,
-                f"cluster-stall:{name}",
-                stalled,
-                "STALLED",
-                status,
-                statuses,
-                reason,
-                ts,
-            )
+            peer_height = peer.get("height")
+            peer_record = state.get("nodes", {}).get(peer["hostname"], {})
+            if (
+                peer_height is not None
+                and peer_height > height
+                and int(peer_record.get("last_progress", 0)) > last_progress
+            ):
+                peer_evidence.append(f"{peer['hostname']} advanced to height {peer_height}")
+    stalled = (
+        not controller_failed(local_status)
+        and expects_node_service(local_status)
+        and node_healthy(local_status)
+        and height is not None
+        and age >= stall_seconds
+        and bool(peer_evidence)
+    )
+    reason = (
+        f"no local height progress for {age}s (threshold {stall_seconds}s); "
+        f"peer evidence: {', '.join(peer_evidence)}"
+    )
+    stall_key = f"local-sync-stall:{local_host}"
+    stall_record = state.get("alerts", {}).get(stall_key, {})
+    stall_active = bool(stall_record.get("active"))
+    recovery_pending = bool(stall_record.get("recovery_pending"))
+    local_progressed = (
+        isinstance(height, int)
+        and isinstance(previous_local_height, int)
+        and height > previous_local_height
+    )
+    if controller_owns_lifecycle:
+        retire_alert(
+            config,
+            state,
+            stall_key,
+            local_host,
+            f"controller phase is {controller_phase(local_status)}",
+        )
+    elif stalled or (stall_active and (local_progressed or recovery_pending)):
+        maybe_alert(
+            config,
+            state,
+            stall_key,
+            stalled,
+            "SYNC STALLED",
+            local_status,
+            statuses,
+            reason,
+            "SYNC RECOVERED",
+            "local height progress resumed",
+            ts,
+        )
 
     save_state(state_file, state)
     return 0

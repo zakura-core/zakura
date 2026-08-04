@@ -197,6 +197,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 deploy/continuous-sync/tests/test_continuous_sync.py
 
+      - name: Cluster dashboard and watchdog tests
+        if: ${{ !cancelled() }}
+        run: |
+          python3 deploy/runner/test_zakura_cluster_status.py
+          python3 deploy/runner/test_zakura_cluster_watchdog.py
+
       - name: Ensure no arbitrary or proptest dependency on default build
         if: ${{ !cancelled() }}
         run: cargo +stable tree --package zakura -e=features,no-dev | grep -Eq "arbitrary|proptest" && exit 1 || exit 0

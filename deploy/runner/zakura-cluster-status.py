@@ -607,12 +607,18 @@ class ClusterCollector:
         self.state_file = state_file
         self.ironwood_activation_height = IRONWOOD_ACTIVATION_HEIGHTS[network]
         self.lock = threading.Lock()
-        self.last_height: dict[str, int | None] = {node.name: None for node in nodes}
+        restored_progress = load_progress(state_file)
+        self.last_height: dict[str, int | None] = {
+            node.name: restored_progress.get(node.name, {}).get("height") for node in nodes
+        }
         self.last_block_hash: dict[str, str | None] = {node.name: None for node in nodes}
         self.last_ancestors: dict[str, dict[str, str]] = {
             node.name: {} for node in nodes
         }
-        self.last_advanced_at: dict[str, float | None] = {node.name: None for node in nodes}
+        self.last_advanced_at: dict[str, float | None] = {
+            node.name: restored_progress.get(node.name, {}).get("last_advanced_at")
+            for node in nodes
+        }
         self.height_history: list[tuple[float, int]] = []
         self.recent_reorgs: deque[dict] = deque(
             load_orphan_pairs(state_file),
@@ -658,10 +664,31 @@ class ClusterCollector:
             self.chain = chain
             self.last_poll = now
             self.record_height_sample(now, rows)
+            snapshot = self.progress_snapshot()
+        # Snapshot under the lock, write outside it: the stall timers must
+        # survive a restart or every node reports as freshly advanced on the
+        # next process start.
+        self.persist_state(snapshot)
+
+    def progress_snapshot(self) -> dict[str, dict]:
+        return {
+            name: {
+                "height": self.last_height.get(name),
+                "last_advanced_at": self.last_advanced_at.get(name),
+            }
+            for name in self.last_advanced_at
+        }
+
+    def persist_state(self, snapshot: dict[str, dict] | None = None) -> None:
+        save_orphan_pairs(
+            self.state_file,
+            list(self.recent_reorgs),
+            self.progress_snapshot() if snapshot is None else snapshot,
+        )
 
     def record_orphan_pair(self, event: dict) -> None:
         self.recent_reorgs.appendleft(event)
-        save_orphan_pairs(self.state_file, list(self.recent_reorgs))
+        self.persist_state()
 
     def record_height_sample(self, now: float, rows: list[dict]) -> None:
         heights = [row["height"] for row in rows if row.get("height") is not None]
@@ -1071,7 +1098,11 @@ def load_orphan_pairs(path: Path | None) -> list[dict]:
     return cleaned[:RECENT_REORG_LIMIT]
 
 
-def save_orphan_pairs(path: Path | None, events: list[dict]) -> None:
+def save_orphan_pairs(
+    path: Path | None,
+    events: list[dict],
+    progress: dict[str, dict] | None = None,
+) -> None:
     if path is None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1079,12 +1110,45 @@ def save_orphan_pairs(path: Path | None, events: list[dict]) -> None:
     payload = {
         "updated_at": time.time(),
         "orphan_pairs": list(events)[:RECENT_REORG_LIMIT],
+        "progress": progress or {},
     }
     tmp_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     tmp_path.replace(path)
+
+
+def load_progress(path: Path | None) -> dict[str, dict]:
+    """Restore per-node height/last-advanced timers written by a previous process.
+
+    Without this the stall clock restarts from zero on every dashboard restart,
+    which reports every node as freshly advanced regardless of its real height.
+    """
+    if path is None or not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    progress = payload.get("progress")
+    if not isinstance(progress, dict):
+        return {}
+    restored: dict[str, dict] = {}
+    for name, record in progress.items():
+        if not isinstance(record, dict):
+            continue
+        height = record.get("height")
+        advanced_at = record.get("last_advanced_at")
+        restored[str(name)] = {
+            "height": int(height) if isinstance(height, (int, float)) else None,
+            "last_advanced_at": (
+                float(advanced_at) if isinstance(advanced_at, (int, float)) else None
+            ),
+        }
+    return restored
 
 
 def estimate_fork_depth_from_ancestors(

@@ -1,17 +1,17 @@
 use std::{
+    collections::HashMap,
     fmt::Display,
     path::PathBuf,
-    sync::Arc,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
-use serde_json::{Map, Value};
+use serde::Serialize;
 use zakura_chain::block::{self, Height};
-use zakura_jsonl_trace::{JsonlTracer, JsonlWriteEvent};
+use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTraceTable, JsonlTracer};
 use zakura_network::PeerSocketAddr;
 
-const TABLE: &str = "legacy_sync";
-const FILE_NAME: &str = "legacy_sync.jsonl";
+const TABLE: JsonlTraceTable = JsonlTraceTable::new("legacy_sync", "legacy_sync.jsonl");
 
 #[derive(Clone, Debug)]
 pub(super) struct LegacyTaskState {
@@ -26,12 +26,20 @@ pub(super) enum LegacyBlockOutcome<'a> {
     Error(&'a dyn Display),
 }
 
+pub(super) struct LegacyDiagnosticSnapshot<'a> {
+    pub(super) event: &'static str,
+    pub(super) state_tip: Option<Height>,
+    pub(super) in_flight: usize,
+    pub(super) reserve: usize,
+    pub(super) prospective_tips: usize,
+    pub(super) registry_retries: usize,
+    pub(super) task_states: &'a Mutex<HashMap<block::Hash, LegacyTaskState>>,
+}
+
 /// Non-blocking structured diagnostics for the legacy block sync pipeline.
 #[derive(Clone, Debug)]
 pub(super) struct LegacySyncTrace {
-    tracer: JsonlTracer,
-    node: Arc<str>,
-    started: Instant,
+    emitter: JsonlEventEmitter,
     expose_peer_addresses: bool,
 }
 
@@ -40,11 +48,8 @@ impl LegacySyncTrace {
         let tracer = trace_dir
             .map(JsonlTracer::spawn)
             .unwrap_or_else(JsonlTracer::noop);
-
         Self {
-            tracer,
-            node: zakura_jsonl_trace::node_id().into(),
-            started: Instant::now(),
+            emitter: JsonlEventEmitter::new(tracer, zakura_jsonl_trace::node_id()),
             expose_peer_addresses,
         }
     }
@@ -54,29 +59,9 @@ impl LegacySyncTrace {
         peer_addr_label(addr, self.expose_peer_addresses)
     }
 
-    pub(super) fn emit(&self, event: &'static str, build: impl FnOnce(&mut Map<String, Value>)) {
-        let Ok(permit) = self.tracer.try_reserve() else {
-            return;
-        };
-
-        let mut row = Map::new();
-        row.insert("ts".to_string(), elapsed_micros(self.started.elapsed()));
-        row.insert("node".to_string(), Value::String(self.node.to_string()));
-        row.insert("event".to_string(), Value::String(event.to_string()));
-        build(&mut row);
-
-        if let Ok(line) = serde_json::to_vec(&Value::Object(row)) {
-            permit.send(JsonlWriteEvent {
-                table: TABLE,
-                file_name: FILE_NAME,
-                line,
-            });
-        }
-    }
-
     pub(super) fn round_start(&self, state_tip: Option<Height>) {
-        self.emit("round_start", |row| {
-            insert_height(row, "state_tip", state_tip)
+        self.emitter.emit_event(|| LegacyEvent::RoundStart {
+            state_tip: state_tip.map(|height| height.0),
         });
     }
 
@@ -86,26 +71,24 @@ impl LegacySyncTrace {
         state_tip: Option<Height>,
         error: Option<&dyn Display>,
     ) {
-        self.emit("round_finish", |row| {
-            row.insert("reason".to_string(), Value::String(reason.to_string()));
-            insert_height(row, "state_tip", state_tip);
-            if let Some(error) = error {
-                row.insert("error".to_string(), Value::String(error.to_string()));
-            }
+        self.emitter.emit_event(|| LegacyEvent::RoundFinish {
+            reason,
+            state_tip: state_tip.map(|height| height.0),
+            error: error.map(ToString::to_string),
         });
     }
 
     pub(super) fn tips_obtained(&self, reserve: usize, prospective_tips: usize) {
-        self.emit("tips_obtained", |row| {
-            insert_count(row, "reserve", reserve);
-            insert_count(row, "prospective_tips", prospective_tips);
+        self.emitter.emit_event(|| LegacyEvent::TipsObtained {
+            reserve: bounded_count(reserve),
+            prospective_tips: bounded_count(prospective_tips),
         });
     }
 
     pub(super) fn tips_extended(&self, discovered: usize, prospective_tips: usize) {
-        self.emit("tips_extended", |row| {
-            insert_count(row, "discovered", discovered);
-            insert_count(row, "prospective_tips", prospective_tips);
+        self.emitter.emit_event(|| LegacyEvent::TipsExtended {
+            discovered: bounded_count(discovered),
+            prospective_tips: bounded_count(prospective_tips),
         });
     }
 
@@ -115,31 +98,69 @@ impl LegacySyncTrace {
         outcome: LegacyBlockOutcome<'_>,
         state: Option<LegacyTaskState>,
     ) {
-        self.emit("block_finish", |row| {
-            row.insert("hash".to_string(), Value::String(hash.to_string()));
-            match outcome {
-                LegacyBlockOutcome::Verified(height) => {
-                    row.insert("height".to_string(), Value::from(height.0));
-                    row.insert("result".to_string(), Value::String("verified".to_string()));
-                }
-                LegacyBlockOutcome::Error(error) => {
-                    row.insert("result".to_string(), Value::String("error".to_string()));
-                    row.insert("error".to_string(), Value::String(error.to_string()));
-                }
-            }
+        self.emitter
+            .emit_event(|| block_finish(hash, outcome, state));
+    }
 
-            if let Some(state) = state {
-                row.insert("phase".to_string(), Value::String(state.phase.to_string()));
-                insert_height(row, "height", state.height);
-                row.insert(
-                    "elapsed_ms".to_string(),
-                    elapsed_millis(state.started.elapsed()),
-                );
-                row.insert(
-                    "phase_elapsed_ms".to_string(),
-                    elapsed_millis(state.phase_started.elapsed()),
-                );
+    pub(super) fn block_phase(
+        &self,
+        hash: block::Hash,
+        phase: &'static str,
+        previous_phase: &'static str,
+        state: LegacyTaskState,
+        phase_elapsed: Duration,
+    ) {
+        self.emitter.emit_event(|| LegacyEvent::BlockPhase {
+            hash: hash.to_string(),
+            phase,
+            previous_phase,
+            height: state.height.map(|height| height.0),
+            phase_elapsed_ms: elapsed_millis(phase_elapsed),
+            elapsed_ms: elapsed_millis(state.started.elapsed()),
+        });
+    }
+
+    pub(super) fn diagnostic_snapshot(&self, snapshot: LegacyDiagnosticSnapshot<'_>) {
+        self.emitter.emit_event(|| {
+            let states = snapshot
+                .task_states
+                .lock()
+                .expect("legacy task state lock is only held for synchronous updates");
+            let mut tasks: Vec<_> = states
+                .iter()
+                .map(|(hash, state)| LegacyTaskTrace::new(*hash, state))
+                .collect();
+            tasks.sort_by_key(|task| task.height().map(u64::from).unwrap_or(u64::MAX));
+
+            let fields = DiagnosticFields {
+                state_tip: snapshot.state_tip.map(|height| height.0),
+                in_flight: bounded_count(snapshot.in_flight),
+                reserve: bounded_count(snapshot.reserve),
+                prospective_tips: bounded_count(snapshot.prospective_tips),
+                registry_retries: bounded_count(snapshot.registry_retries),
+                tasks,
+            };
+            match snapshot.event {
+                "pipeline_reset" => LegacyEvent::PipelineReset(fields),
+                "round_error_snapshot" => LegacyEvent::RoundErrorSnapshot(fields),
+                "round_stalled" => LegacyEvent::RoundStalled(fields),
+                event => unreachable!("unsupported legacy diagnostic event: {event}"),
             }
+        });
+    }
+
+    pub(super) fn block_downloaded(
+        &self,
+        hash: block::Hash,
+        height: Height,
+        download_elapsed: Duration,
+        peer: Option<PeerSocketAddr>,
+    ) {
+        self.emitter.emit_event(|| LegacyEvent::BlockDownloaded {
+            hash: hash.to_string(),
+            height: height.0,
+            download_elapsed_ms: elapsed_millis(download_elapsed),
+            peer: peer.map(|peer| self.peer_label(peer)),
         });
     }
 }
@@ -153,39 +174,158 @@ pub(super) fn peer_addr_label(addr: PeerSocketAddr, expose_peer_addresses: bool)
     }
 }
 
-pub(super) fn elapsed_millis(duration: Duration) -> Value {
-    Value::from(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+pub(super) fn elapsed_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn elapsed_micros(duration: Duration) -> Value {
-    Value::from(u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
+fn bounded_count(count: usize) -> u64 {
+    u64::try_from(count).unwrap_or(u64::MAX)
 }
 
-fn insert_height(row: &mut Map<String, Value>, key: &'static str, height: Option<Height>) {
-    if let Some(height) = height {
-        row.insert(key.to_string(), Value::from(height.0));
+#[derive(Debug, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum LegacyEvent {
+    RoundStart {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state_tip: Option<u32>,
+    },
+    RoundFinish {
+        reason: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state_tip: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    TipsObtained {
+        reserve: u64,
+        prospective_tips: u64,
+    },
+    TipsExtended {
+        discovered: u64,
+        prospective_tips: u64,
+    },
+    BlockFinish {
+        hash: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+        result: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase_elapsed_ms: Option<u64>,
+    },
+    BlockPhase {
+        hash: String,
+        phase: &'static str,
+        previous_phase: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+        phase_elapsed_ms: u64,
+        elapsed_ms: u64,
+    },
+    PipelineReset(DiagnosticFields),
+    RoundErrorSnapshot(DiagnosticFields),
+    RoundStalled(DiagnosticFields),
+    BlockDownloaded {
+        hash: String,
+        height: u32,
+        download_elapsed_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer: Option<String>,
+    },
+}
+zakura_jsonl_trace::impl_jsonl_trace_event!(LegacyEvent, TABLE);
+
+#[derive(Debug, Serialize)]
+struct DiagnosticFields {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_tip: Option<u32>,
+    in_flight: u64,
+    reserve: u64,
+    prospective_tips: u64,
+    registry_retries: u64,
+    tasks: Vec<LegacyTaskTrace>,
+}
+
+fn block_finish(
+    hash: block::Hash,
+    outcome: LegacyBlockOutcome<'_>,
+    state: Option<LegacyTaskState>,
+) -> LegacyEvent {
+    let (mut height, result, error) = match outcome {
+        LegacyBlockOutcome::Verified(height) => (Some(height.0), "verified", None),
+        LegacyBlockOutcome::Error(error) => (None, "error", Some(error.to_string())),
+    };
+    let (phase, elapsed_ms, phase_elapsed_ms) = state.map_or((None, None, None), |state| {
+        height = state.height.map(|height| height.0).or(height);
+        (
+            Some(state.phase),
+            Some(elapsed_millis(state.started.elapsed())),
+            Some(elapsed_millis(state.phase_started.elapsed())),
+        )
+    });
+    LegacyEvent::BlockFinish {
+        hash: hash.to_string(),
+        height,
+        result,
+        error,
+        phase,
+        elapsed_ms,
+        phase_elapsed_ms,
     }
 }
 
-fn insert_count(row: &mut Map<String, Value>, key: &'static str, count: usize) {
-    row.insert(
-        key.to_string(),
-        Value::from(u64::try_from(count).unwrap_or(u64::MAX)),
-    );
+#[derive(Debug, Serialize)]
+pub(super) struct LegacyTaskTrace {
+    hash: String,
+    phase: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u32>,
+    elapsed_ms: u64,
+    phase_elapsed_ms: u64,
+}
+
+impl LegacyTaskTrace {
+    pub(super) fn new(hash: block::Hash, state: &LegacyTaskState) -> Self {
+        Self {
+            hash: hash.to_string(),
+            phase: state.phase,
+            height: state.height.map(|height| height.0),
+            elapsed_ms: elapsed_millis(state.started.elapsed()),
+            phase_elapsed_ms: elapsed_millis(state.phase_started.elapsed()),
+        }
+    }
+
+    pub(super) fn height(&self) -> Option<u32> {
+        self.height
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{json, Value};
+
     use super::*;
+
+    #[test]
+    fn absent_round_tip_is_omitted() {
+        assert_eq!(
+            serde_json::to_value(LegacyEvent::RoundStart { state_tip: None })
+                .expect("event serializes"),
+            json!({"event": "round_start"})
+        );
+    }
 
     #[tokio::test]
     async fn writes_legacy_sync_event() {
         let dir = tempfile::tempdir().expect("temporary trace directory");
         let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
         let trace = LegacySyncTrace {
-            tracer: guard.tracer(),
-            node: "test-node".into(),
-            started: Instant::now(),
+            emitter: JsonlEventEmitter::new(guard.tracer(), "test-node"),
             expose_peer_addresses: false,
         };
 
@@ -193,7 +333,7 @@ mod tests {
         drop(trace);
         guard.shutdown().await;
 
-        let event = std::fs::read_to_string(dir.path().join(FILE_NAME))
+        let event = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
             .expect("legacy trace file is written");
         let event: Value = serde_json::from_str(event.trim()).expect("trace row is valid JSON");
         assert_eq!(event["event"], "round_start");

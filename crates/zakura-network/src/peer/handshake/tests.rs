@@ -61,6 +61,29 @@ fn connected_addr_labels_require_explicit_opt_in() {
     assert!(!debug.contains("192.0.2.1"));
 }
 
+#[test]
+fn noncanonical_shielded_proof_size_gets_ban_score() {
+    let addr = peer_addr(8233);
+    let change = inbound_error_address_change(
+        addr,
+        PeerServices::NODE_NETWORK,
+        &SerializationError::NonCanonicalShieldedProofSize,
+    );
+
+    assert_eq!(change.addr(), addr);
+    assert_eq!(
+        change.misbehavior_score(),
+        constants::MAX_PEER_MISBEHAVIOR_SCORE
+    );
+
+    let ordinary_parser_error = inbound_error_address_change(
+        addr,
+        PeerServices::NODE_NETWORK,
+        &SerializationError::Parse("test parser error"),
+    );
+    assert_eq!(ordinary_parser_error.misbehavior_score(), 0);
+}
+
 fn test_config(p2p_stack: P2pStack) -> Config {
     Config::for_test(p2p_stack)
 }

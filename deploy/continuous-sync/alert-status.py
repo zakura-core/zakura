@@ -24,14 +24,32 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def service_active(service: str) -> bool:
-    try:
-        result = subprocess.run(
-            ["systemctl", "is-active", "--quiet", service],
-            timeout=4,
+    result = subprocess.run(
+        ["systemctl", "show", "--property=ActiveState", "--value", service],
+        text=True,
+        capture_output=True,
+        timeout=4,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"systemctl could not query {service}: {detail or f'exit {result.returncode}'}"
         )
-        return result.returncode == 0
-    except Exception:
-        return False
+
+    active_state = result.stdout.strip()
+    known_states = {
+        "active",
+        "reloading",
+        "inactive",
+        "failed",
+        "activating",
+        "deactivating",
+        "maintenance",
+        "refreshing",
+    }
+    if active_state not in known_states:
+        raise RuntimeError(f"systemctl returned unknown ActiveState {active_state!r} for {service}")
+    return active_state in {"active", "reloading", "refreshing"}
 
 
 def metric_height(text: str) -> int | None:

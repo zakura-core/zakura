@@ -609,7 +609,16 @@ def failure_text(config: Config, run_state: dict[str, Any], reason: str) -> str:
     height_text = str(height) if isinstance(height, int) else "unknown"
     return (
         f":rotating_light: Zakura failed: {p.hostname} | {policy_mode(p)} | "
-        f"{ssh_target(p)} | time to failure: {duration} | height: {height_text}"
+        f"{ssh_target(p)} | time to failure: {duration} | height: {height_text} | "
+        f"reason: {short_reason(reason)}"
+    )
+
+
+def resumed_text(config: Config) -> str:
+    p = config.policy
+    return (
+        f":white_check_mark: Zakura controller resumed: {p.hostname} | "
+        f"{policy_mode(p)} | {ssh_target(p)}"
     )
 
 
@@ -795,13 +804,25 @@ def status(config: Config) -> int:
 def resume(config: Config) -> int:
     state_path = config.paths.state_dir / "state.json"
     state = load_state(state_path)
+    previous_state = state.copy()
+    was_failed = bool(state.get("failed"))
     state.pop("failed", None)
     state.pop("failure", None)
     state["phase"] = "resumed"
     state["resumed_at"] = utc_stamp()
     save_state(state_path, state)
     run(["systemctl", "reset-failed", "zakura-continuous-sync.service"], check=False)
-    run(["systemctl", "start", "zakura-continuous-sync.service"], check=False)
+    try:
+        run(["systemctl", "start", "zakura-continuous-sync.service"])
+    except Exception:
+        save_state(state_path, previous_state)
+        raise
+    if was_failed and not post_slack(config, resumed_text(config)):
+        # `resume` is a one-shot operator action, so nothing retries a dropped
+        # notification. Report it on stdout, where `deploy.py resume` surfaces
+        # it to the operator who is already watching the command.
+        print("resumed (slack notification failed)")
+        return 0
     print("resumed")
     return 0
 

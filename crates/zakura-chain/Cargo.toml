@@ -1,6 +1,6 @@
 [package]
 name = "zakura-chain"
-version = "3.1.0-rc1"
+version = "4.0.0-rc1"
 authors.workspace = true
 description = "Core Zcash data structures for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true

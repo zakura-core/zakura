@@ -213,6 +213,22 @@ def node_condition(
     return ("ok", now, 0)
 
 
+def stall_cleared(entry: dict[str, Any], height: float | None) -> bool:
+    """True when a stalled alert may be retired.
+
+    A stall is only over once the node is strictly higher than it was when the
+    alert fired. The dashboard's stall timer lives in memory, so any restart
+    reports every node as freshly advanced and would otherwise clear the alert
+    at an unchanged height.
+    """
+    if entry.get("condition") != "stalled":
+        return True
+    alert_height = coerce_float(entry.get("alert_height"))
+    if alert_height is None:
+        return True
+    return height is not None and height > alert_height
+
+
 def update_alert_state(
     state_bucket: dict[str, Any],
     key: str,
@@ -224,12 +240,24 @@ def update_alert_state(
     now: float,
     suppressed: bool,
     args: argparse.Namespace,
+    height: float | None = None,
 ) -> None:
     entry = state_bucket.get(key, {"condition": "ok", "alerting": False})
     was_alerting = bool(entry.get("alerting"))
 
     if condition == "ok":
         if was_alerting:
+            if not stall_cleared(entry, height):
+                # Keep the alert latched; the timer reset but the node did not move.
+                anchor = coerce_float(entry.get("alert_height"))
+                if height is not None and anchor is not None and height < anchor:
+                    # The node was wiped, rolled back, or restarted onto a shorter
+                    # chain. Follow it down: anchored at the old tip the alert could
+                    # only clear once it re-synced past it, so a node that was fixed
+                    # by a resync would never post a recovery.
+                    entry = {**entry, "alert_height": height}
+                state_bucket[key] = entry
+                return
             if post_slack(recovery_text, args):
                 state_bucket[key] = {"condition": "ok", "alerting": False}
             return
@@ -251,12 +279,25 @@ def update_alert_state(
         "last_seen": now,
     }
 
+    if alerting:
+        anchor = entry.get("alert_height")
+        if anchor is None and condition == "stalled":
+            # The alert fired on a sample with no usable height, so it has nothing
+            # to compare against and would clear on the first reset timer. Anchor
+            # on the first sample that does report one.
+            anchor = height
+        if anchor is not None:
+            next_entry["alert_height"] = anchor
+
     if not alerting and age >= threshold:
         if suppressed:
             print(f"suppressed alert for {key}: {condition} for {format_duration(age)}")
         elif post_slack(alert_text, args):
             next_entry["alerting"] = True
             next_entry["last_alert_at"] = now
+            if condition == "stalled" and height is not None:
+                # Anchor recovery to this height, not to the dashboard's timer.
+                next_entry["alert_height"] = height
 
     state_bucket[key] = next_entry
 
@@ -420,6 +461,7 @@ class Watchdog:
             now,
             suppressed,
             self.args,
+            coerce_float(row.get("height")),
         )
 
 

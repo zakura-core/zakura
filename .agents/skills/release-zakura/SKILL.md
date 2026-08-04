@@ -137,7 +137,7 @@ After the `zakura` package version bump is final, run:
 make prepare-release-changelog RELEASE_TAG=<tag>
 ```
 
-This target is defined in `make/release.mk`. It must consume every numbered
+This target is defined in `scripts/make/release.mk`. It must consume every
 `docs/changelog/unreleased/<PR-number>.md` fragment into the root changelog,
 including explicit no-changelog fragments. Keep
 `docs/changelog/unreleased/README.md`; it documents the fragment format and is not a

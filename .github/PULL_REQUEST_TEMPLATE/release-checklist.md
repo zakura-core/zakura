@@ -222,7 +222,7 @@ cargo release replace --verbose --execute --allow-branch '*' -p zakura
 make prepare-release-changelog RELEASE_TAG=v<version>
 ```
 
-- [ ] Confirm the `make/release.mk` target consumed every numbered
+- [ ] Confirm the `scripts/make/release.mk` target consumed every numbered
       `docs/changelog/unreleased/<PR-number>.md` file, including no-changelog
       fragments. Keep `docs/changelog/unreleased/README.md`; it documents the
       fragment format.

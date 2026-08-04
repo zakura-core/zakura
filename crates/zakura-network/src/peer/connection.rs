@@ -27,6 +27,7 @@ use crate::{
         OVERLOAD_PROTECTION_INTERVAL, PEER_ADDR_RESPONSE_LIMIT,
     },
     meta_addr::MetaAddr,
+    p2p_trace::P2pTraceContext,
     peer::{
         connection::peer_tx::PeerTx, error::AlreadyErrored, ClientRequest, ClientRequestReceiver,
         ConnectionInfo, ErrorSlot, InProgressClientRequest, MustUseClientResponseSender, PeerError,
@@ -614,6 +615,11 @@ where
     /// service to a request from this connection,
     /// or None if this connection hasn't yet received an overload error.
     last_overload_time: Option<Instant>,
+
+    /// Per-message trace context, shared with this connection's [`PeerTx`].
+    ///
+    /// Covers the receive path; sends are traced inside [`PeerTx::send`].
+    p2p_trace: P2pTraceContext,
 }
 
 impl<S, Tx> fmt::Debug for Connection<S, Tx>
@@ -650,6 +656,7 @@ where
         connection_info: Arc<ConnectionInfo>,
         addr_label: String,
         initial_cached_addrs: Vec<MetaAddr>,
+        p2p_trace: P2pTraceContext,
     ) -> Self {
         Connection {
             connection_info,
@@ -659,11 +666,12 @@ where
             svc: inbound_service,
             client_rx: client_rx.into(),
             error_slot,
-            peer_tx: peer_tx.into(),
+            peer_tx: PeerTx::from(peer_tx).with_p2p_trace(p2p_trace.clone()),
             connection_tracker,
             addr_label,
             last_metrics_state: None,
             last_overload_time: None,
+            p2p_trace,
         }
     }
 }
@@ -754,6 +762,7 @@ where
                         }
                         Either::Left((Some(Err(e)), _)) => self.fail_with(e).await,
                         Either::Left((Some(Ok(msg)), _)) => {
+                            self.p2p_trace.trace("recv", &msg);
                             let unhandled_msg = self.handle_message_as_request(msg).await;
 
                             if let Some(unhandled_msg) = unhandled_msg {
@@ -863,6 +872,7 @@ where
                         }
                         Either::Right((Some(Err(e)), _)) => self.fail_with(e).await,
                         Either::Right((Some(Ok(peer_msg)), _cancel)) => {
+                            self.p2p_trace.trace("recv", &peer_msg);
                             self.update_state_metrics(format!("Out::Rsp::{}", peer_msg.command()));
 
                             // Try to process the message using the handler.

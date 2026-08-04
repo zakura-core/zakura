@@ -348,9 +348,22 @@ impl JsonlEventEmitter {
     where
         E: JsonlTraceEvent,
     {
-        let Ok(permit) = self.tracer.try_reserve() else {
-            return;
-        };
+        let _ = self.try_emit_event(build);
+    }
+
+    /// Lazily build and emit a typed event, reporting why it was not queued.
+    ///
+    /// Identical to [`emit_event`], but surfaces the reserve outcome so callers
+    /// that need to account for dropped rows can do so. Without this, a row
+    /// lost to a full queue is indistinguishable from an event that never
+    /// happened, which silently biases any measurement drawn from the table.
+    ///
+    /// [`emit_event`]: JsonlEventEmitter::emit_event
+    pub fn try_emit_event<E>(&self, build: impl FnOnce() -> E) -> Result<(), JsonlTraceReserveError>
+    where
+        E: JsonlTraceEvent,
+    {
+        let permit = self.tracer.try_reserve()?;
 
         let event = build();
         let row = JsonlEventEnvelope {
@@ -370,6 +383,8 @@ impl JsonlEventEmitter {
                 line,
             });
         }
+
+        Ok(())
     }
 
     /// Lazily build and emit a raw JSON object for compatibility callers.
@@ -702,6 +717,21 @@ impl JsonlTracer {
         };
 
         runtime.tx.capacity()
+    }
+
+    /// Returns the total queue capacity.
+    ///
+    /// Callers that shed load based on how full the queue is need this as the
+    /// denominator for [`capacity`]. Reading it from the channel keeps the two
+    /// from disagreeing when the tracer was built with a non-default config.
+    ///
+    /// [`capacity`]: JsonlTracer::capacity
+    pub fn max_capacity(&self) -> usize {
+        let TraceState::Enabled(runtime) = &self.inner else {
+            return 0;
+        };
+
+        runtime.tx.max_capacity()
     }
 
     /// Try to reserve a queue slot for a trace record.

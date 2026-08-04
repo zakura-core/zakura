@@ -4,7 +4,9 @@ use futures::{FutureExt, Sink, SinkExt};
 
 use zakura_chain::serialization::SerializationError;
 
-use crate::{constants::REQUEST_TIMEOUT, protocol::external::Message, PeerError};
+use crate::{
+    constants::REQUEST_TIMEOUT, p2p_trace::P2pTraceContext, protocol::external::Message, PeerError,
+};
 
 /// A wrapper type for a peer connection message sender.
 ///
@@ -18,14 +20,30 @@ where
     ///
     /// This channel accepts [`Message`]s.
     inner: Tx,
+
+    /// Per-message trace context for this connection.
+    ///
+    /// Every outbound message passes through [`PeerTx::send`], so tracing here
+    /// covers the whole send path from one place.
+    p2p_trace: P2pTraceContext,
 }
 
 impl<Tx> PeerTx<Tx>
 where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
+    /// Attach a per-message trace context to this sender.
+    pub(crate) fn with_p2p_trace(mut self, p2p_trace: P2pTraceContext) -> Self {
+        self.p2p_trace = p2p_trace;
+        self
+    }
+
     /// Sends `msg` on `self.inner`, returning a timeout error if it takes too long.
     pub async fn send(&mut self, msg: Message) -> Result<(), PeerError> {
+        // Traced before the send so the row records when this node decided to
+        // send, not when the peer's socket accepted it.
+        self.p2p_trace.trace("send", &msg);
+
         tokio::time::timeout(REQUEST_TIMEOUT, self.inner.send(msg))
             .await
             .map_err(|_| PeerError::ConnectionSendTimeout)?
@@ -48,7 +66,10 @@ where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
     fn from(tx: Tx) -> Self {
-        PeerTx { inner: tx }
+        PeerTx {
+            inner: tx,
+            p2p_trace: P2pTraceContext::noop(),
+        }
     }
 }
 

@@ -39,6 +39,7 @@ use zakura_chain::{
 use crate::{
     constants,
     meta_addr::MetaAddrChange,
+    p2p_trace::{P2pTraceContext, P2pTracer},
     peer::{
         CancelHeartbeatTask, Client, ClientRequest, Connection, ErrorSlot, HandshakeError,
         MinimumPeerVersion, PeerError,
@@ -94,6 +95,12 @@ where
     /// canonicalized for IPv4-mapped matching. Empty when unconfigured.
     protected_peer_ips: Arc<HashSet<IpAddr>>,
 
+    /// Per-message P2P tracer, shared by every connection this service builds.
+    ///
+    /// Enabled by `[network.zakura] trace_dir`, the same key that enables the
+    /// other on-node trace tables.
+    p2p_tracer: P2pTracer,
+
     parent_span: Span,
 }
 
@@ -140,6 +147,7 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector.clone(),
             peer_registry: self.peer_registry.clone(),
             protected_peer_ips: self.protected_peer_ips.clone(),
+            p2p_tracer: self.p2p_tracer.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -646,6 +654,10 @@ where
         let network = config.network.clone();
         let minimum_peer_version = MinimumPeerVersion::new(self.latest_chain_tip, &network);
 
+        // One writer task per node, shared by every connection. Disabled unless
+        // a trace directory is configured.
+        let p2p_tracer = P2pTracer::new(config.zakura.trace_dir.clone());
+
         Ok(Handshake {
             config,
             user_agent,
@@ -659,6 +671,7 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector,
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
+            p2p_tracer,
             parent_span: Span::current(),
         })
     }
@@ -1553,6 +1566,7 @@ where
         let minimum_peer_version = self.minimum_peer_version.clone();
         let zakura_handshake_connector = self.zakura_handshake_connector.clone();
         let peer_registry = self.peer_registry.clone();
+        let p2p_tracer = self.p2p_tracer.clone();
 
         // Whether this peer is exempt from the inbound-overload connection drop.
         // Computed here (not in the future) so only the resulting `bool` is moved
@@ -1832,6 +1846,12 @@ where
                     )
                 });
 
+            // The trace peer label follows the same privacy policy as the log
+            // and metrics label: a real `IP:port` only when the operator has
+            // set `expose_peer_addresses`. Correlating a message across nodes
+            // needs the real address, so the experiment fleet sets it.
+            let p2p_trace = P2pTraceContext::new(p2p_tracer, addr_label.as_str());
+
             let server = Connection::new(
                 inbound_service,
                 server_rx,
@@ -1841,6 +1861,7 @@ where
                 connection_info.clone(),
                 addr_label,
                 alternate_addrs.collect(),
+                p2p_trace,
             );
 
             let connection_task = tokio::spawn(

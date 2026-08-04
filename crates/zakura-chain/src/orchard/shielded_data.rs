@@ -90,10 +90,8 @@ impl ShieldedData {
     ///
     /// An Orchard proof is stored as an unbounded byte sequence, so a proof that is
     /// present but not canonically sized can be padded with arbitrary trailing data
-    /// without affecting its validity. Whole-transaction parsing enforces this
-    /// rule for every V5 and V6 transaction, while semantic verification repeats
-    /// it for defense-in-depth and in-memory transactions. See
-    /// `GHSA-jfw5-j458-pfv6`.
+    /// without affecting its validity. Deserialization and semantic verification
+    /// both require canonical proof sizes.
     pub fn proof_size_is_canonical(&self) -> bool {
         self.proof.0.len() == expected_proof_size(self.actions.len())
     }

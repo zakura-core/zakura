@@ -469,7 +469,7 @@ where
             // A proof that is present but not canonically sized can be padded with
             // arbitrary trailing data without affecting its validity, allowing excess
             // bandwidth and storage costs to be imposed while paying only fees sized to a
-            // canonical proof (GHSA-jfw5-j458-pfv6).
+            // canonical proof.
             //
             // Transaction parsing enforces the same rule. Repeat it here for
             // defense-in-depth and transactions constructed in memory.

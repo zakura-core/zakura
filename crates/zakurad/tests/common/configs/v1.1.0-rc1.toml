@@ -116,6 +116,18 @@ enable_cookie_auth = true
 max_response_body_size = 52428800
 parallel_cpu_threads = 0
 
+[rpc.transaction_submission]
+enabled = true
+max_connections = 100
+max_connections_per_ip = 20
+max_in_flight = 16
+max_in_flight_per_ip = 4
+request_burst = 20
+request_burst_per_ip = 4
+requests_per_minute_per_ip = 60
+requests_per_second = 10
+trusted_proxies = []
+
 [state]
 cache_dir = "cache_dir"
 debug_skip_non_finalized_state_backup_task = false

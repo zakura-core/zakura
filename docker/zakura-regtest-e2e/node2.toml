@@ -49,6 +49,9 @@ debug_skip_regtest_genesis_self_seed = true
 listen_addr = "127.0.0.1:18332"
 enable_cookie_auth = false
 
+[rpc.transaction_submission]
+listen_addr = "127.0.0.1:18337"
+
 [metrics]
 endpoint_addr = "127.0.0.1:19002"
 

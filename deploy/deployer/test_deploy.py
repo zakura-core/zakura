@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -136,6 +137,7 @@ class MountRenderingTests(unittest.TestCase):
             "network_cache_dir": "",
             "rpc_listen_addr": "",
             "rpc_enable_cookie_auth": None,
+            "transaction_submission_trusted_proxies": None,
             "storage_mode": "archive",
             "p2p_stack": "dual",
             "metrics_endpoint": "",
@@ -165,6 +167,49 @@ class MountRenderingTests(unittest.TestCase):
 
         self.assertNotIn("RequiresMountsFor=/mnt/data", service)
         self.assertNotIn("AssertPathIsMountPoint=/mnt/data", service)
+
+    def test_render_config_includes_transaction_submission_trusted_proxies(self):
+        config = deploy.render_node_config(self.node(
+            transaction_submission_trusted_proxies=[
+                "127.0.0.1/32",
+                "192.0.2.10/32",
+            ],
+        ))
+
+        self.assertIn("[rpc.transaction_submission]", config)
+        self.assertIn('    "127.0.0.1/32",', config)
+        self.assertIn('    "192.0.2.10/32",', config)
+
+
+class TrustedProxyValidationTests(unittest.TestCase):
+    def test_normalize_trusted_proxies_accepts_exact_networks(self):
+        self.assertEqual(
+            deploy.normalize_trusted_proxies(
+                ["127.0.0.1/32", "2001:db8::1/128"], where="test"
+            ),
+            ["127.0.0.1/32", "2001:db8::1/128"],
+        )
+
+    def test_normalize_trusted_proxies_rejects_catch_all(self):
+        with self.assertRaisesRegex(deploy.DeployError, "must not trust every address"):
+            deploy.normalize_trusted_proxies(["0.0.0.0/0"], where="test")
+
+
+class BinaryOnlyInstallTests(unittest.TestCase):
+    def test_trusted_proxy_drop_in_is_valid_shell(self):
+        script = deploy.BINARY_ONLY_INSTALL_SCRIPT.format(
+            bin_path="/usr/local/bin/zakurad",
+            service="zakurad",
+            no_restart="0",
+            configure_trusted_proxies="1",
+            trusted_proxies="127.0.0.1/32,192.0.2.10/32",
+        )
+
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        self.assertIn(
+            'Environment="ZAKURA_RPC__TRANSACTION_SUBMISSION__TRUSTED_PROXIES=%s"',
+            script,
+        )
 
 
 if __name__ == "__main__":

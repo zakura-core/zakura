@@ -868,6 +868,80 @@ where
     gbt: GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>,
 }
 
+/// Decodes and submits one transaction to the mempool.
+///
+/// Only the full RPC interface supplies `retry_queue`. Public submissions pass `None`, so they
+/// cannot create background retry work after the request has finished.
+pub(crate) async fn submit_raw_transaction_to_mempool<Mempool>(
+    mempool: Mempool,
+    retry_queue: Option<broadcast::Sender<UnminedTx>>,
+    raw_transaction_hex: String,
+) -> Result<SendRawTransactionResponse>
+where
+    Mempool: MempoolService,
+{
+    // Reference for the legacy error code:
+    // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/rawtransaction.cpp#L1259-L1260>
+    let raw_transaction_bytes =
+        Vec::from_hex(raw_transaction_hex).map_error(server::error::LegacyCode::Deserialization)?;
+    let raw_transaction = Transaction::zcash_deserialize(&*raw_transaction_bytes)
+        .map_error(server::error::LegacyCode::Deserialization)?;
+
+    let transaction_hash = raw_transaction.hash();
+
+    if let Some(retry_queue) = retry_queue {
+        let _ = retry_queue.send(UnminedTx::from(raw_transaction.clone()));
+    }
+
+    let request = mempool::Request::Queue(vec![mempool::Gossip::Tx(raw_transaction.into())]);
+    let response = mempool.oneshot(request).await.map_misc_error()?;
+
+    let mut queue_results = match response {
+        mempool::Response::Queued(results) => results,
+        _ => {
+            return Err(ErrorObject::owned(
+                i32::from(server::error::LegacyCode::Misc),
+                "unexpected response from mempool service",
+                None::<()>,
+            ));
+        }
+    };
+
+    if queue_results.len() != 1 {
+        return Err(ErrorObject::owned(
+            i32::from(server::error::LegacyCode::Misc),
+            "mempool service returned an unexpected number of results",
+            None::<()>,
+        ));
+    }
+
+    let queue_result = queue_results
+        .pop()
+        .ok_or_else(|| {
+            ErrorObject::owned(
+                i32::from(server::error::LegacyCode::Misc),
+                "mempool service did not return a result",
+                None::<()>,
+            )
+        })?
+        .inspect_err(|err| tracing::debug!(?err, "transaction submission queue rejected"))
+        .map_misc_error()?
+        .await
+        .map_misc_error()?;
+
+    tracing::debug!(?queue_result, "transaction submission completed");
+
+    queue_result
+        .map(|_| SendRawTransactionResponse(transaction_hash))
+        // Reference for the legacy error code:
+        // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/rawtransaction.cpp#L1290-L1301>
+        // Note that this error code might not exactly match the one returned by zcashd
+        // since zcashd's error code selection logic is more granular. We'd need to
+        // propagate the error coming from the verifier to be able to return more specific
+        // error codes.
+        .map_error(server::error::LegacyCode::Verify)
+}
+
 /// A type alias for the last event logged by the server.
 pub type LoggedLastEvent = watch::Receiver<Option<(String, tracing::Level, chrono::DateTime<Utc>)>>;
 
@@ -1270,57 +1344,12 @@ where
         raw_transaction_hex: String,
         _allow_high_fees: Option<bool>,
     ) -> Result<SendRawTransactionResponse> {
-        let mempool = self.mempool.clone();
-        let queue_sender = self.queue_sender.clone();
-
-        // Reference for the legacy error code:
-        // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/rawtransaction.cpp#L1259-L1260>
-        let raw_transaction_bytes = Vec::from_hex(raw_transaction_hex)
-            .map_error(server::error::LegacyCode::Deserialization)?;
-        let raw_transaction = Transaction::zcash_deserialize(&*raw_transaction_bytes)
-            .map_error(server::error::LegacyCode::Deserialization)?;
-
-        let transaction_hash = raw_transaction.hash();
-
-        // send transaction to the rpc queue, ignore any error.
-        let unmined_transaction = UnminedTx::from(raw_transaction.clone());
-        let _ = queue_sender.send(unmined_transaction);
-
-        let transaction_parameter = mempool::Gossip::Tx(raw_transaction.into());
-        let request = mempool::Request::Queue(vec![transaction_parameter]);
-
-        let response = mempool.oneshot(request).await.map_misc_error()?;
-
-        let mut queue_results = match response {
-            mempool::Response::Queued(results) => results,
-            _ => unreachable!("incorrect response variant from mempool service"),
-        };
-
-        assert_eq!(
-            queue_results.len(),
-            1,
-            "mempool service returned more results than expected"
-        );
-
-        let queue_result = queue_results
-            .pop()
-            .expect("there should be exactly one item in Vec")
-            .inspect_err(|err| tracing::debug!("sent transaction to mempool: {:?}", &err))
-            .map_misc_error()?
-            .await
-            .map_misc_error()?;
-
-        tracing::debug!("sent transaction to mempool: {:?}", &queue_result);
-
-        queue_result
-            .map(|_| SendRawTransactionResponse(transaction_hash))
-            // Reference for the legacy error code:
-            // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/rawtransaction.cpp#L1290-L1301>
-            // Note that this error code might not exactly match the one returned by zcashd
-            // since zcashd's error code selection logic is more granular. We'd need to
-            // propagate the error coming from the verifier to be able to return more specific
-            // error codes.
-            .map_error(server::error::LegacyCode::Verify)
+        submit_raw_transaction_to_mempool(
+            self.mempool.clone(),
+            Some(self.queue_sender.clone()),
+            raw_transaction_hex,
+        )
+        .await
     }
 
     // # Performance

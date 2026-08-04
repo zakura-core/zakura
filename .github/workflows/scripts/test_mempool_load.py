@@ -16,6 +16,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parent
 
@@ -125,6 +126,17 @@ class PortSafety(unittest.TestCase):
         for i in range(3):
             for port in (lab.P2P_PORT, lab.RPC_PORT, lab.METRICS_PORT, lab.ZAKURA_P2P_PORT):
                 self.assertIn((lab.node_ip(i), port), checked)
+
+    def test_preflight_checks_transaction_submission_when_supported(self):
+        checked: list[tuple[str, int]] = []
+        original = lab.port_owner
+        lab.port_owner = lambda host, port: (checked.append((host, port)), False)[1]
+        self.addCleanup(lambda: setattr(lab, "port_owner", original))
+
+        lab.assert_ports_free(3, transaction_submission=True)
+
+        for i in range(3):
+            self.assertIn((lab.node_ip(i), lab.TRANSACTION_SUBMISSION_PORT), checked)
 
     def test_port_owner_detects_a_real_listener(self):
         import socket
@@ -311,6 +323,27 @@ class NodeEnvironment(unittest.TestCase):
         env = lab.node_env()
         self.assertEqual(env.get("MEMPOOL_LOAD_PROBE"), "keep-me")
         self.assertIn("PATH", env)
+
+    def test_harness_sets_a_node_specific_transaction_submission_address(self):
+        address = f"{lab.node_ip(2)}:{lab.TRANSACTION_SUBMISSION_PORT}"
+
+        env = lab.node_env(transaction_submission_addr=address)
+
+        self.assertEqual(
+            env["ZAKURA_RPC__TRANSACTION_SUBMISSION__LISTEN_ADDR"], address
+        )
+
+    def test_detects_transaction_submission_support_from_generated_config(self):
+        generated = mock.Mock(
+            stdout="[rpc]\n[rpc.transaction_submission]\nenabled = true\n"
+        )
+        with mock.patch.object(lab.subprocess, "run", return_value=generated):
+            self.assertTrue(lab.supports_transaction_submission("/tmp/zakurad"))
+
+    def test_detects_binary_without_transaction_submission(self):
+        generated = mock.Mock(stdout="[rpc]\nlisten_addr = '127.0.0.1:8232'\n")
+        with mock.patch.object(lab.subprocess, "run", return_value=generated):
+            self.assertFalse(lab.supports_transaction_submission("/tmp/zakurad"))
 
 
 class StartupConvergence(unittest.TestCase):

@@ -44,6 +44,7 @@ pub mod http_request_compatibility;
 pub mod rpc_call_compatibility;
 pub mod rpc_metrics;
 pub mod rpc_tracing;
+mod transaction_submission;
 
 #[cfg(test)]
 mod tests;
@@ -81,6 +82,10 @@ impl fmt::Debug for RpcServer {
 
 /// The message to log when logging the RPC server's listen address
 pub const OPENED_RPC_ENDPOINT_MSG: &str = "Opened RPC endpoint at ";
+
+/// The message logged with the public transaction submission listen address.
+pub const OPENED_TRANSACTION_SUBMISSION_ENDPOINT_MSG: &str =
+    "Opened public transaction submission endpoint at ";
 
 type ServerTask = JoinHandle<Result<(), tower::BoxError>>;
 

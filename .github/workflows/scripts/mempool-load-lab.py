@@ -44,6 +44,9 @@ METRICS_PORT = 19999
 # The Zakura p2p stack's own listener, present in the config even when
 # p2p_stack = "default" leaves it unused.
 ZAKURA_P2P_PORT = 18234
+# The public transaction submission listener. Newer nodes enable it by default;
+# each lab node binds it on that node's distinct loopback address.
+TRANSACTION_SUBMISSION_PORT = 18237
 
 # Node RPC has to open the state DB and bind before we start counting failures.
 RPC_READY_TIMEOUT_SECS = 180
@@ -281,7 +284,7 @@ def localize_fleet(lab: Path, args) -> None:
 # stray one in the environment is read as a config key and the node refuses to
 # start ("unknown field `dir`"). The lab always passes an explicit config file,
 # so nothing of ours belongs in that namespace.
-def node_env() -> dict:
+def node_env(*, transaction_submission_addr: str | None = None) -> dict:
     hijacked = sorted(k for k in os.environ if k.startswith("ZAKURA_"))
     if hijacked:
         print(
@@ -289,10 +292,42 @@ def node_env() -> dict:
             + ", ".join(hijacked),
             file=sys.stderr,
         )
-    return {k: v for k, v in os.environ.items() if not k.startswith("ZAKURA_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ZAKURA_")}
+    if transaction_submission_addr is not None:
+        env["ZAKURA_RPC__TRANSACTION_SUBMISSION__LISTEN_ADDR"] = (
+            transaction_submission_addr
+        )
+    return env
 
 
-def spawn_node(lab: Path, args, index: int, *, bootstrap: bool) -> subprocess.Popen:
+def supports_transaction_submission(binary: str) -> bool:
+    """Return whether `binary` accepts transaction submission configuration."""
+    command = [str(Path(binary).resolve()), "generate"]
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=node_env(),
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(
+            f"could not inspect transaction submission support in {command[0]}: "
+            f"{type(error).__name__}"
+        ) from error
+    return "[rpc.transaction_submission]" in result.stdout
+
+
+def spawn_node(
+    lab: Path,
+    args,
+    index: int,
+    *,
+    bootstrap: bool,
+    transaction_submission: bool,
+) -> subprocess.Popen:
     name = node_name(index)
     node_dir = lab / "nodes" / name
     config = node_dir / ("zakura.bootstrap.toml" if bootstrap else "zakura.toml")
@@ -305,7 +340,13 @@ def spawn_node(lab: Path, args, index: int, *, bootstrap: bool) -> subprocess.Po
         stderr=subprocess.STDOUT,
         # Own process group, so stopping a node never signals the whole lab.
         start_new_session=True,
-        env=node_env(),
+        env=node_env(
+            transaction_submission_addr=(
+                f"{node_ip(index)}:{TRANSACTION_SUBMISSION_PORT}"
+                if transaction_submission
+                else None
+            )
+        ),
     )
     print(f"started {name} ({suffix}) pid={proc.pid} log={log_path}", flush=True)
     return proc
@@ -345,7 +386,7 @@ def port_owner(host: str, port: int) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
-def assert_ports_free(node_count: int) -> None:
+def assert_ports_free(node_count: int, *, transaction_submission: bool = False) -> None:
     """Refuse to start if any port the lab needs is already taken.
 
     Developer boxes and CI droplets can already be running a node; binding on
@@ -354,12 +395,15 @@ def assert_ports_free(node_count: int) -> None:
     conflicts = []
     for i in range(node_count):
         ip = node_ip(i)
-        for port, label in (
+        ports = [
             (P2P_PORT, "p2p"),
             (RPC_PORT, "rpc"),
             (METRICS_PORT, "metrics"),
             (ZAKURA_P2P_PORT, "zakura-p2p"),
-        ):
+        ]
+        if transaction_submission:
+            ports.append((TRANSACTION_SUBMISSION_PORT, "transaction-submission"))
+        for port, label in ports:
             if port_owner(ip, port):
                 conflicts.append(f"{ip}:{port} ({label}, node {node_name(i)})")
     if conflicts:
@@ -388,7 +432,7 @@ def stop_proc(proc: subprocess.Popen, name: str, timeout_secs: int = 60) -> None
         proc.wait(timeout=30)
 
 
-def seed_node(lab: Path, args, index: int) -> None:
+def seed_node(lab: Path, args, index: int, *, transaction_submission: bool) -> None:
     """Load the generated chain into one node via the P2P-disabled bootstrap config.
 
     Brings the node up with P2P off so it cannot gossip a partial chain, then
@@ -402,7 +446,13 @@ def seed_node(lab: Path, args, index: int) -> None:
     genesis_path = lab / "payload" / "local_genesis" / "genesis.hex"
     premine_path = lab / "payload" / "local_genesis" / "premine_blocks.hex"
 
-    proc = spawn_node(lab, args, index, bootstrap=True)
+    proc = spawn_node(
+        lab,
+        args,
+        index,
+        bootstrap=True,
+        transaction_submission=transaction_submission,
+    )
     try:
         if not wait_for_rpc(url, proc=proc):
             log_path = lab / "nodes" / name / "bootstrap.log"
@@ -453,14 +503,23 @@ def explain_startup_failure(log_path: Path) -> str:
 def cmd_up(args) -> int:
     """Seed every node, start them all, and leave them running."""
     lab = Path(args.lab_dir).resolve()
-    assert_ports_free(args.node_count)
+    transaction_submission = supports_transaction_submission(args.zakurad_binary)
+    assert_ports_free(
+        args.node_count, transaction_submission=transaction_submission
+    )
     localize_fleet(lab, args)
     for i in range(args.node_count):
-        seed_node(lab, args, i)
+        seed_node(lab, args, i, transaction_submission=transaction_submission)
 
     procs: dict[str, subprocess.Popen] = {}
     for i in range(args.node_count):
-        procs[node_name(i)] = spawn_node(lab, args, i, bootstrap=False)
+        procs[node_name(i)] = spawn_node(
+            lab,
+            args,
+            i,
+            bootstrap=False,
+            transaction_submission=transaction_submission,
+        )
         # Recorded after each spawn, not once at the end: if a later spawn
         # raises, the nodes already started must still be visible to `down`.
         write_pidfile(lab, procs)

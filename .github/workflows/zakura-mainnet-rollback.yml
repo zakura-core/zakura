@@ -88,9 +88,16 @@ jobs:
             "SERVICE='${{ inputs.service }}' BIN='${{ inputs.bin_path }}' bash -s" <<'EOF'
           set -euo pipefail
           if [ ! -x "${BIN}.bak" ]; then echo "no ${BIN}.bak to restore" >&2; exit 1; fi
+          proxy_drop_in="/etc/systemd/system/${SERVICE}.service.d/transaction-submission.conf"
           systemctl stop "$SERVICE" || true
           for _ in 1 2 3 4 5 6 7 8 9 10; do systemctl is-active --quiet "$SERVICE" || break; sleep 1; done
           install -m 755 "${BIN}.bak" "$BIN"
+          if [ -f "${proxy_drop_in}.bak" ]; then
+            mv -f "${proxy_drop_in}.bak" "$proxy_drop_in"
+          else
+            rm -f "$proxy_drop_in"
+          fi
+          systemctl daemon-reload
           systemctl start "$SERVICE"
           sleep 3
           systemctl is-active "$SERVICE"

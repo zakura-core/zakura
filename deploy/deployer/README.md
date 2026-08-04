@@ -27,6 +27,8 @@ Copy `nodes.example.toml` to `nodes.toml` and edit. Each `[[nodes]]` entry needs
 
 `[defaults]` supplies fleet-wide values (service name, paths, network, ssh
 `port`); any field can be overridden per node. `nodes.toml` is gitignored.
+`transaction_submission_trusted_proxies` accepts exact CIDR networks for
+reverse proxies that overwrite `X-Forwarded-For`.
 
 ## Commands
 
@@ -139,7 +141,8 @@ It also installs the public broadcast-only JSON-RPC gateway on
 - TLS front door: `/etc/caddy/Caddyfile` from `deploy/gateway/testnet/Caddyfile`
 
 The gateway allowlists `sendrawtransaction`, rate-limits at 30 req/min/IP, and
-load-balances across the testnet `:18232` backends listed in
+load-balances across the testnet transaction submission listeners on `:18237`
+listed in
 `deploy/gateway/testnet/backends.toml`.
 
 The workflow also refreshes a static Zakura Ironwood testnet snapshots website on
@@ -217,7 +220,9 @@ iroh identity (the node ids hardcoded as bootstrap peers in
 `/root/.cache/zebra`. Rendering the deployer's managed config over that would
 change every node id and drop the tuning. So the generated CI config sets
 `manage_config = false`: the deployer swaps `/usr/local/bin/zakurad` and restarts
-the existing `zakurad` service, leaving the config, unit, and cache untouched. The
+the existing `zakurad` service, leaving the hand-tuned config, primary unit, and
+cache untouched. Gateway backends additionally receive their explicit
+`transaction_submission_trusted_proxies` setting through a systemd drop-in. The
 `rpc_listen_addr` / `log_file` / `p2p_stack` /
 `[defaults.zakura] bootstrap_peers` in that config are read-only inputs for the
 dashboard's SSH probe, not deployed to nodes. On-node configs should use
@@ -241,7 +246,8 @@ It also installs the public broadcast-only JSON-RPC gateway on the same host
 - TLS front door: `/etc/caddy/Caddyfile` from `deploy/gateway/mainnet/Caddyfile`
 
 The gateway allowlists `sendrawtransaction`, rate-limits at 30 req/min/IP, and
-load-balances across the mainnet `:8232` backends listed in
+load-balances across the mainnet transaction submission listeners on `:8237`
+listed in
 `deploy/gateway/mainnet/backends.toml`.
 
 It is the same `zakura-cluster-status.py` as testnet, launched with

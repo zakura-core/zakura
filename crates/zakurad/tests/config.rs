@@ -101,6 +101,8 @@ fn config_load_defaults() {
         DEFAULT_ZAKURA_MAX_CONNS_PER_IP
     );
     assert_eq!(config.rpc.listen_addr, None); // RPC disabled by default
+    assert!(config.rpc.transaction_submission.enabled);
+    assert_eq!(config.rpc.transaction_submission.listen_addr, None);
     assert_eq!(config.metrics.endpoint_addr, None); // Metrics disabled by default
     assert!(!config.network.expose_peer_addresses); // Peer addresses redacted by default
 }
@@ -137,6 +139,12 @@ expose_peer_addresses = true
 [rpc]
 listen_addr = "127.0.0.1:8232"
 
+[rpc.transaction_submission]
+enabled = false
+listen_addr = "127.0.0.1:18237"
+requests_per_second = 7
+trusted_proxies = ["127.0.0.1/32"]
+
 [metrics]
 endpoint_addr = "127.0.0.1:9999"
 "#;
@@ -150,6 +158,18 @@ endpoint_addr = "127.0.0.1:9999"
         config.rpc.listen_addr.unwrap().to_string(),
         "127.0.0.1:8232"
     );
+    assert!(!config.rpc.transaction_submission.enabled);
+    assert_eq!(
+        config
+            .rpc
+            .transaction_submission
+            .listen_addr
+            .expect("configured listen address")
+            .to_string(),
+        "127.0.0.1:18237"
+    );
+    assert_eq!(config.rpc.transaction_submission.requests_per_second, 7);
+    assert_eq!(config.rpc.transaction_submission.trusted_proxies.len(), 1);
     assert_eq!(
         config.metrics.endpoint_addr.unwrap().to_string(),
         "127.0.0.1:9999"
@@ -291,6 +311,45 @@ fn config_nested_env_vars() {
     let config = ZakuradConfig::load(None).expect("load config with nested env vars");
 
     assert_eq!(config.tracing.filter.as_deref(), Some("debug"));
+}
+
+#[test]
+fn config_transaction_submission_nested_env_vars() {
+    let env = EnvGuard::new();
+
+    env.set_var("ZAKURA_RPC__TRANSACTION_SUBMISSION__ENABLED", "false");
+    env.set_var(
+        "ZAKURA_RPC__TRANSACTION_SUBMISSION__LISTEN_ADDR",
+        "127.0.0.1:18237",
+    );
+    env.set_var(
+        "ZAKURA_RPC__TRANSACTION_SUBMISSION__REQUESTS_PER_SECOND",
+        "12",
+    );
+    env.set_var(
+        "ZAKURA_RPC__TRANSACTION_SUBMISSION__TRUSTED_PROXIES",
+        "127.0.0.1/32,192.0.2.10/32",
+    );
+
+    let config = ZakuradConfig::load(None).expect("load transaction submission env vars");
+
+    assert!(!config.rpc.transaction_submission.enabled);
+    assert_eq!(
+        config.rpc.transaction_submission.listen_addr,
+        Some("127.0.0.1:18237".parse().expect("valid address"))
+    );
+    assert_eq!(config.rpc.transaction_submission.requests_per_second, 12);
+    assert_eq!(config.rpc.transaction_submission.trusted_proxies.len(), 2);
+    assert!(config
+        .rpc
+        .transaction_submission
+        .trusted_proxies
+        .contains(&"127.0.0.1/32".parse().expect("valid network")));
+    assert!(config
+        .rpc
+        .transaction_submission
+        .trusted_proxies
+        .contains(&"192.0.2.10/32".parse().expect("valid network")));
 }
 
 #[test]

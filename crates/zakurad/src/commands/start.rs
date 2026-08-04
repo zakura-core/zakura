@@ -655,6 +655,21 @@ impl StartCmd {
             tokio::spawn(std::future::pending().in_current_span())
         };
 
+        let transaction_submission_task_handle = if config.rpc.transaction_submission.enabled {
+            let (task, _listen_addr) = RpcServer::start_transaction_submission(
+                mempool.clone(),
+                config.rpc.transaction_submission.clone(),
+                config.network.network.kind(),
+                config.mempool.max_transaction_bytes,
+            )
+            .await
+            .map_err(|error| eyre!("could not start transaction submission server: {error}"))?;
+            task
+        } else {
+            info!("public transaction submission endpoint is disabled");
+            tokio::spawn(std::future::pending().in_current_span())
+        };
+
         let zcashd_compat_shutdown_timeout =
             Self::zcashd_compat_supervisor_shutdown_timeout(&config);
         let zcashd_compat_supervisor_config =
@@ -868,6 +883,7 @@ impl StartCmd {
 
         // ongoing tasks
         pin!(rpc_task_handle);
+        pin!(transaction_submission_task_handle);
         pin!(indexer_rpc_task_handle);
         pin!(syncer_task_handle);
         pin!(block_gossip_task_handle);
@@ -913,6 +929,13 @@ impl StartCmd {
                         .expect("unexpected panic in the rpc transaction queue task");
                     info!("rpc transaction queue task exited");
                     Ok(())
+                }
+
+                transaction_submission_join_result = &mut transaction_submission_task_handle => {
+                    let server_result = transaction_submission_join_result
+                        .expect("unexpected panic in the transaction submission task");
+                    info!(?server_result, "transaction submission task exited");
+                    server_result.map_err(|error| eyre!(error))
                 }
 
                 indexer_rpc_join_result = &mut indexer_rpc_task_handle => {
@@ -1018,6 +1041,7 @@ impl StartCmd {
 
         // ongoing tasks
         rpc_task_handle.abort();
+        transaction_submission_task_handle.abort();
         rpc_tx_queue_handle.abort();
         health_task_handle.abort();
         syncer_task_handle.abort();

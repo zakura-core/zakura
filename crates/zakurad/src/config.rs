@@ -177,6 +177,8 @@ impl ZakuradConfig {
             builder = builder.add_source(
                 config::Environment::default()
                     .separator("__")
+                    .list_separator(",")
+                    .with_list_parse_key("rpc.transaction_submission.trusted_proxies")
                     .try_parsing(true)
                     .source(Some(filtered_env)),
             );

@@ -25,6 +25,9 @@ ephemeral = true
 listen_addr = "127.0.0.1:18532"
 enable_cookie_auth = false
 
+[rpc.transaction_submission]
+listen_addr = "127.0.0.1:18537"
+
 [metrics]
 endpoint_addr = "127.0.0.1:19004"
 

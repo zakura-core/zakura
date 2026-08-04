@@ -24,9 +24,11 @@ services:
     # P2P port for inbound peer connections (recommended).
     ports:
       - "8233:8233"   # P2P on Mainnet (use 18233:18233 for Testnet)
+      - "8237:8237"   # Public transaction submission on Mainnet
 
     # Uncomment any of these to expose additional services:
     #   - "18233:18233" # P2P on Testnet
+    #   - "18237:18237" # Public transaction submission on Testnet
     #   - "8232:8232"   # RPC endpoint on Mainnet
     #   - "18232:18232" # RPC endpoint on Testnet
     #   - "9999:9999"   # Metrics

@@ -145,6 +145,7 @@ jobs:
           name       = "zakura-testnet-1"
           ssh_string = "root@167.99.103.111"
           commit     = "${{ inputs.ref }}"
+          transaction_submission_trusted_proxies = ["127.0.0.1/32"]
           network_cache_dir = "/mnt/data/zakura-cache"
           state_cache_dir = "/mnt/data/zakura-cache"
           log_file = "/mnt/data/logs/zakura.log"
@@ -153,6 +154,7 @@ jobs:
           name       = "zakura-testnet-2"
           ssh_string = "root@167.99.110.145"
           commit     = "${{ inputs.ref }}"
+          transaction_submission_trusted_proxies = ["167.99.103.111/32"]
           network_cache_dir = "/mnt/data/zakura-cache"
           state_cache_dir = "/mnt/data/zakura-cache"
           log_file = "/mnt/data/logs/zakura.log"
@@ -161,6 +163,7 @@ jobs:
           name       = "zakura-testnet-3"
           ssh_string = "root@138.68.229.254"
           commit     = "${{ inputs.ref }}"
+          transaction_submission_trusted_proxies = ["167.99.103.111/32"]
           network_cache_dir = "/mnt/data/zakura-cache"
           state_cache_dir = "/mnt/data/zakura-cache"
           log_file = "/mnt/data/logs/zakura.log"
@@ -352,7 +355,8 @@ jobs:
           sudo systemctl --no-pager --full status zakura-testnet-snapshots.service || true
 
       - name: Install public broadcast gateway
-        if: always()
+        # Switch the fleet gateway only after every backend is running the new listener.
+        if: ${{ success() && !inputs.no_restart && inputs.node == '' }}
         run: |
           set -euo pipefail
 

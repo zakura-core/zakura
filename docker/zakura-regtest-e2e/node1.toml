@@ -36,6 +36,10 @@ listen_addr = "127.0.0.1:18232"
 # The e2e script calls RPC directly over loopback.
 enable_cookie_auth = false
 
+[rpc.transaction_submission]
+# Host networking requires a distinct submission port for every node.
+listen_addr = "127.0.0.1:18237"
+
 [metrics]
 endpoint_addr = "127.0.0.1:19001"
 

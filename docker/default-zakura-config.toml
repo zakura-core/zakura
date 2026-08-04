@@ -42,6 +42,22 @@ cookie_dir = "/home/zebra/.cache/zakura"
 
 # enable_cookie_auth = true
 
+[rpc.transaction_submission]
+# This public listener is enabled by default and exposes only
+# `sendrawtransaction` plus a liveness check at `/healthz`.
+#
+# enabled = true
+# listen_addr = "[::]:8237" # Mainnet; use [::]:18237 for Testnet
+# requests_per_second = 10
+# request_burst = 20
+# requests_per_minute_per_ip = 60
+# request_burst_per_ip = 4
+# max_in_flight = 16
+# max_in_flight_per_ip = 4
+# max_connections = 100
+# max_connections_per_ip = 20
+# trusted_proxies = ["127.0.0.1/32"]
+
 [state]
 cache_dir = "/home/zebra/.cache/zakura"
 

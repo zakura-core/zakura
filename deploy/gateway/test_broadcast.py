@@ -30,10 +30,25 @@ def make_fake_backend_handler(
     responses: dict[str, tuple[int, dict[str, Any]]],
 ) -> type[BaseHTTPRequestHandler]:
     class FakeBackendHandler(BaseHTTPRequestHandler):
+        forwarded_for_values: list[str | None] = []
+        post_count = 0
+
         def log_message(self, fmt: str, *args: Any) -> None:
             return
 
+        def do_GET(self) -> None:
+            if self.path != "/healthz":
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "3")
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
         def do_POST(self) -> None:
+            type(self).post_count += 1
+            type(self).forwarded_for_values.append(self.headers.get("X-Forwarded-For"))
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length)
             payload = json.loads(raw.decode())
@@ -74,13 +89,13 @@ class LoadBackendsTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "backends.toml"
             path.write_text(
-                '[[backends]]\nname = "a"\nurl = "http://127.0.0.1:8232/"\n',
+                '[[backends]]\nname = "a"\nurl = "http://127.0.0.1:8237/"\n',
                 encoding="utf-8",
             )
             backends = gateway.load_backends(path)
             self.assertEqual(
                 backends,
-                [gateway.Backend(name="a", url="http://127.0.0.1:8232/")],
+                [gateway.Backend(name="a", url="http://127.0.0.1:8237/")],
             )
 
 
@@ -113,23 +128,13 @@ class InflightLimiterTest(unittest.TestCase):
 
 
 class BackendPoolTest(unittest.TestCase):
-    def test_fails_over_from_unreachable_backend(self) -> None:
+    def test_does_not_retry_an_ambiguous_backend_failure(self) -> None:
         good_payload = {
             "jsonrpc": "2.0",
             "id": 1,
             "result": "abcd" * 16,
         }
-        health_ok = {
-            "jsonrpc": "2.0",
-            "id": "health",
-            "result": {"blocks": 1},
-        }
-        server_good, url_good = start_fake_backend(
-            {
-                "getblockchaininfo": (200, health_ok),
-                "sendrawtransaction": (200, good_payload),
-            }
-        )
+        server_good, url_good = start_fake_backend({"sendrawtransaction": (200, good_payload)})
         try:
             pool = gateway.BackendPool(
                 [
@@ -140,7 +145,7 @@ class BackendPoolTest(unittest.TestCase):
                 timeout=1.0,
                 health_interval=60.0,
             )
-            # Pretend both were healthy so forward() still tries bad first.
+            # Pretend both are healthy so the unreachable backend is selected.
             with pool.lock:
                 pool.healthy = {"bad": True, "good": True}
                 pool.next_index = 0
@@ -150,32 +155,76 @@ class BackendPoolTest(unittest.TestCase):
                     "id": 1,
                     "method": "sendrawtransaction",
                     "params": ["00"],
-                }
+                },
+                "203.0.113.9",
             )
-            self.assertEqual(status, 200)
-            self.assertEqual(name, "good")
-            self.assertEqual(json.loads(body)["result"], "abcd" * 16)
+            self.assertEqual(status, 502)
+            self.assertEqual(name, "")
+            self.assertEqual(json.loads(body)["error"]["code"], -32000)
+            self.assertEqual(server_good.RequestHandlerClass.post_count, 0)
         finally:
             server_good.shutdown()
+            server_good.server_close()
+
+    def test_forwards_the_sanitized_client_ip(self) -> None:
+        submit_ok = {"jsonrpc": "2.0", "id": 1, "result": "ab" * 32}
+        server, url = start_fake_backend({"sendrawtransaction": (200, submit_ok)})
+        try:
+            pool = gateway.BackendPool(
+                [gateway.Backend("local", url)],
+                timeout=1.0,
+                health_interval=60.0,
+            )
+            status, _, name = pool.forward(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "sendrawtransaction",
+                    "params": ["00"],
+                },
+                "203.0.113.9",
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(name, "local")
+            self.assertEqual(
+                server.RequestHandlerClass.forwarded_for_values,
+                ["203.0.113.9"],
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class ServerLoggingTest(unittest.TestCase):
+    def test_handler_errors_redact_client_details_and_tracebacks(self) -> None:
+        server = gateway.RedactingThreadingHTTPServer(
+            ("127.0.0.1", 0), gateway.SubmitHandler
+        )
+        try:
+            with self.assertLogs(gateway.LOGGER, level="DEBUG") as captured:
+                try:
+                    raise ConnectionResetError("attacker-controlled detail")
+                except ConnectionResetError:
+                    server.handle_error(object(), ("203.0.113.9", 12345))
+        finally:
+            server.server_close()
+
+        output = "\n".join(captured.output)
+        self.assertIn("ConnectionResetError", output)
+        self.assertNotIn("203.0.113.9", output)
+        self.assertNotIn("12345", output)
+        self.assertNotIn("attacker-controlled detail", output)
 
 
 class HandlerTest(unittest.TestCase):
     def setUp(self) -> None:
-        health_ok = {
-            "jsonrpc": "2.0",
-            "id": "health",
-            "result": {"blocks": 1},
-        }
         submit_ok = {
             "jsonrpc": "2.0",
             "id": 1,
             "result": "ab" * 32,
         }
         self.backend, backend_url = start_fake_backend(
-            {
-                "getblockchaininfo": (200, health_ok),
-                "sendrawtransaction": (200, submit_ok),
-            }
+            {"sendrawtransaction": (200, submit_ok)}
         )
         pool = gateway.BackendPool(
             [gateway.Backend("local", backend_url)],
@@ -188,15 +237,21 @@ class HandlerTest(unittest.TestCase):
         gateway.INFLIGHT_LIMITER = gateway.InflightLimiter()
         gateway.BODY_READ_TIMEOUT = gateway.DEFAULT_BODY_READ_TIMEOUT
         gateway.MAX_BODY_BYTES = 1024
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.SubmitHandler)
+        self.server = gateway.RedactingThreadingHTTPServer(
+            ("127.0.0.1", 0), gateway.SubmitHandler
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         host, port = self.server.server_address
+        self.host = host
+        self.port = port
         self.base = f"http://{host}:{port}"
 
     def tearDown(self) -> None:
         self.server.shutdown()
+        self.server.server_close()
         self.backend.shutdown()
+        self.backend.server_close()
         gateway.GATEWAY = None
 
     def _post(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -212,6 +267,15 @@ class HandlerTest(unittest.TestCase):
                 return int(resp.status), json.loads(resp.read().decode())
         except urllib.error.HTTPError as exc:
             return int(exc.code), json.loads(exc.read().decode())
+
+    def _raw_request(self, request: bytes) -> bytes:
+        with socket.create_connection((self.host, self.port), timeout=3) as sock:
+            sock.settimeout(3)
+            sock.sendall(request)
+            response = b""
+            while chunk := sock.recv(4096):
+                response += chunk
+            return response
 
     def test_allowlists_sendrawtransaction(self) -> None:
         status, body = self._post(
@@ -241,6 +305,33 @@ class HandlerTest(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/healthz", timeout=3) as resp:
             self.assertEqual(resp.status, 200)
             self.assertEqual(resp.read(), b"ok\n")
+
+    def test_rejections_with_unread_bodies_close_the_connection(self) -> None:
+        for headers, expected_status in (
+            ("Content-Type: text/plain\r\nContent-Length: 4", 415),
+            (
+                "Content-Type: application/json\r\n"
+                "Content-Encoding: gzip\r\nContent-Length: 4",
+                400,
+            ),
+        ):
+            with self.subTest(expected_status=expected_status):
+                response = self._raw_request(
+                    (
+                        "POST / HTTP/1.1\r\n"
+                        f"Host: {self.host}\r\n"
+                        f"{headers}\r\n\r\n"
+                        "junk"
+                        "GET /healthz HTTP/1.1\r\n"
+                        f"Host: {self.host}\r\n\r\n"
+                    ).encode()
+                )
+
+                self.assertTrue(
+                    response.startswith(f"HTTP/1.1 {expected_status} ".encode())
+                )
+                self.assertIn(b"Connection: close\r\n", response)
+                self.assertEqual(response.count(b"HTTP/1.1 "), 1)
 
 
 def wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
@@ -283,7 +374,9 @@ class SlowBodyTest(unittest.TestCase):
         gateway.INFLIGHT_LIMITER = gateway.InflightLimiter(total_limit=8, client_limit=2)
         gateway.BODY_READ_TIMEOUT = 30.0
         gateway.MAX_BODY_BYTES = 1024
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.SubmitHandler)
+        self.server = gateway.RedactingThreadingHTTPServer(
+            ("127.0.0.1", 0), gateway.SubmitHandler
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.host, self.port = self.server.server_address

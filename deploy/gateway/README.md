@@ -31,10 +31,16 @@ Submit-only JSON-RPC reverse proxy for Vizor and other clients that need
 | Auth | none |
 | Success | HTTP 2xx; `result` = 64-char hex txid |
 | Redirects | none (HTTP returns `400 HTTPS required`) |
-| Body logging | never |
+| Body or client IP logging | never |
 | Rate limit | 30 req/min/client IP |
+| Backend attempts | exactly one per submission; POSTs are never retried |
 | Concurrency | 64 in-flight requests total, 8 per client IP |
 | Read timeouts | headers 10 s, body 30 s (enforced by both Caddy and the gateway) |
+
+The gateway selects a healthy backend before forwarding. A timeout or
+connection failure is an ambiguous submission result, so it returns an error
+without failing over to another node. Backend liveness uses the submission
+listener's `GET /healthz` endpoint, not the full RPC interface.
 
 ### Mainnet
 

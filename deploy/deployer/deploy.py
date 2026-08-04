@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import ipaddress
 import os
 import shlex
 import shutil
@@ -59,6 +60,8 @@ DEFAULTS = {
     "network_cache_dir": "",
     "rpc_listen_addr": "",  # empty -> RPC stays disabled
     "rpc_enable_cookie_auth": None,
+    # Optional exact proxy networks for the public transaction submission listener.
+    "transaction_submission_trusted_proxies": None,
     "port": None,           # ssh port; None -> ssh default
     # Match zakurad's own defaults so existing fleets render unchanged.
     "storage_mode": "archive",
@@ -105,6 +108,7 @@ class Node:
     network_cache_dir: str
     rpc_listen_addr: str
     rpc_enable_cookie_auth: object
+    transaction_submission_trusted_proxies: list[str] | None
     storage_mode: str
     p2p_stack: str
     metrics_endpoint: str
@@ -165,6 +169,43 @@ def normalize_p2p_stack(value: object, *, where: str) -> str:
             f"expected one of: default, legacy, zakura, dual"
         )
     return stack
+
+
+def normalize_trusted_proxies(value: object, *, where: str) -> list[str] | None:
+    """Validate exact transaction submission proxy networks."""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise DeployError(
+            f"{where}: transaction_submission_trusted_proxies must be a list"
+        )
+    if len(value) > 256:
+        raise DeployError(
+            f"{where}: transaction_submission_trusted_proxies must not contain "
+            "more than 256 networks"
+        )
+
+    networks = []
+    for item in value:
+        if not isinstance(item, str):
+            raise DeployError(
+                f"{where}: transaction_submission_trusted_proxies entries "
+                "must be CIDR strings"
+            )
+        try:
+            network = ipaddress.ip_network(item, strict=True)
+        except ValueError as error:
+            raise DeployError(
+                f"{where}: invalid transaction submission trusted proxy {item!r}: {error}"
+            ) from error
+        if network.prefixlen == 0:
+            raise DeployError(
+                f"{where}: transaction_submission_trusted_proxies must not trust "
+                "every address"
+            )
+        networks.append(str(network))
+
+    return networks
 
 
 def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
@@ -229,6 +270,10 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             network_cache_dir=merged["network_cache_dir"],
             rpc_listen_addr=merged["rpc_listen_addr"],
             rpc_enable_cookie_auth=merged["rpc_enable_cookie_auth"],
+            transaction_submission_trusted_proxies=normalize_trusted_proxies(
+                merged["transaction_submission_trusted_proxies"],
+                where=f"[[nodes]] {name}",
+            ),
             storage_mode=merged["storage_mode"],
             p2p_stack=normalize_p2p_stack(
                 merged["p2p_stack"], where=f"[[nodes]] {name}"
@@ -459,6 +504,16 @@ def render_node_config(node: Node) -> str:
         rpc_block = "\n".join(rpc_lines)
     else:
         rpc_block = "# listen_addr disabled"
+    transaction_submission_block = ""
+    if node.transaction_submission_trusted_proxies is not None:
+        proxy_items = "".join(
+            f'    "{network}",\n'
+            for network in node.transaction_submission_trusted_proxies
+        )
+        transaction_submission_block = (
+            "\n[rpc.transaction_submission]\n"
+            f"trusted_proxies = [\n{proxy_items}]\n"
+        )
     metrics_block = f'[metrics]\nendpoint_addr = "{node.metrics_endpoint}"\n' if node.metrics_endpoint else ""
     filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zakurad default)"
     network_cache_line = (
@@ -480,6 +535,7 @@ def render_node_config(node: Node) -> str:
         "TRACING_FILTER": filter_line,
         "LOG_FILE": node.log_file,
         "RPC_BLOCK": rpc_block,
+        "TRANSACTION_SUBMISSION_BLOCK": transaction_submission_block,
         "CHECKPOINT_SYNC": "true" if node.checkpoint_sync else "false",
         "VCT_FAST_SYNC": "true" if node.vct_fast_sync else "false",
     })
@@ -699,8 +755,35 @@ set -euo pipefail
 BIN_PATH={bin_path}
 SERVICE={service}
 NO_RESTART={no_restart}
+CONFIGURE_TRUSTED_PROXIES={configure_trusted_proxies}
+TRUSTED_PROXIES={trusted_proxies}
+PROXY_DROP_IN_DIR="/etc/systemd/system/${{SERVICE}}.service.d"
+PROXY_DROP_IN="${{PROXY_DROP_IN_DIR}}/transaction-submission.conf"
+PROXY_DROP_IN_BACKUP="${{PROXY_DROP_IN}}.bak"
 
 mkdir -p "$(dirname "$BIN_PATH")"
+
+if [ "$CONFIGURE_TRUSTED_PROXIES" = "1" ]; then
+    mkdir -p "$PROXY_DROP_IN_DIR"
+    if [ -f "$PROXY_DROP_IN" ]; then
+        cp -a "$PROXY_DROP_IN" "$PROXY_DROP_IN_BACKUP"
+    else
+        rm -f "$PROXY_DROP_IN_BACKUP"
+    fi
+
+    if [ -n "$TRUSTED_PROXIES" ]; then
+        {{
+            printf '%s\n' '[Service]'
+            printf 'Environment="ZAKURA_RPC__TRANSACTION_SUBMISSION__TRUSTED_PROXIES=%s"\n' \
+                "$TRUSTED_PROXIES"
+        }} > "${{PROXY_DROP_IN}}.new"
+        chmod 644 "${{PROXY_DROP_IN}}.new"
+        mv -f "${{PROXY_DROP_IN}}.new" "$PROXY_DROP_IN"
+    else
+        rm -f "$PROXY_DROP_IN"
+    fi
+    systemctl daemon-reload
+fi
 
 if [ -x "$BIN_PATH" ]; then
     cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
@@ -725,8 +808,21 @@ restart_service() {{
     systemctl is-active --quiet "$SERVICE"
 }}
 
+restore_trusted_proxy_drop_in() {{
+    if [ "$CONFIGURE_TRUSTED_PROXIES" != "1" ]; then
+        return
+    fi
+    if [ -f "$PROXY_DROP_IN_BACKUP" ]; then
+        mv -f "$PROXY_DROP_IN_BACKUP" "$PROXY_DROP_IN"
+    else
+        rm -f "$PROXY_DROP_IN"
+    fi
+    systemctl daemon-reload
+}}
+
 if ! restart_service; then
     echo "service unhealthy after deploy; rolling back to ${{BIN_PATH}}.bak" >&2
+    restore_trusted_proxy_drop_in
     if [ -x "${{BIN_PATH}}.bak" ]; then
         install -m 755 "${{BIN_PATH}}.bak" "$BIN_PATH"
         restart_service || true
@@ -835,6 +931,26 @@ def cmd_deploy(args) -> int:
                     )
                 if node.deploy_kind == "docker" and not node.container_name:
                     return (node.name, False, "docker deploy requires container_name")
+                if (
+                    node.deploy_kind == "docker"
+                    and node.transaction_submission_trusted_proxies is not None
+                ):
+                    return (
+                        node.name,
+                        False,
+                        "transaction_submission_trusted_proxies is not supported "
+                        "for binary-only Docker deploys",
+                    )
+                if (
+                    node.deploy_kind == "systemd"
+                    and node.transaction_submission_trusted_proxies == []
+                ):
+                    return (
+                        node.name,
+                        False,
+                        "transaction_submission_trusted_proxies must be non-empty "
+                        "for binary-only systemd deploys",
+                    )
                 run(node.scp_to(str(binary), "/tmp/zakurad-deploy.new"), capture=True)
                 if node.deploy_kind == "docker":
                     script = DOCKER_BINARY_ONLY_INSTALL_SCRIPT.format(
@@ -847,6 +963,14 @@ def cmd_deploy(args) -> int:
                         bin_path=shlex.quote(node.bin_path),
                         service=shlex.quote(node.service_name),
                         no_restart="1" if args.no_restart else "0",
+                        configure_trusted_proxies=(
+                            "1"
+                            if node.transaction_submission_trusted_proxies is not None
+                            else "0"
+                        ),
+                        trusted_proxies=shlex.quote(
+                            ",".join(node.transaction_submission_trusted_proxies or [])
+                        ),
                     )
                 proc = ssh_with_stdin(node, script)
                 if proc.returncode != 0:

@@ -47,8 +47,10 @@ futures = { workspace = true }
 jsonrpsee = { workspace = true, features = ["server"] }
 jsonrpsee-types = { workspace = true }
 jsonrpsee-proc-macros = { workspace = true }
-hyper = { workspace = true }
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["server", "service", "tokio"] }
 http-body-util = { workspace = true }
+ipnet = { workspace = true, features = ["serde"] }
 semver = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 serde_with = { workspace = true, features = ["hex"] }

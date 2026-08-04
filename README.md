@@ -27,6 +27,9 @@ Zakura is forked from [Zebra](https://github.com/ZcashFoundation/zebra). This fi
 - [zcashd compatibility](docs/zcashd-compat.md): A compatibility mode
   reproduces the legacy zcashd RPC interface, so existing wallets and
   integrations keep working.
+- [Public transaction submission](docs/transaction-submission.md): A
+  default-on, resource-bounded endpoint accepts signed transactions without
+  exposing the full RPC interface.
 - Experimental P2P v2: We are building a new P2P transport layer for Zakura nodes, currently off by default on Mainnet. The goals are sub-500ms worst-case block propagation, mempool aggregation (used in Tachyon), sync at the speed of your bandwidth, and a future-proofed gossip protocol. The v2 stack has known DoS risks and is not yet production-hardened.
 
 ## Getting Started
@@ -57,13 +60,15 @@ This command will run our latest release and sync it to the tip:
 docker run -d \
   --name zakura \
   -p 8233:8233 \
+  -p 8237:8237 \
   -v zakurad-cache:/home/zakura/.cache/zakura \
   zakuracore/zakura:latest
 ```
 
-The `-p 8233:8233` flag exposes the P2P port so other Zcash nodes can connect to
-yours, and `-v` persists the chain state across restarts (use port `18233` for
-Testnet). For more information, see the image's
+The `-p 8233:8233` flag exposes the P2P port and `-p 8237:8237` exposes only
+public transaction submission. The `-v` flag persists the chain state across
+restarts. Use ports `18233` and `18237` for Testnet. For more information, see
+the image's
 [Docker Hub page](https://hub.docker.com/r/zakuracore/zakura).
 
 ### Manual Install

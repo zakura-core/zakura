@@ -15,6 +15,9 @@ network         = "Mainnet"
 listen_addr     = "[::]:8233"
 # identity_dir  = "/root/.zakura"           # empty = zakurad default; pins the iroh node_id
 rpc_listen_addr = ""                        # empty = RPC disabled; e.g. "0.0.0.0:8232"
+# Exact reverse proxy networks allowed to supply X-Forwarded-For on the
+# transaction submission listener. Leave unset when there is no trusted proxy.
+# transaction_submission_trusted_proxies = ["192.0.2.10/32"]
 storage_mode    = "archive"                 # "archive" serves all history; "pruned" does not
 p2p_stack       = "dual"                     # legacy | zakura | dual | default
 # port          = 22                        # optional non-default ssh port

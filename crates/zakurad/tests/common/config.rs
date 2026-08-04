@@ -65,7 +65,7 @@ pub fn default_test_config(net: &Network) -> ZakuradConfig {
     let mut state = zakura_state::Config::ephemeral();
     state.debug_validity_check_interval = Some(DATABASE_FORMAT_CHECK_INTERVAL);
 
-    ZakuradConfig {
+    let mut config = ZakuradConfig {
         network,
         state,
         sync,
@@ -74,7 +74,10 @@ pub fn default_test_config(net: &Network) -> ZakuradConfig {
         tracing,
         ..ZakuradConfig::default()
     }
-    .with(MinerAddressType::Transparent)
+    .with(MinerAddressType::Transparent);
+    config.rpc.transaction_submission.listen_addr =
+        Some("127.0.0.1:0".parse().expect("valid test listen address"));
+    config
 }
 
 pub fn persistent_test_config(network: &Network) -> Result<ZakuradConfig> {

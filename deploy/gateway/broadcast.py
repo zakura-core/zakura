@@ -2,8 +2,9 @@
 """Public Zakura JSON-RPC broadcast gateway.
 
 Accepts only `sendrawtransaction`, rate-limits by client IP, caps concurrent
-requests globally and per client, bounds body-read time, and load-balances
-across healthy Zakura backends. Request bodies are never logged.
+requests globally and per client, bounds body-read time, and selects exactly
+one healthy Zakura backend per request. Submissions are never retried, and
+request bodies and client IPs are never logged.
 
 Only the Python stdlib is used.
 """
@@ -14,6 +15,7 @@ import argparse
 import ipaddress
 import json
 import logging
+import sys
 import threading
 import time
 import tomllib
@@ -31,17 +33,26 @@ ALLOWED_METHOD = "sendrawtransaction"
 DEFAULT_RATE_LIMIT = 30
 DEFAULT_RATE_WINDOW = 60.0
 DEFAULT_RATE_CLIENT_LIMIT = 4_096
-DEFAULT_MAX_BODY_BYTES = 1 * 1024 * 1024
+DEFAULT_MAX_BODY_BYTES = 504_096
 DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024
-DEFAULT_BACKEND_TIMEOUT = 10.0
+DEFAULT_BACKEND_TIMEOUT = 100.0
 DEFAULT_HEALTH_INTERVAL = 15.0
+DEFAULT_HEALTH_TIMEOUT = 3.0
 DEFAULT_SOCKET_TIMEOUT = 30.0
 DEFAULT_BODY_READ_TIMEOUT = 30.0
 DEFAULT_MAX_INFLIGHT_TOTAL = 64
 DEFAULT_MAX_INFLIGHT_PER_CLIENT = 8
-HEALTH_METHOD = "getblockchaininfo"
 
 LOGGER = logging.getLogger("zakura-broadcast-gateway")
+
+
+class RedactingThreadingHTTPServer(ThreadingHTTPServer):
+    """Suppress client addresses and tracebacks from handler error logs."""
+
+    def handle_error(self, _request: Any, _client_address: Any) -> None:
+        error_type = sys.exc_info()[0]
+        error_name = error_type.__name__ if error_type is not None else "unknown"
+        LOGGER.debug("request handler failed error=%s", error_name)
 
 
 @dataclass(frozen=True)
@@ -139,6 +150,7 @@ class BackendPool:
         *,
         timeout: float = DEFAULT_BACKEND_TIMEOUT,
         health_interval: float = DEFAULT_HEALTH_INTERVAL,
+        health_timeout: float = DEFAULT_HEALTH_TIMEOUT,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ):
         if not backends:
@@ -146,6 +158,7 @@ class BackendPool:
         self.backends = backends
         self.timeout = timeout
         self.health_interval = health_interval
+        self.health_timeout = health_timeout
         self.max_response_bytes = max_response_bytes
         self.lock = threading.Lock()
         self.next_index = 0
@@ -188,23 +201,17 @@ class BackendPool:
                 )
 
     def _probe(self, backend: Backend) -> bool:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": "health",
-            "method": HEALTH_METHOD,
-            "params": [],
-        }
+        request = urllib.request.Request(
+            urllib.parse.urljoin(backend.url, "healthz"),
+            method="GET",
+            headers={"User-Agent": "zakura-broadcast-gateway/1.0"},
+        )
         try:
-            status, body = self._post(backend, payload)
-        except Exception:
+            with urllib.request.urlopen(request, timeout=self.health_timeout) as response:
+                body = response.read(16)
+                return int(response.status) == 200 and body == b"ok\n"
+        except (OSError, urllib.error.URLError):
             return False
-        if status != 200:
-            return False
-        try:
-            decoded = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return False
-        return isinstance(decoded, dict) and "result" in decoded and "error" not in decoded
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -222,55 +229,68 @@ class BackendPool:
                 ),
             }
 
-    def _ordered_candidates(self) -> list[Backend]:
+    def _select_backend(self) -> Backend | None:
         with self.lock:
             start = self.next_index % len(self.backends)
             self.next_index = (start + 1) % len(self.backends)
             ordered = self.backends[start:] + self.backends[:start]
-            healthy = [b for b in ordered if self.healthy.get(b.name, False)]
-            if healthy:
-                return healthy
-            # All marked unhealthy: still try everyone once so the gateway can recover.
-            return ordered
+            return next(
+                (backend for backend in ordered if self.healthy.get(backend.name, False)),
+                None,
+            )
 
     def mark_unhealthy(self, backend: Backend) -> None:
         with self.lock:
             self.healthy[backend.name] = False
 
-    def forward(self, payload: dict[str, Any]) -> tuple[int, bytes, str]:
-        errors: list[str] = []
-        for backend in self._ordered_candidates():
-            try:
-                status, body = self._post(backend, payload)
-            except Exception as exc:
-                self.mark_unhealthy(backend)
-                errors.append(f"{backend.name}: {exc}")
-                LOGGER.warning(
-                    "backend request failed name=%s error=%s",
-                    backend.name,
-                    type(exc).__name__,
-                )
-                continue
-            if status >= 500:
-                self.mark_unhealthy(backend)
-                errors.append(f"{backend.name}: HTTP {status}")
-                continue
-            return status, body, backend.name
-        detail = "; ".join(errors) if errors else "no backends available"
+    def forward(
+        self,
+        payload: dict[str, Any],
+        client_ip: str,
+    ) -> tuple[int, bytes, str]:
+        backend = self._select_backend()
+        if backend is None:
+            return self._unavailable_response(payload, "No healthy submit backend")
+
+        try:
+            status, body = self._post(backend, payload, client_ip)
+        except Exception as exc:
+            self.mark_unhealthy(backend)
+            LOGGER.warning(
+                "backend request failed name=%s error=%s",
+                backend.name,
+                type(exc).__name__,
+            )
+            return self._unavailable_response(payload, "Submit backend unavailable")
+
+        if status >= 500:
+            self.mark_unhealthy(backend)
+        return status, body, backend.name
+
+    @staticmethod
+    def _unavailable_response(
+        payload: dict[str, Any],
+        message: str,
+    ) -> tuple[int, bytes, str]:
         body = json.dumps(
             {
                 "jsonrpc": "2.0",
                 "id": payload.get("id"),
                 "error": {
                     "code": -32000,
-                    "message": f"All submit backends unavailable: {detail}",
+                    "message": message,
                 },
             },
             separators=(",", ":"),
         ).encode()
         return 502, body, ""
 
-    def _post(self, backend: Backend, payload: dict[str, Any]) -> tuple[int, bytes]:
+    def _post(
+        self,
+        backend: Backend,
+        payload: dict[str, Any],
+        client_ip: str,
+    ) -> tuple[int, bytes]:
         data = json.dumps(payload, separators=(",", ":")).encode()
         request = urllib.request.Request(
             backend.url,
@@ -280,6 +300,7 @@ class BackendPool:
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "User-Agent": "zakura-broadcast-gateway/1.0",
+                "X-Forwarded-For": client_ip,
             },
         )
         try:
@@ -345,8 +366,8 @@ class SubmitHandler(BaseHTTPRequestHandler):
     timeout = DEFAULT_SOCKET_TIMEOUT
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        # Replace BaseHTTPRequestHandler's stderr logger; never include bodies.
-        LOGGER.info("http client=%s %s", self.rate_limit_client(), fmt % args)
+        # The default logger includes the client IP and unsanitized request target.
+        return
 
     def rate_limit_client(self) -> str:
         peer = self.client_address[0]
@@ -438,13 +459,32 @@ class SubmitHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path not in {"", "/"}:
+        if parsed.path not in {"", "/"} or parsed.query:
             # The body was not read; close so leftover bytes cannot desync
             # a reused keep-alive connection.
             return self.send_bytes(
                 404,
                 b"not found\n",
                 "text/plain; charset=utf-8",
+                {"Connection": "close"},
+            )
+
+        if self.headers.get("Transfer-Encoding") or self.headers.get("Content-Encoding"):
+            body = jsonrpc_error(None, -32600, "Encoded request bodies are not supported")
+            return self.send_bytes(
+                400,
+                body,
+                "application/json; charset=utf-8",
+                {"Connection": "close"},
+            )
+
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            body = jsonrpc_error(None, -32600, "Content-Type must be application/json")
+            return self.send_bytes(
+                415,
+                body,
+                "application/json; charset=utf-8",
                 {"Connection": "close"},
             )
 
@@ -527,11 +567,6 @@ class SubmitHandler(BaseHTTPRequestHandler):
         req_id = payload.get("id")
         method = payload.get("method")
         if method != ALLOWED_METHOD:
-            LOGGER.info(
-                "rejected method client=%s method=%r",
-                client,
-                method if isinstance(method, str) else type(method).__name__,
-            )
             body = jsonrpc_error(req_id, -32601, "Method not allowed")
             return self.send_bytes(200, body, "application/json; charset=utf-8")
 
@@ -546,11 +581,10 @@ class SubmitHandler(BaseHTTPRequestHandler):
 
         assert GATEWAY is not None
         started = time.monotonic()
-        status, body, backend_name = GATEWAY.forward(payload)
+        status, body, backend_name = GATEWAY.forward(payload, client)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         LOGGER.info(
-            "submit client=%s backend=%s status=%s bytes=%s elapsed_ms=%s",
-            client,
+            "submit backend=%s status=%s bytes=%s elapsed_ms=%s",
             backend_name or "-",
             status,
             len(body),
@@ -613,7 +647,7 @@ def main() -> None:
     )
     GATEWAY.start()
 
-    server = ThreadingHTTPServer((args.host, args.port), SubmitHandler)
+    server = RedactingThreadingHTTPServer((args.host, args.port), SubmitHandler)
     LOGGER.info(
         "listening on http://%s:%s backends=%s rate=%s/%ss inflight=%s/%s body_timeout=%ss",
         args.host,

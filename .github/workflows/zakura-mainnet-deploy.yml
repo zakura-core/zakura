@@ -12,10 +12,11 @@ name: Deploy Zakura mainnet fleet
 # per-node configs (external_addr, an inline zakura_node_secret_key that pins
 # each node's iroh identity, custom peers, and mempool/sync tuning) and their
 # state DB at /root/.cache/zebra. To avoid changing node identities or resyncing,
-# this deploy sets manage_config = false: it only swaps /usr/local/bin/zakurad and
-# restarts the existing `zakurad` service, leaving the config, unit, and cache
-# untouched. Rebuilding those configs into the deployer's managed model is
-# separate future work.
+# this deploy sets manage_config = false: it swaps /usr/local/bin/zakurad and
+# restarts the existing `zakurad` service, leaving the hand-tuned config, primary
+# unit, and cache untouched. An explicit trusted-proxy list is installed as a
+# systemd drop-in for gateway backends. Rebuilding the full configs into the
+# deployer's managed model is separate future work.
 #
 # After PR #21, hand configs should use network.p2p_stack (legacy|zakura|dual|
 # default) rather than the deprecated v2_p2p/legacy_p2p bools. This workflow does
@@ -35,7 +36,7 @@ on:
         required: false
         default: false
       no_restart:
-        description: "Stage the binary without restarting the node"
+        description: "Stage the binary and trusted-proxy override without restarting"
         type: boolean
         required: false
         default: false
@@ -194,21 +195,25 @@ jobs:
           name       = "us-0"
           ssh_string = "root@104.131.184.123"
           commit     = "${{ inputs.ref }}"
+          transaction_submission_trusted_proxies = ["159.65.183.89/32"]
 
           [[nodes]]
           name       = "us-east-0"
           ssh_string = "root@159.65.183.89"
           commit     = "${{ inputs.ref }}"
+          transaction_submission_trusted_proxies = ["127.0.0.1/32"]
 
           [[nodes]]
           name       = "us-west-0"
           ssh_string = "root@143.244.184.176"
           commit     = "${{ inputs.ref }}"
+          transaction_submission_trusted_proxies = ["159.65.183.89/32"]
 
           [[nodes]]
           name       = "canada-0"
           ssh_string = "root@159.203.38.10"
           commit     = "${{ inputs.ref }}"
+          transaction_submission_trusted_proxies = ["159.65.183.89/32"]
 
           [[nodes]]
           name       = "europe-west-0"
@@ -387,7 +392,8 @@ jobs:
           sudo systemctl --no-pager --full status zakura-mainnet-dashboard.service || true
 
       - name: Install public broadcast gateway
-        if: always()
+        # Switch the fleet gateway only after every backend is running the new listener.
+        if: ${{ success() && !inputs.no_restart && inputs.node == '' }}
         run: |
           set -euo pipefail
 

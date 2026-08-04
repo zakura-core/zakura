@@ -59,9 +59,13 @@ exclusion with a reason:
 This PR only changes tests and has no operator-visible effect.
 ```
 
-Dependabot and release PRs are automated exceptions to the one-file check. The
-`C-exclude-from-changelog` label remains useful release metadata, but does not
-replace the explicit fragment for Rust or `Cargo.toml` PRs.
+Dependabot, release PRs, and automated release-state updates are automated
+exceptions to the one-file check. Release-state PRs (the Mainnet checkpoint and
+VCT frontier refresh) carry `A-release-state`: their only Rust change is the
+generated end-of-support floor, and unlike the release PR they do not consume
+the pending fragments. The `C-exclude-from-changelog` label remains useful
+release metadata, but does not replace the explicit fragment for Rust or
+`Cargo.toml` PRs.
 
 Run `./scripts/changelog.py check` locally. CI validates the syntax and checks
 that the fragment filename matches the PR number. The concise format reference

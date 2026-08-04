@@ -30,11 +30,19 @@ jobs:
       - name: Validate this pull request's fragment
         if: github.event_name == 'pull_request'
         env:
-          ALLOW_MISSING: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
+          # Release-state PRs come from `Update Mainnet release state`. They carry `A-release`
+          # for the release CI paths, but they are not the release PR that consumes the pending
+          # fragments, and their only Rust change is the generated end-of-support floor. Treat
+          # them like Dependabot: exempt from the one-fragment rule, and not a release PR.
+          ALLOW_MISSING: >-
+            ${{ github.event.pull_request.user.login == 'dependabot[bot]'
+                || contains(github.event.pull_request.labels.*.name, 'A-release-state') }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          RELEASE_PR: ${{ contains(github.event.pull_request.labels.*.name, 'A-release') }}
+          RELEASE_PR: >-
+            ${{ contains(github.event.pull_request.labels.*.name, 'A-release')
+                && !contains(github.event.pull_request.labels.*.name, 'A-release-state') }}
         run: |
           args=(
             check-pr

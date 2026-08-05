@@ -115,7 +115,7 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.0.5 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.1.0 zakura
 ```
 
 You can start Zakura by running

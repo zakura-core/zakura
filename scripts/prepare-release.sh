@@ -46,6 +46,8 @@ cd "$repo_root"
 # The library is linted as a standalone shellcheck input in lint.yml.
 # shellcheck source=scripts/lib/crates-index.sh disable=SC1091
 . "${repo_root}/scripts/lib/crates-index.sh"
+# shellcheck source=scripts/lib/release-packages.sh disable=SC1091
+. "${repo_root}/scripts/lib/release-packages.sh"
 
 release_tag=""
 base_tag=""
@@ -261,6 +263,21 @@ zakura_old="$(
   jq -r '.packages[] | select(.name == "zakura") | .version' <<<"$metadata"
 )"
 
+# Match base-tag packages by Cargo package name rather than their current
+# manifest path. Repository-only moves must not make existing published crates
+# look new to the release planner.
+declare -A base_manifest_by_crate=()
+declare -A base_version_by_crate=()
+while IFS=$'\t' read -r base_crate base_version base_manifest_rel; do
+  [ -n "$base_crate" ] || continue
+  if [ -n "${base_manifest_by_crate[$base_crate]:-}" ]; then
+    echo "ERROR: duplicate package '${base_crate}' at ${base_tag}." >&2
+    exit 1
+  fi
+  base_manifest_by_crate["$base_crate"]="$base_manifest_rel"
+  base_version_by_crate["$base_crate"]="$base_version"
+done < <(list_release_packages_at "$base_tag")
+
 base_zakura_version="$(
   # Transition fallback: tags created before the crates/ move keep
   # zakurad/Cargo.toml at the repo root; remove once a post-move tag exists.
@@ -349,8 +366,9 @@ if [ "$no_crates" = 0 ]; then
 
     manifest_rel="${manifest_path#"$repo_root"/}"
     crate_dir="$(dirname "$manifest_rel")"
+    base_manifest_rel="${base_manifest_by_crate[$crate]:-}"
 
-    if ! git cat-file -e "${base_tag}:${manifest_rel}" 2>/dev/null; then
+    if [ -z "$base_manifest_rel" ]; then
       if ! git diff --quiet "$base_tag" -- "$crate_dir"; then
         echo "NOTICE: ${crate} is new since ${base_tag}; choose its initial publish version manually." >&2
         add_crate_row "$crate" "" "$current_version" "" "manual" \
@@ -359,16 +377,14 @@ if [ "$no_crates" = 0 ]; then
       continue
     fi
 
-    if git diff --quiet "$base_tag" -- "$crate_dir"; then
+    base_crate_dir="$(dirname "$base_manifest_rel")"
+    if git diff --quiet "$base_tag" -- "$base_crate_dir" "$crate_dir"; then
       continue
     fi
 
     # Assumes [package] has a literal version before any other version key;
     # manifests using version.workspace = true would need different parsing.
-    base_version="$(
-      git show "${base_tag}:${manifest_rel}" \
-        | awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }'
-    )"
+    base_version="${base_version_by_crate[$crate]:-}"
     if [ -z "$base_version" ]; then
       echo "ERROR: could not read ${crate}'s package version at ${base_tag}." >&2
       exit 1

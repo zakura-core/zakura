@@ -63,5 +63,7 @@ jobs:
         run: ./scripts/changelog.py check
 
       - name: Run scripts/tests unit tests
-        # covers the changelog tool and the bench digest helper (both stdlib-only)
-        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+        # These tests use only Python's stdlib and standard shell/git tools.
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+          bash scripts/tests/test_release_packages.sh

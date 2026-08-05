@@ -511,6 +511,7 @@ fn synthetic_headers(state: &ZakuraDb, count: u32) -> Vec<Arc<block::Header>> {
                 &network,
                 context.iter().copied(),
             )
+            .expect("the test database retains the complete difficulty context")
             .expected_difficulty_threshold();
 
             let mut header = *template.header;

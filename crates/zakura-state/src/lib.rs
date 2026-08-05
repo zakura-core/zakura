@@ -25,6 +25,7 @@ extern crate tracing;
 pub mod config;
 // Most constants are exported by default
 pub mod constants;
+mod header_chain;
 
 // Allow use in external tests
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -48,15 +49,16 @@ pub use constants::{
     MAX_BLOCK_REORG_HEIGHT,
 };
 pub use error::{
-    BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError, CommitHeaderRangeError,
+    BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
     CommitSemanticallyVerifiedError, DuplicateNullifierError, HistoricalSubtreeUnavailable,
     HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable, MissingSproutTipTree,
-    StateInitError, StoreIncoherentError, ValidateContextError,
+    StateInitError, ValidateContextError,
 };
+pub use header_chain::*;
 pub use request::{
-    AuthenticateHeaderRootsRequest, CheckpointVerifiedBlock,
-    CommitSemanticallyVerifiedBlockRequest, HashOrHeight, MappedRequest, ReadRequest, Request,
-    SemanticallyVerifiedBlock,
+    CheckpointVerifiedBlock, CommitSemanticallyVerifiedBlockRequest, HashOrHeight,
+    HeaderChainBodyEvidenceAuthority, MappedRequest, PreparedHeaderChainBodyEvidence,
+    PreparedHeaderChainInsert, ReadRequest, Request, SemanticallyVerifiedBlock,
 };
 
 #[cfg(feature = "indexer")]
@@ -66,11 +68,13 @@ pub use response::{
     AnyTx, GetBlockTemplateChainInfo, KnownBlock, MinedTx, NonFinalizedBlocksListener,
     ReadResponse, Response,
 };
+#[cfg(any(test, feature = "header-fuzz"))]
+pub use service::finalized_state::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub use service::{
     chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip, TipAction},
     check,
     finalized_state::FinalizedState,
-    init, init_read_only,
+    init, init_read_only, init_with_header_chain_body_evidence,
     non_finalized_state::NonFinalizedState,
     spawn_init_read_only,
     watch_receiver::WatchReceiver,
@@ -105,10 +109,7 @@ pub use service::read::{
     derive_historical_frontiers, DerivedFrontiers, HistoricalTreeCache, MAX_MEMOIZED_FRONTIERS,
 };
 pub use service::{
-    finalized_state::{
-        DiskWriteBatch, FromDisk, HighestCompletedCheckpoint, HighestCompletedCheckpointError,
-        IntoDisk, WriteDisk, ZakuraDb,
-    },
+    finalized_state::{DiskWriteBatch, FallibleDiskValue, FromDisk, IntoDisk, WriteDisk, ZakuraDb},
     ReadStateService, VctRootRepairState, VctRootRepairStatus,
 };
 

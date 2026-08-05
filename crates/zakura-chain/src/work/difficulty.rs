@@ -658,14 +658,6 @@ impl PartialOrd<ExpandedDifficulty> for block::Hash {
     }
 }
 
-impl std::ops::Add for Work {
-    type Output = PartialCumulativeWork;
-
-    fn add(self, rhs: Work) -> PartialCumulativeWork {
-        PartialCumulativeWork::from(self) + rhs
-    }
-}
-
 /// Partial work used to track relative work in non-finalized chains
 ///
 /// # Consensus
@@ -779,22 +771,6 @@ impl From<Work> for U256 {
 impl From<PartialCumulativeWork> for U256 {
     fn from(work: PartialCumulativeWork) -> Self {
         work.0
-    }
-}
-
-impl std::ops::Add<Work> for PartialCumulativeWork {
-    type Output = PartialCumulativeWork;
-
-    fn add(self, rhs: Work) -> Self::Output {
-        self.checked_add(rhs).expect(
-            "cumulative work fits in 256 bits under the chain-work representation invariant",
-        )
-    }
-}
-
-impl std::ops::AddAssign<Work> for PartialCumulativeWork {
-    fn add_assign(&mut self, rhs: Work) {
-        *self = *self + rhs;
     }
 }
 

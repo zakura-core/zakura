@@ -707,9 +707,13 @@ fn handoff_tree_is_only_expected_after_sync_reaches_handoff() {
     assert!(!is_syncing_below_last_checkpoint(None, handoff));
 }
 
-/// A missing subtree is transient while the finalized tip is still below the handoff.
+/// A missing subtree's availability is undecided while the finalized tip is below the handoff.
+///
+/// The node cannot tell a skipped subtree from one the chain has not reached until it has the
+/// pool's leaf count at the handoff, so the error must not advise a retry: every subtree that
+/// completed below the handoff is skipped, and this node never records it.
 #[tokio::test]
-async fn missing_subtree_while_syncing_reports_transient_reason() {
+async fn missing_subtree_before_handoff_reports_indeterminate_reason() {
     let _init_guard = zakura_test::init();
     let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
         .values()
@@ -734,8 +738,18 @@ async fn missing_subtree_while_syncing_reports_transient_reason() {
     )
     .expect_err("a subtree below an unreached handoff must fail closed");
 
-    assert_eq!(error.reason, HistoricalSubtreeUnavailableReason::Syncing);
-    assert!(error.to_string().contains("retry after sync advances"));
+    assert_eq!(
+        error.reason,
+        HistoricalSubtreeUnavailableReason::Indeterminate
+    );
+    assert!(error
+        .to_string()
+        .contains("cannot yet tell whether the subtree was skipped"));
+    assert!(
+        !error.to_string().contains("retry"),
+        "a subtree skipped below the handoff never arrives, so the error must not advise a \
+         retry, got: {error}"
+    );
 }
 
 /// A missing handoff tree is an error once the finalized tip has reached the handoff.

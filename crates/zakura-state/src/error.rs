@@ -100,16 +100,24 @@ pub struct HistoricalSubtreeUnavailable {
     /// The checkpoint handoff height `H`, below which no subtree roots were recorded.
     pub handoff: block::Height,
 
-    /// Whether the subtree can become available as this node continues syncing.
+    /// What this node knows about the subtree's availability.
     pub reason: HistoricalSubtreeUnavailableReason,
 }
 
 /// Why a requested historical subtree is currently unavailable.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum HistoricalSubtreeUnavailableReason {
-    /// The node has not reached the fast-sync checkpoint handoff yet.
-    #[error("this node is still syncing toward the checkpoint handoff; retry after sync advances")]
-    Syncing,
+    /// The node has not reached the fast-sync checkpoint handoff, so it cannot yet tell a
+    /// subtree the fast path skipped from one the chain has not reached.
+    ///
+    /// This is not a promise of recovery. Deciding between the two needs the pool's leaf count
+    /// at the handoff, which only exists once sync gets there; every subtree that completed
+    /// below the handoff is skipped, and turns into [`Self::NotStored`] rather than appearing.
+    #[error(
+        "this node has not reached the checkpoint handoff, so it cannot yet tell whether the \
+         subtree was skipped; subtrees completed below the handoff are never recorded"
+    )]
+    Indeterminate,
 
     /// The node has passed the handoff without recording the requested subtree.
     #[error(

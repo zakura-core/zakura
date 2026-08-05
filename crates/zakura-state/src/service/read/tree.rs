@@ -46,9 +46,14 @@ fn resolve_historical_tree<Tree: Default>(
         return Ok(tree);
     }
 
+    // An empty frontier is only an answer for a block this node has. Both arms resolve through an
+    // index column family (`height_by_hash` and `hash_by_height`), which pruning retains — it
+    // removes only the `tx_by_loc` bodies. Keep it that way: a body-backed probe such as
+    // `contains_body_at_height` would report every pruned block as absent, silently turning a
+    // pre-activation empty frontier back into a "missing tree" error in pruned storage mode.
     let Some(height) = (match hash_or_height {
         HashOrHeight::Hash(hash) => db.height(hash),
-        HashOrHeight::Height(height) => db.hash(height).map(|_| height),
+        HashOrHeight::Height(height) => db.contains_height(height).then_some(height),
     }) else {
         return Ok(None);
     };
@@ -136,7 +141,7 @@ fn check_historical_subtree_available(
             pool,
             index: first_missing,
             handoff,
-            reason: HistoricalSubtreeUnavailableReason::Syncing,
+            reason: HistoricalSubtreeUnavailableReason::Indeterminate,
         });
     }
 

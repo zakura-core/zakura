@@ -157,6 +157,10 @@ impl AuditHistoricalTreestatesCmd {
             for (index, pool) in &outcome.mismatched {
                 println!("    {pool} subtree {}", index.0);
             }
+            println!("  stored only: {}", outcome.stored_only.len());
+            for (index, pool) in &outcome.stored_only {
+                println!("    {pool} subtree {}", index.0);
+            }
 
             validate_subtree_verification(&outcome)?;
         }
@@ -309,20 +313,21 @@ fn sampled_heights(from: Height, to: Height, step: u32) -> Vec<Height> {
     heights
 }
 
-/// Rejects incomplete as well as contradictory subtree ground truth.
+/// Rejects incomplete as well as contradictory subtree ground truth in either direction.
 ///
 /// Every replay completion in the audited range is above the handoff, where the database is
-/// expected to store subtree rows. A missing row therefore prevents verification just like a
-/// mismatched row does.
+/// expected to store subtree rows, and every stored row in that range must correspond to a replay
+/// completion. Missing, mismatched, and stored-only rows all prevent verification.
 fn validate_subtree_verification(outcome: &SubtreeVerification) -> Result<()> {
-    if outcome.unstored == 0 && outcome.mismatched.is_empty() {
+    if outcome.unstored == 0 && outcome.mismatched.is_empty() && outcome.stored_only.is_empty() {
         Ok(())
     } else {
         Err(eyre!(
-            "replay could not be verified against stored subtree rows: {} missing and {} \
-             mismatched; generated subtree artifacts cannot be trusted",
+            "replay could not be verified against stored subtree rows: {} missing, {} mismatched, \
+             and {} stored-only; generated subtree artifacts cannot be trusted",
             outcome.unstored,
             outcome.mismatched.len(),
+            outcome.stored_only.len(),
         ))
     }
 }
@@ -485,6 +490,15 @@ mod tests {
         assert!(
             validate_subtree_verification(&mismatched).is_err(),
             "a replay completion that contradicts its stored row must fail the audit"
+        );
+
+        let stored_only = SubtreeVerification {
+            stored_only: vec![(NoteCommitmentSubtreeIndex(1), "orchard")],
+            ..Default::default()
+        };
+        assert!(
+            validate_subtree_verification(&stored_only).is_err(),
+            "a stored row without a replay completion must fail the audit"
         );
     }
 }

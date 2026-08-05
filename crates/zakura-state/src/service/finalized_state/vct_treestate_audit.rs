@@ -10,7 +10,10 @@
 //! Everything here is read-only, runs off the consensus path, and is safe against a quiesced
 //! database snapshot.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{Duration, Instant},
+};
 
 use zakura_chain::{block::Height, subtree::NoteCommitmentSubtreeIndex};
 
@@ -201,10 +204,17 @@ pub struct SubtreeVerification {
     /// Any entry makes verification incomplete: replay only covers the band above the last checkpoint,
     /// where every completed subtree is expected to have a stored row.
     pub unstored: usize,
+
+    /// Stored subtrees whose completion height is in the replay range, but which replay did not
+    /// produce.
+    ///
+    /// Any entry is an extra or stale database row and makes the comparison incomplete in the
+    /// storage-to-replay direction.
+    pub stored_only: Vec<(NoteCommitmentSubtreeIndex, &'static str)>,
 }
 
-/// Replays `(from, to]`, authenticates the final frontiers at `to`, and checks every subtree that
-/// completes against the root and completion height in the stored subtree rows.
+/// Replays `(from, to]`, authenticates the final frontiers at `to`, and compares replayed and
+/// stored subtrees in both directions over that range.
 ///
 /// This exists because subtree roots produced by replay are otherwise unvalidated: they are
 /// interior nodes, so the per-height root check does not test them directly. Above a fast-synced
@@ -239,32 +249,40 @@ pub fn verify_subtrees_against_stored(
     })?;
     verify_against_index(db, to, &frontiers)?;
 
+    let stored = db
+        .sapling_subtree_list_by_index_range(..)
+        .into_iter()
+        .map(|(index, data)| (("sapling", index), (data.root.to_bytes(), data.end_height)))
+        .chain(
+            db.orchard_subtree_list_by_index_range(..)
+                .into_iter()
+                .map(|(index, data)| (("orchard", index), (data.root.to_repr(), data.end_height))),
+        )
+        .chain(
+            db.ironwood_subtree_list_by_index_range(..)
+                .into_iter()
+                .map(|(index, data)| (("ironwood", index), (data.root.to_repr(), data.end_height))),
+        )
+        .collect();
+
+    Ok(compare_subtrees(completions, stored, from, to))
+}
+
+fn compare_subtrees(
+    completions: impl IntoIterator<Item = (ShieldedPool, CompletedSubtree)>,
+    stored: BTreeMap<(&'static str, NoteCommitmentSubtreeIndex), ([u8; 32], Height)>,
+    from: Height,
+    to: Height,
+) -> SubtreeVerification {
     let mut outcome = SubtreeVerification::default();
+    let mut replayed = BTreeSet::new();
 
     for (pool, completed) in completions {
-        let stored = match pool {
-            ShieldedPool::Sapling => db
-                .sapling_subtree_list_by_index_range(completed.index..=completed.index)
-                .get(&completed.index)
-                .map(|data| (data.root.to_bytes(), data.end_height)),
-            ShieldedPool::Orchard => db
-                .orchard_subtree_list_by_index_range(completed.index..=completed.index)
-                .get(&completed.index)
-                .map(|data| (data.root.to_repr(), data.end_height)),
-            ShieldedPool::Ironwood => db
-                .ironwood_subtree_list_by_index_range(completed.index..=completed.index)
-                .get(&completed.index)
-                .map(|data| (data.root.to_repr(), data.end_height)),
-        };
+        let pool_name = pool_name(pool);
+        replayed.insert((pool_name, completed.index));
 
-        let pool_name = match pool {
-            ShieldedPool::Sapling => "sapling",
-            ShieldedPool::Orchard => "orchard",
-            ShieldedPool::Ironwood => "ironwood",
-        };
-
-        match stored {
-            Some((root, end_height)) if stored_subtree_matches(root, end_height, &completed) => {
+        match stored.get(&(pool_name, completed.index)) {
+            Some((root, end_height)) if stored_subtree_matches(*root, *end_height, &completed) => {
                 outcome.matched += 1
             }
             Some(_) => outcome.mismatched.push((completed.index, pool_name)),
@@ -272,7 +290,23 @@ pub fn verify_subtrees_against_stored(
         }
     }
 
-    Ok(outcome)
+    outcome.stored_only = stored
+        .into_iter()
+        .filter_map(|((pool, index), (_, end_height))| {
+            (end_height > from && end_height <= to && !replayed.contains(&(pool, index)))
+                .then_some((index, pool))
+        })
+        .collect();
+
+    outcome
+}
+
+fn pool_name(pool: ShieldedPool) -> &'static str {
+    match pool {
+        ShieldedPool::Sapling => "sapling",
+        ShieldedPool::Orchard => "orchard",
+        ShieldedPool::Ironwood => "ironwood",
+    }
 }
 
 fn stored_subtree_matches(
@@ -385,5 +419,43 @@ mod tests {
             completed.end_height,
             &completed
         ));
+    }
+
+    #[test]
+    fn subtree_comparison_detects_stored_only_rows_in_range() {
+        let replayed = CompletedSubtree {
+            index: NoteCommitmentSubtreeIndex(3),
+            end_height: Height(100),
+            root: [7; 32],
+        };
+        let stored = [
+            (
+                ("sapling", replayed.index),
+                (replayed.root, replayed.end_height),
+            ),
+            (
+                ("sapling", NoteCommitmentSubtreeIndex(4)),
+                ([8; 32], Height(101)),
+            ),
+            (
+                ("orchard", NoteCommitmentSubtreeIndex(2)),
+                ([9; 32], Height(99)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let outcome = compare_subtrees(
+            [(ShieldedPool::Sapling, replayed)],
+            stored,
+            Height(99),
+            Height(101),
+        );
+
+        assert_eq!(outcome.matched, 1);
+        assert_eq!(
+            outcome.stored_only,
+            [(NoteCommitmentSubtreeIndex(4), "sapling")]
+        );
     }
 }

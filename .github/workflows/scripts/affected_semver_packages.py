@@ -8,6 +8,11 @@ import subprocess
 import sys
 
 
+# Remove this exclusion after the crate's first crates.io publish gives
+# cargo-semver-checks a stable baseline to compare.
+UNPUBLISHED_BASELINE_EXCLUSIONS = {"zakura-header-chain"}
+
+
 def is_publishable(package):
     publish = package.get("publish")
     return publish is None or bool(publish)
@@ -126,6 +131,7 @@ def affected_publishable_packages(metadata, changed_files=None, check_all=False)
         packages[package_id]["name"]
         for package_id in ordered
         if is_publishable(packages[package_id])
+        and packages[package_id]["name"] not in UNPUBLISHED_BASELINE_EXCLUSIONS
     ]
 
 

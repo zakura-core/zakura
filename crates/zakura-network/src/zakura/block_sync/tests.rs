@@ -639,6 +639,97 @@ fn block_liveness_uses_probe_cap_until_first_accepted_body() {
 }
 
 #[test]
+fn probe_cap_reopens_once_an_unproven_peers_probe_ends_without_a_body() {
+    // The probe-first cap bounds an unproven peer's *concurrent* cold-start burst,
+    // not its lifetime attempts. A probe that ends without a body — the short
+    // floor-rescue leash expiring, a request timeout, a `RangeUnavailable` — drains
+    // `outstanding`, and the peer must be free to probe again. Charging the streak
+    // cumulatively wedged it forever: nothing but an accepted body (which needs a
+    // request) or a destructive view reset cleared the charge.
+    let config = ZakuraBlockSyncConfig {
+        initial_block_probe_requests: 1,
+        max_requests_without_block_progress: 8,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let timeout = config.effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = DownloadWindow::new(&config);
+
+    assert!(!window.no_progress_at_cap(), "a fresh peer may probe");
+
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+    let armed = window.block_liveness_deadline;
+    assert_eq!(armed, Some(now + timeout));
+    assert!(
+        window.no_progress_at_cap(),
+        "the cold-start probe in flight holds the unproven peer at its cap",
+    );
+
+    // The probe ends with no body: every completion path removes it from
+    // `outstanding` without disarming block-progress liveness.
+    window.outstanding.clear();
+
+    assert!(
+        !window.no_progress_at_cap(),
+        "an unproven peer whose probe ended without a body must be able to probe again",
+    );
+    assert!(
+        !window.has_block_progress(),
+        "re-probing does not prove a peer"
+    );
+
+    // Re-probing must not buy the peer extra time: the deadline its first probe
+    // armed still stands, so a peer that serves nothing is parked on schedule.
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now + Duration::from_millis(1), timeout);
+    assert_eq!(
+        window.block_liveness_deadline, armed,
+        "a re-probe must not extend the block-liveness deadline",
+    );
+    assert_eq!(window.check_liveness(now + timeout), LivenessOutcome::Park);
+}
+
+#[test]
+fn proven_peer_no_progress_cap_stays_cumulative() {
+    // Reopening the gate is scoped to the unproven cold start. Once a peer has
+    // served a body it is charged cumulatively, so a long run of requests with no
+    // further accepted body still reaches the cap even as each request completes
+    // and drains `outstanding`.
+    let config = ZakuraBlockSyncConfig {
+        initial_block_probe_requests: 1,
+        max_requests_without_block_progress: 3,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let timeout = config.effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = DownloadWindow::new(&config);
+
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+    window.note_block_progress(now + Duration::from_millis(1), timeout);
+    window.outstanding.clear();
+    assert!(window.has_block_progress());
+
+    for request in 1..=3 {
+        assert!(
+            !window.no_progress_at_cap(),
+            "a proven peer may issue request {request} of 3",
+        );
+        window.outstanding.push(window_request(request + 1));
+        window.arm_liveness(now + Duration::from_millis(u64::from(request) + 1), timeout);
+        // Each request completes without an accepted body, draining `outstanding`.
+        window.outstanding.clear();
+    }
+
+    assert_eq!(window.requests_without_block_progress, 3);
+    assert!(
+        window.no_progress_at_cap(),
+        "a proven peer's no-progress streak is cumulative, not in-flight",
+    );
+}
+
+#[test]
 fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let now = Instant::now();
@@ -3447,6 +3538,109 @@ async fn remote_stream_eof_after_probe_timeout_still_parks_session() {
         !connection_cancel.is_cancelled(),
         "a first stream-EOF stall must preserve the shared transport connection",
     );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn unproven_peer_reprobes_after_its_probe_ends_without_a_body() {
+    // Regression for the single-carrier cold-start wedge: an unproven peer's one
+    // cold-start probe is a *floor* request, so it carries the short floor-rescue
+    // leash. When that leash expires the request is returned to the queue, but the
+    // probe charge used to stay spent — only an accepted body (which needs a
+    // request) or a destructive view reset cleared it. With one servable peer that
+    // wedged body sync until the liveness deadline parked the session and the
+    // no-progress cooldown elapsed: 30 s of `initial_block_probe_request_cap` fill
+    // stops with the whole range pending, then a 180 s park.
+    //
+    // The probe-first cap bounds an unproven peer's *concurrent* cold-start burst,
+    // not its lifetime attempts, so the peer must probe again once its probe ends.
+    let mut config = immediate_body_download_config();
+    // Short leashes so the probe expires quickly, while the liveness deadline
+    // (`request_timeout * 4` = 2 s) stays well beyond the re-probe asserted below:
+    // the re-probe must come from the fill loop, not from a park/re-admission.
+    config.request_timeout = Duration::from_millis(500);
+    config.floor_rescue_timeout = Duration::from_millis(100);
+
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    let peer = peer(0x61);
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    let connection_cancel = CancellationToken::new();
+    service.add_peer(Peer::new_with_direction(
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        connection_cancel.clone(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                tip_hash: block::Hash([1; 32]),
+                max_blocks_per_response: 1,
+                max_inflight_requests: 4,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+
+    tip_tx
+        .send((block::Height(1), block::Hash([1; 32])))
+        .expect("tip watch is live");
+    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+            height: block::Height(1),
+            hash: block::Hash([1; 32]),
+            size: BlockSizeEstimate::Advertised(1_000),
+        }]))
+        .await
+        .expect("needed metadata queues");
+
+    // The unproven peer gets exactly one cold-start probe for the floor height.
+    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(count, 1);
+
+    // Never answer it: the floor-rescue leash expires and the height returns to
+    // `pending`. The peer is still connected, still servable for height 1, and the
+    // budget and its request slots are free, so the floor gap must be re-requested
+    // well before the liveness deadline would park the session.
+    let (retry_start, retry_count) = tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_for_outbound_getblocks(&mut outbound_rx),
+    )
+    .await
+    .expect(
+        "an unproven peer whose probe ended without a body must probe the queued floor gap \
+         again instead of wedging at its one-probe cap until the no-progress park",
+    );
+    assert_eq!(retry_start, block::Height(1));
+    assert_eq!(retry_count, 1);
 
     reactor_task.abort();
 }

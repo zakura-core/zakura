@@ -331,7 +331,6 @@ async fn fuzz_silent_peer_request_cap() {
         max_requests_without_block_progress: request_cap,
         ..fuzz_config()
     };
-
     let mut silent = PeerSpec::with_serve(
         1,
         target(blocks),
@@ -359,9 +358,19 @@ async fn fuzz_silent_peer_request_cap() {
         "no-progress liveness is not a protocol reject",
     );
     assert_eq!(
-        report.max_unproven_requests_without_block_progress,
+        report.max_unproven_outstanding_requests,
         u64::from(probe_requests),
-        "the silent peer should receive exactly the configured initial probe budget",
+        "the silent peer must never hold more than the configured initial probe budget \
+         in flight — the probe-first cap bounds an unproven peer's cold-start burst",
+    );
+    // The silent peer re-probes serially as each probe ends unanswered — a peer whose
+    // probe is rescued at the short floor leash must not wedge until the park, which
+    // stalls a single-carrier node outright. Those attempts stay bounded because the
+    // block-progress liveness deadline its first probe armed is never extended by a
+    // re-probe, which is what `session_parks` above proves still lands on schedule.
+    assert!(
+        report.max_unproven_requests_without_block_progress >= u64::from(probe_requests),
+        "the silent peer must actually have been probed",
     );
 }
 

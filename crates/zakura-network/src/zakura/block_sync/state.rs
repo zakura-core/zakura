@@ -690,6 +690,34 @@ impl DownloadWindow {
         }
     }
 
+    /// Whether the no-progress gate currently withholds further work from this peer.
+    ///
+    /// A **proven** peer is charged cumulatively: it has served a body, so a long run
+    /// of requests with no further accepted body is the signal, and once it reaches
+    /// the cap the block-liveness deadline governs.
+    ///
+    /// An **unproven** peer is charged on its *in-flight* probes instead. The
+    /// probe-first cap exists so a peer that accepts requests but never serves bodies
+    /// cannot spend a full BBR cold-start burst — a bound on concurrency, not on
+    /// lifetime attempts. Charging it cumulatively wedged the peer permanently the
+    /// first time a probe ended without a body (a floor request rescued at the short
+    /// floor leash, a request timeout, or a `RangeUnavailable`), because only an
+    /// accepted body — which needs a request the peer may no longer issue — or a
+    /// destructive view reset clears the streak. With a single servable peer that
+    /// stalled body sync outright until the liveness park and its cooldown elapsed.
+    ///
+    /// A re-probe never buys extra time: [`arm_liveness`](Self::arm_liveness) only
+    /// arms `block_liveness_deadline` when it is unset, so a peer that truly serves
+    /// nothing is still parked on the schedule its first probe started.
+    pub(super) fn no_progress_at_cap(&self) -> bool {
+        let charged = if self.has_block_progress() {
+            self.requests_without_block_progress
+        } else {
+            u32::try_from(self.outstanding.len()).unwrap_or(u32::MAX)
+        };
+        charged >= self.no_progress_request_cap()
+    }
+
     pub(super) fn arm_liveness(&mut self, now: Instant, timeout: Duration) {
         self.last_request_at = Some(now);
         self.requests_without_block_progress =

@@ -713,8 +713,7 @@ impl PeerRoutine {
             if !self.received_status {
                 break FillStop::NoStatus;
             }
-            if self.window.requests_without_block_progress >= self.window.no_progress_request_cap()
-            {
+            if self.window.no_progress_at_cap() {
                 break if self.window.has_block_progress() {
                     FillStop::NoBlockProgressRequestCap
                 } else {

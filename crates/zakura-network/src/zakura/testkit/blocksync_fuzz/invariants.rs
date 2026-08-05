@@ -232,28 +232,26 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
 }
 
 fn max_unproven_requests_without_block_progress(reader: &TraceReader) -> u64 {
-    reader
-        .table("block_sync")
-        .rows()
-        .into_iter()
-        .filter(|row| event(row) == Some("block_get_blocks_sent"))
-        .filter(|row| u64_field(row, "block_progress_proven") == Some(0))
-        .filter_map(|row| u64_field(row, "requests_without_block_progress"))
-        .max()
-        .unwrap_or(0)
+    max_unproven_u64_field(reader, "requests_without_block_progress")
 }
 
 /// Peak concurrent request depth held by a peer that has not yet delivered an accepted
 /// body. `peer_outstanding` is emitted after the new request joins `outstanding`, so
 /// this is the depth the probe-first cap actually admitted.
 fn max_unproven_outstanding_requests(reader: &TraceReader) -> u64 {
+    max_unproven_u64_field(reader, "peer_outstanding")
+}
+
+/// Peak `field` across the requests sent by a peer that has not yet delivered an
+/// accepted body, as counted at send time by `block_get_blocks_sent`.
+fn max_unproven_u64_field(reader: &TraceReader, field: &str) -> u64 {
     reader
         .table("block_sync")
         .rows()
         .into_iter()
         .filter(|row| event(row) == Some("block_get_blocks_sent"))
         .filter(|row| u64_field(row, "block_progress_proven") == Some(0))
-        .filter_map(|row| u64_field(row, "peer_outstanding"))
+        .filter_map(|row| u64_field(row, field))
         .max()
         .unwrap_or(0)
 }

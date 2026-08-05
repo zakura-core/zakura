@@ -3516,9 +3516,35 @@ async fn remote_stream_eof_after_probe_timeout_still_parks_session() {
     assert_eq!(start_height, block::Height(1));
     assert_eq!(count, 1);
 
-    // Let the probe time out: `outstanding` drains, the unproven peer is gated
-    // at its one-probe cap, and the liveness deadline stays armed.
+    // Move the peer's servable range past the queued height. An unproven peer's
+    // probe-first cap reopens once its probe drains, so without this the peer
+    // simply re-probes for the returned height and the EOF below lands with
+    // `outstanding` non-empty — the other stall path. Leaving it nothing servable
+    // pins the path under test: `outstanding` empty with liveness still armed.
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(2),
+                servable_high: block::Height(2),
+                tip_hash: block::Hash([2; 32]),
+                max_blocks_per_response: 1,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+
+    // Let the probe time out: `outstanding` drains, the peer has nothing servable
+    // left to re-probe for, and the liveness deadline stays armed.
     tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        handle.peer_snapshot().outbound_peers,
+        1,
+        "the session must still be attached when the stream EOFs",
+    );
 
     // Close the peer's send side of the stream inside the window between the
     // per-request timeout and the liveness deadline.

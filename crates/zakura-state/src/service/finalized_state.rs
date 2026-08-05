@@ -111,9 +111,9 @@ pub use disk_format::{
 };
 pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, NextVctBlock};
 pub use vct_treestate_audit::{
-    derived_roots_in_display_order, inventory, measure_derivations, replay_inputs,
-    verify_subtrees_against_stored, DerivationSample, ReplayInputs, SubtreeVerification,
-    VctTreestateInventory,
+    derived_roots_in_display_order, inventory, inventory_with_scans, measure_derivations,
+    replay_inputs, verify_subtrees_against_stored, DerivationSample, ReplayInputs,
+    SubtreeVerification, VctTreestateInventory,
 };
 #[allow(unused_imports)]
 pub use zakura_db::commitment_roots_db::{

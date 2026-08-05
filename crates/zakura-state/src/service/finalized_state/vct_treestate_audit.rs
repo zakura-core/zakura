@@ -50,18 +50,17 @@ pub struct VctTreestateInventory {
     /// Replay reads block bodies, so a pruned database cannot derive below this height.
     pub lowest_retained_height: Option<Height>,
 
-    /// Whether the full-band scans ran.
-    ///
-    /// When they did not, [`Self::root_index_gap`], [`Self::malformed_root_row`], and
-    /// [`Self::missing_block_body`] are `None` because nothing looked, not because nothing is
-    /// missing or malformed.
-    pub scanned: bool,
+    /// Whether the authenticated-root index scan ran.
+    pub root_index_scanned: bool,
+
+    /// Whether the retained block-body scan ran.
+    pub block_bodies_scanned: bool,
 
     /// The first height in the absent band with no `commitment_roots_by_height` row.
     ///
     /// `None` means the index is gap-free across the band, which is what derivation needs: every
     /// derived frontier is checked against the row at its own height. Only meaningful when
-    /// [`Self::scanned`].
+    /// [`Self::root_index_scanned`].
     pub root_index_gap: Option<Height>,
 
     /// The first height in the absent band with a malformed `commitment_roots_by_height` value.
@@ -69,7 +68,8 @@ pub struct VctTreestateInventory {
 
     /// The first height in the absent band whose block body is not retained.
     ///
-    /// `None` means the whole band is replayable. Only meaningful when [`Self::scanned`].
+    /// `None` means the whole band is replayable. Only meaningful when
+    /// [`Self::block_bodies_scanned`].
     pub missing_block_body: Option<Height>,
 
     /// The required pre-band frontier height, if any pool has no stored tree at or below it.
@@ -90,16 +90,22 @@ impl VctTreestateInventory {
         (upgrade < committed_end).then_some((upgrade, committed_end))
     }
 
-    /// Returns whether this database has everything derivation needs across its absent band, or
-    /// `None` if the scans that would answer that were skipped.
+    /// Returns whether this database has everything derivation needs across its absent band.
+    ///
+    /// Returns `None` if no problem is known but either full-band scan was skipped.
     pub fn can_derive(&self) -> Option<bool> {
-        self.scanned.then(|| {
-            self.absent_band().is_some()
-                && self.root_index_gap.is_none()
-                && self.malformed_root_row.is_none()
-                && self.missing_block_body.is_none()
-                && self.missing_anchor.is_none()
-        })
+        let known_problem = self.absent_band().is_none()
+            || self.root_index_gap.is_some()
+            || self.malformed_root_row.is_some()
+            || self.missing_block_body.is_some()
+            || self.missing_anchor.is_some();
+        if known_problem {
+            Some(false)
+        } else if self.root_index_scanned && self.block_bodies_scanned {
+            Some(true)
+        } else {
+            None
+        }
     }
 }
 
@@ -109,6 +115,16 @@ impl VctTreestateInventory {
 /// retention, which is proportional to the band's height range rather than constant time. Without
 /// it, only the cheap markers are read.
 pub fn inventory(db: &ZakuraDb, scan_band: bool) -> VctTreestateInventory {
+    inventory_with_scans(db, scan_band, scan_band)
+}
+
+/// Inspects `db`, allowing callers that will replay the whole band to defer the redundant
+/// block-body scan while retaining the compact authenticated-root preflight.
+pub fn inventory_with_scans(
+    db: &ZakuraDb,
+    scan_root_index: bool,
+    scan_block_bodies: bool,
+) -> VctTreestateInventory {
     let start = Instant::now();
 
     let upgrade_height = db.vct_upgrade_height();
@@ -119,7 +135,8 @@ pub fn inventory(db: &ZakuraDb, scan_band: bool) -> VctTreestateInventory {
         upgrade_height,
         last_checkpoint,
         lowest_retained_height: db.lowest_retained_height(),
-        scanned: scan_band,
+        root_index_scanned: scan_root_index,
+        block_bodies_scanned: scan_block_bodies,
         root_index_gap: None,
         malformed_root_row: None,
         missing_block_body: None,
@@ -127,19 +144,23 @@ pub fn inventory(db: &ZakuraDb, scan_band: bool) -> VctTreestateInventory {
         scan_duration: Duration::ZERO,
     };
 
-    if let (true, Some((band_start, band_end))) = (scan_band, inventory.absent_band()) {
+    if let Some((band_start, band_end)) = inventory.absent_band() {
         // The band is half-open, so the last height it covers is `H - 1`.
         let last = Height(band_end.0 - 1);
-        match db.first_commitment_root_issue(band_start..=last) {
-            Some(CommitmentRootIndexIssue::Missing(height)) => {
-                inventory.root_index_gap = Some(height);
+        if scan_root_index {
+            match db.first_commitment_root_issue(band_start..=last) {
+                Some(CommitmentRootIndexIssue::Missing(height)) => {
+                    inventory.root_index_gap = Some(height);
+                }
+                Some(CommitmentRootIndexIssue::Malformed(height)) => {
+                    inventory.malformed_root_row = Some(height);
+                }
+                None => {}
             }
-            Some(CommitmentRootIndexIssue::Malformed(height)) => {
-                inventory.malformed_root_row = Some(height);
-            }
-            None => {}
         }
-        inventory.missing_block_body = db.first_missing_block_body(band_start, last);
+        if scan_block_bodies {
+            inventory.missing_block_body = db.first_missing_block_body(band_start, last);
+        }
     }
 
     if let Some((band_start, _)) = inventory.absent_band() {
@@ -433,7 +454,8 @@ mod tests {
             upgrade_height: Some(Height(100)),
             last_checkpoint: Some(Height(200)),
             lowest_retained_height: None,
-            scanned: true,
+            root_index_scanned: true,
+            block_bodies_scanned: true,
             root_index_gap: None,
             malformed_root_row: None,
             missing_block_body: None,
@@ -469,6 +491,16 @@ mod tests {
         let mut inventory = inventory_with_tip(Height(149));
         inventory.malformed_root_row = Some(Height(125));
 
+        assert_eq!(inventory.can_derive(), Some(false));
+    }
+
+    #[test]
+    fn deferred_body_scan_keeps_derivation_pending_unless_an_issue_is_known() {
+        let mut inventory = inventory_with_tip(Height(149));
+        inventory.block_bodies_scanned = false;
+        assert_eq!(inventory.can_derive(), None);
+
+        inventory.root_index_gap = Some(Height(125));
         assert_eq!(inventory.can_derive(), Some(false));
     }
 

@@ -29,9 +29,9 @@ TREESTATE_RANGE_ARGS = \
 	$(if $(TREESTATE_TO),--to "$(TREESTATE_TO)") \
 	--step "$(TREESTATE_STEP)"
 
-# Report the database's historical-treestate inventory without deriving any trees.
+# Report the database inventory and explicitly verify full-band block-body retention.
 treestate-audit-inventory:
-	$(TREESTATE_AUDIT) $(TREESTATE_EXTRA_ARGS)
+	$(TREESTATE_AUDIT) --scan-block-bodies $(TREESTATE_EXTRA_ARGS)
 
 # Replay the post-checkpoint band and compare the resulting subtree roots with stored rows.
 treestate-audit-subtrees:

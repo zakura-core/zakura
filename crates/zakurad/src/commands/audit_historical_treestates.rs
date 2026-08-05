@@ -101,12 +101,18 @@ pub struct AuditHistoricalTreestatesCmd {
     )]
     verify_subtrees: bool,
 
-    /// Skip the root-index and block-body scans, reporting only the cheap markers.
+    /// Explicitly verify that every absent-band block body is retained.
     ///
-    /// Those scans visit every height in the band, which takes minutes on Mainnet. Skipping them
-    /// is worth it when repeating a walk on a database already known to be complete; the walk
-    /// still fails on the first height it cannot derive, so nothing goes unchecked.
-    #[clap(long, help = "skip the full-band scans, reporting markers only")]
+    /// This expensive preflight is only valid for an inventory-only invocation. Walk and subtree
+    /// modes validate the bodies in their own replay ranges.
+    #[clap(
+        long,
+        help = "scan every absent-band height for a retained block body (inventory only)"
+    )]
+    scan_block_bodies: bool,
+
+    /// Skip the authenticated-root index scan, reporting only cheap markers.
+    #[clap(long, help = "skip the full-band authenticated-root index scan")]
     no_scan: bool,
 }
 
@@ -128,6 +134,15 @@ impl AuditHistoricalTreestatesCmd {
         if self.step == 0 {
             return Err(eyre!("--step must be at least 1"));
         }
+        if self.scan_block_bodies && (self.walk || self.verify_subtrees) {
+            return Err(eyre!(
+                "--scan-block-bodies is inventory-only; walk and subtree modes validate their \
+                 own replay ranges"
+            ));
+        }
+        if self.scan_block_bodies && self.no_scan {
+            return Err(eyre!("--scan-block-bodies conflicts with --no-scan"));
+        }
 
         if let Some(cache_dir) = self.cache_dir.clone() {
             state_config.cache_dir = cache_dir;
@@ -145,12 +160,33 @@ impl AuditHistoricalTreestatesCmd {
         let (_read_state, db, _non_finalized_sender) =
             zakura_state::init_read_only(state_config, &self.network)?;
 
-        if !self.no_scan {
+        let scan_root_index = !self.no_scan && (self.walk || !self.verify_subtrees);
+        if self.walk && scan_root_index {
             println!(
-                "inventory scan starting. Please wait for approximately 5–15 minutes on Mainnet"
+                "root-index preflight starting; the walk will validate every body in its \
+                 requested range"
+            );
+        } else if self.verify_subtrees {
+            println!(
+                "inventory full-band scans skipped; subtree replay will validate every required \
+                 body above the checkpoint"
+            );
+        } else if self.scan_block_bodies {
+            println!(
+                "root-index and block-body inventory scans starting. Please wait for \
+                 approximately 5–15 minutes on Mainnet"
+            );
+        } else if scan_root_index {
+            println!(
+                "root-index inventory scan starting; use --scan-block-bodies to explicitly \
+                 validate full-band body retention"
             );
         }
-        let inventory = zakura_state::vct_treestate_inventory(&db, !self.no_scan);
+        let inventory = zakura_state::vct_treestate_inventory_with_scans(
+            &db,
+            scan_root_index,
+            self.scan_block_bodies,
+        );
         print_inventory(&inventory);
 
         if self.verify_subtrees {
@@ -440,24 +476,36 @@ fn print_inventory(inventory: &VctTreestateInventory) {
 
     println!(
         "  root index gap:         {}",
-        inventory.root_index_gap.map_or_else(
-            || "none (gap-free)".to_string(),
-            |height| format!("at height {}", height.0)
-        )
+        if inventory.root_index_scanned {
+            inventory.root_index_gap.map_or_else(
+                || "none (gap-free)".to_string(),
+                |height| format!("at height {}", height.0),
+            )
+        } else {
+            "not checked".to_string()
+        }
     );
     println!(
         "  malformed root row:     {}",
-        inventory.malformed_root_row.map_or_else(
-            || "none".to_string(),
-            |height| format!("at height {} (corrupt input)", height.0)
-        )
+        if inventory.root_index_scanned {
+            inventory.malformed_root_row.map_or_else(
+                || "none".to_string(),
+                |height| format!("at height {} (corrupt input)", height.0),
+            )
+        } else {
+            "not checked".to_string()
+        }
     );
     println!(
         "  missing block body:     {}",
-        inventory.missing_block_body.map_or_else(
-            || "none (all retained)".to_string(),
-            |height| format!("at height {}", height.0)
-        )
+        if inventory.block_bodies_scanned {
+            inventory.missing_block_body.map_or_else(
+                || "none (all retained)".to_string(),
+                |height| format!("at height {}", height.0),
+            )
+        } else {
+            "not scanned (use --scan-block-bodies for full inventory)".to_string()
+        }
     );
     println!(
         "  missing anchor:         {}",
@@ -471,7 +519,7 @@ fn print_inventory(inventory: &VctTreestateInventory) {
         match inventory.can_derive() {
             Some(true) => "yes",
             Some(false) => "no",
-            None => "not checked (--no-scan)",
+            None => "not fully preflighted",
         }
     );
     println!(

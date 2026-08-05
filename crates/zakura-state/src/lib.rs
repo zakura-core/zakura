@@ -82,9 +82,10 @@ pub use service::{
 pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch};
 
 pub use service::finalized_state::{
-    derived_roots_in_display_order, inventory as vct_treestate_inventory, measure_derivations,
-    replay_inputs, verify_subtrees_against_stored, DerivationSample, ReplayInputs,
-    SubtreeVerification, VctTreestateInventory,
+    derived_roots_in_display_order, inventory as vct_treestate_inventory,
+    inventory_with_scans as vct_treestate_inventory_with_scans, measure_derivations, replay_inputs,
+    verify_subtrees_against_stored, DerivationSample, ReplayInputs, SubtreeVerification,
+    VctTreestateInventory,
 };
 pub use service::finalized_state::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,

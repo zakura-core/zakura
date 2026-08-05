@@ -1657,14 +1657,15 @@ mod zakura_header_sync_driver_tests {
             .header_chain_port
             .prepare_header_target(zakura_node_services::header_chain::PrepareHeaderTarget {
                 source,
-                network: zakura_chain::parameters::Network::Mainnet,
                 owner: owner.into(),
                 common_ancestor,
                 target,
                 entries: blocks
                     .iter()
                     .map(|(height, block, size)| durable_header_entry(*height, block, *size))
-                    .collect(),
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .expect("the durable suffix fits the header transition cap"),
                 completion: zakura_header_chain::TargetCompletion::TargetComplete {
                     common_ancestor,
                 },
@@ -2579,6 +2580,48 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[tokio::test]
+    async fn block_sync_driver_does_not_refill_a_nonempty_deferred_queue() {
+        let (action_tx, mut action_rx) = mpsc::channel(2);
+        for marker in [1, 2] {
+            action_tx
+                .send(BlockSyncAction::Misbehavior {
+                    peer: test_zakura_peer(marker),
+                    reason: BlockSyncMisbehavior::StatusSpam,
+                })
+                .await
+                .expect("the initial bounded action batch queues");
+        }
+
+        let mut deferred_actions = VecDeque::new();
+        assert!(
+            coalesce_ready_needed_block_queries(&mut action_rx, &mut deferred_actions).is_none()
+        );
+        assert_eq!(deferred_actions.len(), 2);
+        let _dispatched = deferred_actions.pop_front();
+
+        action_tx
+            .send(BlockSyncAction::Misbehavior {
+                peer: test_zakura_peer(3),
+                reason: BlockSyncMisbehavior::StatusSpam,
+            })
+            .await
+            .expect("the bounded receiver refills while deferred work remains");
+        assert!(
+            coalesce_ready_needed_block_queries(&mut action_rx, &mut deferred_actions).is_none()
+        );
+
+        assert_eq!(
+            deferred_actions.len(),
+            1,
+            "a nonempty deferred queue must apply backpressure to the receiver"
+        );
+        assert!(matches!(
+            action_rx.try_recv(),
+            Ok(BlockSyncAction::Misbehavior { peer, .. }) if peer == test_zakura_peer(3)
+        ));
+    }
+
+    #[tokio::test]
     async fn block_sync_driver_persists_exact_body_retry_evidence() {
         let (action_tx, action_rx) = mpsc::channel(1);
         let startup = block_sync_startup_for_test();
@@ -2599,15 +2642,13 @@ mod zakura_header_sync_driver_tests {
             BoxCloneService::new(service_fn(move |request: zakura_state::Request| {
                 let request_tx = request_tx.clone();
                 async move {
-                    let zakura_state::Request::RecordHeaderChainBodyUnavailable {
-                        expected_version,
-                        failure,
-                    } = request
+                    let zakura_state::Request::RecordHeaderChainBodyUnavailable { prepared } =
+                        request
                     else {
                         panic!("unexpected state write while persisting body retry evidence")
                     };
                     request_tx
-                        .send((expected_version, failure))
+                        .send(prepared)
                         .await
                         .expect("body retry request receiver stays open");
                     Err::<zakura_state::Response, zakura_state::BoxError>(
@@ -2615,6 +2656,7 @@ mod zakura_header_sync_driver_tests {
                     )
                 }
             }));
+        let body_evidence_authority = zakura_state::HeaderChainBodyEvidenceAuthority::new_test();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
@@ -2624,6 +2666,7 @@ mod zakura_header_sync_driver_tests {
             zakura_chain::chain_tip::NoChainTip,
             read_state,
             Some(header_chain_write),
+            Some(body_evidence_authority.clone()),
             verifier,
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -2660,7 +2703,7 @@ mod zakura_header_sync_driver_tests {
             tokio::time::timeout(Duration::from_secs(1), request_rx.recv())
                 .await
                 .expect("state writer receives body retry evidence"),
-            Some((expected_version, failure))
+            Some(body_evidence_authority.from_registered_attempt(expected_version, failure,))
         );
 
         let _ = shutdown_tx.send(());
@@ -2738,6 +2781,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height::MAX,
@@ -2885,6 +2929,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height::MAX,
@@ -3041,6 +3086,7 @@ mod zakura_header_sync_driver_tests {
             zakura_chain::chain_tip::NoChainTip,
             read_state,
             None,
+            None,
             verifier,
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -3160,6 +3206,7 @@ mod zakura_header_sync_driver_tests {
             zakura_chain::chain_tip::NoChainTip,
             read_state,
             None,
+            None,
             verifier,
             block::Height(2),
             2,
@@ -3266,6 +3313,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height(2),
@@ -3375,6 +3423,7 @@ mod zakura_header_sync_driver_tests {
             zakura_chain::chain_tip::NoChainTip,
             read_state,
             None,
+            None,
             verifier,
             block::Height(0),
             2,
@@ -3463,6 +3512,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height(0),
@@ -3561,6 +3611,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height(0),
@@ -3684,6 +3735,7 @@ mod zakura_header_sync_driver_tests {
             zakura_chain::chain_tip::NoChainTip,
             read_state,
             None,
+            None,
             verifier,
             block::Height(0),
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -3763,6 +3815,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height(0),
@@ -3892,6 +3945,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height(0),
@@ -4444,6 +4498,7 @@ mod zakura_header_sync_driver_tests {
             zakura_chain::chain_tip::NoChainTip,
             read_state,
             None,
+            None,
             verifier,
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -4544,6 +4599,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height::MAX,
@@ -4659,6 +4715,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height::MAX,
@@ -4791,6 +4848,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             _latest_tip,
             read_state.clone(),
+            None,
             None,
             verifier,
             // Every block 0..=10 is at or below the checkpoint, so all are Checkpoint-class
@@ -4953,6 +5011,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             latest_tip,
             read_state.clone(),
+            None,
             None,
             verifier,
             second_checkpoint_height,

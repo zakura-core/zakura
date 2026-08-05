@@ -17,9 +17,11 @@
 #
 # Host networking is required: Regtest only accepts localhost initial peers
 # (crates/zakura-network/src/config.rs: initial_peers filters to is_localhost), so the
-# nodes share 127.0.0.1 on distinct ports. State is ephemeral and traces/temp
-# live on tmpfs, so a run leaves nothing on disk. Per-node CPU/memory caps keep
-# the whole cluster well under the resources a single build would use.
+# nodes share 127.0.0.1 on distinct ports. State is ephemeral by default and
+# traces/temp live on tmpfs, so a run leaves nothing on disk. Node2 has a
+# dedicated named mount below so restart-matrix runs can deliberately preserve
+# or reset its database without losing it when the container is recreated.
+# Per-node CPU/memory/swap caps keep the cluster responsive under failure.
 
 name: zakura-regtest-e2e
 
@@ -28,6 +30,9 @@ x-zakura-node: &zakura-node
   network_mode: host
   restart: "no"
   stop_grace_period: 5s
+  cpu_shares: 256
+  mem_swappiness: 0
+  memswap_limit: 1536m
   tmpfs:
     - /tmp
   deploy:
@@ -35,6 +40,7 @@ x-zakura-node: &zakura-node
       limits:
         cpus: "2"
         memory: 1536m
+        pids: 256
 
 services:
   zakura-node-1:
@@ -56,6 +62,7 @@ services:
       - ${ZAKURAD_BIN:-../target/debug/zakurad}:/usr/local/bin/zakurad:ro
       - ${ZAKURA_NODE2_CONFIG:-./zakura-regtest-e2e/node2.toml}:/etc/zakura/node2.toml:ro
       - ${ZAKURA_E2E_TRACE_DIR:-/tmp/zakura-regtest-e2e-traces}:/traces
+      - zakura-node2-state:/tmp/zakura-node2-state
 
   zakura-node-3:
     <<: *zakura-node
@@ -78,3 +85,7 @@ services:
       - ${ZAKURAD_BIN:-../target/debug/zakurad}:/usr/local/bin/zakurad:ro
       - ${ZAKURA_NODE4_CONFIG:-./zakura-regtest-e2e/node4.toml}:/etc/zakura/node4.toml:ro
       - ${ZAKURA_E2E_TRACE_DIR:-/tmp/zakura-regtest-e2e-traces}:/traces
+
+volumes:
+  zakura-node2-state:
+    name: ${ZAKURA_NODE2_STATE_VOLUME:-zakura-regtest-e2e-node2-state-default}

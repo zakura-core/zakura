@@ -875,6 +875,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_accepted_operation_fails_instead_of_blocking_fallback() {
+        let coordinator = SyncCoordinator::new();
+        let operation = coordinator
+            .queue_apply()
+            .expect("native ownership admits a queued operation");
+        let mut state = operation.subscribe();
+        let accepted = operation
+            .accept()
+            .expect("the queued operation becomes accepted");
+        state.changed().await.expect("acceptance is observable");
+
+        let fallback_coordinator = coordinator.clone();
+        let fallback = tokio::spawn(async move {
+            fallback_coordinator
+                .acquire_legacy_fallback(Duration::from_millis(1))
+                .await
+        });
+        state
+            .changed()
+            .await
+            .expect("fallback publishes that cancellation is too late");
+        assert_eq!(*state.borrow(), BlockApplyOperationState::TooLate);
+
+        drop(accepted);
+        assert_eq!(*state.borrow(), BlockApplyOperationState::Failed);
+        let result = tokio::time::timeout(Duration::from_secs(1), fallback)
+            .await
+            .expect("an abandoned accepted apply must not strand fallback")
+            .expect("the fallback task remains live");
+        assert!(matches!(
+            result,
+            Err(LifecycleTransitionError::IllegalPhase)
+        ));
+        assert!(matches!(
+            coordinator.apply_phase(),
+            ApplyPhase::Failed { .. }
+        ));
+        assert_eq!(coordinator.operation_count(), 0);
+        assert_eq!(
+            coordinator
+                .in_flight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn dropping_an_observer_does_not_release_an_accepted_operation() {
         let coordinator = SyncCoordinator::new();
         let operation = coordinator

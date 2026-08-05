@@ -6,6 +6,7 @@ The oracle reads the per-node JSONL trace layout produced by the Docker e2e:
     node*/commit_state.jsonl
     node*/block_sync.jsonl
     node*/header_sync.jsonl
+    node*/legacy_sync.jsonl
 
 It checks high-signal sync invariants and prints compact diagnostics for the
 first offending row in each node. It intentionally depends only on Python's
@@ -39,6 +40,7 @@ BLOCK_SYNC_STATE = "block_sync_state"
 HEADER_FRONTIER_ADVANCED = "header_frontier_advanced"
 HEADER_FRONTIER_REANCHORED = "header_frontier_reanchored"
 HEADER_GET_HEADERS_SENT = "header_get_headers_sent"
+HEADER_REQUEST_SENT = "header_request_sent"
 HEADER_RANGE_COMMITTED = "header_range_committed"
 HEADER_RANGE_REJECTED = "header_range_rejected"
 HEADER_PEER_VIOLATION = "header_peer_violation"
@@ -59,8 +61,9 @@ COMMIT_EVENT_WINDOW = 200_000
 COMMIT_MICROS_WINDOW = 30 * 60 * 1_000_000
 COMMIT_TREND_MIN_MS = 300_000
 COMMIT_TREND_FACTOR = 4.0
-APPLY_CLASS_CHECKPOINT = "checkpoint"
 APPLY_CLASS_FULL = "full"
+LEGACY_ROUND_FINISH = "round_finish"
+LEGACY_CHECKPOINT_HANDOFF = "checkpoint_handoff"
 
 
 @dataclass(frozen=True)
@@ -306,6 +309,7 @@ def load_traces(root: Path) -> list[NodeTrace]:
                 "commit_state": read_jsonl(trace_dir / "commit_state.jsonl", node, "commit_state"),
                 "block_sync": read_jsonl(trace_dir / "block_sync.jsonl", node, "block_sync"),
                 "header_sync": read_jsonl(trace_dir / "header_sync.jsonl", node, "header_sync"),
+                "legacy_sync": read_jsonl(trace_dir / "legacy_sync.jsonl", node, "legacy_sync"),
             }
             if any(tables.values()):
                 nodes.append(NodeTrace(node, tables))
@@ -317,6 +321,7 @@ def trace_files() -> Iterable[str]:
     yield "commit_state.jsonl"
     yield "block_sync.jsonl"
     yield "header_sync.jsonl"
+    yield "legacy_sync.jsonl"
 
 
 def check_commit_pairs(node: NodeTrace, options: OracleOptions) -> list[Failure]:
@@ -735,49 +740,78 @@ def check_checkpoint_to_full_handoff(nodes: list[NodeTrace], options: OracleOpti
 def checkpoint_to_full_handoff(
     node: NodeTrace, options: OracleOptions
 ) -> tuple[Failure | None, dict[str, Any]]:
-    checkpoint_finish: TraceRow | None = None
-    checkpoint_height: int | None = None
+    handoffs = [
+        row
+        for row in node.events("legacy_sync", LEGACY_ROUND_FINISH)
+        if row.row.get("reason") == LEGACY_CHECKPOINT_HANDOFF
+    ]
+    full_finishes = [
+        row
+        for row in node.events("commit_state", COMMIT_FINISH)
+        if row.row.get("apply_class") == APPLY_CLASS_FULL
+        and row.row.get("result") == "committed"
+    ]
+    latest_detail: dict[str, Any] = {}
+    slow_failure: Failure | None = None
 
-    for row in node.events("commit_state", COMMIT_FINISH):
-        apply_class = row.row.get("apply_class")
-        height = int_field(row.row, "height")
-        if apply_class == APPLY_CLASS_CHECKPOINT and height is not None:
-            checkpoint_finish = row
-            checkpoint_height = height
-        elif (
-            apply_class == APPLY_CLASS_FULL
-            and checkpoint_finish is not None
-            and height is not None
-            and checkpoint_height is not None
-            and height > checkpoint_height
-            and (row.index > checkpoint_finish.index or later_ts(row, checkpoint_finish))
+    for handoff in handoffs:
+        checkpoint_height = int_field(handoff.row, "checkpoint_height")
+        state_tip = int_field(handoff.row, "state_tip")
+        process_trace_id = handoff.row.get("process_trace_id")
+        latest_detail = {
+            "checkpoint_height": checkpoint_height,
+            "state_tip": state_tip,
+            "process_trace_id": process_trace_id,
+        }
+        if (
+            checkpoint_height is None
+            or state_tip is None
+            or state_tip < checkpoint_height
+            or not isinstance(process_trace_id, str)
+            or not process_trace_id
+            or handoff.ts is None
         ):
-            if checkpoint_finish.ts is not None and row.ts is not None:
-                elapsed = row.ts - checkpoint_finish.ts
-                if elapsed > options.handoff_stall_micros:
-                    return (
-                        failure(
-                            node,
-                            "checkpoint_to_full_handoff_within_window",
-                            row,
-                            {
-                                "checkpoint": compact_row(checkpoint_finish),
-                                "full": compact_row(row),
-                                "elapsed_us": elapsed,
-                            },
-                        ),
-                        {},
-                    )
+            continue
+
+        boundary = max(checkpoint_height, state_tip)
+        for full in full_finishes:
+            height = int_field(full.row, "height")
+            if (
+                full.row.get("process_trace_id") != process_trace_id
+                or height is None
+                or height <= boundary
+                or full.ts is None
+                or full.ts <= handoff.ts
+            ):
+                continue
+
+            elapsed = full.ts - handoff.ts
+            if elapsed > options.handoff_stall_micros:
+                slow_failure = failure(
+                    node,
+                    "checkpoint_to_full_handoff_within_window",
+                    full,
+                    {
+                        "handoff": compact_row(handoff),
+                        "full": compact_row(full),
+                        "elapsed_us": elapsed,
+                    },
+                )
+                continue
             return (None, {})
 
+    if slow_failure is not None:
+        return (slow_failure, {})
+
+    latest_handoff = handoffs[-1] if handoffs else None
     return (
         failure(
             node,
             "checkpoint_to_full_handoff_observed",
-            checkpoint_finish,
-            {"latest_checkpoint_height": checkpoint_height},
+            latest_handoff,
+            latest_detail,
         ),
-        {"latest_checkpoint_height": checkpoint_height},
+        latest_detail,
     )
 
 
@@ -850,27 +884,40 @@ def check_v7_request_ids(nodes: list[NodeTrace]) -> list[Failure]:
     requests = [
         row
         for node in nodes
-        for row in node.events("header_sync", HEADER_GET_HEADERS_SENT)
+        for row in node.events("header_sync", HEADER_REQUEST_SENT)
     ]
-    v7_requests = [
-        row
-        for row in requests
-        if int_field(row.row, "stream_version") is not None
-        and int_field(row.row, "stream_version") >= 7
-    ]
-    if not v7_requests:
+    if not requests:
         node = nodes[0] if nodes else NodeTrace("<none>", {})
         return [
             failure(
                 node,
                 "v7_header_request_ids_present",
-                requests[-1] if requests else None,
-                {"header_get_headers_sent_rows": len(requests)},
+                None,
+                {"header_request_sent_rows": 0},
+            )
+        ]
+
+    invalid_versions = [
+        row
+        for row in requests
+        if (int_field(row.row, "stream_version") or 0) < 7
+    ]
+    if invalid_versions:
+        node = next(node for node in nodes if node.node == invalid_versions[0].node)
+        return [
+            failure(
+                node,
+                "v7_header_request_version_attributed",
+                invalid_versions[0],
+                {"header_request_sent_rows": len(requests)},
             )
         ]
 
     missing_or_zero = [
-        row for row in v7_requests if (int_field(row.row, "request_id") or 0) == 0
+        row
+        for row in requests
+        if (int_field(row.row, "session_id") or 0) == 0
+        or (int_field(row.row, "request_id") or 0) == 0
     ]
     if missing_or_zero:
         node = next(node for node in nodes if node.node == missing_or_zero[0].node)
@@ -879,27 +926,46 @@ def check_v7_request_ids(nodes: list[NodeTrace]) -> list[Failure]:
                 node,
                 "v7_header_request_ids_nonzero",
                 missing_or_zero[0],
-                {"v7_header_get_headers_sent_rows": len(v7_requests)},
+                {"v7_header_request_sent_rows": len(requests)},
             )
         ]
 
-    duplicate_ids: set[tuple[str, int, int]] = set()
-    seen_ids: set[tuple[str, int, int]] = set()
-    for row in v7_requests:
+    missing_process = [
+        row
+        for row in requests
+        if not isinstance(row.row.get("process_trace_id"), str)
+        or not row.row.get("process_trace_id")
+    ]
+    if missing_process:
+        node = next(node for node in nodes if node.node == missing_process[0].node)
+        return [
+            failure(
+                node,
+                "v7_header_request_process_attributed",
+                missing_process[0],
+                {"v7_header_request_sent_rows": len(requests)},
+            )
+        ]
+
+    duplicate_ids: set[tuple[str, str, int, int]] = set()
+    seen_ids: set[tuple[str, str, int, int]] = set()
+    for row in requests:
         request_id = int_field(row.row, "request_id")
         session_id = int_field(row.row, "session_id")
-        if request_id is None or session_id is None:
+        process_trace_id = row.row.get("process_trace_id")
+        if request_id is None or session_id is None or not isinstance(process_trace_id, str):
             continue
-        key = (row.node, session_id, request_id)
+        key = (row.node, process_trace_id, session_id, request_id)
         if key in seen_ids:
             duplicate_ids.add(key)
         seen_ids.add(key)
     if duplicate_ids:
         first_duplicate = next(
             row
-            for row in v7_requests
+            for row in requests
             if (
                 row.node,
+                row.row.get("process_trace_id"),
                 int_field(row.row, "session_id"),
                 int_field(row.row, "request_id"),
             )
@@ -1013,8 +1079,9 @@ def run_self_test() -> None:
             [
                 {
                     "ts": 1,
-                    "event": HEADER_GET_HEADERS_SENT,
-                    "stream_version": 7,
+                    "event": HEADER_REQUEST_SENT,
+                    "stream_version": 8,
+                    "process_trace_id": "request-process",
                     "session_id": 11,
                     "request_id": 1,
                     "range_start": 1,
@@ -1022,8 +1089,9 @@ def run_self_test() -> None:
                 },
                 {
                     "ts": 2,
-                    "event": HEADER_GET_HEADERS_SENT,
-                    "stream_version": 7,
+                    "event": HEADER_REQUEST_SENT,
+                    "stream_version": 8,
+                    "process_trace_id": "request-process",
                     "session_id": 12,
                     "request_id": 1,
                     "range_start": 81,
@@ -1031,32 +1099,80 @@ def run_self_test() -> None:
                 },
             ],
         )
-        assert not run_oracle(
-            root / "v7_ids",
-            OracleOptions(require_v7_request_ids=True),
+        assert not check_v7_request_ids(
+            load_traces(root / "v7_ids")
         ), "v7 request IDs should pass when nonzero and unique per session"
+
+        for name, mutations, expected in (
+            (
+                "v7_missing_version",
+                {"stream_version": None},
+                "v7_header_request_version_attributed",
+            ),
+            ("v7_zero_id", {"request_id": 0}, "v7_header_request_ids_nonzero"),
+        ):
+            directory = root / name / "node2"
+            row = {
+                "ts": 1,
+                "event": HEADER_REQUEST_SENT,
+                "stream_version": 8,
+                "process_trace_id": "request-process",
+                "session_id": 11,
+                "request_id": 1,
+                **mutations,
+            }
+            write_jsonl(directory / "header_sync.jsonl", [row])
+            assert any(
+                failure.invariant == expected
+                for failure in check_v7_request_ids(load_traces(root / name))
+            )
+
+        duplicate_ids = root / "v7_duplicate_ids" / "node2"
+        duplicate = {
+            "event": HEADER_REQUEST_SENT,
+            "stream_version": 8,
+            "process_trace_id": "request-process",
+            "session_id": 11,
+            "request_id": 1,
+        }
+        write_jsonl(
+            duplicate_ids / "header_sync.jsonl",
+            [{"ts": 1, **duplicate}, {"ts": 2, **duplicate}],
+        )
+        assert any(
+            failure.invariant == "v7_header_request_ids_unique_per_session"
+            for failure in check_v7_request_ids(load_traces(root / "v7_duplicate_ids"))
+        )
+
+        cross_process_ids = root / "v7_cross_process_ids" / "node2"
+        write_jsonl(
+            cross_process_ids / "header_sync.jsonl",
+            [
+                {"ts": 1, **duplicate},
+                {"ts": 1, **duplicate, "process_trace_id": "restarted-process"},
+            ],
+        )
+        assert not check_v7_request_ids(
+            load_traces(root / "v7_cross_process_ids")
+        ), "request IDs may restart in a distinct traced process"
 
         handoff = root / "handoff" / "node2"
         write_jsonl(
-            handoff / "commit_state.jsonl",
+            handoff / "legacy_sync.jsonl",
             [
                 {
-                    "ts": 1,
-                    "event": COMMIT_START,
-                    "apply_token": 10,
-                    "apply_class": APPLY_CLASS_CHECKPOINT,
-                    "height": 80,
-                    "hash": "cc",
-                },
-                {
                     "ts": 2,
-                    "event": COMMIT_FINISH,
-                    "apply_token": 10,
-                    "apply_class": APPLY_CLASS_CHECKPOINT,
-                    "height": 80,
-                    "hash": "cc",
-                    "elapsed_ms": 1,
-                },
+                    "event": LEGACY_ROUND_FINISH,
+                    "reason": LEGACY_CHECKPOINT_HANDOFF,
+                    "state_tip": 80,
+                    "checkpoint_height": 80,
+                    "process_trace_id": "handoff-process",
+                }
+            ],
+        )
+        write_jsonl(
+            handoff / "commit_state.jsonl",
+            [
                 {
                     "ts": 3,
                     "event": COMMIT_START,
@@ -1072,7 +1188,9 @@ def run_self_test() -> None:
                     "apply_class": APPLY_CLASS_FULL,
                     "height": 81,
                     "hash": "dd",
+                    "result": "committed",
                     "elapsed_ms": 1,
+                    "process_trace_id": "handoff-process",
                 },
             ],
         )
@@ -1087,19 +1205,13 @@ def run_self_test() -> None:
             [
                 {
                     "ts": 1,
-                    "event": COMMIT_START,
-                    "apply_token": 12,
-                    "apply_class": APPLY_CLASS_CHECKPOINT,
-                    "height": 80,
-                    "hash": "ee",
-                },
-                {
-                    "ts": 2,
                     "event": COMMIT_FINISH,
                     "apply_token": 12,
-                    "apply_class": APPLY_CLASS_CHECKPOINT,
-                    "height": 80,
+                    "apply_class": APPLY_CLASS_FULL,
+                    "height": 81,
                     "hash": "ee",
+                    "result": "committed",
+                    "process_trace_id": "no-handoff-process",
                 },
             ],
         )
@@ -1108,18 +1220,80 @@ def run_self_test() -> None:
             for f in run_oracle(root / "no_handoff", OracleOptions(require_handoff_boundary=True))
         )
 
-        slow_handoff = root / "slow_handoff" / "node2"
+        no_later_full = root / "no_later_full" / "node2"
         write_jsonl(
-            slow_handoff / "commit_state.jsonl",
+            no_later_full / "legacy_sync.jsonl",
+            [
+                {
+                    "ts": 2,
+                    "event": LEGACY_ROUND_FINISH,
+                    "reason": LEGACY_CHECKPOINT_HANDOFF,
+                    "state_tip": 80,
+                    "checkpoint_height": 80,
+                    "process_trace_id": "no-full-process",
+                }
+            ],
+        )
+        assert any(
+            f.invariant == "checkpoint_to_full_handoff_observed"
+            for f in run_oracle(
+                root / "no_later_full", OracleOptions(require_handoff_boundary=True)
+            )
+        )
+
+        cross_process = root / "cross_process" / "node2"
+        write_jsonl(
+            cross_process / "legacy_sync.jsonl",
             [
                 {
                     "ts": 1,
+                    "event": LEGACY_ROUND_FINISH,
+                    "reason": LEGACY_CHECKPOINT_HANDOFF,
+                    "state_tip": 80,
+                    "checkpoint_height": 80,
+                    "process_trace_id": "new-process",
+                }
+            ],
+        )
+        write_jsonl(
+            cross_process / "commit_state.jsonl",
+            [
+                {
+                    "ts": 2,
                     "event": COMMIT_FINISH,
-                    "apply_token": 20,
-                    "apply_class": APPLY_CLASS_CHECKPOINT,
-                    "height": 80,
-                    "hash": "aa",
-                },
+                    "apply_token": 19,
+                    "apply_class": APPLY_CLASS_FULL,
+                    "height": 81,
+                    "hash": "old-process-full",
+                    "result": "committed",
+                    "process_trace_id": "old-process",
+                }
+            ],
+        )
+        assert any(
+            f.invariant == "checkpoint_to_full_handoff_observed"
+            for f in run_oracle(
+                root / "cross_process", OracleOptions(require_handoff_boundary=True)
+            )
+        )
+
+        slow_handoff = root / "slow_handoff" / "node2"
+        write_jsonl(
+            slow_handoff / "legacy_sync.jsonl",
+            [
+                {
+                    "ts": 1,
+                    "event": LEGACY_ROUND_FINISH,
+                    "reason": LEGACY_CHECKPOINT_HANDOFF,
+                    "state_tip": 80,
+                    "checkpoint_height": 80,
+                    "process_trace_id": "slow-process",
+                }
+            ],
+        )
+        write_jsonl(
+            slow_handoff / "commit_state.jsonl",
+            [
                 {
                     "ts": 10_000_000,
                     "event": COMMIT_FINISH,
@@ -1127,6 +1301,8 @@ def run_self_test() -> None:
                     "apply_class": APPLY_CLASS_FULL,
                     "height": 81,
                     "hash": "bb",
+                    "result": "committed",
+                    "process_trace_id": "slow-process",
                 },
             ],
         )

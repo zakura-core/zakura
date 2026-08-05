@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [1.1.0-rc2] - 2026-08-05
+
+### Changed
+
+- Apply batched peer misbehavior scores to the address book every five seconds
+  instead of every 30 seconds, so threshold bans become visible to the
+  listener and peer set promptly
+  ([#428](https://github.com/zakura-core/zakura/pull/428)).
+- A Mainnet database written by the original verified-commitment-trees fast sync (VCT-synced and
+  below database format version 28.0.1) is now rejected at startup instead of being repaired in
+  place. Such a database is missing the historical Sprout anchors needed to verify JoinSplits
+  that spend a historical Sprout root, and the repair that used to backfill them has been
+  removed. Discard the database and resync, or restore a snapshot taken with a current release
+  ([#533](https://github.com/zakura-core/zakura/pull/533)).
+- Replaced the `StateInitError::VctSproutHistoryRepairRequired` and
+  `::VctSproutHistoryRepairInvalid` variants with a single `::VctSproutHistoryUnrepairable`
+  ([#533](https://github.com/zakura-core/zakura/pull/533)).
+
+### Removed
+
+- Removed the `zakurad validate-vct-sprout-history` subcommand and the embedded VCT
+  Sprout-history repair artifact it audited. The forward fix that stops new databases from
+  missing historical Sprout anchors shipped long ago, so the 71 MB embedded artifact and its
+  replay migration no longer earn their place
+  ([#533](https://github.com/zakura-core/zakura/pull/533)).
+- Removed the `zakura-state` public API that existed only to build and audit that artifact:
+  `generate_mainnet_from_archive`, `GeneratorError`, `validate_vct_sprout_history`,
+  `VctSproutHistoryValidationSummary`, and `VctSproutHistoryValidationError`
+  ([#533](https://github.com/zakura-core/zakura/pull/533)).
+
+### Fixed
+
+- Reject noncanonical Orchard and Ironwood proof sizes while parsing V5 and V6
+  transactions, and ban peers that send these malformed transactions
+  ([#410](https://github.com/zakura-core/zakura/pull/410)).
+- Indexer gRPC tip and mempool subscriptions now apply backpressure with a
+  60-second send timeout instead of being dropped the moment their buffer
+  fills, so a briefly slow consumer no longer triggers rapid re-subscribe
+  cycles ([#486](https://github.com/zakura-core/zakura/pull/486)).
+- Prevent mined-block broadcasts from waiting for peers that disconnected while unavailable
+  ([#497](https://github.com/zakura-core/zakura/pull/497)).
+- Unknown peer message commands are now escaped before they are written to the
+  log, so control characters sent by a peer can no longer alter log output
+  ([#513](https://github.com/zakura-core/zakura/pull/513)).
+- Fixed Zakura's P2P user agent so every transport mode advertises the
+  `zakurad` release version without an internal networking crate version
+  ([#524](https://github.com/zakura-core/zakura/pull/524)).
+- Fixed `z_gettreestate` returning a JSON `null` treestate, and `z_getsubtreesbyindex`
+  returning an empty list, for heights a verified-commitment-trees fast-synced node has no
+  data for. Clients following the lightwalletd contract read an absent treestate as the
+  _empty_ tree, so a wallet could derive a birthday anchor asserting an empty commitment
+  tree deep in the chain with no error raised. Both now return a typed archive-mode error,
+  and verbose `getblock`/`getblockheader` preserve that explanation rather than reporting
+  bare "missing Orchard tree" and "missing Sapling tree" errors, respectively. Subtree errors
+  also report whether this node has determined that it will never hold the data, or has not yet
+  reached the handoff needed to decide
+  ([#534](https://github.com/zakura-core/zakura/pull/534)).
+
 ## [1.1.0-rc1] - 2026-08-02
 
 ### Changed

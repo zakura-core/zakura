@@ -334,7 +334,7 @@ impl ZakuraDb {
         &self,
         height: &Height,
     ) -> Option<Arc<sapling::tree::NoteCommitmentTree>> {
-        let sapling_trees = self.db.cf_handle("sapling_note_commitment_tree").unwrap();
+        let sapling_trees = self.db.cf_handle("sapling_note_commitment_tree")?;
         let (_stored_height, tree) = self
             .db
             .zs_prev_key_value_back_from(&sapling_trees, height)?;
@@ -489,7 +489,7 @@ impl ZakuraDb {
         &self,
         height: &Height,
     ) -> Option<Arc<orchard::tree::NoteCommitmentTree>> {
-        let orchard_trees = self.db.cf_handle("orchard_note_commitment_tree").unwrap();
+        let orchard_trees = self.db.cf_handle("orchard_note_commitment_tree")?;
         let (_stored_height, tree) = self
             .db
             .zs_prev_key_value_back_from(&orchard_trees, height)?;
@@ -644,7 +644,7 @@ impl ZakuraDb {
         &self,
         height: &Height,
     ) -> Option<Arc<ironwood::tree::NoteCommitmentTree>> {
-        let ironwood_trees = self.db.cf_handle("ironwood_note_commitment_tree").unwrap();
+        let ironwood_trees = self.db.cf_handle("ironwood_note_commitment_tree")?;
         let (_stored_height, tree) = self
             .db
             .zs_prev_key_value_back_from(&ironwood_trees, height)?;

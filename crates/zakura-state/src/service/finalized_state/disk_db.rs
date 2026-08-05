@@ -111,6 +111,11 @@ pub struct DiskDb {
     /// In [`MultiThreaded`](rocksdb::MultiThreaded) mode,
     /// only [`Drop`] requires exclusive access.
     db: Arc<DB>,
+
+    /// The temporary workspace RocksDB uses to follow a primary database.
+    ///
+    /// This must be declared after `db` so the RocksDB handle is dropped before the directory.
+    _secondary_dir: Option<Arc<tempfile::TempDir>>,
 }
 
 /// Wrapper struct to ensure low-level database writes go through the correct API.
@@ -394,8 +399,8 @@ enum DbMode {
     /// A read-write primary backed by temporary files that are deleted on drop.
     Ephemeral,
 
-    /// A read-only secondary that follows an existing primary's on-disk state. It owns
-    /// no files and never writes, flushes, or deletes them.
+    /// A read-only secondary that follows an existing primary's on-disk state. It never writes,
+    /// flushes, or deletes primary files; its temporary workspace is deleted on drop.
     ReadOnlySecondary,
 }
 
@@ -1088,17 +1093,21 @@ impl DiskDb {
             read_only,
         );
 
-        let db_result = if read_only {
-            // Use a tempfile for the secondary instance cache directory
-            let secondary_config = Config {
-                ephemeral: true,
-                ..config.clone()
-            };
-            let secondary_path =
-                secondary_config.db_path("secondary_state", format_version_in_code.major, network);
-            let create_dir_result = std::fs::create_dir_all(&secondary_path);
+        let secondary_dir = read_only.then(|| {
+            Arc::new(
+                tempfile::Builder::new()
+                    .prefix("zebra-secondary-state-")
+                    .tempdir()
+                    .expect("temporary RocksDB secondary directory can be created"),
+            )
+        });
 
-            info!(?create_dir_result, "creating secondary db directory");
+        let db_result = if let Some(secondary_dir) = &secondary_dir {
+            let secondary_path = secondary_dir.path().to_path_buf();
+            info!(
+                path = ?secondary_path,
+                "created temporary secondary db directory"
+            );
 
             DB::open_cf_descriptors_as_secondary(
                 &db_options,
@@ -1120,6 +1129,7 @@ impl DiskDb {
                     network: network.clone(),
                     mode,
                     db: Arc::new(db),
+                    _secondary_dir: secondary_dir,
                     finished_format_upgrades: Arc::new(AtomicBool::new(false)),
                 };
 
@@ -1166,6 +1176,12 @@ impl DiskDb {
     /// Returns the `Path` where the files used by this database are located.
     pub fn path(&self) -> &Path {
         self.db.path()
+    }
+
+    /// Returns the temporary RocksDB secondary workspace in tests.
+    #[cfg(test)]
+    pub(crate) fn secondary_path(&self) -> Option<&Path> {
+        self._secondary_dir.as_deref().map(tempfile::TempDir::path)
     }
 
     /// Returns the low-level rocksdb inner database.

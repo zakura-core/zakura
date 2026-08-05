@@ -5,7 +5,7 @@
 //! checking the result against the authenticated roots in `commitment_roots_by_height` (see
 //! [`crate::service::read::historical_tree`]). That rests on two inputs actually being present:
 //! a gap-free root index across the band, and retained block bodies. This module reports whether
-//! they are, and measures what the replay costs.
+//! they are, checks the pre-band anchor frontiers, and measures what the replay costs.
 //!
 //! Everything here is read-only, runs off the consensus path, and is safe against a quiesced
 //! database snapshot.
@@ -68,17 +68,22 @@ pub struct VctTreestateInventory {
     /// `None` means the whole band is replayable. Only meaningful when [`Self::scanned`].
     pub missing_block_body: Option<Height>,
 
+    /// The required pre-band frontier height, if any pool has no stored tree at or below it.
+    pub missing_anchor: Option<Height>,
+
     /// How long the two scans took.
     pub scan_duration: Duration,
 }
 
 impl VctTreestateInventory {
-    /// Returns the absent band `[U, H)`, or `None` if this database has no band.
+    /// Returns the committed part of the absent band `[U, min(H, T + 1))`.
     pub fn absent_band(&self) -> Option<(Height, Height)> {
         let last_checkpoint = self.last_checkpoint?;
+        let finalized_tip = self.finalized_tip?;
         let upgrade = self.upgrade_height.unwrap_or(Height(0));
+        let committed_end = Height(last_checkpoint.0.min(finalized_tip.0.saturating_add(1)));
 
-        (upgrade < last_checkpoint).then_some((upgrade, last_checkpoint))
+        (upgrade < committed_end).then_some((upgrade, committed_end))
     }
 
     /// Returns whether this database has everything derivation needs across its absent band, or
@@ -88,6 +93,7 @@ impl VctTreestateInventory {
             self.absent_band().is_some()
                 && self.root_index_gap.is_none()
                 && self.missing_block_body.is_none()
+                && self.missing_anchor.is_none()
         })
     }
 }
@@ -111,6 +117,7 @@ pub fn inventory(db: &ZakuraDb, scan_band: bool) -> VctTreestateInventory {
         scanned: scan_band,
         root_index_gap: None,
         missing_block_body: None,
+        missing_anchor: None,
         scan_duration: Duration::ZERO,
     };
 
@@ -119,6 +126,18 @@ pub fn inventory(db: &ZakuraDb, scan_band: bool) -> VctTreestateInventory {
         let last = Height(band_end.0 - 1);
         inventory.root_index_gap = db.first_commitment_root_gap(band_start..=last);
         inventory.missing_block_body = db.first_missing_block_body(band_start, last);
+    }
+
+    if let Some((band_start, _)) = inventory.absent_band() {
+        if band_start.0 > 0 {
+            let anchor = Height(band_start.0 - 1);
+            if db.latest_stored_sapling_tree(&anchor).is_none()
+                || db.latest_stored_orchard_tree(&anchor).is_none()
+                || db.latest_stored_ironwood_tree(&anchor).is_none()
+            {
+                inventory.missing_anchor = Some(anchor);
+            }
+        }
     }
 
     inventory.scan_duration = start.elapsed();
@@ -163,9 +182,7 @@ pub fn measure_derivations(
     heights: impl IntoIterator<Item = Height>,
     max_replay_blocks: u64,
     mut on_sample: impl FnMut(&DerivationSample),
-) -> Result<Vec<DerivationSample>, (Height, HistoricalTreeDerivationError)> {
-    let mut samples = Vec::new();
-
+) -> Result<(), (Height, HistoricalTreeDerivationError)> {
     for height in heights {
         let start = Instant::now();
         // The derivation reports its own replay length: it may have anchored on the memo, on a
@@ -181,10 +198,9 @@ pub fn measure_derivations(
             elapsed,
         };
         on_sample(&sample);
-        samples.push(sample);
     }
 
-    Ok(samples)
+    Ok(())
 }
 
 /// The outcome of checking replay-derived subtrees against the ones the database stored.
@@ -227,9 +243,9 @@ pub fn verify_subtrees_against_stored(
     to: Height,
 ) -> Result<SubtreeVerification, HistoricalTreeDerivationError> {
     let (Some(sapling), Some(orchard), Some(ironwood)) = (
-        db.sapling_tree_by_height(&from),
-        db.orchard_tree_by_height(&from),
-        db.ironwood_tree_by_height(&from),
+        db.latest_stored_sapling_tree(&from),
+        db.latest_stored_orchard_tree(&from),
+        db.latest_stored_ironwood_tree(&from),
     ) else {
         return Err(HistoricalTreeDerivationError::MissingAnchor {
             height: to,
@@ -395,6 +411,42 @@ pub fn replay_inputs(db: &ZakuraDb, from: Height, to: Height) -> ReplayInputs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inventory_with_tip(finalized_tip: Height) -> VctTreestateInventory {
+        VctTreestateInventory {
+            finalized_tip: Some(finalized_tip),
+            upgrade_height: Some(Height(100)),
+            last_checkpoint: Some(Height(200)),
+            lowest_retained_height: None,
+            scanned: true,
+            root_index_gap: None,
+            missing_block_body: None,
+            missing_anchor: None,
+            scan_duration: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn absent_band_is_capped_at_finalized_tip() {
+        assert_eq!(
+            inventory_with_tip(Height(149)).absent_band(),
+            Some((Height(100), Height(150)))
+        );
+        assert_eq!(
+            inventory_with_tip(Height(250)).absent_band(),
+            Some((Height(100), Height(200)))
+        );
+        assert_eq!(inventory_with_tip(Height(99)).absent_band(), None);
+    }
+
+    #[test]
+    fn missing_anchor_prevents_derivation() {
+        let mut inventory = inventory_with_tip(Height(149));
+        assert_eq!(inventory.can_derive(), Some(true));
+
+        inventory.missing_anchor = Some(Height(99));
+        assert_eq!(inventory.can_derive(), Some(false));
+    }
 
     #[test]
     fn stored_subtree_match_requires_root_and_end_height() {

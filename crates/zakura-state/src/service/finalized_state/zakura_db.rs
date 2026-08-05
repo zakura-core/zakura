@@ -331,6 +331,12 @@ impl ZakuraDb {
         self.db.path()
     }
 
+    /// Returns the temporary RocksDB secondary workspace in tests.
+    #[cfg(test)]
+    pub(crate) fn secondary_path(&self) -> Option<&Path> {
+        self.db.secondary_path()
+    }
+
     /// Check for panics in code running in spawned threads.
     /// If a thread exited with a panic, resume that panic.
     ///

@@ -5,7 +5,8 @@
 //! command reports whether a state database has the inputs that needs, and optionally walks the
 //! absent band to confirm the root check holds at every height and to measure what replay costs.
 //!
-//! Read-only: it opens the database as a secondary instance and never writes.
+//! It opens the primary database read-only as a secondary instance. RocksDB writes its temporary
+//! secondary workspace separately and removes it when the command closes the database.
 
 use std::{path::PathBuf, sync::Mutex, time::Duration};
 
@@ -20,6 +21,9 @@ use zakura_state::{
 };
 
 use crate::prelude::APPLICATION;
+
+/// Bounds audit bookkeeping and catches accidentally enormous CLI ranges before any allocation.
+const MAX_AUDIT_SAMPLES: u64 = 5_000_000;
 
 /// Audit historical note commitment treestate serving in an existing state database
 #[derive(Command, Debug, Default, Parser)]
@@ -183,12 +187,7 @@ impl AuditHistoricalTreestatesCmd {
             ));
         }
 
-        // The band is half-open, so its last covered height is `H - 1`.
-        let from = Height(self.from.unwrap_or(band_start.0));
-        let to = Height(self.to.unwrap_or(band_end.0 - 1));
-        if from > to {
-            return Err(eyre!("--from {} is above --to {}", from.0, to.0));
-        }
+        let (from, to) = validated_walk_range(self.from, self.to, band_start, band_end)?;
 
         println!();
         println!(
@@ -205,22 +204,32 @@ impl AuditHistoricalTreestatesCmd {
     /// Derives every sampled height in `[from, to]`, printing progress and a summary.
     #[allow(clippy::print_stdout)]
     fn walk_band(&self, db: &zakura_state::ZakuraDb, from: Height, to: Height) -> Result<()> {
+        let total = sample_count(from, to, self.step);
+        if total > MAX_AUDIT_SAMPLES {
+            return Err(eyre!(
+                "the requested range contains {total} samples, above the {MAX_AUDIT_SAMPLES} \
+                 sample limit; increase --step or narrow the range"
+            ));
+        }
+        let total = usize::try_from(total)
+            .map_err(|_| eyre!("the requested sample count does not fit this platform"))?;
         let heights = sampled_heights(from, to, self.step);
-        let total = heights.len();
 
         if self.print_roots {
             let cache = Mutex::new(HistoricalTreeCache::default());
-            let roots = zakura_state::derived_roots_in_display_order(
-                db,
-                &cache,
-                heights,
-                DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
-            )
-            .map_err(|(height, error)| {
-                eyre!("derivation failed at height {}: {error}", height.0)
-            })?;
-
-            for (height, sapling, orchard, ironwood) in roots {
+            for height in heights {
+                let mut roots = zakura_state::derived_roots_in_display_order(
+                    db,
+                    &cache,
+                    [height],
+                    DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+                )
+                .map_err(|(height, error)| {
+                    eyre!("derivation failed at height {}: {error}", height.0)
+                })?;
+                let (height, sapling, orchard, ironwood) = roots
+                    .pop()
+                    .expect("one requested derivation produces one root tuple");
                 println!("ROOT {} {sapling} {orchard} {ironwood}", height.0);
             }
 
@@ -264,7 +273,7 @@ impl AuditHistoricalTreestatesCmd {
         let result = if self.cold {
             // A fresh memo per height forces every derivation to replay from the bottom of the
             // band, which is the cost a client pays with no nearby frontier.
-            let mut collected = Ok(Vec::new());
+            let mut result = Ok(());
             for height in heights {
                 let cache = Mutex::new(new_cache());
                 match zakura_state::measure_derivations(
@@ -276,12 +285,12 @@ impl AuditHistoricalTreestatesCmd {
                 ) {
                     Ok(_) => {}
                     Err(error) => {
-                        collected = Err(error);
+                        result = Err(error);
                         break;
                     }
                 }
             }
-            collected.map(|_: Vec<DerivationSample>| ())
+            result
         } else {
             let cache = Mutex::new(new_cache());
             zakura_state::measure_derivations(
@@ -291,7 +300,6 @@ impl AuditHistoricalTreestatesCmd {
                 DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
                 &mut report,
             )
-            .map(|_| ())
         };
 
         print_walk_summary(&samples);
@@ -300,17 +308,54 @@ impl AuditHistoricalTreestatesCmd {
     }
 }
 
-/// Returns heights spaced by `step` in `[from, to]`, always including both endpoints.
-fn sampled_heights(from: Height, to: Height, step: u32) -> Vec<Height> {
-    let step =
-        usize::try_from(step).expect("u32 values fit in usize on Zakura's supported targets");
-    let mut heights: Vec<Height> = (from.0..=to.0).step_by(step).map(Height).collect();
+/// Validates explicit bounds and applies the committed absent-band defaults.
+fn validated_walk_range(
+    from: Option<u32>,
+    to: Option<u32>,
+    band_start: Height,
+    band_end: Height,
+) -> Result<(Height, Height)> {
+    let from = Height(from.unwrap_or(band_start.0));
+    let to = Height(to.unwrap_or(band_end.0 - 1));
 
-    if heights.last() != Some(&to) {
-        heights.push(to);
+    if from > Height::MAX || to > Height::MAX {
+        return Err(eyre!(
+            "walk bounds must not exceed the maximum block height {}",
+            Height::MAX.0
+        ));
+    }
+    if from > to {
+        return Err(eyre!("--from {} is above --to {}", from.0, to.0));
+    }
+    if from < band_start || to >= band_end {
+        return Err(eyre!(
+            "walk range [{}, {}] is outside the committed absent band [{}, {})",
+            from.0,
+            to.0,
+            band_start.0,
+            band_end.0
+        ));
     }
 
-    heights
+    Ok((from, to))
+}
+
+/// Returns the number of heights sampled in `[from, to]`, including both endpoints.
+fn sample_count(from: Height, to: Height, step: u32) -> u64 {
+    let span = u64::from(to.0 - from.0);
+    span / u64::from(step) + 1 + u64::from(!span.is_multiple_of(u64::from(step)))
+}
+
+/// Iterates over heights spaced by `step` in `[from, to]`, always including both endpoints.
+fn sampled_heights(from: Height, to: Height, step: u32) -> impl Iterator<Item = Height> + Clone {
+    let needs_endpoint = !(to.0 - from.0).is_multiple_of(step);
+    let step =
+        usize::try_from(step).expect("u32 values fit in usize on Zakura's supported targets");
+
+    (from.0..=to.0)
+        .step_by(step)
+        .map(Height)
+        .chain(needs_endpoint.then_some(to))
 }
 
 /// Rejects incomplete as well as contradictory subtree ground truth in either direction.
@@ -376,6 +421,13 @@ fn print_inventory(inventory: &VctTreestateInventory) {
         "  missing block body:     {}",
         inventory.missing_block_body.map_or_else(
             || "none (all retained)".to_string(),
+            |height| format!("at height {}", height.0)
+        )
+    );
+    println!(
+        "  missing anchor:         {}",
+        inventory.missing_anchor.map_or_else(
+            || "none (all pools present)".to_string(),
             |height| format!("at height {}", height.0)
         )
     );
@@ -453,21 +505,47 @@ fn format_duration(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{sampled_heights, validate_subtree_verification};
+    use super::{
+        sample_count, sampled_heights, validate_subtree_verification, validated_walk_range,
+    };
     use zakura_chain::{block::Height, subtree::NoteCommitmentSubtreeIndex};
     use zakura_state::SubtreeVerification;
 
     #[test]
     fn sampled_heights_always_include_to() {
         assert_eq!(
-            sampled_heights(Height(100), Height(110), 6),
+            sampled_heights(Height(100), Height(110), 6).collect::<Vec<_>>(),
             [Height(100), Height(106), Height(110)]
         );
         assert_eq!(
-            sampled_heights(Height(100), Height(112), 6),
+            sampled_heights(Height(100), Height(112), 6).collect::<Vec<_>>(),
             [Height(100), Height(106), Height(112)]
         );
-        assert_eq!(sampled_heights(Height(100), Height(100), 6), [Height(100)]);
+        assert_eq!(
+            sampled_heights(Height(100), Height(100), 6).collect::<Vec<_>>(),
+            [Height(100)]
+        );
+        assert_eq!(sample_count(Height(100), Height(110), 6), 3);
+        assert_eq!(sample_count(Height(100), Height(112), 6), 3);
+        assert_eq!(sample_count(Height(100), Height(100), 6), 1);
+        assert_eq!(
+            sample_count(Height::MIN, Height(u32::MAX), 1),
+            u64::from(u32::MAX) + 1
+        );
+    }
+
+    #[test]
+    fn walk_range_must_stay_within_committed_absent_band() {
+        let band_start = Height(100);
+        let band_end = Height(200);
+
+        assert_eq!(
+            validated_walk_range(None, None, band_start, band_end).unwrap(),
+            (Height(100), Height(199))
+        );
+        assert!(validated_walk_range(Some(99), None, band_start, band_end).is_err());
+        assert!(validated_walk_range(None, Some(200), band_start, band_end).is_err());
+        assert!(validated_walk_range(Some(Height::MAX.0 + 1), None, band_start, band_end).is_err());
     }
 
     #[test]

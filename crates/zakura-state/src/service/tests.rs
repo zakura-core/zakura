@@ -1526,6 +1526,40 @@ fn read_only_completed_checkpoint_subscription_stays_open() {
     assert!(receiver.has_changed().is_err());
 }
 
+#[test]
+fn read_only_secondary_workspace_is_deleted_on_drop() {
+    let network = Network::Mainnet;
+    let cache_dir =
+        tempfile::tempdir().expect("creating a temporary cache directory should succeed");
+    let config = Config {
+        cache_dir: cache_dir.path().to_path_buf(),
+        ephemeral: false,
+        ..Config::default()
+    };
+
+    let mut finalized_state =
+        FinalizedState::new(&config, &network).expect("writable state creates the database");
+    finalized_state.db.shutdown(true);
+    drop(finalized_state);
+
+    let (read_service, db, non_finalized_sender) =
+        super::init_read_only(config, &network).expect("read-only state opens");
+    let secondary_path = db
+        .secondary_path()
+        .expect("read-only state has a secondary workspace")
+        .to_path_buf();
+    assert!(secondary_path.is_dir());
+
+    drop(read_service);
+    drop(non_finalized_sender);
+    drop(db);
+
+    assert!(
+        !secondary_path.exists(),
+        "the secondary workspace is owned by the read-only database"
+    );
+}
+
 /// Opening a read-only state against a missing or unreadable cache directory must fail with a
 /// typed [`StateInitError::ReadOnlyCacheDirUnreadable`] rather than panicking while reading the
 /// on-disk format version.

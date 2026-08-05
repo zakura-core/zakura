@@ -316,9 +316,9 @@ fn anchor_for(
 
     let anchor = Height(upgrade.0 - 1);
     let (Some(sapling), Some(orchard), Some(ironwood)) = (
-        db.sapling_tree_by_height(&anchor),
-        db.orchard_tree_by_height(&anchor),
-        db.ironwood_tree_by_height(&anchor),
+        db.latest_stored_sapling_tree(&anchor),
+        db.latest_stored_orchard_tree(&anchor),
+        db.latest_stored_ironwood_tree(&anchor),
     ) else {
         return Err(HistoricalTreeDerivationError::MissingAnchor { height, anchor });
     };

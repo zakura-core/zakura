@@ -1,6 +1,6 @@
 [package]
 name = "zakura-rpc"
-version = "6.0.0-rc1"
+version = "6.0.0-rc2"
 authors.workspace = true
 description = "The Zakura node's JSON Remote Procedure Call (JSON-RPC) interface. Internal crate, published to support cargo install zakura"
 license.workspace = true

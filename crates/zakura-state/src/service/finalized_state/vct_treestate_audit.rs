@@ -18,7 +18,7 @@ use crate::service::{
     finalized_state::ZakuraDb,
     read::{
         historical_tree::{
-            derive_historical_frontiers_measured, replay_with_subtrees,
+            derive_historical_frontiers_measured, replay_with_subtrees, verify_against_index,
             HistoricalTreeDerivationError, ShieldedPool,
         },
         DerivedFrontiers, HistoricalTreeCache,
@@ -200,7 +200,8 @@ pub struct SubtreeVerification {
     pub unstored: usize,
 }
 
-/// Replays `(from, to]` and checks every subtree that completes against the stored subtree rows.
+/// Replays `(from, to]`, authenticates the final frontiers at `to`, and checks every subtree that
+/// completes against the stored subtree rows.
 ///
 /// This exists because subtree roots produced by replay are otherwise unvalidated: they are
 /// interior nodes, so the per-height root check does not test them directly. Above a fast-synced
@@ -230,9 +231,10 @@ pub fn verify_subtrees_against_stored(
     };
 
     let mut completions = Vec::new();
-    replay_with_subtrees(db, to, from.0 + 1, anchor, |pool, completed| {
+    let frontiers = replay_with_subtrees(db, to, from.0 + 1, anchor, |pool, completed| {
         completions.push((pool, completed))
     })?;
+    verify_against_index(db, to, &frontiers)?;
 
     let mut outcome = SubtreeVerification::default();
 

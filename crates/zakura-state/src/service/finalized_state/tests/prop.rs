@@ -48,8 +48,8 @@ use crate::{
 
 use super::super::{
     commitment_aux, serve_block_roots, vct::validate_final_frontiers_bytes,
-    CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState, HeaderRootAuthUpdate,
-    HeaderWitnessState, HighestCompletedCheckpoint, NextVctBlock,
+    verify_subtrees_against_stored, CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState,
+    HeaderRootAuthUpdate, HeaderWitnessState, HighestCompletedCheckpoint, NextVctBlock,
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -1860,6 +1860,45 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 bad_ironwood_handoff.db.finalized_tip_height(),
                 Some(Height(last as u32 - 1)),
                 "the refused Ironwood handoff block left state untouched"
+            );
+
+            // The subtree audit must authenticate the replay endpoint even when no subtree
+            // completes in the range. Otherwise corruption after the last boundary (or, as in
+            // this short fixture, before the first boundary) would leave no subtree row to expose
+            // the bad replay.
+            let subtree_outcome =
+                verify_subtrees_against_stored(&legacy.db, Height(seed as u32), handoff)
+                    .expect("the unmodified replay endpoint matches its authenticated roots");
+            prop_assert_eq!(
+                subtree_outcome,
+                Default::default(),
+                "the short fixture completes no subtrees"
+            );
+
+            let mut corrupted_endpoint = legacy
+                .db
+                .commitment_roots_by_height_range(handoff..=handoff)
+                .into_iter()
+                .next()
+                .expect("the handoff has an authenticated root row");
+            prop_assert_ne!(
+                corrupted_endpoint.sapling_root,
+                Default::default(),
+                "the fixture needs a non-empty Sapling endpoint"
+            );
+            corrupted_endpoint.sapling_root = Default::default();
+            let mut corrupt_endpoint_batch = DiskWriteBatch::new();
+            corrupt_endpoint_batch
+                .insert_body_derived_commitment_roots(&legacy.db, &corrupted_endpoint);
+            legacy
+                .db
+                .write_batch(corrupt_endpoint_batch)
+                .expect("the test corrupts the endpoint root row");
+
+            prop_assert_eq!(
+                verify_subtrees_against_stored(&legacy.db, Height(seed as u32), handoff),
+                Err(HistoricalTreeDerivationError::RootMismatch { height: handoff }),
+                "the subtree audit rejects a replay whose final frontiers are unauthenticated"
             );
     });
 

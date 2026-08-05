@@ -1657,8 +1657,8 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             // The `z_gettreestate` RPC gate predicate matches the read guard: a
             // below-handoff height is unavailable (typed archive-mode error), while the
             // handoff height itself is available.
-            prop_assert!(fast.db.vct_historical_tree_unavailable(HashOrHeight::Height(Height(last as u32 - 1))), "RPC gate: below-handoff treestate is unavailable");
-            prop_assert!(!fast.db.vct_historical_tree_unavailable(HashOrHeight::Height(handoff)), "RPC gate: handoff treestate is available");
+            prop_assert!(fast.db.vct_tree_absent(Height(last as u32 - 1)), "RPC gate: below-handoff treestate is unavailable");
+            prop_assert!(!fast.db.vct_tree_absent(handoff), "RPC gate: handoff treestate is available");
 
             // The read handlers turn that predicate into the typed archive-mode error the
             // RPC boundary reports, carrying the handoff so the failure is diagnosable.

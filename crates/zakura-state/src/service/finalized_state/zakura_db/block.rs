@@ -971,17 +971,6 @@ impl ZakuraDb {
         upgrade <= height && height < handoff
     }
 
-    /// Returns `true` if `hash_or_height` resolves to a non-tip historical height
-    /// whose per-height note-commitment tree is unavailable because this is a
-    /// vct-synced database (the tree within the `[U, H)` absent band was never
-    /// written). Read-request handlers use this to return an archive-mode error
-    /// instead of a misleading "not found".
-    pub fn vct_historical_tree_unavailable(&self, hash_or_height: HashOrHeight) -> bool {
-        hash_or_height
-            .height_or_else(|hash| self.height(hash))
-            .is_some_and(|height| self.vct_tree_absent(height))
-    }
-
     /// Returns the half-open range of block heights `[from, until)` whose raw
     /// transaction data should be pruned when committing a block at `new_tip`,
     /// given the configured `retention` window. Returns `None` if there is

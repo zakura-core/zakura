@@ -793,13 +793,10 @@ async fn pre_activation_tree_requests_return_empty_frontiers() {
 
     let mut batch = DiskWriteBatch::new();
     batch.update_vct_sync_marker(&read_state.db, handoff);
-    batch.delete_sapling_tree(&read_state.db, &requested_height);
-    batch.delete_orchard_tree(&read_state.db, &requested_height);
-    batch.delete_ironwood_tree(&read_state.db, &requested_height);
     read_state
         .db
         .write_batch(batch)
-        .expect("seeding missing pre-activation trees succeeds");
+        .expect("seeding the VCT absent band succeeds");
 
     assert_eq!(
         read_state

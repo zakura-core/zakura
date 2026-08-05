@@ -5,6 +5,7 @@
 # against this file directly — the tokens are not valid TOML until rendered.
 #
 # Tokens: @@COMMIT@@ @@COHORT@@ @@BOOTSTRAP@@ @@P2P_STACK@@ @@STORAGE@@
+#         @@NODE_A_SSH@@ @@NODE_B_SSH@@
 
 [defaults]
 service_name    = "zakurad"
@@ -26,10 +27,10 @@ bootstrap_peers = @@BOOTSTRAP@@
 
 [[nodes]]
 name       = "serve-a"
-ssh_string = "root@167.99.162.47"
+ssh_string = "@@NODE_A_SSH@@"
 commit     = "@@COMMIT@@"
 
 [[nodes]]
 name       = "serve-b"
-ssh_string = "root@167.172.201.36"
+ssh_string = "@@NODE_B_SSH@@"
 commit     = "@@COMMIT@@"

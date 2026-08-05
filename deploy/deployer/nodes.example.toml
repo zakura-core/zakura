@@ -29,12 +29,12 @@ p2p_stack       = "dual"                     # legacy | zakura | dual | default
 
 [[nodes]]
 name       = "node-a"
-ssh_string = "root@167.99.162.47"
+ssh_string = "root@203.0.113.10"
 commit     = "evan/perf-note-commit-tree"   # branch, tag, or full/short SHA
 
 [[nodes]]
 name       = "node-b"
-ssh_string = "root@167.172.201.36"
+ssh_string = "root@203.0.113.11"
 commit     = "evan/perf-note-commit-tree"
 
 # Process-managed nodes skip systemd unit installation. Use this only when a

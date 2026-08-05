@@ -89,6 +89,8 @@ render_nodes() {
       -e "s#@@BOOTSTRAP@@#$(bootstrap_toml)#g" \
       -e "s#@@P2P_STACK@@#${p2p_stack}#g" \
       -e "s#@@STORAGE@@#archive#g" \
+      -e "s#@@NODE_A_SSH@@#${NODE_A_SSH}#g" \
+      -e "s#@@NODE_B_SSH@@#${NODE_B_SSH}#g" \
       "$NODES_TMPL" > "$out"
   echo "$out"
 }

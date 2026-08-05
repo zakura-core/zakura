@@ -244,15 +244,15 @@ class ContinuousSyncTests(unittest.TestCase):
     def test_deploy_renders_expanded_legacy_alert_inventory(self):
         nodes = deploy.load_nodes(
             ROOT / "deploy" / "continuous-sync" / "nodes.toml",
-            ["temp-zakura-sync-test-4"],
+            ["temp-zakura-sync-test-5"],
         )
         rendered = deploy.render_files(nodes[0])
 
         self.assertIn('p2p_stack = "legacy"', rendered["zakurad.toml.template"])
         self.assertIn('mode_label = "Zebra/legacy-only"', rendered["controller.toml"])
         self.assertIn('branch = "main"', rendered["controller.toml"])
-        self.assertEqual(rendered["alert-monitor.toml"].count("[[nodes]]"), 7)
-        for index in range(1, 8):
+        self.assertEqual(rendered["alert-monitor.toml"].count("[[nodes]]"), 3)
+        for index in [1, 2, 5]:
             self.assertIn(
                 f'hostname = "temp-zakura-sync-test-{index}"',
                 rendered["alert-monitor.toml"],
@@ -494,16 +494,16 @@ class ContinuousSyncTests(unittest.TestCase):
             )
 
     def test_metrics_degraded_while_service_active_does_not_page_down(self):
-        hostname = "temp-zakura-sync-test-6"
+        hostname = "temp-zakura-sync-test-5"
         status = {
             "hostname": hostname,
-            "public_ip": "138.68.249.46",
+            "public_ip": "142.93.27.189",
             "mode": "Zebra/legacy-only",
             "service": "zakura.service",
             "service_active": True,
             "metrics_status": "unavailable: TimeoutError",
             "height": None,
-            "connection": "root@138.68.249.46",
+            "connection": "root@142.93.27.189",
             "alias_connection": f"ssh {hostname}",
             "log_path": "/tmp/zebrad.log",
             "trace_path": "/tmp/traces",
@@ -878,9 +878,9 @@ class ContinuousSyncTests(unittest.TestCase):
         config = make_config(
             Path("/tmp"),
             policy=sync.Policy(
-                hostname="temp-zakura-sync-test-3",
+                hostname="temp-zakura-sync-test-5",
                 p2p_stack="zebra",
-                public_ip="134.209.49.92",
+                public_ip="142.93.27.189",
             ),
         )
 
@@ -892,8 +892,8 @@ class ContinuousSyncTests(unittest.TestCase):
 
         self.assertEqual(
             text,
-            ":rotating_light: Zakura failed: temp-zakura-sync-test-3 | legacy | "
-            "root@134.209.49.92 | time to failure: 1h 2m 3s | height: 2584406 | "
+            ":rotating_light: Zakura failed: temp-zakura-sync-test-5 | legacy | "
+            "root@142.93.27.189 | time to failure: 1h 2m 3s | height: 2584406 | "
             "reason: boom",
         )
         self.assertNotIn("\n", text)

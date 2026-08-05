@@ -12,11 +12,6 @@
       "rpc_url": "http://127.0.0.1:18232"
     },
     {
-      "name": "roman-zebra",
-      "impl": "zebra",
-      "rpc_url": "http://159.65.164.85:18232"
-    },
-    {
       "name": "zakura-testnet-eu",
       "impl": "zakura",
       "rpc_url": "http://164.92.209.78:18232"

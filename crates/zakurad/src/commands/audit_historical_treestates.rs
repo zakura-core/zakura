@@ -16,8 +16,8 @@ use color_eyre::eyre::{eyre, Result};
 
 use zakura_chain::{block::Height, parameters::Network};
 use zakura_state::{
-    DerivationSample, HistoricalTreeCache, SubtreeVerification, VctTreestateInventory,
-    DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+    DerivationSample, HistoricalTreeCache, PruningConfig, StorageMode, SubtreeVerification,
+    VctTreestateInventory, DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 
 use crate::prelude::APPLICATION;
@@ -112,9 +112,10 @@ pub struct AuditHistoricalTreestatesCmd {
 
 impl Runnable for AuditHistoricalTreestatesCmd {
     /// `audit-historical-treestates` sub-command entrypoint.
+    #[allow(clippy::print_stderr)]
     fn run(&self) {
         if let Err(error) = self.run_with_config(APPLICATION.config().state.clone()) {
-            tracing::error!("Failed to audit historical treestates: {error:#}");
+            eprintln!("Failed to audit historical treestates: {error:#}");
             std::process::exit(1);
         }
     }
@@ -130,7 +131,16 @@ impl AuditHistoricalTreestatesCmd {
 
         if let Some(cache_dir) = self.cache_dir.clone() {
             state_config.cache_dir = cache_dir;
+            // Read-only pruned mode can inspect both archive and pruned databases, and never
+            // performs pruning. This makes a standalone path override sufficient for either.
+            if matches!(state_config.storage_mode, StorageMode::Archive) {
+                state_config.storage_mode = StorageMode::Pruned(PruningConfig::default());
+            }
         }
+
+        state_config
+            .validate_storage_mode(&self.network)
+            .map_err(|error| eyre!("{error}"))?;
 
         let (_read_state, db, _non_finalized_sender) =
             zakura_state::init_read_only(state_config, &self.network)?;

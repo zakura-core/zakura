@@ -26,11 +26,12 @@ use zakura_chain::{
 use crate::service::finalized_state::{
     disk_db::{DiskWriteBatch, ReadDisk},
     disk_format::{
+        block::HEIGHT_DISK_BYTES,
         chain::{HistoryTreeDecodeError, HistoryTreeParts},
         shielded::CommitmentRootsByHeight,
         RawBytes,
     },
-    IntoDisk, TypedColumnFamily,
+    FromDisk, IntoDisk, TypedColumnFamily,
 };
 
 use super::{highest_completed_checkpoint::HighestCompletedCheckpoint, ZakuraDb};
@@ -1052,12 +1053,22 @@ impl ZakuraDb {
     /// multi-hundred-megabyte vector.
     pub fn first_commitment_root_gap(&self, range: impl RangeBounds<Height>) -> Option<Height> {
         let (start, end) = inclusive_bounds(range)?;
+        let Some(commitment_roots) = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT) else {
+            return Some(start);
+        };
+        let start_key = RawBytes::new_raw_bytes(start.as_bytes().to_vec());
+        let end_key = RawBytes::new_raw_bytes(end.as_bytes().to_vec());
 
         let mut expected = start;
-        for (height, _row) in self
-            .commitment_roots_cf()
-            .zs_forward_range_iter(start..=end)
-        {
+        for (key, _raw_value) in self.db.zs_forward_range_iter::<_, RawBytes, RawBytes, _>(
+            &commitment_roots,
+            start_key..=end_key,
+        ) {
+            if key.raw_bytes().len() != HEIGHT_DISK_BYTES {
+                return Some(expected);
+            }
+
+            let height = Height::from_bytes(key.raw_bytes());
             if height != expected {
                 return Some(expected);
             }
@@ -2801,6 +2812,54 @@ mod tests {
             db.first_commitment_root_gap(Height(5)..=Height(4)),
             None,
             "an empty range has no gap"
+        );
+    }
+
+    #[test]
+    fn first_commitment_root_gap_reads_only_canonical_keys() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_mainnet_db();
+        let roots = |height: u32| BlockCommitmentRoots {
+            height: Height(height),
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0; 32]),
+            sapling_tx: 0,
+            orchard_tx: 0,
+            ironwood_tx: 0,
+        };
+        db.insert_zakura_header_commitment_roots((1..=3).map(roots))
+            .expect("seeding roots succeeds");
+
+        let roots_cf = db
+            .db
+            .cf_handle(COMMITMENT_ROOTS_BY_HEIGHT)
+            .expect("test database has the roots column family");
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_insert(&roots_cf, Height(2), RawBytes::new_raw_bytes(vec![0xff]));
+        db.write_batch(batch)
+            .expect("writing a malformed value succeeds");
+
+        assert_eq!(
+            db.first_commitment_root_gap(Height(1)..=Height(3)),
+            None,
+            "the key inventory does not decode unused row values"
+        );
+
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_insert(
+            &roots_cf,
+            RawBytes::new_raw_bytes(vec![0, 0, 1, 0]),
+            RawBytes::new_raw_bytes(vec![0]),
+        );
+        db.write_batch(batch)
+            .expect("writing a noncanonical key succeeds");
+
+        assert_eq!(
+            db.first_commitment_root_gap(Height(1)..=Height(3)),
+            Some(Height(2)),
+            "a noncanonical key cannot alias a canonical height"
         );
     }
 }

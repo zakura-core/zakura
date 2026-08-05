@@ -1718,10 +1718,6 @@ where
                     //
                     // In regtest we only connect to Zebra nodes, not zcashd,
                     // so we trust all hashes in the response and keep them all.
-                    // This is necessary when there are only a small number of
-                    // blocks to sync (e.g. 2 new blocks), where stripping the
-                    // last hash leaves only 1 unknown hash and rchunks_exact(2)
-                    // would discard the entire response.
                     let hashes = if self.is_regtest {
                         hashes.as_slice()
                     } else {

@@ -8505,7 +8505,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "anyhow",
  "bitflags",
@@ -8547,7 +8547,9 @@ dependencies = [
  "tracing-futures",
  "tracing-subscriber",
  "zakura-chain",
+ "zakura-header-chain",
  "zakura-jsonl-trace",
+ "zakura-node-services",
  "zakura-test",
 ]
 

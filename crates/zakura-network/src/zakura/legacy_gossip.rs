@@ -114,6 +114,9 @@ const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_INVENTORY_MISSING_RETRIES: usize = 8;
 const SOURCE_INVENTORY_MISSING_RETRY_DELAY: Duration = Duration::from_millis(500);
 const LEGACY_REQUEST_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Reserve half of each connection's stream-open budget for native ordered
+/// streams, reconnects, and other request clients.
+const LEGACY_REQUEST_STREAM_RATE_DIVISOR: u32 = 2;
 /// How long the dual-stack tries the (buffered) legacy peer set for an inventory
 /// fetch before falling back to Zakura. Without this bound, a node that upgraded
 /// all its peers to Zakura (and so has no ready legacy peer) would block every
@@ -748,7 +751,13 @@ impl LegacyResponseCodec {
         reassembler.finish()?;
 
         match request_kind {
+            LegacyRequestKind::Blocks if blocks.is_empty() => {
+                Err(LegacyGossipError::MissingResponse(request_kind.command()))
+            }
             LegacyRequestKind::Blocks => Ok(Response::Blocks(blocks)),
+            LegacyRequestKind::Transactions if transactions.is_empty() => {
+                Err(LegacyGossipError::MissingResponse(request_kind.command()))
+            }
             LegacyRequestKind::Transactions => Ok(Response::Transactions(transactions)),
             LegacyRequestKind::FindBlocks => Ok(Response::BlockHashes(block_hashes)),
             LegacyRequestKind::FindHeaders => Ok(Response::BlockHeaders(block_headers)),
@@ -1739,6 +1748,20 @@ impl LegacyRequestAdapter {
         }
     }
 
+    fn new_with_trace_and_stream_rate(
+        supervisor: ZakuraSupervisorHandle,
+        trace: ZakuraTrace,
+        stream_open_rate_per_second: u32,
+    ) -> Self {
+        Self {
+            client: ZakuraRequestClient::new_with_trace_and_stream_rate(
+                supervisor,
+                trace,
+                stream_open_rate_per_second,
+            ),
+        }
+    }
+
     #[cfg(test)]
     fn new_with_timeout(supervisor: ZakuraSupervisorHandle, request_timeout: Duration) -> Self {
         Self {
@@ -1847,11 +1870,16 @@ impl<L> ZakuraDualStackService<L> {
         supervisor: ZakuraSupervisorHandle,
         legacy_enabled: bool,
         trace: ZakuraTrace,
+        stream_open_rate_per_second: u32,
     ) -> Self {
         Self {
             legacy,
             gossip: LegacyGossipAdapter::new(supervisor.clone()),
-            request: LegacyRequestAdapter::new_with_trace(supervisor, trace),
+            request: LegacyRequestAdapter::new_with_trace_and_stream_rate(
+                supervisor,
+                trace,
+                stream_open_rate_per_second,
+            ),
             legacy_enabled,
         }
     }
@@ -1963,6 +1991,8 @@ pub struct ZakuraRequestClient {
     supervisor: ZakuraSupervisorHandle,
     request_timeout: Duration,
     trace: ZakuraTrace,
+    request_interval: Duration,
+    next_request_at: Arc<Mutex<Instant>>,
 }
 
 impl ZakuraRequestClient {
@@ -1973,20 +2003,47 @@ impl ZakuraRequestClient {
 
     /// Create a client from a Zakura supervisor and trace emitter.
     pub fn new_with_trace(supervisor: ZakuraSupervisorHandle, trace: ZakuraTrace) -> Self {
+        Self::new_with_trace_and_stream_rate(
+            supervisor,
+            trace,
+            super::DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,
+        )
+    }
+
+    fn new_with_trace_and_stream_rate(
+        supervisor: ZakuraSupervisorHandle,
+        trace: ZakuraTrace,
+        stream_open_rate_per_second: u32,
+    ) -> Self {
+        let request_rate = legacy_request_stream_rate(stream_open_rate_per_second);
+        let interval_nanos = 1_000_000_000u64
+            .checked_div(u64::from(request_rate))
+            .unwrap_or(1)
+            .max(1);
         Self {
             supervisor,
             request_timeout: LEGACY_REQUEST_TIMEOUT,
             trace,
+            request_interval: Duration::from_nanos(interval_nanos),
+            next_request_at: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
     #[cfg(test)]
     fn new_with_timeout(supervisor: ZakuraSupervisorHandle, request_timeout: Duration) -> Self {
-        Self {
-            supervisor,
-            request_timeout,
-            trace: ZakuraTrace::noop(),
-        }
+        let mut client = Self::new(supervisor);
+        client.request_timeout = request_timeout;
+        client
+    }
+
+    async fn wait_for_request_slot(&self) {
+        let request_at = {
+            let mut next_request_at = self.next_request_at.lock().await;
+            let request_at = (*next_request_at).max(Instant::now());
+            *next_request_at = request_at + self.request_interval;
+            request_at
+        };
+        tokio::time::sleep_until(request_at).await;
     }
 
     async fn request(
@@ -2080,6 +2137,7 @@ impl ZakuraRequestClient {
         frame: LegacyRequestFrame,
         request_kind: LegacyRequestKind,
     ) -> Result<Response, BoxError> {
+        self.wait_for_request_slot().await;
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         // Capture the requested block hashes (if any) before consuming the frame,
         // so the response can be bound to a hash we actually asked for.
@@ -2176,6 +2234,12 @@ impl ZakuraRequestClient {
         });
         Ok(response)
     }
+}
+
+fn legacy_request_stream_rate(stream_open_rate_per_second: u32) -> u32 {
+    stream_open_rate_per_second
+        .max(1)
+        .div_ceil(LEGACY_REQUEST_STREAM_RATE_DIVISOR)
 }
 
 fn select_handle(
@@ -3581,6 +3645,7 @@ mod tests {
         let (service_send, _peer_recv) = framed_channel(8);
         let stream = ServiceStream::new(
             session_id,
+            LEGACY_GOSSIP_VERSION,
             service_recv,
             service_send,
             cancel_token.child_token(),
@@ -3616,16 +3681,26 @@ mod tests {
     }
 
     async fn wait_registered_count(node: &ZakuraTestNode, count: usize) -> Result<(), BoxError> {
-        tokio::time::timeout(TEST_NET_TIMEOUT, async {
+        let result = tokio::time::timeout(TEST_NET_TIMEOUT, async {
             loop {
-                if node.supervisor().registered_ids().await.len() == count {
+                let observed = node.supervisor().registered_ids().await.len();
+                if observed == count {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .map_err(|_| -> BoxError { "timed out waiting for peer registration count".into() })
+        .await;
+
+        if result.is_err() {
+            let observed = node.supervisor().registered_ids().await.len();
+            return Err(format!(
+                "timed out waiting for {count} peer registrations; observed {observed}"
+            )
+            .into());
+        }
+
+        Ok(())
     }
 
     /// Regression for `claude-legacy-request-orphaned-handler-permits`.
@@ -4966,6 +5041,47 @@ mod tests {
             ),
             Err(LegacyGossipError::OversizedResponse(_))
         ));
+    }
+
+    #[test]
+    fn response_codec_rejects_empty_inventory_frame_sets() {
+        for kind in [LegacyRequestKind::Blocks, LegacyRequestKind::Transactions] {
+            assert!(matches!(
+                LegacyResponseCodec::decode_response(1, kind, Vec::new(), None),
+                Err(LegacyGossipError::MissingResponse(_))
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_client_paces_stream_opens_below_the_connection_limit() {
+        let client = ZakuraRequestClient::new_with_trace_and_stream_rate(
+            ZakuraSupervisorHandle::new(1),
+            ZakuraTrace::noop(),
+            4,
+        );
+        let started = Instant::now();
+
+        client.wait_for_request_slot().await;
+        assert_eq!(
+            Instant::now(),
+            started,
+            "the first request uses the open slot"
+        );
+
+        client.wait_for_request_slot().await;
+        assert_eq!(
+            Instant::now().duration_since(started),
+            Duration::from_millis(500),
+            "compatibility requests use half the configured stream-open rate"
+        );
+
+        client.wait_for_request_slot().await;
+        assert_eq!(
+            Instant::now().duration_since(started),
+            Duration::from_secs(1),
+            "successive request slots stay evenly spaced"
+        );
     }
 
     /// The inbound service returns `Response::Nil` (a lone nil frame) for an empty

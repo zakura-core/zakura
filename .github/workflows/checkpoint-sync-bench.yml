@@ -162,7 +162,6 @@ jobs:
       - name: Run checkpoint-sync benchmark
         env:
           IP: ${{ steps.droplet.outputs.ip }}
-          GH_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BUILD_REF: ${{ inputs.build_ref }}
           BASELINE_REF: ${{ inputs.baseline_ref }}
           SKIP_BASELINE: ${{ inputs.skip_baseline && '1' || '0' }}
@@ -192,7 +191,6 @@ jobs:
           umask 077
           {
             printf 'GH_REPO=%q\n'          "${GITHUB_REPOSITORY}"
-            printf 'GH_CLONE_TOKEN=%q\n'   "${GH_CLONE_TOKEN}"
             printf 'BUILD_REF=%q\n'        "${BUILD_REF}"
             printf 'BASELINE_REF=%q\n'     "${BASELINE_REF}"
             printf 'SKIP_BASELINE=%q\n'    "${SKIP_BASELINE}"

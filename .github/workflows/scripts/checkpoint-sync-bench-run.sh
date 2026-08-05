@@ -24,20 +24,6 @@ mkdir -p "$OUT_DIR" "$BENCH_HOME"
 log() { printf '[ckpt-bench-run %(%H:%M:%S)T] %s\n' -1 "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
 
-# Invoked via trap below; shellcheck cannot see indirect calls.
-# shellcheck disable=SC2317,SC2329
-scrub_secrets() {
-  local ec=$?
-  git config --global --unset credential.helper 2>/dev/null || true
-  if command -v gh >/dev/null 2>&1; then
-    gh auth logout --hostname github.com >/dev/null 2>&1 || true
-  fi
-  rm -f /root/run.env
-  # Preserve the script's real status: EXIT-trap failures would otherwise mask it.
-  exit "$ec"
-}
-trap scrub_secrets EXIT INT TERM
-
 [[ -f "$BENCH_SH" ]] || die "missing $BENCH_SH (workflow must scp it)"
 [[ -n "${VOLUME_NAME:-}" ]] || die "VOLUME_NAME is required"
 
@@ -73,14 +59,11 @@ PRIMARY_SHA=""
 if [[ -n "${BUILD_REF:-}" ]]; then
   [[ -d /root/zakura/.git ]] || die "baked /root/zakura clone missing"
   cd /root/zakura
-  GIT_AUTH=$(printf 'x-access-token:%s' "${GH_CLONE_TOKEN}" | base64 -w0)
   # Fetch every ref we may build so BUILD_REF / BASELINE_REF resolve offline later.
-  git -c http.extraheader="AUTHORIZATION: basic ${GIT_AUTH}" \
-    fetch --no-tags origin "${BUILD_REF}"
+  git fetch --no-tags origin "${BUILD_REF}"
   PRIMARY_SHA=$(git rev-parse --verify 'FETCH_HEAD^{commit}')
   if [[ -n "${BASELINE_REF:-}" && "${SKIP_BASELINE:-0}" != "1" ]]; then
-    git -c http.extraheader="AUTHORIZATION: basic ${GIT_AUTH}" \
-      fetch --no-tags origin "${BASELINE_REF}"
+    git fetch --no-tags origin "${BASELINE_REF}"
   fi
   git checkout --detach "${PRIMARY_SHA}"
 
@@ -94,31 +77,11 @@ if [[ -n "${BUILD_REF:-}" ]]; then
     die "DB format mismatch: volume is v${DIR_VER}, benched tree is v${CODE_VER}; re-bake the state snapshot"
   fi
   log "state DB v${DIR_VER} compatible with code v${CODE_VER}; primary=${PRIMARY_SHA}"
-
-  # Leave a short-lived credential helper so checkpoint-sync-bench.sh can fetch
-  # baseline/primary checkouts without re-exporting the token into the env file.
-  git config --global credential.helper \
-    "!f() { echo username=x-access-token; echo password=${GH_CLONE_TOKEN}; }; f"
-elif [[ -n "${RELEASE_TAG:-}" ]]; then
-  if ! command -v gh >/dev/null 2>&1; then
-    log "installing GitHub CLI for release download ..."
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg status=none
-    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list
-    apt-get update -qq
-    apt-get install -y -qq gh
-  fi
-  echo "${GH_CLONE_TOKEN}" | gh auth login --with-token
-else
+elif [[ -z "${RELEASE_TAG:-}" ]]; then
   die "set BUILD_REF or RELEASE_TAG"
 fi
 
 rm -f /root/run.env
-# Keep the token only inside the temporary git credential helper (build mode)
-# or the gh auth session (release mode). Clear the shell copy.
-unset GH_CLONE_TOKEN GIT_AUTH
 
 # ---------------------------------------------------------------------------- #
 # Run metadata for the artifact (image / snapshot / droplet identity)

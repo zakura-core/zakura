@@ -293,22 +293,22 @@ ensure_snapshot() {
 # sets ZAKURAD_BIN to the zakurad binary path for $1=tag (returns via global, not
 # stdout, so no subcommand chatter can ever pollute the path)
 ensure_binary() {
-  local tag="$1" bindir="$BENCH_HOME/bins/$1" zakurad
+  local tag="$1" bindir="$BENCH_HOME/bins/$1" zakurad asset release_url
   zakurad="$bindir/zakurad"
   if [[ -x "$zakurad" ]]; then ZAKURAD_BIN="$zakurad"; return; fi
   mkdir -p "$bindir"
   log "fetching release $tag from $GH_REPO ..." >&2
   local dl="$bindir/dl"; rm -rf "$dl"; mkdir -p "$dl"
-  gh release download "$tag" -R "$GH_REPO" \
-    -p 'zakurad-*-linux-x86_64.tar.gz' -p 'zakurad-*-linux-x86_64.tar.gz' -p 'SHA256SUMS.txt' -D "$dl" \
-    || die "gh release download failed for $tag"
-  local tgz; tgz="$(find "$dl" \( -name 'zakurad-*-linux-x86_64.tar.gz' -o -name 'zakurad-*-linux-x86_64.tar.gz' \) | head -1)"
-  [[ -n "$tgz" ]] || die "no linux-x86_64 tarball asset on release $tag"
-  if [[ -f "$dl/SHA256SUMS.txt" ]]; then
-    # NB: keep all output on stderr — this function's stdout is captured as the binary path
-    ( cd "$dl" && grep "$(basename "$tgz")" SHA256SUMS.txt | sha256sum -c - ) >&2 \
-      || die "release tarball checksum mismatch for $tag"
-  fi
+  asset="zakurad-${tag}-linux-x86_64.tar.gz"
+  release_url="https://github.com/${GH_REPO}/releases/download/${tag}"
+  curl -fL --retry 3 --retry-all-errors -o "$dl/$asset" "$release_url/$asset" \
+    || die "release tarball download failed for $tag"
+  curl -fL --retry 3 --retry-all-errors -o "$dl/SHA256SUMS.txt" "$release_url/SHA256SUMS.txt" \
+    || die "release checksum download failed for $tag"
+  # NB: keep all output on stderr — this function's stdout is captured as the binary path
+  ( cd "$dl" && grep -F " ./$asset" SHA256SUMS.txt | sha256sum -c - ) >&2 \
+    || die "release tarball checksum mismatch for $tag"
+  local tgz="$dl/$asset"
   tar -xzf "$tgz" -C "$dl"
   local found; found="$(find "$dl" -type f \( -name zakurad -o -name zakurad \) | head -1)"
   [[ -n "$found" ]] || die "node binary not found in tarball for $tag"
@@ -349,11 +349,10 @@ ensure_source() {
   ensure_toolchain
   if [[ ! -d "$BUILD_SRC/.git" ]]; then
     log "cloning $GH_REPO -> $BUILD_SRC (first build only) ..." >&2
-    gh auth setup-git 2>/dev/null || true
     git clone "https://github.com/$GH_REPO.git" "$BUILD_SRC" >&2 || die "git clone failed"
   fi
-  # Ephemeral CI prefetches the needed commits; a credential helper may still be
-  # configured. Fall back to a tagged fetch for local persistent hosts.
+  # Ephemeral CI prefetches the needed commits. Fall back to a tagged fetch for
+  # local persistent hosts.
   if ! git -C "$BUILD_SRC" fetch --no-tags --force origin >&2; then
     git -C "$BUILD_SRC" fetch --tags --force origin >&2 || die "git fetch failed"
   fi

@@ -17,7 +17,8 @@ mod validation;
 
 pub use config::{
     CheckpointSet, EngineConfig, EngineConfigError, EngineLimits, EngineMode,
-    SettledUpgradeManifest, SettledUpgradePin, TrustedAnchor, MAX_CANDIDATE_TIPS_V1,
+    SettledUpgradeManifest, SettledUpgradePin, TrustedAnchor, MAX_AUX_DELIVERIES_PER_HEADER_V1,
+    MAX_AUX_DELIVERIES_TOTAL_V1, MAX_CANDIDATE_TIPS_V1, MAX_HEADERS_PER_TRANSITION_V1,
     MAX_NON_FINALIZED_NODES_V1, MAX_STAGED_TARGETS_V1,
 };
 pub use error::{Attribution, ErrorCategory, ErrorSubject, HeaderChainError, RuleId};
@@ -40,8 +41,12 @@ pub use ownership::{
 };
 pub use transition::*;
 pub use validation::{
-    infer_height, validate_commitment_structure, validate_compact_target,
+    infer_height, prepare_context_free_headers, prepare_headers, validate_commitment_structure,
+    validate_compact_target, validate_contextual_difficulty_and_time,
     validate_encoding_version_hash, validate_future_time, validate_hash_filter, validate_link,
-    CompactTargetError, HashFilterError, HeaderEncodingError, HeaderHeightError, HeaderLinkError,
-    PowPolicy, PowPolicyError,
+    AdjustedDifficulty, AdjustedDifficultyError, CompactTargetError, ContextualValidationError,
+    HashFilterError, HeaderBatchInput, HeaderEncodingError, HeaderFailure, HeaderHeightError,
+    HeaderLinkError, HeaderRule, HeaderRules, PowPolicy, PowPolicyError,
+    BLOCK_MAX_TIME_SINCE_MEDIAN, POW_ADJUSTMENT_BLOCK_SPAN, POW_MEDIAN_BLOCK_SPAN,
+    POW_PREDECESSOR_CONTEXT_SPAN,
 };

@@ -35,48 +35,40 @@ pub(crate) fn enforce_retention<G: HeaderGraphEdit>(
         }
     }
 
-    let mut plan = RetentionPlan::default();
+    let plan = RetentionPlan::default();
     let under_pressure = store.view_eligible_tips().len() > limits.max_candidate_tips.get()
         || store.view_node_count().saturating_sub(1) > limits.max_non_finalized_nodes.get();
     if under_pressure {
         evict_permanently_ineligible(store, &protected)?;
     }
 
+    let mut eligible_candidates = unprotected_eligible_tips(store, &protected)?;
     while store.view_eligible_tips().len() > limits.max_candidate_tips.get() {
-        let Some(tip) = lowest_unprotected_eligible_tip(store, &protected)? else {
-            plan.admission_refused = true;
-            plan.resource_stalled = true;
-            return Ok(plan);
+        let Some(tip) = eligible_candidates.pop() else {
+            return Ok(stalled(plan));
         };
-        let previous_node_count = store.view_node_count();
-        evict_tip_branch(store, tip.hash, &protected)?;
-        if store.view_node_count() == previous_node_count {
-            plan.admission_refused = true;
-            plan.resource_stalled = true;
-            return Ok(plan);
+        if store.view_node(tip.hash).is_some() {
+            evict_tip_branch(store, tip.hash, &protected)?;
         }
     }
 
+    let mut leaf_candidates = unprotected_leaves(store, &protected)?;
     while store.view_node_count().saturating_sub(1) > limits.max_non_finalized_nodes.get() {
-        let tip = match lowest_unprotected_eligible_tip(store, &protected)? {
-            Some(tip) => Some(tip.hash),
-            None => lowest_unprotected_leaf(store, &protected)?,
+        let Some(hash) = leaf_candidates.pop() else {
+            return Ok(stalled(plan));
         };
-        let Some(tip) = tip else {
-            plan.admission_refused = true;
-            plan.resource_stalled = true;
-            return Ok(plan);
-        };
-        let previous_node_count = store.view_node_count();
-        evict_tip_branch(store, tip, &protected)?;
-        if store.view_node_count() == previous_node_count {
-            plan.admission_refused = true;
-            plan.resource_stalled = true;
-            return Ok(plan);
+        if store.view_node(hash).is_some() {
+            evict_tip_branch(store, hash, &protected)?;
         }
     }
 
     Ok(plan)
+}
+
+fn stalled(mut plan: RetentionPlan) -> RetentionPlan {
+    plan.admission_refused = true;
+    plan.resource_stalled = true;
+    plan
 }
 
 fn protect_path<G: HeaderGraphView>(
@@ -121,7 +113,7 @@ fn evict_permanently_ineligible<G: HeaderGraphEdit>(
         (node.height, hash.0)
     });
     for root in roots {
-        if store.view_node(root).is_none() || subtree_contains_protected(store, root, protected) {
+        if store.view_node(root).is_none() {
             continue;
         }
         let mut descendants = subtree_postorder(store, root);
@@ -130,21 +122,6 @@ fn evict_permanently_ineligible<G: HeaderGraphEdit>(
         }
     }
     Ok(())
-}
-
-fn subtree_contains_protected<G: HeaderGraphView>(
-    store: &G,
-    root: block::Hash,
-    protected: &HashSet<block::Hash>,
-) -> bool {
-    let mut pending = vec![root];
-    while let Some(hash) = pending.pop() {
-        if protected.contains(&hash) {
-            return true;
-        }
-        pending.extend(store.view_children(hash));
-    }
-    false
 }
 
 fn subtree_postorder<G: HeaderGraphView>(store: &G, root: block::Hash) -> Vec<block::Hash> {
@@ -167,35 +144,32 @@ fn subtree_postorder<G: HeaderGraphView>(store: &G, root: block::Hash) -> Vec<bl
     result
 }
 
-fn lowest_unprotected_eligible_tip<G: HeaderGraphView>(
+fn unprotected_eligible_tips<G: HeaderGraphView>(
     store: &G,
     protected: &HashSet<block::Hash>,
-) -> Result<Option<Frontier>, GraphError> {
+) -> Result<Vec<Frontier>, GraphError> {
     let mut candidates: Vec<_> = store
         .view_eligible_tips()
         .into_iter()
-        .filter(|tip| {
-            !protected.contains(&tip.hash)
-                && !subtree_contains_protected(store, tip.hash, protected)
-        })
+        .filter(|tip| !protected.contains(&tip.hash))
         .map(|tip| Ok((store.view_score(tip.hash)?, tip)))
         .collect::<Result<_, GraphError>>()?;
-    candidates.sort_unstable_by_key(|(score, _)| *score);
-    Ok(candidates.first().map(|(_, tip)| *tip))
+    candidates.sort_unstable_by_key(|(score, _)| std::cmp::Reverse(*score));
+    Ok(candidates.into_iter().map(|(_, tip)| tip).collect())
 }
 
-fn lowest_unprotected_leaf<G: HeaderGraphView>(
+fn unprotected_leaves<G: HeaderGraphView>(
     store: &G,
     protected: &HashSet<block::Hash>,
-) -> Result<Option<block::Hash>, GraphError> {
+) -> Result<Vec<block::Hash>, GraphError> {
     let mut candidates: Vec<_> = store
         .view_retained_hashes()
         .into_iter()
         .filter(|hash| !protected.contains(hash) && store.view_children(*hash).is_empty())
         .map(|hash| Ok((store.view_score(hash)?, hash)))
         .collect::<Result<_, GraphError>>()?;
-    candidates.sort_unstable_by_key(|(score, _)| *score);
-    Ok(candidates.first().map(|(_, hash)| *hash))
+    candidates.sort_unstable_by_key(|(score, _)| std::cmp::Reverse(*score));
+    Ok(candidates.into_iter().map(|(_, hash)| hash).collect())
 }
 
 fn evict_tip_branch<G: HeaderGraphEdit>(
@@ -203,10 +177,7 @@ fn evict_tip_branch<G: HeaderGraphEdit>(
     root: block::Hash,
     protected: &HashSet<block::Hash>,
 ) -> Result<(), GraphError> {
-    if protected.contains(&root)
-        || root == store.view_finalized().hash
-        || subtree_contains_protected(store, root, protected)
-    {
+    if protected.contains(&root) || root == store.view_finalized().hash {
         return Ok(());
     }
     let mut hash = store

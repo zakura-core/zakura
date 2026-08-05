@@ -314,12 +314,16 @@ impl<'a> GraphOverlay<'a> {
         &mut self,
         hash: block::Hash,
         id: OperatorInvalidationId,
+        evidence: Option<EvidenceId>,
     ) -> Result<bool, GraphError> {
-        let changed = self
-            .node_mut(hash)?
-            .eligibility
-            .direct_reasons
-            .remove(&EligibilityReason::OperatorInvalid { id });
+        let reasons = &mut self.node_mut(hash)?.eligibility.direct_reasons;
+        let before = reasons.len();
+        reasons.retain(|reason| {
+            !matches!(reason,
+                EligibilityReason::OperatorInvalid { id: existing, evidence: existing_evidence, .. }
+                if *existing == id && Some(*existing_evidence) == evidence)
+        });
+        let changed = reasons.len() != before;
         if changed {
             self.recompute_descendant_eligibility(hash)?;
         }
@@ -773,11 +777,19 @@ mod tests {
         overlay
             .add_reason(
                 first.hash,
-                EligibilityReason::OperatorInvalid { id: operator },
+                EligibilityReason::operator_invalid(
+                    first.hash,
+                    operator,
+                    EvidenceId::from_digest([9; 32]),
+                ),
             )
             .expect("operator invalidation propagates");
         overlay
-            .remove_operator_invalidation(first.hash, operator)
+            .remove_operator_invalidation(
+                first.hash,
+                operator,
+                Some(EvidenceId::from_digest([9; 32])),
+            )
             .expect("operator reconsideration propagates");
         overlay
             .set_body_state(second.hash, BodyValidationState::CommitmentMatched)
@@ -902,9 +914,11 @@ mod tests {
         eligibility
             .add_reason(
                 left.hash,
-                EligibilityReason::OperatorInvalid {
-                    id: OperatorInvalidationId::new([5; 16]),
-                },
+                EligibilityReason::operator_invalid(
+                    left.hash,
+                    OperatorInvalidationId::new([5; 16]),
+                    EvidenceId::from_digest([5; 32]),
+                ),
             )
             .expect("the local invalidation propagates");
         let (base_clones, changed_nodes, eligibility_visits) = eligibility.operation_counts();

@@ -275,21 +275,26 @@ impl AdjustedDifficulty {
         let averaging_window_thresholds =
             &self.relevant_difficulty_thresholds.as_slice()[0..POW_AVERAGING_WINDOW];
 
-        // Since the PoWLimits are `2^251 − 1` for Testnet, and `2^243 − 1` for
-        // Mainnet, the sum of 17 `ExpandedDifficulty` will be less than or equal
-        // to: `(2^251 − 1) * 17 = 2^255 + 2^251 - 17`. Therefore, the sum can
-        // not overflow a u256 value.
-        let total: ExpandedDifficulty = averaging_window_thresholds
-            .iter()
-            .map(|compact| {
-                compact
-                    .to_expanded()
-                    .expect("difficulty thresholds in previously verified blocks are valid")
-            })
-            .sum();
-
         let divisor: U256 = POW_AVERAGING_WINDOW.into();
-        total / divisor
+        let mut quotient_total = U256::zero();
+        let mut remainder_total = U256::zero();
+        for compact in averaging_window_thresholds {
+            let target: U256 = compact
+                .to_expanded()
+                .expect("difficulty thresholds in previously verified blocks are valid")
+                .into();
+            quotient_total = quotient_total
+                .checked_add(target / divisor)
+                .expect("the sum of divided targets is at most U256::MAX");
+            remainder_total = remainder_total
+                .checked_add(target % divisor)
+                .expect("17 remainders smaller than 17 fit in U256");
+        }
+        ExpandedDifficulty::from(
+            quotient_total
+                .checked_add(remainder_total / divisor)
+                .expect("the exact mean of U256 targets is at most U256::MAX"),
+        )
     }
 
     /// Calculate the bounded median timespan. The median timespan is the
@@ -489,6 +494,26 @@ mod tests {
 
     fn compact_half_limit(network: &Network) -> CompactDifficulty {
         (network.target_difficulty_limit() / U256::from(2_u8)).to_compact()
+    }
+
+    #[test]
+    fn custom_target_mean_does_not_overflow_u256() {
+        let candidate_time =
+            DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in range");
+        let compact = ExpandedDifficulty::from(U256::MAX).to_compact();
+        let expanded = compact
+            .to_expanded()
+            .expect("the maximum compact-representable target is valid");
+        let context = vec![(compact, candidate_time - Duration::seconds(1)); 28];
+        let adjustment = AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            block::Height(699_999),
+            &Network::Mainnet,
+            context,
+        )
+        .expect("the complete context is accepted");
+
+        assert_eq!(adjustment.mean_target_difficulty(), expanded);
     }
 
     fn context(

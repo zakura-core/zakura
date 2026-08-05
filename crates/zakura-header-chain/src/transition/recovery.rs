@@ -191,6 +191,11 @@ pub fn audit_store_at<S: StoreAuditRead>(
         }
     }
     let by_hash: HashMap<_, _> = source_nodes.iter().map(|node| (node.hash, node)).collect();
+    let validation_contexts = store.validation_context_records()?;
+    let archived_contexts: HashMap<_, _> = validation_contexts
+        .iter()
+        .map(|record| (record.header.hash(), record.header.as_ref()))
+        .collect();
     let finalized = metadata.frontiers.finalized;
     if by_hash
         .get(&finalized.hash)
@@ -198,10 +203,25 @@ pub fn audit_store_at<S: StoreAuditRead>(
     {
         violations.push(AuditViolation::ProtectedPath(finalized.hash));
     }
-    check_nodes(&source_nodes, &by_hash, &metadata, now, &mut violations);
+    check_nodes(
+        &source_nodes,
+        &by_hash,
+        &archived_contexts,
+        &metadata,
+        config,
+        now,
+        &mut violations,
+    );
     check_finalized_connectivity(&source_nodes, finalized, &mut violations);
     check_trust_pins(&source_nodes, finalized, config, &mut violations);
-    check_authoritative_rows(store, &source_nodes, &metadata, config, &mut violations)?;
+    check_authoritative_rows(
+        store,
+        &source_nodes,
+        &validation_contexts,
+        &metadata,
+        config,
+        &mut violations,
+    )?;
     if source_nodes.len().saturating_sub(1) > config.limits.max_non_finalized_nodes.get()
         && !metadata.alarms.resource_stalled
     {
@@ -342,11 +362,18 @@ pub fn audit_store_at<S: StoreAuditRead>(
 fn check_nodes(
     nodes: &[HeaderNode],
     by_hash: &HashMap<block::Hash, &HeaderNode>,
+    archived_contexts: &HashMap<block::Hash, &block::Header>,
     metadata: &EngineMetadata,
+    config: &EngineConfig,
     now: DateTime<Utc>,
     violations: &mut Vec<AuditViolation>,
 ) {
     for node in nodes {
+        if node.hash != metadata.frontiers.finalized.hash
+            && !header_consensus_is_valid(node, by_hash, archived_contexts, config)
+        {
+            violations.push(AuditViolation::HeaderValidation(node.hash));
+        }
         if node.header.difficulty_threshold.to_work() != Some(node.block_work) {
             violations.push(AuditViolation::Work(node.hash));
         }
@@ -406,6 +433,51 @@ fn check_nodes(
             violations.push(AuditViolation::HeaderValidation(node.hash));
         }
     }
+}
+
+fn header_consensus_is_valid(
+    node: &HeaderNode,
+    by_hash: &HashMap<block::Hash, &HeaderNode>,
+    archived_contexts: &HashMap<block::Hash, &block::Header>,
+    config: &EngineConfig,
+) -> bool {
+    if crate::validation::validate_trusted_anchor_observables(
+        &node.header,
+        &config.network,
+        node.height,
+    ) != Ok(node.hash)
+    {
+        return false;
+    }
+    let Ok(parent_height) = node.height.previous() else {
+        return false;
+    };
+    let required = usize::try_from(node.height.0)
+        .unwrap_or(usize::MAX)
+        .min(crate::POW_ADJUSTMENT_BLOCK_SPAN);
+    let mut hash = node.parent_hash;
+    let mut context = Vec::with_capacity(required);
+    while context.len() < required {
+        let header = if let Some(predecessor) = by_hash.get(&hash) {
+            predecessor.header.as_ref()
+        } else if let Some(predecessor) = archived_contexts.get(&hash) {
+            *predecessor
+        } else {
+            return false;
+        };
+        context.push((header.difficulty_threshold, header.time));
+        hash = header.previous_block_hash;
+    }
+    let Ok(adjustment) = crate::AdjustedDifficulty::new_from_header_time(
+        node.header.time,
+        parent_height,
+        &config.network,
+        context,
+    ) else {
+        return false;
+    };
+    crate::validate_contextual_difficulty_and_time(node.header.difficulty_threshold, adjustment)
+        .is_ok()
 }
 
 fn check_finalized_connectivity(
@@ -507,6 +579,7 @@ fn check_trust_pins(
 fn check_authoritative_rows<S: StoreAuditRead>(
     store: &S,
     nodes: &[HeaderNode],
+    validation_contexts: &[ValidationContextRecord],
     metadata: &EngineMetadata,
     config: &EngineConfig,
     violations: &mut Vec<AuditViolation>,
@@ -569,7 +642,7 @@ fn check_authoritative_rows<S: StoreAuditRead>(
         }
     }
 
-    let mut contexts = store.validation_context_records()?;
+    let mut contexts = validation_contexts.to_vec();
     contexts.sort_unstable_by_key(|record| record.height);
     let predecessor_span = u32::try_from(crate::POW_PREDECESSOR_CONTEXT_SPAN)
         .map_err(|_| StoreError::Incoherent("validation context bound does not fit in u32"))?;
@@ -893,6 +966,7 @@ mod tests {
         .expect("the canonical anchor fields agree");
         let mut child_header = *block.header;
         child_header.previous_block_hash = anchor.hash;
+        child_header.time += Duration::seconds(1);
         child_header.nonce = [1; 32].into();
         let child_header = Arc::new(child_header);
         let child_hash = child_header.hash();
@@ -1041,6 +1115,48 @@ mod tests {
                 .expect("the child remains retained")
                 .validation,
             crate::HeaderValidationState::Valid
+        );
+    }
+
+    #[test]
+    fn persisted_valid_flags_do_not_bypass_header_consensus_validation() {
+        let (mut store, config) = fixture();
+        let anchor = store.metadata.frontiers.finalized;
+        let mut invalid_header = *store.nodes[1].header;
+        invalid_header.solution = zakura_chain::work::equihash::Solution::for_proposal();
+        let invalid_header = Arc::new(invalid_header);
+        let invalid_hash = invalid_header.hash();
+        let block_work = invalid_header
+            .difficulty_threshold
+            .to_work()
+            .expect("the independently invalid version retains valid work");
+        store.nodes[1] = HeaderNode::from_durable_parts(
+            invalid_header,
+            invalid_hash,
+            anchor.hash,
+            block::Height(1),
+            block_work,
+            store.nodes[0]
+                .work_coordinate()
+                .checked_add(block_work)
+                .expect("the one-block fixture work fits"),
+            HeaderValidationState::Valid,
+            EligibilityState::default(),
+            BodyValidationState::Unknown,
+            Vec::new(),
+        )
+        .expect("durable shape validation is intentionally weaker than consensus validation");
+        let invalid = Frontier::new(block::Height(1), invalid_hash);
+        store.children = vec![(anchor.hash, invalid_hash)];
+        store.selected = vec![anchor, invalid];
+        store.metadata.frontiers.header_best = invalid;
+        store.metadata.header_best_score =
+            ChainScore::new(SuffixWork::new(block_work.as_u256()), invalid_hash);
+        store.snapshot = store.metadata.snapshot();
+        store.canonical.insert(block::Height(1), invalid_hash);
+
+        assert!(
+            violations(&store, &config).contains(&AuditViolation::HeaderValidation(invalid_hash))
         );
     }
 

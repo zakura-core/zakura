@@ -10,7 +10,7 @@ use zakura_chain::{
     ironwood, orchard,
     parameters::NetworkKind,
     sapling,
-    work::difficulty::Work,
+    work::difficulty::{ParameterDifficulty, Work},
 };
 
 use crate::{
@@ -85,8 +85,8 @@ pub struct EngineMetadata {
     pub oldest_retained_height: block::Height,
     /// Durable alarms.
     pub alarms: AlarmSet,
-    /// Idempotency identity of the most recent committed transition.
-    pub last_transition_id: EvidenceId,
+    /// Domain- and payload-bound identity of the most recent committed transition.
+    pub last_transition: Option<TransitionFingerprint>,
 }
 
 impl EngineMetadata {
@@ -106,14 +106,12 @@ impl EngineMetadata {
 }
 
 /// One immutable predecessor fact sealed into a validation lease.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeaderContextFact {
     /// Exact predecessor frontier.
     pub frontier: Frontier,
-    /// Compact target and time are authenticated by `frontier.hash`.
-    pub difficulty_threshold: zakura_chain::work::difficulty::CompactDifficulty,
-    /// Canonical predecessor time.
-    pub time: DateTime<Utc>,
+    /// Canonical predecessor header whose hash authenticates all contextual fields.
+    pub header: Arc<block::Header>,
 }
 
 /// Exact branch-local context used to prepare a header batch.
@@ -123,6 +121,8 @@ pub struct ValidationLease {
     pub(crate) parent: Frontier,
     /// Up to 28 facts in reverse height order, beginning with `parent`.
     pub(crate) predecessors: Vec<HeaderContextFact>,
+    /// Exact network policy used by the issuing engine.
+    pub(crate) network: zakura_chain::parameters::Network,
     /// Digest of current trust anchors.
     pub(crate) trust_anchor_digest: [u8; 32],
     /// Digest binding the complete lease contents.
@@ -134,6 +134,7 @@ impl ValidationLease {
     pub fn new(
         parent: Frontier,
         predecessors: Vec<HeaderContextFact>,
+        network: zakura_chain::parameters::Network,
         trust_anchor_digest: [u8; 32],
     ) -> Self {
         let mut hasher = Sha256::new();
@@ -141,16 +142,16 @@ impl ValidationLease {
         hasher.update(parent.height.0.to_le_bytes());
         hasher.update(parent.hash.0);
         hasher.update(trust_anchor_digest);
+        hash_network_policy(&mut hasher, &network);
         for fact in &predecessors {
             hasher.update(fact.frontier.height.0.to_le_bytes());
             hasher.update(fact.frontier.hash.0);
-            hasher.update(fact.difficulty_threshold.to_le_bytes());
-            hasher.update(fact.time.timestamp().to_le_bytes());
-            hasher.update(fact.time.timestamp_subsec_nanos().to_le_bytes());
+            hasher.update(fact.header.hash().0);
         }
         Self {
             parent,
             predecessors,
+            network,
             trust_anchor_digest,
             context_digest: hasher.finalize().into(),
         }
@@ -166,6 +167,11 @@ impl ValidationLease {
         &self.predecessors
     }
 
+    /// Return the exact authenticated network policy used to issue this lease.
+    pub fn network(&self) -> &zakura_chain::parameters::Network {
+        &self.network
+    }
+
     /// Return the digest of the trust anchors used to issue this lease.
     pub const fn trust_anchor_digest(&self) -> [u8; 32] {
         self.trust_anchor_digest
@@ -174,6 +180,47 @@ impl ValidationLease {
     /// Return the digest binding all lease contents.
     pub const fn context_digest(&self) -> [u8; 32] {
         self.context_digest
+    }
+
+    pub(crate) fn is_coherent(
+        &self,
+        network: &zakura_chain::parameters::Network,
+        trust_anchor_digest: [u8; 32],
+    ) -> bool {
+        let required = usize::try_from(self.parent.height.0)
+            .ok()
+            .and_then(|height| height.checked_add(1))
+            .map(|height| height.min(crate::POW_ADJUSTMENT_BLOCK_SPAN));
+        if self.network != *network
+            || self.trust_anchor_digest != trust_anchor_digest
+            || required != Some(self.predecessors.len())
+            || self.predecessors.first().map(|fact| fact.frontier) != Some(self.parent)
+        {
+            return false;
+        }
+        for (index, fact) in self.predecessors.iter().enumerate() {
+            if fact.header.hash() != fact.frontier.hash {
+                return false;
+            }
+            if let Some(newer) = index
+                .checked_sub(1)
+                .and_then(|index| self.predecessors.get(index))
+            {
+                if newer.header.previous_block_hash != fact.frontier.hash
+                    || newer.frontier.height.previous().ok() != Some(fact.frontier.height)
+                {
+                    return false;
+                }
+            }
+        }
+        Self::new(
+            self.parent,
+            self.predecessors.clone(),
+            self.network.clone(),
+            self.trust_anchor_digest,
+        )
+        .context_digest
+            == self.context_digest
     }
 }
 
@@ -193,9 +240,10 @@ pub struct PreparedHeader {
 }
 
 /// Sealed evidence that preparation completed every graph-independent rule.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextFreePreparationReceipt {
     parent: Frontier,
+    network: zakura_chain::parameters::Network,
     trust_anchor_digest: [u8; 32],
 }
 
@@ -203,6 +251,11 @@ impl ContextFreePreparationReceipt {
     /// Return the caller-supplied parent used for height-dependent local rules.
     pub const fn parent(&self) -> Frontier {
         self.parent
+    }
+
+    /// Return the exact network policy used for graph-independent validation.
+    pub fn network(&self) -> &zakura_chain::parameters::Network {
+        &self.network
     }
 
     /// Return the authenticated immutable rule-set identity.
@@ -224,16 +277,21 @@ impl PreparedHeaderBatch {
     pub(crate) fn new(
         headers: Vec<PreparedHeader>,
         parent: Frontier,
+        network: zakura_chain::parameters::Network,
         trust_anchor_digest: [u8; 32],
         evidence: EvidenceId,
     ) -> Result<Self, TransitionTypeError> {
         if headers.is_empty() {
             return Err(TransitionTypeError::EmptyHeaderBatch);
         }
+        if headers.len() > crate::MAX_HEADERS_PER_TRANSITION_V1 {
+            return Err(TransitionTypeError::OversizedHeaderBatch);
+        }
         Ok(Self {
             headers,
             receipt: ContextFreePreparationReceipt {
                 parent,
+                network,
                 trust_anchor_digest,
             },
             evidence,
@@ -246,8 +304,8 @@ impl PreparedHeaderBatch {
     }
 
     /// Return the sealed graph-independent preparation receipt.
-    pub const fn receipt(&self) -> ContextFreePreparationReceipt {
-        self.receipt
+    pub const fn receipt(&self) -> &ContextFreePreparationReceipt {
+        &self.receipt
     }
 
     /// Return the batch's stable validation-evidence identity.
@@ -655,6 +713,8 @@ pub struct OperatorReconsider {
     pub target: block::Hash,
     /// Exact invalidation identity to remove.
     pub id: OperatorInvalidationId,
+    /// Exact currently installed invalidation evidence, or `None` if it is absent.
+    pub invalidation_evidence: Option<EvidenceId>,
     /// Stable idempotency evidence for this authenticated operator action.
     pub evidence: EvidenceId,
 }
@@ -753,6 +813,127 @@ pub enum TransitionEvent {
     ReevaluateDeferred,
 }
 
+/// Stable domain of one replay-protected transition event.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TransitionDomain {
+    /// Prepared header admission.
+    InsertHeaders,
+    /// Full-state selected-path replacement.
+    VerifiedChainChanged,
+    /// Full-state side-path acceptance.
+    VerifiedBlockAccepted,
+    /// Supplier-attributed body payload mismatch.
+    BodyPayloadMismatch,
+    /// Deterministic body invalidity.
+    ConsensusBodyInvalid,
+    /// Transient body failure.
+    TransientBodyFailure,
+    /// Verified body acceptance.
+    VerifiedBody,
+    /// Body supplier-set discovery.
+    BodySupplierDiscovered,
+    /// Scheduler/operator body retry.
+    OperatorBodyRetry,
+    /// Operator invalidation.
+    OperatorInvalidate,
+    /// Operator reconsideration.
+    OperatorReconsider,
+    /// Full-state finality.
+    FullStateFinalized,
+    /// Migrated-pin refutation.
+    MigratedPinRefutation,
+    /// Auxiliary authentication evidence.
+    AuxEvidence,
+}
+
+impl TransitionDomain {
+    /// Return the stable version-one disk discriminant.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::InsertHeaders => 0,
+            Self::VerifiedChainChanged => 1,
+            Self::VerifiedBlockAccepted => 2,
+            Self::BodyPayloadMismatch => 3,
+            Self::ConsensusBodyInvalid => 4,
+            Self::TransientBodyFailure => 5,
+            Self::VerifiedBody => 6,
+            Self::BodySupplierDiscovered => 7,
+            Self::OperatorBodyRetry => 8,
+            Self::OperatorInvalidate => 9,
+            Self::OperatorReconsider => 10,
+            Self::FullStateFinalized => 11,
+            Self::MigratedPinRefutation => 12,
+            Self::AuxEvidence => 13,
+        }
+    }
+
+    /// Decode a stable version-one disk discriminant.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::InsertHeaders,
+            1 => Self::VerifiedChainChanged,
+            2 => Self::VerifiedBlockAccepted,
+            3 => Self::BodyPayloadMismatch,
+            4 => Self::ConsensusBodyInvalid,
+            5 => Self::TransientBodyFailure,
+            6 => Self::VerifiedBody,
+            7 => Self::BodySupplierDiscovered,
+            8 => Self::OperatorBodyRetry,
+            9 => Self::OperatorInvalidate,
+            10 => Self::OperatorReconsider,
+            11 => Self::FullStateFinalized,
+            12 => Self::MigratedPinRefutation,
+            13 => Self::AuxEvidence,
+            _ => return None,
+        })
+    }
+}
+
+/// Exact replay identity of one committed transition.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TransitionFingerprint {
+    domain: TransitionDomain,
+    evidence: EvidenceId,
+    payload_digest: [u8; 32],
+}
+
+impl TransitionFingerprint {
+    /// Reconstruct one persisted fingerprint from its canonical fields.
+    pub const fn from_parts(
+        domain: TransitionDomain,
+        evidence: EvidenceId,
+        payload_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            domain,
+            evidence,
+            payload_digest,
+        }
+    }
+
+    /// Return the stable event domain.
+    pub const fn domain(self) -> TransitionDomain {
+        self.domain
+    }
+
+    /// Return the domain-local idempotency evidence.
+    pub const fn evidence(self) -> EvidenceId {
+        self.evidence
+    }
+
+    /// Return the canonical effect-bearing payload digest.
+    pub const fn payload_digest(self) -> [u8; 32] {
+        self.payload_digest
+    }
+
+    /// True when two events reuse one domain-local key with different effects.
+    pub fn conflicts_with(self, other: Self) -> bool {
+        self.domain.code() == other.domain.code()
+            && self.evidence.digest() == other.evidence.digest()
+            && self.payload_digest != other.payload_digest
+    }
+}
+
 /// Authority/mode gate checked before any transition effect.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum EventAdmission {
@@ -760,6 +941,10 @@ pub enum EventAdmission {
     AnyMode,
     /// Requires authenticated integrated full-state authority.
     IntegratedFullState,
+    /// Requires an exact retry action staged by the serialized scheduler boundary.
+    RegisteredScheduler,
+    /// Requires an exact header completion registered by the serialized authority boundary.
+    RegisteredHeaderCompletion,
 }
 
 impl TransitionEvent {
@@ -772,12 +957,12 @@ impl TransitionEvent {
             | Self::BodySupplierDiscovered(_)
             | Self::FullStateFinalized(_)
             | Self::MigratedPinRefutation(_)
-            | Self::AuxEvidence(_) => EventAdmission::IntegratedFullState,
-            Self::InsertHeaders(_)
-            | Self::OperatorBodyRetry(_)
+            | Self::AuxEvidence(_)
             | Self::OperatorInvalidate(_)
-            | Self::OperatorReconsider(_)
-            | Self::ReevaluateDeferred => EventAdmission::AnyMode,
+            | Self::OperatorReconsider(_) => EventAdmission::IntegratedFullState,
+            Self::OperatorBodyRetry(_) => EventAdmission::RegisteredScheduler,
+            Self::InsertHeaders(_) => EventAdmission::RegisteredHeaderCompletion,
+            Self::ReevaluateDeferred => EventAdmission::AnyMode,
         }
     }
 
@@ -813,6 +998,43 @@ impl TransitionEvent {
         }
     }
 
+    /// Return the domain-separated canonical replay fingerprint, when replay protection applies.
+    pub fn fingerprint(&self) -> Option<TransitionFingerprint> {
+        let evidence = self.idempotency_key()?;
+        let domain = match self {
+            Self::InsertHeaders(_) => TransitionDomain::InsertHeaders,
+            Self::VerifiedChainChanged(_) => TransitionDomain::VerifiedChainChanged,
+            Self::VerifiedBlockAccepted(_) => TransitionDomain::VerifiedBlockAccepted,
+            Self::BodyEvidence(BodyEvidence::PayloadMismatch(_)) => {
+                TransitionDomain::BodyPayloadMismatch
+            }
+            Self::BodyEvidence(BodyEvidence::ConsensusInvalid(_)) => {
+                TransitionDomain::ConsensusBodyInvalid
+            }
+            Self::BodyEvidence(BodyEvidence::Transient(_)) => {
+                TransitionDomain::TransientBodyFailure
+            }
+            Self::BodyEvidence(BodyEvidence::Verified(_)) => TransitionDomain::VerifiedBody,
+            Self::BodySupplierDiscovered(_) => TransitionDomain::BodySupplierDiscovered,
+            Self::OperatorBodyRetry(_) => TransitionDomain::OperatorBodyRetry,
+            Self::OperatorInvalidate(_) => TransitionDomain::OperatorInvalidate,
+            Self::OperatorReconsider(_) => TransitionDomain::OperatorReconsider,
+            Self::FullStateFinalized(_) => TransitionDomain::FullStateFinalized,
+            Self::MigratedPinRefutation(_) => TransitionDomain::MigratedPinRefutation,
+            Self::AuxEvidence(_) => TransitionDomain::AuxEvidence,
+            Self::ReevaluateDeferred => return None,
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-header-chain-transition-payload-v1");
+        hasher.update([domain.code()]);
+        hash_transition_payload(&mut hasher, self);
+        Some(TransitionFingerprint::from_parts(
+            domain,
+            evidence,
+            hasher.finalize().into(),
+        ))
+    }
+
     /// Return explicit branch ownership for asynchronous network-originated events.
     pub fn header_sync_owner(&self) -> Option<HeaderSyncWorkOwner> {
         match self {
@@ -826,6 +1048,296 @@ impl TransitionEvent {
         match self {
             Self::AuxEvidence(event) => Some(event.owner),
             _ => None,
+        }
+    }
+}
+
+fn hash_transition_payload(hasher: &mut Sha256, event: &TransitionEvent) {
+    match event {
+        TransitionEvent::InsertHeaders(event) => {
+            hash_sync_owner(hasher, event.owner);
+            hasher.update(event.source.digest());
+            hasher.update(event.parent_hash.0);
+            hasher.update(event.target_tip_hash.0);
+            match event.completion {
+                TargetCompletion::TargetComplete { common_ancestor } => {
+                    hasher.update([0]);
+                    hash_frontier(hasher, common_ancestor);
+                }
+                TargetCompletion::TargetPrefix { common_ancestor } => {
+                    hasher.update([1]);
+                    hash_frontier(hasher, common_ancestor);
+                }
+                TargetCompletion::SelectedAuxiliaryRepair {
+                    common_ancestor,
+                    selected_target,
+                } => {
+                    hasher.update([2]);
+                    hash_frontier(hasher, common_ancestor);
+                    hash_frontier(hasher, selected_target);
+                }
+            }
+            let receipt = event.batch.receipt();
+            hash_frontier(hasher, receipt.parent());
+            hasher.update(receipt.trust_anchor_digest());
+            hash_network_policy(hasher, receipt.network());
+            for header in event.batch.headers() {
+                hasher.update(header.height.0.to_le_bytes());
+                hasher.update(header.hash.0);
+                hasher.update(header.block_work.as_u256().to_big_endian());
+                hash_validation_state(hasher, header.validation);
+            }
+            for delivery in &event.aux {
+                hash_aux_delivery(hasher, *delivery);
+            }
+        }
+        TransitionEvent::VerifiedChainChanged(event) => {
+            hash_frontier(hasher, event.old_tip);
+            hasher.update([match event.cause {
+                VerifiedChangeCause::Grow => 0,
+                VerifiedChangeCause::Reset => 1,
+            }]);
+            hash_verified_path(hasher, &event.new_path);
+        }
+        TransitionEvent::VerifiedBlockAccepted(event) => hash_verified_path(hasher, &event.path),
+        TransitionEvent::BodyEvidence(BodyEvidence::PayloadMismatch(event)) => {
+            hasher.update(event.requested.0);
+            hasher.update(event.delivered.0);
+            hasher.update(event.source.digest());
+            match event.kind {
+                BodyCommitmentKind::HeaderHash => hasher.update([0]),
+                BodyCommitmentKind::TransactionMerkleRoot => hasher.update([1]),
+                BodyCommitmentKind::AuthDataRoot => hasher.update([2]),
+                BodyCommitmentKind::Other(rule) => {
+                    hasher.update([3]);
+                    hash_bytes(hasher, rule.as_bytes());
+                }
+            }
+        }
+        TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(event)) => {
+            hasher.update(event.hash.0);
+            hash_bytes(hasher, event.rule.as_str().as_bytes());
+            hasher.update(event.source.digest());
+        }
+        TransitionEvent::BodyEvidence(BodyEvidence::Transient(event)) => {
+            hasher.update(event.hash.0);
+            hasher.update([match event.kind {
+                TransientBodyFailureKind::MissingContext => 0,
+                TransientBodyFailureKind::Canceled => 1,
+                TransientBodyFailureKind::Storage => 2,
+                TransientBodyFailureKind::VerifierUnavailable => 3,
+                TransientBodyFailureKind::Timeout => 4,
+                TransientBodyFailureKind::ResourceExhausted => 5,
+            }]);
+            hash_availability(hasher, event.availability);
+        }
+        TransitionEvent::BodyEvidence(BodyEvidence::Verified(event)) => {
+            hasher.update(event.hash.0);
+        }
+        TransitionEvent::BodySupplierDiscovered(event) => {
+            hasher.update(event.hash.0);
+            hash_availability(hasher, event.availability);
+        }
+        TransitionEvent::OperatorBodyRetry(event) => {
+            hasher.update(event.hash.0);
+            hash_availability(hasher, event.availability);
+        }
+        TransitionEvent::OperatorInvalidate(event) => {
+            hasher.update(event.target.0);
+            hasher.update(event.id.bytes());
+            hasher.update(event.operator_reason_digest);
+        }
+        TransitionEvent::OperatorReconsider(event) => {
+            hasher.update(event.target.0);
+            hasher.update(event.id.bytes());
+            match event.invalidation_evidence {
+                Some(evidence) => {
+                    hasher.update([1]);
+                    hasher.update(evidence.digest());
+                }
+                None => hasher.update([0]),
+            }
+        }
+        TransitionEvent::FullStateFinalized(event) => {
+            hash_frontier(hasher, event.new_finalized);
+            for hash in &event.verified_path_proof {
+                hasher.update(hash.0);
+            }
+        }
+        TransitionEvent::MigratedPinRefutation(event) => {
+            hash_frontier(hasher, event.pin);
+            hash_frontier(hasher, event.invalid_header);
+            hash_bytes(hasher, event.rule.as_str().as_bytes());
+        }
+        TransitionEvent::AuxEvidence(event) => {
+            hash_body_owner(hasher, event.owner);
+            for delivery in &event.deliveries {
+                hash_aux_delivery(hasher, *delivery);
+            }
+            hash_aux_authentication(hasher, event.authentication);
+        }
+        TransitionEvent::ReevaluateDeferred => {}
+    }
+}
+
+fn hash_frontier(hasher: &mut Sha256, frontier: Frontier) {
+    hasher.update(frontier.height.0.to_le_bytes());
+    hasher.update(frontier.hash.0);
+}
+
+fn hash_network_policy(hasher: &mut Sha256, network: &zakura_chain::parameters::Network) {
+    hasher.update([match network.kind() {
+        NetworkKind::Mainnet => 0,
+        NetworkKind::Testnet => 1,
+        NetworkKind::Regtest => 2,
+    }]);
+    hasher.update(network.genesis_hash().0);
+    let target: zakura_chain::work::difficulty::U256 = network.target_difficulty_limit().into();
+    hasher.update(target.to_big_endian());
+    hasher.update([u8::from(network.disable_pow())]);
+    let max_time_height = match network {
+        zakura_chain::parameters::Network::Mainnet => block::Height::MIN,
+        zakura_chain::parameters::Network::Testnet(parameters) => {
+            parameters.max_block_time_start_height()
+        }
+    };
+    hasher.update(max_time_height.0.to_le_bytes());
+    for (height, upgrade) in network.activation_list() {
+        hasher.update(height.0.to_le_bytes());
+        let (branch_tag, upgrade_code) = match upgrade.branch_id() {
+            Some(branch) => (1_u8, u32::from(branch)),
+            None => (
+                0,
+                match upgrade {
+                    zakura_chain::parameters::NetworkUpgrade::Genesis => 0,
+                    zakura_chain::parameters::NetworkUpgrade::BeforeOverwinter => 1,
+                    zakura_chain::parameters::NetworkUpgrade::Nu7 => 2,
+                    _ => u32::MAX,
+                },
+            ),
+        };
+        hasher.update([branch_tag]);
+        hasher.update(upgrade_code.to_le_bytes());
+    }
+}
+
+fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(
+        u64::try_from(bytes.len())
+            .expect("in-memory payload length fits in u64")
+            .to_le_bytes(),
+    );
+    hasher.update(bytes);
+}
+
+fn hash_time(hasher: &mut Sha256, time: DateTime<Utc>) {
+    hasher.update(time.timestamp().to_le_bytes());
+    hasher.update(time.timestamp_subsec_nanos().to_le_bytes());
+}
+
+fn hash_validation_state(hasher: &mut Sha256, validation: HeaderValidationState) {
+    match validation {
+        HeaderValidationState::Valid => hasher.update([0]),
+        HeaderValidationState::DeferredUntil(until) => {
+            hasher.update([1]);
+            hash_time(hasher, until);
+        }
+    }
+}
+
+fn hash_header_owner(hasher: &mut Sha256, owner: crate::HeaderWorkOwner) {
+    hasher.update(owner.authority.header_generation.get().to_le_bytes());
+    hasher.update(owner.authority.branch.anchor_hash.0);
+    hasher.update(owner.authority.branch.target_tip_hash.0);
+    hasher.update(owner.session_id.to_le_bytes());
+    hasher.update(owner.request_id.get().to_le_bytes());
+}
+
+fn hash_body_owner(hasher: &mut Sha256, owner: BodyWorkOwner) {
+    hash_header_owner(
+        hasher,
+        crate::HeaderWorkOwner {
+            authority: owner.authority.header,
+            session_id: owner.session_id,
+            request_id: owner.request_id,
+        },
+    );
+    hasher.update(owner.authority.verified_generation.get().to_le_bytes());
+}
+
+fn hash_sync_owner(hasher: &mut Sha256, owner: HeaderSyncWorkOwner) {
+    match owner {
+        HeaderSyncWorkOwner::Header(owner) => {
+            hasher.update([0]);
+            hash_header_owner(hasher, owner);
+        }
+        HeaderSyncWorkOwner::BodyRepair(owner) => {
+            hasher.update([1]);
+            hash_body_owner(hasher, owner);
+        }
+    }
+}
+
+fn hash_availability(hasher: &mut Sha256, availability: BodyUnavailableSummary) {
+    hash_time(hasher, availability.started_at);
+    hasher.update(availability.attempts.to_le_bytes());
+    hasher.update(availability.suppliers.to_le_bytes());
+    hasher.update(availability.supplier_set_digest);
+    hasher.update([u8::from(availability.alarmed)]);
+    hash_time(hasher, availability.next_probe_at);
+}
+
+fn hash_verified_path(hasher: &mut Sha256, path: &[VerifiedHeaderRef]) {
+    for header in path {
+        hasher.update(header.height.0.to_le_bytes());
+        hasher.update(header.hash.0);
+        hasher.update(header.header.hash().0);
+    }
+}
+
+fn hash_aux_delivery(hasher: &mut Sha256, delivery: AuxDelivery) {
+    hasher.update(delivery.delivery_id.digest());
+    hasher.update(delivery.header_hash.0);
+    hasher.update(delivery.source.digest());
+    hash_sync_owner(hasher, delivery.owner);
+    hasher.update(
+        match delivery.body_size {
+            BodySizeHint::Unknown => 0_u32,
+            BodySizeHint::Known(size) => size.get(),
+        }
+        .to_le_bytes(),
+    );
+    match delivery.tree_aux {
+        None => hasher.update([0]),
+        Some(aux) => {
+            hasher.update([1]);
+            hasher.update(aux.height.0.to_le_bytes());
+            hasher.update(<[u8; 32]>::from(aux.sapling_root));
+            hasher.update(<[u8; 32]>::from(aux.orchard_root));
+            hasher.update(<[u8; 32]>::from(aux.ironwood_root));
+            hasher.update(aux.sapling_tx_count.to_le_bytes());
+            hasher.update(aux.orchard_tx_count.to_le_bytes());
+            hasher.update(aux.ironwood_tx_count.to_le_bytes());
+            hasher.update(<[u8; 32]>::from(aux.auth_data_root));
+        }
+    }
+    hash_aux_authentication(hasher, delivery.authentication);
+}
+
+fn hash_aux_authentication(hasher: &mut Sha256, authentication: AuxAuthentication) {
+    match authentication {
+        AuxAuthentication::Unauthenticated => hasher.update([0]),
+        AuxAuthentication::Authenticated {
+            evidence,
+            boundary_hash,
+        } => {
+            hasher.update([1]);
+            hasher.update(evidence.digest());
+            hasher.update(boundary_hash.0);
+        }
+        AuxAuthentication::Rejected { evidence } => {
+            hasher.update([2]);
+            hasher.update(evidence.digest());
         }
     }
 }
@@ -1013,10 +1525,162 @@ pub enum TransitionTypeError {
     /// Header insertion batches must be nonempty.
     #[error("prepared header batch must be nonempty")]
     EmptyHeaderBatch,
+    /// Header insertion batches must fit the frozen engine transition bound.
+    #[error("prepared header batch exceeds the engine transition limit")]
+    OversizedHeaderBatch,
     /// A new finalized parent was not an exact member of the prepared path.
     #[error("prepared header batch cannot rebase to the requested parent")]
     InvalidPreparedRebase,
     /// Advisory body size exceeded the canonical block limit.
     #[error("invalid advisory body size {0}")]
     InvalidBodySize(u32),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_size_hints_enforce_zero_sentinel_and_canonical_limit() {
+        assert_eq!(BodySizeHint::new(0), Ok(BodySizeHint::Unknown));
+        assert!(matches!(BodySizeHint::new(1), Ok(BodySizeHint::Known(_))));
+        let maximum =
+            u32::try_from(block::MAX_BLOCK_BYTES).expect("the canonical block limit fits in u32");
+        assert!(matches!(
+            BodySizeHint::new(maximum),
+            Ok(BodySizeHint::Known(_))
+        ));
+        assert_eq!(
+            BodySizeHint::new(maximum + 1),
+            Err(TransitionTypeError::InvalidBodySize(maximum + 1))
+        );
+    }
+
+    #[test]
+    fn event_authority_and_evidence_policies_are_typed() {
+        let evidence = EvidenceId::from_digest([7; 32]);
+        let reconsider = TransitionEvent::OperatorReconsider(OperatorReconsider {
+            target: block::Hash([1; 32]),
+            id: OperatorInvalidationId::new([2; 16]),
+            invalidation_evidence: Some(EvidenceId::from_digest([3; 32])),
+            evidence,
+        });
+        assert_eq!(reconsider.admission(), EventAdmission::IntegratedFullState);
+        assert_eq!(reconsider.idempotency_key(), Some(evidence));
+        assert_eq!(reconsider.header_sync_owner(), None);
+        assert_eq!(reconsider.body_owner(), None);
+
+        let refutation = TransitionEvent::MigratedPinRefutation(MigratedPinRefutation {
+            full_state_transition_id: evidence,
+            pin: Frontier::new(block::Height(2), block::Hash([4; 32])),
+            invalid_header: Frontier::new(block::Height(1), block::Hash([5; 32])),
+            rule: BodyRuleId::new("body.rule"),
+        });
+        assert_eq!(refutation.admission(), EventAdmission::IntegratedFullState);
+        assert_eq!(refutation.idempotency_key(), Some(evidence));
+        assert_eq!(refutation.header_sync_owner(), None);
+        assert_eq!(refutation.body_owner(), None);
+
+        assert_eq!(
+            TransitionEvent::ReevaluateDeferred.admission(),
+            EventAdmission::AnyMode
+        );
+        assert_eq!(TransitionEvent::ReevaluateDeferred.idempotency_key(), None);
+    }
+
+    #[test]
+    fn body_verification_outcomes_preserve_distinct_transition_effects() {
+        let evidence = EvidenceId::from_digest([9; 32]);
+        let hash = block::Hash([8; 32]);
+        assert!(matches!(
+            BodyEvidence::from(BodyVerificationOutcome::Verified(VerifiedBodyEvidence {
+                hash,
+                evidence,
+            })),
+            BodyEvidence::Verified(VerifiedBodyEvidence { hash: actual, .. }) if actual == hash
+        ));
+        assert!(matches!(
+            BodyEvidence::from(BodyVerificationOutcome::PayloadMismatch(
+                BodyPayloadMismatch {
+                    evidence,
+                    requested: hash,
+                    delivered: block::Hash([7; 32]),
+                    kind: BodyCommitmentKind::HeaderHash,
+                    source: SourceId::from_digest([6; 32]),
+                }
+            )),
+            BodyEvidence::PayloadMismatch(BodyPayloadMismatch { requested, .. }) if requested == hash
+        ));
+        assert!(matches!(
+            BodyEvidence::from(BodyVerificationOutcome::ConsensusInvalid(
+                ConsensusBodyInvalid {
+                    hash,
+                    evidence,
+                    rule: BodyRuleId::new("body.rule"),
+                    source: SourceId::from_digest([5; 32]),
+                }
+            )),
+            BodyEvidence::ConsensusInvalid(ConsensusBodyInvalid { hash: actual, .. }) if actual == hash
+        ));
+        assert!(matches!(
+            BodyEvidence::from(BodyVerificationOutcome::Retryable(TransientBodyFailure {
+                hash,
+                evidence,
+                kind: TransientBodyFailureKind::MissingContext,
+                availability: BodyUnavailableSummary {
+                    attempts: 1,
+                    suppliers: 1,
+                    alarmed: false,
+                    ..Default::default()
+                },
+            })),
+            BodyEvidence::Transient(TransientBodyFailure { hash: actual, .. }) if actual == hash
+        ));
+    }
+
+    #[test]
+    fn all_named_inputs_use_their_single_serialized_transition_path() {
+        let source = include_str!("types.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the production type surface precedes its tests");
+        for variant in [
+            "InsertHeaders(Box<InsertHeaders>)",
+            "VerifiedChainChanged(VerifiedChainChanged)",
+            "VerifiedBlockAccepted(VerifiedBlockAccepted)",
+            "BodyEvidence(BodyEvidence)",
+            "BodySupplierDiscovered(BodySupplierDiscovered)",
+            "OperatorBodyRetry(OperatorBodyRetry)",
+            "OperatorInvalidate(OperatorInvalidate)",
+            "OperatorReconsider(OperatorReconsider)",
+            "FullStateFinalized(FullStateFinalized)",
+            "MigratedPinRefutation(MigratedPinRefutation)",
+            "AuxEvidence(Box<AuxEvidence>)",
+            "ReevaluateDeferred",
+        ] {
+            assert!(source.contains(variant), "missing event variant {variant}");
+        }
+        for forbidden in [
+            "pub new_header_best",
+            "pub new_generation",
+            "pub prune",
+            "pub publish",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "event inputs must contain evidence, not requested consequence {forbidden}"
+            );
+        }
+        for obsolete_facade in [
+            "AdvanceLocalCheckpoint",
+            "InternalFullState",
+            "RecoveryEvidence",
+            "TransitionEvent::Recover",
+        ] {
+            assert!(
+                !source.contains(obsolete_facade),
+                "the event surface must not duplicate a real transition path with {obsolete_facade}"
+            );
+        }
+    }
 }

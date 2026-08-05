@@ -11,6 +11,9 @@ categories = ["cryptography::cryptocurrencies"]
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+fuzz-impl = []
+
 [dependencies]
 chrono = { workspace = true }
 sha2 = { workspace = true }

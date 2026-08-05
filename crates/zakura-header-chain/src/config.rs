@@ -29,6 +29,8 @@ pub const MAX_HEADERS_PER_TRANSITION_V1: usize = 4_000;
 pub const MAX_AUX_DELIVERIES_PER_HEADER_V1: usize = 16;
 /// Exact v1 maximum auxiliary deliveries retained across the graph.
 pub const MAX_AUX_DELIVERIES_TOTAL_V1: usize = MAX_NON_FINALIZED_NODES_V1;
+/// Exact v1 maximum active retained-path references supplied to one transition.
+pub const MAX_RETENTION_REFERENCES_V1: usize = MAX_STAGED_TARGETS_V1;
 /// Exact v1 maximum number of candidate tips.
 pub const MAX_CANDIDATE_TIPS_V1: usize = MAX_NON_FINALIZED_CHAIN_FORKS;
 
@@ -301,6 +303,8 @@ pub struct EngineLimits {
     pub max_aux_deliveries_per_header: NonZeroUsize,
     /// Maximum fixed-size auxiliary records retained across the graph.
     pub max_aux_deliveries_total: NonZeroUsize,
+    /// Maximum active retained-path references admitted by one transition.
+    pub max_retention_references: NonZeroUsize,
 }
 
 impl EngineLimits {
@@ -319,6 +323,8 @@ impl EngineLimits {
                 .expect("the v1 per-header auxiliary limit is nonzero"),
             max_aux_deliveries_total: NonZeroUsize::new(MAX_AUX_DELIVERIES_TOTAL_V1)
                 .expect("the v1 aggregate auxiliary limit is nonzero"),
+            max_retention_references: NonZeroUsize::new(MAX_RETENTION_REFERENCES_V1)
+                .expect("the v1 retained-path reference limit is nonzero"),
         }
     }
 }
@@ -336,6 +342,7 @@ const _: () = assert!(MAX_STAGED_TARGETS_V1 == 16);
 const _: () = assert!(MAX_HEADERS_PER_TRANSITION_V1 == 4_000);
 const _: () = assert!(MAX_AUX_DELIVERIES_PER_HEADER_V1 == 16);
 const _: () = assert!(MAX_AUX_DELIVERIES_TOTAL_V1 == 65_536);
+const _: () = assert!(MAX_RETENTION_REFERENCES_V1 == 16);
 
 #[cfg(test)]
 mod tests {

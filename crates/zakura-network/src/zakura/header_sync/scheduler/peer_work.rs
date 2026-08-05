@@ -842,3 +842,459 @@ impl PeerWorkQueue {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use zakura_chain::{block, block::genesis::regtest_genesis_block, work::difficulty::U256};
+    use zakura_header_chain::{
+        AlarmSet, ChainScore, EngineMode, Frontier, FrontierSet, HeaderGeneration, StateVersion,
+        SuffixWork, VerifiedGeneration,
+    };
+
+    fn hash(byte: u8) -> block::Hash {
+        block::Hash([byte; 32])
+    }
+
+    fn snapshot() -> EngineSnapshot {
+        let finalized = Frontier::new(block::Height(10), hash(10));
+        let tip = Frontier::new(block::Height(100), hash(100));
+        EngineSnapshot {
+            mode: EngineMode::Integrated,
+            state_version: StateVersion::new(1),
+            header_generation: HeaderGeneration::new(1),
+            verified_generation: VerifiedGeneration::new(1),
+            frontiers: FrontierSet {
+                finalized,
+                header_best: tip,
+                verified_best: finalized,
+            },
+            header_best_score: ChainScore::new(SuffixWork::new(U256::from(100_u32)), tip.hash),
+            oldest_retained_height: finalized.height,
+            alarms: AlarmSet::default(),
+        }
+    }
+
+    fn advertisement(marker: u8) -> AdvertisedHeaderTarget {
+        let local = snapshot();
+        AdvertisedHeaderTarget {
+            scope: HeaderWorkAuthority::for_target(&local, hash(marker)),
+            session_id: 7,
+            status: Status {
+                work_anchor_height: block::Height(10),
+                work_anchor_hash: hash(10),
+                selected_tip_height: block::Height(u32::from(marker)),
+                selected_tip_hash: hash(marker),
+                suffix_cumulative_work: U256::from(u32::from(marker)),
+                oldest_retained_height: block::Height(10),
+                max_headers_per_response: 1_000,
+                max_inflight_requests: 1,
+                max_message_bytes: 2_000_000,
+                tree_aux_schema_mask: 1,
+            },
+        }
+    }
+
+    fn peer(marker: u8) -> ZakuraPeerId {
+        ZakuraPeerId::new(vec![marker; 32]).expect("the test peer ID has the required length")
+    }
+
+    fn active_request(
+        marker: u8,
+        target: AdvertisedHeaderTarget,
+        local: &EngineSnapshot,
+        entries: Vec<HeaderEntry>,
+    ) -> ActiveHeaderRequest {
+        let request_id =
+            HeaderSyncRequestId::new(u64::from(marker)).expect("the marker is nonzero");
+        ActiveHeaderRequest {
+            purpose: HeaderTargetPurpose::Normal,
+            peer: peer(marker),
+            source: SourceId::from_digest([marker; 32]),
+            sent_locator: HeaderLocator::for_continuation(local.frontiers.finalized),
+            owner: zakura_header_chain::HeaderWorkOwner {
+                authority: HeaderWorkAuthority::for_target(local, target.status.selected_tip_hash),
+                session_id: target.session_id,
+                request_id: std::num::NonZeroU64::new(request_id.get())
+                    .expect("header-sync request IDs are nonzero"),
+            }
+            .into(),
+            target,
+            request_id,
+            common_ancestor: Some(local.frontiers.finalized),
+            entries,
+            phase: HeaderTargetPhase::Receiving,
+            max_header_count: 1_000,
+            tree_aux_schema: AuxSchema::None,
+        }
+    }
+
+    #[test]
+    fn unknown_status_targets_remain_eligible_regardless_of_advisory_shape() {
+        let local = snapshot();
+
+        let mut same_height_fork = advertisement(1);
+        same_height_fork.status.selected_tip_height = local.frontiers.header_best.height;
+        same_height_fork.status.suffix_cumulative_work = U256::from(1_u32);
+        assert!(same_height_fork.is_discovery_eligible(&local));
+        assert_eq!(
+            same_height_fork.claimed_work_order(&local),
+            Some(Ordering::Less)
+        );
+
+        let mut shorter_higher_work = advertisement(2);
+        shorter_higher_work.status.selected_tip_height = block::Height(90);
+        shorter_higher_work.status.suffix_cumulative_work = U256::from(101_u32);
+        assert!(shorter_higher_work.is_discovery_eligible(&local));
+        assert_eq!(
+            shorter_higher_work.claimed_work_order(&local),
+            Some(Ordering::Greater)
+        );
+
+        let mut incomparable = advertisement(3);
+        incomparable.status.work_anchor_hash = hash(11);
+        incomparable.status.suffix_cumulative_work = U256::MAX;
+        assert!(incomparable.is_discovery_eligible(&local));
+        assert_eq!(incomparable.claimed_work_order(&local), None);
+
+        let mut known = advertisement(4);
+        known.status.selected_tip_hash = local.frontiers.header_best.hash;
+        assert!(!known.is_discovery_eligible(&local));
+
+        let mut pure_requester = advertisement(5);
+        pure_requester.status.max_headers_per_response = 0;
+        assert!(!pure_requester.is_discovery_eligible(&local));
+    }
+
+    #[test]
+    fn staged_tip_rejects_heights_above_the_protocol_maximum() {
+        let local = snapshot();
+        let target = advertisement(1);
+        let mut request = active_request(
+            1,
+            target,
+            &local,
+            vec![HeaderEntry {
+                header: regtest_genesis_block().header.clone(),
+                body_size: 0,
+                tree_aux: None,
+            }],
+        );
+        request.common_ancestor = Some(Frontier::new(block::Height::MAX, hash(10)));
+
+        assert_eq!(request.staged_tip(), None);
+    }
+
+    #[test]
+    fn peer_work_queue_caps_targets_and_only_supersedes_unstarted_work() {
+        let mut queue = PeerWorkQueue::default();
+        for marker in 1..=16 {
+            assert_eq!(
+                queue.stage(
+                    peer(marker),
+                    advertisement(marker),
+                    PeerWorkPriority::Normal
+                ),
+                QueueWorkResult::NeedsLocator
+            );
+        }
+        assert_eq!(
+            queue.stage(peer(17), advertisement(17), PeerWorkPriority::Normal),
+            QueueWorkResult::AtCapacity
+        );
+
+        let replacement = advertisement(42);
+        assert_eq!(
+            queue.stage(peer(1), replacement.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        assert_eq!(
+            queue.awaiting(&peer(1), 7, hash(42), replacement.scope),
+            Some(&replacement)
+        );
+
+        let local = snapshot();
+        let locator = HeaderLocator::for_selected_path(&local, |height| {
+            let marker = u8::try_from(height.0).expect("the test heights fit in one byte");
+            Ok(Some(hash(marker)))
+        })
+        .expect("the test projection contains every requested frontier");
+        let request = ActiveHeaderRequest {
+            purpose: HeaderTargetPurpose::Normal,
+            peer: peer(1),
+            source: SourceId::from_digest([1; 32]),
+            target: replacement.clone(),
+            sent_locator: locator.clone(),
+            request_id: HeaderSyncRequestId::new(1).expect("one is a nonzero request ID"),
+            owner: zakura_header_chain::HeaderWorkOwner {
+                authority: HeaderWorkAuthority::for_target(
+                    &local,
+                    replacement.status.selected_tip_hash,
+                ),
+                session_id: 7,
+                request_id: std::num::NonZeroU64::new(1).expect("one is nonzero"),
+            }
+            .into(),
+            common_ancestor: None,
+            entries: Vec::new(),
+            phase: HeaderTargetPhase::Receiving,
+            max_header_count: 1_000,
+            tree_aux_schema: AuxSchema::None,
+        };
+        assert!(queue.reserve_request(&peer(1), 1));
+        assert!(queue.start(request.clone()));
+        assert_eq!(queue.active(&peer(1)), Some(&request));
+        assert_eq!(
+            queue.stage(
+                peer(1),
+                advertisement(43),
+                PeerWorkPriority::HigherComparableWork
+            ),
+            QueueWorkResult::AlreadyActive
+        );
+        assert_eq!(queue.active(&peer(1)), Some(&request));
+        assert_eq!(queue.active(&peer(1)).unwrap().sent_locator, locator);
+        let continuation_tip = Frontier::new(block::Height(101), hash(101));
+        assert_eq!(
+            request.continuation_locator(continuation_tip).entries(),
+            &[continuation_tip]
+        );
+        assert_eq!(request.target.status.selected_tip_hash, hash(42));
+        assert_eq!(
+            PeerWorkPriority::from_work_order(None),
+            PeerWorkPriority::Normal
+        );
+        assert_eq!(
+            queue.stage(
+                peer(17),
+                advertisement(17),
+                PeerWorkPriority::HigherComparableWork,
+            ),
+            QueueWorkResult::NeedsLocator
+        );
+        let expected = advertisement(17);
+        assert!(queue
+            .awaiting(&peer(17), 7, hash(17), expected.scope)
+            .is_some());
+    }
+
+    #[test]
+    fn generation_change_retires_unstarted_targets_before_new_scheduling() {
+        let local = snapshot();
+        let mut queue = PeerWorkQueue::default();
+        let awaiting = advertisement(1);
+        assert_eq!(
+            queue.stage(peer(1), awaiting, PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        let active = advertisement(2);
+        assert_eq!(
+            queue.stage(peer(2), active.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        assert!(queue.reserve_request(&peer(2), 1));
+        assert!(queue.start(active_request(2, active, &local, Vec::new())));
+
+        let mut current = local;
+        current.state_version = current
+            .state_version
+            .checked_next()
+            .expect("the fixture state version advances");
+        current.header_generation = current
+            .header_generation
+            .checked_next()
+            .expect("the fixture generation advances");
+        assert_eq!(queue.retire_obsolete_unstarted(&current), 1);
+        assert_eq!(queue.len(), 1);
+        assert!(
+            queue.active(&peer(2)).is_some(),
+            "active requests remain owned by the pending-owner retirement path"
+        );
+    }
+
+    #[test]
+    fn body_only_state_version_change_keeps_header_locator_work_current() {
+        let local = snapshot();
+        let mut queue = PeerWorkQueue::default();
+        let awaiting = advertisement(1);
+        let original_scope = awaiting.scope;
+        let target_hash = awaiting.status.selected_tip_hash;
+        assert_eq!(
+            queue.stage(peer(1), awaiting, PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+
+        let mut current = local;
+        current.state_version = current
+            .state_version
+            .checked_next()
+            .expect("the fixture state version advances");
+
+        assert_eq!(queue.retire_obsolete_unstarted(&current), 0);
+        assert!(
+            queue
+                .awaiting(&peer(1), 7, target_hash, original_scope)
+                .is_some(),
+            "an unrelated body commit preserves header-generation locator authority"
+        );
+    }
+
+    #[test]
+    fn aggregate_owned_header_budget_spans_all_peers_and_releases_on_retirement() {
+        let local = snapshot();
+        let entry = HeaderEntry {
+            header: Arc::new(*regtest_genesis_block().header),
+            body_size: 0,
+            tree_aux: None,
+        };
+        let mut queue = PeerWorkQueue::default();
+        let first_count = HEADER_CHUNK_BUDGET_CAPACITY_V1 * 3 / 4;
+        let remaining = HEADER_CHUNK_BUDGET_CAPACITY_V1 - first_count;
+
+        let first = advertisement(1);
+        assert_eq!(
+            queue.stage(peer(1), first.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        assert!(queue.reserve_request(&peer(1), 1));
+        assert!(queue.start(active_request(
+            1,
+            first,
+            &local,
+            vec![entry.clone(); first_count],
+        )));
+        queue.set_capacity_for_test(&peer(1), first_count, 0);
+        assert_eq!(queue.unowned_chunk_capacity(), remaining);
+
+        let second = advertisement(2);
+        assert_eq!(
+            queue.stage(peer(2), second.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        assert!(queue.reserve_request(&peer(2), 1));
+        assert!(queue.start(active_request(2, second, &local, vec![entry; remaining],)));
+        queue.set_capacity_for_test(&peer(2), remaining, 0);
+        assert_eq!(queue.unowned_chunk_capacity(), 0);
+
+        queue.remove(&peer(1));
+        assert_eq!(queue.unowned_chunk_capacity(), first_count);
+    }
+
+    #[test]
+    fn header_chunk_leases_release_unused_and_owned_capacity_exactly_once() {
+        let budget = HeaderChunkBudget::default();
+        let reservation = budget
+            .reserve(MAX_HEADER_CHUNK_RESERVATION_V1)
+            .expect("the fair share fits an empty budget");
+        assert_eq!(
+            budget.usage(),
+            HeaderChunkUsage {
+                reserved: MAX_HEADER_CHUNK_RESERVATION_V1,
+                owned: 0,
+            }
+        );
+
+        let returned = MAX_HEADER_CHUNK_RESERVATION_V1 / 2;
+        let lease = reservation
+            .consume(returned)
+            .expect("a partial response fits its reservation")
+            .expect("a nonempty response returns an owned lease");
+        assert_eq!(
+            budget.usage(),
+            HeaderChunkUsage {
+                reserved: 0,
+                owned: returned,
+            },
+            "unused response capacity is returned immediately"
+        );
+        drop(lease);
+        assert_eq!(budget.usage(), HeaderChunkUsage::default());
+
+        let empty = budget
+            .reserve(MAX_HEADER_CHUNK_RESERVATION_V1)
+            .expect("released capacity can be reserved again");
+        assert!(empty
+            .consume(0)
+            .expect("an empty response consumes its reservation")
+            .is_none());
+        assert_eq!(budget.usage(), HeaderChunkUsage::default());
+    }
+
+    #[test]
+    fn malformed_overreturn_preserves_reservation_until_terminal_cleanup() {
+        let budget = HeaderChunkBudget::default();
+        let reservation = budget.reserve(1).expect("one header fits the budget");
+        assert!(reservation.consume(2).is_err());
+        assert_eq!(
+            budget.usage(),
+            HeaderChunkUsage {
+                reserved: 1,
+                owned: 0,
+            },
+            "a rejected conversion remains owned by the request"
+        );
+        drop(reservation);
+        assert_eq!(budget.usage(), HeaderChunkUsage::default());
+    }
+
+    #[test]
+    fn fair_reservations_fill_the_aggregate_budget_without_overcommit() {
+        let mut queue = PeerWorkQueue::default();
+        for marker in 1..=MAX_STAGED_TARGETS_V1 {
+            let marker = u8::try_from(marker).expect("the target-slot count fits u8");
+            assert_eq!(
+                queue.reservable_header_count(MAX_HS_RANGE),
+                u32::try_from(MAX_HEADER_CHUNK_RESERVATION_V1)
+                    .expect("the fair reservation fits u32")
+            );
+            assert!(queue.reserve_request(
+                &peer(marker),
+                u32::try_from(MAX_HEADER_CHUNK_RESERVATION_V1)
+                    .expect("the fair reservation fits u32"),
+            ));
+        }
+        assert_eq!(
+            queue.chunk_budget_usage(),
+            (HEADER_CHUNK_BUDGET_CAPACITY_V1, 0)
+        );
+        assert_eq!(queue.reservable_header_count(MAX_HS_RANGE), 0);
+        assert!(!queue.reserve_request(&peer(17), 1));
+
+        queue.cancel_request_reservation(&peer(1));
+        assert_eq!(
+            queue.unowned_chunk_capacity(),
+            MAX_HEADER_CHUNK_RESERVATION_V1
+        );
+    }
+
+    #[test]
+    fn active_work_requires_a_preallocated_response_reservation() {
+        let local = snapshot();
+        let target = advertisement(1);
+        let mut queue = PeerWorkQueue::default();
+        assert_eq!(
+            queue.stage(peer(1), target.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        let request = active_request(1, target, &local, Vec::new());
+        assert!(!queue.start(request.clone()));
+        assert!(queue.active(&peer(1)).is_none());
+        assert!(queue.reserve_request(&peer(1), 1));
+        assert!(queue.start(request));
+    }
+
+    #[test]
+    fn selected_auxiliary_repair_is_an_exact_one_header_target_purpose() {
+        let selected_target = Frontier::new(zakura_chain::block::Height(11), hash(11));
+        let purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
+            selected_target,
+            repair_generation: 7,
+        };
+
+        assert_eq!(purpose.exact_header_count(), Some(1));
+        assert_eq!(purpose.selected_repair_target(), Some(selected_target));
+        assert_eq!(HeaderTargetPurpose::Normal.exact_header_count(), None);
+    }
+}

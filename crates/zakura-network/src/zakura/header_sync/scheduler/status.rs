@@ -81,3 +81,60 @@ impl StatusPublisher {
         self.pending_at = Some((now + PUBLICATION_RETRY_DELAY).max(floor));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use zakura_chain::{block, work::difficulty::U256};
+
+    use super::*;
+
+    fn status(marker: u8) -> Status {
+        Status {
+            work_anchor_height: block::Height(1),
+            work_anchor_hash: block::Hash([1; 32]),
+            selected_tip_height: block::Height(u32::from(marker)),
+            selected_tip_hash: block::Hash([marker; 32]),
+            suffix_cumulative_work: U256::from(u64::from(marker)),
+            oldest_retained_height: block::Height(1),
+            max_headers_per_response: 1,
+            max_inflight_requests: 1,
+            max_message_bytes: 1,
+            tree_aux_schema_mask: 1,
+        }
+    }
+
+    #[test]
+    fn initial_refresh_and_coalesced_change_deadlines_are_bounded() {
+        let now = Instant::now();
+        let mut publisher = StatusPublisher::new(status(1), Duration::from_secs(30), now);
+        assert!(publisher.due(now));
+
+        publisher.record_sent(status(1), now);
+        assert_eq!(publisher.next_deadline(), now + Duration::from_secs(30));
+
+        publisher.observe(status(2), now + Duration::from_millis(100));
+        publisher.observe(status(3), now + Duration::from_millis(200));
+        assert_eq!(publisher.desired(), status(3));
+        assert_eq!(publisher.next_deadline(), now + Duration::from_secs(1));
+        assert!(!publisher.due(now + Duration::from_millis(999)));
+        assert!(publisher.due(now + Duration::from_secs(1)));
+
+        publisher.record_sent(status(3), now + Duration::from_secs(1));
+        let refresh_at = now + Duration::from_secs(31);
+        assert!(publisher.due(refresh_at));
+        publisher.record_failed(refresh_at);
+        assert_eq!(
+            publisher.next_deadline(),
+            refresh_at + PUBLICATION_RETRY_DELAY
+        );
+    }
+
+    #[test]
+    fn refresh_interval_is_clamped_to_the_publication_floor() {
+        let now = Instant::now();
+        let mut publisher = StatusPublisher::new(status(1), Duration::ZERO, now);
+
+        publisher.record_sent(status(1), now);
+        assert_eq!(publisher.next_deadline(), now + MIN_PUBLICATION_INTERVAL,);
+    }
+}

@@ -303,3 +303,201 @@ impl RepairRequirementSlot {
         self.0.is_none()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use zakura_chain::{block, work::difficulty::U256};
+    use zakura_header_chain::{
+        AlarmSet, ChainScore, EngineMode, Frontier, FrontierSet, HeaderGeneration, StateVersion,
+        SuffixWork, VerifiedGeneration,
+    };
+
+    use super::*;
+
+    fn hash(byte: u8) -> block::Hash {
+        block::Hash([byte; 32])
+    }
+
+    fn snapshot() -> EngineSnapshot {
+        let finalized = Frontier::new(block::Height(10), hash(1));
+        let tip = Frontier::new(block::Height(20), hash(2));
+        EngineSnapshot {
+            mode: EngineMode::Integrated,
+            state_version: StateVersion::new(3),
+            header_generation: HeaderGeneration::new(4),
+            verified_generation: VerifiedGeneration::new(5),
+            frontiers: FrontierSet {
+                finalized,
+                header_best: tip,
+                verified_best: finalized,
+            },
+            header_best_score: ChainScore::new(SuffixWork::new(U256::from(10_u8)), tip.hash),
+            oldest_retained_height: finalized.height,
+            alarms: AlarmSet::default(),
+        }
+    }
+
+    fn owner(snapshot: &EngineSnapshot) -> BodyWorkOwner {
+        zakura_header_chain::BodyWorkAuthority::for_snapshot(snapshot)
+            .bind(6, NonZeroU64::new(7).expect("seven is nonzero"))
+    }
+
+    fn task(snapshot: &EngineSnapshot) -> RepairRequirement {
+        RepairRequirement::new(owner(snapshot), block::Height(19), 11)
+    }
+
+    fn mark_context_requested(task: &mut RepairRequirement) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        task.mark_context_requested(deadline, deadline + std::time::Duration::from_secs(1))
+            .expect("needed context can be queried");
+    }
+
+    fn context() -> VctRepairContext {
+        VctRepairContext {
+            target: Frontier::new(block::Height(19), hash(5)),
+            locator: zakura_header_chain::HeaderLocator::for_continuation(Frontier::new(
+                block::Height(18),
+                hash(4),
+            )),
+        }
+    }
+
+    #[test]
+    fn state_machine_rotates_suppliers_and_rejects_illegal_transitions() {
+        let snapshot = snapshot();
+        let mut task = task(&snapshot);
+        let source = SourceId::from_digest([8; 32]);
+        let context = context();
+        mark_context_requested(&mut task);
+        task.resolve(context.clone())
+            .expect("the exact context can resolve");
+        task.assign(task.owner).expect("ready work can go on wire");
+        assert_eq!(task.retry(source), Ok(()));
+        assert_eq!(
+            task.state,
+            RepairPolicyState::Ready {
+                context: context.clone()
+            }
+        );
+        assert_eq!(task.attempts, 1);
+        assert!(task.tried_sources.contains(&source));
+
+        task.assign(task.owner)
+            .expect("retried work can go on wire");
+        task.complete()
+            .expect("a matching state admission completes the task");
+        let completed = task.clone();
+        assert_eq!(task.retry(source), Err(RepairPolicyError::IllegalState));
+        assert_eq!(task, completed, "completed work cannot transition again");
+    }
+
+    #[test]
+    fn retry_cycle_rotates_sources_and_resumes_after_backoff() {
+        let mut task = task(&snapshot());
+        let first = SourceId::from_digest([8; 32]);
+        let second = SourceId::from_digest([9; 32]);
+        let context = context();
+        mark_context_requested(&mut task);
+        task.resolve(context.clone())
+            .expect("the exact context resolves");
+        task.assign(task.owner)
+            .expect("the first supplier goes on wire");
+        task.retry(first).expect("the first supplier can fail");
+        task.assign(task.owner)
+            .expect("the second supplier goes on wire");
+        task.retry(second).expect("the second supplier can fail");
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        task.defer_retry_until(deadline)
+            .expect("a complete supplier cycle backs off");
+
+        task.resume_retry_cycle(deadline);
+
+        assert!(task.tried_sources.is_empty());
+        assert_eq!(task.state, RepairPolicyState::Ready { context });
+        assert_eq!(task.attempts, 2);
+    }
+
+    #[test]
+    fn context_backoff_wakes_at_its_deadline() {
+        let mut task = task(&snapshot());
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        mark_context_requested(&mut task);
+        task.context_unavailable(deadline)
+            .expect("an unavailable query enters context backoff");
+
+        task.resume_retry_cycle(deadline - std::time::Duration::from_millis(1));
+        assert_eq!(
+            task.state,
+            RepairPolicyState::ContextBackoff { retry_at: deadline }
+        );
+        task.resume_retry_cycle(deadline);
+        assert_eq!(task.state, RepairPolicyState::NeedsContext);
+    }
+
+    #[test]
+    fn outstanding_context_query_times_out_before_retrying() {
+        let mut task = task(&snapshot());
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let retry_at = deadline + std::time::Duration::from_secs(2);
+        task.mark_context_requested(deadline, retry_at)
+            .expect("needed context can be queried");
+
+        task.resume_retry_cycle(deadline);
+        assert_eq!(task.state, RepairPolicyState::ContextBackoff { retry_at });
+        task.resume_retry_cycle(retry_at);
+        assert_eq!(task.state, RepairPolicyState::NeedsContext);
+    }
+
+    #[test]
+    // AUD-09: enumerate every repair policy state to prove a generation change
+    // retires all old work, rather than sampling only the active state.
+    fn generation_change_retires_every_repair_state() {
+        let snapshot = snapshot();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let context = context();
+        let states = vec![
+            RepairPolicyState::NeedsContext,
+            RepairPolicyState::QueryingContext {
+                deadline,
+                retry_at: deadline + std::time::Duration::from_secs(1),
+            },
+            RepairPolicyState::ContextBackoff { retry_at: deadline },
+            RepairPolicyState::Ready {
+                context: context.clone(),
+            },
+            RepairPolicyState::SupplierBackoff {
+                context: context.clone(),
+                retry_at: deadline,
+            },
+            RepairPolicyState::Assigned { context },
+            RepairPolicyState::Completed,
+        ];
+        for state in states {
+            let mut old_task = task(&snapshot);
+            old_task.state = state.clone();
+            let mut slot = RepairRequirementSlot::default();
+            assert_eq!(slot.insert(old_task.clone()), None);
+            let mut changed = snapshot.clone();
+            changed.state_version = StateVersion::new(4);
+            changed.header_generation = HeaderGeneration::new(5);
+            changed.frontiers.header_best =
+                Frontier::new(changed.frontiers.header_best.height, hash(3));
+            assert_eq!(slot.retain_current(&changed), Some(old_task.clone()));
+            assert!(slot.is_empty(), "state {state:?} survived retirement");
+
+            let replacement = task(&changed);
+            assert_eq!(slot.insert(replacement.clone()), None);
+            assert_eq!(
+                slot.needs_context(),
+                Some(&replacement),
+                "new exact-branch repair schedules only after old state retirement"
+            );
+            assert!(
+                slot.get(old_task.owner).is_none(),
+                "old state ownership cannot alias replacement work"
+            );
+        }
+    }
+}

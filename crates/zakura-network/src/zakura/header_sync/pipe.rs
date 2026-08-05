@@ -218,3 +218,219 @@ fn protocol_reject(error: impl std::fmt::Display) -> SinkReject {
         error.to_string(),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zakura::{framed_channel, header_sync::*, ServicePeerSnapshot};
+    use tokio::sync::watch;
+    use zakura_chain::{block, parameters::Network};
+
+    fn peer() -> ZakuraPeerId {
+        ZakuraPeerId::new(vec![7; 32]).expect("test peer ID has the required length")
+    }
+
+    fn scope() -> zakura_header_chain::HeaderWorkAuthority {
+        zakura_header_chain::HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(2),
+            branch: zakura_header_chain::BranchId::new(block::Hash([0; 32]), block::Hash([3; 32])),
+        }
+    }
+
+    fn handle(codec: HeaderSyncCodec) -> (HeaderSyncHandle, mpsc::Receiver<HeaderSyncEvent>) {
+        let (events, receiver) = mpsc::channel(4);
+        let (lifecycle, _) = mpsc::unbounded_channel();
+        let (_, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+        let (_, peers) = watch::channel(ServicePeerSnapshot::default());
+        let (_, candidates) = watch::channel(Default::default());
+        (
+            HeaderSyncHandle {
+                events,
+                lifecycle,
+                tip,
+                peers,
+                candidates,
+                codec,
+                trace: crate::zakura::ZakuraTrace::noop(),
+            },
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn discriminator_four_is_always_headers_outcome() {
+        let codec = HeaderSyncCodec::new(Network::Mainnet, 1024, 1, 0);
+        let outcome = HeaderSyncMessage::HeadersOutcome(HeadersOutcome {
+            request_id: 1,
+            target_tip_hash: block::Hash([3; 32]),
+            outcome: HeadersOutcomeCode::Busy,
+        });
+        let frame = codec.encode_frame(&outcome).expect("outcome encodes");
+        let (send, recv) = framed_channel(1);
+        send.send(frame).await.expect("pipe input remains open");
+        drop(send);
+        let (handle, mut events) = handle(codec.clone());
+        let (commands_tx, commands) = mpsc::unbounded_channel();
+        commands_tx
+            .send(HeaderSyncPeerCommand::Reserve(ExpectedHeadersResponse {
+                request_id: HeaderSyncRequestId::new(1).expect("one is nonzero"),
+                scope: scope(),
+                context: HeaderSyncDecodeContext {
+                    max_header_count: 1,
+                    requested_tree_aux_schema: AuxSchema::None,
+                },
+            }))
+            .expect("the pipe command receiver is open");
+
+        run_peer(
+            handle,
+            codec,
+            peer(),
+            1,
+            crate::zakura::ServicePeerDirection::Inbound,
+            commands,
+            recv,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("canonical outcome is accepted");
+
+        assert!(matches!(
+            events.recv().await,
+            Some(HeaderSyncEvent::SessionResponse {
+                scope: response_scope,
+                msg: HeaderSyncMessage::HeadersOutcome(_),
+                ..
+            }) if response_scope == scope()
+        ));
+    }
+
+    #[tokio::test]
+    async fn unsolicited_and_mismatched_responses_are_protocol_rejected() {
+        for (reserved_id, response_id) in [(None, 1), (Some(1), 2)] {
+            let codec = HeaderSyncCodec::new(Network::Mainnet, 1024, 1, 0);
+            let frame = codec
+                .encode_frame(&HeaderSyncMessage::HeadersOutcome(HeadersOutcome {
+                    request_id: response_id,
+                    target_tip_hash: block::Hash([3; 32]),
+                    outcome: HeadersOutcomeCode::Busy,
+                }))
+                .expect("the response fixture encodes");
+            let (send, recv) = framed_channel(1);
+            send.send(frame).await.expect("pipe input remains open");
+            drop(send);
+            let (handle, mut events) = handle(codec.clone());
+            let (commands_tx, commands) = mpsc::unbounded_channel();
+            if let Some(request_id) = reserved_id {
+                commands_tx
+                    .send(HeaderSyncPeerCommand::Reserve(ExpectedHeadersResponse {
+                        request_id: HeaderSyncRequestId::new(request_id)
+                            .expect("the fixture request ID is nonzero"),
+                        scope: scope(),
+                        context: HeaderSyncDecodeContext {
+                            max_header_count: 1,
+                            requested_tree_aux_schema: AuxSchema::None,
+                        },
+                    }))
+                    .expect("the pipe command receiver is open");
+            }
+
+            let result = run_peer(
+                handle,
+                codec,
+                peer(),
+                1,
+                crate::zakura::ServicePeerDirection::Inbound,
+                commands,
+                recv,
+                CancellationToken::new(),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(SinkReject::Protocol(_))),
+                "an unsolicited or mismatched response is peer-attributable"
+            );
+            assert!(
+                events.try_recv().is_err(),
+                "a rejected response never reaches the reactor"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn locally_cancelled_response_is_dropped_but_unknown_response_is_rejected() {
+        let codec = HeaderSyncCodec::new(Network::Mainnet, 1024, 1, 0);
+        let late_response = codec
+            .encode_frame(&HeaderSyncMessage::HeadersOutcome(HeadersOutcome {
+                request_id: 1,
+                target_tip_hash: block::Hash([3; 32]),
+                outcome: HeadersOutcomeCode::Busy,
+            }))
+            .expect("the late response fixture encodes");
+        let (send, recv) = framed_channel(1);
+        send.send(late_response)
+            .await
+            .expect("pipe input remains open");
+        drop(send);
+        let (handle, mut events) = handle(codec.clone());
+        let (commands_tx, commands) = mpsc::unbounded_channel();
+        let request_id = HeaderSyncRequestId::new(1).expect("one is nonzero");
+        commands_tx
+            .send(HeaderSyncPeerCommand::Reserve(ExpectedHeadersResponse {
+                request_id,
+                scope: scope(),
+                context: HeaderSyncDecodeContext {
+                    max_header_count: 1,
+                    requested_tree_aux_schema: AuxSchema::None,
+                },
+            }))
+            .expect("the pipe command receiver is open");
+        commands_tx
+            .send(HeaderSyncPeerCommand::Cancel(request_id))
+            .expect("the pipe command receiver is open");
+
+        run_peer(
+            handle,
+            codec,
+            peer(),
+            1,
+            crate::zakura::ServicePeerDirection::Inbound,
+            commands,
+            recv,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a response to a locally cancelled request is not peer-attributable");
+        assert!(
+            events.try_recv().is_err(),
+            "late response never reaches the reactor"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn cancelled_response_grace_is_bounded_and_expires() {
+        let mut cancelled = CancelledResponseIds::default();
+        for id in 1..=u64::try_from(MAX_CANCELLED_RESPONSE_IDS + 1)
+            .expect("the small cancellation cap fits in u64")
+        {
+            cancelled.insert(HeaderSyncRequestId::new(id).expect("fixture IDs are nonzero"));
+        }
+        assert_eq!(cancelled.ids.len(), MAX_CANCELLED_RESPONSE_IDS);
+        assert!(
+            !cancelled.take(HeaderSyncRequestId::new(1).expect("one is nonzero")),
+            "the oldest cancellation is evicted at the hard cap"
+        );
+
+        tokio::time::advance(CANCELLED_RESPONSE_GRACE).await;
+        assert!(
+            !cancelled.take(
+                HeaderSyncRequestId::new(
+                    u64::try_from(MAX_CANCELLED_RESPONSE_IDS + 1)
+                        .expect("the small cancellation cap fits in u64")
+                )
+                .expect("fixture IDs are nonzero")
+            ),
+            "a response is peer-attributable again after local cancellation grace expires"
+        );
+    }
+}

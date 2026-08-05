@@ -332,3 +332,312 @@ impl BodyRetryQueue {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use zakura_chain::block;
+
+    use super::*;
+
+    struct ManualClock(Mutex<DateTime<Utc>>);
+
+    impl ManualClock {
+        fn new(now: DateTime<Utc>) -> Self {
+            Self(Mutex::new(now))
+        }
+
+        fn advance(&self, duration: Duration) {
+            let mut now = self.0.lock().expect("the test clock mutex is not poisoned");
+            *now += duration;
+        }
+    }
+
+    impl Clock for ManualClock {
+        fn now(&self) -> DateTime<Utc> {
+            *self.0.lock().expect("the test clock mutex is not poisoned")
+        }
+    }
+
+    struct FixedJitter(i16);
+
+    impl RetryJitter for FixedJitter {
+        fn offset_per_thousand(&self, _branch: BranchId, _header: Frontier, _attempt: u32) -> i16 {
+            self.0
+        }
+    }
+
+    fn hash(byte: u8) -> block::Hash {
+        block::Hash([byte; 32])
+    }
+
+    fn source(byte: u8) -> SourceId {
+        SourceId::from_digest([byte; 32])
+    }
+
+    fn clock() -> ManualClock {
+        ManualClock::new(
+            DateTime::from_timestamp(1_700_000_000, 0).expect("the timestamp is valid"),
+        )
+    }
+
+    fn episode(clock: &ManualClock, suppliers: &[SourceId]) -> BodyRetryEpisode {
+        BodyRetryEpisode::new(
+            BranchId::new(hash(1), hash(2)),
+            HeaderGeneration::new(3),
+            Frontier::new(block::Height(20), hash(2)),
+            suppliers.iter().copied().collect(),
+            clock,
+        )
+    }
+
+    #[test]
+    fn exact_backoff_caps_then_alarms_and_probes_every_ten_minutes() {
+        let clock = clock();
+        let supplier = source(3);
+        let mut episode = episode(&clock, &[supplier]);
+        let jitter = FixedJitter(0);
+
+        for expected_seconds in [1, 2, 4, 8, 16, 32, 60, 60, 60] {
+            let now = clock.now();
+            assert_eq!(
+                episode.record_failure(supplier, &clock, &jitter),
+                RetryUpdate::RetryAt(now + Duration::seconds(expected_seconds))
+            );
+            clock.advance(Duration::seconds(expected_seconds));
+        }
+        let now = clock.now();
+        assert_eq!(
+            episode.record_failure(supplier, &clock, &jitter),
+            RetryUpdate::Alarmed {
+                probe_at: now + ALARM_PROBE_INTERVAL
+            }
+        );
+        assert_eq!(
+            episode.record_failure(supplier, &clock, &jitter),
+            RetryUpdate::TooEarly
+        );
+        clock.advance(ALARM_PROBE_INTERVAL);
+        let now = clock.now();
+        assert_eq!(
+            episode.record_failure(supplier, &clock, &jitter),
+            RetryUpdate::ProbeAt(now + ALARM_PROBE_INTERVAL)
+        );
+        assert_eq!(
+            episode.summary(),
+            BodyUnavailableSummary {
+                started_at: episode.started_at,
+                attempts: 11,
+                suppliers: 1,
+                supplier_set_digest: BodyUnavailableSummary::supplier_set_digest(
+                    &episode.eligible_suppliers,
+                ),
+                alarmed: true,
+                next_probe_at: episode.next_probe_at,
+            }
+        );
+    }
+
+    #[test]
+    fn jitter_and_final_delay_are_clamped_and_only_restart_resets_an_episode() {
+        let clock = clock();
+        let first = source(3);
+        let second = source(4);
+        let mut episode = episode(&clock, &[first]);
+        let now = clock.now();
+        assert_eq!(
+            episode.record_failure(first, &clock, &FixedJitter(-500)),
+            RetryUpdate::RetryAt(now + Duration::milliseconds(900))
+        );
+        clock.advance(Duration::milliseconds(900));
+        let now = clock.now();
+        assert_eq!(
+            episode.record_failure(first, &clock, &FixedJitter(500)),
+            RetryUpdate::RetryAt(now + Duration::milliseconds(2_200))
+        );
+        assert_eq!(
+            retry_delay(episode.branch, episode.header, 7, &FixedJitter(-500)),
+            Duration::seconds(54)
+        );
+        assert_eq!(
+            retry_delay(episode.branch, episode.header, 7, &FixedJitter(500)),
+            Duration::seconds(60),
+            "the jittered delay itself must not exceed the normative cap"
+        );
+        let started_at = episode.started_at;
+        let attempts = episode.attempts;
+        let next_probe_at = episode.next_probe_at;
+        assert!(episode.refresh_suppliers([first, second].into_iter().collect()));
+        assert_eq!(episode.started_at, started_at);
+        assert_eq!(episode.attempts, attempts);
+        assert_eq!(episode.tried_suppliers, [first].into_iter().collect());
+        assert_eq!(episode.next_probe_at, next_probe_at);
+        assert!(!episode.alarmed);
+        episode.record_failure(second, &clock, &FixedJitter(0));
+        assert_eq!(episode.attempts, attempts.saturating_add(1));
+        episode.restart(&clock);
+        assert_eq!(episode.attempts, 0);
+        assert!(episode.is_due(&clock));
+    }
+
+    #[test]
+    fn supplier_churn_cannot_suppress_a_persistent_alarm() {
+        let clock = clock();
+        let first = source(3);
+        let mut episode = episode(&clock, &[first]);
+        let jitter = FixedJitter(0);
+
+        for _ in 0..ALARM_ATTEMPTS {
+            assert!(matches!(
+                episode.record_failure(first, &clock, &jitter),
+                RetryUpdate::RetryAt(_) | RetryUpdate::Alarmed { .. }
+            ));
+            if !episode.alarmed {
+                clock.advance(Duration::seconds(60));
+            }
+        }
+        assert!(episode.alarmed);
+        let started_at = episode.started_at;
+        let attempts = episode.attempts;
+        let next_probe_at = episode.next_probe_at;
+
+        let mut suppliers: BTreeSet<_> = [first].into_iter().collect();
+        for value in 4..=10 {
+            let supplier = source(value);
+            assert!(suppliers.insert(supplier));
+            assert!(episode.refresh_suppliers(suppliers.clone()));
+            assert_eq!(episode.started_at, started_at);
+            assert_eq!(episode.attempts, attempts);
+            assert!(episode.alarmed);
+            assert_eq!(episode.next_probe_at, next_probe_at);
+            assert_eq!(episode.tried_suppliers, [first].into_iter().collect());
+        }
+
+        clock.advance(ALARM_PROBE_INTERVAL);
+        assert_eq!(
+            episode.record_failure(first, &clock, &jitter),
+            RetryUpdate::ProbeAt(clock.now() + ALARM_PROBE_INTERVAL)
+        );
+        assert_eq!(episode.attempts, attempts.saturating_add(1));
+        assert!(episode.alarmed);
+    }
+
+    #[test]
+    fn restored_alarm_preserves_episode_age_attempts_and_probe_cadence() {
+        let clock = clock();
+        let first = source(3);
+        let second = source(4);
+        let suppliers = [first, second].into_iter().collect();
+        let started_at = clock.now() - Duration::minutes(12);
+        let next_probe_at = clock.now() + Duration::minutes(4);
+        let summary = BodyUnavailableSummary {
+            started_at,
+            attempts: 14,
+            suppliers: 2,
+            supplier_set_digest: BodyUnavailableSummary::supplier_set_digest(&suppliers),
+            alarmed: true,
+            next_probe_at,
+        };
+        let mut episode = BodyRetryEpisode::restore(
+            BranchId::new(hash(1), hash(2)),
+            HeaderGeneration::new(3),
+            Frontier::new(block::Height(20), hash(2)),
+            suppliers,
+            summary,
+        );
+
+        assert_eq!(episode.summary(), summary);
+        assert!(!episode.is_due(&clock));
+        assert_eq!(
+            episode.record_failure(first, &clock, &FixedJitter(0)),
+            RetryUpdate::TooEarly
+        );
+        clock.advance(Duration::minutes(4));
+        assert_eq!(
+            episode.record_failure(second, &clock, &FixedJitter(0)),
+            RetryUpdate::ProbeAt(clock.now() + ALARM_PROBE_INTERVAL)
+        );
+        assert_eq!(episode.started_at, started_at);
+        assert_eq!(episode.attempts, 15);
+        assert!(episode.alarmed);
+    }
+
+    #[test]
+    fn seeded_jitter_is_reproducible_and_within_the_normative_bound() {
+        let episode = episode(&clock(), &[source(3)]);
+        let jitter = SeededRetryJitter::new([7; 32]);
+        let first = jitter.offset_per_thousand(episode.branch, episode.header, 1);
+        assert_eq!(
+            first,
+            jitter.offset_per_thousand(episode.branch, episode.header, 1)
+        );
+        assert!((-100..=100).contains(&first));
+        for attempt in 2..=64 {
+            assert!((-100..=100).contains(&jitter.offset_per_thousand(
+                episode.branch,
+                episode.header,
+                attempt
+            )));
+        }
+    }
+
+    #[test]
+    fn elapsed_alarm_waits_until_every_known_supplier_was_tried() {
+        let clock = clock();
+        let first = source(3);
+        let second = source(4);
+        let mut episode = episode(&clock, &[first, second]);
+        let jitter = FixedJitter(0);
+        assert!(matches!(
+            episode.record_failure(first, &clock, &jitter),
+            RetryUpdate::RetryAt(_)
+        ));
+        clock.advance(ALARM_AFTER);
+        assert!(matches!(
+            episode.record_failure(first, &clock, &jitter),
+            RetryUpdate::RetryAt(_)
+        ));
+        assert!(matches!(
+            episode.record_failure(second, &clock, &jitter),
+            RetryUpdate::Alarmed { .. }
+        ));
+    }
+
+    #[test]
+    fn generation_or_anchor_change_retires_retry_work_before_reuse() {
+        let clock = clock();
+        let episode = episode(&clock, &[source(3)]);
+        let mut queue = BodyRetryQueue::default();
+        assert!(queue.insert(episode.clone()).is_none());
+        assert!(queue
+            .get_mut(episode.generation, episode.branch, episode.header.hash)
+            .is_some());
+        queue.retain_current(
+            HeaderGeneration::new(4),
+            Frontier::new(block::Height(10), episode.branch.anchor_hash),
+        );
+        assert_eq!(queue.len(), 0);
+        assert!(queue.is_empty());
+
+        queue.insert(episode.clone());
+        assert_eq!(
+            queue.remove(episode.generation, episode.branch, episode.header.hash),
+            Some(episode.clone())
+        );
+        queue.insert(episode.clone());
+        queue.retain_current(
+            episode.generation,
+            Frontier::new(block::Height(11), hash(9)),
+        );
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn retry_deadlines_saturate_at_the_clock_boundary() {
+        assert_eq!(
+            retry_deadline(DateTime::<Utc>::MAX_UTC, Duration::minutes(10)),
+            DateTime::<Utc>::MAX_UTC
+        );
+    }
+}

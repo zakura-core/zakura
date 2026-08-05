@@ -1,6 +1,6 @@
 [package]
 name = "zakura-utils"
-version = "2.1.0-rc1"
+version = "2.1.0-rc2"
 authors.workspace = true
 description = "Developer tools for Zakura maintenance and testing. Internal crate, published to support cargo install zakura"
 license.workspace = true

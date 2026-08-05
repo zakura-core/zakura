@@ -145,6 +145,11 @@ impl AuditHistoricalTreestatesCmd {
         let (_read_state, db, _non_finalized_sender) =
             zakura_state::init_read_only(state_config, &self.network)?;
 
+        if !self.no_scan {
+            eprintln!(
+                "inventory scan starting. Please wait for approximately 5–15 minutes on Mainnet"
+            );
+        }
         let inventory = zakura_state::vct_treestate_inventory(&db, !self.no_scan);
         print_inventory(&inventory);
 
@@ -224,6 +229,16 @@ impl AuditHistoricalTreestatesCmd {
         let total = usize::try_from(total)
             .map_err(|_| eyre!("the requested sample count does not fit this platform"))?;
         let heights = sampled_heights(from, to, self.step);
+        let block_count = u64::from(to.0) - u64::from(from.0) + 1;
+        let progress_interval = (total / 100).max(1);
+
+        println!("long block read/replay starting: {block_count} blocks, {total} sampled roots");
+        if !self.cold && self.step > 1 {
+            println!(
+                "  --step controls root sampling only; sequential replay still reads every block"
+            );
+        }
+        println!("  progress will be reported approximately every 1%");
 
         if self.print_roots {
             let cache = Mutex::new(HistoricalTreeCache::default());
@@ -249,6 +264,7 @@ impl AuditHistoricalTreestatesCmd {
         let print_samples = self.print_samples;
         let mut samples: Vec<DerivationSample> = Vec::with_capacity(total);
         let mut report = |sample: &DerivationSample| {
+            let completed = samples.len() + 1;
             if print_samples {
                 // The replayed range ends at this height and covers `replayed_blocks` blocks.
                 // Cast is safe: the `min` clamps the value to `height.0 + 1`, which fits in
@@ -267,11 +283,11 @@ impl AuditHistoricalTreestatesCmd {
                     sample.elapsed.as_micros()
                 );
             }
-            // One line per 1000 samples keeps a multi-million-height walk readable.
-            if samples.len().is_multiple_of(1000) {
+            if completed == 1 || completed.is_multiple_of(progress_interval) || completed == total {
+                let percent = completed * 100 / total;
                 println!(
-                    "  {:>7}/{total}  height {:>9}  replayed {:>9} blocks in {:>10}",
-                    samples.len(),
+                    "  {:>7}/{total} ({percent:>3}%)  height {:>9}  replayed {:>9} blocks in {:>10}",
+                    completed,
                     sample.height.0,
                     sample.replayed_blocks,
                     format_duration(sample.elapsed),

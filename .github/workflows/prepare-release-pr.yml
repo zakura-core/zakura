@@ -148,18 +148,9 @@ jobs:
           toolchain: stable
           cache-key: prepare-release
           cache-on-failure: true
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # Separate cache for baseline rustdoc JSON, mirroring semver-checks.yml:
-      # rust-cache's target-dir cleaner would delete target/semver-checks
-      # before saving. Distinct key because --baseline-rev baselines differ
-      # from crates.io ones.
-      - name: Restore baseline rustdoc cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
-        with:
-          path: target/semver-checks/cache
-          key: prepare-release-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ github.run_id }}
-          restore-keys: prepare-release-baselines-${{ steps.toolchain.outputs.cachekey }}-
+          # Release preparation consumes existing build caches without
+          # replacing caches warmed by regular CI.
+          cache-save-if: false
 
       # Deliberately unpinned (like semver-checks.yml): cargo-semver-checks
       # must track new stable rustdoc formats.
@@ -190,12 +181,6 @@ jobs:
           [ -z "$RELEASE_STATE_WAIVER" ] \
             || args+=(--release-state-waiver "$RELEASE_STATE_WAIVER")
           scripts/prepare-release.sh "${args[@]}"
-
-      - name: Save baseline rustdoc cache
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
-        with:
-          path: target/semver-checks/cache
-          key: prepare-release-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ github.run_id }}
 
       # cargo package (run by the packaging check) refuses a dirty tree, so
       # verification runs on a temporary local commit; it is soft-reset away

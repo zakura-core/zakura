@@ -31,12 +31,14 @@
 #       [--latest-release-state-height HEIGHT]
 #       [--release-state-waiver REASON]
 #       [--tag-remote URL]
-#       [--no-crates] [--dry-run] [--summary-json PATH]
+#       [--no-crates] [--dry-run] [--allow-dirty-release-state] [--summary-json PATH]
 #
 #   --base-tag      defaults to the most recent v* tag reachable from HEAD
 #   --tag-remote    canonical tag source checked before retargeting
 #   --no-crates     GitHub-only release candidate: bump only the zakura package
 #   --dry-run       print the bump plan and intended edits; modify nothing
+#   --allow-dirty-release-state
+#                   allow a pre-imported release-state update to be present
 #   --summary-json  write a machine-readable summary (used for the PR body)
 set -euo pipefail
 
@@ -53,6 +55,7 @@ release_tag=""
 base_tag=""
 no_crates=0
 dry_run=0
+allow_dirty_release_state=0
 summary_json=""
 estimated_release_height=""
 latest_release_state_height=""
@@ -60,7 +63,7 @@ release_state_waiver=""
 tag_remote="https://github.com/zakura-core/zakura.git"
 
 usage() {
-  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -74,6 +77,7 @@ while [ $# -gt 0 ]; do
     --tag-remote) tag_remote="${2:?--tag-remote needs a value}"; shift 2 ;;
     --no-crates) no_crates=1; shift ;;
     --dry-run) dry_run=1; shift ;;
+    --allow-dirty-release-state) allow_dirty_release_state=1; shift ;;
     --summary-json) summary_json="${2:?--summary-json needs a value}"; shift 2 ;;
     -h|--help) usage ;;
     *) echo "Unknown argument: $1" >&2; usage 1 >&2 ;;
@@ -138,9 +142,36 @@ for height_arg in "$estimated_release_height" "$latest_release_state_height"; do
   fi
 done
 
-if [ "$dry_run" = 0 ] && [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
-  echo "ERROR: the working tree is not clean; commit or stash before preparing a release." >&2
-  exit 1
+if [ "$dry_run" = 0 ]; then
+  dirty_tree="$(git status --porcelain --untracked-files=normal)"
+  if [ -n "$dirty_tree" ]; then
+    if [ "$allow_dirty_release_state" = 1 ]; then
+      allow_only_release_state=1
+      while IFS= read -r dirty_line; do
+        [ -n "$dirty_line" ] || continue
+        dirty_path="${dirty_line:3}"
+        case "$dirty_path" in
+          crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt|\
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin|\
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json|\
+          crates/zakurad/src/components/sync/end_of_support.rs)
+            ;;
+          *)
+            allow_only_release_state=0
+            break
+            ;;
+        esac
+      done <<<"$dirty_tree"
+      if [ "$allow_only_release_state" = 0 ]; then
+        echo "ERROR: the working tree has changes outside the imported release-state files." >&2
+        exit 1
+      fi
+      echo "Allowing imported release-state edits in the working tree."
+    else
+      echo "ERROR: the working tree is not clean; commit or stash before preparing a release." >&2
+      exit 1
+    fi
+  fi
 fi
 
 echo "Preparing ${release_tag} from base ${base_tag}$( [ "$no_crates" = 1 ] && echo ' (zakura package only)' )"

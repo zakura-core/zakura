@@ -201,6 +201,7 @@ jobs:
           ESTIMATED_RELEASE_HEIGHT: ${{ steps.release-state.outputs.estimated_release_height }}
           LATEST_RELEASE_STATE_HEIGHT: ${{ steps.release-state.outputs.bundle_height }}
           RELEASE_STATE_WAIVER: ${{ inputs.release_state_waiver }}
+          RELEASE_STATE_IMPORTED: ${{ steps.release-state-import.outputs.has_changes }}
         run: |
           args=(
             --release-tag "$RELEASE_TAG"
@@ -212,6 +213,8 @@ jobs:
           [ -z "$NO_CRATES_FLAG" ] || args+=("$NO_CRATES_FLAG")
           [ -z "$RELEASE_STATE_WAIVER" ] \
             || args+=(--release-state-waiver "$RELEASE_STATE_WAIVER")
+          [ "$RELEASE_STATE_IMPORTED" = "true" ] \
+            && args+=(--allow-dirty-release-state)
           scripts/prepare-release.sh "${args[@]}"
 
       # cargo package (run by the packaging check) refuses a dirty tree, so

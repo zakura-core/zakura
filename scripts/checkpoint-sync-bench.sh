@@ -21,6 +21,7 @@
 #   STOP_HEIGHT           debug_stop_at_height                (default 1737210, +30k)
 #   WALL_CAP              hard wall-clock cap, seconds         (default 2000)
 #   FEED_PEER             optional single pinned peer ip:port  (default: DNS seeders)
+#   PEERSET_SIZE          target peer count                    (default: 1 pinned, 75 DNS)
 #   CKPT_LIMIT            checkpoint_verify_concurrency_limit  (default 1500)
 #   DL_LIMIT              download_concurrency_limit           (default 150)
 #   VERIFY_MODE           checkpoint | semantic                (default checkpoint)
@@ -75,7 +76,13 @@ CKPT_LIMIT="${CKPT_LIMIT:-1500}"
 DL_LIMIT="${DL_LIMIT:-150}"
 VERIFY_MODE="${VERIFY_MODE:-checkpoint}"
 FULL_VERIFY_LIMIT="${FULL_VERIFY_LIMIT:-20}"
-PEERSET_SIZE="${PEERSET_SIZE:-1}"   # 1 = strict single pinned peer; raise to allow DNS-seeder fallback
+if [[ -z "${PEERSET_SIZE:-}" ]]; then
+  if [[ -n "$FEED_PEER" ]]; then
+    PEERSET_SIZE=1
+  else
+    PEERSET_SIZE=75
+  fi
+fi
 TARGET_P2P_STACK="${TARGET_P2P_STACK:-}"
 BASELINE_P2P_STACK="${BASELINE_P2P_STACK:-}"
 START_HEIGHT="${START_HEIGHT:-1707210}"

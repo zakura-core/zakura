@@ -60,6 +60,8 @@ jobs:
       has_packages: ${{ steps.affected.outputs.has_packages }}
       packages: ${{ steps.affected.outputs.packages }}
       packages_json: ${{ steps.affected.outputs.packages_json }}
+      public_api_packages_json: ${{ steps.affected.outputs.public_api_packages_json }}
+      has_public_api_packages: ${{ steps.affected.outputs.has_public_api_packages }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
@@ -93,14 +95,25 @@ jobs:
               | jq --raw-input --slurp --compact-output \
                 'split("\n") | map(select(length > 0))'
           )"
+          # The release preparation has always limited the independent
+          # public-API evidence to library crates in its crate bump plan;
+          # `zakura` is versioned separately from that plan.
+          public_api_packages_json="$(
+            jq --compact-output 'map(select(. != "zakura"))' <<<"$packages_json"
+          )"
+          has_public_api_packages="$(
+            jq --raw-output 'length > 0' <<<"$public_api_packages_json"
+          )"
 
           {
             echo "baseline_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*')"
             echo "has_packages=$([[ -n "$packages" ]] && echo true || echo false)"
+            echo "has_public_api_packages=$has_public_api_packages"
             echo "packages<<EOF"
             echo "$packages"
             echo "EOF"
             echo "packages_json=$packages_json"
+            echo "public_api_packages_json=$public_api_packages_json"
           } >> "$GITHUB_OUTPUT"
 
           if [[ -n "$packages" ]]; then
@@ -178,6 +191,46 @@ jobs:
           checklist ("Update Crate Versions").
           EOF
 
+  public-api-diff:
+    name: public API (${{ matrix.package }})
+    if: >-
+      github.event_name == 'pull_request'
+      && startsWith(github.head_ref, 'release/v')
+      && needs.select-packages.outputs.has_public_api_packages == 'true'
+    needs: select-packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.select-packages.outputs.public_api_packages_json) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
+          toolchain: stable
+          cache: false
+
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
+        with:
+          tool: cargo-public-api
+
+      - uses: ./.github/actions/setup-zakura-build
+
+      - name: Install nightly rustdoc toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Diff against the latest published API
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          # cargo-public-api builds both the current and published crate with
+          # nightly. Nightly-only warnings are evidence, not the lint gate.
+          RUSTFLAGS='' cargo public-api diff latest -p "$PACKAGE" -sss
+
   warm-baselines:
     name: Warm semver baselines
     if: >-
@@ -240,7 +293,7 @@ jobs:
   semver-checks:
     name: semver-checks
     if: always()
-    needs: [select-packages, check-package, warm-baselines]
+    needs: [select-packages, check-package, public-api-diff, warm-baselines]
     runs-on: ubuntu-latest
     steps:
       - name: Check semver job results
@@ -248,6 +301,9 @@ jobs:
           CHECK_RESULT: ${{ needs.check-package.result }}
           EVENT_NAME: ${{ github.event_name }}
           HAS_PACKAGES: ${{ needs.select-packages.outputs.has_packages }}
+          HAS_PUBLIC_API_PACKAGES: ${{ needs.select-packages.outputs.has_public_api_packages }}
+          PUBLIC_API_RESULT: ${{ needs.public-api-diff.result }}
+          RELEASE_PR: ${{ startsWith(github.head_ref, 'release/v') }}
           SELECT_RESULT: ${{ needs.select-packages.result }}
           WARM_RESULT: ${{ needs.warm-baselines.result }}
         run: |
@@ -259,6 +315,11 @@ jobs:
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             if [[ "$HAS_PACKAGES" == "true" && "$CHECK_RESULT" != "success" ]]; then
               echo "Package checks failed: $CHECK_RESULT" >&2
+              exit 1
+            fi
+            if [[ "$RELEASE_PR" == "true" && "$HAS_PUBLIC_API_PACKAGES" == "true" \
+              && "$PUBLIC_API_RESULT" != "success" ]]; then
+              echo "Public API diffs failed: $PUBLIC_API_RESULT" >&2
               exit 1
             fi
           elif [[ "$WARM_RESULT" != "success" ]]; then

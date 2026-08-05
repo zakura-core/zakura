@@ -162,11 +162,10 @@ jobs:
           restore-keys: prepare-release-baselines-${{ steps.toolchain.outputs.cachekey }}-
 
       # Deliberately unpinned (like semver-checks.yml): cargo-semver-checks
-      # must track new stable rustdoc formats. cargo-public-api supplies
-      # independent API-diff evidence for each changed published library.
+      # must track new stable rustdoc formats.
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
         with:
-          tool: cargo-release,cargo-semver-checks,cargo-public-api
+          tool: cargo-release,cargo-semver-checks
 
       - uses: ./.github/actions/setup-zakura-build
 
@@ -241,37 +240,6 @@ jobs:
         continue-on-error: true
         run: cargo fmt --all -- --check
 
-      - name: Record public API diffs
-        id: verify-public-api
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          packages="$(
-            jq -r '
-              .crates[]
-              | select(.level != "manual" and .target != null and .target != "")
-              | .name
-            ' \
-              "$RUNNER_TEMP/prep-summary.json"
-          )"
-          if [ -z "$packages" ]; then
-            echo "No changed library crates are being published."
-            exit 0
-          fi
-          # cargo-public-api builds rustdoc JSON with nightly even when the
-          # workspace itself is built and verified with stable. Keep setup in
-          # this continue-on-error step so a toolchain outage is recorded in
-          # the generated draft PR instead of preventing PR creation.
-          rustup toolchain install nightly --profile minimal
-          while IFS= read -r package; do
-            [ -n "$package" ] || continue
-            echo "::group::cargo public-api diff latest -p ${package}"
-            # Public API evidence must build both current and previously
-            # published crates; nightly-only warnings are not a lint gate.
-            RUSTFLAGS='' cargo public-api diff latest -p "$package" -sss
-            echo "::endgroup::"
-          done <<<"$packages"
-
       - name: Write the PR body
         id: body
         env:
@@ -280,7 +248,6 @@ jobs:
           VERIFY_PRERELEASE: ${{ steps.verify-prerelease.outcome }}
           VERIFY_CONFIG: ${{ steps.verify-config.outcome }}
           VERIFY_FMT: ${{ steps.verify-fmt.outcome }}
-          VERIFY_PUBLIC_API: ${{ steps.verify-public-api.outcome }}
         run: |
           python3 - "$RUNNER_TEMP/prep-summary.json" > "$RUNNER_TEMP/pr-body.md" <<'PY'
           import json, os, sys
@@ -377,11 +344,13 @@ jobs:
               ("cargo test -p zakura --test acceptance config_tests -- --exact",
                os.environ["VERIFY_CONFIG"]),
               ("cargo fmt --all -- --check", os.environ["VERIFY_FMT"]),
-              ("cargo public-api diff latest for changed published libraries",
-               os.environ["VERIFY_PUBLIC_API"]),
           ]
           lines += ["", "## Verification", ""]
           lines += [f"- [{mark(o)}] `{cmd}`" for cmd, o in checks]
+          lines.append(
+              "- ⏳ `cargo public-api diff latest` for changed published "
+              "libraries runs in the parallel release-PR CI matrix."
+          )
           if any(o != "success" for _, o in checks):
               lines += [
                   "",
@@ -482,8 +451,7 @@ jobs:
         if: >-
           steps.verify-prerelease.outcome == 'failure' ||
           steps.verify-config.outcome == 'failure' ||
-          steps.verify-fmt.outcome == 'failure' ||
-          steps.verify-public-api.outcome == 'failure'
+          steps.verify-fmt.outcome == 'failure'
         run: |
           echo "Release preparation verification failed; see the step logs above." >&2
           exit 1

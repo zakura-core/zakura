@@ -21,6 +21,7 @@ use zakura_chain::{
     block::Height,
     ironwood, orchard,
     parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
+    parameters::NetworkUpgrade,
     sapling, sprout,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
     transaction::Transaction,
@@ -626,16 +627,22 @@ impl ZakuraDb {
 
         let ironwood_trees = self.db.cf_handle("ironwood_note_commitment_tree").unwrap();
 
-        // Outside the VCT absent band, Ironwood tree rows must exist by genesis
-        // commit or the `add_ironwood_tree` upgrade.
-        let (_first_duplicate_height, tree) = self
-            .db
-            .zs_prev_key_value_back_from(&ironwood_trees, height)
-            .expect(
-                "Ironwood note commitment trees must exist for all heights below the finalized tip",
-            );
+        // The Ironwood column family is seeded by the `add_ironwood_tree` format upgrade, which
+        // runs in the background. Before NU6.3, a temporarily empty column family therefore has
+        // the consensus-correct empty tree. From activation onward, a missing tree is an invariant
+        // violation rather than an upgrade race.
+        let nu6_3_activated = NetworkUpgrade::Nu6_3
+            .activation_height(&self.network())
+            .is_some_and(|activation| *height >= activation);
 
-        Some(Arc::new(tree))
+        match self.db.zs_prev_key_value_back_from(&ironwood_trees, height) {
+            Some((_first_duplicate_height, tree)) => Some(Arc::new(tree)),
+            None if !nu6_3_activated => Some(Default::default()),
+            None => panic!(
+                "Ironwood note commitment trees must exist for all heights below the finalized tip \
+                 from NU6.3 activation onward"
+            ),
+        }
     }
 
     /// Returns the latest stored Ironwood tree at or below `height`, without asserting its presence.

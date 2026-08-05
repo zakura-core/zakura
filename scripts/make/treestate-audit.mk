@@ -29,21 +29,27 @@ TREESTATE_RANGE_ARGS = \
 	$(if $(TREESTATE_TO),--to "$(TREESTATE_TO)") \
 	--step "$(TREESTATE_STEP)"
 
+# Report the database's historical-treestate inventory without deriving any trees.
 treestate-audit-inventory:
 	$(TREESTATE_AUDIT) $(TREESTATE_EXTRA_ARGS)
 
+# Replay the post-checkpoint band and compare the resulting subtree roots with stored rows.
 treestate-audit-subtrees:
 	$(TREESTATE_AUDIT) --verify-subtrees $(TREESTATE_EXTRA_ARGS)
 
+# Derive and authenticate historical treestates over a configurable height range.
 treestate-audit-walk:
 	$(TREESTATE_AUDIT) --walk $(TREESTATE_RANGE_ARGS) $(TREESTATE_EXTRA_ARGS)
 
+# Measure independent cold replays and emit one `SAMPLE` cost/input line per sampled height.
 treestate-audit-samples:
 	$(TREESTATE_AUDIT) --walk --cold --print-samples $(TREESTATE_RANGE_ARGS) $(TREESTATE_EXTRA_ARGS)
 
+# Derive treestates and emit one `ROOT` line per sampled height for external comparison.
 treestate-audit-roots:
 	$(TREESTATE_AUDIT) --walk --print-roots $(TREESTATE_RANGE_ARGS) $(TREESTATE_EXTRA_ARGS)
 
+# Compare locally derived roots with a legacy node's `z_gettreestate` response over JSON-RPC.
 treestate-audit-differential:
 	@if [ -n "$(TREESTATE_FROM)" ] && [ -n "$(TREESTATE_TO)" ] && [ -n "$(TREESTATE_RPC_URL)" ]; then :; else \
 		echo "usage: make treestate-audit-differential TREESTATE_FROM=<height> TREESTATE_TO=<height> TREESTATE_RPC_URL=<url> [TREESTATE_CACHE_DIR=<path>] [TREESTATE_STEP=<n>]" >&2; \

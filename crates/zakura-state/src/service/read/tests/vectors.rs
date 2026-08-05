@@ -752,6 +752,42 @@ async fn missing_subtree_before_handoff_reports_indeterminate_reason() {
     );
 }
 
+/// A subtree that the authenticated handoff frontier proves was not completed is an ordinary
+/// empty result, even while the finalized tip is below the handoff.
+#[tokio::test]
+async fn incomplete_ironwood_subtree_before_mainnet_handoff_is_empty() {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .take(2)
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Mainnet).await;
+    let handoff = Mainnet.checkpoint_list().max_height();
+
+    assert!(
+        read_state.db.finalized_tip_height() < Some(handoff),
+        "the regression requires a finalized tip below the Mainnet handoff"
+    );
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, handoff);
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding the Mainnet VCT handoff succeeds");
+
+    let subtrees = ironwood_subtrees(
+        None::<Arc<Chain>>,
+        &read_state.db,
+        NoteCommitmentSubtreeIndex(0)..1.into(),
+    )
+    .expect("the authenticated handoff proves Ironwood subtree zero was not completed");
+
+    assert!(subtrees.is_empty());
+}
+
 /// A missing handoff tree is an error once the finalized tip has reached the handoff.
 #[tokio::test]
 async fn missing_handoff_tree_fails_closed_after_sync_reaches_handoff() {

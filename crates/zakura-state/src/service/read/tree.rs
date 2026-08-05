@@ -24,7 +24,10 @@ use crate::{
     error::{
         HistoricalSubtreeUnavailable, HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable,
     },
-    service::{finalized_state::ZakuraDb, non_finalized_state::Chain},
+    service::{
+        finalized_state::{embedded_handoff_leaf_counts, ZakuraDb},
+        non_finalized_state::Chain,
+    },
     HashOrHeight,
 };
 
@@ -115,6 +118,7 @@ fn check_historical_subtree_available(
     db: &ZakuraDb,
     pool: &'static str,
     first_missing: Option<NoteCommitmentSubtreeIndex>,
+    authenticated_handoff_leaves: impl FnOnce(&ZakuraDb, block::Height) -> Option<u64>,
     handoff_leaves: impl FnOnce(&ZakuraDb, block::Height) -> Option<u64>,
 ) -> Result<(), HistoricalSubtreeUnavailable> {
     // No gap: either the run covered everything asked for, or it ran past the last possible index.
@@ -126,10 +130,25 @@ fn check_historical_subtree_available(
         return Ok(());
     };
 
+    // The embedded final frontier is authenticated before fast sync begins, so its leaf count can
+    // bound skipped subtrees even while the finalized tip is still below the handoff.
+    if let Some(leaves) = authenticated_handoff_leaves(db, handoff) {
+        return if subtree_completed_by_handoff(first_missing, leaves) {
+            Err(HistoricalSubtreeUnavailable {
+                pool,
+                index: first_missing,
+                handoff,
+                reason: HistoricalSubtreeUnavailableReason::NotStored,
+            })
+        } else {
+            Ok(())
+        };
+    }
+
     // The durable handoff marker is written by the first fast-path commit, so it exists throughout
-    // an ordinary fast sync even though the handoff height is still above the finalized tip. Keep
-    // this guard before `handoff_leaves`: its backward search has no tip guard and can return a row
-    // below the unreached handoff.
+    // an ordinary fast sync even though the handoff height is still above the finalized tip. If no
+    // matching authenticated frontier is available, do not run `handoff_leaves`: its backward
+    // search has no tip guard and can return a row below the unreached handoff.
     if is_syncing_below_last_checkpoint(db.finalized_tip_height(), handoff) {
         tracing::debug!(
             pool,
@@ -226,6 +245,9 @@ fn check_historical_sapling_subtrees_available(
         "sapling",
         first_missing_subtree_index(subtrees, start_index, end_index),
         |db, handoff| {
+            embedded_handoff_leaf_counts(&db.network(), handoff).map(|(sapling, _, _)| sapling)
+        },
+        |db, handoff| {
             // Sparse-tree dedup only omits the handoff row when an older frontier is identical.
             db.latest_stored_sapling_tree(&handoff)
                 .map(|tree| tree.count())
@@ -247,6 +269,9 @@ fn check_historical_orchard_subtrees_available(
         db,
         "orchard",
         first_missing_subtree_index(subtrees, start_index, end_index),
+        |db, handoff| {
+            embedded_handoff_leaf_counts(&db.network(), handoff).map(|(_, orchard, _)| orchard)
+        },
         |db, handoff| {
             // Sparse-tree dedup only omits the handoff row when an older frontier is identical.
             db.latest_stored_orchard_tree(&handoff)
@@ -272,6 +297,9 @@ fn check_historical_ironwood_subtrees_available(
         db,
         "ironwood",
         first_missing_subtree_index(subtrees, start_index, end_index),
+        |db, handoff| {
+            embedded_handoff_leaf_counts(&db.network(), handoff).map(|(_, _, ironwood)| ironwood)
+        },
         |db, handoff| {
             // Sparse-tree dedup only omits the handoff row when an older frontier is identical.
             db.latest_stored_ironwood_tree(&handoff)

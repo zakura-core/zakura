@@ -18,7 +18,7 @@ use std::{
 use zakura_chain::{block::Height, subtree::NoteCommitmentSubtreeIndex};
 
 use crate::service::{
-    finalized_state::ZakuraDb,
+    finalized_state::{CommitmentRootIndexIssue, ZakuraDb},
     read::{
         historical_tree::{
             derive_historical_frontiers_measured, replay_with_subtrees, verify_against_index,
@@ -52,8 +52,9 @@ pub struct VctTreestateInventory {
 
     /// Whether the full-band scans ran.
     ///
-    /// When they did not, [`Self::root_index_gap`] and [`Self::missing_block_body`] are `None`
-    /// because nothing looked, not because nothing is missing.
+    /// When they did not, [`Self::root_index_gap`], [`Self::malformed_root_row`], and
+    /// [`Self::missing_block_body`] are `None` because nothing looked, not because nothing is
+    /// missing or malformed.
     pub scanned: bool,
 
     /// The first height in the absent band with no `commitment_roots_by_height` row.
@@ -62,6 +63,9 @@ pub struct VctTreestateInventory {
     /// derived frontier is checked against the row at its own height. Only meaningful when
     /// [`Self::scanned`].
     pub root_index_gap: Option<Height>,
+
+    /// The first height in the absent band with a malformed `commitment_roots_by_height` value.
+    pub malformed_root_row: Option<Height>,
 
     /// The first height in the absent band whose block body is not retained.
     ///
@@ -92,6 +96,7 @@ impl VctTreestateInventory {
         self.scanned.then(|| {
             self.absent_band().is_some()
                 && self.root_index_gap.is_none()
+                && self.malformed_root_row.is_none()
                 && self.missing_block_body.is_none()
                 && self.missing_anchor.is_none()
         })
@@ -116,6 +121,7 @@ pub fn inventory(db: &ZakuraDb, scan_band: bool) -> VctTreestateInventory {
         lowest_retained_height: db.lowest_retained_height(),
         scanned: scan_band,
         root_index_gap: None,
+        malformed_root_row: None,
         missing_block_body: None,
         missing_anchor: None,
         scan_duration: Duration::ZERO,
@@ -124,7 +130,15 @@ pub fn inventory(db: &ZakuraDb, scan_band: bool) -> VctTreestateInventory {
     if let (true, Some((band_start, band_end))) = (scan_band, inventory.absent_band()) {
         // The band is half-open, so the last height it covers is `H - 1`.
         let last = Height(band_end.0 - 1);
-        inventory.root_index_gap = db.first_commitment_root_gap(band_start..=last);
+        match db.first_commitment_root_issue(band_start..=last) {
+            Some(CommitmentRootIndexIssue::Missing(height)) => {
+                inventory.root_index_gap = Some(height);
+            }
+            Some(CommitmentRootIndexIssue::Malformed(height)) => {
+                inventory.malformed_root_row = Some(height);
+            }
+            None => {}
+        }
         inventory.missing_block_body = db.first_missing_block_body(band_start, last);
     }
 
@@ -420,6 +434,7 @@ mod tests {
             lowest_retained_height: None,
             scanned: true,
             root_index_gap: None,
+            malformed_root_row: None,
             missing_block_body: None,
             missing_anchor: None,
             scan_duration: Duration::ZERO,
@@ -445,6 +460,14 @@ mod tests {
         assert_eq!(inventory.can_derive(), Some(true));
 
         inventory.missing_anchor = Some(Height(99));
+        assert_eq!(inventory.can_derive(), Some(false));
+    }
+
+    #[test]
+    fn malformed_root_row_prevents_derivation() {
+        let mut inventory = inventory_with_tip(Height(149));
+        inventory.malformed_root_row = Some(Height(125));
+
         assert_eq!(inventory.can_derive(), Some(false));
     }
 

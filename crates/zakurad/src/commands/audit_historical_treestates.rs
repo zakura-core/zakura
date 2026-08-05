@@ -428,6 +428,13 @@ fn print_inventory(inventory: &VctTreestateInventory) {
         )
     );
     println!(
+        "  malformed root row:     {}",
+        inventory.malformed_root_row.map_or_else(
+            || "none".to_string(),
+            |height| format!("at height {} (corrupt input)", height.0)
+        )
+    );
+    println!(
         "  missing block body:     {}",
         inventory.missing_block_body.map_or_else(
             || "none (all retained)".to_string(),

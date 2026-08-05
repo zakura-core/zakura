@@ -118,8 +118,9 @@ pub use vct_treestate_audit::{
 #[allow(unused_imports)]
 pub use zakura_db::commitment_roots_db::{
     AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,
-    HeaderRootAuthFrontier, HeaderRootAuthFrontierError, HeaderRootAuthState, HeaderRootAuthUpdate,
-    HeaderWitnessState, COMMITMENT_ROOTS_BY_HEIGHT, HEADER_ROOT_AUTH_FRONTIER,
+    CommitmentRootIndexIssue, HeaderRootAuthFrontier, HeaderRootAuthFrontierError,
+    HeaderRootAuthState, HeaderRootAuthUpdate, HeaderWitnessState, COMMITMENT_ROOTS_BY_HEIGHT,
+    HEADER_ROOT_AUTH_FRONTIER,
 };
 pub use zakura_db::highest_completed_checkpoint::*;
 pub use zakura_db::ZakuraDb;

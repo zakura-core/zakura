@@ -378,6 +378,17 @@ if [ "$no_crates" = 0 ]; then
     fi
 
     base_crate_dir="$(dirname "$base_manifest_rel")"
+
+    # Assumes [package] has a literal version before any other version key;
+    # manifests using version.workspace = true would need different parsing.
+    # Resolve before the unchanged-crate de-rc path so stable promotion does not
+    # reuse a leftover $base_version from an earlier loop iteration.
+    base_version="${base_version_by_crate[$crate]:-}"
+    if [ -z "$base_version" ]; then
+      echo "ERROR: could not read ${crate}'s package version at ${base_tag}." >&2
+      exit 1
+    fi
+
     if git diff --quiet "$base_tag" -- "$base_crate_dir" "$crate_dir"; then
       # Stable promotion must de-rc the entire publishable workspace, not only
       # crates changed since the final release candidate.
@@ -388,14 +399,6 @@ if [ "$no_crates" = 0 ]; then
         add_to_plan "$crate" "$target" "$current_version" "$manifest_rel"
       fi
       continue
-    fi
-
-    # Assumes [package] has a literal version before any other version key;
-    # manifests using version.workspace = true would need different parsing.
-    base_version="${base_version_by_crate[$crate]:-}"
-    if [ -z "$base_version" ]; then
-      echo "ERROR: could not read ${crate}'s package version at ${base_tag}." >&2
-      exit 1
     fi
 
     if [ "$retarget_unpublished" = 1 ] \

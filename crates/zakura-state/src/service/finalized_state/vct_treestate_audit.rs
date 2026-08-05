@@ -412,6 +412,7 @@ pub fn replay_inputs(db: &ZakuraDb, from: Height, to: Height) -> ReplayInputs {
             .map_or(0, |info| u64::from(info.size()));
 
         if let Some(block) = db.block(height.into()) {
+            // Cast is safe: one block holds far fewer commitments than fit in a u64.
             inputs.commitments += (block.sapling_note_commitments().count()
                 + block.orchard_note_commitments().count()
                 + block.ironwood_note_commitments().count())

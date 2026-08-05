@@ -251,6 +251,8 @@ impl AuditHistoricalTreestatesCmd {
         let mut report = |sample: &DerivationSample| {
             if print_samples {
                 // The replayed range ends at this height and covers `replayed_blocks` blocks.
+                // Cast is safe: the `min` clamps the value to `height.0 + 1`, which fits in
+                // a u32 because heights stay below `u32::MAX`.
                 let from = Height(
                     sample.height.0 + 1
                         - sample.replayed_blocks.min(u64::from(sample.height.0) + 1) as u32,

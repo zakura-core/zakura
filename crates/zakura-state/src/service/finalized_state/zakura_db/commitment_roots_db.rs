@@ -50,7 +50,7 @@ type HeaderRootAuthFrontierCf<'cf> = TypedColumnFamily<'cf, RawBytes, RawBytes>;
 pub enum CommitmentRootIndexIssue {
     /// The expected height has no canonical row.
     Missing(Height),
-    /// The expected height has a value that is not a commitment-root row.
+    /// The expected height has a noncanonical key or a value that is not a commitment-root row.
     Malformed(Height),
 }
 
@@ -1077,7 +1077,7 @@ impl ZakuraDb {
             start_key..=end_key,
         ) {
             if key.raw_bytes().len() != HEIGHT_DISK_BYTES {
-                return Some(CommitmentRootIndexIssue::Missing(expected));
+                return Some(CommitmentRootIndexIssue::Malformed(expected));
             }
 
             let height = Height::from_bytes(key.raw_bytes());
@@ -1096,7 +1096,12 @@ impl ZakuraDb {
                 return None;
             }
 
-            expected = height.next().ok()?;
+            // Unreachable while the `height == end` return above precedes it, but an overflow
+            // must never read as a clean scan.
+            expected = match height.next() {
+                Ok(next) => next,
+                Err(_) => return Some(CommitmentRootIndexIssue::Malformed(height)),
+            };
         }
 
         // The iterator ran out before reaching `end`, so the gap starts wherever it stopped.
@@ -2877,8 +2882,8 @@ mod tests {
 
         assert_eq!(
             db.first_commitment_root_issue(Height(1)..=Height(3)),
-            Some(CommitmentRootIndexIssue::Missing(Height(2))),
-            "a noncanonical key cannot alias a canonical height"
+            Some(CommitmentRootIndexIssue::Malformed(Height(2))),
+            "a noncanonical key is corrupt input, not a canonical height"
         );
     }
 }

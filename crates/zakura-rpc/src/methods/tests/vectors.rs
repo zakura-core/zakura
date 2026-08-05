@@ -1163,7 +1163,7 @@ async fn rpc_getblockheader_preserves_historical_tree_error() {
         .unwrap();
     let hash = block.hash();
     let height = Height(0);
-    let handoff = Height(3_418_406);
+    let last_checkpoint = Height(3_418_406);
 
     let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
@@ -1203,7 +1203,7 @@ async fn rpc_getblockheader_preserves_historical_tree_error() {
         .await
         .respond_error(Box::new(zakura_state::HistoricalTreeUnavailable {
             hash_or_height: hash.into(),
-            handoff,
+            last_checkpoint,
         }));
 
     let error = header_future
@@ -1343,7 +1343,7 @@ async fn rpc_getblock_preserves_historical_tree_error() {
         .unwrap();
     let hash = block.hash();
     let height = Height(0);
-    let handoff = Height(3_418_406);
+    let last_checkpoint = Height(3_418_406);
     let tx_hashes = block
         .transactions
         .iter()
@@ -1404,7 +1404,7 @@ async fn rpc_getblock_preserves_historical_tree_error() {
         .await
         .respond_error(Box::new(zakura_state::HistoricalTreeUnavailable {
             hash_or_height: hash.into(),
-            handoff,
+            last_checkpoint,
         }));
     read_state
         .expect_request(ReadRequest::BlockInfo(
@@ -1446,7 +1446,7 @@ async fn rpc_z_get_treestate_absent_band_is_an_error() {
 
     // Sapling is active here and NU5 is not, so the Sapling tree is the only tree requested.
     let height = Height(1_000_000);
-    let handoff = Height(3_418_406);
+    let last_checkpoint = Height(3_418_406);
 
     let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
@@ -1483,7 +1483,7 @@ async fn rpc_z_get_treestate_absent_band_is_an_error() {
         .await
         .respond_error(Box::new(zakura_state::HistoricalTreeUnavailable {
             hash_or_height: block_hash.into(),
-            handoff,
+            last_checkpoint,
         }));
 
     let treestate_response = treestate_future
@@ -1553,7 +1553,7 @@ async fn rpc_z_get_subtrees_by_index_absent_band_is_an_error() {
         .respond_error(Box::new(zakura_state::HistoricalSubtreeUnavailable {
             pool: "sapling",
             index: start_index,
-            handoff: Height(3_418_406),
+            last_checkpoint: Height(3_418_406),
             reason: zakura_state::HistoricalSubtreeUnavailableReason::NotStored,
         }));
 
@@ -1585,7 +1585,7 @@ async fn rpc_z_get_subtrees_by_index_absent_band_is_an_error() {
         .respond_error(Box::new(zakura_state::HistoricalSubtreeUnavailable {
             pool: "sapling",
             index: start_index,
-            handoff: Height(3_418_406),
+            last_checkpoint: Height(3_418_406),
             reason: zakura_state::HistoricalSubtreeUnavailableReason::Indeterminate,
         }));
 
@@ -1607,7 +1607,7 @@ async fn rpc_z_get_subtrees_by_index_absent_band_is_an_error() {
     );
     assert!(
         !indeterminate_response.message().contains("retry"),
-        "a subtree skipped below the handoff never arrives, so the error must not advise a \
+        "a subtree skipped below the last checkpoint never arrives, so the error must not advise a \
          retry, got: {}",
         indeterminate_response.message()
     );

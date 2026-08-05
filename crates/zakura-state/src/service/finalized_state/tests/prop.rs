@@ -1667,7 +1667,10 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             let below_handoff_height = HashOrHeight::Height(Height(last as u32 - 1));
             prop_assert_eq!(
                 sapling_tree(None::<Arc<Chain>>, &fast.db, below_handoff_height),
-                Err(HistoricalTreeUnavailable { hash_or_height: below_handoff_height, handoff }),
+                Err(HistoricalTreeUnavailable {
+                    hash_or_height: below_handoff_height,
+                    last_checkpoint: handoff,
+                }),
                 "a below-handoff tree read is a typed archive-mode error, not an absent tree"
             );
             prop_assert!(

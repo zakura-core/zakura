@@ -25,7 +25,7 @@ use crate::{
         HistoricalSubtreeUnavailable, HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable,
     },
     service::{
-        finalized_state::{embedded_handoff_leaf_counts, ZakuraDb},
+        finalized_state::{embedded_last_checkpoint_leaf_counts, ZakuraDb},
         non_finalized_state::Chain,
     },
     HashOrHeight,
@@ -69,43 +69,43 @@ fn resolve_historical_tree<Tree: Default>(
     }
 
     match db.vct_synced_below() {
-        Some(handoff) if db.vct_tree_absent(height) => Err(HistoricalTreeUnavailable {
+        Some(last_checkpoint) if db.vct_tree_absent(height) => Err(HistoricalTreeUnavailable {
             hash_or_height,
-            handoff,
+            last_checkpoint,
         }),
         _ => Ok(None),
     }
 }
 
-/// Returns `true` if the subtree at `start_index` completed at or below the checkpoint handoff,
-/// given `handoff_leaves`, the pool's note commitment count at the handoff height.
+/// Returns `true` if the subtree at `start_index` completed at or below the last checkpoint,
+/// given `last_checkpoint_leaves`, the pool's note commitment count at the last checkpoint height.
 ///
 /// Subtrees complete at every multiple of `1 << TRACKED_SUBTREE_HEIGHT` leaves, so the leaf
 /// count floor-divides to the number of subtrees completed by then, and index `i` is one of
 /// them exactly when `i` is below that count.
-pub(crate) fn subtree_completed_by_handoff(
+pub(crate) fn subtree_completed_by_last_checkpoint(
     start_index: NoteCommitmentSubtreeIndex,
-    handoff_leaves: u64,
+    last_checkpoint_leaves: u64,
 ) -> bool {
-    u64::from(start_index) < (handoff_leaves >> TRACKED_SUBTREE_HEIGHT)
+    u64::from(start_index) < (last_checkpoint_leaves >> TRACKED_SUBTREE_HEIGHT)
 }
 
-/// Returns `true` while the finalized tip has not reached the checkpoint handoff.
+/// Returns `true` while the finalized tip has not reached the last checkpoint.
 pub(crate) fn is_syncing_below_last_checkpoint(
     finalized_tip: Option<block::Height>,
-    handoff: block::Height,
+    last_checkpoint: block::Height,
 ) -> bool {
-    finalized_tip.is_some_and(|tip| tip < handoff)
+    finalized_tip.is_some_and(|tip| tip < last_checkpoint)
 }
 
 /// Returns an error if the served run stops short of a subtree that exists on this chain but
 /// this node cannot supply.
 ///
 /// `first_missing` is the lowest index the served run does not cover: `start_index` when nothing
-/// was served, otherwise one past the end of the contiguous run. `handoff_leaves` reads the pool's
-/// commitment count at the handoff, which bounds the indexes the fast path could have skipped:
-/// anything at or above it completed after the handoff and is genuinely absent on any node, so a
-/// client asking past the tip still gets today's empty list.
+/// was served, otherwise one past the end of the contiguous run. `last_checkpoint_leaves` reads
+/// the pool's commitment count at the last checkpoint, which bounds the indexes the fast path
+/// could have skipped: anything at or above it completed after the last checkpoint and is
+/// genuinely absent on any node, so a client asking past the tip still gets today's empty list.
 ///
 /// # Correctness
 ///
@@ -118,26 +118,26 @@ fn check_historical_subtree_available(
     db: &ZakuraDb,
     pool: &'static str,
     first_missing: Option<NoteCommitmentSubtreeIndex>,
-    authenticated_handoff_leaves: impl FnOnce(&ZakuraDb, block::Height) -> Option<u64>,
-    handoff_leaves: impl FnOnce(&ZakuraDb, block::Height) -> Option<u64>,
+    authenticated_last_checkpoint_leaves: impl FnOnce(&ZakuraDb, block::Height) -> Option<u64>,
+    last_checkpoint_leaves: impl FnOnce(&ZakuraDb, block::Height) -> Option<u64>,
 ) -> Result<(), HistoricalSubtreeUnavailable> {
     // No gap: either the run covered everything asked for, or it ran past the last possible index.
     let Some(first_missing) = first_missing else {
         return Ok(());
     };
 
-    let Some(handoff) = db.vct_synced_below() else {
+    let Some(last_checkpoint) = db.vct_synced_below() else {
         return Ok(());
     };
 
     // The embedded final frontier is authenticated before fast sync begins, so its leaf count can
-    // bound skipped subtrees even while the finalized tip is still below the handoff.
-    if let Some(leaves) = authenticated_handoff_leaves(db, handoff) {
-        return if subtree_completed_by_handoff(first_missing, leaves) {
+    // bound skipped subtrees even while the finalized tip is still below the last checkpoint.
+    if let Some(leaves) = authenticated_last_checkpoint_leaves(db, last_checkpoint) {
+        return if subtree_completed_by_last_checkpoint(first_missing, leaves) {
             Err(HistoricalSubtreeUnavailable {
                 pool,
                 index: first_missing,
-                handoff,
+                last_checkpoint,
                 reason: HistoricalSubtreeUnavailableReason::NotStored,
             })
         } else {
@@ -145,52 +145,53 @@ fn check_historical_subtree_available(
         };
     }
 
-    // The durable handoff marker is written by the first fast-path commit, so it exists throughout
-    // an ordinary fast sync even though the handoff height is still above the finalized tip. If no
-    // matching authenticated frontier is available, do not run `handoff_leaves`: its backward
-    // search has no tip guard and can return a row below the unreached handoff.
-    if is_syncing_below_last_checkpoint(db.finalized_tip_height(), handoff) {
+    // The durable last-checkpoint marker is written by the first fast-path commit, so it exists
+    // throughout an ordinary fast sync even though the last checkpoint height is still above the
+    // finalized tip. If no matching authenticated frontier is available, do not run
+    // `last_checkpoint_leaves`: its backward search has no tip guard and can return a row below the
+    // unreached last checkpoint.
+    if is_syncing_below_last_checkpoint(db.finalized_tip_height(), last_checkpoint) {
         tracing::debug!(
             pool,
-            ?handoff,
-            "checkpoint handoff has not been reached; refusing to serve incomplete subtrees",
+            ?last_checkpoint,
+            "last checkpoint has not been reached; refusing to serve incomplete subtrees",
         );
 
         return Err(HistoricalSubtreeUnavailable {
             pool,
             index: first_missing,
-            handoff,
+            last_checkpoint,
             reason: HistoricalSubtreeUnavailableReason::Indeterminate,
         });
     }
 
-    // Without the handoff leaf count there is no way to tell a skipped subtree from one that
+    // Without the last checkpoint leaf count there is no way to tell a skipped subtree from one that
     // never existed, so fail closed. Reporting the archive-mode error for a subtree that was
     // genuinely never completed is a visible, diagnosable wrong answer; serving a truncated list
-    // is the silent one this whole path exists to remove. Once the tip reaches the handoff, its
-    // tree is outside the absent band and must be present.
-    let Some(leaves) = handoff_leaves(db, handoff) else {
+    // is the silent one this whole path exists to remove. Once the tip reaches the last checkpoint,
+    // its tree is outside the absent band and must be present.
+    let Some(leaves) = last_checkpoint_leaves(db, last_checkpoint) else {
         tracing::error!(
             pool,
-            ?handoff,
-            "no note commitment tree at the checkpoint handoff, so completed subtrees cannot be \
+            ?last_checkpoint,
+            "no note commitment tree at the last checkpoint, so completed subtrees cannot be \
              distinguished from absent ones; refusing to serve",
         );
-        metrics::counter!("state.historical_tree.handoff_tree_missing").increment(1);
+        metrics::counter!("state.historical_tree.last_checkpoint_tree_missing").increment(1);
 
         return Err(HistoricalSubtreeUnavailable {
             pool,
             index: first_missing,
-            handoff,
+            last_checkpoint,
             reason: HistoricalSubtreeUnavailableReason::NotStored,
         });
     };
 
-    if subtree_completed_by_handoff(first_missing, leaves) {
+    if subtree_completed_by_last_checkpoint(first_missing, leaves) {
         Err(HistoricalSubtreeUnavailable {
             pool,
             index: first_missing,
-            handoff,
+            last_checkpoint,
             reason: HistoricalSubtreeUnavailableReason::NotStored,
         })
     } else {
@@ -244,12 +245,13 @@ fn check_historical_sapling_subtrees_available(
         db,
         "sapling",
         first_missing_subtree_index(subtrees, start_index, end_index),
-        |db, handoff| {
-            embedded_handoff_leaf_counts(&db.network(), handoff).map(|(sapling, _, _)| sapling)
+        |db, last_checkpoint| {
+            embedded_last_checkpoint_leaf_counts(&db.network(), last_checkpoint)
+                .map(|(sapling, _, _)| sapling)
         },
-        |db, handoff| {
-            // Sparse-tree dedup only omits the handoff row when an older frontier is identical.
-            db.latest_stored_sapling_tree(&handoff)
+        |db, last_checkpoint| {
+            // Sparse-tree dedup only omits the last checkpoint row when an older frontier is identical.
+            db.latest_stored_sapling_tree(&last_checkpoint)
                 .map(|tree| tree.count())
         },
     )
@@ -269,12 +271,13 @@ fn check_historical_orchard_subtrees_available(
         db,
         "orchard",
         first_missing_subtree_index(subtrees, start_index, end_index),
-        |db, handoff| {
-            embedded_handoff_leaf_counts(&db.network(), handoff).map(|(_, orchard, _)| orchard)
+        |db, last_checkpoint| {
+            embedded_last_checkpoint_leaf_counts(&db.network(), last_checkpoint)
+                .map(|(_, orchard, _)| orchard)
         },
-        |db, handoff| {
-            // Sparse-tree dedup only omits the handoff row when an older frontier is identical.
-            db.latest_stored_orchard_tree(&handoff)
+        |db, last_checkpoint| {
+            // Sparse-tree dedup only omits the last checkpoint row when an older frontier is identical.
+            db.latest_stored_orchard_tree(&last_checkpoint)
                 .map(|tree| tree.count())
         },
     )
@@ -297,12 +300,13 @@ fn check_historical_ironwood_subtrees_available(
         db,
         "ironwood",
         first_missing_subtree_index(subtrees, start_index, end_index),
-        |db, handoff| {
-            embedded_handoff_leaf_counts(&db.network(), handoff).map(|(_, _, ironwood)| ironwood)
+        |db, last_checkpoint| {
+            embedded_last_checkpoint_leaf_counts(&db.network(), last_checkpoint)
+                .map(|(_, _, ironwood)| ironwood)
         },
-        |db, handoff| {
-            // Sparse-tree dedup only omits the handoff row when an older frontier is identical.
-            db.latest_stored_ironwood_tree(&handoff)
+        |db, last_checkpoint| {
+            // Sparse-tree dedup only omits the last checkpoint row when an older frontier is identical.
+            db.latest_stored_ironwood_tree(&last_checkpoint)
                 .map(|tree| tree.count())
         },
     )

@@ -31,7 +31,7 @@ use crate::{
             ironwood_subtrees, orchard_subtrees, sapling_subtrees,
             tree::{
                 first_missing_subtree_index, is_syncing_below_last_checkpoint,
-                subtree_completed_by_handoff,
+                subtree_completed_by_last_checkpoint,
             },
         },
     },
@@ -652,7 +652,7 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
 /// The absent-band subtree bound must cover exactly the subtrees the fast path skipped.
 ///
 /// The bound is what keeps [`crate::HistoricalSubtreeUnavailable`] from firing on an ordinary
-/// "you asked past the tip" query: only indices that completed at or below the handoff were
+/// "you asked past the tip" query: only indices that completed at or below the last checkpoint were
 /// skipped, everything at or above that is genuinely absent on any node.
 #[test]
 fn subtree_absent_band_bound_is_exact() {
@@ -661,59 +661,74 @@ fn subtree_absent_band_bound_is_exact() {
     // No subtree has completed yet, so no index is in the band, whatever the client asks for.
     for leaves in [0, 1, LEAVES_PER_SUBTREE - 1] {
         assert!(
-            !subtree_completed_by_handoff(0.into(), leaves),
+            !subtree_completed_by_last_checkpoint(0.into(), leaves),
             "no subtree completes before {LEAVES_PER_SUBTREE} leaves, but {leaves} claimed one"
         );
     }
 
     // Exactly one subtree (index 0) completed. Index 1 has not, so it stays an empty list.
-    assert!(subtree_completed_by_handoff(0.into(), LEAVES_PER_SUBTREE));
-    assert!(!subtree_completed_by_handoff(1.into(), LEAVES_PER_SUBTREE));
+    assert!(subtree_completed_by_last_checkpoint(
+        0.into(),
+        LEAVES_PER_SUBTREE
+    ));
+    assert!(!subtree_completed_by_last_checkpoint(
+        1.into(),
+        LEAVES_PER_SUBTREE
+    ));
 
     // A partly-filled second subtree does not count as completed.
-    assert!(subtree_completed_by_handoff(
+    assert!(subtree_completed_by_last_checkpoint(
         0.into(),
         LEAVES_PER_SUBTREE + 1
     ));
-    assert!(!subtree_completed_by_handoff(
+    assert!(!subtree_completed_by_last_checkpoint(
         1.into(),
         LEAVES_PER_SUBTREE + 1
     ));
 
-    // Mainnet-scale: 73,934,658 Sapling commitments at the handoff is 1,128 completed subtrees,
-    // indexes 0..=1127. Index 1128 is the one still filling.
-    let sapling_leaves_at_handoff = 73_934_658;
-    assert!(subtree_completed_by_handoff(
+    // Mainnet-scale: 73,934,658 Sapling commitments at the last checkpoint is 1,128 completed
+    // subtrees, indexes 0..=1127. Index 1128 is the one still filling.
+    let sapling_leaves_at_last_checkpoint = 73_934_658;
+    assert!(subtree_completed_by_last_checkpoint(
         1127.into(),
-        sapling_leaves_at_handoff
+        sapling_leaves_at_last_checkpoint
     ));
-    assert!(!subtree_completed_by_handoff(
+    assert!(!subtree_completed_by_last_checkpoint(
         1128.into(),
-        sapling_leaves_at_handoff
+        sapling_leaves_at_last_checkpoint
     ));
 }
 
-/// A persisted handoff marker does not mean the handoff tree should exist before sync reaches it.
+/// A persisted last-checkpoint marker does not mean the tree should exist before sync reaches it.
 #[test]
-fn handoff_tree_is_only_expected_after_sync_reaches_handoff() {
-    let handoff = Height(10);
+fn last_checkpoint_tree_is_only_expected_after_sync_reaches_last_checkpoint() {
+    let last_checkpoint = Height(10);
 
-    assert!(is_syncing_below_last_checkpoint(Some(Height(9)), handoff));
-    assert!(!is_syncing_below_last_checkpoint(Some(handoff), handoff));
-    assert!(!is_syncing_below_last_checkpoint(Some(Height(11)), handoff));
+    assert!(is_syncing_below_last_checkpoint(
+        Some(Height(9)),
+        last_checkpoint
+    ));
+    assert!(!is_syncing_below_last_checkpoint(
+        Some(last_checkpoint),
+        last_checkpoint
+    ));
+    assert!(!is_syncing_below_last_checkpoint(
+        Some(Height(11)),
+        last_checkpoint
+    ));
 
     // A marker without any finalized block cannot be produced by the atomic commit path, so keep
     // treating that state as an invariant failure rather than ordinary sync progress.
-    assert!(!is_syncing_below_last_checkpoint(None, handoff));
+    assert!(!is_syncing_below_last_checkpoint(None, last_checkpoint));
 }
 
-/// A missing subtree's availability is undecided while the finalized tip is below the handoff.
+/// A missing subtree's availability is undecided while the finalized tip is below the last checkpoint.
 ///
 /// The node cannot tell a skipped subtree from one the chain has not reached until it has the
-/// pool's leaf count at the handoff, so the error must not advise a retry: every subtree that
-/// completed below the handoff is skipped, and this node never records it.
+/// pool's leaf count at the last checkpoint, so the error must not advise a retry: every subtree
+/// that completed below the last checkpoint is skipped, and this node never records it.
 #[tokio::test]
-async fn missing_subtree_before_handoff_reports_indeterminate_reason() {
+async fn missing_subtree_before_last_checkpoint_reports_indeterminate_reason() {
     let _init_guard = zakura_test::init();
     let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
         .values()
@@ -722,21 +737,21 @@ async fn missing_subtree_before_handoff_reports_indeterminate_reason() {
         .collect();
     let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
         populated_state(blocks, &Mainnet).await;
-    let handoff = Height(10);
+    let last_checkpoint = Height(10);
 
     let mut batch = DiskWriteBatch::new();
-    batch.update_vct_sync_marker(&read_state.db, handoff);
+    batch.update_vct_sync_marker(&read_state.db, last_checkpoint);
     read_state
         .db
         .write_batch(batch)
-        .expect("seeding a future handoff succeeds");
+        .expect("seeding a future last checkpoint succeeds");
 
     let error = sapling_subtrees(
         None::<Arc<Chain>>,
         &read_state.db,
         NoteCommitmentSubtreeIndex(0)..1.into(),
     )
-    .expect_err("a subtree below an unreached handoff must fail closed");
+    .expect_err("a subtree below an unreached last checkpoint must fail closed");
 
     assert_eq!(
         error.reason,
@@ -747,15 +762,15 @@ async fn missing_subtree_before_handoff_reports_indeterminate_reason() {
         .contains("cannot yet tell whether the subtree was skipped"));
     assert!(
         !error.to_string().contains("retry"),
-        "a subtree skipped below the handoff never arrives, so the error must not advise a \
+        "a subtree skipped below the last checkpoint never arrives, so the error must not advise a \
          retry, got: {error}"
     );
 }
 
-/// A subtree that the authenticated handoff frontier proves was not completed is an ordinary
-/// empty result, even while the finalized tip is below the handoff.
+/// A subtree that the authenticated last-checkpoint frontier proves was not completed is an
+/// ordinary empty result, even while the finalized tip is below the last checkpoint.
 #[tokio::test]
-async fn incomplete_ironwood_subtree_before_mainnet_handoff_is_empty() {
+async fn incomplete_ironwood_subtree_before_mainnet_last_checkpoint_is_empty() {
     let _init_guard = zakura_test::init();
     let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
         .values()
@@ -764,33 +779,33 @@ async fn incomplete_ironwood_subtree_before_mainnet_handoff_is_empty() {
         .collect();
     let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
         populated_state(blocks, &Mainnet).await;
-    let handoff = Mainnet.checkpoint_list().max_height();
+    let last_checkpoint = Mainnet.checkpoint_list().max_height();
 
     assert!(
-        read_state.db.finalized_tip_height() < Some(handoff),
-        "the regression requires a finalized tip below the Mainnet handoff"
+        read_state.db.finalized_tip_height() < Some(last_checkpoint),
+        "the regression requires a finalized tip below the Mainnet last checkpoint"
     );
 
     let mut batch = DiskWriteBatch::new();
-    batch.update_vct_sync_marker(&read_state.db, handoff);
+    batch.update_vct_sync_marker(&read_state.db, last_checkpoint);
     read_state
         .db
         .write_batch(batch)
-        .expect("seeding the Mainnet VCT handoff succeeds");
+        .expect("seeding the Mainnet VCT last checkpoint succeeds");
 
     let subtrees = ironwood_subtrees(
         None::<Arc<Chain>>,
         &read_state.db,
         NoteCommitmentSubtreeIndex(0)..1.into(),
     )
-    .expect("the authenticated handoff proves Ironwood subtree zero was not completed");
+    .expect("the authenticated last checkpoint proves Ironwood subtree zero was not completed");
 
     assert!(subtrees.is_empty());
 }
 
-/// A missing handoff tree is an error once the finalized tip has reached the handoff.
+/// A missing last-checkpoint tree is an error once the finalized tip has reached the checkpoint.
 #[tokio::test]
-async fn missing_handoff_tree_fails_closed_after_sync_reaches_handoff() {
+async fn missing_last_checkpoint_tree_fails_closed_after_sync_reaches_last_checkpoint() {
     let _init_guard = zakura_test::init();
     let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
         .values()
@@ -799,30 +814,30 @@ async fn missing_handoff_tree_fails_closed_after_sync_reaches_handoff() {
         .collect();
     let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
         populated_state(blocks, &Mainnet).await;
-    let handoff = read_state
+    let last_checkpoint = read_state
         .db
         .finalized_tip_height()
         .expect("the populated state has a finalized tip");
 
     let mut batch = DiskWriteBatch::new();
-    batch.update_vct_sync_marker(&read_state.db, handoff);
-    batch.delete_range_sapling_tree(&read_state.db, &Height::MIN, &handoff);
-    batch.delete_sapling_tree(&read_state.db, &handoff);
+    batch.update_vct_sync_marker(&read_state.db, last_checkpoint);
+    batch.delete_range_sapling_tree(&read_state.db, &Height::MIN, &last_checkpoint);
+    batch.delete_sapling_tree(&read_state.db, &last_checkpoint);
     read_state
         .db
         .write_batch(batch)
-        .expect("seeding a missing handoff tree succeeds");
+        .expect("seeding a missing last-checkpoint tree succeeds");
 
     let error = sapling_subtrees(
         None::<Arc<Chain>>,
         &read_state.db,
         NoteCommitmentSubtreeIndex(0)..1.into(),
     )
-    .expect_err("a reached handoff without its tree must fail closed");
+    .expect_err("a reached last checkpoint without its tree must fail closed");
 
     assert_eq!(error.pool, "sapling");
     assert_eq!(error.index, NoteCommitmentSubtreeIndex(0));
-    assert_eq!(error.handoff, handoff);
+    assert_eq!(error.last_checkpoint, last_checkpoint);
     assert_eq!(error.reason, HistoricalSubtreeUnavailableReason::NotStored);
     assert!(error.to_string().contains("use another node"));
 }
@@ -839,10 +854,10 @@ async fn pre_activation_tree_requests_return_empty_frontiers() {
     let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
         populated_state(blocks, &Mainnet).await;
     let requested_height = Height::MIN;
-    let handoff = Height(10);
+    let last_checkpoint = Height(10);
 
     let mut batch = DiskWriteBatch::new();
-    batch.update_vct_sync_marker(&read_state.db, handoff);
+    batch.update_vct_sync_marker(&read_state.db, last_checkpoint);
     read_state
         .db
         .write_batch(batch)
@@ -874,7 +889,7 @@ async fn pre_activation_tree_requests_return_empty_frontiers() {
     );
     assert_eq!(
         read_state
-            .oneshot(ReadRequest::SaplingTree(handoff.into()))
+            .oneshot(ReadRequest::SaplingTree(last_checkpoint.into()))
             .await
             .expect("missing pre-activation block request succeeds"),
         ReadResponse::SaplingTree(None),
@@ -909,7 +924,7 @@ fn first_missing_subtree_index_finds_the_end_of_the_run() {
         Some(NoteCommitmentSubtreeIndex(3))
     );
 
-    // An upgraded database can contain a pre-U row and a post-handoff row around a subtree
+    // An upgraded database can contain a pre-U row and a post-checkpoint row around a subtree
     // skipped by VCT fast sync. The later row must not hide the internal gap.
     assert_eq!(
         first_missing_subtree_index(&map(&[0, 2]), NoteCommitmentSubtreeIndex(0), None),

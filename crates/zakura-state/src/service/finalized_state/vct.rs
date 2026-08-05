@@ -481,14 +481,14 @@ pub(super) fn embedded_final_frontiers(network: &Network) -> Option<FinalFrontie
     }
 }
 
-/// Returns the verified Sapling, Orchard, and Ironwood leaf counts at `handoff`, when the
+/// Returns the verified Sapling, Orchard, and Ironwood leaf counts at `last_checkpoint`, when the
 /// configured network has a matching embedded final frontier.
-pub(crate) fn embedded_handoff_leaf_counts(
+pub(crate) fn embedded_last_checkpoint_leaf_counts(
     network: &Network,
-    handoff: block::Height,
+    last_checkpoint: block::Height,
 ) -> Option<(u64, u64, u64)> {
     let frontiers = embedded_final_frontiers(network)?;
-    (frontiers.height == handoff).then(|| {
+    (frontiers.height == last_checkpoint).then(|| {
         (
             frontiers.sapling.count(),
             frontiers.orchard.count(),

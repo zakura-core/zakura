@@ -85,7 +85,7 @@ mod disk_format;
 mod vct;
 mod zakura_db;
 
-pub(crate) use vct::embedded_handoff_leaf_counts;
+pub(crate) use vct::embedded_last_checkpoint_leaf_counts;
 use vct::{VctCommitState, VctState, VctWriteData};
 
 #[cfg(any(test, feature = "proptest-impl"))]

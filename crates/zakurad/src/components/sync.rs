@@ -541,8 +541,8 @@ where
     RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>,
 {
     let ready = read_state.ready().await.ok()?;
-    match ready.call(zs::ReadRequest::BestDurableHeaderTip).await {
-        Ok(zs::ReadResponse::BestDurableHeaderTip(tip)) => tip.map(|(height, _hash)| height),
+    match ready.call(zs::ReadRequest::BestHeaderTip).await {
+        Ok(zs::ReadResponse::BestHeaderTip(tip)) => tip.map(|(height, _hash)| height),
         _ => None,
     }
 }
@@ -554,19 +554,16 @@ where
 /// the fallback node might be the only peer with working legacy ingest, so it
 /// must keep advertising frontiers and serving headers/bodies to Zakura peers.
 async fn engage_legacy_fallback_alongside_zakura(
-    block_sync_handoff: &crate::commands::start::zakura::BlockSyncHandoff,
-) {
+    block_sync_handoff: &std::sync::Arc<crate::commands::start::zakura::SyncCoordinator>,
+) -> Result<
+    crate::commands::start::zakura::LegacyFallbackLease,
+    zakura_node_services::sync_lifecycle::LifecycleTransitionError,
+> {
+    let lease = block_sync_handoff
+        .acquire_legacy_fallback(std::time::Duration::from_secs(60))
+        .await?;
     metrics::counter!("sync.zakura.legacy_fallback.engaged").increment(1);
-    // Sticky by design: once legacy fallback owns body sync, the node stays in
-    // bridge mode until restart.
-    metrics::gauge!("sync.zakura.legacy_fallback.active").set(1.0);
-
-    // Commit barrier: two engines driving bulk commits concurrently race in
-    // the applying queue, so stop new Zakura applies and drain in-flight ones
-    // before legacy ChainSync takes the pipeline.
-    block_sync_handoff
-        .yield_to_legacy(std::time::Duration::from_secs(60))
-        .await;
+    Ok(lease)
 }
 
 /// Sync configuration section.
@@ -703,6 +700,90 @@ impl Default for Config {
 struct CheckedTip {
     tip: block::Hash,
     expected_next: block::Hash,
+}
+
+fn checkpoint_bootstrap_hash_limit(
+    state_tip: Option<Height>,
+    max_checkpoint_height: Height,
+    pending_checkpoint_work: usize,
+) -> usize {
+    let state_tip = state_tip.unwrap_or(Height(0));
+    let remaining = max_checkpoint_height.0.saturating_sub(state_tip.0);
+    usize::try_from(remaining)
+        .expect("block height difference fits in usize")
+        .saturating_sub(pending_checkpoint_work)
+}
+
+/// Removes pending hashes, then limits new compatibility downloads to the final checkpoint.
+fn cap_checkpoint_bootstrap_hashes(
+    hashes: &mut IndexSet<block::Hash>,
+    state_tip: Option<Height>,
+    max_checkpoint_height: Height,
+    pending: &HashMap<block::Hash, Option<Height>>,
+) -> bool {
+    let state_tip = state_tip.unwrap_or(Height(0));
+    let raw_hashes = hashes.len();
+    let overlapping_pending = hashes
+        .iter()
+        .filter(|hash| pending.contains_key(hash))
+        .count();
+    let overlapping_unknown_pending = hashes
+        .iter()
+        .filter(|hash| pending.get(hash).is_some_and(Option::is_none))
+        .count();
+    let known_pending_checkpoint_work = pending
+        .values()
+        .filter(|height| {
+            height.is_some_and(|height| height > state_tip && height <= max_checkpoint_height)
+        })
+        .count();
+    let known_pending_reaches_checkpoint = pending
+        .values()
+        .any(|height| height.is_some_and(|height| height >= max_checkpoint_height));
+    let pending_checkpoint_work = pending
+        .values()
+        .filter(|height| match height {
+            Some(height) => *height > state_tip && *height <= max_checkpoint_height,
+            None => true,
+        })
+        .count();
+
+    // A refreshed locator response repeats blocks parked in the checkpoint verifier. Remove those
+    // hashes before truncating, so they do not consume both the pending and new-download budgets.
+    hashes.retain(|hash| !pending.contains_key(hash));
+
+    let limit = checkpoint_bootstrap_hash_limit(
+        Some(state_tip),
+        max_checkpoint_height,
+        pending_checkpoint_work,
+    );
+    // Unknown tasks reserve download capacity, but only an overlapping hash gives them a position
+    // in this ordered response. Do not turn unrelated unknown work into boundary evidence.
+    let evidenced_limit = checkpoint_bootstrap_hash_limit(
+        Some(state_tip),
+        max_checkpoint_height,
+        known_pending_checkpoint_work.saturating_add(overlapping_unknown_pending),
+    );
+    let response_reaches_checkpoint = evidenced_limit > 0 && hashes.len() >= evidenced_limit;
+    let reaches_checkpoint = state_tip >= max_checkpoint_height
+        || known_pending_reaches_checkpoint
+        || response_reaches_checkpoint;
+    hashes.truncate(limit);
+
+    debug!(
+        raw_hashes,
+        overlapping_pending,
+        pending_checkpoint_work,
+        known_pending_checkpoint_work,
+        overlapping_unknown_pending,
+        new_hash_limit = limit,
+        retained_new_hashes = hashes.len(),
+        ?state_tip,
+        ?max_checkpoint_height,
+        "capped checkpoint bootstrap hashes",
+    );
+
+    reaches_checkpoint
 }
 
 pub struct ChainSync<ZN, ZS, ZV, ZSTip>
@@ -970,7 +1051,7 @@ where
         self.request_genesis().await?;
 
         loop {
-            if self.try_to_sync().await.is_err() {
+            if self.try_to_sync(None).await.is_err() {
                 self.downloads.cancel_all();
             }
 
@@ -990,12 +1071,15 @@ where
         }
     }
 
-    /// Downloads and verifies genesis, then hands body sync to native Zakura sync
-    /// while watching for progress, optionally falling back to the legacy syncer if
-    /// Zakura makes none.
+    /// Downloads and verifies through checkpoint semantic handoff, then hands
+    /// body sync to native Zakura while watching for progress, optionally
+    /// falling back to the legacy syncer if Zakura makes none.
     ///
-    /// Zakura block sync uses this bootstrap path because header range validation needs the
-    /// committed genesis header before native Zakura header/body sync can advance from scratch.
+    /// Zakura block sync uses this bootstrap path because state does not publish
+    /// the authenticated header snapshot until its configured checkpoint range
+    /// has committed. The legacy-compatible downloader keeps ownership until
+    /// that snapshot appears, stops dispatching, and drains its already-started
+    /// verifier work before native applies are enabled.
     ///
     /// After genesis, native Zakura sync is expected to drive body downloads. But
     /// it cannot always: a node whose reachable peers are legacy-only (no
@@ -1003,24 +1087,34 @@ where
     /// Zakura body-sync peers, and parking forever there leaves it stuck at genesis.
     ///
     /// `legacy_fallback` (set when the node runs both stacks, `v2_p2p && legacy_p2p`)
-    /// controls the recovery path. When `true`, a Zakura stall resumes the legacy
-    /// [`ChainSync::sync`] loop as the body-sync driver while Zakura keeps serving
-    /// peers and following local commits through the chain-tip mirror. When `false`
+    /// controls the recovery path. When `true`, a Zakura stall runs one legacy
+    /// body-sync recovery round while Zakura keeps serving peers and following local
+    /// commits through the chain-tip mirror, then returns apply ownership to Zakura. When `false`
     /// (a Zakura-only node, where falling back to absent legacy peers is pointless),
     /// the watchdog never switches: it parks and warns (once per stall window) so a
     /// stalled, eclipsed, or peerless node is visible in the logs.
     ///
     /// `read_state` answers
-    /// [`ReadRequest::BestDurableHeaderTip`](zs::ReadRequest::BestDurableHeaderTip)
+    /// [`ReadRequest::BestHeaderTip`](zs::ReadRequest::BestHeaderTip)
     /// for the legacy-informed cross-check, which only probes legacy peers when
     /// the verified tip is frozen and the node looks caught up to its own header
     /// frontier.
-    #[instrument(skip(self, read_state, block_sync_handoff))]
+    #[instrument(skip(
+        self,
+        read_state,
+        committed_snapshots,
+        header_runtime_status,
+        block_sync_handoff
+    ))]
     pub(crate) async fn bootstrap_genesis_then_pause<RS>(
         mut self,
         mut read_state: RS,
+        committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        mut header_runtime_status: watch::Receiver<
+            zakura_node_services::sync_lifecycle::HeaderRuntimeStatus,
+        >,
         legacy_fallback: bool,
-        block_sync_handoff: std::sync::Arc<crate::commands::start::zakura::BlockSyncHandoff>,
+        block_sync_handoff: std::sync::Arc<crate::commands::start::zakura::SyncCoordinator>,
     ) -> Result<(), Report>
     where
         RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
@@ -1029,8 +1123,65 @@ where
         RS::Future: Send,
     {
         self.request_genesis().await?;
+
+        loop {
+            let runtime_status = header_runtime_status.borrow().clone();
+            block_sync_handoff
+                .observe_header_runtime(&runtime_status)
+                .map_err(|error| eyre!("coordinator rejected header runtime status: {error}"))?;
+            if runtime_status.is_ready() {
+                break;
+            }
+            if let zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Failed {
+                error, ..
+            } = runtime_status
+            {
+                return Err(eyre!("header runtime attachment failed: {error}"));
+            }
+            if self
+                .try_to_sync(Some(&mut header_runtime_status))
+                .await
+                .is_err()
+            {
+                self.downloads.cancel_all();
+            }
+            self.update_metrics();
+
+            let runtime_status = header_runtime_status.borrow().clone();
+            block_sync_handoff
+                .observe_header_runtime(&runtime_status)
+                .map_err(|error| eyre!("coordinator rejected header runtime status: {error}"))?;
+            if !runtime_status.is_ready() {
+                let restart_delay = if self.is_regtest {
+                    REGTEST_SYNC_RESTART_DELAY
+                } else {
+                    SYNC_RESTART_SLEEP
+                };
+                info!(
+                    timeout = ?restart_delay,
+                    state_tip = ?self.latest_chain_tip.best_tip_height(),
+                    checkpoint = ?self.max_checkpoint_height,
+                    "waiting to resume pre-handoff checkpoint bootstrap"
+                );
+                sleep(restart_delay).await;
+            }
+        }
+
+        let handoff_state_tip = committed_snapshots
+            .borrow()
+            .as_ref()
+            .expect("runtime readiness is published only after its committed snapshot")
+            .frontiers
+            .verified_best
+            .height;
+        self.trace
+            .checkpoint_handoff(Some(handoff_state_tip), self.max_checkpoint_height);
+        block_sync_handoff
+            .finish_legacy_bootstrap()
+            .map_err(|error| eyre!("checkpoint apply handoff failed: {error}"))?;
         info!(
-            "Zakura block sync replacement completed genesis bootstrap; \
+            checkpoint = ?self.max_checkpoint_height,
+            "Zakura block sync replacement completed checkpoint bootstrap; \
              monitoring for Zakura body-sync progress"
         );
 
@@ -1081,8 +1232,10 @@ where
                          legacy ChainSync as the body-sync driver while Zakura keeps serving \
                          peers and following local commits"
                     );
-                    engage_legacy_fallback_alongside_zakura(&block_sync_handoff).await;
-                    return self.sync().await;
+                    self.run_legacy_fallback_round(&block_sync_handoff).await;
+                    let resumed_tip = self.latest_chain_tip.best_tip_height();
+                    tracker = ZakuraStallTracker::new(resumed_tip);
+                    legacy_probe = ZakuraLegacyProbe::new(resumed_tip);
                 }
                 ZakuraWatchdogAction::ProbeLegacyPeers => {
                     let blocks_ahead = self.legacy_peers_blocks_ahead().await;
@@ -1100,12 +1253,37 @@ where
                              higher tip; resuming legacy ChainSync as the body-sync driver \
                              while Zakura keeps serving peers and following local commits"
                         );
-                        engage_legacy_fallback_alongside_zakura(&block_sync_handoff).await;
-                        return self.sync().await;
+                        self.run_legacy_fallback_round(&block_sync_handoff).await;
+                        let resumed_tip = self.latest_chain_tip.best_tip_height();
+                        tracker = ZakuraStallTracker::new(resumed_tip);
+                        legacy_probe = ZakuraLegacyProbe::new(resumed_tip);
                     }
                 }
             }
         }
+    }
+
+    /// Runs one fully drained legacy recovery round, then returns apply ownership to Zakura.
+    async fn run_legacy_fallback_round(
+        &mut self,
+        block_sync_handoff: &std::sync::Arc<crate::commands::start::zakura::SyncCoordinator>,
+    ) {
+        let lease = match engage_legacy_fallback_alongside_zakura(block_sync_handoff).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                warn!(?error, "could not acquire the legacy fallback apply lease");
+                return;
+            }
+        };
+        if self.try_to_sync(None).await.is_err() {
+            self.downloads.cancel_all();
+        }
+        self.update_metrics();
+        drop(lease);
+        info!(
+            verified_tip = ?self.latest_chain_tip.best_tip_height(),
+            "legacy fallback recovery round finished; returned body-sync ownership to Zakura"
+        );
     }
 
     /// Probes the legacy peer set for how far ahead the network is on **our**
@@ -1220,7 +1398,12 @@ where
     /// necessary. This includes outer timeouts, where an entire syncing step takes an extremely
     /// long time. (These usually indicate hangs.)
     #[instrument(skip(self))]
-    async fn try_to_sync(&mut self) -> Result<(), Report> {
+    async fn try_to_sync(
+        &mut self,
+        header_runtime_status: Option<
+            &mut watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
+        >,
+    ) -> Result<(), Report> {
         self.prospective_tips = HashSet::new();
         self.missing_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
@@ -1228,8 +1411,16 @@ where
         let state_tip = self.latest_chain_tip.best_tip_height();
         self.trace.round_start(state_tip);
 
+        if header_runtime_status
+            .as_ref()
+            .is_some_and(|status| status.borrow().is_ready())
+        {
+            return Ok(());
+        }
+
         info!(?state_tip, "starting sync, obtaining new tips");
-        let extra_hashes = timeout(SYNC_RESTART_DELAY, self.obtain_tips())
+        let checkpoint_bootstrap = header_runtime_status.is_some();
+        let extra_hashes = timeout(SYNC_RESTART_DELAY, self.obtain_tips(checkpoint_bootstrap))
             .await
             .map_err(Into::into)
             // TODO: replace with flatten() when it stabilises (#70142)
@@ -1250,7 +1441,7 @@ where
         self.trace
             .tips_obtained(extra_hashes.len(), self.prospective_tips.len());
 
-        if let Err(error) = self.sync_round(extra_hashes).await {
+        if let Err(error) = self.sync_round(extra_hashes, header_runtime_status).await {
             self.trace_sync_snapshot("round_error_snapshot", 0);
             self.trace.round_finish(
                 "sync_error",
@@ -1277,7 +1468,15 @@ where
     /// Returns `Ok(())` once the round is exhausted: nothing in flight, nothing queued, and no tips
     /// left to extend. Returns `Err` if an unrecoverable error means the sync should restart.
     #[instrument(skip(self, reserve))]
-    async fn sync_round(&mut self, mut reserve: IndexSet<block::Hash>) -> Result<(), Report> {
+    async fn sync_round(
+        &mut self,
+        mut reserve: IndexSet<block::Hash>,
+        header_runtime_status: Option<
+            &mut watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
+        >,
+    ) -> Result<(), Report> {
+        let checkpoint_bootstrap = header_runtime_status.is_some();
+
         // The type of the in-flight tip-extension future.
         type ExtendOutput = Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report>;
 
@@ -1295,13 +1494,47 @@ where
         // of those happen for `BLOCK_VERIFY_TIMEOUT`, restart the round.
         let mut last_progress = Instant::now();
 
-        loop {
+        'sync_round: loop {
+            if header_runtime_status
+                .as_ref()
+                .is_some_and(|status| status.borrow().is_ready())
+            {
+                reserve.clear();
+                self.prospective_tips.clear();
+                self.registry_miss_retry.clear();
+
+                while let Some(response) = self.downloads.next().await {
+                    if let Err(error) = response {
+                        debug!(
+                            ?error,
+                            "legacy bootstrap download finished with an error while draining at \
+                             the checkpoint handoff"
+                        );
+                    }
+                }
+                break;
+            }
+
             // Opportunistically handle any block tasks that are already finished, without blocking.
             while let Poll::Ready(Some(rsp)) = futures::poll!(self.downloads.next()) {
                 // Handle completed block tasks. Missing blocks may be requeued; duplicate,
                 // cancelled, behind-tip, above-lookahead, and no-height blocks are treated as
                 // non-fatal. Other download or verification errors restart this sync round.
-                self.handle_block_response_with_missing_retry(rsp).await?;
+                let result = self.handle_block_response_with_missing_retry(rsp).await;
+                if header_runtime_status
+                    .as_ref()
+                    .is_some_and(|status| status.borrow().is_ready())
+                {
+                    if let Err(error) = result {
+                        debug!(
+                            ?error,
+                            "legacy bootstrap download finished with an error at the checkpoint \
+                             handoff"
+                        );
+                    }
+                    continue 'sync_round;
+                }
+                result?;
                 last_progress = Instant::now();
             }
             metrics::gauge!("sync.reserve.depth").set(reserve.len() as f64);
@@ -1384,7 +1617,21 @@ where
 
                 match completed {
                     Ok(Some(rsp)) => {
-                        self.handle_block_response_with_missing_retry(rsp).await?;
+                        let result = self.handle_block_response_with_missing_retry(rsp).await;
+                        if header_runtime_status
+                            .as_ref()
+                            .is_some_and(|status| status.borrow().is_ready())
+                        {
+                            if let Err(error) = result {
+                                debug!(
+                                    ?error,
+                                    "legacy bootstrap download finished with an error at the \
+                                     checkpoint handoff"
+                                );
+                            }
+                            continue 'sync_round;
+                        }
+                        result?;
                         last_progress = Instant::now();
                         self.update_metrics();
                     }
@@ -1405,11 +1652,12 @@ where
                         );
                         metrics::counter!("sync.tip.refresh").increment(1);
 
-                        let refreshed = timeout(SYNC_RESTART_DELAY, self.obtain_tips())
-                            .await
-                            .map_err(Into::into)
-                            // TODO: replace with flatten() when it stabilises (#70142)
-                            .and_then(convert::identity)?;
+                        let refreshed =
+                            timeout(SYNC_RESTART_DELAY, self.obtain_tips(checkpoint_bootstrap))
+                                .await
+                                .map_err(Into::into)
+                                // TODO: replace with flatten() when it stabilises (#70142)
+                                .and_then(convert::identity)?;
 
                         // A refresh is not progress, even when it returns hashes.
                         //
@@ -1483,14 +1731,36 @@ where
 
                     rsp = self.downloads.next(), if has_inflight => {
                         let rsp = rsp.expect("downloads is nonempty");
-                        self.handle_block_response_with_missing_retry(rsp).await?;
+                        let result = self.handle_block_response_with_missing_retry(rsp).await;
+                        if header_runtime_status
+                            .as_ref()
+                            .is_some_and(|status| status.borrow().is_ready())
+                        {
+                            if let Err(error) = result {
+                                debug!(
+                                    ?error,
+                                    "legacy bootstrap download finished with an error at the \
+                                     checkpoint handoff"
+                                );
+                            }
+                            return Ok(());
+                        }
+                        result?;
                         last_progress = Instant::now();
                         self.update_metrics();
                     }
 
                     extended = OptionFuture::from(extend.as_mut()), if extend.is_some() => {
-                        let (download_set, new_tips, discovered) =
+                        let (mut download_set, mut new_tips, _discovered) =
                             extended.expect("only polled while an extension is in flight")?;
+                        let reached_checkpoint = self.cap_checkpoint_bootstrap_downloads(
+                            &mut download_set,
+                            checkpoint_bootstrap,
+                        );
+                        if reached_checkpoint {
+                            new_tips.clear();
+                        }
+                        let discovered = download_set.len();
                         self.trace.tips_extended(discovered, new_tips.len());
                         self.prospective_tips = new_tips;
                         // security: use the actual number of new downloads from all peers, so the
@@ -1640,7 +1910,10 @@ where
     /// Given a block_locator list fan out request for subsequent hashes to
     /// multiple peers
     #[instrument(skip(self))]
-    async fn obtain_tips(&mut self) -> Result<IndexSet<block::Hash>, Report> {
+    async fn obtain_tips(
+        &mut self,
+        checkpoint_bootstrap: bool,
+    ) -> Result<IndexSet<block::Hash>, Report> {
         let stage_start = std::time::Instant::now();
 
         let block_locator = self
@@ -1796,6 +2069,12 @@ where
             }
         }
 
+        let reached_checkpoint =
+            self.cap_checkpoint_bootstrap_downloads(&mut download_set, checkpoint_bootstrap);
+        if reached_checkpoint {
+            self.prospective_tips.clear();
+        }
+
         debug!(?self.prospective_tips);
 
         // Check that the new tips we got are actually unknown.
@@ -1820,6 +2099,27 @@ where
             .record(stage_start.elapsed().as_secs_f64());
 
         Self::handle_hash_response(response, self.expose_peer_addresses).map_err(Into::into)
+    }
+
+    /// Limits compatibility downloads to the final checkpoint while it owns
+    /// initial block applies. Hashes above that boundary are left for native
+    /// Zakura block sync after the durable snapshot transfers ownership.
+    fn cap_checkpoint_bootstrap_downloads(
+        &self,
+        hashes: &mut IndexSet<block::Hash>,
+        checkpoint_bootstrap: bool,
+    ) -> bool {
+        if !checkpoint_bootstrap {
+            return false;
+        }
+
+        let pending = self.downloads.pending_hash_heights();
+        cap_checkpoint_bootstrap_hashes(
+            hashes,
+            self.latest_chain_tip.best_tip_height(),
+            self.max_checkpoint_height,
+            &pending,
+        )
     }
 
     /// Asks peers to extend the given prospective `tips`, returning the newly discovered block

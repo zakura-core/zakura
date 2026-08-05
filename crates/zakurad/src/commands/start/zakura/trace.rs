@@ -1,8 +1,6 @@
 //! Typed JSONL events emitted by the zakurad Zakura sync drivers.
 
 pub(crate) mod block_driver;
-pub(crate) mod chain_tip_mirror;
-pub(crate) mod header_driver;
 
 #[cfg(test)]
 mod tests {

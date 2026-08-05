@@ -7,8 +7,7 @@ use zakura_chain::block;
 use zakura_jsonl_trace::{saturating_count, saturating_millis, JsonlTraceEvent};
 use zakura_network::zakura::{
     commit_state_trace as event, zakura_trace_peer_label, BlockApplyResult, BlockApplyToken,
-    BlockSyncAction, BlockSyncFrontiers, BlockSyncMisbehavior, ZakuraPeerId, ZakuraTrace,
-    COMMIT_STATE_TABLE,
+    BlockSyncAction, BlockSyncMisbehavior, ZakuraPeerId, ZakuraTrace, COMMIT_STATE_TABLE,
 };
 
 use super::super::block_sync_driver::BlockApplyClass;
@@ -54,6 +53,7 @@ enum ReceivedAction {
         hash: String,
         apply_token: u64,
     },
+    Action(Action<'static>),
 }
 
 #[derive(Serialize)]
@@ -133,34 +133,6 @@ struct CommitStalled {
 }
 
 #[derive(Serialize)]
-struct FrontierQuery {
-    height: u64,
-    hash: String,
-    apply_token: u64,
-    #[serde(flatten)]
-    frontiers: Option<Frontiers>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    local_frontier: Option<bool>,
-}
-
-#[derive(Serialize)]
-struct Frontiers {
-    finalized_height: u64,
-    verified_block_tip: u64,
-    verified_block_hash: String,
-}
-
-impl From<&BlockSyncFrontiers> for Frontiers {
-    fn from(value: &BlockSyncFrontiers) -> Self {
-        Self {
-            finalized_height: value.finalized_height.0.into(),
-            verified_block_tip: value.verified_block_tip.0.into(),
-            verified_block_hash: value.verified_block_hash.to_string(),
-        }
-    }
-}
-
-#[derive(Serialize)]
 struct SubmitQueued {
     #[serde(skip_serializing_if = "Option::is_none")]
     height: Option<u64>,
@@ -169,12 +141,6 @@ struct SubmitQueued {
     apply_class: &'static str,
     queue_len: u64,
     in_flight_count: u64,
-}
-
-#[derive(Serialize)]
-struct RefreshAttempt {
-    verified_block_tip: u64,
-    attempts_remaining: u64,
 }
 
 pub(crate) trait BlockDriverTraceExt {
@@ -270,21 +236,6 @@ pub(crate) trait BlockDriverTraceExt {
         hash: block::Hash,
         elapsed: std::time::Duration,
     );
-    fn trace_block_frontier_query_started(
-        &self,
-        token: BlockApplyToken,
-        height: block::Height,
-        hash: block::Hash,
-    );
-    fn trace_block_frontier_query_finished(
-        &self,
-        token: BlockApplyToken,
-        height: block::Height,
-        hash: block::Hash,
-        frontiers: Option<&BlockSyncFrontiers>,
-    );
-    fn trace_checkpoint_refresh_attempt(&self, attempts_remaining: usize, tip: block::Height);
-    fn trace_checkpoint_refresh_sent(&self, frontiers: &BlockSyncFrontiers);
 }
 
 impl BlockDriverTraceExt for ZakuraTrace {
@@ -296,12 +247,13 @@ impl BlockDriverTraceExt for ZakuraTrace {
                 BlockSyncAction::Misbehavior { peer, reason } => ReceivedAction::Misbehavior {
                     action: "misbehavior",
                     peer: zakura_trace_peer_label(peer),
-                    reason: misbehavior_label(*reason),
+                    reason: misbehavior_label(reason),
                 },
                 BlockSyncAction::QueryNeededBlocks {
                     from,
                     limit,
                     best_header_tip,
+                    ..
                 } => ReceivedAction::NeededBlocks(NeededRange {
                     action: "query_needed_blocks",
                     range_start: from.0.into(),
@@ -316,12 +268,24 @@ impl BlockDriverTraceExt for ZakuraTrace {
                         range_count: (*count).into(),
                     }
                 }
-                BlockSyncAction::SubmitBlock { token, block } => ReceivedAction::SubmitBlock {
+                BlockSyncAction::SubmitBlock { token, block, .. } => ReceivedAction::SubmitBlock {
                     action: "submit_block",
                     apply_token: *token,
                     hash: block.hash().to_string(),
                     height: block.coinbase_height().map(|height| height.0.into()),
                 },
+                BlockSyncAction::RecordBodyUnavailable { .. } => ReceivedAction::Action(Action {
+                    action: "record_body_unavailable",
+                }),
+                BlockSyncAction::RecordBodyInvalid { .. } => ReceivedAction::Action(Action {
+                    action: "record_body_invalid",
+                }),
+                BlockSyncAction::RestartBodyAvailability { .. } => ReceivedAction::Action(Action {
+                    action: "restart_body_availability",
+                }),
+                BlockSyncAction::RetryBodyAvailability { .. } => ReceivedAction::Action(Action {
+                    action: "retry_body_availability",
+                }),
             },
         });
     }
@@ -577,50 +541,6 @@ impl BlockDriverTraceExt for ZakuraTrace {
             elapsed_ms: saturating_millis(elapsed),
         });
     }
-
-    fn trace_block_frontier_query_started(
-        &self,
-        token: BlockApplyToken,
-        height: block::Height,
-        hash: block::Hash,
-    ) {
-        emit(self, event::FRONTIER_QUERY_START, || FrontierQuery {
-            apply_token: token,
-            height: height.0.into(),
-            hash: hash.to_string(),
-            local_frontier: None,
-            frontiers: None,
-        });
-    }
-
-    fn trace_block_frontier_query_finished(
-        &self,
-        token: BlockApplyToken,
-        height: block::Height,
-        hash: block::Hash,
-        frontiers: Option<&BlockSyncFrontiers>,
-    ) {
-        emit(self, event::FRONTIER_QUERY_FINISH, || FrontierQuery {
-            apply_token: token,
-            height: height.0.into(),
-            hash: hash.to_string(),
-            local_frontier: Some(frontiers.is_some()),
-            frontiers: frontiers.map(Frontiers::from),
-        });
-    }
-
-    fn trace_checkpoint_refresh_attempt(&self, attempts_remaining: usize, tip: block::Height) {
-        emit(self, event::CHECKPOINT_REFRESH_ATTEMPT, || RefreshAttempt {
-            attempts_remaining: saturating_count(attempts_remaining),
-            verified_block_tip: tip.0.into(),
-        });
-    }
-
-    fn trace_checkpoint_refresh_sent(&self, frontiers: &BlockSyncFrontiers) {
-        emit(self, event::CHECKPOINT_REFRESH_SENT, || {
-            Frontiers::from(frontiers)
-        });
-    }
 }
 
 fn emit<F: Serialize>(trace: &ZakuraTrace, name: &'static str, fields: impl FnOnce() -> F) {
@@ -672,16 +592,19 @@ fn result_label(result: BlockApplyResult) -> &'static str {
         BlockApplyResult::Committed => "committed",
         BlockApplyResult::Duplicate => "duplicate",
         BlockApplyResult::Rejected => "rejected",
+        BlockApplyResult::Unavailable => "unavailable",
         BlockApplyResult::TimedOut => "timed_out",
     }
 }
 
-fn misbehavior_label(reason: BlockSyncMisbehavior) -> &'static str {
+fn misbehavior_label(reason: &BlockSyncMisbehavior) -> &'static str {
     match reason {
         BlockSyncMisbehavior::MalformedMessage => "malformed_message",
         BlockSyncMisbehavior::UnsolicitedBlock => "unsolicited_block",
         BlockSyncMisbehavior::GetBlocksTooLong => "get_blocks_too_long",
         BlockSyncMisbehavior::GetBlocksSpam => "get_blocks_spam",
+        BlockSyncMisbehavior::BodyPayloadMismatch(_) => "body_payload_mismatch",
+        BlockSyncMisbehavior::ConsensusBodyInvalid(_) => "consensus_body_invalid",
         BlockSyncMisbehavior::InvalidBlock => "invalid_block",
         BlockSyncMisbehavior::SizeMismatch => "size_mismatch",
         BlockSyncMisbehavior::InvalidStatus => "invalid_status",
@@ -696,59 +619,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn block_driver_schema_preserves_key_order_and_sparse_fields() {
-        let row = DriverEvent {
-            event: event::FRONTIER_QUERY_FINISH,
-            source: SOURCE,
-            fields: FrontierQuery {
-                apply_token: 7,
-                height: 42,
-                hash: "abcd".to_string(),
-                local_frontier: Some(true),
-                frontiers: Some(Frontiers {
-                    finalized_height: 40,
-                    verified_block_tip: 42,
-                    verified_block_hash: "dcba".to_string(),
-                }),
-            },
-        };
-
-        let serialized = serde_json::to_string(&row).expect("block driver row serializes");
-        assert_eq!(
-            serialized,
-            r#"{"event":"frontier_query_finish","source":"block_sync_driver","height":42,"hash":"abcd","apply_token":7,"finalized_height":40,"verified_block_tip":42,"verified_block_hash":"dcba","local_frontier":true}"#
-        );
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&serialized).expect("valid JSON"),
-            serde_json::json!({
-                "event": "frontier_query_finish",
-                "source": "block_sync_driver",
-                "apply_token": 7,
-                "height": 42,
-                "hash": "abcd",
-                "local_frontier": true,
-                "finalized_height": 40,
-                "verified_block_tip": 42,
-                "verified_block_hash": "dcba",
-            })
-        );
-
-        let sparse = DriverEvent {
-            event: event::FRONTIER_QUERY_START,
-            source: SOURCE,
-            fields: FrontierQuery {
-                apply_token: 7,
-                height: 42,
-                hash: "abcd".to_string(),
-                local_frontier: None,
-                frontiers: None,
-            },
-        };
-        assert_eq!(
-            serde_json::to_string(&sparse).expect("sparse row serializes"),
-            r#"{"event":"frontier_query_start","source":"block_sync_driver","height":42,"hash":"abcd","apply_token":7}"#
-        );
-
+    fn block_driver_commit_schema_preserves_key_order() {
         let apply = DriverEvent {
             event: event::COMMIT_FINISH,
             source: SOURCE,

@@ -1,6 +1,6 @@
 [package]
 name = "zakura-network"
-version = "5.1.0-rc2"
+version = "6.0.0-rc2"
 authors.workspace = true
 description = "Networking code for the Zakura node. Internal crate, published to support cargo install zakura"
 # # Legal

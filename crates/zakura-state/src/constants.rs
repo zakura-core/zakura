@@ -39,7 +39,7 @@ pub const STATE_DATABASE_KIND: &str = "state";
 pub const MIN_PRUNING_RETENTION: u32 = 10_000;
 
 /// The default bound on how many blocks one historical note commitment tree derivation may
-/// replay, used by [`Config::max_historical_tree_replay_blocks`](crate::Config).
+/// replay. Used as the `audit-historical-treestates` CLI default until the config knob lands.
 ///
 /// Sized to cover a cold request anywhere in a from-genesis fast-synced node's absent band on
 /// Mainnet, so the first request of a wallet sweep succeeds rather than failing at a limit. Later

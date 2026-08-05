@@ -45,9 +45,6 @@ def derive_locally(args):
         "--to", str(args.to_height),
         "--step", str(args.step),
     ]
-    if args.frontier_artifact:
-        command += ["--frontier-artifact", args.frontier_artifact]
-
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
         sys.exit(f"local derivation failed:\n{result.stderr[-4000:]}")
@@ -84,7 +81,6 @@ def main():
     parser.add_argument("--from-height", type=int, required=True)
     parser.add_argument("--to-height", type=int, required=True)
     parser.add_argument("--step", type=int, default=50)
-    parser.add_argument("--frontier-artifact", help="frontier artifact to anchor derivation on")
     parser.add_argument("--zakurad", default="target/release/zakurad")
     args = parser.parse_args()
 

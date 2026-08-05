@@ -47,7 +47,7 @@ jobs:
           components: llvm-tools-preview
           # Avoid reserving about 1.2 GB for this infrequent workflow.
           cache: false
-      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
         with:
           tool: cargo-llvm-cov,nextest
       - uses: ./.github/actions/setup-zakura-build

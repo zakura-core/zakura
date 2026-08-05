@@ -15,7 +15,7 @@ use color_eyre::eyre::{eyre, Result};
 
 use zakura_chain::{block::Height, parameters::Network};
 use zakura_state::{
-    DerivationSample, HistoricalTreeCache, VctTreestateInventory,
+    DerivationSample, HistoricalTreeCache, SubtreeVerification, VctTreestateInventory,
     DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 
@@ -154,12 +154,7 @@ impl AuditHistoricalTreestatesCmd {
                 println!("    {pool} subtree {}", index.0);
             }
 
-            if !outcome.mismatched.is_empty() {
-                return Err(eyre!(
-                    "replay does not reproduce stored subtree roots, so generated subtree \
-                     artifacts cannot be trusted"
-                ));
-            }
+            validate_subtree_verification(&outcome)?;
         }
 
         if !self.walk {
@@ -300,6 +295,24 @@ impl AuditHistoricalTreestatesCmd {
     }
 }
 
+/// Rejects incomplete as well as contradictory subtree ground truth.
+///
+/// Every replay completion in the audited range is above the handoff, where the database is
+/// expected to store subtree rows. A missing row therefore prevents verification just like a
+/// mismatched row does.
+fn validate_subtree_verification(outcome: &SubtreeVerification) -> Result<()> {
+    if outcome.unstored == 0 && outcome.mismatched.is_empty() {
+        Ok(())
+    } else {
+        Err(eyre!(
+            "replay could not be verified against stored subtree roots: {} missing and {} \
+             mismatched; generated subtree artifacts cannot be trusted",
+            outcome.unstored,
+            outcome.mismatched.len(),
+        ))
+    }
+}
+
 #[allow(clippy::print_stdout)]
 fn print_inventory(inventory: &VctTreestateInventory) {
     println!("historical treestate inventory:");
@@ -416,5 +429,35 @@ fn format_duration(duration: Duration) -> String {
         format!("{:.1}ms", duration.as_secs_f64() * 1e3)
     } else {
         format!("{:.2}s", duration.as_secs_f64())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_subtree_verification;
+    use zakura_chain::subtree::NoteCommitmentSubtreeIndex;
+    use zakura_state::SubtreeVerification;
+
+    #[test]
+    fn subtree_verification_requires_every_stored_row() {
+        assert!(validate_subtree_verification(&SubtreeVerification::default()).is_ok());
+
+        let missing = SubtreeVerification {
+            unstored: 1,
+            ..Default::default()
+        };
+        assert!(
+            validate_subtree_verification(&missing).is_err(),
+            "a replay completion without its expected stored row must fail the audit"
+        );
+
+        let mismatched = SubtreeVerification {
+            mismatched: vec![(NoteCommitmentSubtreeIndex(0), "sapling")],
+            ..Default::default()
+        };
+        assert!(
+            validate_subtree_verification(&mismatched).is_err(),
+            "a replay completion that contradicts its stored row must fail the audit"
+        );
     }
 }

@@ -197,6 +197,9 @@ pub struct SubtreeVerification {
     pub mismatched: Vec<(NoteCommitmentSubtreeIndex, &'static str)>,
 
     /// Subtrees that completed during the replay with no stored row to compare against.
+    ///
+    /// Any entry makes verification incomplete: replay only covers the band above the last checkpoint,
+    /// where every completed subtree is expected to have a stored row.
     pub unstored: usize,
 }
 

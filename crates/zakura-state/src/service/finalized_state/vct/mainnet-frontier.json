@@ -2,11 +2,11 @@
   "schema_version": 1,
   "network": "Mainnet",
   "source": "release-state-bundle",
-  "generated_at": "2026-08-04T16:18:32Z",
-  "finalized_height": 3434971,
-  "finalized_hash": "0000000000670ac4b8899c87bb9e3f4a741e07012b2d57026331ba6c57b4028b",
-  "checkpoints_sha256": "f856cf7c36b47edfc7f39a16b2089e9a677b1cda24f805a7b7b829fe2618c69b",
-  "frontier_sha256": "5bced77f3a6845192734a0b6d0c9f0bf564202606800988bfd2b908c00c7f5ec",
-  "frontier_size": 1782,
-  "meta_sha256": "d5bc1aabf6344a72d97e019b4c3e60cc66c5294f2db45c49b497a1b28bf89474"
+  "generated_at": "2026-08-05T13:17:58Z",
+  "finalized_height": 3436171,
+  "finalized_hash": "000000000007ec04a25dc7552851b4cd512b71f9af26bfb77e4ff6b465c257fa",
+  "checkpoints_sha256": "732e1dc28025e9f9cc7a4ed79fcc44c5938448b3fab5d2495b131b66fe6cfb39",
+  "frontier_sha256": "5550eccd414f01139e4ea7abab6ca0429b5d0639ffc1710b1bc15fae44cca090",
+  "frontier_size": 2070,
+  "meta_sha256": "879a3fdb5c08cc071b5525bbc457412e313cf8f1ed6d813bfaea23f2a66bc7c2"
 }

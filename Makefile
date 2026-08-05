@@ -3,6 +3,7 @@
 include scripts/make/zcashd-compat.mk
 include scripts/make/perf.mk
 include scripts/make/zakura-dev.mk
+include scripts/make/treestate-audit.mk
 include scripts/make/release.mk
 include scripts/make/install.mk
 
@@ -16,6 +17,16 @@ help:
 	@echo "  zakura-build-dev                 Build release zakurad"
 	@echo "  zakura-dev-init                  Create ~/.local/zakura-dev config + dirs"
 	@echo "  zakura-start-dev                 Start local dev node (pruned, VCT, v2-only)"
+	@echo ""
+	@echo "  Historical treestate audit:"
+	@echo "  treestate-audit-inventory        Report the database's historical treestate inventory"
+	@echo "  treestate-audit-subtrees         Verify replay-derived subtree roots against stored rows"
+	@echo "  treestate-audit-walk             Derive and root-check the absent band"
+	@echo "  treestate-audit-samples          Measure cold replay and print per-height samples"
+	@echo "  treestate-audit-roots            Print derived roots for cross-node comparison"
+	@echo "  treestate-audit-differential     Compare derived roots with a legacy node over RPC"
+	@echo "    Variables: TREESTATE_CACHE_DIR, TREESTATE_NETWORK, TREESTATE_FROM,"
+	@echo "               TREESTATE_TO, TREESTATE_STEP, TREESTATE_RPC_URL"
 	@echo ""
 	@echo "  Perf harness (deterministic isolated-cohort bench):"
 	@echo "  perf-build-local                 Build the instrumented (commit-metrics) bench binary"

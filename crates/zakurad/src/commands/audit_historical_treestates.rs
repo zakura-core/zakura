@@ -146,7 +146,7 @@ impl AuditHistoricalTreestatesCmd {
             zakura_state::init_read_only(state_config, &self.network)?;
 
         if !self.no_scan {
-            eprintln!(
+            println!(
                 "inventory scan starting. Please wait for approximately 5–15 minutes on Mainnet"
             );
         }

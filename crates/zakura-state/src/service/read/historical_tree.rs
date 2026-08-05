@@ -25,11 +25,12 @@ use thiserror::Error;
 
 use zakura_chain::{
     block::Height, ironwood, orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling,
+    transaction::Transaction,
 };
 
 use zakura_chain::subtree::NoteCommitmentSubtreeIndex;
 
-use crate::service::finalized_state::ZakuraDb;
+use crate::service::finalized_state::{TransactionLocation, ZakuraDb};
 
 /// The most derived frontiers to keep memoized per node.
 ///
@@ -366,24 +367,61 @@ pub fn replay_with_subtrees(
     let mut orchard = (*orchard).clone();
     let mut ironwood = (*ironwood).clone();
 
+    let first_height = Height(replay_from);
+    let mut transactions = db
+        .transactions_by_location_range(
+            TransactionLocation::min_for_height(first_height)
+                ..=TransactionLocation::max_for_height(height),
+        )
+        .peekable();
+
     for block_height in replay_from..=height.0 {
         let block_height = Height(block_height);
-        let block = db.block(block_height.into()).ok_or(
-            HistoricalTreeDerivationError::MissingBlockBody {
-                height,
-                missing: block_height,
-            },
-        )?;
-
         let append_error = |error: &dyn std::fmt::Display| HistoricalTreeDerivationError::Append {
             height,
             block: block_height,
             error: error.to_string(),
         };
 
+        let Some((first_location, first_transaction)) = transactions.next() else {
+            return Err(HistoricalTreeDerivationError::MissingBlockBody {
+                height,
+                missing: block_height,
+            });
+        };
+        if first_location != TransactionLocation::min_for_height(block_height) {
+            return Err(HistoricalTreeDerivationError::MissingBlockBody {
+                height,
+                missing: block_height,
+            });
+        }
+
         // A block never spans two subtree boundaries: the block size limit caps it far below the
         // 65,536 commitments a subtree holds, so a single batch append is always valid.
-        let sapling_commitments: Vec<_> = block.sapling_note_commitments().cloned().collect();
+        let mut sapling_commitments = Vec::new();
+        let mut orchard_commitments = Vec::new();
+        let mut ironwood_commitments = Vec::new();
+        extend_commitments(
+            &first_transaction,
+            &mut sapling_commitments,
+            &mut orchard_commitments,
+            &mut ironwood_commitments,
+        );
+        while transactions
+            .peek()
+            .is_some_and(|(location, _)| location.height == block_height)
+        {
+            let (_, transaction) = transactions
+                .next()
+                .expect("a transaction observed through peek is available");
+            extend_commitments(
+                &transaction,
+                &mut sapling_commitments,
+                &mut orchard_commitments,
+                &mut ironwood_commitments,
+            );
+        }
+
         if !sapling_commitments.is_empty() {
             let completed = sapling
                 .append_batch(&sapling_commitments)
@@ -400,7 +438,6 @@ pub fn replay_with_subtrees(
             }
         }
 
-        let orchard_commitments: Vec<_> = block.orchard_note_commitments().cloned().collect();
         if !orchard_commitments.is_empty() {
             let completed = orchard
                 .append_batch(&orchard_commitments)
@@ -417,7 +454,6 @@ pub fn replay_with_subtrees(
             }
         }
 
-        let ironwood_commitments: Vec<_> = block.ironwood_note_commitments().cloned().collect();
         if !ironwood_commitments.is_empty() {
             let completed = ironwood
                 .append_batch(&ironwood_commitments)
@@ -440,6 +476,17 @@ pub fn replay_with_subtrees(
         orchard: Arc::new(orchard),
         ironwood: Arc::new(ironwood),
     })
+}
+
+fn extend_commitments(
+    transaction: &Transaction,
+    sapling: &mut Vec<sapling::tree::NoteCommitmentUpdate>,
+    orchard: &mut Vec<orchard::tree::NoteCommitmentUpdate>,
+    ironwood: &mut Vec<ironwood::tree::NoteCommitmentUpdate>,
+) {
+    sapling.extend(transaction.sapling_note_commitments().cloned());
+    orchard.extend(transaction.orchard_note_commitments().copied());
+    ironwood.extend(transaction.ironwood_note_commitments().copied());
 }
 
 /// Checks `frontiers` against the authenticated roots stored for `height`.

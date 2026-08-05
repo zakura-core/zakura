@@ -22,7 +22,7 @@ rollback pattern generalized to a dynamic multi-node config.
 Copy `nodes.example.toml` to `nodes.toml` and edit. Each `[[nodes]]` entry needs:
 
 - `name` — used for `--node` selection and `logs/<name>.log`.
-- `ssh_string` — the ssh/scp destination, e.g. `root@167.99.162.47`.
+- `ssh_string` — the ssh/scp destination, e.g. `root@203.0.113.10`.
 - `commit` — branch, tag, or SHA to build from (must be fetched locally).
 
 `[defaults]` supplies fleet-wide values (service name, paths, network, ssh

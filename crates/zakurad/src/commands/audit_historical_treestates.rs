@@ -46,11 +46,15 @@ pub struct AuditHistoricalTreestatesCmd {
     )]
     walk: bool,
 
-    /// Derive every `step`th height rather than every height.
+    /// Derive every `step`th height rather than every height, always including `--to`.
     ///
     /// A step of 1 walks contiguously, which is the strongest invariant check. Larger steps
     /// approximate a wallet's scan batch size and measure what a client actually pays.
-    #[clap(long, default_value = "1", help = "height spacing for the walk")]
+    #[clap(
+        long,
+        default_value = "1",
+        help = "height spacing for the walk; --to is always included"
+    )]
     step: u32,
 
     /// The first height to derive. Defaults to the bottom of the absent band.
@@ -197,10 +201,7 @@ impl AuditHistoricalTreestatesCmd {
     /// Derives every sampled height in `[from, to]`, printing progress and a summary.
     #[allow(clippy::print_stdout)]
     fn walk_band(&self, db: &zakura_state::ZakuraDb, from: Height, to: Height) -> Result<()> {
-        let heights: Vec<Height> = (from.0..=to.0)
-            .step_by(self.step as usize)
-            .map(Height)
-            .collect();
+        let heights = sampled_heights(from, to, self.step);
         let total = heights.len();
 
         if self.print_roots {
@@ -293,6 +294,19 @@ impl AuditHistoricalTreestatesCmd {
 
         result.map_err(|(height, error)| eyre!("derivation failed at height {}: {error}", height.0))
     }
+}
+
+/// Returns heights spaced by `step` in `[from, to]`, always including both endpoints.
+fn sampled_heights(from: Height, to: Height, step: u32) -> Vec<Height> {
+    let step =
+        usize::try_from(step).expect("u32 values fit in usize on Zakura's supported targets");
+    let mut heights: Vec<Height> = (from.0..=to.0).step_by(step).map(Height).collect();
+
+    if heights.last() != Some(&to) {
+        heights.push(to);
+    }
+
+    heights
 }
 
 /// Rejects incomplete as well as contradictory subtree ground truth.
@@ -434,9 +448,22 @@ fn format_duration(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_subtree_verification;
-    use zakura_chain::subtree::NoteCommitmentSubtreeIndex;
+    use super::{sampled_heights, validate_subtree_verification};
+    use zakura_chain::{block::Height, subtree::NoteCommitmentSubtreeIndex};
     use zakura_state::SubtreeVerification;
+
+    #[test]
+    fn sampled_heights_always_include_to() {
+        assert_eq!(
+            sampled_heights(Height(100), Height(110), 6),
+            [Height(100), Height(106), Height(110)]
+        );
+        assert_eq!(
+            sampled_heights(Height(100), Height(112), 6),
+            [Height(100), Height(106), Height(112)]
+        );
+        assert_eq!(sampled_heights(Height(100), Height(100), 6), [Height(100)]);
+    }
 
     #[test]
     fn subtree_verification_requires_every_stored_row() {

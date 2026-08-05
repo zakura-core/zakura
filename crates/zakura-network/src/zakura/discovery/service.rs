@@ -690,7 +690,12 @@ impl DiscoverySink {
             } => {
                 let records = self
                     .handle
-                    .sample_peers(usize::from(limit), &wanted_services, &exclude_node_ids)
+                    .sample_peers(
+                        self.peer_node_id,
+                        usize::from(limit),
+                        &wanted_services,
+                        &exclude_node_ids,
+                    )
                     .await;
                 self.send_peers(records)
             }

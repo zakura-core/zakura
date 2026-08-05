@@ -39,12 +39,11 @@ proptest! {
             let expanded_trip = compact_trip.to_expanded().expect("roundtrip expanded is valid");
             prop_assert_eq!(expanded_trunc, expanded_trip);
 
-            // Some impossibly hard compact values are not valid work values in Zebra
-            if let Some(work) = work {
-                // roundtrip
-                let work_trip = compact_trip.to_work().expect("roundtrip work is valid if work is valid");
-                prop_assert_eq!(work, work_trip);
-            }
+            let work = work.expect("every positive 256-bit target has representable work");
+            let work_trip = compact_trip
+                .to_work()
+                .expect("roundtrip positive target has representable work");
+            prop_assert_eq!(work, work_trip);
         }
     }
 
@@ -53,8 +52,8 @@ proptest! {
     /// Make sure the conversions don't panic, and that they compare correctly.
     #[test]
     fn prop_work_conversion(work in any::<Work>()) {
-        let work_zero = Work(0);
-        let work_max = Work(u128::MAX);
+        let work_zero = Work(U256::zero());
+        let work_max = Work(U256::MAX);
 
         prop_assert!(work > work_zero);
         // similarly, the maximum compact value has less precision than work
@@ -65,8 +64,14 @@ proptest! {
         prop_assert!(partial_work < PartialCumulativeWork::from(work_max));
 
         // Now try adding zero to convert to PartialCumulativeWork
-        prop_assert!(partial_work > work_zero + work_zero);
-        prop_assert!(partial_work < work_max + work_zero);
+        let zero_sum = PartialCumulativeWork::from(work_zero)
+            .checked_add(work_zero)
+            .expect("adding zero to zero is representable");
+        let max_sum = PartialCumulativeWork::from(work_max)
+            .checked_add(work_zero)
+            .expect("adding zero to the maximum is representable");
+        prop_assert!(partial_work > zero_sum);
+        prop_assert!(partial_work < max_sum);
     }
 
     /// Check that a random ExpandedDifficulty compares correctly with fixed block::Hash
@@ -161,9 +166,8 @@ proptest! {
             prop_assert!(compact1 == compact2);
         }
 
-        // Skip impossibly hard work values
-        prop_assume!(work1.is_some());
-        prop_assume!(work2.is_some());
+        prop_assert!(work1.is_some());
+        prop_assert!(work2.is_some());
 
         match expanded1_seed.cmp(&expanded2_seed) {
             Ordering::Greater => {
@@ -196,9 +200,7 @@ proptest! {
     #[test]
     fn prop_work_sum(work1 in any::<Work>(), work2 in any::<Work>()) {
 
-        // If the sum won't panic
-        if work1.0.checked_add(work2.0).is_some() {
-            let work_total = work1 + work2;
+        if let Some(work_total) = PartialCumulativeWork::from(work1).checked_add(work2) {
             prop_assert!(work_total >= PartialCumulativeWork::from(work1));
             prop_assert!(work_total >= PartialCumulativeWork::from(work2));
 
@@ -206,15 +208,13 @@ proptest! {
             prop_assert_eq!(work_total - work2, PartialCumulativeWork::from(work1));
         }
 
-        if work1.0.checked_add(work1.0).is_some() {
-            let work_total = work1 + work1;
+        if let Some(work_total) = PartialCumulativeWork::from(work1).checked_add(work1) {
             prop_assert!(work_total >= PartialCumulativeWork::from(work1));
 
             prop_assert_eq!(work_total - work1, PartialCumulativeWork::from(work1));
         }
 
-        if work2.0.checked_add(work2.0).is_some() {
-            let work_total = work2 + work2;
+        if let Some(work_total) = PartialCumulativeWork::from(work2).checked_add(work2) {
             prop_assert!(work_total >= PartialCumulativeWork::from(work2));
 
             prop_assert_eq!(work_total - work2, PartialCumulativeWork::from(work2));

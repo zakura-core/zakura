@@ -205,3 +205,250 @@ fn evict_tip_branch<G: HeaderGraphEdit>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{num::NonZeroUsize, sync::Arc};
+
+    use super::*;
+    use crate::{
+        BodyValidationState, EligibilityReason, HeaderValidationState, InsertResult, MemHeaderStore,
+    };
+    use zakura_chain::block::genesis::regtest_genesis_block;
+
+    fn store() -> MemHeaderStore {
+        let block = regtest_genesis_block();
+        let hash = block.hash();
+        let work = block
+            .header
+            .difficulty_threshold
+            .to_work()
+            .expect("valid work");
+        MemHeaderStore::new(
+            Frontier::new(block::Height(0), hash),
+            block.header.clone(),
+            work,
+            work.as_u256(),
+        )
+        .expect("fixture anchor matches")
+    }
+
+    fn insert(
+        store: &mut MemHeaderStore,
+        parent: block::Hash,
+        seed: u8,
+        reasons: impl IntoIterator<Item = EligibilityReason>,
+    ) -> Frontier {
+        let mut header = *regtest_genesis_block().header;
+        header.previous_block_hash = parent;
+        header.nonce = [seed; 32].into();
+        let header = Arc::new(header);
+        let work = header.difficulty_threshold.to_work().expect("valid work");
+        match store
+            .insert(
+                header,
+                work,
+                HeaderValidationState::Valid,
+                reasons,
+                BodyValidationState::Unknown,
+            )
+            .expect("fixture parent is retained")
+        {
+            InsertResult::Inserted(frontier) | InsertResult::AlreadyPresent(frontier) => frontier,
+        }
+    }
+
+    fn limits(tips: usize, nodes: usize) -> EngineLimits {
+        EngineLimits {
+            max_candidate_tips: NonZeroUsize::new(tips).expect("test limit is nonzero"),
+            max_non_finalized_nodes: NonZeroUsize::new(nodes).expect("test limit is nonzero"),
+            ..EngineLimits::v1()
+        }
+    }
+
+    #[test]
+    fn candidate_tip_eviction_is_lowest_work_then_smallest_raw_hash() {
+        let mut store = store();
+        let anchor = store.finalized();
+        let tips: Vec<_> = (1..=12)
+            .map(|seed| insert(&mut store, anchor.hash, seed, []))
+            .collect();
+        let header_best = store.select_header_best().expect("graph is coherent").0;
+        let mut expected: Vec<_> = tips
+            .iter()
+            .copied()
+            .filter(|tip| *tip != header_best)
+            .collect();
+        expected.sort_unstable_by_key(|tip| store.score(tip.hash).expect("retained").tip_hash.0);
+
+        let plan = enforce_retention(&mut store, header_best, anchor, [], limits(10, 100))
+            .expect("retention succeeds");
+        assert!(store.node(expected[0].hash).is_none());
+        assert!(store.node(expected[1].hash).is_none());
+        assert_eq!(store.eligible_tips().len(), 10);
+        assert!(store.node(header_best.hash).is_some());
+        assert!(!plan.admission_refused);
+
+        let reacquired_seed = (1..=12)
+            .find(|seed| {
+                let mut header = *regtest_genesis_block().header;
+                header.previous_block_hash = anchor.hash;
+                header.nonce = [*seed; 32].into();
+                header.hash() == expected[0].hash
+            })
+            .expect("the evicted fixture tip has a seed");
+        let reacquired = insert(&mut store, anchor.hash, reacquired_seed, []);
+        assert_eq!(reacquired.hash, expected[0].hash);
+        assert!(store
+            .node(reacquired.hash)
+            .expect("reacquired")
+            .is_eligible());
+    }
+
+    #[test]
+    fn eligible_tip_with_deferred_descendant_is_evicted_without_stalling() {
+        let mut store = store();
+        let anchor = store.finalized();
+        let tips: Vec<_> = (1..=12)
+            .map(|seed| insert(&mut store, anchor.hash, seed, []))
+            .collect();
+        let header_best = store.select_header_best().expect("graph is coherent").0;
+        let victim = tips
+            .iter()
+            .copied()
+            .filter(|tip| *tip != header_best)
+            .min_by_key(|tip| store.score(tip.hash).expect("retained"))
+            .expect("one unprotected tip exists");
+        let deferred = insert(&mut store, victim.hash, 13, []);
+        store
+            .set_validation(
+                deferred.hash,
+                HeaderValidationState::DeferredUntil(
+                    regtest_genesis_block().header.time + chrono::Duration::hours(3),
+                ),
+            )
+            .expect("the deferred descendant is retained");
+
+        assert!(store
+            .eligible_tips()
+            .iter()
+            .any(|tip| tip.hash == victim.hash));
+        assert!(!store
+            .node(deferred.hash)
+            .expect("the deferred child is retained")
+            .is_eligible());
+
+        let plan = enforce_retention(&mut store, header_best, anchor, [], limits(10, 100))
+            .expect("retention evicts the ineligible descendant subtree");
+
+        assert!(store.node(deferred.hash).is_none());
+        assert!(store.node(victim.hash).is_none());
+        assert_eq!(store.eligible_tips().len(), 10);
+        assert!(!plan.admission_refused);
+    }
+
+    #[test]
+    fn permanent_subtrees_are_evicted_first_only_under_pressure() {
+        let mut store = store();
+        let anchor = store.finalized();
+        let permanent = insert(
+            &mut store,
+            anchor.hash,
+            1,
+            [EligibilityReason::CheckpointConflict {
+                height: block::Height(1),
+                expected: block::Hash([9; 32]),
+            }],
+        );
+        let selected = insert(&mut store, anchor.hash, 2, []);
+        let spare = insert(&mut store, anchor.hash, 3, []);
+
+        enforce_retention(&mut store, selected, anchor, [], limits(10, 2))
+            .expect("permanent subtree frees capacity");
+        assert!(store.node(permanent.hash).is_none());
+        assert!(store.node(selected.hash).is_some());
+        assert!(store.node(spare.hash).is_some());
+    }
+
+    #[test]
+    fn protected_paths_and_context_references_fail_closed_under_node_pressure() {
+        let mut store = store();
+        let anchor = store.finalized();
+        let first = insert(&mut store, anchor.hash, 1, []);
+        let selected = insert(&mut store, first.hash, 2, []);
+
+        let plan = enforce_retention(&mut store, selected, anchor, [first.hash], limits(10, 1))
+            .expect("retention returns a typed refusal");
+        assert!(plan.admission_refused);
+        assert!(plan.resource_stalled);
+        assert!(store.node(selected.hash).is_some());
+    }
+
+    #[test]
+    fn overlapping_protected_paths_stop_at_their_first_protected_ancestor() {
+        let mut store = store();
+        let anchor = store.finalized();
+        let first = insert(&mut store, anchor.hash, 1, []);
+        let selected = insert(&mut store, first.hash, 2, []);
+        let branch = insert(&mut store, first.hash, 3, []);
+        let mut protected = HashSet::new();
+
+        assert_eq!(
+            protect_path(&store, selected.hash, &mut protected)
+                .expect("the selected path is coherent"),
+            3
+        );
+        assert_eq!(
+            protect_path(&store, branch.hash, &mut protected)
+                .expect("the branch joins the selected path"),
+            2
+        );
+        assert_eq!(
+            protect_path(&store, first.hash, &mut protected)
+                .expect("the context reference is already protected"),
+            1
+        );
+        assert!(protected.contains(&anchor.hash));
+        assert!(protected.contains(&first.hash));
+        assert!(protected.contains(&selected.hash));
+        assert!(protected.contains(&branch.hash));
+    }
+
+    #[test]
+    fn reference_pruned_before_retention_is_no_longer_protectable() {
+        let mut store = store();
+        let anchor = store.finalized();
+
+        let plan = enforce_retention(
+            &mut store,
+            anchor,
+            anchor,
+            [block::Hash([0x91; 32])],
+            limits(10, 100),
+        )
+        .expect("a reference already pruned by finality is ignored");
+
+        assert_eq!(plan, RetentionPlan::default());
+    }
+
+    #[test]
+    fn exact_v1_node_boundary_refuses_to_evict_the_selected_path() {
+        let mut store = store();
+        let anchor = store.finalized();
+        let mut selected = anchor;
+        for offset in 0..=crate::MAX_NON_FINALIZED_NODES_V1 {
+            let seed = u8::try_from(offset % 251).expect("the reduced test nonce fits in u8");
+            selected = insert(&mut store, selected.hash, seed, []);
+        }
+        assert_eq!(
+            store.node_count() - 1,
+            crate::MAX_NON_FINALIZED_NODES_V1 + 1
+        );
+
+        let plan = enforce_retention(&mut store, selected, anchor, [], EngineLimits::v1())
+            .expect("the exact boundary produces a typed refusal");
+        assert!(plan.admission_refused);
+        assert!(plan.resource_stalled);
+        assert!(store.node(selected.hash).is_some());
+    }
+}

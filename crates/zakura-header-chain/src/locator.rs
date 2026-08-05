@@ -93,3 +93,121 @@ impl HeaderLocator {
         self.0.iter().map(|frontier| frontier.hash).collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        AlarmSet, ChainScore, EngineMode, FrontierSet, HeaderGeneration, StateVersion, SuffixWork,
+        VerifiedGeneration,
+    };
+    use zakura_chain::work::difficulty::U256;
+
+    use super::*;
+
+    fn hash_at(height: block::Height) -> block::Hash {
+        block::Hash(
+            height
+                .0
+                .to_le_bytes()
+                .repeat(8)
+                .try_into()
+                .expect("eight u32 encodings are 32 bytes"),
+        )
+    }
+
+    fn snapshot(tip_height: u32, finalized_height: u32) -> EngineSnapshot {
+        let finalized = Frontier::new(
+            block::Height(finalized_height),
+            hash_at(block::Height(finalized_height)),
+        );
+        let tip = Frontier::new(
+            block::Height(tip_height),
+            hash_at(block::Height(tip_height)),
+        );
+        EngineSnapshot {
+            mode: EngineMode::Integrated,
+            state_version: StateVersion::new(1),
+            header_generation: HeaderGeneration::new(1),
+            verified_generation: VerifiedGeneration::new(1),
+            frontiers: FrontierSet {
+                finalized,
+                header_best: tip,
+                verified_best: finalized,
+            },
+            header_best_score: ChainScore::new(SuffixWork::new(U256::from(tip_height)), tip.hash),
+            oldest_retained_height: finalized.height,
+            alarms: AlarmSet::default(),
+        }
+    }
+
+    #[test]
+    fn selected_path_locators_match_every_offset_and_cap_boundary() {
+        for tip_height in 0..=2_000 {
+            let snapshot = snapshot(tip_height, 0);
+            let locator =
+                HeaderLocator::for_selected_path(&snapshot, |height| Ok(Some(hash_at(height))))
+                    .expect("the fixture selected projection is complete");
+            let expected_heights: Vec<_> = SELECTED_PATH_OFFSETS
+                .into_iter()
+                .filter(|offset| *offset <= tip_height)
+                .map(|offset| block::Height(tip_height - offset))
+                .chain(std::iter::once(block::Height(0)))
+                .fold(Vec::new(), |mut heights, height| {
+                    if !heights.contains(&height) {
+                        heights.push(height);
+                    }
+                    heights
+                });
+            assert_eq!(
+                locator
+                    .entries()
+                    .iter()
+                    .map(|frontier| frontier.height)
+                    .collect::<Vec<_>>(),
+                expected_heights,
+                "tip {tip_height}"
+            );
+            assert!(locator.entries().len() <= MAX_HEADER_LOCATOR_HASHES);
+            assert_eq!(
+                locator.entries().first(),
+                Some(&snapshot.frontiers.header_best)
+            );
+            assert_eq!(
+                locator.entries().last(),
+                Some(&snapshot.frontiers.finalized)
+            );
+        }
+    }
+
+    #[test]
+    fn selected_path_locator_appends_a_non_genesis_finalized_frontier() {
+        let snapshot = snapshot(2_000, 750);
+        let locator =
+            HeaderLocator::for_selected_path(&snapshot, |height| Ok(Some(hash_at(height))))
+                .expect("the fixture selected projection is complete");
+
+        assert_eq!(
+            locator.entries().last(),
+            Some(&snapshot.frontiers.finalized)
+        );
+        assert_eq!(locator.entries().len(), MAX_HEADER_LOCATOR_HASHES);
+        assert_eq!(locator.entries()[11].height, block::Height(1_000));
+    }
+
+    #[test]
+    fn selected_path_locator_fails_closed_on_a_projection_gap() {
+        let snapshot = snapshot(10, 0);
+        assert_eq!(
+            HeaderLocator::for_selected_path(&snapshot, |height| {
+                if height == block::Height(8) {
+                    Ok(None)
+                } else {
+                    Ok(Some(hash_at(height)))
+                }
+            }),
+            Err(StoreError::Incoherent(
+                "selected locator height is absent from the selected projection"
+            ))
+        );
+    }
+}

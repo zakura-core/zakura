@@ -168,3 +168,50 @@ pub enum WorkCoordinateError {
     #[error("work-coordinate suffix subtraction underflow")]
     Underflow,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chain_score_breaks_equal_work_ties_using_raw_hash_bytes() {
+        let work = SuffixWork::from(U256::from(7));
+        let lower = ChainScore::new(
+            work,
+            block::Hash([
+                0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0,
+            ]),
+        );
+        let higher = ChainScore::new(
+            work,
+            block::Hash([
+                1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0,
+            ]),
+        );
+        assert!(
+            higher > lower,
+            "raw byte order, not display order, breaks ties"
+        );
+    }
+
+    #[test]
+    fn work_coordinates_rebase_only_with_a_shared_origin() {
+        let origin = block::Hash([1; 32]);
+        let anchor = WorkCoordinate::new(origin, U256::from(10));
+        let tip = WorkCoordinate::new(origin, U256::from(17));
+        assert_eq!(
+            tip.suffix_after(anchor),
+            Ok(SuffixWork::from(U256::from(7)))
+        );
+        assert_eq!(
+            anchor.suffix_after(tip),
+            Err(WorkCoordinateError::Underflow)
+        );
+        assert!(matches!(
+            tip.suffix_after(WorkCoordinate::new(block::Hash([2; 32]), U256::from(1))),
+            Err(WorkCoordinateError::OriginMismatch { .. })
+        ));
+    }
+}

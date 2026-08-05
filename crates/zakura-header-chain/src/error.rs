@@ -290,3 +290,123 @@ impl StdError for HeaderChainError {
             .map(|source| -> &(dyn StdError + 'static) { source })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zakura_chain::block;
+
+    #[test]
+    fn only_malformed_protocol_and_invalid_header_default_to_header_peer_fault() {
+        let source = SourceId::from_digest([1; 32]);
+        let subject = ErrorSubject::Header(HeaderId::new(block::Hash([2; 32])));
+        let malformed =
+            HeaderChainError::malformed_protocol(subject, RuleId::new("LC-WIRE-01"), source, None);
+        let invalid = HeaderChainError::invalid_header(
+            subject,
+            RuleId::new("LC-VAL-01"),
+            EvidenceId::from_digest([3; 32]),
+            source,
+            None,
+        );
+        let unknown = HeaderChainError::unknown_anchor(subject, None);
+        assert!(malformed.is_automatic_header_peer_fault());
+        assert!(invalid.is_automatic_header_peer_fault());
+        assert!(!unknown.is_automatic_header_peer_fault());
+        assert_eq!(unknown.attribution, Attribution::None);
+    }
+
+    #[test]
+    fn supplier_evidence_attribution_matrix_distinguishes_header_body_and_advertiser() {
+        let header_source = SourceId::from_digest([1; 32]);
+        let body_source = SourceId::from_digest([2; 32]);
+        let advertiser = SourceId::from_digest([3; 32]);
+        let hash = block::Hash([4; 32]);
+        let subject = ErrorSubject::Header(HeaderId::new(hash));
+        let header = HeaderChainError::invalid_header(
+            subject,
+            RuleId::new("LC-VAL-01"),
+            EvidenceId::from_digest([5; 32]),
+            header_source,
+            None,
+        );
+        let mismatch = HeaderChainError::body_payload_mismatch(BodyPayloadMismatch {
+            evidence: EvidenceId::from_digest([6; 32]),
+            requested: hash,
+            delivered: block::Hash([7; 32]),
+            kind: crate::BodyCommitmentKind::HeaderHash,
+            source: body_source,
+        });
+        let invalid_evidence = ConsensusBodyInvalid {
+            hash,
+            evidence: EvidenceId::from_digest([8; 32]),
+            rule: crate::BodyRuleId::new("test.consensus_invalid"),
+            source: body_source,
+        };
+        let invalid = HeaderChainError::consensus_body_invalid(&invalid_evidence);
+        let advertised = HeaderChainError::new(
+            ErrorCategory::ValidLosingFork,
+            subject,
+            None,
+            None,
+            Attribution::None,
+            None,
+        );
+
+        assert_eq!(header.attribution, Attribution::HeaderPeer(header_source));
+        assert!(header.is_automatic_header_peer_fault());
+        for body_error in [&mismatch, &invalid] {
+            assert_eq!(body_error.attribution, Attribution::BodyPeer(body_source));
+            assert!(body_error.is_automatic_body_peer_fault());
+            assert_ne!(
+                body_error.attribution,
+                Attribution::HeaderPeer(header_source)
+            );
+            assert_ne!(body_error.attribution, Attribution::HeaderPeer(advertiser));
+        }
+        assert_eq!(advertised.attribution, Attribution::None);
+        assert!(!advertised.is_automatic_header_peer_fault());
+        assert!(!advertised.is_automatic_body_peer_fault());
+    }
+
+    #[test]
+    fn taxonomy_has_stable_exhaustive_metric_and_attribution_labels() {
+        let categories = [
+            (ErrorCategory::MalformedProtocol, "malformed_protocol"),
+            (ErrorCategory::InvalidHeader, "invalid_header"),
+            (ErrorCategory::ValidLosingFork, "valid_losing_fork"),
+            (ErrorCategory::DeferredHeader, "deferred_header"),
+            (ErrorCategory::BodyPayloadMismatch, "body_payload_mismatch"),
+            (
+                ErrorCategory::ConsensusBodyInvalid,
+                "consensus_body_invalid",
+            ),
+            (ErrorCategory::OperatorIneligible, "operator_ineligible"),
+            (
+                ErrorCategory::StaleTargetOrGeneration,
+                "stale_target_or_generation",
+            ),
+            (
+                ErrorCategory::LocalAnchorOrIncoherence,
+                "local_anchor_or_incoherence",
+            ),
+            (
+                ErrorCategory::LocalResourceOrStorage,
+                "local_resource_or_storage",
+            ),
+        ];
+        for (category, expected) in categories {
+            assert_eq!(category.metrics_label(), expected);
+        }
+
+        let source = SourceId::from_digest([9; 32]);
+        for (attribution, expected) in [
+            (Attribution::None, "none"),
+            (Attribution::HeaderPeer(source), "header_peer"),
+            (Attribution::BodyPeer(source), "body_peer"),
+            (Attribution::AuxPeer(source), "aux_peer"),
+        ] {
+            assert_eq!(attribution.metrics_label(), expected);
+        }
+    }
+}

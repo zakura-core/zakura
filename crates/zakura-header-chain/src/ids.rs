@@ -391,3 +391,53 @@ impl From<BodyWorkOwner> for HeaderSyncWorkOwner {
         Self::BodyRepair(owner)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_counters_fail_closed_at_exhaustion() {
+        assert_eq!(
+            StateVersion::new(8).checked_next(),
+            Ok(StateVersion::new(9))
+        );
+        assert_eq!(
+            HeaderGeneration::new(u64::MAX).checked_next(),
+            Err(CounterExhausted {
+                counter: "header generation"
+            })
+        );
+        assert_eq!(
+            VerifiedGeneration::new(u64::MAX).checked_next(),
+            Err(CounterExhausted {
+                counter: "verified generation"
+            })
+        );
+        assert_eq!(
+            FinalityEpoch::new(u64::MAX).checked_next(),
+            Err(CounterExhausted {
+                counter: "finality epoch"
+            })
+        );
+    }
+
+    #[test]
+    fn domain_authority_binds_transport_identity_without_irrelevant_coordinates() {
+        let authority = BodyWorkAuthority {
+            header: HeaderWorkAuthority {
+                header_generation: HeaderGeneration::new(2),
+                branch: BranchId::new(block::Hash([4; 32]), block::Hash([5; 32])),
+            },
+            verified_generation: VerifiedGeneration::new(3),
+        };
+        let request_id = NonZeroU64::new(7).expect("seven is nonzero");
+        let owner = authority.bind(6, request_id);
+        assert_eq!(owner.authority, authority);
+        assert_eq!(owner.header_generation, authority.header_generation);
+        assert_eq!(owner.verified_generation, authority.verified_generation);
+        assert_eq!(owner.branch, authority.branch);
+        assert_eq!(owner.session_id, 6);
+        assert_eq!(owner.request_id, request_id);
+    }
+}

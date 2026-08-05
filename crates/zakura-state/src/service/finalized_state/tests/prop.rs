@@ -1,6 +1,12 @@
 //! Randomised property tests for the finalized state.
 
-use std::{collections::HashMap, env, error::Error, fs, sync::Arc};
+use std::{
+    collections::HashMap,
+    env,
+    error::Error,
+    fs,
+    sync::{Arc, Mutex},
+};
 
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -31,7 +37,10 @@ use crate::{
         arbitrary::PreparedChain,
         check::anchors::tx_anchors_refer_to_final_treestates,
         non_finalized_state::Chain,
-        read::{sapling_subtrees, sapling_tree},
+        read::{
+            derive_historical_frontiers, historical_tree::HistoricalTreeDerivationError,
+            sapling_subtrees, sapling_tree, HistoricalTreeCache,
+        },
     },
     tests::FakeChainHelper,
     HashOrHeight,
@@ -1696,6 +1705,56 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                     .is_empty(),
                 "an index past the last completed subtree stays an empty list, not an error"
             );
+
+            // On-demand derivation rebuilds the absent band from retained block bodies. `U` is 0
+            // here, so every derivation replays from empty genesis frontiers — the cold path.
+            // Each result is accepted only after reproducing the authenticated root, so agreeing
+            // with the legacy node's own per-height trees is what proves the replay is faithful
+            // rather than merely self-consistent.
+            let cache = Mutex::new(HistoricalTreeCache::default());
+            for height in (seed as u32 + 1)..(last as u32) {
+                let height = Height(height);
+                let derived = derive_historical_frontiers(&fast.db, &cache, height, u64::MAX)
+                    .expect("every absent-band height derives from retained bodies");
+
+                prop_assert_eq!(
+                    derived.sapling.root(),
+                    legacy.db.sapling_tree_by_height(&height).expect("the legacy node stores every tree").root(),
+                    "derived Sapling frontier matches the legacy node at {:?}", height
+                );
+                prop_assert_eq!(
+                    derived.orchard.root(),
+                    legacy.db.orchard_tree_by_height(&height).expect("the legacy node stores every tree").root(),
+                    "derived Orchard frontier matches the legacy node at {:?}", height
+                );
+                prop_assert_eq!(
+                    derived.ironwood.root(),
+                    legacy.db.ironwood_tree_by_height(&height).expect("the legacy node stores every tree").root(),
+                    "derived Ironwood frontier matches the legacy node at {:?}", height
+                );
+            }
+
+            // The replay bound is a serving limit: with the memo primed by the loop above, the
+            // last height is already derived, so it costs nothing. A cold height below every memo
+            // entry still has to replay, and refuses rather than running unbounded.
+            prop_assert!(
+                derive_historical_frontiers(&fast.db, &cache, Height(last as u32 - 1), 0).is_ok(),
+                "a memoized height is served without replaying, whatever the bound"
+            );
+            let cold_cache = Mutex::new(HistoricalTreeCache::default());
+            let cold_height = Height(last as u32 - 1);
+            prop_assert_eq!(
+                derive_historical_frontiers(&fast.db, &cold_cache, cold_height, 1).err(),
+                Some(HistoricalTreeDerivationError::ReplayTooLong {
+                    height: cold_height,
+                    // From empty genesis frontiers, reaching `cold_height` replays every block up
+                    // to and including it.
+                    blocks: u64::from(cold_height.0) + 1,
+                    limit: 1,
+                }),
+                "a cold derivation past the replay bound refuses instead of running unbounded"
+            );
+
 
             // Negative: a peer can supply a wrong root exactly at the handoff height,
             // where there is no buffered checkpoint successor to authenticate it. The

@@ -18,6 +18,7 @@ pub mod address;
 pub mod block;
 pub mod difficulty;
 pub mod find;
+pub mod historical_tree;
 pub mod tree;
 
 #[cfg(test)]
@@ -41,6 +42,9 @@ pub use find::{
     best_tip, block_locator, depth, finalized_state_contains_block_hash, find_chain_hashes,
     find_chain_headers, hash_by_height, height_by_hash, next_median_time_past,
     non_finalized_state_contains_block_hash, tip, tip_height, tip_with_value_balance,
+};
+pub use historical_tree::{
+    derive_historical_frontiers, DerivedFrontiers, HistoricalTreeCache, MAX_MEMOIZED_FRONTIERS,
 };
 pub use tree::{
     ironwood_subtrees, ironwood_tree, orchard_subtrees, orchard_tree, sapling_subtrees,

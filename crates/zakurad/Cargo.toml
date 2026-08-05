@@ -359,11 +359,13 @@ workspace = true
 #
 # `ZakuradCmd` is likewise not a supported downstream library API: it is the
 # clap subcommand enum for the `zakurad` binary, and its variants track the
-# CLI, not a consumer contract. Retiring a subcommand is an operator-visible
-# change recorded in the changelog, and must not require a major version
-# solely because the enum happens to be reachable from the crate root.
+# CLI, not a consumer contract. Adding or retiring a subcommand is an
+# operator-visible change recorded in the changelog, and must not require a
+# major version solely because the enum happens to be reachable from the crate
+# root.
 [package.metadata.cargo-semver-checks.lints]
 feature_missing = "warn"
+enum_variant_added = "warn"
 enum_variant_missing = "warn"
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]

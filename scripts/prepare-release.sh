@@ -799,11 +799,11 @@ if [ -z "$suffix" ]; then
   while IFS=$'\t' read -r manifest_path dependency_key dependency_version; do
     [ -n "$manifest_path" ] || continue
     DEPENDENCY="$dependency_key" NEW="$dependency_version" perl -0777 -pi -e '
-      s{
+      s~
         (\Q$ENV{DEPENDENCY}\E\s*=\s*\{[^}]*?\bversion\s*=\s*")
         [^"]*-[^"]*
         (")
-      }{$1$ENV{NEW}$2}gx
+      ~$1$ENV{NEW}$2~gx
     ' "$manifest_path"
   done < <(
     jq -r '

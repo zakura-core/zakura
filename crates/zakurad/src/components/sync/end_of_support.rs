@@ -28,12 +28,11 @@ pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET
 ///
 /// - Zebra will exit with a panic if the current tip height is bigger than the
 ///   `ESTIMATED_RELEASE_HEIGHT` plus this number of days.
-/// - Currently set to 18 days
+/// - Currently set to 40 days
 ///
-/// Note: v1.0.3 spans the expected Ironwood activation (height 3,428,143,
-/// ~2026-07-28) and halts about eleven days after it (~2026-08-08, height 3,441,136),
-/// forcing migration to the post-Ironwood release.
-pub const EOS_PANIC_AFTER: u32 = 18;
+/// Note: v1.1.0 is estimated to release at height 3,438,427 (~2026-08-05) and
+/// halts 40 days later at height 3,484,507 (~2026-09-15).
+pub const EOS_PANIC_AFTER: u32 = 40;
 
 /// The number of days before the end of support where Zebra will display warnings.
 pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 3;

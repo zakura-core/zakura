@@ -32,8 +32,6 @@ the user immediately before dispatch.
 Testnet:
 
 - `zakura-testnet-1`
-- `zakura-testnet-2`
-- `zakura-testnet-3`
 - `zakura-testnet-eu`
 - `zakura-testnet-as`
 

@@ -7,9 +7,9 @@
   },
   "nodes": [
     {
-      "name": "zakura-testnet-3",
+      "name": "zakura-testnet-1",
       "impl": "zakura",
-      "rpc_url": "http://138.68.229.254:18232"
+      "rpc_url": "http://127.0.0.1:18232"
     },
     {
       "name": "roman-zebra",

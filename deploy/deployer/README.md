@@ -59,12 +59,10 @@ self-hosted runner, expected to be `zakura-testnet-1` with the
 then deploys it to:
 
 - `zakura-testnet-1` — `root@167.99.103.111`
-- `zakura-testnet-2` — `root@167.99.110.145`
-- `zakura-testnet-3` — `root@138.68.229.254`
 - `zakura-testnet-eu` — `root@164.92.209.78`
 - `zakura-testnet-as` — `root@206.189.148.0`
 
-All five nodes are systemd-managed `zakurad.service` nodes.
+All three nodes are systemd-managed `zakurad.service` nodes.
 
 One-time runner bootstrap from an operator machine with SSH access and CI
 credentials in `~/agents-env`:

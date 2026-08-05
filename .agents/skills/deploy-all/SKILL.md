@@ -29,7 +29,7 @@ blank.
 
 Testnet:
 
-1. `zakura-testnet-1`, `zakura-testnet-2`, `zakura-testnet-3`
+1. `zakura-testnet-1`
 2. `zakura-testnet-eu`, `zakura-testnet-as`
 
 Mainnet:
@@ -38,7 +38,7 @@ Mainnet:
 2. `us-east-0`, `europe-central-0`, `asia-south-0`,
    `asia-pacific-0`, `zakura-compat`
 
-These batches cover all 5 testnet and all 10 mainnet nodes. Keep the
+These batches cover all 3 testnet and all 10 mainnet nodes. Keep the
 compatibility node in the second half so ordinary nodes establish the candidate
 version first.
 
@@ -94,7 +94,7 @@ Call the function in this order:
 REF=<full-commit-sha>
 
 deploy_batch zakura-testnet-deploy.yml \
-  zakura-testnet-1 zakura-testnet-2 zakura-testnet-3
+  zakura-testnet-1
 
 # Complete the testnet first-half health gate.
 
@@ -135,7 +135,7 @@ Dashboards:
 ## Completion report
 
 Report the immutable ref, the four batches, run URLs, health verification, any
-retries, and whether all 15 nodes completed successfully.
+retries, and whether all 13 nodes completed successfully.
 
 ## References
 

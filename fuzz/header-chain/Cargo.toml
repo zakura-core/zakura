@@ -1,0 +1,45 @@
+[package]
+name = "zakura-header-chain-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zakura-chain = { path = "../../crates/zakura-chain" }
+zakura-header-chain = { path = "../../crates/zakura-header-chain", features = ["fuzz-impl"] }
+zakura-network = { path = "../../crates/zakura-network", features = ["header-fuzz"] }
+zakura-state = { path = "../../crates/zakura-state", features = ["header-fuzz"] }
+
+[[bin]]
+name = "header_codec"
+path = "fuzz_targets/header_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fork_transitions"
+path = "fuzz_targets/fork_transitions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "header_pursuit"
+path = "fuzz_targets/header_pursuit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recovery_rows"
+path = "fuzz_targets/recovery_rows.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

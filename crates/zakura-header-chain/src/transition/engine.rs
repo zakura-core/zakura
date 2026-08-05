@@ -258,7 +258,7 @@ impl EngineTransition {
         self.projected
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz-impl"))]
     pub(crate) fn into_plan(self) -> TransitionPlan {
         self.plan
     }

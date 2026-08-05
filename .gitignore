@@ -99,6 +99,13 @@ Temporary Items
 debug/
 target/
 
+# Local cargo-fuzz inputs and findings are generated during campaigns.
+/fuzz/header-chain/artifacts/
+/fuzz/header-chain/corpus/
+/fuzz/header-chain/coverage/
+/fuzz/header-chain/*.profdata
+/fuzz/header-chain/*.profraw
+
 # Remove Cargo.lock from gitignore if creating an executable, leave it for libraries
 # More information here https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html
 # Cargo.lock
@@ -171,4 +178,3 @@ perf-artifacts/**/*
 # local VCT fast-sync run artifacts (state cache, config, logs, traces)
 .zakurad-vct-local-cache/
 zakurad-vct-local*
-

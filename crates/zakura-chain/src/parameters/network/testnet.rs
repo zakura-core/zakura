@@ -750,6 +750,10 @@ pub struct ParametersBuilder {
     /// The NSM value balance immediately before NU7, see
     /// [`Parameters::initial_nsm_value_balance`].
     initial_nsm_value_balance: Option<Amount<NonNegative>>,
+    /// The height at which proof-of-work validation begins. Blocks below this height
+    /// skip the Equihash solution and difficulty filter checks. `None` enforces
+    /// proof-of-work from genesis.
+    pow_start_height: Option<Height>,
 }
 
 impl Default for ParametersBuilder {
@@ -795,6 +799,7 @@ impl Default for ParametersBuilder {
             test_nsm_reissuance_height: None,
             // Configured networks derive their seed unless an override is supplied.
             initial_nsm_value_balance: None,
+            pow_start_height: None,
         }
     }
 }
@@ -1057,6 +1062,35 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets the height at which proof-of-work validation begins in the
+    /// [`Parameters`] being built.
+    ///
+    /// Blocks below this height skip the Equihash solution check and the
+    /// difficulty filter. This exists so a private network can be seeded with
+    /// cheap unsolved blocks and still enforce real proof-of-work from the
+    /// seeded tip onwards, which is what lets the chain start at its
+    /// equilibrium difficulty instead of climbing to it.
+    ///
+    /// `None` (the default) enforces proof-of-work from genesis.
+    pub fn with_pow_start_height(
+        mut self,
+        pow_start_height: impl Into<Option<Height>>,
+    ) -> Result<Self, ParametersBuilderError> {
+        let pow_start_height = pow_start_height.into();
+
+        // A start height of 0 is indistinguishable from `None`, and one above
+        // `Height::MAX` would silently disable proof-of-work forever. Both are
+        // more likely to be a configuration mistake than an intent.
+        if let Some(height) = pow_start_height {
+            if height == Height(0) || height > Height::MAX {
+                return Err(ParametersBuilderError::InvalidPowStartHeight);
+            }
+        }
+
+        self.pow_start_height = pow_start_height;
+        Ok(self)
+    }
+
     /// Sets the `disable_pow` flag to be used in the [`Parameters`] being built.
     pub fn with_unshielded_coinbase_spends(
         mut self,
@@ -1205,6 +1239,7 @@ impl ParametersBuilder {
             #[cfg(any(test, feature = "proptest-impl"))]
             test_nsm_reissuance_height,
             initial_nsm_value_balance,
+            pow_start_height,
         } = self;
         let mut parameters = Parameters {
             network_name,
@@ -1227,6 +1262,7 @@ impl ParametersBuilder {
             test_nsm_reissuance_height,
             nsm_reissuance_crossing_height: DerivedHeight::default(),
             initial_nsm_value_balance,
+            pow_start_height,
         };
 
         // ZIP 218 moves the third halving, and ZIP 214 Revision 3 moves the end of the
@@ -1310,6 +1346,7 @@ impl ParametersBuilder {
             #[cfg(any(test, feature = "proptest-impl"))]
                 test_nsm_reissuance_height: _,
             initial_nsm_value_balance: _,
+            pow_start_height,
         } = Self::default();
 
         // Compare the height ranges after NU7 moves the inherited ones, so an explicit copy
@@ -1328,6 +1365,7 @@ impl ParametersBuilder {
             && self.post_blossom_halving_interval == post_blossom_halving_interval
             && self.lockbox_disbursements == lockbox_disbursements
             && self.initial_nsm_value_balance == Some(testnet::INITIAL_NSM_VALUE_BALANCE)
+            && self.pow_start_height == pow_start_height
     }
 }
 
@@ -1421,6 +1459,10 @@ pub struct Parameters {
     nsm_reissuance_crossing_height: DerivedHeight,
     /// The NSM value balance immediately before NU7 activates.
     initial_nsm_value_balance: Option<Amount<NonNegative>>,
+    /// The height at which proof-of-work validation begins. Blocks below this height
+    /// skip the Equihash solution and difficulty filter checks. `None` enforces
+    /// proof-of-work from genesis.
+    pow_start_height: Option<Height>,
 }
 
 /// A height derived from the other [`Parameters`] fields and computed on first use.
@@ -1576,6 +1618,9 @@ impl Parameters {
             // identity check for the same reason the halving interval stays in: it is
             // derived from the defaults above, not chosen.
             initial_nsm_value_balance: _,
+            // Regtest disables proof-of-work outright, so a start height cannot
+            // change how blocks are validated on it.
+            pow_start_height: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 
         self.network_name == network_name
@@ -1638,6 +1683,12 @@ impl Parameters {
     /// Returns the local activation height for the MTP-plus-90-minutes rule.
     pub fn max_block_time_start_height(&self) -> Height {
         self.max_block_time_start_height
+    }
+
+    /// Returns the height at which proof-of-work validation begins for this network,
+    /// or `None` if proof-of-work is enforced from genesis.
+    pub fn pow_start_height(&self) -> Option<Height> {
+        self.pow_start_height
     }
 
     /// Returns true if this network should allow transactions with transparent outputs
@@ -1731,6 +1782,26 @@ impl Network {
         } else {
             false
         }
+    }
+
+    /// Returns the height at which proof-of-work validation begins for this network,
+    /// or `None` if proof-of-work is enforced from genesis. Always `None` on Mainnet.
+    pub fn pow_start_height(&self) -> Option<Height> {
+        if let Self::Testnet(params) = self {
+            params.pow_start_height()
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if the Equihash solution and difficulty filter checks should be
+    /// skipped for a block at `height` on this network.
+    ///
+    /// This is only ever true below a configured [`Network::pow_start_height`], which
+    /// lets a private network be seeded with cheap unsolved blocks while still
+    /// enforcing real proof-of-work on everything mined afterwards.
+    pub fn should_skip_pow_at_height(&self, height: Height) -> bool {
+        self.pow_start_height().is_some_and(|start| height < start)
     }
 
     /// Returns slow start interval for this network

@@ -414,7 +414,10 @@ where
             // > acceptance rules (excluding the check for a valid proof-of-work).
             // <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
             let pow_policy = zakura_header_chain::PowPolicy::for_network(&network)?;
-            if request.is_proposal() || pow_policy.is_authenticated_custom_waiver() {
+            if request.is_proposal()
+                || pow_policy.is_authenticated_custom_waiver()
+                || network.should_skip_pow_at_height(height)
+            {
                 check::difficulty_threshold_is_valid(&block.header, &network, &height, &hash)?;
             } else {
                 // Do the difficulty checks first, to raise the threshold for

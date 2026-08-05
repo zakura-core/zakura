@@ -19,6 +19,7 @@ use zakura_quic::NodeSecretKey;
 use tracing::Span;
 use zakura_chain::{
     amount::Amount,
+    block,
     common::atomic_write,
     parameters::{
         testnet::{
@@ -972,6 +973,14 @@ struct DTestnetParameters {
     funding_streams: Option<Vec<ConfiguredFundingStreams>>,
     pre_blossom_halving_interval: Option<u32>,
     lockbox_disbursements: Option<Vec<ConfiguredLockboxDisbursement>>,
+    /// The height at which proof-of-work validation begins.
+    ///
+    /// Blocks below this height skip the Equihash solution check, the difficulty
+    /// filter, and the contextual difficulty-adjustment check. This exists so a
+    /// private network can be seeded with cheap unsolved blocks and still enforce
+    /// real proof-of-work at its configured `target_difficulty_limit` from the
+    /// seeded tip onwards. If unset, proof-of-work is enforced from genesis.
+    pow_start_height: Option<u32>,
     #[serde(default)]
     checkpoints: ConfiguredCheckpoints,
     /// If `true`, automatically repeats configured funding stream addresses to fill
@@ -1100,6 +1109,7 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
                     .map(Into::into)
                     .collect(),
             ),
+            pow_start_height: params.pow_start_height().map(|height| height.0),
             checkpoints: if params.checkpoints() == testnet::Parameters::default().checkpoints() {
                 ConfiguredCheckpoints::Default(true)
             } else {
@@ -1391,6 +1401,7 @@ where
         funding_streams,
         pre_blossom_halving_interval,
         lockbox_disbursements,
+        pow_start_height,
         checkpoints,
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
@@ -1439,6 +1450,14 @@ where
     if let Some(height) = max_block_time_start_height {
         params_builder = params_builder
             .with_max_block_time_start_height(height.try_into().map_err(de::Error::custom)?);
+    }
+
+    if let Some(pow_start_height) = pow_start_height {
+        params_builder = params_builder
+            .with_pow_start_height(Some(
+                block::Height::try_from(pow_start_height).map_err(de::Error::custom)?,
+            ))
+            .map_err(de::Error::custom)?;
     }
 
     // Retain default Testnet activation heights unless an activation-height map is

@@ -60,6 +60,12 @@ pub enum ParametersBuilderError {
     #[non_exhaustive]
     InvaildDifficultyLimits,
 
+    #[error(
+        "proof-of-work start height must be greater than zero and no greater than Height::MAX"
+    )]
+    #[non_exhaustive]
+    InvalidPowStartHeight,
+
     #[error("halving interval on ParametersBuilder must not be set after setting funding streams")]
     #[non_exhaustive]
     HalvingIntervalAfterFundingStreams,

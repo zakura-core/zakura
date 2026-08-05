@@ -1483,3 +1483,46 @@ fn activation_height_overlay_is_only_for_configured_testnets() {
         );
     }
 }
+#[test]
+fn pow_start_height_is_configurable_from_the_config_file() {
+    let _init_guard = zakura_test::init();
+
+    let config: Config = toml::from_str(
+        r#"
+            network = "Testnet"
+            # A retuned network is not the public Testnet, so it must not keep
+            # the default public peers.
+            initial_testnet_peers = []
+
+            [testnet_parameters]
+            network_name = "SeededPow"
+            checkpoints = true
+            pow_start_height = 89
+        "#,
+    )
+    .expect("a configured proof-of-work start height is accepted");
+
+    assert_eq!(config.network.pow_start_height(), Some(Height(89)));
+    assert!(config.network.should_skip_pow_at_height(Height(88)));
+    assert!(!config.network.should_skip_pow_at_height(Height(89)));
+    assert!(!config.network.should_skip_pow_at_height(Height(90)));
+
+    // Zero is indistinguishable from "unset", so it is a configuration mistake
+    // rather than a way to spell "enforce from genesis".
+    let error = toml::from_str::<Config>(
+        r#"
+            network = "Testnet"
+            initial_testnet_peers = []
+
+            [testnet_parameters]
+            network_name = "ZeroPowStart"
+            checkpoints = true
+            pow_start_height = 0
+        "#,
+    )
+    .expect_err("a zero proof-of-work start height is rejected");
+    assert!(
+        error.to_string().contains("start height"),
+        "unexpected error: {error}"
+    );
+}

@@ -656,7 +656,9 @@ where
 
         let pow_policy = zakura_header_chain::PowPolicy::for_network(&self.network)
             .map_err(VerifyBlockError::from)?;
-        if pow_policy.is_authenticated_custom_waiver() {
+        if pow_policy.is_authenticated_custom_waiver()
+            || self.network.should_skip_pow_at_height(height)
+        {
             crate::block::check::difficulty_threshold_is_valid(
                 &block.header,
                 &self.network,

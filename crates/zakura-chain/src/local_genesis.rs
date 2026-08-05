@@ -39,8 +39,28 @@ pub struct LocalTestnetGenesisOptions {
     pub network_name: String,
     /// The latest network upgrade to activate (all upgrades up to this one are enabled).
     pub latest_network_upgrade: NetworkUpgrade,
-    /// If true, skip Equihash proof-of-work validation.
+    /// If true, generate the seed blocks without solving Equihash, and mark the
+    /// resulting network as proof-of-work disabled unless
+    /// `enforce_pow_after_seeded_tip` says otherwise.
     pub disable_pow: bool,
+    /// Enforce proof-of-work on the generated network from one past the seeded
+    /// tip, while still generating the seed blocks themselves unsolved.
+    ///
+    /// This is what lets a private network start at its equilibrium difficulty:
+    /// seeding stays instant, but the first live-mined block already has to
+    /// satisfy `target_difficulty_limit`, so there is no difficulty warm-up.
+    ///
+    /// Ignored when `disable_pow` is false — the seed blocks are solved in that
+    /// case, so proof-of-work already applies from genesis.
+    pub enforce_pow_after_seeded_tip: bool,
+    /// Big-endian proof-of-work limit for the generated network. Every seed block
+    /// declares this target, and it is also the loosest target the live network
+    /// will accept.
+    ///
+    /// Callers that enforce proof-of-work must pass the value they intend to mine
+    /// against: a chain seeded at one limit and run at another is rejected at the
+    /// seeded tip.
+    pub target_difficulty_limit: [u8; 32],
     /// Target spacing between generated seeded block timestamps, in seconds.
     pub target_spacing_secs: u32,
     /// Optional UNIX timestamp for the final seeded tip block. If unset, the
@@ -57,6 +77,8 @@ impl Default for LocalTestnetGenesisOptions {
             network_name: "KreskoLocalGenesis".to_string(),
             latest_network_upgrade: NetworkUpgrade::Nu6_3,
             disable_pow: true,
+            enforce_pow_after_seeded_tip: false,
+            target_difficulty_limit: LOCAL_TESTNET_TARGET_DIFFICULTY_LIMIT,
             target_spacing_secs: 1,
             seeded_tip_time: None,
             maturity_padding_blocks: 0,
@@ -64,9 +86,13 @@ impl Default for LocalTestnetGenesisOptions {
     }
 }
 
-/// Fixed private-network PoW limit used by both generated seed blocks and the
+/// Default private-network PoW limit used by both generated seed blocks and the
 /// configured custom testnet.
-const LOCAL_TESTNET_TARGET_DIFFICULTY_LIMIT: [u8; 32] = [0x0f; 32];
+///
+/// This is the loosest target the difficulty adjustment can represent with the
+/// default averaging window of 17 (it is exactly `U256::MAX / 17`), so a network
+/// that widens the window has to lower it too.
+pub const LOCAL_TESTNET_TARGET_DIFFICULTY_LIMIT: [u8; 32] = [0x0f; 32];
 
 /// Script hash for the zero-value output that marks the implicit NU6.1 event.
 const LOCAL_TESTNET_LOCKBOX_SCRIPT_HASH: [u8; 20] = [0; 20];
@@ -157,9 +183,8 @@ pub fn generate_local_testnet_with_funded_keys(
         })
         .collect();
 
-    let target_difficulty = ExpandedDifficulty::from(U256::from_big_endian(
-        &LOCAL_TESTNET_TARGET_DIFFICULTY_LIMIT,
-    ));
+    let target_difficulty =
+        ExpandedDifficulty::from(U256::from_big_endian(&options.target_difficulty_limit));
     let compact_difficulty = target_difficulty.to_compact();
 
     let seeded_block_count = num_miners.saturating_add(options.maturity_padding_blocks);
@@ -240,12 +265,23 @@ pub fn generate_local_testnet_with_funded_keys(
     let mut magic_bytes = [0u8; 4];
     rng.fill_bytes(&mut magic_bytes);
 
+    // The seed blocks are unsolved when `disable_pow` is set, so proof-of-work can
+    // only be enforced from one past the seeded tip. `blocks.len()` is that height:
+    // the seeded chain occupies heights `0..blocks.len()`.
+    let (network_disable_pow, pow_start_height) =
+        if options.disable_pow && options.enforce_pow_after_seeded_tip {
+            (false, Some(Height(u32::try_from(blocks.len())?)))
+        } else {
+            (options.disable_pow, None)
+        };
+
     let network = build_network(BuildNetworkOptions {
         network_name: &options.network_name,
         genesis_hash,
         latest_network_upgrade: options.latest_network_upgrade,
         activation_height,
-        disable_pow: options.disable_pow,
+        disable_pow: network_disable_pow,
+        pow_start_height,
         checkpoints: &checkpoints,
         magic_bytes,
         target_difficulty,
@@ -368,6 +404,7 @@ struct BuildNetworkOptions<'a> {
     latest_network_upgrade: NetworkUpgrade,
     activation_height: u32,
     disable_pow: bool,
+    pow_start_height: Option<Height>,
     checkpoints: &'a [(Height, block::Hash)],
     magic_bytes: [u8; 4],
     target_difficulty: ExpandedDifficulty,
@@ -381,6 +418,7 @@ fn build_network(options: BuildNetworkOptions<'_>) -> Result<Network, crate::Box
         latest_network_upgrade,
         activation_height,
         disable_pow,
+        pow_start_height,
         checkpoints,
         magic_bytes,
         target_difficulty,
@@ -398,6 +436,7 @@ fn build_network(options: BuildNetworkOptions<'_>) -> Result<Network, crate::Box
         .with_network_magic(Magic(magic_bytes))?
         .with_target_difficulty_limit(target_difficulty)?
         .with_disable_pow(disable_pow)
+        .with_pow_start_height(pow_start_height)?
         .with_slow_start_interval(Height(0))
         .with_max_block_time_start_height(Height(activation_height))
         .with_activation_heights(activation_heights)?
@@ -728,5 +767,82 @@ mod tests {
         let times = block_times(&generated);
         assert_eq!(times.first().copied(), Some(9_875));
         assert_eq!(times.last().copied(), Some(10_000));
+    }
+
+    #[test]
+    fn seeded_generation_can_enforce_pow_from_the_seeded_tip() {
+        let generated = generate_local_testnet_with_funded_keys(
+            vec!["alice".to_string(), "bob".to_string()],
+            LocalTestnetGenesisOptions {
+                disable_pow: true,
+                enforce_pow_after_seeded_tip: true,
+                maturity_padding_blocks: 3,
+                ..Default::default()
+            },
+        )
+        .expect("local testnet should generate");
+
+        // The seed blocks themselves are never solved, which is what makes
+        // seeding cheap, but the network they configure does enforce
+        // proof-of-work on everything mined after them.
+        assert!(!generated.network.disable_pow());
+        assert_eq!(
+            generated.network.pow_start_height(),
+            Some(Height(generated.blocks.len() as u32)),
+        );
+        assert!(generated
+            .blocks
+            .iter()
+            .all(|block| block.header.solution == crate::work::equihash::Solution::for_proposal()));
+    }
+
+    #[test]
+    fn seeded_generation_leaves_pow_disabled_by_default() {
+        let generated = generate_local_testnet_with_funded_keys(
+            vec!["alice".to_string()],
+            LocalTestnetGenesisOptions::default(),
+        )
+        .expect("local testnet should generate");
+
+        assert!(generated.network.disable_pow());
+        assert_eq!(generated.network.pow_start_height(), None);
+    }
+
+    #[test]
+    fn generated_chain_uses_the_configured_difficulty_limit() {
+        // Roughly the calibrated limit a small private fleet lands on: far
+        // harder than the default private-network limit, and still safely below
+        // the overflow ceiling for the default averaging window.
+        let calibrated = {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x04;
+            bytes[1] = 0xec;
+            bytes[2] = 0x4e;
+            bytes
+        };
+
+        let generated = generate_local_testnet_with_funded_keys(
+            vec!["alice".to_string()],
+            LocalTestnetGenesisOptions {
+                target_difficulty_limit: calibrated,
+                ..Default::default()
+            },
+        )
+        .expect("local testnet should generate");
+
+        let expected = ExpandedDifficulty::from(U256::from_big_endian(&calibrated))
+            .to_compact()
+            .to_expanded()
+            .expect("a compact difficulty round-trips");
+
+        let params = generated
+            .network
+            .parameters()
+            .expect("a generated local testnet is a configured testnet");
+        assert_eq!(params.target_difficulty_limit(), expected);
+        assert!(generated
+            .blocks
+            .iter()
+            .all(|block| block.header.difficulty_threshold == expected.to_compact()));
     }
 }

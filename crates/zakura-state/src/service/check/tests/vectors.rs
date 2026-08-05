@@ -438,3 +438,156 @@ fn daa_context(
         })
         .collect()
 }
+
+/// Generate a seed chain long enough that the difficulty adjustment derives a
+/// real expectation from it, rather than falling back to the limit.
+fn seeded_chain_with_pow_start(
+    target_spacing_secs: u32,
+) -> zakura_chain::local_genesis::GeneratedLocalTestnet {
+    let miner_names: Vec<String> = (0..80).map(|i| format!("miner-{i:03}")).collect();
+    let generated = zakura_chain::local_genesis::generate_local_testnet_with_funded_keys(
+        miner_names,
+        zakura_chain::local_genesis::LocalTestnetGenesisOptions {
+            disable_pow: true,
+            enforce_pow_after_seeded_tip: true,
+            target_spacing_secs,
+            maturity_padding_blocks: 8,
+            ..Default::default()
+        },
+    )
+    .expect("local testnet should generate");
+
+    assert!(
+        generated.blocks.len() > POW_AVERAGING_WINDOW,
+        "the seeded chain must be longer than the {POW_AVERAGING_WINDOW}-block averaging \
+         window, or the adjustment just returns the limit and proves nothing"
+    );
+
+    generated
+}
+
+/// The relevant chain for `blocks[index]`: its ancestors, newest first.
+fn difficulty_context(
+    blocks: &[Block],
+    index: usize,
+) -> impl Iterator<Item = (CompactDifficulty, DateTime<chrono::Utc>)> + '_ {
+    blocks[..index]
+        .iter()
+        .rev()
+        .map(|block| (block.header.difficulty_threshold, block.header.time))
+}
+
+/// Seed blocks below `pow_start_height` are exempt from the contextual
+/// difficulty-adjustment equality check.
+///
+/// They have to be. Seed blocks are generated before any network upgrade
+/// activates, so the adjustment measures their spacing against the fixed
+/// 150-second pre-Blossom target no matter what the network configures. Once the
+/// seeded chain is longer than `PoWAveragingWindow` that produces an expectation
+/// the seed blocks cannot satisfy, and without the exemption the whole chain is
+/// rejected at replay.
+#[test]
+fn seeded_blocks_below_pow_start_height_skip_the_difficulty_adjustment() {
+    let _init_guard = zakura_test::init();
+
+    let generated = seeded_chain_with_pow_start(75);
+    let network = &generated.network;
+    let pow_start_height = network
+        .pow_start_height()
+        .expect("enforce_pow_after_seeded_tip sets a start height");
+
+    for (index, candidate) in generated.blocks.iter().enumerate().skip(1) {
+        let adjustment = difficulty::AdjustedDifficulty::new_from_block(
+            candidate,
+            network,
+            difficulty_context(&generated.blocks, index),
+        );
+
+        difficulty_threshold_and_time_are_valid(candidate.header.difficulty_threshold, adjustment)
+            .unwrap_or_else(|error| {
+                panic!("seeded block at height {index} should be accepted, got {error:?}")
+            });
+    }
+
+    // The exemption really is bounded: the adjustment does disagree with the
+    // seeded blocks, so without it these would be rejected.
+    let disagreements = (1..generated.blocks.len())
+        .filter(|&index| {
+            let expected = difficulty::AdjustedDifficulty::new_from_block(
+                &generated.blocks[index],
+                network,
+                difficulty_context(&generated.blocks, index),
+            )
+            .expected_difficulty_threshold();
+            generated.blocks[index].header.difficulty_threshold != expected
+        })
+        .count();
+    assert!(
+        disagreements > 0,
+        "expected the adjustment to disagree with at least one seeded block, \
+         otherwise this test would pass even without the exemption"
+    );
+
+    assert_eq!(
+        pow_start_height,
+        block::Height(
+            u32::try_from(generated.blocks.len()).expect("seeded chain is far below Height::MAX")
+        ),
+        "proof-of-work must start one past the seeded tip"
+    );
+}
+
+/// The first live-mined block is checked strictly, and the difficulty it has to
+/// declare is the network's limit.
+///
+/// This is the property that removes the difficulty warm-up: the chain starts at
+/// whatever `target_difficulty_limit` was calibrated for the fleet instead of
+/// climbing to it from a trivial seed difficulty.
+#[test]
+fn first_block_at_pow_start_height_expects_the_configured_limit() {
+    let _init_guard = zakura_test::init();
+
+    let generated = seeded_chain_with_pow_start(75);
+    let network = &generated.network;
+    let pow_start_height = network
+        .pow_start_height()
+        .expect("enforce_pow_after_seeded_tip sets a start height");
+
+    assert!(
+        !network.should_skip_pow_at_height(pow_start_height),
+        "proof-of-work must be enforced at the start height itself"
+    );
+
+    let seeded_tip = generated
+        .blocks
+        .last()
+        .expect("the generated chain is not empty");
+    let candidate_time = seeded_tip.header.time
+        + zakura_chain::parameters::NetworkUpgrade::target_spacing_for_height(network, pow_start_height);
+
+    let expected = difficulty::AdjustedDifficulty::new_from_header_time(
+        candidate_time,
+        block::Height(pow_start_height.0 - 1),
+        network,
+        difficulty_context(&generated.blocks, generated.blocks.len()),
+    )
+    .expected_difficulty_threshold();
+
+    let expected_target: U256 = expected
+        .to_expanded()
+        .expect("an expected difficulty is always representable")
+        .into();
+    let limit: U256 = network.target_difficulty_limit().into();
+
+    // The expectation is the limit, give or take the truncation in
+    // `MeanTarget / AveragingWindowTimespan * DampedTimespan`. What matters is
+    // that the first live-mined block already has to do the full configured work
+    // rather than climbing to it from a trivially easy seed difficulty, so this
+    // pins the target to within a tenth of a percent of the limit.
+    assert!(
+        expected_target <= limit && expected_target >= limit - limit / U256::from(1_000u64),
+        "the first live-mined block should be mined at the configured limit, so the \
+         chain starts at its equilibrium difficulty: expected {expected_target:x}, \
+         limit {limit:x}"
+    );
+}

@@ -19,7 +19,7 @@ use crate::service::{
     read::{
         historical_tree::{
             derive_historical_frontiers_measured, replay_with_subtrees, verify_against_index,
-            HistoricalTreeDerivationError, ShieldedPool,
+            CompletedSubtree, HistoricalTreeDerivationError, ShieldedPool,
         },
         DerivedFrontiers, HistoricalTreeCache,
     },
@@ -184,13 +184,13 @@ pub fn measure_derivations(
     Ok(samples)
 }
 
-/// The outcome of checking replay-derived subtree roots against the ones the database stored.
+/// The outcome of checking replay-derived subtrees against the ones the database stored.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SubtreeVerification {
-    /// Subtrees that completed during the replay and matched the stored root.
+    /// Subtrees that completed during the replay and matched the stored root and completion height.
     pub matched: usize,
 
-    /// Subtrees that completed during the replay but whose stored root differs.
+    /// Subtrees that completed during the replay but whose stored root or completion height differs.
     ///
     /// Any entry here falsifies the claim that replay reproduces subtree roots, which is what the
     /// generated subtree artifact rests on.
@@ -204,7 +204,7 @@ pub struct SubtreeVerification {
 }
 
 /// Replays `(from, to]`, authenticates the final frontiers at `to`, and checks every subtree that
-/// completes against the stored subtree rows.
+/// completes against the root and completion height in the stored subtree rows.
 ///
 /// This exists because subtree roots produced by replay are otherwise unvalidated: they are
 /// interior nodes, so the per-height root check does not test them directly. Above a fast-synced
@@ -246,15 +246,15 @@ pub fn verify_subtrees_against_stored(
             ShieldedPool::Sapling => db
                 .sapling_subtree_list_by_index_range(completed.index..=completed.index)
                 .get(&completed.index)
-                .map(|data| data.root.to_bytes()),
+                .map(|data| (data.root.to_bytes(), data.end_height)),
             ShieldedPool::Orchard => db
                 .orchard_subtree_list_by_index_range(completed.index..=completed.index)
                 .get(&completed.index)
-                .map(|data| data.root.to_repr()),
+                .map(|data| (data.root.to_repr(), data.end_height)),
             ShieldedPool::Ironwood => db
                 .ironwood_subtree_list_by_index_range(completed.index..=completed.index)
                 .get(&completed.index)
-                .map(|data| data.root.to_repr()),
+                .map(|data| (data.root.to_repr(), data.end_height)),
         };
 
         let pool_name = match pool {
@@ -264,13 +264,23 @@ pub fn verify_subtrees_against_stored(
         };
 
         match stored {
-            Some(root) if root == completed.root => outcome.matched += 1,
+            Some((root, end_height)) if stored_subtree_matches(root, end_height, &completed) => {
+                outcome.matched += 1
+            }
             Some(_) => outcome.mismatched.push((completed.index, pool_name)),
             None => outcome.unstored += 1,
         }
     }
 
     Ok(outcome)
+}
+
+fn stored_subtree_matches(
+    stored_root: [u8; 32],
+    stored_end_height: Height,
+    completed: &CompletedSubtree,
+) -> bool {
+    stored_root == completed.root && stored_end_height == completed.end_height
 }
 
 /// Returns the per-pool note commitment roots derived at each of `heights`, hex-encoded in the
@@ -346,4 +356,34 @@ pub fn replay_inputs(db: &ZakuraDb, from: Height, to: Height) -> ReplayInputs {
     }
 
     inputs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_subtree_match_requires_root_and_end_height() {
+        let completed = CompletedSubtree {
+            index: NoteCommitmentSubtreeIndex(3),
+            end_height: Height(100),
+            root: [7; 32],
+        };
+
+        assert!(stored_subtree_matches(
+            completed.root,
+            completed.end_height,
+            &completed
+        ));
+        assert!(!stored_subtree_matches(
+            completed.root,
+            Height(101),
+            &completed
+        ));
+        assert!(!stored_subtree_matches(
+            [8; 32],
+            completed.end_height,
+            &completed
+        ));
+    }
 }

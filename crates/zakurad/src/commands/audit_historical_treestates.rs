@@ -319,7 +319,7 @@ fn validate_subtree_verification(outcome: &SubtreeVerification) -> Result<()> {
         Ok(())
     } else {
         Err(eyre!(
-            "replay could not be verified against stored subtree roots: {} missing and {} \
+            "replay could not be verified against stored subtree rows: {} missing and {} \
              mismatched; generated subtree artifacts cannot be trusted",
             outcome.unstored,
             outcome.mismatched.len(),

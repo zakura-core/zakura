@@ -848,7 +848,13 @@ jobs:
           docker buildx imagetools inspect "zakuracore/zakura:zcashd-compat-${image_version}" \
             --format '{{json .Manifest}}' \
             | jq -e '
-                [ .manifests[].platform | "\(.os)/\(.architecture)" ] as $platforms
+                # Buildx provenance attestations use unknown/unknown because they
+                # describe the build rather than a runnable image platform.
+                [
+                  .manifests[].platform
+                  | select(.os != "unknown" and .architecture != "unknown")
+                  | "\(.os)/\(.architecture)"
+                ] as $platforms
                 | $platforms == ["linux/amd64"]
               ' >/dev/null
 

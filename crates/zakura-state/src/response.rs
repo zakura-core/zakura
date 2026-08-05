@@ -367,6 +367,49 @@ impl PartialEq for NonFinalizedBlocksListener {
 
 impl Eq for NonFinalizedBlocksListener {}
 
+/// Everything a client needs to rebuild the note commitment treestate at one block for itself,
+/// gathered in a single state read so the anchor and the target roots can never straddle a reorg.
+///
+/// The target roots are the authenticated ones this node holds in `commitment_roots_by_height`;
+/// the anchor is a frontier this node has already checked against them. A client that replays
+/// canonical blocks from the anchor and reproduces all three target roots has the treestate, and
+/// has verified it rather than trusted it — which is what makes serving this safe on a node that
+/// cannot serve `z_gettreestate` for the height at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreestateReconstruction {
+    /// The canonical height the material is for.
+    pub target_height: block::Height,
+
+    /// The canonical hash at `target_height`, so the client can pin its replay to this chain.
+    pub target_hash: block::Hash,
+
+    /// The target block's header time, carried so the client can build the same `TreeState` the
+    /// exact path would have returned.
+    pub target_time: u32,
+
+    /// The authenticated per-pool roots the client's replay must reproduce.
+    pub target_roots: zakura_chain::parallel::commitment_aux::BlockCommitmentRoots,
+
+    /// The highest verified frontier at or below the target, or `None` to replay from genesis.
+    pub anchor: Option<TreestateAnchor>,
+
+    /// The first height the client has to replay.
+    pub replay_from: block::Height,
+}
+
+/// A verified frontier the client replays forward from, bound to its canonical block hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreestateAnchor {
+    /// The height the frontiers are the state at the end of.
+    pub height: block::Height,
+
+    /// The canonical hash at `height`.
+    pub hash: block::Hash,
+
+    /// The frontiers, already root-checked by this node.
+    pub frontiers: Arc<crate::service::read::DerivedFrontiers>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a read-only
 /// [`ReadStateService`](crate::service::ReadStateService)'s [`ReadRequest`].
@@ -505,6 +548,12 @@ pub enum ReadResponse {
 
     /// Response to [`ReadRequest::IronwoodTree`] with the specified Ironwood note commitment tree.
     IronwoodTree(Option<Arc<ironwood::tree::NoteCommitmentTree>>),
+
+    /// Response to [`ReadRequest::TreestateReconstruction`] with the material a client needs to
+    /// rebuild the treestate at the requested block itself.
+    ///
+    /// `None` when the requested block is not in the best chain.
+    TreestateReconstruction(Option<Box<TreestateReconstruction>>),
 
     /// Response to [`ReadRequest::SaplingSubtrees`] with the specified Sapling note commitment
     /// subtrees.
@@ -664,6 +713,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::SaplingTree(_)
             | ReadResponse::OrchardTree(_)
             | ReadResponse::IronwoodTree(_)
+            | ReadResponse::TreestateReconstruction(_)
             | ReadResponse::SaplingSubtrees(_)
             | ReadResponse::OrchardSubtrees(_)
             | ReadResponse::IronwoodSubtrees(_)

@@ -162,6 +162,92 @@ impl Default for GetTreestateResponse {
     }
 }
 
+/// Response to a `z_gettreestateanchor` RPC request.
+///
+/// A Zakura-specific companion to `z_gettreestate`, for the band where a fast-synced node has no
+/// stored per-height tree. Instead of the treestate itself it returns what a client needs to
+/// rebuild one: the authenticated roots at the target, and the highest frontier at or below it
+/// that this node has already checked against those roots.
+///
+/// The client replays canonical blocks from the anchor and accepts its result only if all three
+/// target roots match. That check is the whole trust story — a frontier that reproduces an
+/// authenticated root *is* the frontier — so this hands out no authority the node did not already
+/// have over the client's view of the chain.
+///
+/// `z_gettreestate`'s request and response are untouched. A client tries it first and only falls
+/// back here when it reports the historical tree unavailable.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct GetTreestateAnchorResponse {
+    /// The canonical target block and the roots the client's replay must reproduce.
+    target: TreestateTarget,
+
+    /// The verified frontier to replay forward from, or `null` to replay from genesis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    anchor: Option<TreestateAnchorFrontiers>,
+
+    /// The first height the client has to replay.
+    #[serde(rename = "replayFrom")]
+    #[getter(copy)]
+    replay_from: Height,
+}
+
+/// The target block of a `z_gettreestateanchor` response: what the client is reconstructing, and
+/// the authenticated roots that prove it got it right.
+///
+/// The per-pool fields carry `finalRoot` only — the `finalState` is exactly what the client is
+/// asking the node to help it derive — and use the same byte order and encoding as
+/// `z_gettreestate`, so the two responses are directly comparable.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct TreestateTarget {
+    /// The canonical block hash at `height`, hex-encoded.
+    #[serde(with = "hex")]
+    #[getter(copy)]
+    hash: Hash,
+
+    /// The block height, numeric.
+    #[getter(copy)]
+    height: Height,
+
+    /// Unix time when the block was mined, so the client can build the same treestate the exact
+    /// path would have returned.
+    time: u32,
+
+    /// The authenticated Sapling root at this block.
+    sapling: Treestate,
+
+    /// The authenticated Orchard root at this block.
+    orchard: Treestate,
+
+    /// The authenticated Ironwood root at this block.
+    ironwood: Treestate,
+}
+
+/// The anchor of a `z_gettreestateanchor` response: a frontier this node has already verified,
+/// bound to the canonical block it is the state at the end of.
+///
+/// Both `finalRoot` and `finalState` are present for each pool, in `z_gettreestate`'s encoding, so
+/// a client can load the frontier with the same parser it already uses.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct TreestateAnchorFrontiers {
+    /// The canonical block hash at `height`, hex-encoded.
+    #[serde(with = "hex")]
+    #[getter(copy)]
+    hash: Hash,
+
+    /// The height the frontiers are the state at the end of, numeric.
+    #[getter(copy)]
+    height: Height,
+
+    /// The Sapling frontier and its root.
+    sapling: Treestate,
+
+    /// The Orchard frontier and its root.
+    orchard: Treestate,
+
+    /// The Ironwood frontier and its root.
+    ironwood: Treestate,
+}
+
 /// A treestate that is included in the [`z_gettreestate`][1] RPC response.
 ///
 /// [1]: https://zcash.github.io/rpc/z_gettreestate.html

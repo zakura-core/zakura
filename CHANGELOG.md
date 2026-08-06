@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-08-06
+
+### Fixed
+
+- Chain synchronization now downloads a peer's only unknown block hash from a short
+  `FindBlocks` response, allowing nodes near the chain tip to continue advancing
+  ([#576](https://github.com/zakura-core/zakura/pull/576)).
+
 ## [1.1.0] - 2026-08-05
 
 ### Added

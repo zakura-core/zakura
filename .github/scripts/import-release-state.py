@@ -58,7 +58,7 @@ def _checkpoint_height(checkpoints: bytes, label: str) -> int:
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        json.dumps(value, indent=2) + "\n",
         encoding="utf-8",
     )
     temporary.replace(path)
@@ -68,6 +68,8 @@ def import_bundle(
     repo_root: Path,
     bundle: Path,
     resolution_path: Path,
+    *,
+    floor_eos: bool = True,
 ) -> dict[str, Any]:
     """Import a newer bundle while requiring an append-only checkpoint history."""
 
@@ -75,7 +77,6 @@ def import_bundle(
     checkpoint_path = repo_root / CHECKPOINTS
     frontier_path = repo_root / FRONTIER
     provenance_path = repo_root / PROVENANCE
-    eos_path = repo_root / EOS_FILE
 
     try:
         committed_checkpoints = checkpoint_path.read_bytes()
@@ -122,24 +123,26 @@ def import_bundle(
         },
     )
 
-    try:
-        eos_text = eos_path.read_text(encoding="utf-8")
-    except OSError as error:
-        raise BundleImportError(f"cannot read {EOS_FILE}: {error}") from error
-    match = EOS_PATTERN.search(eos_text)
-    if match is None:
-        raise BundleImportError(f"cannot find ESTIMATED_RELEASE_HEIGHT in {EOS_FILE}")
-    current_eos = int(match.group(2).replace("_", ""))
-    eos_floor = bundle_height + 3456
-    if current_eos < eos_floor:
-        formatted = f"{eos_floor:_}"
-        eos_path.write_text(
-            EOS_PATTERN.sub(rf"\g<1>{formatted}", eos_text, count=1),
-            encoding="utf-8",
-        )
-        print(f"floored ESTIMATED_RELEASE_HEIGHT at {formatted}")
-    else:
-        print(f"ESTIMATED_RELEASE_HEIGHT {current_eos} already at or above the floor")
+    if floor_eos:
+        eos_path = repo_root / EOS_FILE
+        try:
+            eos_text = eos_path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise BundleImportError(f"cannot read {EOS_FILE}: {error}") from error
+        match = EOS_PATTERN.search(eos_text)
+        if match is None:
+            raise BundleImportError(f"cannot find ESTIMATED_RELEASE_HEIGHT in {EOS_FILE}")
+        current_eos = int(match.group(2).replace("_", ""))
+        eos_floor = bundle_height + 3456
+        if current_eos < eos_floor:
+            formatted = f"{eos_floor:_}"
+            eos_path.write_text(
+                EOS_PATTERN.sub(rf"\g<1>{formatted}", eos_text, count=1),
+                encoding="utf-8",
+            )
+            print(f"floored ESTIMATED_RELEASE_HEIGHT at {formatted}")
+        else:
+            print(f"ESTIMATED_RELEASE_HEIGHT {current_eos} already at or above the floor")
 
     return result
 
@@ -194,6 +197,28 @@ def _self_test() -> int:
             with self.assertRaisesRegex(BundleImportError, "byte-for-byte"):
                 import_bundle(self.root, self.bundle, self.resolution)
 
+        def test_resolution_height_mismatch_is_rejected(self) -> None:
+            resolution = json.loads(self.resolution.read_text(encoding="utf-8"))
+            resolution["height"] = 3
+            self.resolution.write_text(json.dumps(resolution), encoding="utf-8")
+            (self.bundle / CHECKPOINTS.name).write_text(
+                "1 aa\n2 bb\n4 dd\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(BundleImportError, "does not match"):
+                import_bundle(self.root, self.bundle, self.resolution)
+
+        def test_import_can_leave_eos_for_release_preparation(self) -> None:
+            before = (self.root / EOS_FILE).read_text(encoding="utf-8")
+            result = import_bundle(
+                self.root,
+                self.bundle,
+                self.resolution,
+                floor_eos=False,
+            )
+            self.assertTrue(result["has_changes"])
+            self.assertEqual((self.root / EOS_FILE).read_text(encoding="utf-8"), before)
+
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTest)
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
@@ -205,13 +230,23 @@ def main() -> int:
     parser.add_argument("--bundle", type=Path)
     parser.add_argument("--resolution", type=Path)
     parser.add_argument("--result-out", type=Path)
+    parser.add_argument(
+        "--no-eos-floor",
+        action="store_true",
+        help="leave ESTIMATED_RELEASE_HEIGHT unchanged",
+    )
     args = parser.parse_args()
     if args.self_test:
         return _self_test()
     if not (args.bundle and args.resolution and args.result_out):
         parser.error("--bundle, --resolution, and --result-out are required")
     try:
-        result = import_bundle(args.repo_root, args.bundle, args.resolution)
+        result = import_bundle(
+            args.repo_root,
+            args.bundle,
+            args.resolution,
+            floor_eos=not args.no_eos_floor,
+        )
         _write_json(args.result_out, result)
     except BundleImportError as error:
         print(f"release-state import failed: {error}", file=sys.stderr)

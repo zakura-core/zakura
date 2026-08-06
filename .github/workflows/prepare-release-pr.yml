@@ -151,7 +151,8 @@ jobs:
           python3 .github/scripts/import-release-state.py \
             --bundle "$RUNNER_TEMP/release-state-bundle" \
             --resolution "$RUNNER_TEMP/release-state-resolution.json" \
-            --result-out "$RUNNER_TEMP/release-state-import.json"
+            --result-out "$RUNNER_TEMP/release-state-import.json" \
+            --no-eos-floor
           jq -r '
             "has_changes=\(.has_changes)",
             "committed_height=\(.committed_height)",

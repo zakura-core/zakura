@@ -843,15 +843,21 @@ The publisher (`deploy/release-state/`) uploads each export to R2 as an immutabl
 file's size and SHA-256 — then atomically replaces the mutable `release-state/latest.json`
 pointer (height, hash, `meta_url`, `meta_sha256`), keeping the newest few bundles.
 
-The `update-release-state.yml` workflow (manual dispatch plus a weekly cron) resolves the
-pointer once over a pinned HTTPS host with no redirects, bounded reads, digest verification
-at every hop, and a maximum bundle age. It exits green without changes when the bundle does
-not advance the committed list. Otherwise it verifies the committed `main-checkpoints.txt` is
-a byte-identical prefix of the bundle's list, replaces the checkpoint file and frontier,
+The `update-release-state.yml` workflow (manual dispatch plus a weekly cron) and
+`prepare-release-pr.yml` both resolve the pointer once over a pinned HTTPS host with no
+redirects, bounded reads, digest verification at every hop, and a maximum bundle age. They
+exit green without release-state changes when the bundle does not advance the committed
+list. Otherwise their shared importer verifies the committed `main-checkpoints.txt` is a
+byte-identical prefix of the bundle's list, replaces the checkpoint file and frontier, and
 writes `vct/mainnet-frontier.json` provenance (source `release-state-bundle`, heights,
-digests, bundle binding), floors `ESTIMATED_RELEASE_HEIGHT`, validates everything —
-including `cargo test -p zakura-state --lib -- frontier` — restricts the diff to exactly
-those four files, and opens a signed **draft PR** for human review. Checkpoints are
+digests, bundle binding).
+
+The standalone update workflow also floors `ESTIMATED_RELEASE_HEIGHT`, validates everything
+— including `cargo test -p zakura-state --lib -- frontier` — restricts the diff to exactly
+those four files, and opens a signed **draft PR** for human review. During release
+preparation, the importer leaves that constant unchanged so `prepare-release.sh` remains the
+sole owner of its projected value and summary. The release workflow re-proves the imported
+checkpoint/frontier pairing and includes the import in its draft release PR. Checkpoints are
 consensus-critical: the reviewed, committed files are the trust root, and the pipeline's
 digests only prove faithful transport from our own publisher.
 

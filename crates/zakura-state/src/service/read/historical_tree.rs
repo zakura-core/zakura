@@ -240,9 +240,9 @@ pub struct Derivation {
 
     /// How many blocks were replayed to produce them.
     ///
-    /// Zero when the height was already memoized. Callers measuring cost must read this rather
-    /// than infer it from the height, because the anchor may have come from the memo or from a
-    /// published grid rather than from genesis.
+    /// Zero when the requested height was already available as an anchor. Callers measuring cost
+    /// must read this rather than infer it from the height, because the anchor may have come from
+    /// the memo or from a published grid rather than from genesis.
     pub replayed_blocks: u64,
 }
 
@@ -260,6 +260,12 @@ pub fn derive_historical_frontiers_measured(
     if let Some((anchor_height, frontiers)) = &anchor {
         match anchor_height.cmp(&height) {
             std::cmp::Ordering::Equal => {
+                // Memoized entries have already passed this check, but a database fallback has
+                // not. Keep the check here so a zero-replay result follows the same acceptance
+                // rule as every replayed result.
+                verify_against_index(db, height, frontiers)?;
+
+                lock(cache).insert(height, frontiers.clone());
                 return Ok(Derivation {
                     frontiers: frontiers.clone(),
                     replayed_blocks: 0,
@@ -330,6 +336,17 @@ fn anchor_for(
     };
 
     let anchor = Height(upgrade.0 - 1);
+    // Rollback can move the tip below the write-once upgrade marker. In that case a backwards tree
+    // lookup would return a retained row below the rollback target and mislabel it as `anchor`.
+    if db
+        .finalized_tip_height()
+        .is_none_or(|tip_height| anchor > tip_height)
+    {
+        return Err(HistoricalTreeDerivationError::MissingAnchor { height, anchor });
+    }
+
+    // These reads intentionally search backwards because unchanged trees are deduplicated. The tip
+    // check above establishes that the chain still reaches `anchor`, so such a row is its state.
     let (Some(sapling), Some(orchard), Some(ironwood)) = (
         db.latest_stored_sapling_tree(&anchor),
         db.latest_stored_orchard_tree(&anchor),

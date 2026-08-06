@@ -2681,11 +2681,50 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                 }),
                 "a database fallback anchor above the target is refused without underflowing"
             );
+            prop_assert_eq!(
+                derive_historical_frontiers(
+                    &legacy.db,
+                    &Mutex::new(HistoricalTreeCache::default()),
+                    fallback_anchor,
+                    u64::MAX,
+                )
+                .err(),
+                Some(HistoricalTreeDerivationError::MissingAuthenticatedRoot {
+                    height: fallback_anchor,
+                }),
+                "a zero-replay database fallback is not served without an authenticated root"
+            );
             let stitched = serve_block_roots(&legacy.db, serve_range);
             prop_assert_eq!(
                 stitched,
                 all_trees_reference,
                 "serve_block_roots stitches the trees below U with the index at/above U into one gap-free run"
+            );
+
+            // Rollback does not move the write-once upgrade marker. Model that stale metadata by
+            // moving it above the current tip: a backwards lookup must not relabel the tip tree as
+            // the marker's `U - 1` fallback anchor.
+            let stale_upgrade = Height(last_height.0 + 2);
+            let stale_anchor = Height(stale_upgrade.0 - 1);
+            let mut batch = DiskWriteBatch::new();
+            batch.update_vct_upgrade_marker(&legacy.db, stale_upgrade);
+            legacy
+                .db
+                .write_batch(batch)
+                .expect("simulating a stale post-rollback upgrade marker succeeds");
+            prop_assert_eq!(
+                derive_historical_frontiers(
+                    &legacy.db,
+                    &Mutex::new(HistoricalTreeCache::default()),
+                    stale_anchor,
+                    u64::MAX,
+                )
+                .err(),
+                Some(HistoricalTreeDerivationError::MissingAnchor {
+                    height: stale_anchor,
+                    anchor: stale_anchor,
+                }),
+                "a stale upgrade marker cannot relabel a retained tree above the finalized tip"
             );
     });
 

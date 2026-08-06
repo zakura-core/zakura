@@ -23,10 +23,8 @@ use crate::zakura::{
 const HEADER_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_HEADER_SYNC,
     version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
-    // Advisory until the transport wires Stream::frame_cap end-to-end; the
-    // authoritative inbound cap is app_frame_cap_for_stream_kind. The cast is
-    // safe because both terms are small protocol constants checked against the
-    // local message cap in header_sync::wire.
+    // The cast is safe because both terms are small protocol constants checked
+    // against the local message cap in header_sync::wire.
     frame_cap: (MAX_HS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32,
     capability: ZAKURA_CAP_HEADER_SYNC,
     mode: StreamMode::Ordered,

@@ -125,9 +125,9 @@ pub enum HistoricalTreeDerivationError {
         missing: Height,
     },
 
-    /// The frontier the replay starts from is missing, so there is nothing to anchor on.
+    /// A usable frontier to start the replay from is missing, so there is nothing to anchor on.
     #[error(
-        "cannot derive the note commitment tree at {height:?}: no anchor frontier at {anchor:?}"
+        "cannot derive the note commitment tree at {height:?}: no usable anchor frontier at {anchor:?}"
     )]
     MissingAnchor {
         /// The requested height.
@@ -258,18 +258,32 @@ pub fn derive_historical_frontiers_measured(
     let anchor = anchor_for(db, cache, height)?;
 
     if let Some((anchor_height, frontiers)) = &anchor {
-        if *anchor_height == height {
-            return Ok(Derivation {
-                frontiers: frontiers.clone(),
-                replayed_blocks: 0,
-            });
+        match anchor_height.cmp(&height) {
+            std::cmp::Ordering::Equal => {
+                return Ok(Derivation {
+                    frontiers: frontiers.clone(),
+                    replayed_blocks: 0,
+                });
+            }
+            std::cmp::Ordering::Greater => {
+                return Err(HistoricalTreeDerivationError::MissingAnchor {
+                    height,
+                    anchor: *anchor_height,
+                });
+            }
+            std::cmp::Ordering::Less => {}
         }
     }
 
     // The anchor is the state at the *end* of its height, so replay starts at the next block.
     // With no anchor the replay starts at genesis.
     let replay_from = anchor.as_ref().map_or(0, |(anchor, _)| anchor.0 + 1);
-    let blocks = u64::from(height.0 - replay_from) + 1;
+    let blocks = u64::from(
+        height
+            .0
+            .checked_sub(replay_from)
+            .expect("anchors above the requested height are rejected"),
+    ) + 1;
     if blocks > max_replay_blocks {
         return Err(HistoricalTreeDerivationError::ReplayTooLong {
             height,

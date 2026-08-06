@@ -2665,6 +2665,22 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                     .is_empty(),
                 "the serving index is dropped below the upgrade height"
             );
+            let below_upgrade = Height(upgrade.0 - 2);
+            let fallback_anchor = Height(upgrade.0 - 1);
+            prop_assert_eq!(
+                derive_historical_frontiers(
+                    &legacy.db,
+                    &Mutex::new(HistoricalTreeCache::default()),
+                    below_upgrade,
+                    u64::MAX,
+                )
+                .err(),
+                Some(HistoricalTreeDerivationError::MissingAnchor {
+                    height: below_upgrade,
+                    anchor: fallback_anchor,
+                }),
+                "a database fallback anchor above the target is refused without underflowing"
+            );
             let stitched = serve_block_roots(&legacy.db, serve_range);
             prop_assert_eq!(
                 stitched,

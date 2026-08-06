@@ -196,6 +196,7 @@ impl AuditHistoricalTreestatesCmd {
             let tip = inventory
                 .finalized_tip
                 .ok_or_else(|| eyre!("this database has no finalized tip"))?;
+            validate_subtree_range(last_checkpoint, tip)?;
 
             println!();
             println!(
@@ -404,6 +405,20 @@ fn validated_walk_range(
     Ok((from, to))
 }
 
+/// Rejects an empty or reversed subtree replay range before reporting that verification started.
+fn validate_subtree_range(last_checkpoint: Height, finalized_tip: Height) -> Result<()> {
+    if finalized_tip <= last_checkpoint {
+        return Err(eyre!(
+            "cannot verify stored subtrees: finalized tip {} must be above last checkpoint {}; \
+             fast sync may not have reached the stored subtree band yet",
+            finalized_tip.0,
+            last_checkpoint.0,
+        ));
+    }
+
+    Ok(())
+}
+
 /// Returns the number of heights sampled in `[from, to]`, including both endpoints.
 fn sample_count(from: Height, to: Height, step: u32) -> u64 {
     let span = u64::from(to.0 - from.0);
@@ -422,18 +437,23 @@ fn sampled_heights(from: Height, to: Height, step: u32) -> impl Iterator<Item = 
         .chain(needs_endpoint.then_some(to))
 }
 
-/// Rejects incomplete as well as contradictory subtree ground truth in either direction.
+/// Requires at least one comparison and rejects incomplete or contradictory ground truth.
 ///
 /// Every replay completion in the audited range is above the handoff, where the database is
 /// expected to store subtree rows, and every stored row in that range must correspond to a replay
 /// completion. Missing, mismatched, and stored-only rows all prevent verification.
 fn validate_subtree_verification(outcome: &SubtreeVerification) -> Result<()> {
-    if outcome.unstored == 0 && outcome.mismatched.is_empty() && outcome.stored_only.is_empty() {
+    if outcome.matched > 0
+        && outcome.unstored == 0
+        && outcome.mismatched.is_empty()
+        && outcome.stored_only.is_empty()
+    {
         Ok(())
     } else {
         Err(eyre!(
-            "replay could not be verified against stored subtree rows: {} missing, {} mismatched, \
-             and {} stored-only; generated subtree artifacts cannot be trusted",
+            "replay could not be verified against stored subtree rows: {} matched, {} missing, {} \
+             mismatched, and {} stored-only; at least one match with no discrepancies is required",
+            outcome.matched,
             outcome.unstored,
             outcome.mismatched.len(),
             outcome.stored_only.len(),
@@ -589,7 +609,8 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        sample_count, sampled_heights, validate_subtree_verification, validated_walk_range,
+        sample_count, sampled_heights, validate_subtree_range, validate_subtree_verification,
+        validated_walk_range,
     };
     use zakura_chain::{block::Height, subtree::NoteCommitmentSubtreeIndex};
     use zakura_state::SubtreeVerification;
@@ -632,10 +653,27 @@ mod tests {
     }
 
     #[test]
-    fn subtree_verification_requires_every_stored_row() {
-        assert!(validate_subtree_verification(&SubtreeVerification::default()).is_ok());
+    fn subtree_range_must_extend_above_last_checkpoint() {
+        assert!(validate_subtree_range(Height(100), Height(101)).is_ok());
+        assert!(validate_subtree_range(Height(100), Height(100)).is_err());
+        assert!(validate_subtree_range(Height(100), Height(99)).is_err());
+    }
+
+    #[test]
+    fn subtree_verification_requires_a_match_and_every_stored_row() {
+        assert!(
+            validate_subtree_verification(&SubtreeVerification::default()).is_err(),
+            "an audit that compared no subtree rows must not pass"
+        );
+
+        let matched = SubtreeVerification {
+            matched: 1,
+            ..Default::default()
+        };
+        assert!(validate_subtree_verification(&matched).is_ok());
 
         let missing = SubtreeVerification {
+            matched: 1,
             unstored: 1,
             ..Default::default()
         };
@@ -645,6 +683,7 @@ mod tests {
         );
 
         let mismatched = SubtreeVerification {
+            matched: 1,
             mismatched: vec![(NoteCommitmentSubtreeIndex(0), "sapling")],
             ..Default::default()
         };
@@ -654,6 +693,7 @@ mod tests {
         );
 
         let stored_only = SubtreeVerification {
+            matched: 1,
             stored_only: vec![(NoteCommitmentSubtreeIndex(1), "orchard")],
             ..Default::default()
         };

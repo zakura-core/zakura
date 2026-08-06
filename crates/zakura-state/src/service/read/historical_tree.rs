@@ -100,6 +100,18 @@ impl DerivedFrontiers {
 /// path, and a node that cannot derive simply cannot answer the request.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum HistoricalTreeDerivationError {
+    /// A subtree audit endpoint is not above its anchor, so there is no replay range.
+    #[error(
+        "cannot verify note commitment subtrees in ({from:?}, {to:?}]: the endpoint must be above \
+         the anchor"
+    )]
+    InvalidReplayRange {
+        /// The frontier height used as the replay anchor.
+        from: Height,
+        /// The requested replay endpoint.
+        to: Height,
+    },
+
     /// The replay would have to cover more blocks than the configured limit.
     #[error(
         "deriving the note commitment tree at {height:?} needs {blocks} blocks of replay, more \

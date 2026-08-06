@@ -1866,6 +1866,23 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             // completes in the range. Otherwise corruption after the last boundary (or, as in
             // this short fixture, before the first boundary) would leave no subtree row to expose
             // the bad replay.
+            prop_assert_eq!(
+                verify_subtrees_against_stored(&legacy.db, handoff, handoff),
+                Err(HistoricalTreeDerivationError::InvalidReplayRange {
+                    from: handoff,
+                    to: handoff,
+                }),
+                "an empty subtree replay range is rejected"
+            );
+            prop_assert_eq!(
+                verify_subtrees_against_stored(&legacy.db, handoff, Height(seed as u32)),
+                Err(HistoricalTreeDerivationError::InvalidReplayRange {
+                    from: handoff,
+                    to: Height(seed as u32),
+                }),
+                "a reversed subtree replay range is rejected"
+            );
+
             let subtree_outcome =
                 verify_subtrees_against_stored(&legacy.db, Height(seed as u32), handoff)
                     .expect("the unmodified replay endpoint matches its authenticated roots");

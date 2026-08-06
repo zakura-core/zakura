@@ -271,12 +271,17 @@ pub struct SubtreeVerification {
 /// interior nodes, so the per-height root check does not test them directly. Above a fast-synced
 /// node's last checkpoint the database *does* store subtree rows, which makes that band the one
 /// place the two can be compared. `from` must be a height whose per-height trees are present, so
-/// the replay starts from a known-good frontier rather than reconstructing one.
+/// the replay starts from a known-good frontier rather than reconstructing one. `to` must be
+/// strictly greater than `from`; an empty or reversed range cannot verify any replay.
 pub fn verify_subtrees_against_stored(
     db: &ZakuraDb,
     from: Height,
     to: Height,
 ) -> Result<SubtreeVerification, HistoricalTreeDerivationError> {
+    if to <= from {
+        return Err(HistoricalTreeDerivationError::InvalidReplayRange { from, to });
+    }
+
     let (Some(sapling), Some(orchard), Some(ironwood)) = (
         db.latest_stored_sapling_tree(&from),
         db.latest_stored_orchard_tree(&from),

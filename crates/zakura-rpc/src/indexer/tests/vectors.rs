@@ -1,6 +1,6 @@
 //! Fixed test vectors for indexer RPCs
 
-use std::{sync::Arc, time::Duration};
+use std::{fs, sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use tokio::{sync::broadcast, task::JoinHandle};
@@ -19,6 +19,11 @@ use zakura_test::{
 };
 
 use crate::indexer::{self, indexer_client::IndexerClient, BlockRequest, Empty};
+use crate::{
+    config::rpc::IndexerTlsConfig,
+    indexer::tests::certs::{CA_CERT, CLIENT_CERT, CLIENT_KEY, SERVER_CERT, SERVER_KEY},
+    sync::{IndexerClientConfig, IndexerClientTlsConfig},
+};
 
 #[tokio::test]
 async fn rpc_server_spawn() -> Result<()> {
@@ -36,6 +41,70 @@ async fn rpc_server_spawn() -> Result<()> {
     test_mempool_change(client.clone(), mempool_transaction_sender).await?;
     test_get_block(client.clone(), mock_read_service).await?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn indexer_server_requires_a_trusted_client_certificate() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let temp_dir = tempfile::tempdir()?;
+    let ca_file = temp_dir.path().join("ca.pem");
+    let server_cert_file = temp_dir.path().join("server.pem");
+    let server_key_file = temp_dir.path().join("server-key.pem");
+    let client_cert_file = temp_dir.path().join("client.pem");
+    let client_key_file = temp_dir.path().join("client-key.pem");
+    fs::write(&ca_file, CA_CERT)?;
+    fs::write(&server_cert_file, SERVER_CERT)?;
+    fs::write(&server_key_file, SERVER_KEY)?;
+    fs::write(&client_cert_file, CLIENT_CERT)?;
+    fs::write(&client_key_file, CLIENT_KEY)?;
+
+    let server_tls = IndexerTlsConfig {
+        cert_file: server_cert_file,
+        key_file: server_key_file,
+        client_ca_file: ca_file,
+    };
+    let (server_task, listen_addr, _read_state, _tip_sender, _mempool_sender) =
+        start_server(Some(server_tls)).await?;
+
+    let unauthenticated_tls = tonic::transport::ClientTlsConfig::new()
+        .ca_certificate(tonic::transport::Certificate::from_pem(CA_CERT))
+        .domain_name("localhost");
+    let unauthenticated_endpoint =
+        tonic::transport::Endpoint::new(format!("https://{listen_addr}"))?
+            .tls_config(unauthenticated_tls)?;
+    let mut unauthenticated_client = IndexerClient::connect(unauthenticated_endpoint).await?;
+    assert!(
+        unauthenticated_client
+            .get_block(BlockRequest {
+                hash_or_height: Vec::new(),
+            })
+            .await
+            .is_err(),
+        "the indexer server must reject clients without a certificate"
+    );
+
+    let authenticated_endpoint = IndexerClientConfig::mtls(
+        listen_addr,
+        IndexerClientTlsConfig::new(
+            temp_dir.path().join("ca.pem"),
+            client_cert_file,
+            client_key_file,
+            "localhost".to_string(),
+        ),
+    )
+    .endpoint()
+    .map_err(|error| eyre!(error))?;
+    let mut client = IndexerClient::connect(authenticated_endpoint).await?;
+    let status = client
+        .get_block(BlockRequest {
+            hash_or_height: Vec::new(),
+        })
+        .await
+        .expect_err("the authenticated request should reach request validation");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    server_task.abort();
     Ok(())
 }
 
@@ -149,25 +218,13 @@ async fn start_server_and_get_client() -> Result<(
     MockChainTipSender,
     broadcast::Sender<MempoolChange>,
 )> {
-    let listen_addr: std::net::SocketAddr = "127.0.0.1:0"
-        .parse()
-        .expect("hard-coded IP and u16 port should parse successfully");
-
-    let mock_read_service = MockService::build()
-        .with_max_request_delay(Duration::from_secs(2))
-        .for_unit_tests();
-
-    let (mock_chain_tip_change, mock_chain_tip_change_sender) = MockChainTip::new();
-    let (mempool_transaction_sender, _) = tokio::sync::broadcast::channel(1);
-    let mempool_tx_subscriber = MempoolTxSubscriber::new(mempool_transaction_sender.clone());
-    let (server_task, listen_addr) = indexer::server::init(
+    let (
+        server_task,
         listen_addr,
-        mock_read_service.clone(),
-        mock_chain_tip_change,
-        mempool_tx_subscriber.clone(),
-    )
-    .await
-    .map_err(|err| eyre!(err))?;
+        mock_read_service,
+        mock_chain_tip_change_sender,
+        mempool_transaction_sender,
+    ) = start_server(None).await?;
 
     // wait for the server to start
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -184,6 +241,45 @@ async fn start_server_and_get_client() -> Result<(
     Ok((
         server_task,
         client,
+        mock_read_service,
+        mock_chain_tip_change_sender,
+        mempool_transaction_sender,
+    ))
+}
+
+async fn start_server(
+    tls: Option<IndexerTlsConfig>,
+) -> Result<(
+    JoinHandle<Result<(), BoxError>>,
+    std::net::SocketAddr,
+    MockService<ReadRequest, ReadResponse, PanicAssertion, BoxError>,
+    MockChainTipSender,
+    broadcast::Sender<MempoolChange>,
+)> {
+    let listen_addr: std::net::SocketAddr = "127.0.0.1:0"
+        .parse()
+        .expect("hard-coded IP and u16 port should parse successfully");
+
+    let mock_read_service = MockService::build()
+        .with_max_request_delay(Duration::from_secs(2))
+        .for_unit_tests();
+
+    let (mock_chain_tip_change, mock_chain_tip_change_sender) = MockChainTip::new();
+    let (mempool_transaction_sender, _) = tokio::sync::broadcast::channel(1);
+    let mempool_tx_subscriber = MempoolTxSubscriber::new(mempool_transaction_sender.clone());
+    let (server_task, listen_addr) = indexer::server::init(
+        listen_addr,
+        tls,
+        mock_read_service.clone(),
+        mock_chain_tip_change,
+        mempool_tx_subscriber.clone(),
+    )
+    .await
+    .map_err(|err| eyre!(err))?;
+
+    Ok((
+        server_task,
+        listen_addr,
         mock_read_service,
         mock_chain_tip_change_sender,
         mempool_transaction_sender,

@@ -192,6 +192,40 @@ where
     S::Future: Send + 'static,
     C: ChainTip + Clone + Send + Sync + 'static,
 {
+    init_with_zakura_custom_services(
+        config,
+        inbound_service,
+        latest_chain_tip,
+        user_agent,
+        advertised_services,
+        block_gossip_peer_ips,
+        header_sync_driver_startup,
+        Vec::new(),
+    )
+    .await
+}
+
+/// Initialize a peer set with application-supplied Zakura protocol services.
+pub async fn init_with_zakura_custom_services<S, C>(
+    config: Config,
+    inbound_service: S,
+    latest_chain_tip: C,
+    user_agent: String,
+    advertised_services: PeerServices,
+    block_gossip_peer_ips: Vec<IpAddr>,
+    header_sync_driver_startup: Option<crate::zakura::ZakuraHeaderSyncDriverStartup>,
+    custom_services: Vec<crate::zakura::CustomService>,
+) -> (
+    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    Arc<std::sync::Mutex<AddressBook>>,
+    mpsc::Sender<(PeerSocketAddr, u32)>,
+    Option<crate::zakura::ZakuraEndpoint>,
+)
+where
+    S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + Sync + 'static,
+    S::Future: Send + 'static,
+    C: ChainTip + Clone + Send + Sync + 'static,
+{
     let (tcp_listener, listen_addr) = if config.legacy_p2p() {
         let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
         (Some(tcp_listener), listen_addr)
@@ -214,6 +248,7 @@ where
             )) as Arc<dyn crate::zakura::Service>
         },
         header_sync_driver_startup,
+        custom_services,
         peer_registry.clone(),
     )
     .await

@@ -22,7 +22,10 @@ use zakura_chain::{
     orchard,
     parameters::{Network, NetworkKind},
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
+    subtree_verify::SubtreeRootsError,
 };
+
+use super::commitment_aux::FinalFrontiers;
 
 /// Magic bytes identifying a subtree-root artifact.
 const SUBTREE_MAGIC: &[u8; 8] = b"ZKVCTST1";
@@ -136,6 +139,54 @@ pub enum TreestateArtifactError {
         /// The offending entry's key.
         found: u32,
     },
+
+    /// A subtree root is not a canonical node encoding for its pool.
+    #[error("{pool} subtree root at index {index} is not a valid {pool} node")]
+    MalformedSubtreeRoot {
+        /// The pool the root belongs to.
+        pool: &'static str,
+        /// The subtree index that failed to decode.
+        index: u16,
+    },
+
+    /// The subtree roots do not match the frontier that pins them.
+    #[error("{pool} subtree roots do not match the {pool} frontier: {source}")]
+    UnverifiedSubtreeRoots {
+        /// The pool whose roots failed.
+        pool: &'static str,
+        /// Why the check failed.
+        #[source]
+        source: SubtreeRootsError,
+    },
+
+    /// The frontier the roots were to be checked against could not be parsed.
+    #[error("cannot check subtree roots: {error}")]
+    InvalidFrontier {
+        /// Why the frontier could not be parsed.
+        error: String,
+    },
+
+    /// This network ships no frontier to check subtree roots against.
+    #[error("no embedded frontier is available for this network")]
+    NoEmbeddedFrontier,
+}
+
+/// How many subtree roots were proven against a frontier, per pool.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VerifiedSubtreeCounts {
+    /// Proven Sapling roots.
+    pub sapling: usize,
+    /// Proven Orchard roots.
+    pub orchard: usize,
+    /// Proven Ironwood roots.
+    pub ironwood: usize,
+}
+
+impl VerifiedSubtreeCounts {
+    /// Returns the total number of roots proven.
+    pub fn total(&self) -> usize {
+        self.sapling + self.orchard + self.ironwood
+    }
 }
 
 /// Returns the network byte an artifact for `network` carries.
@@ -363,6 +414,71 @@ impl SubtreeArtifact {
         Ok(artifact)
     }
 
+    /// Checks every root in this artifact against the frontiers that pin them.
+    ///
+    /// Subtree roots are interior nodes, so nothing else in the artifact's framing tests their
+    /// values: an artifact full of wrong roots, or of no roots at all, parses exactly like a
+    /// correct one. A frontier's ommers are the pairwise hashes of the subtrees it has already
+    /// completed, so folding these roots must reproduce them.
+    ///
+    /// The frontiers must be at the height this artifact is bound to. Ironwood shares Orchard's
+    /// tree type, so it is checked the same way.
+    pub fn verify_against_frontiers(
+        &self,
+        sapling: &zakura_chain::sapling::tree::NoteCommitmentTree,
+        orchard: &orchard::tree::NoteCommitmentTree,
+        ironwood: &orchard::tree::NoteCommitmentTree,
+    ) -> Result<VerifiedSubtreeCounts, TreestateArtifactError> {
+        let sapling_roots = self
+            .sapling
+            .iter()
+            .map(|record| {
+                sapling_crypto::Node::from_bytes(record.root)
+                    .into_option()
+                    .ok_or(TreestateArtifactError::MalformedSubtreeRoot {
+                        pool: "sapling",
+                        index: record.index.0,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let pallas_roots = |pool: &'static str, records: &[SubtreeRecord]| {
+            records
+                .iter()
+                .map(|record| {
+                    orchard::tree::Node::try_from(record.root.as_slice()).map_err(|_| {
+                        TreestateArtifactError::MalformedSubtreeRoot {
+                            pool,
+                            index: record.index.0,
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+
+        let orchard_roots = pallas_roots("orchard", &self.orchard)?;
+        let ironwood_roots = pallas_roots("ironwood", &self.ironwood)?;
+
+        let verified = |pool: &'static str, result: Result<usize, SubtreeRootsError>| {
+            result.map_err(|source| TreestateArtifactError::UnverifiedSubtreeRoots { pool, source })
+        };
+
+        Ok(VerifiedSubtreeCounts {
+            sapling: verified(
+                "sapling",
+                sapling.verify_completed_subtree_roots(&sapling_roots),
+            )?,
+            orchard: verified(
+                "orchard",
+                orchard.verify_completed_subtree_roots(&orchard_roots),
+            )?,
+            ironwood: verified(
+                "ironwood",
+                ironwood.verify_completed_subtree_roots(&ironwood_roots),
+            )?,
+        })
+    }
+
     /// Returns the Sapling subtrees in `range`, as `z_getsubtreesbyindex` serves them.
     pub fn sapling_range(
         &self,
@@ -453,6 +569,52 @@ pub(crate) fn embedded_historical_subtrees(network: &Network) -> Option<SubtreeA
     }
 }
 
+/// Checks a candidate subtree-root artifact against a frontier, with no database and no network.
+///
+/// `frontier_bytes` is the serialized frontier artifact to check against; `None` uses the one
+/// embedded in this binary.
+///
+/// The artifact is bound to a last checkpoint, and which one it must match depends on the
+/// frontier:
+///
+/// - With an embedded frontier, that is this binary's last checkpoint. The embedded pair is
+///   already known to describe it, so anything else is the wrong artifact for this binary.
+/// - With a supplied frontier, it is that frontier's own height. A candidate bundle is bound to a
+///   checkpoint *ahead* of the binary checking it, so requiring the binary's own last checkpoint
+///   would reject every bundle that advances the checkpoint list — which is all of them. Pairing
+///   the two supplied files against each other proves the bundle is internally consistent, which
+///   is what can be established before the bundle is imported. That the checkpoint itself is the
+///   expected one is a separate check, made by the importer and re-made afterwards against the
+///   embedded pair.
+pub fn verify_subtree_artifact(
+    network: &Network,
+    subtree_bytes: &[u8],
+    frontier_bytes: Option<&[u8]>,
+) -> Result<VerifiedSubtreeCounts, TreestateArtifactError> {
+    let frontiers = match frontier_bytes {
+        Some(bytes) => FinalFrontiers::from_bytes(bytes).map_err(|error| {
+            TreestateArtifactError::InvalidFrontier {
+                error: error.to_string(),
+            }
+        })?,
+        None => super::vct::embedded_final_frontiers(network)
+            .ok_or(TreestateArtifactError::NoEmbeddedFrontier)?,
+    };
+
+    let expected_last_checkpoint = match frontier_bytes {
+        Some(_) => frontiers.height,
+        None => network.checkpoint_list().max_height(),
+    };
+
+    let artifact = SubtreeArtifact::decode_at_last_checkpoint(
+        subtree_bytes,
+        network,
+        expected_last_checkpoint,
+    )?;
+
+    artifact.verify_against_frontiers(&frontiers.sapling, &frontiers.orchard, &frontiers.ironwood)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +684,89 @@ mod tests {
             embedded_historical_subtrees(&Network::new_default_testnet()).is_none(),
             "the Mainnet trust bundle must not be used on Testnet"
         );
+    }
+
+    /// Proves the embedded Mainnet subtree roots against the embedded Mainnet frontier.
+    ///
+    /// Everything else guarding this artifact is structural — framing, payload digest, manifest
+    /// hash, handoff height — and passes just as happily on an artifact whose roots are wrong or
+    /// absent. This is the only check that reads the roots themselves.
+    ///
+    /// Keep `frontier` in the name: `.github/workflows/update-release-state.yml` re-proves each
+    /// imported release-state bundle with `cargo test -p zakura-state --lib -- frontier
+    /// sprout_change`, so the name is what makes this run against every future artifact.
+    #[test]
+    fn embedded_subtree_roots_match_embedded_frontier() {
+        let counts = verify_subtree_artifact(&Network::Mainnet, MAINNET_SUBTREES, None)
+            .expect("embedded Mainnet subtree roots must match the embedded Mainnet frontier");
+
+        let artifact = embedded_historical_subtrees(&Network::Mainnet)
+            .expect("Mainnet ships an embedded subtree-root artifact");
+
+        assert_eq!(counts.sapling, artifact.sapling.len());
+        assert_eq!(counts.orchard, artifact.orchard.len());
+        assert_eq!(counts.ironwood, artifact.ironwood.len());
+
+        // A Mainnet last checkpoint above three million has completed hundreds of subtrees in
+        // both long-lived pools. Zero here means an empty artifact shipped, which is what
+        // happened once already, and every structural check passed.
+        assert!(
+            counts.sapling > 0 && counts.orchard > 0,
+            "embedded artifact proved {counts:?}; an artifact with no roots serves nothing"
+        );
+    }
+
+    /// A supplied frontier is paired with the artifact by its own height, so a bundle can be
+    /// checked by a binary whose last checkpoint is still the older one.
+    #[test]
+    fn a_supplied_frontier_pairs_with_the_artifact_by_its_own_height() {
+        const MAINNET_FRONTIER: &[u8] = include_bytes!("vct/mainnet-frontier.bin");
+
+        let counts =
+            verify_subtree_artifact(&Network::Mainnet, MAINNET_SUBTREES, Some(MAINNET_FRONTIER))
+                .expect("the committed pair proves against each other");
+
+        assert_eq!(
+            counts,
+            verify_subtree_artifact(&Network::Mainnet, MAINNET_SUBTREES, None)
+                .expect("and against the embedded frontier")
+        );
+
+        // A frontier from a different height is still rejected, so the pairing is real.
+        let mut wrong_height = MAINNET_FRONTIER.to_vec();
+        wrong_height[0] ^= 0xff;
+        assert!(matches!(
+            verify_subtree_artifact(&Network::Mainnet, MAINNET_SUBTREES, Some(&wrong_height)),
+            Err(TreestateArtifactError::WrongLastCheckpoint { .. })
+        ));
+    }
+
+    /// The regression this check exists for: an empty artifact, correctly framed.
+    #[test]
+    fn an_empty_artifact_is_rejected_against_the_embedded_frontier() {
+        let empty = SubtreeArtifact {
+            last_checkpoint: Network::Mainnet.checkpoint_list().max_height(),
+            sapling: Vec::new(),
+            orchard: Vec::new(),
+            ironwood: Vec::new(),
+        }
+        .encode(&Network::Mainnet);
+
+        // It parses, its digest is valid, and it is bound to the right checkpoint.
+        SubtreeArtifact::decode_at_last_checkpoint(
+            &empty,
+            &Network::Mainnet,
+            Network::Mainnet.checkpoint_list().max_height(),
+        )
+        .expect("an empty artifact is structurally valid, which is the problem");
+
+        assert!(matches!(
+            verify_subtree_artifact(&Network::Mainnet, &empty, None),
+            Err(TreestateArtifactError::UnverifiedSubtreeRoots {
+                pool: "sapling",
+                source: SubtreeRootsError::CountMismatch { found: 0, .. },
+            })
+        ));
     }
 
     #[test]

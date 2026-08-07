@@ -112,7 +112,10 @@ pub use disk_format::{
     MAX_ON_DISK_HEIGHT,
 };
 pub(crate) use treestate_artifact::embedded_historical_subtrees;
-pub use treestate_artifact::{SubtreeArtifact, SubtreeRecord, TreestateArtifactError};
+pub use treestate_artifact::{
+    verify_subtree_artifact, SubtreeArtifact, SubtreeRecord, TreestateArtifactError,
+    VerifiedSubtreeCounts,
+};
 pub use treestate_export::{
     export as export_subtree_artifact, TreestateExport, TreestateExportError,
 };

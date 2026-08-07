@@ -88,8 +88,8 @@ pub use service::finalized_state::{
     VctTreestateInventory,
 };
 pub use service::finalized_state::{
-    export_subtree_artifact, SubtreeArtifact, SubtreeRecord, TreestateArtifactError,
-    TreestateExport, TreestateExportError,
+    export_subtree_artifact, verify_subtree_artifact, SubtreeArtifact, SubtreeRecord,
+    TreestateArtifactError, TreestateExport, TreestateExportError, VerifiedSubtreeCounts,
 };
 pub use service::finalized_state::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,

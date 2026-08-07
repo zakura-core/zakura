@@ -2508,7 +2508,7 @@ impl Service<ReadRequest> for ReadStateService {
                             &state.db,
                             start_index,
                             end_index,
-                            &merged,
+                            merged,
                         )
                     },
                 )?;
@@ -2557,7 +2557,7 @@ impl Service<ReadRequest> for ReadStateService {
                             &state.db,
                             start_index,
                             end_index,
-                            &merged,
+                            merged,
                         )
                     },
                 )?;
@@ -2602,7 +2602,7 @@ impl Service<ReadRequest> for ReadStateService {
                             &state.db,
                             start_index,
                             end_index,
-                            &merged,
+                            merged,
                         )
                     },
                 )?;

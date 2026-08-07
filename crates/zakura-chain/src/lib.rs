@@ -43,6 +43,7 @@ pub mod serialization;
 pub mod shutdown;
 pub mod sprout;
 pub mod subtree;
+pub mod subtree_verify;
 pub mod transaction;
 pub mod transparent;
 pub mod value_balance;

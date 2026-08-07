@@ -75,6 +75,13 @@ impl ExportHistoricalTreestatesCmd {
             export.subtrees.orchard.len(),
             export.subtrees.ironwood.len(),
         );
+        println!(
+            "proven roots:    {} of {}, against the frontiers at the export bound",
+            export.verified_roots,
+            export.subtrees.sapling.len()
+                + export.subtrees.orchard.len()
+                + export.subtrees.ironwood.len(),
+        );
         if export.replayed_blocks == 0 {
             println!("source:          stored subtree rows");
         } else {

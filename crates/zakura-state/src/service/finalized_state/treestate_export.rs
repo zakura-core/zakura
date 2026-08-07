@@ -37,7 +37,7 @@ use zakura_chain::{
 
 use crate::service::{
     finalized_state::{
-        treestate_artifact::{SubtreeArtifact, SubtreeRecord},
+        treestate_artifact::{SubtreeArtifact, SubtreeRecord, TreestateArtifactError},
         ZakuraDb,
     },
     read::{
@@ -74,6 +74,19 @@ pub enum TreestateExportError {
         required: Height,
         /// The network last checkpoint.
         last_checkpoint: Height,
+    },
+
+    /// The generated roots do not match the frontiers they were generated against.
+    ///
+    /// Generation fails rather than writing roots that cannot be proven, which is the whole point
+    /// of generating them from an authenticated database.
+    #[error("generated subtree roots do not match the frontiers at {bound:?}: {source}")]
+    SubtreeRootsUnverified {
+        /// The height whose frontiers the roots were checked against.
+        bound: Height,
+        /// Why the check failed.
+        #[source]
+        source: TreestateArtifactError,
     },
 
     /// One or more pre-last-checkpoint frontiers are present while others are missing.
@@ -146,6 +159,29 @@ pub struct TreestateExport {
     ///
     /// Zero for a direct stored-row export from a legacy archive.
     pub replayed_blocks: u64,
+
+    /// How many subtree roots were proven against the frontiers at the export bound.
+    ///
+    /// Always the artifact's total record count: generation fails rather than returning roots it
+    /// could not prove.
+    pub verified_roots: usize,
+}
+
+/// Proves `subtrees` against the frontiers it was generated against, at `bound`.
+///
+/// The count check in [`collect_stored_pool`] and the endpoint root checks in the replay both
+/// leave the root values themselves untested — they are interior nodes. Folding them back into
+/// the frontier's own interior nodes is what tests them, and it is nearly free here because the
+/// frontiers are already in hand.
+fn verify_exported_subtrees(
+    subtrees: &SubtreeArtifact,
+    frontiers: &DerivedFrontiers,
+    bound: Height,
+) -> Result<usize, TreestateExportError> {
+    subtrees
+        .verify_against_frontiers(&frontiers.sapling, &frontiers.orchard, &frontiers.ironwood)
+        .map(|counts| counts.total())
+        .map_err(|source| TreestateExportError::SubtreeRootsUnverified { bound, source })
 }
 
 /// Generates the subtree-root artifact for the network last checkpoint.
@@ -177,11 +213,14 @@ pub fn export(
     match probe_pre_last_checkpoint_frontiers(db, pre_last_checkpoint)? {
         FrontierProbe::Present(frontiers) => {
             let subtrees = export_stored(db, last_checkpoint, pre_last_checkpoint, &frontiers)?;
+            let verified_roots =
+                verify_exported_subtrees(&subtrees, &frontiers, pre_last_checkpoint)?;
             on_progress(pre_last_checkpoint, 0);
             Ok(TreestateExport {
                 subtrees,
                 elapsed: start.elapsed(),
                 replayed_blocks: 0,
+                verified_roots,
             })
         }
         FrontierProbe::Absent => export_by_replay(
@@ -424,10 +463,14 @@ fn export_by_replay(
         }
     }
 
+    // `frontiers` is the replay's final state, at `last`, which is the artifact's bound.
+    let verified_roots = verify_exported_subtrees(&subtrees, &frontiers, last)?;
+
     Ok(TreestateExport {
         subtrees,
         elapsed: start.elapsed(),
         replayed_blocks,
+        verified_roots,
     })
 }
 
@@ -629,7 +672,12 @@ mod tests {
         set_tip(&db, PRE_LAST_CHECKPOINT);
 
         let sapling_tree = sapling_tree_with_completed_subtrees(1);
-        let sapling_root = sapling_crypto::Node::from_bytes([9; 32]).unwrap();
+        // Export proves the roots it emits against this tree, so the seeded row has to carry the
+        // root the tree actually completed, the way a real database does.
+        let (_, sapling_root) = sapling_tree
+            .completed_subtree_index_and_root()
+            .expect("the fixture tree completes exactly one subtree");
+        let post_bound_root = sapling_crypto::Node::from_bytes([9; 32]).unwrap();
         let mut batch = DiskWriteBatch::new();
         batch.create_sapling_tree(&db, &PRE_LAST_CHECKPOINT, &sapling_tree);
         batch.create_orchard_tree(
@@ -649,7 +697,7 @@ mod tests {
         // A subtree that completes at the last checkpoint itself is post-bound and must not be exported.
         batch.insert_sapling_subtree(
             &db,
-            &NoteCommitmentSubtree::new(1u16, LAST_CHECKPOINT, sapling_root),
+            &NoteCommitmentSubtree::new(1u16, LAST_CHECKPOINT, post_bound_root),
         );
         db.write_batch(batch).expect("seeding stored rows succeeds");
 

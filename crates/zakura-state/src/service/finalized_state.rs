@@ -114,7 +114,10 @@ pub use disk_format::{
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use header_chain::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub(crate) use treestate_artifact::embedded_historical_subtrees;
-pub use treestate_artifact::{SubtreeArtifact, SubtreeRecord, TreestateArtifactError};
+pub use treestate_artifact::{
+    verify_subtree_artifact, SubtreeArtifact, SubtreeRecord, TreestateArtifactError,
+    VerifiedSubtreeCounts,
+};
 pub use treestate_export::{
     export as export_subtree_artifact, TreestateExport, TreestateExportError,
 };

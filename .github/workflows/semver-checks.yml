@@ -82,9 +82,10 @@ jobs:
                 --head "$GITHUB_SHA"
             )"
           else
-            # Trusted main runs populate reusable rustdoc JSON for the latest
-            # stable crates.io baselines. Check every publishable crate so one
-            # cache entry can warm any package selected by a later PR.
+            # Trusted main runs populate reusable rustdoc JSON for both the
+            # stable PR baseline and the exact latest-tag baseline used by
+            # release preparation. Check every publishable crate so one cache
+            # entry can warm any package selected later.
             packages="$(
               python3 .github/workflows/scripts/affected_semver_packages.py --all
             )"
@@ -159,8 +160,10 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: target/semver-checks/cache
-          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ needs.select-packages.outputs.baseline_tag }}
-          restore-keys: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
+          key: semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-${{ needs.select-packages.outputs.baseline_tag }}
+          restore-keys: |
+            semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-
+            semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
 
       # Deliberately unpinned (like cargo-hack): cargo-semver-checks must
       # track new stable rustdoc formats; pin only if a regression forces it.
@@ -242,6 +245,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
@@ -255,8 +259,10 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: target/semver-checks/cache
-          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ needs.select-packages.outputs.baseline_tag }}
-          restore-keys: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
+          key: semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-${{ needs.select-packages.outputs.baseline_tag }}
+          restore-keys: |
+            semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-
+            semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
 
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1
         with:
@@ -264,23 +270,71 @@ jobs:
 
       - uses: ./.github/actions/setup-zakura-build
 
-      - name: Check all crates against stable crates.io baselines
+      - name: Check all crates and warm published release baselines
+        id: warm
         env:
+          BASELINE_TAG: ${{ needs.select-packages.outputs.baseline_tag }}
           PACKAGES: ${{ needs.select-packages.outputs.packages }}
         run: |
+          source scripts/lib/crates-index.sh
+          source scripts/lib/release-packages.sh
+
+          declare -A release_versions=()
+          while IFS=$'\t' read -r package version _manifest; do
+            release_versions["$package"]="$version"
+          done < <(list_release_packages_at "$BASELINE_TAG")
+
+          cache_complete=true
           while IFS= read -r package; do
             [[ -n "$package" ]] || continue
-            cargo semver-checks --package "$package" --default-features
+
+            release_version="${release_versions[$package]:-}"
+            if [[ -z "$release_version" ]]; then
+              echo "${package} is absent from ${BASELINE_TAG}; checking the stable baseline only."
+              cargo semver-checks --package "$package" --default-features
+              cache_complete=false
+              continue
+            fi
+
+            index_rc=0
+            crates_index_has_version "$package" "$release_version" \
+              || index_rc=$?
+            case "$index_rc" in
+              0) ;;
+              1)
+                echo "${package}@${release_version} is not published; checking the stable baseline only."
+                cargo semver-checks --package "$package" --default-features
+                cache_complete=false
+                continue
+                ;;
+              *)
+                echo "Could not query the crates.io index for ${package}." >&2
+                exit 1
+                ;;
+            esac
+
+            # cargo-semver-checks deliberately chooses a stable release by
+            # default. Preserve that baseline for ordinary PR checks when the
+            # latest tag is a release candidate, then also cache the exact RC
+            # baseline needed by release preparation.
+            if [[ "$release_version" == *-* ]]; then
+              cargo semver-checks --package "$package" --default-features
+            fi
+            cargo semver-checks --package "$package" --default-features \
+              --baseline-version "$release_version"
           done <<< "$PACKAGES"
+
+          echo "cache_complete=$cache_complete" >> "$GITHUB_OUTPUT"
 
       - name: Save baseline rustdoc cache
         if: >-
           github.ref == 'refs/heads/main'
           && steps.baseline-cache.outputs.cache-hit != 'true'
+          && steps.warm.outputs.cache_complete == 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: target/semver-checks/cache
-          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ needs.select-packages.outputs.baseline_tag }}
+          key: semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-${{ needs.select-packages.outputs.baseline_tag }}
 
       - name: Explain the failure
         if: failure()

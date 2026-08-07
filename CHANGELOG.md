@@ -481,7 +481,7 @@ cap increase is a compatible policy adjustment.
 
 - Add an offline Mainnet checkpoint and VCT frontier export mode to
   `zakura-checkpoints`, and a committed provenance record
-  (`vct/mainnet-frontier.json`) that CI verifies against the embedded
+  (`vct/mainnet-vct-manifest.json`) that CI verifies against the embedded
   checkpoint list and frontier on every PR. Groundwork for automated
   release-state updates
   ([#261](https://github.com/zakura-core/zakura/pull/261)).

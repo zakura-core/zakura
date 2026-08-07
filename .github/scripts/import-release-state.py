@@ -16,7 +16,7 @@ from typing import Any
 
 CHECKPOINTS = Path("crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt")
 FRONTIER = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin")
-PROVENANCE = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json")
+PROVENANCE = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json")
 SUBTREES = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin")
 EOS_FILE = Path("crates/zakurad/src/components/sync/end_of_support.rs")
 EOS_PATTERN = re.compile(r"(ESTIMATED_RELEASE_HEIGHT: u32 = )([0-9_]+)")
@@ -71,11 +71,11 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def _subtree_pools(data: bytes, label: str) -> tuple[bytes, bytes, bytes]:
+def _subtree_pools(data: bytes, label: str) -> tuple[int, bytes, bytes, bytes]:
     if len(data) < SUBTREE_HEADER_LEN:
         raise BundleImportError(f"{label} is a truncated subtree-root artifact")
 
-    magic, version, network, _handoff, *counts = SUBTREE_HEADER_PREFIX.unpack_from(data)
+    magic, version, network, last_checkpoint, *counts = SUBTREE_HEADER_PREFIX.unpack_from(data)
     if magic != b"ZKVCTST1":
         raise BundleImportError(f"{label} is not a subtree-root artifact")
     if version != 1:
@@ -99,38 +99,47 @@ def _subtree_pools(data: bytes, label: str) -> tuple[bytes, bytes, bytes]:
         end = offset + count * SUBTREE_RECORD_LEN
         pools.append(payload[offset:end])
         offset = end
-    return pools[0], pools[1], pools[2]
+    return last_checkpoint, pools[0], pools[1], pools[2]
 
 
 def _prepare_subtree_import(
     repo_root: Path,
     bundle: Path,
+    expected_last_checkpoint: int,
 ) -> tuple[bytes | None, bool]:
     committed_path = repo_root / SUBTREES
     bundle_path = bundle / SUBTREE_BUNDLE_NAME
 
     if not bundle_path.exists():
-        print("bundle carries no subtree-root artifact; leaving the committed copy unchanged")
         try:
-            return (
-                committed_path.read_bytes() if committed_path.exists() else None,
-                False,
-            )
+            committed_bytes = committed_path.read_bytes()
         except OSError as error:
             raise BundleImportError(f"cannot read {SUBTREES}: {error}") from error
+        committed_last_checkpoint, *_ = _subtree_pools(committed_bytes, str(SUBTREES))
+        if committed_last_checkpoint != expected_last_checkpoint:
+            raise BundleImportError(
+                "bundle carries no subtree-root artifact for its last checkpoint"
+            )
+        print("bundle carries no new subtree roots; keeping the matching committed artifact")
+        return committed_bytes, False
 
     try:
         bundle_bytes = bundle_path.read_bytes()
     except OSError as error:
         raise BundleImportError(f"cannot read {SUBTREE_BUNDLE_NAME}: {error}") from error
-    bundle_pools = _subtree_pools(bundle_bytes, SUBTREE_BUNDLE_NAME)
+    bundle_last_checkpoint, *bundle_pools = _subtree_pools(bundle_bytes, SUBTREE_BUNDLE_NAME)
+    if bundle_last_checkpoint != expected_last_checkpoint:
+        raise BundleImportError(
+            f"{SUBTREE_BUNDLE_NAME} last_checkpoint {bundle_last_checkpoint} does not match "
+            f"checkpoint height {expected_last_checkpoint}"
+        )
 
     if committed_path.exists():
         try:
             committed_bytes = committed_path.read_bytes()
         except OSError as error:
             raise BundleImportError(f"cannot read {SUBTREES}: {error}") from error
-        committed_pools = _subtree_pools(committed_bytes, str(SUBTREES))
+        _, *committed_pools = _subtree_pools(committed_bytes, str(SUBTREES))
         for name, old, new in zip(
             ("sapling", "orchard", "ironwood"),
             committed_pools,
@@ -186,7 +195,9 @@ def import_bundle(
     if _checkpoint_height(bundle_checkpoints, "bundle checkpoint list") != bundle_height:
         raise BundleImportError("bundle checkpoint height does not match the resolution")
 
-    subtree_bytes, import_subtrees = _prepare_subtree_import(repo_root, bundle)
+    subtree_bytes, import_subtrees = _prepare_subtree_import(
+        repo_root, bundle, bundle_height
+    )
 
     checkpoint_path.write_bytes(bundle_checkpoints)
     frontier_path.write_bytes(bundle_frontier)
@@ -251,7 +262,7 @@ def _self_test() -> int:
             b"ZKVCTST1",
             1,
             1,
-            1,
+            2,
             *(len(pool) // SUBTREE_RECORD_LEN for pool in pools),
         )
         return prefix + hashlib.sha256(payload).digest() + payload
@@ -264,6 +275,7 @@ def _self_test() -> int:
                 (self.root / relative).parent.mkdir(parents=True, exist_ok=True)
             (self.root / CHECKPOINTS).write_text("1 aa\n", encoding="utf-8")
             (self.root / FRONTIER).write_bytes(b"old")
+            (self.root / SUBTREES).write_bytes(subtree_artifact(b"", b"", b""))
             (self.root / EOS_FILE).write_text(
                 "const ESTIMATED_RELEASE_HEIGHT: u32 = 1_000;\n",
                 encoding="utf-8",

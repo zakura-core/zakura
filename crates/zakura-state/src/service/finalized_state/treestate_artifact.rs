@@ -27,10 +27,13 @@ use zakura_chain::{
 /// Magic bytes identifying a subtree-root artifact.
 const SUBTREE_MAGIC: &[u8; 8] = b"ZKVCTST1";
 
+/// Reviewed completed-subtree roots shipped with the Mainnet last checkpoint.
+pub(super) const MAINNET_SUBTREES: &[u8] = include_bytes!("vct/mainnet-subtrees.bin");
+
 /// The format version both artifacts are written at.
 const VERSION: u16 = 1;
 
-/// Fixed header length: magic, version, network, handoff, three record counts, digest.
+/// Fixed header length: magic, version, network, last_checkpoint, three record counts, digest.
 const SUBTREE_HEADER_LEN: usize = 8 + 2 + 1 + 4 + 4 + 4 + 4 + 32;
 
 /// Bytes per subtree record: index, end height, root.
@@ -69,6 +72,17 @@ pub enum TreestateArtifactError {
         found: u8,
         /// The network byte this node expects.
         expected: u8,
+    },
+
+    /// The artifact was generated for a different last checkpoint.
+    #[error("{kind} artifact last checkpoint {found:?} does not match expected last checkpoint {expected:?}")]
+    WrongLastCheckpoint {
+        /// Which artifact was being parsed.
+        kind: &'static str,
+        /// The last checkpoint encoded in the artifact.
+        found: Height,
+        /// The last checkpoint expected by this binary.
+        expected: Height,
     },
 
     /// The artifact is shorter than its own framing requires.
@@ -168,8 +182,8 @@ pub struct SubtreeRecord {
 /// replaying each subtree's leaves, so this ships in the reviewed, committed bundle (§4.6).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubtreeArtifact {
-    /// The checkpoint handoff this was generated against.
-    pub handoff: Height,
+    /// The last checkpoint this was generated against.
+    pub last_checkpoint: Height,
 
     /// Completed Sapling subtrees, in index order.
     pub sapling: Vec<SubtreeRecord>,
@@ -184,7 +198,7 @@ pub struct SubtreeArtifact {
 impl Default for SubtreeArtifact {
     fn default() -> Self {
         Self {
-            handoff: Height(0),
+            last_checkpoint: Height(0),
             sapling: Vec::new(),
             orchard: Vec::new(),
             ironwood: Vec::new(),
@@ -215,7 +229,7 @@ impl SubtreeArtifact {
         out.extend_from_slice(SUBTREE_MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
         out.push(network_byte(network));
-        out.extend_from_slice(&self.handoff.0.to_le_bytes());
+        out.extend_from_slice(&self.last_checkpoint.0.to_le_bytes());
         out.extend_from_slice(&count(&self.sapling).to_le_bytes());
         out.extend_from_slice(&count(&self.orchard).to_le_bytes());
         out.extend_from_slice(&count(&self.ironwood).to_le_bytes());
@@ -251,7 +265,7 @@ impl SubtreeArtifact {
             });
         }
 
-        let handoff = Height(u32::from_le_bytes(read_array::<4>(bytes, 11, kind)?));
+        let last_checkpoint = Height(u32::from_le_bytes(read_array::<4>(bytes, 11, kind)?));
 
         let mut counts = [0usize; 3];
         for (index, count) in counts.iter_mut().enumerate() {
@@ -324,11 +338,29 @@ impl SubtreeArtifact {
 
         let mut pools = pools.into_iter();
         Ok(Self {
-            handoff,
+            last_checkpoint,
             sapling: pools.next().expect("three pools were decoded"),
             orchard: pools.next().expect("three pools were decoded"),
             ironwood: pools.next().expect("three pools were decoded"),
         })
+    }
+
+    /// Parses an artifact and verifies that it belongs to `expected_last_checkpoint`.
+    pub fn decode_at_last_checkpoint(
+        bytes: &[u8],
+        network: &Network,
+        expected_last_checkpoint: Height,
+    ) -> Result<Self, TreestateArtifactError> {
+        let artifact = Self::decode(bytes, network)?;
+        if artifact.last_checkpoint != expected_last_checkpoint {
+            return Err(TreestateArtifactError::WrongLastCheckpoint {
+                kind: Self::KIND,
+                found: artifact.last_checkpoint,
+                expected: expected_last_checkpoint,
+            });
+        }
+
+        Ok(artifact)
     }
 
     /// Returns the Sapling subtrees in `range`, as `z_getsubtreesbyindex` serves them.
@@ -402,6 +434,25 @@ impl SubtreeArtifact {
     }
 }
 
+/// Returns the reviewed subtree roots coupled to `network`'s last checkpoint.
+///
+/// Mainnet ships these bytes in the binary. Other networks do not use the Mainnet trust bundle.
+pub(crate) fn embedded_historical_subtrees(network: &Network) -> Option<SubtreeArtifact> {
+    match network {
+        Network::Mainnet => Some(
+            SubtreeArtifact::decode_at_last_checkpoint(
+                MAINNET_SUBTREES,
+                network,
+                network.checkpoint_list().max_height(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("invalid embedded Mainnet subtree-root artifact: {error}")
+            }),
+        ),
+        Network::Testnet(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,7 +461,7 @@ mod tests {
 
     fn sample_subtrees() -> SubtreeArtifact {
         SubtreeArtifact {
-            handoff: Height(31),
+            last_checkpoint: Height(31),
             sapling: vec![
                 SubtreeRecord {
                     index: NoteCommitmentSubtreeIndex(0),
@@ -440,6 +491,36 @@ mod tests {
         assert_eq!(
             SubtreeArtifact::decode(&bytes, &Network::Mainnet),
             Ok(artifact)
+        );
+    }
+
+    #[test]
+    fn subtree_artifact_is_bound_to_last_checkpoint() {
+        let artifact = sample_subtrees();
+        let bytes = artifact.encode(&Network::Mainnet);
+
+        assert_eq!(
+            SubtreeArtifact::decode_at_last_checkpoint(&bytes, &Network::Mainnet, Height(32)),
+            Err(TreestateArtifactError::WrongLastCheckpoint {
+                kind: "subtree-root",
+                found: Height(31),
+                expected: Height(32),
+            })
+        );
+    }
+
+    #[test]
+    fn embedded_subtrees_match_mainnet_last_checkpoint() {
+        let artifact = embedded_historical_subtrees(&Network::Mainnet)
+            .expect("Mainnet ships an embedded subtree-root artifact");
+
+        assert_eq!(
+            artifact.last_checkpoint,
+            Network::Mainnet.checkpoint_list().max_height()
+        );
+        assert!(
+            embedded_historical_subtrees(&Network::new_default_testnet()).is_none(),
+            "the Mainnet trust bundle must not be used on Testnet"
         );
     }
 

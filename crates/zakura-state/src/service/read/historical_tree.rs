@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn published_subtree_lookup_finds_the_right_pool_and_index() {
         let artifact = SubtreeArtifact {
-            handoff: Height(9_000),
+            last_checkpoint: Height(9_000),
             sapling: vec![record(0, 0xaa), record(1, 0xbb), record(5, 0xcc)],
             orchard: vec![record(0, 0xdd)],
             ironwood: Vec::new(),

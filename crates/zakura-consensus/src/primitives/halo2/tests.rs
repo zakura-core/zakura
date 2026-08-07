@@ -24,7 +24,7 @@ use std::{
 };
 
 use futures::future::join_all;
-use orchard::bundle::{Authorized, Bundle, BundleVersion};
+use orchard::bundle::{Authorized, Bundle, BundleVersion, Flags};
 use tower::{Service, ServiceExt};
 use tower_batch_control::Batch;
 use tower_fallback::Fallback;
@@ -421,6 +421,63 @@ fn cache_key_distinguishes_different_bundles_with_the_same_sighash() {
     );
 }
 
+/// Returns `bundle`'s parts rebuilt under `flags` and `version`.
+fn rebuilt_as(
+    bundle: &Bundle<Authorized, ZatBalance>,
+    flags: Flags,
+    version: BundleVersion,
+) -> Bundle<Authorized, ZatBalance> {
+    Bundle::try_from_parts(
+        bundle.actions().clone(),
+        flags,
+        *bundle.value_balance(),
+        *bundle.anchor(),
+        bundle.authorization().clone(),
+        version,
+    )
+    .expect("a real mainnet Orchard bundle's parts are representable under the given version")
+}
+
+/// The Orchard and Ironwood pools of one v6 transaction never share a cache key.
+///
+/// A v6 transaction verifies both of its bundles against the same sighash under the same network
+/// upgrade, and — because both pools use the NU6.3 circuit — through the same verifier and so the
+/// same memo. A key that did not separate the pools would answer one pool's verification with the
+/// other's result.
+///
+/// The two bundles here are built from identical parts, and with cross-address transfers disabled
+/// their flag bytes are identical too, so their consensus encodings are byte-for-byte the same.
+/// Only the pool discriminant tells them apart. This is the collision that `(auth digest, sighash)`
+/// would have had.
+#[test]
+fn cache_key_distinguishes_the_orchard_and_ironwood_pools() {
+    let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+
+    // Cross-address transfers are disallowed in the NU6.3 Orchard pool and optional in Ironwood,
+    // so this is the one flag set both pools can encode — and they encode it identically.
+    let orchard = rebuilt_as(
+        &bundle,
+        Flags::CROSS_ADDRESS_DISABLED,
+        BundleVersion::orchard_v3(),
+    );
+    let ironwood = rebuilt_as(
+        &bundle,
+        Flags::CROSS_ADDRESS_DISABLED,
+        BundleVersion::ironwood_v3(),
+    );
+
+    assert_eq!(
+        orchard.flag_byte(),
+        ironwood.flag_byte(),
+        "this test is only meaningful if the two pools encode these flags identically"
+    );
+    assert_ne!(
+        cache_key(&orchard, sighash),
+        cache_key(&ironwood, sighash),
+        "the Orchard and Ironwood bundles of one transaction must not share a cache key"
+    );
+}
+
 /// The bundle version is committed to even when nothing else about the bundle changes.
 ///
 /// The consensus encoding of a bundle contains its flag byte but not its [`BundleVersion`], and
@@ -430,15 +487,7 @@ fn cache_key_distinguishes_different_bundles_with_the_same_sighash() {
 fn cache_key_changes_with_the_bundle_version() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
 
-    let rebuilt = Bundle::try_from_parts(
-        bundle.actions().clone(),
-        *bundle.flags(),
-        *bundle.value_balance(),
-        *bundle.anchor(),
-        bundle.authorization().clone(),
-        BundleVersion::orchard_v2(),
-    )
-    .expect("a real mainnet Orchard bundle is representable under the NU6.2 bundle version");
+    let rebuilt = rebuilt_as(&bundle, *bundle.flags(), BundleVersion::orchard_v2());
 
     assert_eq!(
         bundle.flag_byte(),

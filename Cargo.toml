@@ -149,7 +149,7 @@ tokio-stream = "0.1.17"
 tokio-test = "0.4"
 tokio-util = "0.7.14"
 toml = "1.0"
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-aws-lc"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tonic-reflection = "0.14"

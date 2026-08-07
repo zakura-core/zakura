@@ -693,6 +693,7 @@ impl StartCmd {
                 info!("spawning indexer RPC server");
                 let (indexer_rpc_task_handle, _listen_addr) = zakura_rpc::indexer::server::init(
                     indexer_listen_addr,
+                    config.rpc.indexer_tls.clone(),
                     read_only_state_service.clone(),
                     latest_chain_tip.clone(),
                     mempool_transaction_subscriber.clone(),

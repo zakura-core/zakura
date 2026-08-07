@@ -12,11 +12,13 @@ use std::{
 use futures::{future::BoxFuture, FutureExt};
 use once_cell::sync::Lazy;
 use orchard::{
-    bundle::{BatchError, BatchValidator},
+    bundle::{BatchError, BatchValidator, BundleVersion},
     circuit::{OrchardCircuitVersion, VerifyingKey},
+    ProtocolVersion, ValuePool,
 };
 use rand::thread_rng;
 use zakura_chain::{parameters::NetworkUpgrade, transaction::SigHash};
+use zcash_primitives::transaction::components::orchard::write_v5_bundle;
 use zcash_protocol::value::ZatBalance;
 
 use crate::{error::TransactionError, BoxError};
@@ -28,8 +30,14 @@ use tower_fallback::Fallback;
 
 use super::spawn_fifo;
 
+mod memo;
+
 #[cfg(test)]
 mod tests;
+
+pub use memo::Memoized;
+
+use memo::{CacheKey, MEMO_CAPACITY};
 
 /// Adjusted batch size for halo2 batches.
 ///
@@ -50,6 +58,12 @@ type Sender = watch::Sender<Option<VerifyResult>>;
 /// The type of a prepared verifying key.
 /// This is the key used to verify individual items.
 pub type ItemVerifyingKey = VerifyingKey;
+
+/// The BLAKE2b personalization for [`Item`] memo cache keys.
+///
+/// Domain-separates these keys from every other BLAKE2b-256 hash in the protocol, so that a
+/// memo key can never be confused with a txid, an auth digest, or a sighash.
+const HALO2_MEMO_PERSONALIZATION: &[u8; 15] = b"ZakuraHalo2Memo";
 
 // The Orchard Action circuit, and therefore its verifying key, changes across protocol eras.
 // A proof produced under one circuit version does not verify under the other keys. So we keep
@@ -150,6 +164,76 @@ impl Item {
         }
         batch.validate(thread_rng())
     }
+
+    /// Returns a key that determines every input to this item's proof verification.
+    ///
+    /// [`Memoized`] reuses a previous `Ok` result whenever this key matches, so the key must
+    /// commit to everything [`BatchValidator::add_bundle`] reads. It hashes the bundle's own
+    /// consensus encoding, which is injective and covers all of it: the per-action value
+    /// commitments, nullifiers, validating keys, note commitments and spend authorization
+    /// signatures, the bundle flags, value balance, anchor, proof, and binding signature.
+    ///
+    /// The verifying key is *not* in the key. It does not need to be: each Orchard circuit era
+    /// has its own verifier and therefore its own memo, so an entry can only ever be read back
+    /// under the key it was written against. See [`verifier_for`].
+    ///
+    /// Deriving this by hand from things that "obviously" determine the bundle is how this goes
+    /// wrong. The txid does not commit to authorizing data at all under ZIP 244 — that was
+    /// CVE-2026-34377 — and even `(auth digest, sighash)` is incomplete, because the Orchard and
+    /// Ironwood bundles of one v6 transaction share both. Hashing the encoding avoids having to
+    /// get that reasoning right.
+    fn cache_key(&self) -> CacheKey {
+        // Destructured exhaustively on purpose: adding a field to `Item` is a compile error here
+        // until someone decides whether it belongs in the key.
+        let Item { bundle, sighash } = self;
+
+        let mut hasher = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(HALO2_MEMO_PERSONALIZATION)
+            .to_state();
+
+        hasher.update(&[bundle_version_discriminant(bundle.bundle_version())]);
+        hasher.update(&sighash.0);
+
+        // `write_v5_bundle` is the total encoder: it is `write_v6_bundle` without the precondition
+        // that rejects pre-NU6.3 bundle versions, and the two produce identical bytes otherwise.
+        // The v5/v6 distinction it therefore does not encode is supplied by the discriminant above.
+        let mut encoded = Vec::new();
+        write_v5_bundle(Some(bundle.as_ref()), &mut encoded)
+            .expect("encoding a bundle into a Vec cannot fail: the encoder only reports IO errors");
+        hasher.update(&encoded);
+
+        hasher
+            .finalize()
+            .as_bytes()
+            .try_into()
+            .expect("hash_length(32) produces exactly 32 bytes")
+    }
+}
+
+/// Returns a stable one-byte discriminant for `version`.
+///
+/// A bundle's consensus encoding contains its flag byte but not its [`BundleVersion`], and two
+/// bundles in different value pools can share a flag byte, so [`Item::cache_key`] commits to the
+/// value pool and protocol version separately. Today the pool affects verification only through
+/// the flags, but the bundle version already selects other version-dependent behaviour in the
+/// `orchard` crate, and one byte removes the need to re-check that on every dependency bump.
+///
+/// Both matches are exhaustive: a new value pool or protocol version is a compile error here
+/// until it is given a discriminant on purpose.
+fn bundle_version_discriminant(version: BundleVersion) -> u8 {
+    let pool = match version.value_pool() {
+        ValuePool::Orchard => 0x00,
+        ValuePool::Ironwood => 0x10,
+    };
+
+    let protocol = match version.protocol_version() {
+        ProtocolVersion::InsecureV1 => 0x00,
+        ProtocolVersion::V2 => 0x01,
+        ProtocolVersion::V3 => 0x02,
+    };
+
+    pool | protocol
 }
 
 trait QueueBatchVerify {
@@ -217,12 +301,15 @@ impl Service<Item> for OrchardFallback {
     }
 }
 
+/// The batching-and-fallback stack for one Orchard circuit era, before memoization.
+type BatchFallbackService = Fallback<Batch<Verifier, Item>, OrchardFallback>;
+
 /// The concrete type of a global Halo2 verification service.
 ///
 /// Each Orchard circuit era gets its own instance — see [`VERIFIER_PRE_NU6_2`], [`VERIFIER_NU6_2`],
-/// or [`VERIFIER_NU6_3_ONWARD`] — so that batches, fallbacks, and verifying keys are fully
+/// or [`VERIFIER_NU6_3_ONWARD`] — so that batches, fallbacks, verifying keys, and memos are fully
 /// separated per era.
-type VerifierService = Fallback<Batch<Verifier, Item>, OrchardFallback>;
+type VerifierService = Memoized<BatchFallbackService>;
 
 /// Builds a global Halo2 verifier that validates every item against `vk`.
 ///
@@ -231,7 +318,17 @@ type VerifierService = Fallback<Batch<Verifier, Item>, OrchardFallback>;
 /// passed here, so an item built by this verifier is always checked against exactly one era's key.
 /// Callers select the correct era's key by which `VERIFYING_KEY_*` they pass; there is no runtime
 /// key resolution.
+///
+/// The stack is wrapped in a [`Memoized`] so that a proof gossiped into the mempool does not have
+/// to be verified again when the block that mines it arrives. Because each era builds its own
+/// verifier here, each era also gets its own memo, which is what binds a remembered result to the
+/// `vk` it was produced under.
 fn batch_verifier(vk: &'static ItemVerifyingKey) -> VerifierService {
+    Memoized::new(batch_fallback_verifier(vk), MEMO_CAPACITY)
+}
+
+/// Builds the un-memoized batching-and-fallback stack for `vk`.
+fn batch_fallback_verifier(vk: &'static ItemVerifyingKey) -> BatchFallbackService {
     Fallback::new(
         Batch::new(
             Verifier::new(vk),

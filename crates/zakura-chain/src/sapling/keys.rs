@@ -345,56 +345,118 @@ impl ZcashDeserialize for EphemeralPublicKey {
 /// represent [SpendAuthSig^{Sapling}.Public][2], which allows any points, including
 /// of small order).
 ///
+/// # Lazy point decompression
+///
+/// Stored as the raw 32-byte compressed encoding, exactly as it appears on the
+/// wire. Decompressing a Jubjub point requires a square root in the base field,
+/// which dominates the cost of parsing a Sapling transaction — so, like
+/// [`ValueCommitment`] and [`EphemeralPublicKey`], the point and its
+/// not-small-order check are deferred off the checkpoint-sync hot path.
+///
+/// # Consensus
+///
+/// Deserialization only checks the byte length; it does not prove the bytes are
+/// a canonical, non-small-order point. The not-small-order check is deferred to
+/// the semantic verifier and mempool, which call
+/// [`ValidatingKey::is_valid_not_small_order`] (via
+/// [`Transaction::sapling_point_encodings_are_valid`]) and also verify the
+/// Sapling bundle through librustzcash, whose `check_spend` rejects a
+/// small-order `rk`. The checkpoint verifier trusts block hashes and skips the
+/// check. Covered by `sapling_small_order_rk_deferred_but_caught_by_librustzcash`.
+///
 /// [1]: https://zips.z.cash/protocol/protocol.pdf#spenddesc
 /// [2]: https://zips.z.cash/protocol/protocol.pdf#concretereddsa
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-pub struct ValidatingKey(redjubjub::VerificationKey<SpendAuth>);
+/// [`ValueCommitment`]: crate::sapling::ValueCommitment
+/// [`Transaction::sapling_point_encodings_are_valid`]: crate::transaction::Transaction::sapling_point_encodings_are_valid
+//
+// Deliberately not `Copy`, unlike its sibling deferred-point types: adding `Copy` to an already
+// published type is a major semver break, and it would buy nothing here — every consumer takes
+// the bytes through `From<&ValidatingKey>`.
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidatingKey(pub(crate) [u8; 32]);
 
-impl From<ValidatingKey> for redjubjub::VerificationKey<SpendAuth> {
-    fn from(rk: ValidatingKey) -> Self {
-        rk.0
-    }
-}
-
-impl TryFrom<redjubjub::VerificationKey<SpendAuth>> for ValidatingKey {
-    type Error = &'static str;
-
-    /// Convert an array into a ValidatingKey.
+impl ValidatingKey {
+    /// Returns true if the stored encoding is a canonical, non-small-order
+    /// Jubjub point, i.e. a valid `rk` per the consensus rules.
     ///
-    /// Returns an error if the key is malformed or [is of small order][1].
+    /// This is the not-small-order check deferred from deserialization, run by
+    /// the semantic verifier (not the checkpoint verifier) on untrusted
+    /// transactions.
     ///
     /// # Consensus
     ///
     /// > Check that a Spend description's cv and rk are not of small order,
     /// > i.e. \[h_J\]cv MUST NOT be 𝒪_J and \[h_J\]rk MUST NOT be 𝒪_J.
     ///
-    /// [1]: https://zips.z.cash/protocol/protocol.pdf#spenddesc
-    fn try_from(key: redjubjub::VerificationKey<SpendAuth>) -> Result<Self, Self::Error> {
-        if bool::from(
-            jubjub::AffinePoint::from_bytes(key.into())
-                .unwrap()
-                .is_small_order(),
-        ) {
-            Err("jubjub::AffinePoint value for Sapling ValidatingKey is of small order")
-        } else {
-            Ok(Self(key))
+    /// <https://zips.z.cash/protocol/protocol.pdf#spenddesc>
+    ///
+    /// To stay in consensus with the rest of the network, this must accept
+    /// exactly the `rk` encodings librustzcash accepts. There, `read_rk` decodes
+    /// the bytes with `redjubjub::VerificationKey::try_from`, which rejects
+    /// off-curve and non-canonical encodings but deliberately allows small-order
+    /// points, and `check_spend` then rejects `rk_affine.is_small_order()`. The
+    /// conjunction is what this reproduces. Equivalence is pinned by
+    /// `sapling_point_checks_match_librustzcash_predicates`.
+    pub fn is_valid_not_small_order(&self) -> bool {
+        match jubjub::AffinePoint::from_bytes(self.0).into_option() {
+            Some(point) => !bool::from(point.is_small_order()),
+            None => false,
         }
+    }
+}
+
+impl fmt::Debug for ValidatingKey {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("ValidatingKey")
+            .field("rk", &hex::encode(self.0))
+            .finish()
+    }
+}
+
+impl TryFrom<ValidatingKey> for redjubjub::VerificationKey<SpendAuth> {
+    type Error = &'static str;
+
+    /// Decompresses the stored encoding into a `redjubjub` validating key.
+    ///
+    /// This is the point decompression that deserialization defers, so it is
+    /// fallible: callers must handle an invalid key rather than assume the
+    /// stored bytes are valid. It does *not* run the not-small-order check —
+    /// `redjubjub` allows small-order keys on purpose, which is why that check
+    /// lives in [`ValidatingKey::is_valid_not_small_order`].
+    fn try_from(rk: ValidatingKey) -> Result<Self, Self::Error> {
+        redjubjub::VerificationKey::<SpendAuth>::try_from(rk.0)
+            .map_err(|_| "Invalid redjubjub::VerificationKey for Sapling ValidatingKey")
+    }
+}
+
+impl From<redjubjub::VerificationKey<SpendAuth>> for ValidatingKey {
+    fn from(key: redjubjub::VerificationKey<SpendAuth>) -> Self {
+        Self(key.into())
     }
 }
 
 impl TryFrom<[u8; 32]> for ValidatingKey {
     type Error = &'static str;
 
+    /// Store a `ValidatingKey` from a byte array, deferring point decompression
+    /// and the not-small-order check (see the type docs).
+    ///
+    /// This constructor is fallible only to match older call sites and trait
+    /// bounds; any 32-byte array is stored successfully.
     fn try_from(value: [u8; 32]) -> Result<Self, Self::Error> {
-        let vk = redjubjub::VerificationKey::<SpendAuth>::try_from(value)
-            .map_err(|_| "Invalid redjubjub::ValidatingKey for Sapling ValidatingKey")?;
-        vk.try_into()
+        Ok(Self(value))
     }
 }
 
 impl From<ValidatingKey> for [u8; 32] {
     fn from(key: ValidatingKey) -> Self {
-        key.0.into()
+        key.0
+    }
+}
+
+impl From<&ValidatingKey> for [u8; 32] {
+    fn from(key: &ValidatingKey) -> Self {
+        key.0
     }
 }
 

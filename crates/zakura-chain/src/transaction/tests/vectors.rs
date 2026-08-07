@@ -2560,6 +2560,250 @@ fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
     );
 }
 
+/// A small-order Sapling `rk` survives deserialization, and is still rejected by
+/// the deferred check and by librustzcash.
+///
+/// Deserialization stores `rk` as raw bytes, so the not-small-order rule is no
+/// longer enforced there. This pins the two places that now enforce it:
+///
+/// - Zakura's own deferred check,
+///   [`ShieldedData::point_encodings_are_valid`], which the semantic and mempool
+///   paths run via `check::sapling_point_encodings_are_valid`;
+/// - librustzcash, which splits the rule in two — `read_rk` rejects an off-curve
+///   or non-canonical encoding at read (so `to_librustzcash` fails), while
+///   `redjubjub` deliberately admits small-order keys and the Sapling verifier's
+///   `check_spend` rejects them at verify.
+///
+/// The checkpoint verifier reaches neither, which is the tradeoff already
+/// accepted for `cv` and `epk`: its authority is the checkpoint hash chain.
+#[test]
+fn sapling_small_order_rk_deferred_but_caught_by_librustzcash() {
+    use group::Group;
+
+    use crate::{
+        amount::Amount,
+        at_least_one,
+        block::Height,
+        parameters::NetworkUpgrade,
+        primitives::{
+            redjubjub::{self, Binding, Signature, SpendAuth},
+            Groth16Proof,
+        },
+        sapling::{
+            self,
+            keys::ValidatingKey,
+            shielded_data::{ShieldedData, TransferData},
+            Spend, ValueCommitment,
+        },
+        serialization::{ZcashDeserializeInto, ZcashSerialize},
+        transaction::{LockTime, Transaction},
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let valid = jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes();
+    let small_order = jubjub::AffinePoint::from(jubjub::ExtendedPoint::identity()).to_bytes();
+    let off_curve = [0xffu8; 32];
+
+    // librustzcash's `read_rk` is `redjubjub::VerificationKey::try_from`, which
+    // rejects encodings that are not canonical curve points but admits
+    // small-order ones on purpose — reddsa's own comment says Sapling must check
+    // that separately.
+    assert!(
+        redjubjub::VerificationKey::<SpendAuth>::try_from(small_order).is_ok(),
+        "read_rk must accept a small-order rk: the small-order rule is enforced at verify",
+    );
+    assert!(
+        redjubjub::VerificationKey::<SpendAuth>::try_from(off_curve).is_err(),
+        "read_rk must reject an off-curve rk",
+    );
+
+    // ... and `check_spend`, which the Sapling batch verifier runs per spend, is
+    // where the small-order rejection actually happens.
+    assert!(
+        bool::from(
+            jubjub::AffinePoint::from_bytes(small_order)
+                .unwrap()
+                .is_small_order()
+        ),
+        "is_small_order (used by the Sapling verifier check_spend) must flag the small-order rk",
+    );
+
+    // Build a minimal V5 transaction with one Sapling spend carrying `rk_bytes`,
+    // round-tripped through the lazy deserializer.
+    let build = |rk_bytes: [u8; 32]| -> Transaction {
+        let spend = Spend::<sapling::SharedAnchor> {
+            cv: ValueCommitment(valid),
+            per_spend_anchor: sapling::FieldNotPresent,
+            nullifier: sapling::Nullifier::from([0u8; 32]),
+            rk: ValidatingKey(rk_bytes),
+            zkproof: Groth16Proof([0u8; 192]),
+            spend_auth_sig: Signature::<SpendAuth>::from([0u8; 64]),
+        };
+
+        let tx = Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            inputs: vec![],
+            outputs: vec![],
+            sapling_shielded_data: Some(ShieldedData::<sapling::SharedAnchor> {
+                value_balance: Amount::try_from(0).expect("zero is a valid amount"),
+                transfers: TransferData::SpendsAndMaybeOutputs {
+                    shared_anchor: sapling::tree::Root::default(),
+                    spends: at_least_one![spend],
+                    maybe_outputs: vec![],
+                },
+                binding_sig: Signature::<Binding>::from([0u8; 64]),
+            }),
+            orchard_shielded_data: None,
+        };
+
+        tx.zcash_serialize_to_vec()
+            .expect("crafted transaction must serialize")
+            .zcash_deserialize_into()
+            .expect("lazy deserialization accepts any 32-byte rk; validation is deferred")
+    };
+
+    // Deferral: both invalid encodings now parse, where the small-order one used
+    // to fail at deserialization.
+    let small_order_tx = build(small_order);
+    let off_curve_tx = build(off_curve);
+
+    // Zakura's deferred check rejects both, and accepts a valid rk.
+    assert!(
+        build(valid).sapling_point_encodings_are_valid(),
+        "a spend with a valid rk must pass the deferred point check",
+    );
+    assert!(
+        !small_order_tx.sapling_point_encodings_are_valid(),
+        "the deferred point check must reject a small-order rk",
+    );
+    assert!(
+        !off_curve_tx.sapling_point_encodings_are_valid(),
+        "the deferred point check must reject an off-curve rk",
+    );
+
+    // librustzcash agrees: the off-curve rk fails at read, and the small-order rk
+    // is left for `check_spend` at verify.
+    assert!(
+        small_order_tx.to_librustzcash(NetworkUpgrade::Nu5).is_ok(),
+        "to_librustzcash must accept a small-order rk (it is enforced at verify, not read)",
+    );
+    assert!(
+        off_curve_tx.to_librustzcash(NetworkUpgrade::Nu5).is_err(),
+        "to_librustzcash must reject an off-curve rk at read",
+    );
+
+    // `check_spend`'s own rejection of the small-order rk is pinned separately, over a real
+    // mainnet bundle, by `librustzcash_check_spend_rejects_a_small_order_rk` — it cannot be
+    // pinned here because this crafted fixture carries an all-zero proof, which
+    // `check_bundle` rejects on its own regardless of `rk`.
+
+    // Byte-identity: the lazy representation must not perturb the encoding, since
+    // the txid and merkle root hash these bytes.
+    let bytes_in = build(off_curve)
+        .zcash_serialize_to_vec()
+        .expect("serializes");
+    let bytes_out: Transaction = bytes_in
+        .clone()
+        .zcash_deserialize_into()
+        .expect("round-trips");
+    assert_eq!(
+        bytes_in,
+        bytes_out.zcash_serialize_to_vec().expect("re-serializes"),
+        "a lazy rk must round-trip byte-for-byte",
+    );
+}
+
+/// librustzcash rejects a small-order `rk` at verify, which is the backstop the deferral leans
+/// on for the semantic and mempool paths.
+///
+/// This drives `sapling_crypto`'s own `BatchValidator` over a **real mainnet Sapling bundle**
+/// rather than re-stating the rule. Re-stating it would be worthless: `check_spend` tests
+/// `jubjub::AffinePoint::from_bytes(..).is_small_order()`, which is character for character what
+/// [`ValidatingKey::is_valid_not_small_order`] runs, so an assertion written that way is
+/// tautologically true and could never detect a divergence. `sapling-crypto` exposes no
+/// byte-level entry point for that half, so the only independent evidence is the library's
+/// observable behaviour on a bundle.
+///
+/// A real bundle is required: `check_bundle` runs every synchronous consensus check before
+/// batching, so a crafted fixture with a placeholder proof is rejected whatever its `rk` is, and
+/// the test would pass for the wrong reason. The accept leg guards exactly that.
+///
+/// Signature and proof validity are *batched*, not checked by `check_bundle`, so replacing `rk`
+/// — which invalidates the spend authorization signature — does not disturb the accept leg.
+///
+/// [`ValidatingKey::is_valid_not_small_order`]: crate::sapling::keys::ValidatingKey::is_valid_not_small_order
+#[test]
+fn librustzcash_check_spend_rejects_a_small_order_rk() {
+    use crate::{
+        parameters::Network,
+        sapling::{self, keys::ValidatingKey},
+        serialization::AtLeastOne,
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let network = Network::Mainnet;
+
+    let (height, transaction) = arbitrary::test_transactions(&network)
+        .find(|(_, tx)| {
+            matches!(tx.as_ref(), Transaction::V4 { .. })
+                && tx.sapling_spends_per_anchor().next().is_some()
+                && tx.inputs().is_empty()
+        })
+        .expect("mainnet test vectors must contain a V4 Sapling transaction with spends");
+
+    let nu = NetworkUpgrade::current(&network, height);
+
+    // Any sighash gives the same synchronous verdict — `check_bundle` only queues the signature
+    // batch items — but use the real one so the accept leg is a faithful bundle.
+    let sighash = transaction
+        .sighasher(nu, Arc::new(Vec::new()))
+        .expect("the transaction has no transparent inputs")
+        .sighash(HashType::ALL, None);
+
+    let check_bundle_accepts = |tx: &Transaction| -> bool {
+        let bundle = tx
+            .to_librustzcash(nu)
+            .expect("librustzcash reads this mainnet transaction")
+            .into_data()
+            .sapling_bundle()
+            .expect("the transaction has a Sapling bundle")
+            .clone();
+
+        sapling_crypto::BatchValidator::new().check_bundle(bundle, sighash.into())
+    };
+
+    assert!(
+        check_bundle_accepts(&transaction),
+        "check_bundle must accept the unmodified mainnet bundle, or the rejection below proves \
+         nothing",
+    );
+
+    let mut small_order_rk = transaction.as_ref().clone();
+    let Transaction::V4 {
+        sapling_shielded_data: Some(shielded_data),
+        ..
+    } = &mut small_order_rk
+    else {
+        panic!("the fixture was selected for being V4 with Sapling data")
+    };
+    let sapling::TransferData::SpendsAndMaybeOutputs { spends, .. } = &mut shielded_data.transfers
+    else {
+        panic!("the fixture was selected for having spends")
+    };
+    let mut spends_vec = spends.as_slice().to_vec();
+    spends_vec[0].rk = ValidatingKey(jubjub::AffinePoint::identity().to_bytes());
+    *spends = AtLeastOne::from_vec(spends_vec).expect("replacing a field keeps at least one spend");
+
+    assert!(
+        !check_bundle_accepts(&small_order_rk),
+        "check_spend must reject a small-order rk",
+    );
+}
+
 /// Edge cases for lazy Sapling `cv` / `ephemeral_key` deserialization. Beyond the
 /// small-order case, this checks that:
 /// - an off-curve `cv` is also rejected by `to_librustzcash`, so the safety net
@@ -2567,8 +2811,8 @@ fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
 /// - the lazy types round-trip byte-for-byte through serialize/deserialize — the
 ///   txid and merkle root hash these bytes, so any change would break consensus;
 /// - `cv.commitment()` decompresses a valid encoding back to the same point;
-/// - Sapling `rk` was not made lazy, so a small-order `rk` is still rejected at
-///   deserialization.
+/// - Sapling `rk` is lazy too, so a small-order `rk` parses and is caught by the
+///   deferred check instead.
 #[test]
 fn sapling_lazy_cv_epk_edge_cases() {
     use group::Group;
@@ -2683,11 +2927,30 @@ fn sapling_lazy_cv_epk_edge_cases() {
         "commitment() must round-trip a valid value commitment",
     );
 
-    // `rk` was not made lazy: a small-order rk is still rejected at deserialization
-    // via `ValidatingKey::try_from`.
+    // `rk` is lazy as well: every 32-byte encoding is stored, and the
+    // not-small-order check is the deferred one.
     assert!(
-        ValidatingKey::try_from(small_order).is_err(),
-        "Sapling rk must still reject a small-order point at deserialization",
+        ValidatingKey::try_from(small_order).is_ok(),
+        "Sapling rk must store a small-order encoding rather than rejecting it at \
+         deserialization",
+    );
+    assert!(
+        !ValidatingKey::try_from(small_order)
+            .expect("any 32-byte array is stored")
+            .is_valid_not_small_order(),
+        "the deferred rk check must reject a small-order point",
+    );
+    assert!(
+        !ValidatingKey::try_from(off_curve)
+            .expect("any 32-byte array is stored")
+            .is_valid_not_small_order(),
+        "the deferred rk check must reject an off-curve point",
+    );
+    assert!(
+        ValidatingKey::try_from(valid_cv)
+            .expect("any 32-byte array is stored")
+            .is_valid_not_small_order(),
+        "the deferred rk check must accept the Jubjub generator",
     );
 }
 
@@ -3012,11 +3275,13 @@ fn sapling_point_encodings_check_rejects_bad_points() {
     check_transaction("V6", &make_v6);
 }
 
-/// The deferred Sapling point check also covers V4 spend commitments.
+/// The deferred Sapling point check also covers V4 spend commitments and
+/// validating keys.
 ///
-/// The lazy representation applies to spend `cv` as well as output `cv`/`epk`.
-/// V4 takes a distinct `PerSpendAnchor` branch, so keep a focused regression on
-/// that route rather than relying only on output-only V5/V6 coverage.
+/// The lazy representation applies to spend `cv` and `rk` as well as output
+/// `cv`/`epk`. V4 takes a distinct `PerSpendAnchor` branch, so keep a focused
+/// regression on that route rather than relying only on output-only V5/V6
+/// coverage.
 #[test]
 fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
     use group::Group;
@@ -3042,14 +3307,14 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
 
     let valid = jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes();
     let off_curve = [0xffu8; 32];
-    let rk = ValidatingKey::try_from(valid).expect("the Jubjub generator is a valid Sapling rk");
+    let small_order = jubjub::AffinePoint::from(jubjub::ExtendedPoint::identity()).to_bytes();
 
-    let make_v4 = |cv: [u8; 32]| -> Transaction {
+    let make_v4 = |cv: [u8; 32], rk: [u8; 32]| -> Transaction {
         let spend = Spend::<sapling::PerSpendAnchor> {
             cv: ValueCommitment(cv),
             per_spend_anchor: sapling::tree::Root::default(),
             nullifier: sapling::Nullifier::from([0u8; 32]),
-            rk: rk.clone(),
+            rk: ValidatingKey(rk),
             zkproof: Groth16Proof([0u8; 192]),
             spend_auth_sig: Signature::<SpendAuth>::from([0u8; 64]),
         };
@@ -3073,19 +3338,28 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
     };
 
     assert!(
-        make_v4(valid).sapling_point_encodings_are_valid(),
-        "a V4 spend with a valid cv must pass the deferred point check",
+        make_v4(valid, valid).sapling_point_encodings_are_valid(),
+        "a V4 spend with a valid cv and rk must pass the deferred point check",
     );
     assert!(
-        !make_v4(off_curve).sapling_point_encodings_are_valid(),
+        !make_v4(off_curve, valid).sapling_point_encodings_are_valid(),
         "a V4 spend with an off-curve cv must fail the deferred point check",
+    );
+    assert!(
+        !make_v4(valid, off_curve).sapling_point_encodings_are_valid(),
+        "a V4 spend with an off-curve rk must fail the deferred point check",
+    );
+    assert!(
+        !make_v4(valid, small_order).sapling_point_encodings_are_valid(),
+        "a V4 spend with a small-order rk must fail the deferred point check",
     );
 }
 
-/// The relocated Sapling `cv` / `epk` not-small-order checks accept exactly the
-/// same encodings as the librustzcash functions they mirror.
+/// The relocated Sapling `cv` / `rk` / `epk` not-small-order checks accept exactly
+/// the same encodings as the librustzcash functions they mirror.
 ///
-/// If `ValueCommitment::is_valid_not_small_order` or
+/// If `ValueCommitment::is_valid_not_small_order`,
+/// `ValidatingKey::is_valid_not_small_order` or
 /// `EphemeralPublicKey::is_valid_not_small_order` ever diverged from librustzcash,
 /// Zebra would accept or reject transactions the rest of the network doesn't — a
 /// chain split. This pins each Zebra predicate against the library predicate over
@@ -3093,6 +3367,10 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
 ///
 /// - `cv`: `read_value_commitment` accepts a `cv` iff `from_bytes_not_small_order`
 ///   returns a point.
+/// - `rk`: librustzcash splits the rule across two functions — `read_rk` decodes
+///   with `redjubjub::VerificationKey::try_from`, which admits small-order keys,
+///   and `check_spend` then rejects `rk_affine.is_small_order()`. The Zebra
+///   predicate must equal their conjunction.
 /// - `epk`: sapling-crypto decodes `epk` as an `ExtendedPoint` and `check_output`
 ///   rejects it when `epk.is_small_order()`. Zebra decodes as an `AffinePoint`, so
 ///   this also guards that the two decoders agree.
@@ -3100,7 +3378,13 @@ fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
 fn sapling_point_checks_match_librustzcash_predicates() {
     use group::{Group, GroupEncoding};
 
-    use crate::sapling::{keys::EphemeralPublicKey, ValueCommitment};
+    use crate::{
+        primitives::redjubjub::{self, SpendAuth},
+        sapling::{
+            keys::{EphemeralPublicKey, ValidatingKey},
+            ValueCommitment,
+        },
+    };
 
     let _init_guard = zakura_test::init();
 
@@ -3109,6 +3393,28 @@ fn sapling_point_checks_match_librustzcash_predicates() {
         bool::from(
             sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&bytes).is_some(),
         )
+    };
+
+    // The exact predicate librustzcash applies to an `rk`: decode with
+    // `read_rk` (i.e. `redjubjub::VerificationKey::try_from`), then reject a
+    // small-order point (as `check_spend` does).
+    //
+    // Only the *decode* half of this is an independent model. `check_spend` rejects with
+    // `jubjub::AffinePoint::from_bytes(..).is_small_order()`, which is character for character
+    // what `ValidatingKey::is_valid_not_small_order` runs, so re-stating it here could not
+    // detect a divergence — `sapling-crypto` exposes no byte-level entry point for that half to
+    // call instead. What this arm genuinely pins is that `reddsa`'s decoder and `jubjub`'s
+    // decoder agree on acceptance, which is not obvious and would break the conjunction if it
+    // stopped holding. The behaviour of `check_spend` itself is pinned separately and
+    // non-tautologically, by driving the real `sapling_crypto::BatchValidator` in
+    // `sapling_small_order_rk_deferred_but_caught_by_librustzcash`.
+    let librustzcash_rk_valid = |bytes: [u8; 32]| -> bool {
+        redjubjub::VerificationKey::<SpendAuth>::try_from(bytes).is_ok()
+            && !bool::from(
+                jubjub::AffinePoint::from_bytes(bytes)
+                    .expect("read_rk accepted these bytes, so they decode")
+                    .is_small_order(),
+            )
     };
 
     // The exact predicate librustzcash applies to an `epk`: decode as an
@@ -3149,6 +3455,11 @@ fn sapling_point_checks_match_librustzcash_predicates() {
         "cv corpus must contain both accepted and rejected encodings",
     );
     assert!(
+        inputs.iter().any(|&b| librustzcash_rk_valid(b))
+            && inputs.iter().any(|&b| !librustzcash_rk_valid(b)),
+        "rk corpus must contain both accepted and rejected encodings",
+    );
+    assert!(
         inputs.iter().any(|&b| librustzcash_epk_valid(b))
             && inputs.iter().any(|&b| !librustzcash_epk_valid(b)),
         "epk corpus must contain both accepted and rejected encodings",
@@ -3160,6 +3471,12 @@ fn sapling_point_checks_match_librustzcash_predicates() {
             librustzcash_cv_valid(bytes),
             "ValueCommitment::is_valid_not_small_order must match librustzcash \
              read_value_commitment for {bytes:02x?}",
+        );
+        assert_eq!(
+            ValidatingKey(bytes).is_valid_not_small_order(),
+            librustzcash_rk_valid(bytes),
+            "ValidatingKey::is_valid_not_small_order must match librustzcash \
+             read_rk + check_spend for {bytes:02x?}",
         );
         assert_eq!(
             EphemeralPublicKey(bytes).is_valid_not_small_order(),

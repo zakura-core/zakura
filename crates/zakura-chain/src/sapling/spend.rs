@@ -65,7 +65,7 @@ pub struct Spend<AnchorV: AnchorVariant> {
 /// Serialized as `SpendDescriptionV5` in [protocol specification §7.3][ps].
 ///
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#spendencoding
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpendPrefixInTransactionV5 {
     /// A value commitment to the value of the input note.
     pub cv: commitment::ValueCommitment,
@@ -75,13 +75,9 @@ pub struct SpendPrefixInTransactionV5 {
     pub rk: ValidatingKey,
 }
 
-// We can't derive Eq because `VerificationKey` does not implement it,
+// We can't derive Eq because `redjubjub::Signature` does not implement it,
 // even if it is valid for it.
 impl<AnchorV: AnchorVariant + PartialEq> Eq for Spend<AnchorV> {}
-
-// We can't derive Eq because `VerificationKey` does not implement it,
-// even if it is valid for it.
-impl Eq for SpendPrefixInTransactionV5 {}
 
 impl<AnchorV> fmt::Display for Spend<AnchorV>
 where
@@ -162,7 +158,7 @@ impl ZcashSerialize for Spend<PerSpendAnchor> {
         writer.write_all(&self.cv.0)?;
         self.per_spend_anchor.zcash_serialize(&mut writer)?;
         writer.write_32_bytes(&self.nullifier.into())?;
-        writer.write_all(&<[u8; 32]>::from(self.rk.clone())[..])?;
+        writer.write_all(&<[u8; 32]>::from(&self.rk)[..])?;
         self.zkproof.zcash_serialize(&mut writer)?;
         writer.write_all(&<[u8; 64]>::from(self.spend_auth_sig)[..])?;
         Ok(())
@@ -191,8 +187,8 @@ impl ZcashDeserialize for Spend<PerSpendAnchor> {
         //
         // https://zips.z.cash/protocol/protocol.pdf#spenddesc
         //
-        // Sapling `cv` only stores its bytes here; the point validity check is
-        // deferred to `Transaction::sapling_point_encodings_are_valid`.
+        // Sapling `cv` and `rk` only store their bytes here; the point validity
+        // check is deferred to `Transaction::sapling_point_encodings_are_valid`.
         //
         // > LEOS2IP_{256}(anchorSapling), if present, MUST be less than 𝑞_𝕁.
         //
@@ -213,7 +209,8 @@ impl ZcashDeserialize for Spend<PerSpendAnchor> {
             nullifier: note::Nullifier::from(reader.read_32_bytes()?),
             // Type is `SpendAuthSig^{Sapling}.Public`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#concretereddsa
-            // See [`ValidatingKey::try_from`].
+            // Stores the bytes without validating the point; see
+            // [`ValidatingKey`].
             rk: reader
                 .read_32_bytes()?
                 .try_into()
@@ -242,7 +239,7 @@ impl ZcashSerialize for SpendPrefixInTransactionV5 {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
         writer.write_all(&self.cv.0)?;
         writer.write_32_bytes(&self.nullifier.into())?;
-        writer.write_all(&<[u8; 32]>::from(self.rk.clone())[..])?;
+        writer.write_all(&<[u8; 32]>::from(&self.rk)[..])?;
         Ok(())
     }
 }
@@ -255,8 +252,8 @@ impl ZcashDeserialize for SpendPrefixInTransactionV5 {
         //
         // https://zips.z.cash/protocol/protocol.pdf#spenddesc
         //
-        // Sapling `cv` only stores its bytes here; the point validity check is
-        // deferred to `Transaction::sapling_point_encodings_are_valid`.
+        // Sapling `cv` and `rk` only store their bytes here; the point validity
+        // check is deferred to `Transaction::sapling_point_encodings_are_valid`.
         Ok(SpendPrefixInTransactionV5 {
             // Type is `ValueCommit^{Sapling}.Output`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
@@ -267,7 +264,8 @@ impl ZcashDeserialize for SpendPrefixInTransactionV5 {
             nullifier: note::Nullifier::from(reader.read_32_bytes()?),
             // Type is `SpendAuthSig^{Sapling}.Public`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#concretereddsa
-            // See [`ValidatingKey::try_from`].
+            // Stores the bytes without validating the point; see
+            // [`ValidatingKey`].
             rk: reader
                 .read_32_bytes()?
                 .try_into()

@@ -15,7 +15,7 @@
 //!   chain tip changes.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     ops::Bound,
     pin::Pin,
@@ -38,7 +38,7 @@ use zakura_chain::{
     parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{Network, NetworkUpgrade},
     serialization::ZcashSerialize,
-    subtree::NoteCommitmentSubtreeIndex,
+    subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
 };
 
 use crate::{
@@ -1714,6 +1714,42 @@ fn range_for(
     )
 }
 
+/// Uses published subtrees when the node's own rows do not cover `start_index`.
+///
+/// The read result already applies the continuity contract and reports the absent band, so it
+/// stands on its own when it covers `start_index`. Otherwise, this helper tries the union supplied
+/// by `merge_published`, rechecks availability over the whole union, and reapplies continuity.
+/// If that union still does not reach `start_index`, the original result stands, including its
+/// typed absent-band error.
+fn subtrees_with_published_fallback<Node, Error>(
+    stored: Result<BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>, Error>,
+    start_index: NoteCommitmentSubtreeIndex,
+    merge_published: impl FnOnce() -> Option<
+        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+    >,
+    check_available: impl FnOnce(
+        &BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+    ) -> Result<(), Error>,
+) -> Result<BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>, Error> {
+    match stored {
+        Ok(subtrees) if subtrees.contains_key(&start_index) => Ok(subtrees),
+        result => {
+            let Some(merged) = merge_published() else {
+                return result;
+            };
+
+            check_available(&merged)?;
+            let merged = read::contiguous_subtrees_from(merged, start_index);
+
+            if merged.contains_key(&start_index) {
+                Ok(merged)
+            } else {
+                result
+            }
+        }
+    }
+}
+
 fn block_roots_by_height_range<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -2144,47 +2180,34 @@ impl Service<ReadRequest> for ReadStateService {
                     read::sapling_subtrees(best_chain.clone(), &state.db, start_index..)
                 };
 
-                // The read above already applies the continuity contract and reports the absent
-                // band, so it answers on its own whenever the node's own rows cover
-                // `start_index`. Only when they do not is the published artifact consulted: the
-                // union of the raw range and the published records, with availability rechecked
-                // and continuity re-applied over the whole thing, because a client asking from
-                // index 0 must get one list spanning both halves rather than just the published
-                // one. If that union still
-                // does not reach `start_index`, the original result stands — including its typed
-                // absent-band error.
-                let sapling_subtrees = match sapling_subtrees {
-                    Ok(subtrees) if subtrees.contains_key(&start_index) => subtrees,
-                    result => {
-                        let published = if let (Some(artifact), Some(verified_tip)) =
-                            (state.historical_subtrees_at_last_checkpoint(), verified_tip)
-                        {
-                            let range = range_for(start_index, end_index);
-                            let mut merged =
-                                read::sapling_subtrees_with_gaps(best_chain, &state.db, range);
-                            read::merge_published_subtrees(
-                                &mut merged,
-                                artifact.sapling_range(range),
-                                verified_tip,
-                            );
-                            read::check_historical_sapling_subtrees_available(
-                                &state.db,
-                                start_index,
-                                end_index,
-                                &merged,
-                            )?;
-
-                            Some(read::contiguous_subtrees_from(merged, start_index))
-                        } else {
-                            None
-                        };
-
-                        match published {
-                            Some(merged) if merged.contains_key(&start_index) => merged,
-                            _ => result?,
-                        }
-                    }
-                };
+                let sapling_subtrees = subtrees_with_published_fallback(
+                    sapling_subtrees,
+                    start_index,
+                    || {
+                        state
+                            .historical_subtrees_at_last_checkpoint()
+                            .zip(verified_tip)
+                            .map(|(artifact, verified_tip)| {
+                                let range = range_for(start_index, end_index);
+                                let mut merged =
+                                    read::sapling_subtrees_with_gaps(best_chain, &state.db, range);
+                                read::merge_published_subtrees(
+                                    &mut merged,
+                                    artifact.sapling_range(range),
+                                    verified_tip,
+                                );
+                                merged
+                            })
+                    },
+                    |merged| {
+                        read::check_historical_sapling_subtrees_available(
+                            &state.db,
+                            start_index,
+                            end_index,
+                            &merged,
+                        )
+                    },
+                )?;
 
                 Ok(ReadResponse::SaplingSubtrees(sapling_subtrees))
             }
@@ -2206,47 +2229,34 @@ impl Service<ReadRequest> for ReadStateService {
                     read::orchard_subtrees(best_chain.clone(), &state.db, start_index..)
                 };
 
-                // The read above already applies the continuity contract and reports the absent
-                // band, so it answers on its own whenever the node's own rows cover
-                // `start_index`. Only when they do not is the published artifact consulted: the
-                // union of the raw range and the published records, with availability rechecked
-                // and continuity re-applied over the whole thing, because a client asking from
-                // index 0 must get one list spanning both halves rather than just the published
-                // one. If that union still
-                // does not reach `start_index`, the original result stands — including its typed
-                // absent-band error.
-                let orchard_subtrees = match orchard_subtrees {
-                    Ok(subtrees) if subtrees.contains_key(&start_index) => subtrees,
-                    result => {
-                        let published = if let (Some(artifact), Some(verified_tip)) =
-                            (state.historical_subtrees_at_last_checkpoint(), verified_tip)
-                        {
-                            let range = range_for(start_index, end_index);
-                            let mut merged =
-                                read::orchard_subtrees_with_gaps(best_chain, &state.db, range);
-                            read::merge_published_subtrees(
-                                &mut merged,
-                                artifact.orchard_range(range),
-                                verified_tip,
-                            );
-                            read::check_historical_orchard_subtrees_available(
-                                &state.db,
-                                start_index,
-                                end_index,
-                                &merged,
-                            )?;
-
-                            Some(read::contiguous_subtrees_from(merged, start_index))
-                        } else {
-                            None
-                        };
-
-                        match published {
-                            Some(merged) if merged.contains_key(&start_index) => merged,
-                            _ => result?,
-                        }
-                    }
-                };
+                let orchard_subtrees = subtrees_with_published_fallback(
+                    orchard_subtrees,
+                    start_index,
+                    || {
+                        state
+                            .historical_subtrees_at_last_checkpoint()
+                            .zip(verified_tip)
+                            .map(|(artifact, verified_tip)| {
+                                let range = range_for(start_index, end_index);
+                                let mut merged =
+                                    read::orchard_subtrees_with_gaps(best_chain, &state.db, range);
+                                read::merge_published_subtrees(
+                                    &mut merged,
+                                    artifact.orchard_range(range),
+                                    verified_tip,
+                                );
+                                merged
+                            })
+                    },
+                    |merged| {
+                        read::check_historical_orchard_subtrees_available(
+                            &state.db,
+                            start_index,
+                            end_index,
+                            &merged,
+                        )
+                    },
+                )?;
 
                 Ok(ReadResponse::OrchardSubtrees(orchard_subtrees))
             }
@@ -2264,47 +2274,34 @@ impl Service<ReadRequest> for ReadStateService {
                     read::ironwood_subtrees(best_chain.clone(), &state.db, start_index..)
                 };
 
-                // The read above already applies the continuity contract and reports the absent
-                // band, so it answers on its own whenever the node's own rows cover
-                // `start_index`. Only when they do not is the published artifact consulted: the
-                // union of the raw range and the published records, with availability rechecked
-                // and continuity re-applied over the whole thing, because a client asking from
-                // index 0 must get one list spanning both halves rather than just the published
-                // one. If that union still
-                // does not reach `start_index`, the original result stands — including its typed
-                // absent-band error.
-                let ironwood_subtrees = match ironwood_subtrees {
-                    Ok(subtrees) if subtrees.contains_key(&start_index) => subtrees,
-                    result => {
-                        let published = if let (Some(artifact), Some(verified_tip)) =
-                            (state.historical_subtrees_at_last_checkpoint(), verified_tip)
-                        {
-                            let range = range_for(start_index, end_index);
-                            let mut merged =
-                                read::ironwood_subtrees_with_gaps(best_chain, &state.db, range);
-                            read::merge_published_subtrees(
-                                &mut merged,
-                                artifact.ironwood_range(range),
-                                verified_tip,
-                            );
-                            read::check_historical_ironwood_subtrees_available(
-                                &state.db,
-                                start_index,
-                                end_index,
-                                &merged,
-                            )?;
-
-                            Some(read::contiguous_subtrees_from(merged, start_index))
-                        } else {
-                            None
-                        };
-
-                        match published {
-                            Some(merged) if merged.contains_key(&start_index) => merged,
-                            _ => result?,
-                        }
-                    }
-                };
+                let ironwood_subtrees = subtrees_with_published_fallback(
+                    ironwood_subtrees,
+                    start_index,
+                    || {
+                        state
+                            .historical_subtrees_at_last_checkpoint()
+                            .zip(verified_tip)
+                            .map(|(artifact, verified_tip)| {
+                                let range = range_for(start_index, end_index);
+                                let mut merged =
+                                    read::ironwood_subtrees_with_gaps(best_chain, &state.db, range);
+                                read::merge_published_subtrees(
+                                    &mut merged,
+                                    artifact.ironwood_range(range),
+                                    verified_tip,
+                                );
+                                merged
+                            })
+                    },
+                    |merged| {
+                        read::check_historical_ironwood_subtrees_available(
+                            &state.db,
+                            start_index,
+                            end_index,
+                            &merged,
+                        )
+                    },
+                )?;
 
                 Ok(ReadResponse::IronwoodSubtrees(ironwood_subtrees))
             }

@@ -128,6 +128,70 @@ async fn empty_peer_cache_update_preserves_existing_cache() {
     );
 }
 
+/// Cached addresses in the ephemeral port range are dropped when the cache is read,
+/// and listeners on non-default ports are kept.
+///
+/// Releases before this filter cached the ephemeral source ports of inbound peers, and
+/// those addresses are still gossiped by peers running older code. They are re-read as
+/// ordinary initial peers and dialed directly at startup, so a node that restarts on a
+/// polluted cache spends its whole initial peer budget on addresses nothing listens on.
+///
+/// Filtering on the network's default port instead would also discard reachable peers:
+/// about one in six of a mainnet node's outbound peers listens on another port, and
+/// those have already completed a handshake with us.
+#[tokio::test]
+async fn cached_peers_on_ephemeral_ports_are_not_loaded() {
+    let _init_guard = zakura_test::init();
+
+    let cache_dir = tempfile::tempdir().expect("temporary peer cache directory creation failed");
+    let config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        ..Config::default()
+    };
+    let peer_cache_file = config
+        .cache_dir
+        .peer_cache_file_path(&config.network)
+        .expect("test cache directory enables the peer cache");
+    fs::create_dir_all(
+        peer_cache_file
+            .parent()
+            .expect("peer cache file has a parent directory"),
+    )
+    .expect("peer cache directory should be creatable");
+    // A listener on the network's port, listeners on non-default ports observed on the
+    // mainnet fleet, an unusable port 0, and three ephemeral source ports belonging to
+    // the same inbound peer. Only the ephemeral ones and port 0 may be dropped.
+    fs::write(
+        &peer_cache_file,
+        "127.0.0.1:8233\n\
+         127.0.0.3:8235\n\
+         127.0.0.4:21099\n\
+         127.0.0.5:28233\n\
+         127.0.0.6:0\n\
+         127.0.0.2:34138\n\
+         127.0.0.2:38788\n\
+         127.0.0.2:48150\n",
+    )
+    .expect("pre-seeded peer cache should be writable");
+
+    let cached_peers = config
+        .load_peer_cache()
+        .await
+        .expect("pre-seeded peer cache should load");
+
+    assert_eq!(
+        cached_peers,
+        HashSet::from([
+            "127.0.0.1:8233".parse().expect("valid test peer address"),
+            "127.0.0.3:8235".parse().expect("valid test peer address"),
+            "127.0.0.4:21099".parse().expect("valid test peer address"),
+            "127.0.0.5:28233".parse().expect("valid test peer address"),
+        ]),
+        "the peer cache must drop ephemeral source ports and port 0, and keep every \
+         listener below the ephemeral floor whatever port it uses",
+    );
+}
+
 #[test]
 fn testnet_params_serialization_roundtrip() {
     let _init_guard = zakura_test::init();

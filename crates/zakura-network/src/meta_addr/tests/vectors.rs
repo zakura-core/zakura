@@ -13,7 +13,9 @@ use zakura_chain::{
 };
 
 use crate::{
-    constants::{CONCURRENT_ADDRESS_CHANGE_PERIOD, MAX_PEER_ACTIVE_FOR_GOSSIP},
+    constants::{
+        CONCURRENT_ADDRESS_CHANGE_PERIOD, MAX_PEER_ACTIVE_FOR_GOSSIP, MIN_PEER_RECONNECTION_DELAY,
+    },
     meta_addr::MetaAddrChange,
     protocol::{external::canonical_peer_addr, types::PeerServices},
     PeerSocketAddr,
@@ -568,4 +570,84 @@ fn new_misbehavior_canonicalizes_ipv4_mapped_addr() {
 
     assert_eq!(updated.addr(), canonical_addr);
     assert_eq!(updated.misbehavior(), 100);
+}
+
+/// An address learned from an inbound connection is never a dial candidate.
+///
+/// The port on such an address is the peer's ephemeral source port, so dialing
+/// it can only fail. Everything else about the two peers in this test is
+/// identical, so the inbound flag is the only thing that can separate them.
+#[test]
+fn inbound_addresses_are_not_ready_for_connection_attempts() {
+    let _init_guard = zakura_test::init();
+
+    let instant_now = Instant::now();
+    let chrono_now = Utc::now();
+    let local_now: DateTime32 = chrono_now.try_into().expect("will succeed until 2038");
+
+    let address = PeerSocketAddr::from(([192, 168, 180, 9], 10_000));
+
+    // Look at the peers well after the reconnection delay has elapsed, so
+    // `was_recently_updated` cannot be what holds either of them back.
+    let elapsed = MIN_PEER_RECONNECTION_DELAY * 2;
+    let later_instant = instant_now + elapsed;
+    let later_chrono = chrono_now
+        + chrono::Duration::from_std(elapsed).expect("test reconnection delay fits in chrono");
+
+    for is_inbound in [false, true] {
+        let peer = MetaAddr::new_connected(address, &PeerServices::NODE_NETWORK, is_inbound)
+            .into_new_meta_addr(instant_now, local_now);
+
+        assert_eq!(peer.is_inbound(), is_inbound);
+        assert_eq!(
+            peer.is_ready_for_connection_attempt(later_instant, later_chrono, &Mainnet),
+            !is_inbound,
+            "unexpected dial readiness for a peer with is_inbound: {is_inbound}",
+        );
+    }
+}
+
+/// The inbound flag is sticky, so a later change cannot make an address that was
+/// once inbound dialable again.
+///
+/// This is deliberate. The alternative — letting a subsequent outbound-shaped
+/// change clear the flag — would let an ephemeral source port back into the dial
+/// candidate set. The cost is that a peer which dialed us from its own listener
+/// port is only reachable through a separate address book entry, learned from
+/// gossip or a DNS seeder.
+#[test]
+fn inbound_flag_keeps_an_address_out_of_dial_candidates() {
+    let _init_guard = zakura_test::init();
+
+    let instant_now = Instant::now();
+    let chrono_now = Utc::now();
+    let local_now: DateTime32 = chrono_now.try_into().expect("will succeed until 2038");
+
+    let address = PeerSocketAddr::from(([192, 168, 180, 9], 10_000));
+
+    let inbound_peer = MetaAddr::new_connected(address, &PeerServices::NODE_NETWORK, true)
+        .into_new_meta_addr(instant_now, local_now);
+
+    // A response arriving over the same inbound connection is the change most
+    // likely to look like fresh evidence that the address is good. Apply it
+    // well after the connection, so it is not treated as a concurrent change.
+    let response_delay = MIN_PEER_RECONNECTION_DELAY;
+    let response_chrono =
+        chrono_now + chrono::Duration::from_std(response_delay).expect("test delay fits in chrono");
+    let updated = MetaAddr::new_responded(address, None)
+        .apply_to_meta_addr(inbound_peer, instant_now + response_delay, response_chrono)
+        .expect("a later response applies to a connected peer");
+
+    // Look at the peer after the reconnection delay has elapsed since the
+    // response, so `was_recently_updated` cannot be what holds it back.
+    let elapsed = response_delay * 3;
+    let later_chrono = chrono_now
+        + chrono::Duration::from_std(elapsed).expect("test reconnection delay fits in chrono");
+
+    assert!(updated.is_inbound());
+    assert!(!updated.is_ready_for_connection_attempt(
+        instant_now + elapsed,
+        later_chrono,
+        &Mainnet
+    ));
 }

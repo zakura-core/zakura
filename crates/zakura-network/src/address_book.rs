@@ -553,6 +553,25 @@ impl AddressBook {
             // This prevents Zebra from caching nodes that are likely unreachable,
             // which improves startup time and reliability.
             .filter(|addr| addr.is_active_for_gossip(now))
+            // # Security
+            //
+            // Remove addresses learned from inbound connections, whose ports are
+            // the peer's ephemeral source port rather than its listener. They
+            // are connected right now, so they rank as maximally active and
+            // would otherwise dominate the cache, leaving a restarted node with
+            // mostly undialable candidates.
+            .filter(|addr| !addr.is_inbound())
+            // # Security
+            //
+            // Only cache addresses that have answered one of our own connections.
+            // The cache file stores bare socket addresses, so nothing else in this
+            // entry survives a restart: an address we cache on someone else's word
+            // is re-read as an ordinary initial peer, with no record of where it
+            // came from. Requiring a response of our own means an undialable
+            // address can never enter the cache, however it reached the address
+            // book — gossip, a hand-edited cache file, or an earlier cache written
+            // by a release without this filter.
+            .filter(|addr| addr.has_ever_responded())
             .cloned()
             .collect()
     }
@@ -581,6 +600,21 @@ impl AddressBook {
         let Some(most_recent_by_ip) = self.most_recent_by_ip.as_ref() else {
             return false;
         };
+
+        // # Correctness
+        //
+        // This cache exists to space out our own outbound connections to one IP, and
+        // `Config::max_connections_per_ip` is only enforced when we accept inbound
+        // connections, never when we dial. An inbound peer refreshes its entry with
+        // every message it sends, so it would hold its IP's slot for as long as it
+        // stays connected, and the address we would refuse to dial is a different
+        // address on that IP: the peer's own listener, which is the address we want.
+        // Recording inbound entries here stops us dialing exactly the peers that are
+        // most active on the network, and the more inbound connections we accept, the
+        // fewer peers we are able to reach.
+        if updated.is_inbound() {
+            return false;
+        }
 
         if let Some(previous) = most_recent_by_ip.get(&updated.addr.ip()) {
             updated.last_connection_state == PeerAddrState::Responded
@@ -850,6 +884,12 @@ impl AddressBook {
             // If there's no entry for this IP, any connection is allowed
             return true;
         };
+        if same_ip_peer.is_inbound() {
+            // An address can become inbound after it is recorded here, because
+            // `is_inbound` is sticky. Ignore it once it does, for the reasons in
+            // `should_update_most_recent_by_ip`.
+            return true;
+        }
         !same_ip_peer.has_connection_recently_responded(chrono_now)
     }
 

@@ -33,8 +33,9 @@ use zakura_chain::{
 use crate::{
     constants::{
         DEFAULT_CRAWL_NEW_PEER_INTERVAL, DEFAULT_MAX_CONNS_PER_IP,
-        DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT, INBOUND_PEER_LIMIT_MULTIPLIER,
-        MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
+        DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT, EPHEMERAL_PORT_FLOOR,
+        INBOUND_PEER_LIMIT_MULTIPLIER, MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR,
+        OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     protocol::external::{canonical_peer_addr, canonical_socket_addr},
     zakura::ZakuraConfig,
@@ -608,7 +609,7 @@ impl Config {
         let peer_list: HashSet<PeerSocketAddr> = peer_list
             .lines()
             .filter_map(|peer| {
-                peer.parse()
+                peer.parse::<PeerSocketAddr>()
                     .map_err(|peer_parse_error| {
                         info!(
                             ?peer_parse_error,
@@ -620,16 +621,40 @@ impl Config {
             })
             .collect();
 
+        // # Security
+        //
+        // Cached addresses become initial peers, which are dialed directly and enter
+        // the address book as if we had chosen them ourselves. The cache file holds
+        // bare socket addresses, so the port is all we know about them, and an entry
+        // in the ephemeral range is the source port of a past inbound connection
+        // rather than a listener we reached. Dropping them here stops a cache written
+        // by an older release — or edited by hand — from refilling the address book
+        // with addresses that can never be connected to.
+        //
+        // Requiring the network's default port instead would be a mistake: about one
+        // in six of a node's outbound peers listens on a non-default port, and those
+        // are peers we have already handshaked with.
+        let parsed_ip_count = peer_list.len();
+        let peer_list: HashSet<PeerSocketAddr> = peer_list
+            .into_iter()
+            .filter(|peer| peer.port() != 0 && peer.port() < EPHEMERAL_PORT_FLOOR)
+            .collect();
+        let skipped_ip_count = parsed_ip_count - peer_list.len();
+
         // This log is needed for user debugging, but it's annoying during tests.
         #[cfg(not(test))]
         info!(
             cached_ip_count = ?peer_list.len(),
+            ?skipped_ip_count,
+            ephemeral_port_floor = ?EPHEMERAL_PORT_FLOOR,
             ?peer_cache_file,
             "loaded cached peer IP addresses"
         );
         #[cfg(test)]
         debug!(
             cached_ip_count = ?peer_list.len(),
+            ?skipped_ip_count,
+            ephemeral_port_floor = ?EPHEMERAL_PORT_FLOOR,
             ?peer_cache_file,
             "loaded cached peer IP addresses"
         );

@@ -189,6 +189,25 @@ pub const PEER_DISK_CACHE_UPDATE_INTERVAL: Duration = Duration::from_secs(5 * 60
 /// It is a tradeoff between fingerprinting attacks, DNS pollution risk, and cache pollution risk.
 pub const MAX_PEER_DISK_CACHE_SIZE: usize = 300;
 
+/// The lowest port number an operating system assigns as an ephemeral source port.
+///
+/// A peer that connects to us is recorded at the remote end of *its* socket, so its
+/// port is the source port its kernel picked, not a listener we can dial. The peer
+/// disk cache stores bare socket addresses, so the port is the only evidence a cached
+/// entry carries about which of the two it is.
+///
+/// Linux's default `net.ipv4.ip_local_port_range` is `32768 60999`, and other
+/// platforms allocate from `49152-65535`, so this is the inclusive lower bound across
+/// both. It separates every address observed on the mainnet fleet: legitimate peer
+/// listeners appeared on 7952, 8131, 8231, 8233, 8234, 8235, 8236, 8243, 8433, 9058,
+/// 9222, 9533, 18233, 21099, and 28233, while every inbound source port recorded as a
+/// cache entry was above this floor.
+///
+/// This is deliberately weaker than requiring the network's default port: roughly one
+/// in six of a node's outbound peers listens on a non-default port, and those are
+/// reachable peers we want to keep.
+pub const EPHEMERAL_PORT_FLOOR: u16 = 32768;
+
 /// The maximum duration since a peer was last seen to consider it reachable.
 ///
 /// This is used to prevent Zebra from gossiping addresses that are likely unreachable. Peers that

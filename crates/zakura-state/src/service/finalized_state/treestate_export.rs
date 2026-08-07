@@ -184,7 +184,13 @@ pub fn export(
                 replayed_blocks: 0,
             })
         }
-        FrontierProbe::Absent => export_by_replay(db, last_checkpoint, pre_last_checkpoint, start, &mut on_progress),
+        FrontierProbe::Absent => export_by_replay(
+            db,
+            last_checkpoint,
+            pre_last_checkpoint,
+            start,
+            &mut on_progress,
+        ),
     }
 }
 
@@ -215,13 +221,13 @@ fn probe_pre_last_checkpoint_frontiers(
     let ironwood = db.latest_stored_ironwood_tree(&height);
 
     match (sapling, orchard, ironwood) {
-        (Some(sapling), Some(orchard), Some(ironwood)) => Ok(FrontierProbe::Present(
-            DerivedFrontiers {
+        (Some(sapling), Some(orchard), Some(ironwood)) => {
+            Ok(FrontierProbe::Present(DerivedFrontiers {
                 sapling,
                 orchard,
                 ironwood,
-            },
-        )),
+            }))
+        }
         (None, None, None) => Ok(FrontierProbe::Absent),
         (sapling, orchard, ironwood) => {
             let mut missing = Vec::new();
@@ -303,9 +309,8 @@ fn collect_stored_pool<Node>(
 
     let mut records = Vec::with_capacity(expected);
     for (offset, (index, data)) in below_bound.into_iter().enumerate() {
-        let expected_index = NoteCommitmentSubtreeIndex(
-            u16::try_from(offset).expect("expected counts fit in u16"),
-        );
+        let expected_index =
+            NoteCommitmentSubtreeIndex(u16::try_from(offset).expect("expected counts fit in u16"));
         if index != expected_index {
             return Err(TreestateExportError::IncompleteStoredSubtrees {
                 pool,
@@ -337,7 +342,10 @@ fn export_by_replay(
         .vct_synced_below()
         .ok_or(TreestateExportError::NoExportSource { last_checkpoint })?;
     if marked != last_checkpoint {
-        return Err(TreestateExportError::MismatchedVctLastCheckpoint { marked, last_checkpoint });
+        return Err(TreestateExportError::MismatchedVctLastCheckpoint {
+            marked,
+            last_checkpoint,
+        });
     }
 
     let upgrade = db.vct_upgrade_height().unwrap_or(Height(0));
@@ -427,21 +435,19 @@ fn export_by_replay(
 mod tests {
     use zakura_chain::{
         block::{self, Height},
-        ironwood, orchard, sapling,
+        ironwood, orchard,
         parameters::{
-            testnet::{
-                ConfiguredActivationHeights, ConfiguredCheckpoints, ParametersBuilder,
-            },
+            testnet::{ConfiguredActivationHeights, ConfiguredCheckpoints, ParametersBuilder},
             Network,
         },
+        sapling,
         subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex, TRACKED_SUBTREE_HEIGHT},
     };
 
     use crate::{
         config::Config,
         service::finalized_state::{
-            DiskWriteBatch, WriteDisk, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE,
-            STATE_DATABASE_KIND,
+            DiskWriteBatch, WriteDisk, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE, STATE_DATABASE_KIND,
         },
         state_database_format_version_in_code,
     };
@@ -511,8 +517,16 @@ mod tests {
 
     fn store_empty_pre_last_checkpoint_frontiers(db: &ZakuraDb) {
         let mut batch = DiskWriteBatch::new();
-        batch.create_sapling_tree(db, &PRE_LAST_CHECKPOINT, &sapling::tree::NoteCommitmentTree::default());
-        batch.create_orchard_tree(db, &PRE_LAST_CHECKPOINT, &orchard::tree::NoteCommitmentTree::default());
+        batch.create_sapling_tree(
+            db,
+            &PRE_LAST_CHECKPOINT,
+            &sapling::tree::NoteCommitmentTree::default(),
+        );
+        batch.create_orchard_tree(
+            db,
+            &PRE_LAST_CHECKPOINT,
+            &orchard::tree::NoteCommitmentTree::default(),
+        );
         batch.create_ironwood_tree(
             db,
             &PRE_LAST_CHECKPOINT,
@@ -540,8 +554,7 @@ mod tests {
         while value < leaves {
             let end = (value + BATCH).min(leaves);
             let batch: Vec<_> = (value..end).map(sapling_note_commitment).collect();
-            tree.append_batch(&batch)
-                .expect("test tree is not full");
+            tree.append_batch(&batch).expect("test tree is not full");
             value = end;
         }
         tree
@@ -739,7 +752,9 @@ mod tests {
 
         assert_eq!(
             export(&db, |_, _| {}).expect_err("no export source fails"),
-            TreestateExportError::NoExportSource { last_checkpoint: LAST_CHECKPOINT }
+            TreestateExportError::NoExportSource {
+                last_checkpoint: LAST_CHECKPOINT
+            }
         );
     }
 

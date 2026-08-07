@@ -111,12 +111,9 @@ pub use disk_format::{
     FallibleDiskValue, FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex,
     TransactionLocation, MAX_ON_DISK_HEIGHT,
 };
-<<<<<<< HEAD
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use header_chain::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
-=======
 pub(crate) use treestate_artifact::embedded_historical_subtrees;
->>>>>>> 2aebade28 (feat(state): embed Mainnet historical subtree roots)
 pub use treestate_artifact::{SubtreeArtifact, SubtreeRecord, TreestateArtifactError};
 pub use treestate_export::{
     export as export_subtree_artifact, TreestateExport, TreestateExportError,

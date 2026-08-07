@@ -818,15 +818,18 @@ mod tests {
         );
     }
 
-    /// The tracked provenance record for the embedded Mainnet frontier.
-    const MAINNET_FRONTIER_PROVENANCE: &[u8] = include_bytes!("vct/mainnet-frontier.json");
+    /// The tracked provenance record for the embedded Mainnet VCT state.
+    const MAINNET_VCT_MANIFEST: &[u8] = include_bytes!("vct/mainnet-vct-manifest.json");
+
+    /// Embedded Mainnet completed-subtree roots authenticated by the same manifest.
+    const MAINNET_SUBTREES: &[u8] = include_bytes!("vct/mainnet-subtrees.bin");
 
     /// The provenance schema written by the release-state refresh workflow and
     /// checked by `scripts/check-release-state.sh`; this test keeps the record
-    /// bound to the embedded checkpoint list and frontier bytes on every PR.
+    /// bound to the embedded checkpoint list, frontier, and subtree bytes on every PR.
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct MainnetFrontierProvenance {
+    struct MainnetVctManifest {
         schema_version: u32,
         network: String,
         source: String,
@@ -836,6 +839,8 @@ mod tests {
         checkpoints_sha256: String,
         frontier_sha256: String,
         frontier_size: u64,
+        subtrees_sha256: String,
+        subtrees_size: u64,
         #[serde(default)]
         meta_sha256: Option<String>,
     }
@@ -990,13 +995,12 @@ mod tests {
     fn embedded_mainnet_final_frontiers_parse() {
         let frontiers = embedded_final_frontiers(&Network::Mainnet)
             .expect("mainnet has embedded final frontiers");
-        let provenance: MainnetFrontierProvenance =
-            serde_json::from_slice(MAINNET_FRONTIER_PROVENANCE)
-                .expect("embedded Mainnet frontier provenance must be strict JSON");
+        let provenance: MainnetVctManifest = serde_json::from_slice(MAINNET_VCT_MANIFEST)
+            .expect("embedded Mainnet VCT manifest must be strict JSON");
         let finalized_hash: block::Hash = provenance
             .finalized_hash
             .parse()
-            .expect("provenance must contain a canonical finalized block hash");
+            .expect("manifest must contain a canonical finalized block hash");
 
         assert_eq!(
             frontiers.height,
@@ -1010,17 +1014,17 @@ mod tests {
                 provenance.source.as_str(),
                 "legacy-bootstrap" | "release-state-bundle"
             ),
-            "provenance must identify a supported source"
+            "manifest must identify a supported source"
         );
         assert!(
             chrono::DateTime::parse_from_rfc3339(&provenance.generated_at).is_ok(),
-            "provenance must contain an RFC 3339 generation time"
+            "manifest must contain an RFC 3339 generation time"
         );
         assert_eq!(provenance.finalized_height, frontiers.height.0);
         assert_eq!(
             Network::Mainnet.checkpoint_list().hash(frontiers.height),
             Some(finalized_hash),
-            "provenance must identify the terminal Mainnet checkpoint"
+            "manifest must identify the terminal Mainnet checkpoint"
         );
         assert_eq!(
             provenance.checkpoints_sha256,
@@ -1034,7 +1038,7 @@ mod tests {
                     }
                 )
             )),
-            "provenance must authenticate the complete Mainnet checkpoint file"
+            "manifest must authenticate the complete Mainnet checkpoint file"
         );
         assert_eq!(
             provenance.frontier_size,
@@ -1043,7 +1047,16 @@ mod tests {
         assert_eq!(
             provenance.frontier_sha256,
             hex::encode(Sha256::digest(MAINNET_FINAL_FRONTIERS)),
-            "provenance must authenticate the embedded Mainnet frontier bytes"
+            "manifest must authenticate the embedded Mainnet frontier bytes"
+        );
+        assert_eq!(
+            provenance.subtrees_size,
+            u64::try_from(MAINNET_SUBTREES.len()).expect("subtree artifact length fits in u64")
+        );
+        assert_eq!(
+            provenance.subtrees_sha256,
+            hex::encode(Sha256::digest(MAINNET_SUBTREES)),
+            "manifest must authenticate the embedded Mainnet subtree bytes"
         );
         match provenance.source.as_str() {
             "legacy-bootstrap" => assert!(

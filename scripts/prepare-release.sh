@@ -453,14 +453,29 @@ if [ "$no_crates" = 0 ]; then
     fi
 
     # Changed but unbumped: let cargo-semver-checks pick the level against the
-    # base tag (a git baseline, unlike semver-checks.yml's crates.io baseline,
-    # because a base-tag crate version may never have been published).
-    echo "Running cargo-semver-checks for ${crate} against ${base_tag}..."
+    # exact base version. Published baselines can reuse the rustdoc JSON warmed
+    # by semver-checks.yml; unpublished base versions fall back to the git tag.
+    baseline_args=(--baseline-rev "$base_tag")
+    baseline_description="$base_tag (git)"
+    index_rc=0
+    crates_index_has_version "$crate" "$base_version" || index_rc=$?
+    case "$index_rc" in
+      0)
+        baseline_args=(--baseline-version "$base_version")
+        baseline_description="${crate}@${base_version} (crates.io)"
+        ;;
+      1) ;;
+      *)
+        echo "ERROR: could not query the crates.io index for ${crate}." >&2
+        exit 1
+        ;;
+    esac
+    echo "Running cargo-semver-checks for ${crate} against ${baseline_description}..."
     semver_output=""
     semver_status=0
     semver_output="$(
       cargo semver-checks --package "$crate" --default-features \
-        --baseline-rev "$base_tag" 2>&1
+        "${baseline_args[@]}" 2>&1
     )" || semver_status=$?
 
     if [ "$semver_status" -eq 0 ]; then

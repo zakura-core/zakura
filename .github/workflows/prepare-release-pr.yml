@@ -181,6 +181,17 @@ jobs:
           # replacing caches warmed by regular CI.
           cache-save-if: false
 
+      # Read the registry-baseline rustdoc JSON warmed by semver-checks.yml.
+      # Release preparation never saves or replaces this cache. Entries are
+      # keyed internally by crate version, so the rustc-only fallback can
+      # safely supply older published baselines still needed by a base tag.
+      - name: Restore semver baseline rustdoc cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: target/semver-checks/cache
+          key: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-${{ steps.params.outputs.base_tag }}
+          restore-keys: semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
+
       # Deliberately unpinned (like semver-checks.yml): cargo-semver-checks
       # must track new stable rustdoc formats.
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd #v2.84.1

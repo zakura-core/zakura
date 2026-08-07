@@ -921,7 +921,7 @@ async fn artifact_subtree_gaps_return_typed_errors_for_every_pool() {
                 index: NoteCommitmentSubtreeIndex(index),
                 // Tip-bound serving only merges records completed at or below the verified tip.
                 // Keep every height eligible so the index gap, not the tip filter, truncates the run.
-                end_height: Height(1),
+                end_height: Height::MIN,
                 root,
             })
             .collect()

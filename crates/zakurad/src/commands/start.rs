@@ -459,7 +459,7 @@ impl StartCmd {
         let advertised_services = Self::advertised_services(&config);
 
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
-            zakura_network::init_with_zakura_custom_services(
+            zakura_network::init_with_zakura(
                 config.network.clone(),
                 inbound,
                 latest_chain_tip.clone(),

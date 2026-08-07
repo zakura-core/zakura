@@ -3149,7 +3149,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
-    spawn_zakura_endpoint_with_custom_services(
+    spawn_zakura_endpoint_with_services(
         config,
         sink_factory,
         header_sync_driver_startup,
@@ -3158,8 +3158,8 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     .await
 }
 
-/// Start a Zakura endpoint with application-supplied protocol services.
-pub async fn spawn_zakura_endpoint_with_custom_services(
+/// Start a Zakura endpoint with optional runtime services.
+pub async fn spawn_zakura_endpoint_with_services(
     config: &Config,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,

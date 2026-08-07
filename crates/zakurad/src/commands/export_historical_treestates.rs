@@ -3,7 +3,7 @@
 //! Generation is bound to the network last checkpoint. A legacy archive that still holds
 //! pre-last-checkpoint frontiers exports its stored subtree rows directly. A verified-commitment-trees
 //! fast-synced database falls back to authenticated replay across the absent band
-//! (`docs/design/historical-treestate-serving.md` §4.6). Replay checks itself against the
+//! (`docs/design/verified-commitment-trees.md` §16). Replay checks itself against the
 //! authenticated roots the database already holds, so generation fails rather than publishing
 //! roots that do not match.
 

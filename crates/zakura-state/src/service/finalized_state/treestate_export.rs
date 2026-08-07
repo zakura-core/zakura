@@ -4,7 +4,7 @@
 //! synced. A legacy archive that still holds per-height frontiers at `H - 1` exports its stored
 //! subtree rows directly. A verified-commitment-trees fast-synced database that lacks those
 //! frontiers falls back to authenticated replay across the absent band (see
-//! `docs/design/historical-treestate-serving.md` §4.6).
+//! `docs/design/verified-commitment-trees.md` §16).
 //!
 //! # Direct export
 //!

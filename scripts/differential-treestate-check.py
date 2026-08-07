@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Compare a fast-synced node's derived treestates against a legacy-synced node's.
 
-Phase D of `docs/design/historical-treestate-serving.md` asks for a differential test: the same
-heights, served from a verified-commitment-trees fast-synced database and from a legacy archive
-node, must agree. This is the strongest available check on the design, because the two sides build
-their trees by entirely different routes — the legacy node recomputes every per-height tree as it
-syncs, while the fast-synced side replays block bodies and checks the result against authenticated
-roots. Agreement is independent evidence that replay reconstructs real history rather than merely
-being self-consistent.
+The validation described by `docs/design/verified-commitment-trees.md` uses a differential test:
+the same heights, served from a verified-commitment-trees fast-synced database and from a legacy
+archive node, must agree. This is the strongest available check on the design, because the two
+sides build their trees by entirely different routes — the legacy node recomputes every per-height
+tree as it syncs, while the fast-synced side replays block bodies and checks the result against
+authenticated roots. Agreement is independent evidence that replay reconstructs real history
+rather than merely being self-consistent.
 
 The comparison covers whatever range both sides can answer, so it strengthens on its own as a
 legacy node syncs further: rerun it as the node advances and the covered range grows.

@@ -110,19 +110,24 @@ pub fn contiguous_subtrees_from<Node>(
     contiguous
 }
 
-/// Merges published subtree records into `stored`, keeping the node's own row wherever both carry
-/// an index.
+/// Merges published subtree records completed at or below `verified_tip` into `stored`, keeping
+/// the node's own row wherever both carry an index.
 ///
 /// The node computed and verified its own rows; a published record is trusted only after a digest
 /// the artifact carries itself, which is not a signature. A correct artifact holds only subtrees
 /// completed at or below the last checkpoint and so never overlaps what the node stores, which means an
 /// overlap is precisely the corrupt-or-hostile case where precedence decides whether a wrong root
-/// reaches a client.
+/// reaches a client. The tip bound prevents the artifact from granting authority over blocks this
+/// node has not verified yet.
 pub fn merge_published_subtrees<Node>(
     stored: &mut BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
     published: impl IntoIterator<Item = (NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>)>,
+    verified_tip: block::Height,
 ) {
-    for (index, data) in published {
+    for (index, data) in published
+        .into_iter()
+        .filter(|(_, data)| data.end_height <= verified_tip)
+    {
         stored.entry(index).or_insert(data);
     }
 }

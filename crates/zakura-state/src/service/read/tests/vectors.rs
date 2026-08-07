@@ -1131,6 +1131,7 @@ fn published_subtree_merge_includes_non_finalized_rows() {
             (NoteCommitmentSubtreeIndex(0), node(1)),
             (NoteCommitmentSubtreeIndex(1), node(3)),
         ],
+        Height(11),
     );
     let served = contiguous_subtrees_from(merged, NoteCommitmentSubtreeIndex(0));
 
@@ -1169,6 +1170,7 @@ fn published_subtrees_never_displace_the_nodes_own_rows() {
             // Fills a genuine gap, which is what the artifact is for.
             (NoteCommitmentSubtreeIndex(2), node(3)),
         ],
+        Height(11),
     );
 
     assert_eq!(
@@ -1182,4 +1184,79 @@ fn published_subtrees_never_displace_the_nodes_own_rows() {
         "a published record still fills an index the node lacks"
     );
     assert_eq!(stored.len(), 3);
+}
+
+/// Published records cannot grant authority over blocks above the node's verified tip.
+#[test]
+fn published_subtrees_are_bounded_by_the_verified_tip() {
+    let node = |height: u32| {
+        NoteCommitmentSubtreeData::new(
+            Height(height),
+            sapling_crypto::Node::from_bytes([0; 32]).unwrap(),
+        )
+    };
+    let mut stored = std::collections::BTreeMap::new();
+
+    merge_published_subtrees(
+        &mut stored,
+        [
+            (NoteCommitmentSubtreeIndex(0), node(9)),
+            (NoteCommitmentSubtreeIndex(1), node(10)),
+            (NoteCommitmentSubtreeIndex(2), node(11)),
+        ],
+        Height(10),
+    );
+
+    assert_eq!(
+        stored.keys().copied().collect::<Vec<_>>(),
+        vec![NoteCommitmentSubtreeIndex(0), NoteCommitmentSubtreeIndex(1)],
+        "records at the verified tip are eligible, but records above it are not"
+    );
+}
+
+/// The embedded artifact is authoritative only for a database fast-synced to its checkpoint.
+#[tokio::test]
+async fn historical_subtrees_require_the_matching_fast_sync_last_checkpoint() {
+    let _init_guard = zakura_test::init();
+    let (_state, mut read_state, _latest_chain_tip, _chain_tip_change) =
+        init_test_services(&Mainnet).await;
+    let artifact_checkpoint = Height(10);
+
+    read_state.historical_subtrees = Some(Arc::new(SubtreeArtifact {
+        last_checkpoint: artifact_checkpoint,
+        ..SubtreeArtifact::default()
+    }));
+
+    assert!(
+        read_state
+            .historical_subtrees_at_last_checkpoint()
+            .is_none(),
+        "an ordinary database without a fast-sync marker must not use the artifact"
+    );
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, Height(9));
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding a mismatched last checkpoint succeeds");
+    assert!(
+        read_state
+            .historical_subtrees_at_last_checkpoint()
+            .is_none(),
+        "a different fast-sync last checkpoint must not use the artifact"
+    );
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, artifact_checkpoint);
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding the matching last checkpoint succeeds");
+    assert!(
+        read_state
+            .historical_subtrees_at_last_checkpoint()
+            .is_some(),
+        "the artifact is eligible once its checkpoint matches the durable last checkpoint"
+    );
 }

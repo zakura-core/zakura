@@ -785,6 +785,8 @@ impl Service<Request> for Mempool {
                 };
             }
 
+            invalidated_ids.extend(tx_downloads.take_failed_task_ids());
+
             // Handle best chain tip changes
             if let Some(TipAction::Grow { block }) = tip_action {
                 tracing::trace!(block_height = ?block.height, "handling blocks added to tip");

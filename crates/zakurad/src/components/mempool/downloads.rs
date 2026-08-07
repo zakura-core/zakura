@@ -27,6 +27,7 @@
 //! [`Mempool::poll_ready`]: super::Mempool::poll_ready
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -40,7 +41,10 @@ use futures::{
 };
 use pin_project::{pin_project, pinned_drop};
 use thiserror::Error;
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::{
+    sync::oneshot,
+    task::{JoinError, JoinHandle},
+};
 use tower::{Service, ServiceExt};
 use tracing_futures::Instrument;
 
@@ -167,6 +171,41 @@ pub enum TransactionDownloadVerifyError {
     },
 }
 
+type TransactionDownloadVerifyTaskResult = Result<
+    Result<
+        (
+            VerifiedUnminedTx,
+            Vec<transparent::OutPoint>,
+            Option<Height>,
+            Option<oneshot::Sender<Result<(), BoxError>>>,
+        ),
+        Box<(TransactionDownloadVerifyError, UnminedTxId)>,
+    >,
+    (UnminedTxId, tokio::time::error::Elapsed),
+>;
+
+/// Keeps the transaction ID available when the spawned task fails to join.
+#[pin_project]
+#[derive(Debug)]
+struct TransactionDownloadVerifyTask {
+    txid: UnminedTxId,
+    #[pin]
+    handle: JoinHandle<TransactionDownloadVerifyTaskResult>,
+}
+
+impl Future for TransactionDownloadVerifyTask {
+    type Output = (
+        UnminedTxId,
+        Result<TransactionDownloadVerifyTaskResult, JoinError>,
+    );
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        this.handle.poll(cx).map(|result| (*this.txid, result))
+    }
+}
+
 /// Represents a [`Stream`] of download and verification tasks.
 #[pin_project(PinnedDrop)]
 #[derive(Debug)]
@@ -199,22 +238,10 @@ where
     // Internal downloads state
     /// A list of pending transaction download and verify tasks.
     #[pin]
-    pending: FuturesUnordered<
-        JoinHandle<
-            Result<
-                Result<
-                    (
-                        VerifiedUnminedTx,
-                        Vec<transparent::OutPoint>,
-                        Option<Height>,
-                        Option<oneshot::Sender<Result<(), BoxError>>>,
-                    ),
-                    Box<(TransactionDownloadVerifyError, UnminedTxId)>,
-                >,
-                (UnminedTxId, tokio::time::error::Elapsed),
-            >,
-        >,
-    >,
+    pending: FuturesUnordered<TransactionDownloadVerifyTask>,
+
+    /// Transaction IDs whose tasks panicked or were cancelled before completion.
+    failed_task_ids: HashSet<UnminedTxId>,
 
     /// A list of channels that can be used to cancel pending transaction
     /// download and verify tasks. Each entry also stores the corresponding
@@ -260,7 +287,7 @@ where
     >;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let this = self.project();
+        let mut this = self.project();
         // CORRECTNESS
         //
         // The current task must be scheduled for wakeup every time we return
@@ -270,8 +297,42 @@ where
         // task is scheduled for wakeup when the next task becomes ready.
         //
         // TODO: this would be cleaner with poll_map (#2693)
-        let item = if let Some(join_result) = ready!(this.pending.poll_next(cx)) {
-            let result = join_result.expect("transaction download and verify tasks must not panic");
+        loop {
+            let Some((task_txid, join_result)) = ready!(this.pending.as_mut().poll_next(cx)) else {
+                return Poll::Ready(None);
+            };
+
+            let result = match join_result {
+                Ok(result) => result,
+                Err(join_error) => {
+                    let failure_reason = if join_error.is_panic() {
+                        "task_panic"
+                    } else {
+                        "task_cancelled"
+                    };
+
+                    error!(
+                        ?task_txid,
+                        %join_error,
+                        failure_reason,
+                        "transaction download and verification task failed"
+                    );
+                    metrics::counter!(
+                        "mempool.failed.verify.tasks.total",
+                        "reason" => failure_reason,
+                    )
+                    .increment(1);
+
+                    if let Some((_, _gossip, Some(source))) = this.cancel_handles.remove(&task_txid)
+                    {
+                        Self::release_peer_slot(this.pending_per_peer, source);
+                    }
+                    this.failed_task_ids.insert(task_txid);
+
+                    continue;
+                }
+            };
+
             let (result, completed_txid) = match result {
                 Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))) => {
                     let hash = tx.transaction.id;
@@ -302,12 +363,8 @@ where
                 }
             }
 
-            Some(result)
-        } else {
-            None
-        };
-
-        Poll::Ready(item)
+            return Poll::Ready(Some(result));
+        }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -349,6 +406,7 @@ where
             expose_peer_addresses,
             max_transaction_bytes,
             pending: FuturesUnordered::new(),
+            failed_task_ids: HashSet::new(),
             cancel_handles: HashMap::new(),
             pending_per_peer: HashMap::new(),
         }
@@ -544,7 +602,7 @@ where
         })
         .in_current_span();
 
-        let task = tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let fut = tokio::time::timeout(RATE_LIMIT_DELAY, fut);
 
             // Prefer the cancel handle if both are ready.
@@ -588,6 +646,8 @@ where
 
             result
         });
+
+        let task = TransactionDownloadVerifyTask { txid, handle };
 
         self.pending.push(task);
         if let Some(source) = &source {
@@ -647,8 +707,10 @@ where
         for (_hash, (cancel_tx, _gossip, _source)) in self.cancel_handles.drain() {
             let _ = cancel_tx.send(CancelDownloadAndVerify);
         }
+        self.failed_task_ids.clear();
         self.pending_per_peer.clear();
         assert!(self.pending.is_empty());
+        assert!(self.failed_task_ids.is_empty());
         assert!(self.cancel_handles.is_empty());
         metrics::gauge!("mempool.currently.queued.transactions",).set(self.pending.len() as f64);
     }
@@ -668,6 +730,11 @@ where
     #[allow(dead_code)]
     pub fn in_flight(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Takes transaction IDs whose tasks failed without returning a result.
+    pub(super) fn take_failed_task_ids(&mut self) -> HashSet<UnminedTxId> {
+        std::mem::take(&mut self.failed_task_ids)
     }
 
     /// Get a list of the currently pending transaction requests.
@@ -927,6 +994,100 @@ mod tests {
                 if error.0 == txid
                     && matches!(error.1, TransactionDownloadVerifyError::DownloadFailed(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn panicking_task_is_contained_and_releases_queue_state() {
+        let panic_txid = tx_id(7);
+        let transaction = empty_v5_transaction(8);
+        let success_txid = transaction.id;
+        let transaction_for_network = transaction.clone();
+
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(move |request| {
+                let transaction = transaction_for_network.clone();
+                async move {
+                    let zn::Request::TransactionsById(ids) = request else {
+                        panic!("unexpected network request: {request:?}");
+                    };
+
+                    if ids.contains(&panic_txid) {
+                        panic!("simulated transaction download panic");
+                    }
+
+                    assert_eq!(ids, HashSet::from([success_txid]));
+                    Ok(zn::Response::Transactions(vec![
+                        zn::InventoryResponse::Available((transaction, None)),
+                    ]))
+                }
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                let tx::Request::Mempool { transaction, .. } = request else {
+                    panic!("unexpected transaction verifier request: {request:?}");
+                };
+                let miner_fee = transaction.conventional_fee;
+                let transaction =
+                    VerifiedUnminedTx::new(transaction, miner_fee, 0, 0, Arc::new(Vec::new()))
+                        .expect("test transaction pays its conventional fee");
+
+                Ok::<_, BoxError>(tx::Response::Mempool {
+                    transaction,
+                    spent_mempool_outpoints: Vec::new(),
+                })
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
+                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            false,
+            u64::MAX,
+        );
+        let source = QueueSource::LegacySocket(([127, 0, 0, 1], 8233).into());
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+
+        downloads
+            .download_if_needed_and_verify(
+                Gossip::Id(panic_txid),
+                Some(source.clone()),
+                Some(rsp_tx),
+            )
+            .expect("panicking download is queued");
+
+        let failed_result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("panicking download task should complete");
+
+        assert!(failed_result.is_none());
+        assert_eq!(
+            downloads.take_failed_task_ids(),
+            HashSet::from([panic_txid])
+        );
+        assert!(
+            rsp_rx.await.is_err(),
+            "task panic should close its responder"
+        );
+        assert!(downloads.pending.is_empty());
+        assert!(downloads.cancel_handles.is_empty());
+        assert!(downloads.pending_per_peer.is_empty());
+
+        downloads
+            .download_if_needed_and_verify(Gossip::Id(success_txid), Some(source), None)
+            .expect("a new download is queued after the task panic");
+
+        let success = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("subsequent download should complete")
+            .expect("download stream should yield the subsequent result")
+            .expect("subsequent download should not time out")
+            .expect("subsequent transaction should verify");
+
+        assert_eq!(success.0.transaction.id, success_txid);
+        assert!(downloads.pending.is_empty());
+        assert!(downloads.cancel_handles.is_empty());
+        assert!(downloads.pending_per_peer.is_empty());
     }
 
     #[tokio::test]

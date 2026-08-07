@@ -7,13 +7,13 @@
 //! authenticated roots the database already holds, so generation fails rather than publishing
 //! roots that do not match.
 
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 
 use abscissa_core::{Application, Command, Runnable};
 use clap::Parser;
 use color_eyre::eyre::{eyre, Result, WrapErr};
 
-use zakura_chain::parameters::Network;
+use zakura_chain::{common::atomic_write, parameters::Network};
 
 use crate::prelude::APPLICATION;
 
@@ -90,7 +90,9 @@ impl ExportHistoricalTreestatesCmd {
         println!("elapsed:         {:.1}s", export.elapsed.as_secs_f64());
 
         let bytes = export.subtrees.encode(&self.network);
-        write_atomically(&self.subtree_output, &bytes)?;
+        atomic_write(self.subtree_output.clone(), &bytes)
+            .wrap_err_with(|| format!("writing {}", self.subtree_output.display()))?
+            .wrap_err_with(|| format!("persisting {}", self.subtree_output.display()))?;
 
         println!();
         println!(
@@ -101,18 +103,4 @@ impl ExportHistoricalTreestatesCmd {
 
         Ok(())
     }
-}
-
-/// Writes `bytes` to `path` via a temporary file and a rename.
-///
-/// A consumer must never observe a partially written artifact, and a crash mid-write must leave
-/// any previous one intact.
-fn write_atomically(path: &PathBuf, bytes: &[u8]) -> Result<()> {
-    let temporary = path.with_extension("tmp");
-
-    fs::write(&temporary, bytes).wrap_err_with(|| format!("writing {}", temporary.display()))?;
-    fs::rename(&temporary, path)
-        .wrap_err_with(|| format!("renaming {} to {}", temporary.display(), path.display()))?;
-
-    Ok(())
 }

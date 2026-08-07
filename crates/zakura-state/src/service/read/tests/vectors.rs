@@ -25,7 +25,9 @@ use crate::{
     init_test_services, populated_state,
     response::MinedTx,
     service::{
-        finalized_state::{DiskWriteBatch, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE},
+        finalized_state::{
+            DiskWriteBatch, SubtreeArtifact, SubtreeRecord, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE,
+        },
         non_finalized_state::Chain,
         read::{
             contiguous_subtrees_from, ironwood_subtrees, merge_published_subtrees,
@@ -36,7 +38,8 @@ use crate::{
             },
         },
     },
-    Config, HistoricalSubtreeUnavailableReason, ReadRequest, ReadResponse,
+    Config, HistoricalSubtreeUnavailable, HistoricalSubtreeUnavailableReason, ReadRequest,
+    ReadResponse,
 };
 
 /// Test that ReadStateService responds correctly when empty.
@@ -896,6 +899,87 @@ async fn pre_activation_tree_requests_return_empty_frontiers() {
         ReadResponse::SaplingTree(None),
         "an empty frontier is only returned for a block that exists"
     );
+}
+
+/// An artifact-backed subtree response must be checked through the end of its contiguous run.
+#[tokio::test]
+async fn artifact_subtree_gaps_return_typed_errors_for_every_pool() {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .take(2)
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, mut read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Mainnet).await;
+    let last_checkpoint = Height(10);
+
+    let records = |root| {
+        [0u16, 1, 3]
+            .into_iter()
+            .map(|index| SubtreeRecord {
+                index: NoteCommitmentSubtreeIndex(index),
+                end_height: Height(u32::from(index) + 1),
+                root,
+            })
+            .collect()
+    };
+    read_state.historical_subtrees = Some(Arc::new(SubtreeArtifact {
+        last_checkpoint,
+        sapling: records([0; 32]),
+        orchard: records([3; 32]),
+        ironwood: records([3; 32]),
+    }));
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, last_checkpoint);
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding a future last checkpoint succeeds");
+
+    let requests = [
+        (
+            "sapling",
+            ReadRequest::SaplingSubtrees {
+                start_index: NoteCommitmentSubtreeIndex(0),
+                limit: None,
+            },
+        ),
+        (
+            "orchard",
+            ReadRequest::OrchardSubtrees {
+                start_index: NoteCommitmentSubtreeIndex(0),
+                limit: None,
+            },
+        ),
+        (
+            "ironwood",
+            ReadRequest::IronwoodSubtrees {
+                start_index: NoteCommitmentSubtreeIndex(0),
+                limit: None,
+            },
+        ),
+    ];
+
+    for (pool, request) in requests {
+        let error = read_state
+            .clone()
+            .oneshot(request)
+            .await
+            .expect_err("an artifact gap must not return the short prefix [0, 1]");
+        let error = error
+            .downcast_ref::<HistoricalSubtreeUnavailable>()
+            .expect("subtree gaps return HistoricalSubtreeUnavailable");
+
+        assert_eq!(error.pool, pool);
+        assert_eq!(error.index, NoteCommitmentSubtreeIndex(2));
+        assert_eq!(error.last_checkpoint, last_checkpoint);
+        assert_eq!(
+            error.reason,
+            HistoricalSubtreeUnavailableReason::Indeterminate
+        );
+    }
 }
 
 /// The served run must be checked to its end, not just at its start.

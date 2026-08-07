@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Verify the committed Mainnet release state without cargo: the checkpoint
-# list, VCT frontier, and provenance record must identify the same finalized
-# block. Used by `make pre-release-state` and the update-release-state
+# list, VCT frontier, historical subtree roots, and manifest must identify the
+# same finalized block. Used by `make pre-release-state` and the update-release-state
 # workflow; the cargo-side twin is the `embedded_mainnet_final_frontiers_parse`
 # unit test. See docs/design/verified-commitment-trees.md, section 16.3.
 #
@@ -25,7 +25,8 @@ from datetime import datetime, timedelta, timezone
 
 CHECKPOINTS = "crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt"
 FRONTIER = "crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin"
-PROVENANCE = "crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json"
+SUBTREES = "crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin"
+PROVENANCE = "crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json"
 REQUIRED_KEYS = {
     "schema_version",
     "network",
@@ -36,6 +37,8 @@ REQUIRED_KEYS = {
     "checkpoints_sha256",
     "frontier_sha256",
     "frontier_size",
+    "subtrees_sha256",
+    "subtrees_size",
 }
 OPTIONAL_KEYS = {"meta_sha256"}
 STALE_WARNING = timedelta(days=14)
@@ -136,6 +139,35 @@ if blobs not in allowed_blobs:
         f"{FRONTIER} must frame {' or '.join(map(str, allowed_blobs))} tree blobs "
         f"for height {height}, found {blobs}"
     )
+
+subtrees = open(SUBTREES, "rb").read()
+if len(subtrees) != provenance["subtrees_size"]:
+    fail(f"{SUBTREES} size {len(subtrees)} does not match the provenance record")
+if hashlib.sha256(subtrees).hexdigest() != provenance["subtrees_sha256"]:
+    fail(f"{SUBTREES} digest does not match the provenance record")
+
+subtree_prefix = struct.Struct("<8sHBIIII")
+subtree_header_len = subtree_prefix.size + 32
+if len(subtrees) < subtree_header_len:
+    fail(f"{SUBTREES} is truncated before its payload")
+magic, version, network, subtree_handoff, *counts = subtree_prefix.unpack_from(subtrees)
+if magic != b"ZKVCTST1" or version != 1 or network != 1:
+    fail(f"{SUBTREES} has invalid Mainnet subtree-root framing")
+if subtree_handoff != height:
+    fail(
+        f"embedded subtree handoff {subtree_handoff} does not match "
+        f"provenance finalized_height {height}"
+    )
+if any(count > 2**16 for count in counts):
+    fail(f"{SUBTREES} declares too many subtree roots")
+subtree_payload = subtrees[subtree_header_len:]
+if len(subtree_payload) != sum(counts) * (2 + 4 + 32):
+    fail(f"{SUBTREES} payload length does not match its record counts")
+if (
+    hashlib.sha256(subtrees[:subtree_prefix.size] + subtree_payload).digest()
+    != subtrees[subtree_prefix.size:subtree_header_len]
+):
+    fail(f"{SUBTREES} digest does not match its header")
 
 source = provenance["source"]
 meta_sha256 = provenance.get("meta_sha256")

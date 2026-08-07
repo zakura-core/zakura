@@ -58,7 +58,46 @@ jobs:
             --metadata-out "$RUNNER_TEMP/release-state-resolution.json" \
             --max-age-hours "$MAX_AGE_HOURS"
 
-      - name: Import checkpoints, frontier, and provenance
+      # Subtree roots are interior tree nodes, so the importer's framing and append-only checks
+      # pass on an artifact whose roots are wrong or missing. Proving the bundle's two files
+      # against each other rejects a bad bundle before it reaches the working tree, rather than
+      # after. Skipped when the bundle carries no subtree artifact, which is what the importer
+      # does with it too.
+      - name: Check whether the bundle carries subtree roots
+        id: bundle-subtrees
+        env:
+          BUNDLE: ${{ runner.temp }}/release-state-bundle
+        run: |
+          set -euo pipefail
+          if [ -f "$BUNDLE/mainnet-treestate-subtrees.bin" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::bundle carries no subtree-root artifact; nothing to prove before import"
+          fi
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        if: steps.bundle-subtrees.outputs.present == 'true'
+        with:
+          toolchain: stable
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: ./.github/actions/setup-zakura-build
+        if: steps.bundle-subtrees.outputs.present == 'true'
+
+      - name: Prove the bundle's subtree roots against its own frontier
+        if: steps.bundle-subtrees.outputs.present == 'true'
+        env:
+          BUNDLE: ${{ runner.temp }}/release-state-bundle
+        run: |
+          set -euo pipefail
+          cargo run --release --locked -p zakura --bin zakurad -- \
+            verify-historical-treestates \
+            --network Mainnet \
+            --subtree-input "$BUNDLE/mainnet-treestate-subtrees.bin" \
+            --frontier-input "$BUNDLE/mainnet-frontier.bin"
+
+      - name: Import checkpoints, frontier, subtrees, and provenance
         id: import
         env:
           BUNDLE: ${{ runner.temp }}/release-state-bundle
@@ -111,7 +150,8 @@ jobs:
           sort > "$RUNNER_TEMP/allowed-files" <<'EOF'
           crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-          crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
           crates/zakurad/src/components/sync/end_of_support.rs
           EOF
           UNEXPECTED=$(comm -23 "$RUNNER_TEMP/actual-files" "$RUNNER_TEMP/allowed-files")

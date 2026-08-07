@@ -82,6 +82,8 @@ pub(crate) mod commitment_aux;
 pub(crate) mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
+pub mod treestate_artifact;
+pub mod treestate_export;
 mod vct;
 pub mod vct_treestate_audit;
 mod zakura_db;
@@ -108,6 +110,14 @@ pub use disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk};
 pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
     MAX_ON_DISK_HEIGHT,
+};
+pub(crate) use treestate_artifact::embedded_historical_subtrees;
+pub use treestate_artifact::{
+    verify_subtree_artifact, SubtreeArtifact, SubtreeRecord, TreestateArtifactError,
+    VerifiedSubtreeCounts,
+};
+pub use treestate_export::{
+    export as export_subtree_artifact, TreestateExport, TreestateExportError,
 };
 pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, NextVctBlock};
 pub use vct_treestate_audit::{

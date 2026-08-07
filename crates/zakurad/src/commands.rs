@@ -12,8 +12,9 @@ pub use self::{entry_point::EntryPoint, start::StartCmd};
 
 use self::{
     audit_historical_treestates::AuditHistoricalTreestatesCmd, copy_state::CopyStateCmd,
-    generate::GenerateCmd, prune_state::PruneStateCmd, rollback_state::RollbackStateCmd,
-    tip_height::TipHeightCmd,
+    export_historical_treestates::ExportHistoricalTreestatesCmd, generate::GenerateCmd,
+    prune_state::PruneStateCmd, rollback_state::RollbackStateCmd, tip_height::TipHeightCmd,
+    verify_historical_treestates::VerifyHistoricalTreestatesCmd,
 };
 
 pub mod start;
@@ -21,10 +22,12 @@ pub mod start;
 mod audit_historical_treestates;
 mod copy_state;
 mod entry_point;
+mod export_historical_treestates;
 mod generate;
 pub mod prune_state;
 pub mod rollback_state;
 mod tip_height;
+mod verify_historical_treestates;
 
 #[cfg(test)]
 mod tests;
@@ -42,6 +45,12 @@ const LEGACY_CONFIG_FILE: &str = "zebrad.toml";
 pub enum ZakuradCmd {
     /// Audit historical note commitment treestate serving in the state database
     AuditHistoricalTreestates(AuditHistoricalTreestatesCmd),
+
+    /// Generate the historical subtree-root artifact from the state database
+    ExportHistoricalTreestates(ExportHistoricalTreestatesCmd),
+
+    /// Prove a historical subtree-root artifact against a note commitment frontier
+    VerifyHistoricalTreestates(VerifyHistoricalTreestatesCmd),
 
     /// The `copy-state` subcommand, used to debug cached chain state (expert users only)
     // TODO: hide this command from users in release builds (#3279)
@@ -77,10 +86,12 @@ impl ZakuradCmd {
 
             // Utility commands that don't use server components
             AuditHistoricalTreestates(_)
+            | ExportHistoricalTreestates(_)
             | Generate(_)
             | PruneState(_)
             | RollbackState(_)
-            | TipHeight(_) => false,
+            | TipHeight(_)
+            | VerifyHistoricalTreestates(_) => false,
         }
     }
 
@@ -96,10 +107,12 @@ impl ZakuradCmd {
             // Utility commands
             AuditHistoricalTreestates(_)
             | CopyState(_)
+            | ExportHistoricalTreestates(_)
             | Generate(_)
             | PruneState(_)
             | RollbackState(_)
-            | TipHeight(_) => false,
+            | TipHeight(_)
+            | VerifyHistoricalTreestates(_) => false,
         }
     }
 
@@ -119,10 +132,12 @@ impl ZakuradCmd {
             // - is used by automated tools, or
             // - needs to be read easily.
             AuditHistoricalTreestates(_)
+            | ExportHistoricalTreestates(_)
             | Generate(_)
             | PruneState(_)
             | RollbackState(_)
-            | TipHeight(_) => true,
+            | TipHeight(_)
+            | VerifyHistoricalTreestates(_) => true,
 
             // Commands that generate informative logging output by default.
             CopyState(_) | Start(_) => false,
@@ -142,12 +157,14 @@ impl Runnable for ZakuradCmd {
     fn run(&self) {
         match self {
             AuditHistoricalTreestates(cmd) => cmd.run(),
+            ExportHistoricalTreestates(cmd) => cmd.run(),
             CopyState(cmd) => cmd.run(),
             Generate(cmd) => cmd.run(),
             PruneState(cmd) => cmd.run(),
             RollbackState(cmd) => cmd.run(),
             Start(cmd) => cmd.run(),
             TipHeight(cmd) => cmd.run(),
+            VerifyHistoricalTreestates(cmd) => cmd.run(),
         }
     }
 }

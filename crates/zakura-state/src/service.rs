@@ -15,8 +15,9 @@
 //!   chain tip changes.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
+    ops::Bound,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -37,7 +38,7 @@ use zakura_chain::{
     parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{Network, NetworkUpgrade},
     serialization::ZcashSerialize,
-    subtree::NoteCommitmentSubtreeIndex,
+    subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
 };
 
 use crate::{
@@ -251,6 +252,12 @@ pub struct ReadStateService {
     /// Keeps the completed-checkpoint watch open in read-only services.
     _highest_completed_checkpoint_sender:
         Option<tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>>,
+
+    /// Published completed subtree roots for heights below the last checkpoint.
+    ///
+    /// `None` on networks without an embedded artifact, in which case `z_getsubtreesbyindex`
+    /// keeps reporting the absent band rather than serving unchecked data.
+    historical_subtrees: Option<Arc<finalized_state::SubtreeArtifact>>,
 
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
     vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
@@ -1133,11 +1140,15 @@ impl ReadStateService {
             Option<finalized_state::HeaderRootAuthState>,
         >,
     ) -> Self {
+        let historical_subtrees =
+            finalized_state::embedded_historical_subtrees(&finalized_state.network()).map(Arc::new);
+
         let read_service = Self {
             network: finalized_state.network(),
             db: finalized_state.db.clone(),
             non_finalized_state_receiver,
             block_write_task,
+            historical_subtrees,
             highest_completed_checkpoint_receiver,
             _highest_completed_checkpoint_sender: highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
@@ -1152,6 +1163,17 @@ impl ReadStateService {
     /// Return the tip of the current best chain.
     pub fn best_tip(&self) -> Option<(block::Height, block::Hash)> {
         read::best_tip(&self.latest_non_finalized_state(), &self.db)
+    }
+
+    /// Returns the embedded subtree artifact only when it describes this database's fast-sync
+    /// last checkpoint.
+    ///
+    /// This check is made when serving rather than at construction because the durable last
+    /// checkpoint marker can be written after the read service starts.
+    fn historical_subtrees_at_last_checkpoint(&self) -> Option<&finalized_state::SubtreeArtifact> {
+        let artifact = self.historical_subtrees.as_deref()?;
+
+        (self.db.vct_synced_below() == Some(artifact.last_checkpoint)).then_some(artifact)
     }
 
     /// Subscribe to VCT supplied-root repair needs discovered by the finalized writer.
@@ -1675,6 +1697,59 @@ where
         .collect()
 }
 
+/// Returns the index range a subtree request covers, as a concrete range type.
+///
+/// Mirrors the read path's handling of an absent or overflowing end bound, where the request is
+/// served to the end of what exists.
+fn range_for(
+    start_index: NoteCommitmentSubtreeIndex,
+    end_index: Option<NoteCommitmentSubtreeIndex>,
+) -> (
+    Bound<NoteCommitmentSubtreeIndex>,
+    Bound<NoteCommitmentSubtreeIndex>,
+) {
+    (
+        Bound::Included(start_index),
+        end_index.map_or(Bound::Unbounded, Bound::Excluded),
+    )
+}
+
+/// Uses published subtrees when the node's own rows do not cover `start_index`.
+///
+/// The read result already applies the continuity contract and reports the absent band, so it
+/// stands on its own when it covers `start_index`. Otherwise, this helper tries the union supplied
+/// by `merge_published`, rechecks availability over the whole union, and reapplies continuity.
+/// If that union still does not reach `start_index`, the original result stands, including its
+/// typed absent-band error.
+fn subtrees_with_published_fallback<Node, Error>(
+    stored: Result<BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>, Error>,
+    start_index: NoteCommitmentSubtreeIndex,
+    merge_published: impl FnOnce() -> Option<
+        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+    >,
+    check_available: impl FnOnce(
+        &BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+    ) -> Result<(), Error>,
+) -> Result<BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>, Error> {
+    match stored {
+        Ok(subtrees) if subtrees.contains_key(&start_index) => Ok(subtrees),
+        result => {
+            let Some(merged) = merge_published() else {
+                return result;
+            };
+
+            check_available(&merged)?;
+            let merged = read::contiguous_subtrees_from(merged, start_index);
+
+            if merged.contains_key(&start_index) {
+                Ok(merged)
+            } else {
+                result
+            }
+        }
+    }
+}
+
 fn block_roots_by_height_range<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -2094,15 +2169,45 @@ impl Service<ReadRequest> for ReadStateService {
                     .map(NoteCommitmentSubtreeIndex);
 
                 let best_chain = state.latest_best_chain();
+                let verified_tip = read::tip_height(best_chain.clone(), &state.db);
                 let sapling_subtrees = if let Some(end_index) = end_index {
-                    read::sapling_subtrees(best_chain, &state.db, start_index..end_index)
+                    read::sapling_subtrees(best_chain.clone(), &state.db, start_index..end_index)
                 } else {
                     // If there is no end bound, just return all the trees.
                     // If the end bound would overflow, just returns all the trees, because that's what
                     // `zcashd` does. (It never calculates an end bound, so it just keeps iterating until
                     // the trees run out.)
-                    read::sapling_subtrees(best_chain, &state.db, start_index..)
-                }?;
+                    read::sapling_subtrees(best_chain.clone(), &state.db, start_index..)
+                };
+
+                let sapling_subtrees = subtrees_with_published_fallback(
+                    sapling_subtrees,
+                    start_index,
+                    || {
+                        state
+                            .historical_subtrees_at_last_checkpoint()
+                            .zip(verified_tip)
+                            .map(|(artifact, verified_tip)| {
+                                let range = range_for(start_index, end_index);
+                                let mut merged =
+                                    read::sapling_subtrees_with_gaps(best_chain, &state.db, range);
+                                read::merge_published_subtrees(
+                                    &mut merged,
+                                    artifact.sapling_range(range),
+                                    verified_tip,
+                                );
+                                merged
+                            })
+                    },
+                    |merged| {
+                        read::check_historical_sapling_subtrees_available(
+                            &state.db,
+                            start_index,
+                            end_index,
+                            merged,
+                        )
+                    },
+                )?;
 
                 Ok(ReadResponse::SaplingSubtrees(sapling_subtrees))
             }
@@ -2113,15 +2218,45 @@ impl Service<ReadRequest> for ReadStateService {
                     .map(NoteCommitmentSubtreeIndex);
 
                 let best_chain = state.latest_best_chain();
+                let verified_tip = read::tip_height(best_chain.clone(), &state.db);
                 let orchard_subtrees = if let Some(end_index) = end_index {
-                    read::orchard_subtrees(best_chain, &state.db, start_index..end_index)
+                    read::orchard_subtrees(best_chain.clone(), &state.db, start_index..end_index)
                 } else {
                     // If there is no end bound, just return all the trees.
                     // If the end bound would overflow, just returns all the trees, because that's what
                     // `zcashd` does. (It never calculates an end bound, so it just keeps iterating until
                     // the trees run out.)
-                    read::orchard_subtrees(best_chain, &state.db, start_index..)
-                }?;
+                    read::orchard_subtrees(best_chain.clone(), &state.db, start_index..)
+                };
+
+                let orchard_subtrees = subtrees_with_published_fallback(
+                    orchard_subtrees,
+                    start_index,
+                    || {
+                        state
+                            .historical_subtrees_at_last_checkpoint()
+                            .zip(verified_tip)
+                            .map(|(artifact, verified_tip)| {
+                                let range = range_for(start_index, end_index);
+                                let mut merged =
+                                    read::orchard_subtrees_with_gaps(best_chain, &state.db, range);
+                                read::merge_published_subtrees(
+                                    &mut merged,
+                                    artifact.orchard_range(range),
+                                    verified_tip,
+                                );
+                                merged
+                            })
+                    },
+                    |merged| {
+                        read::check_historical_orchard_subtrees_available(
+                            &state.db,
+                            start_index,
+                            end_index,
+                            merged,
+                        )
+                    },
+                )?;
 
                 Ok(ReadResponse::OrchardSubtrees(orchard_subtrees))
             }
@@ -2132,11 +2267,41 @@ impl Service<ReadRequest> for ReadStateService {
                     .map(NoteCommitmentSubtreeIndex);
 
                 let best_chain = state.latest_best_chain();
+                let verified_tip = read::tip_height(best_chain.clone(), &state.db);
                 let ironwood_subtrees = if let Some(end_index) = end_index {
-                    read::ironwood_subtrees(best_chain, &state.db, start_index..end_index)
+                    read::ironwood_subtrees(best_chain.clone(), &state.db, start_index..end_index)
                 } else {
-                    read::ironwood_subtrees(best_chain, &state.db, start_index..)
-                }?;
+                    read::ironwood_subtrees(best_chain.clone(), &state.db, start_index..)
+                };
+
+                let ironwood_subtrees = subtrees_with_published_fallback(
+                    ironwood_subtrees,
+                    start_index,
+                    || {
+                        state
+                            .historical_subtrees_at_last_checkpoint()
+                            .zip(verified_tip)
+                            .map(|(artifact, verified_tip)| {
+                                let range = range_for(start_index, end_index);
+                                let mut merged =
+                                    read::ironwood_subtrees_with_gaps(best_chain, &state.db, range);
+                                read::merge_published_subtrees(
+                                    &mut merged,
+                                    artifact.ironwood_range(range),
+                                    verified_tip,
+                                );
+                                merged
+                            })
+                    },
+                    |merged| {
+                        read::check_historical_ironwood_subtrees_available(
+                            &state.db,
+                            start_index,
+                            end_index,
+                            merged,
+                        )
+                    },
+                )?;
 
                 Ok(ReadResponse::IronwoodSubtrees(ironwood_subtrees))
             }

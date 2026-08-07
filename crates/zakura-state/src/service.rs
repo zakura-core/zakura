@@ -2123,13 +2123,13 @@ impl Service<ReadRequest> for ReadStateService {
 
                 let best_chain = state.latest_best_chain();
                 let sapling_subtrees = if let Some(end_index) = end_index {
-                    read::sapling_subtrees(best_chain, &state.db, start_index..end_index)
+                    read::sapling_subtrees(best_chain.clone(), &state.db, start_index..end_index)
                 } else {
                     // If there is no end bound, just return all the trees.
                     // If the end bound would overflow, just returns all the trees, because that's what
                     // `zcashd` does. (It never calculates an end bound, so it just keeps iterating until
                     // the trees run out.)
-                    read::sapling_subtrees(best_chain, &state.db, start_index..)
+                    read::sapling_subtrees(best_chain.clone(), &state.db, start_index..)
                 };
 
                 // The read above already applies the continuity contract and reports the absent
@@ -2146,7 +2146,8 @@ impl Service<ReadRequest> for ReadStateService {
                     result => {
                         let published = if let Some(artifact) = state.historical_subtrees.as_ref() {
                             let range = range_for(start_index, end_index);
-                            let mut merged = state.db.sapling_subtree_list_by_index_range(range);
+                            let mut merged =
+                                read::sapling_subtrees_with_gaps(best_chain, &state.db, range);
                             read::merge_published_subtrees(
                                 &mut merged,
                                 artifact.sapling_range(range),
@@ -2180,13 +2181,13 @@ impl Service<ReadRequest> for ReadStateService {
 
                 let best_chain = state.latest_best_chain();
                 let orchard_subtrees = if let Some(end_index) = end_index {
-                    read::orchard_subtrees(best_chain, &state.db, start_index..end_index)
+                    read::orchard_subtrees(best_chain.clone(), &state.db, start_index..end_index)
                 } else {
                     // If there is no end bound, just return all the trees.
                     // If the end bound would overflow, just returns all the trees, because that's what
                     // `zcashd` does. (It never calculates an end bound, so it just keeps iterating until
                     // the trees run out.)
-                    read::orchard_subtrees(best_chain, &state.db, start_index..)
+                    read::orchard_subtrees(best_chain.clone(), &state.db, start_index..)
                 };
 
                 // The read above already applies the continuity contract and reports the absent
@@ -2203,7 +2204,8 @@ impl Service<ReadRequest> for ReadStateService {
                     result => {
                         let published = if let Some(artifact) = state.historical_subtrees.as_ref() {
                             let range = range_for(start_index, end_index);
-                            let mut merged = state.db.orchard_subtree_list_by_index_range(range);
+                            let mut merged =
+                                read::orchard_subtrees_with_gaps(best_chain, &state.db, range);
                             read::merge_published_subtrees(
                                 &mut merged,
                                 artifact.orchard_range(range),
@@ -2237,9 +2239,9 @@ impl Service<ReadRequest> for ReadStateService {
 
                 let best_chain = state.latest_best_chain();
                 let ironwood_subtrees = if let Some(end_index) = end_index {
-                    read::ironwood_subtrees(best_chain, &state.db, start_index..end_index)
+                    read::ironwood_subtrees(best_chain.clone(), &state.db, start_index..end_index)
                 } else {
-                    read::ironwood_subtrees(best_chain, &state.db, start_index..)
+                    read::ironwood_subtrees(best_chain.clone(), &state.db, start_index..)
                 };
 
                 // The read above already applies the continuity contract and reports the absent
@@ -2256,7 +2258,8 @@ impl Service<ReadRequest> for ReadStateService {
                     result => {
                         let published = if let Some(artifact) = state.historical_subtrees.as_ref() {
                             let range = range_for(start_index, end_index);
-                            let mut merged = state.db.ironwood_subtree_list_by_index_range(range);
+                            let mut merged =
+                                read::ironwood_subtrees_with_gaps(best_chain, &state.db, range);
                             read::merge_published_subtrees(
                                 &mut merged,
                                 artifact.ironwood_range(range),

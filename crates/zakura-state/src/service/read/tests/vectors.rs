@@ -34,7 +34,7 @@ use crate::{
             orchard_subtrees, sapling_subtrees,
             tree::{
                 first_missing_subtree_index, is_syncing_below_last_checkpoint,
-                subtree_completed_by_last_checkpoint,
+                sapling_subtrees_with_gaps, subtree_completed_by_last_checkpoint,
             },
         },
     },
@@ -1102,6 +1102,43 @@ fn contiguous_subtrees_spans_published_and_stored_rows() {
         served.keys().copied().collect::<Vec<_>>(),
         vec![NoteCommitmentSubtreeIndex(2), NoteCommitmentSubtreeIndex(3)],
         "the run starts at the requested index"
+    );
+}
+
+/// Artifact fallback merging must retain verified rows from the non-finalized best chain.
+#[test]
+fn published_subtree_merge_includes_non_finalized_rows() {
+    let node = |root: u8| {
+        NoteCommitmentSubtreeData::new(
+            Height(11),
+            sapling_crypto::Node::from_bytes([root; 32]).unwrap(),
+        )
+    };
+
+    let mut chain = Chain::default();
+    chain.insert_sapling_subtree(NoteCommitmentSubtree::new(1, Height(11), node(2).root));
+
+    let db = new_ephemeral_db();
+    let mut merged = sapling_subtrees_with_gaps(
+        Some(Arc::new(chain)),
+        &db,
+        NoteCommitmentSubtreeIndex(0)..NoteCommitmentSubtreeIndex(2),
+    );
+
+    merge_published_subtrees(
+        &mut merged,
+        [
+            (NoteCommitmentSubtreeIndex(0), node(1)),
+            (NoteCommitmentSubtreeIndex(1), node(3)),
+        ],
+    );
+    let served = contiguous_subtrees_from(merged, NoteCommitmentSubtreeIndex(0));
+
+    assert_eq!(served.len(), 2);
+    assert_eq!(
+        served[&NoteCommitmentSubtreeIndex(1)].root,
+        node(2).root,
+        "the verified best-chain row must win over the artifact"
     );
 }
 

@@ -48,7 +48,8 @@ pub use historical_tree::{
 };
 pub(crate) use tree::{
     check_historical_ironwood_subtrees_available, check_historical_orchard_subtrees_available,
-    check_historical_sapling_subtrees_available,
+    check_historical_sapling_subtrees_available, ironwood_subtrees_with_gaps,
+    orchard_subtrees_with_gaps, sapling_subtrees_with_gaps,
 };
 pub use tree::{
     contiguous_subtrees_from, ironwood_subtrees, ironwood_tree, merge_published_subtrees,

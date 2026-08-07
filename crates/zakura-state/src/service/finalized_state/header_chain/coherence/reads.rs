@@ -26,6 +26,35 @@ fn selected_projection_node_disagreement_never_produces_a_hash_or_locator() {
 }
 
 #[test]
+fn same_height_fork_sibling_never_enters_selected_reads() {
+    let _init_guard = zakura_test::init();
+    let mut harness = Harness::new();
+    harness.run_all(&[
+        Op::InsertHeaders {
+            source: Source::Trunk,
+            offset: 0,
+            len: 60,
+            anchor: Anchor::Natural,
+        },
+        Op::InsertHeaders {
+            source: Source::Branch(0),
+            offset: 0,
+            len: 2,
+            anchor: Anchor::Natural,
+        },
+    ]);
+    let selected = harness.trunk_frontier(52);
+    let sibling = harness.branch_frontier(0, 1);
+    assert_eq!(selected.height, sibling.height);
+    assert_ne!(selected.hash, sibling.hash);
+
+    harness.corrupt_selected_hash(selected.height, sibling.hash);
+    harness.assert_selected_hash_fails_closed(selected.height);
+    harness.assert_selected_locator_fails_closed();
+    harness.assert_selected_roots_fail_closed(selected.height);
+}
+
+#[test]
 fn selected_projection_gap_within_published_bounds_is_incoherent() {
     let _init_guard = zakura_test::init();
     let harness = trunk_harness();

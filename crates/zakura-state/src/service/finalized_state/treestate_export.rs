@@ -113,6 +113,17 @@ pub enum TreestateExportError {
         detail: String,
     },
 
+    /// A frontier requires more completed subtrees than the artifact format can index.
+    #[error(
+        "{pool} frontier requires {found} completed subtrees, which the artifact format cannot represent"
+    )]
+    UnrepresentableSubtreeCount {
+        /// Which pool has too many completed subtrees.
+        pool: &'static str,
+        /// The completed-subtree count implied by the frontier.
+        found: u64,
+    },
+
     /// The database has no pre-last-checkpoint frontiers and no usable VCT absent band to replay.
     #[error(
         "cannot export historical subtrees: pre-last-checkpoint frontiers are absent and the database \
@@ -329,8 +340,19 @@ fn collect_stored_pool<Node>(
     stored: BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
     root_bytes: impl Fn(&Node) -> [u8; 32],
 ) -> Result<Vec<SubtreeRecord>, TreestateExportError> {
-    let expected = usize::try_from(leaf_count >> TRACKED_SUBTREE_HEIGHT)
-        .expect("subtree indexes are u16, so completed counts fit in usize");
+    let completed_subtrees = leaf_count >> TRACKED_SUBTREE_HEIGHT;
+    if completed_subtrees > u64::from(u16::MAX) + 1 {
+        return Err(TreestateExportError::UnrepresentableSubtreeCount {
+            pool,
+            found: completed_subtrees,
+        });
+    }
+    let expected = usize::try_from(completed_subtrees).map_err(|_| {
+        TreestateExportError::UnrepresentableSubtreeCount {
+            pool,
+            found: completed_subtrees,
+        }
+    })?;
 
     let below_bound: Vec<_> = stored
         .into_iter()
@@ -348,8 +370,12 @@ fn collect_stored_pool<Node>(
 
     let mut records = Vec::with_capacity(expected);
     for (offset, (index, data)) in below_bound.into_iter().enumerate() {
-        let expected_index =
-            NoteCommitmentSubtreeIndex(u16::try_from(offset).expect("expected counts fit in u16"));
+        let expected_index = NoteCommitmentSubtreeIndex(u16::try_from(offset).map_err(|_| {
+            TreestateExportError::UnrepresentableSubtreeCount {
+                pool,
+                found: completed_subtrees,
+            }
+        })?);
         if index != expected_index {
             return Err(TreestateExportError::IncompleteStoredSubtrees {
                 pool,
@@ -645,6 +671,23 @@ mod tests {
             ),
             Err(TreestateExportError::IncompleteStoredSubtrees { expected: 2, .. })
         ));
+
+        assert_eq!(
+            collect_stored_pool(
+                "sapling",
+                bound,
+                (u64::from(u16::MAX) + 2) << TRACKED_SUBTREE_HEIGHT,
+                BTreeMap::<
+                    NoteCommitmentSubtreeIndex,
+                    NoteCommitmentSubtreeData<sapling_crypto::Node>,
+                >::new(),
+                |root| root.to_bytes(),
+            ),
+            Err(TreestateExportError::UnrepresentableSubtreeCount {
+                pool: "sapling",
+                found: u64::from(u16::MAX) + 2,
+            })
+        );
     }
 
     #[test]

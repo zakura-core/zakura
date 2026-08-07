@@ -644,7 +644,7 @@ where
     // to be equal once the leaves have diverged.)
 
     match chain.map(|chain| read_chain(chain.as_ref(), range.clone())) {
-        Some(chain_results) if chain_results.contains_key(&start_index) => return chain_results,
+        Some(chain_results) if chain_results.contains_key(&start_index) => chain_results,
         Some(chain_results) => {
             let mut db_results = read_disk(range);
 

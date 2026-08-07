@@ -114,5 +114,9 @@ harness = false
 name = "sapling"
 harness = false
 
+[[bench]]
+name = "worst_case_tx_verification"
+harness = false
+
 [lints]
 workspace = true

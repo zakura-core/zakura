@@ -3,6 +3,7 @@
 use group::{
     ff::{FromUniformBytes, PrimeField},
     prime::PrimeCurveAffine,
+    GroupEncoding,
 };
 use halo2::pasta::pallas;
 use reddsa::{orchard::SpendAuth, Signature, SigningKey, VerificationKey, VerificationKeyBytes};
@@ -24,11 +25,11 @@ impl Arbitrary for Action {
             any::<note::WrappedNoteKey>(),
         )
             .prop_map(|(nullifier, rk, enc_ciphertext, out_ciphertext)| Self {
-                cv: ValueCommitment(pallas::Affine::identity()),
+                cv: ValueCommitment(pallas::Affine::identity().to_bytes()),
                 nullifier,
                 rk: rk.0,
                 cm_x: NoteCommitment(pallas::Affine::identity()).extract_x(),
-                ephemeral_key: EphemeralPublicKey(pallas::Affine::generator()),
+                ephemeral_key: EphemeralPublicKey(pallas::Affine::generator().to_bytes()),
                 enc_ciphertext,
                 out_ciphertext,
             })

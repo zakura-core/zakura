@@ -451,6 +451,8 @@ where
                 Ok(()) => {}
             }
             check::sapling_point_encodings_are_valid(&tx)?;
+            check::orchard_point_encodings_are_valid(&tx)?;
+            check::ironwood_point_encodings_are_valid(&tx)?;
 
             // Soft fork: temporarily require transactions to not contain Orchard actions.
             //

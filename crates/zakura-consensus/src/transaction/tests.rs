@@ -13,7 +13,10 @@ use std::{
 use chrono::{DateTime, TimeZone, Utc};
 use color_eyre::eyre::Report;
 use futures::{FutureExt, TryFutureExt};
-use halo2::pasta::{group::ff::PrimeField, pallas};
+use halo2::pasta::{
+    group::{ff::PrimeField, GroupEncoding},
+    pallas,
+};
 use tokio::time::timeout;
 use tower::{buffer::Buffer, service_fn, Service, ServiceExt};
 use tower_batch_control::{Batch, BatchControl};
@@ -3653,6 +3656,181 @@ fn sapling_spends_with_invalid_value_commitments_are_rejected_after_roundtrip() 
             );
         }
     });
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OrchardLikePool {
+    Orchard,
+    Ironwood,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DeferredOrchardPoint {
+    ValueCommitment,
+    EphemeralKey,
+}
+
+/// Orchard and Ironwood lazy point encodings must fail before any state access.
+#[test]
+fn orchard_and_ironwood_invalid_points_are_rejected_early() {
+    let _init_guard = zakura_test::init();
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let mut shielded_data = orchard_fixture();
+        shielded_data.flags = Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS;
+
+        let nu5_height = NetworkUpgrade::Nu5
+            .activation_height(&Network::Mainnet)
+            .expect("NU5 has a Mainnet activation height");
+        let v5_orchard = Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::unlocked(),
+            expiry_height: nu5_height,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: Some(shielded_data.clone()),
+        };
+
+        let (nu6_3_network, nu6_3_height) = nu6_3_test_network_and_height();
+        let v6_orchard = v6_pool_flow_transaction(Some(shielded_data.clone()), None, Vec::new());
+        let v6_ironwood = v6_pool_flow_transaction(None, Some(shielded_data), Vec::new());
+
+        let cases = [
+            (
+                "V5 Orchard",
+                Network::Mainnet,
+                nu5_height,
+                OrchardLikePool::Orchard,
+                v5_orchard,
+            ),
+            (
+                "V6 Orchard",
+                nu6_3_network.clone(),
+                nu6_3_height,
+                OrchardLikePool::Orchard,
+                v6_orchard,
+            ),
+            (
+                "V6 Ironwood",
+                nu6_3_network,
+                nu6_3_height,
+                OrchardLikePool::Ironwood,
+                v6_ironwood,
+            ),
+        ];
+
+        for (name, network, height, pool, transaction) in cases {
+            for point in [
+                DeferredOrchardPoint::ValueCommitment,
+                DeferredOrchardPoint::EphemeralKey,
+            ] {
+                let transaction = corrupt_first_orchard_like_point(&transaction, pool, point);
+
+                let check_result = match pool {
+                    OrchardLikePool::Orchard => {
+                        assert!(!transaction.orchard_point_encodings_are_valid());
+                        assert!(transaction.ironwood_point_encodings_are_valid());
+                        check::orchard_point_encodings_are_valid(&transaction)
+                    }
+                    OrchardLikePool::Ironwood => {
+                        assert!(transaction.orchard_point_encodings_are_valid());
+                        assert!(!transaction.ironwood_point_encodings_are_valid());
+                        check::ironwood_point_encodings_are_valid(&transaction)
+                    }
+                };
+                assert_eq!(check_result, Err(TransactionError::SmallOrder));
+                assert_eq!(
+                    TransactionError::SmallOrder.mempool_misbehavior_score(),
+                    100,
+                );
+
+                let state_service =
+                    service_fn(|_| async { unreachable!("state must not be queried") });
+                let verifier = Verifier::new_for_tests(&network, state_service);
+                let transaction_hash = transaction.hash();
+                let result = verifier
+                    .oneshot(Request::Block {
+                        transaction_hash,
+                        transaction,
+                        known_utxos: Arc::new(HashMap::new()),
+                        known_outpoint_hashes: Arc::new(HashSet::new()),
+                        height,
+                        time: DateTime::<Utc>::MAX_UTC,
+                    })
+                    .await;
+
+                assert_eq!(
+                    result,
+                    Err(TransactionError::SmallOrder),
+                    "{name} with invalid {point:?} must fail before state access",
+                );
+            }
+        }
+    });
+}
+
+fn corrupt_first_orchard_like_point(
+    transaction: &Transaction,
+    pool: OrchardLikePool,
+    point: DeferredOrchardPoint,
+) -> Arc<Transaction> {
+    let shielded_data = match pool {
+        OrchardLikePool::Orchard => transaction.orchard_shielded_data(),
+        OrchardLikePool::Ironwood => transaction.ironwood_shielded_data(),
+    }
+    .expect("test transaction has the selected shielded pool");
+    let action_bytes = shielded_data
+        .actions
+        .first()
+        .action
+        .zcash_serialize_to_vec()
+        .expect("test action serializes");
+    let mut transaction_bytes = transaction
+        .zcash_serialize_to_vec()
+        .expect("test transaction serializes");
+
+    let mut action_offsets = transaction_bytes
+        .windows(action_bytes.len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == action_bytes).then_some(offset));
+    let action_offset = action_offsets
+        .next()
+        .expect("serialized transaction contains the selected action");
+    assert!(
+        action_offsets.next().is_none(),
+        "selected action encoding is unique in the transaction",
+    );
+
+    let (field_offset, invalid_encoding) = match point {
+        DeferredOrchardPoint::ValueCommitment => (0, off_curve_pallas_encoding()),
+        DeferredOrchardPoint::EphemeralKey => (4 * 32, [0; 32]),
+    };
+    transaction_bytes[action_offset + field_offset..action_offset + field_offset + 32]
+        .copy_from_slice(&invalid_encoding);
+
+    let transaction = transaction_bytes
+        .clone()
+        .zcash_deserialize_into::<Transaction>()
+        .expect("lazy point deserialization preserves the invalid encoding");
+    assert_eq!(
+        transaction
+            .zcash_serialize_to_vec()
+            .expect("parsed transaction reserializes"),
+        transaction_bytes,
+        "invalid point bytes round-trip unchanged",
+    );
+
+    Arc::new(transaction)
+}
+
+fn off_curve_pallas_encoding() -> [u8; 32] {
+    (0u8..=u8::MAX)
+        .find_map(|x| {
+            let mut bytes = [0; 32];
+            bytes[0] = x;
+            bool::from(pallas::Affine::from_bytes(&bytes).is_none()).then_some(bytes)
+        })
+        .expect("roughly half of Pallas x-coordinates are off-curve")
 }
 
 /// Replaces the first Sapling output's ephemeral key with an off-curve point,

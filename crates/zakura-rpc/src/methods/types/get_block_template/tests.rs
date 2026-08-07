@@ -8,6 +8,8 @@ use zcash_keys::address::Address;
 
 use zakura_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 
+use crate::client::TransactionTemplate;
+use crate::config::mining::{default_miner_address, MinerAddressType};
 use zakura_chain::{
     block::Height,
     local_genesis::generate_local_testnet_with_funded_keys,
@@ -20,9 +22,6 @@ use zakura_chain::{
     transaction::Transaction,
     transparent,
 };
-
-use crate::client::TransactionTemplate;
-use crate::config::mining::{default_miner_address, MinerAddressType};
 
 use super::MinerParams;
 

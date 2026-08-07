@@ -43,7 +43,7 @@ use std::{
 use chrono::Utc;
 use derive_getters::Getters;
 use derive_new::new;
-use futures::{future::OptionFuture, stream::FuturesOrdered, StreamExt, TryFutureExt};
+use futures::{future::OptionFuture, stream::FuturesOrdered, FutureExt, StreamExt, TryFutureExt};
 use hex::{FromHex, ToHex};
 use indexmap::IndexMap;
 use jsonrpsee::core::{async_trait, RpcResult as Result};
@@ -2453,6 +2453,7 @@ where
         //
         // Set up the loop.
         let mut max_time_reached = false;
+        let mut precomputed_coinbase_task = None;
 
         // The loop returns the server long poll ID, which should be different to the client one.
         let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
@@ -2558,6 +2559,33 @@ where
             let wait_for_new_tip = wait_for_new_tip.best_tip_changed();
             // `+2`: we expect the tip to advance by one block before waking us up.
             let precomputed_height = Height(chain_info.tip_height.0 + 2);
+            if precomputed_coinbase_task
+                .as_ref()
+                .is_none_or(|(height, _)| *height != precomputed_height)
+            {
+                let network = self.network.clone();
+                let miner_params = miner_params.clone();
+                let task = tokio::task::spawn_blocking(move || {
+                    TransactionTemplate::new_coinbase(
+                        &network,
+                        precomputed_height,
+                        &miner_params,
+                        Amount::zero(),
+                    )
+                    .expect("valid coinbase tx")
+                });
+                let task = async move { task.await.expect("valid coinbase tx") }
+                    .boxed()
+                    .shared();
+
+                precomputed_coinbase_task = Some((precomputed_height, task));
+            }
+
+            let precomputed_coinbase = precomputed_coinbase_task
+                .as_ref()
+                .expect("precomputed coinbase task was initialized above")
+                .1
+                .clone();
             let wait_for_new_tip = async {
                 // Precompute the coinbase tx for an empty block that will sit on the new tip. We
                 // will return this provisional block upon a chain tip change so that miners can
@@ -2566,20 +2594,7 @@ where
                 // before we start waiting for a new tip since computing the coinbase tx takes a few
                 // seconds if the miner mines to a shielded address, and we want to return fast
                 // when the tip changes.
-                let precompute_coinbase = |network, height, params| {
-                    tokio::task::spawn_blocking(move || {
-                        TransactionTemplate::new_coinbase(&network, height, &params, Amount::zero())
-                            .expect("valid coinbase tx")
-                    })
-                };
-
-                let precomputed_coinbase = precompute_coinbase(
-                    self.network.clone(),
-                    precomputed_height,
-                    miner_params.clone(),
-                )
-                .await
-                .expect("valid coinbase tx");
+                let precomputed_coinbase = precomputed_coinbase.await;
 
                 let _ = wait_for_new_tip.await;
 
@@ -2653,16 +2668,23 @@ where
                     // Respond instantly with an empty block upon a chain tip change so that
                     // the miner doesn't waste their effort trying to extend a shorter
                     // chain.
-                    return Ok(BlockTemplateResponse::new_internal(
-                        &self.network,
-                        precomputed_coinbase,
-                        miner_params,
-                        &chain_info,
-                        server_long_poll_id,
-                        vec![],
-                        submit_old,
-                    )
-                    .into())
+                    let network = self.network.clone();
+                    let miner_params = miner_params.clone();
+                    let response = tokio::task::spawn_blocking(move || {
+                        BlockTemplateResponse::new_internal(
+                            &network,
+                            precomputed_coinbase,
+                            &miner_params,
+                            &chain_info,
+                            server_long_poll_id,
+                            vec![],
+                            submit_old,
+                        )
+                    })
+                    .await
+                    .expect("block template construction task must complete");
+
+                    return Ok(response.into())
                 }
 
                 // The max time does not elapse during normal operation on mainnet,
@@ -2698,35 +2720,40 @@ where
 
         let height = chain_info.tip_height.next().map_misc_error()?;
 
-        // Randomly select some mempool transactions.
-        let mempool_txs = select_mempool_transactions(
-            &self.network,
-            height,
-            miner_params,
-            mempool_txs,
-            mempool_tx_deps,
-        );
+        let network = self.network.clone();
+        let miner_params = miner_params.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            // Randomly select some mempool transactions.
+            let mempool_txs = select_mempool_transactions(
+                &network,
+                height,
+                &miner_params,
+                mempool_txs,
+                mempool_tx_deps,
+            );
 
-        tracing::debug!(
-            selected_mempool_tx_hashes = ?mempool_txs
-                .iter()
-                .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id.mined_id())
-                .collect::<Vec<_>>(),
-            "selected transactions for the template from the mempool"
-        );
+            tracing::debug!(
+                selected_mempool_tx_hashes = ?mempool_txs
+                    .iter()
+                    .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id.mined_id())
+                    .collect::<Vec<_>>(),
+                "selected transactions for the template from the mempool"
+            );
 
-        // - After this point, the template only depends on the previously fetched data.
+            BlockTemplateResponse::new_internal(
+                &network,
+                None,
+                &miner_params,
+                &chain_info,
+                server_long_poll_id,
+                mempool_txs,
+                submit_old,
+            )
+        })
+        .await
+        .expect("block template construction task must complete");
 
-        Ok(BlockTemplateResponse::new_internal(
-            &self.network,
-            None,
-            miner_params,
-            &chain_info,
-            server_long_poll_id,
-            mempool_txs,
-            submit_old,
-        )
-        .into())
+        Ok(response.into())
     }
 
     async fn submit_block(

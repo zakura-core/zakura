@@ -459,7 +459,7 @@ impl StartCmd {
         let advertised_services = Self::advertised_services(&config);
 
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
-            zakura_network::init_with_zakura_header_sync(
+            zakura_network::init_with_zakura_custom_services(
                 config.network.clone(),
                 inbound,
                 latest_chain_tip.clone(),
@@ -467,6 +467,7 @@ impl StartCmd {
                 advertised_services,
                 zcashd_compat_block_gossip_peer_ips,
                 zakura_header_sync_driver_startup,
+                Vec::new(),
             )
             .await;
 

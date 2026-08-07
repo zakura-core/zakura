@@ -954,6 +954,8 @@ struct DTestnetParameters {
     slow_start_interval: Option<u32>,
     target_difficulty_limit: Option<String>,
     disable_pow: Option<bool>,
+    /// Height at which the MTP-plus-90-minutes rule activates.
+    max_block_time_start_height: Option<u32>,
     genesis_hash: Option<String>,
     activation_heights: Option<ConfiguredActivationHeights>,
     pre_nu6_funding_streams: Option<ConfiguredFundingStreams>,
@@ -1060,6 +1062,7 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             slow_start_interval: Some(params.slow_start_interval().0),
             target_difficulty_limit: Some(params.target_difficulty_limit().to_string()),
             disable_pow: Some(params.disable_pow()),
+            max_block_time_start_height: Some(params.max_block_time_start_height().0),
             genesis_hash: Some(params.genesis_hash().to_string()),
             activation_heights: Some(params.activation_heights().into()),
             pre_nu6_funding_streams: None,
@@ -1345,6 +1348,7 @@ where
         slow_start_interval,
         target_difficulty_limit,
         disable_pow,
+        max_block_time_start_height,
         genesis_hash,
         activation_heights,
         pre_nu6_funding_streams,
@@ -1394,6 +1398,11 @@ where
 
     if let Some(disable_pow) = disable_pow {
         params_builder = params_builder.with_disable_pow(disable_pow);
+    }
+
+    if let Some(height) = max_block_time_start_height {
+        params_builder = params_builder
+            .with_max_block_time_start_height(height.try_into().map_err(de::Error::custom)?);
     }
 
     // Retain default Testnet activation heights unless there's an empty [testnet_parameters.activation_heights] section.
@@ -1470,6 +1479,7 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         lockbox_disbursements,
         checkpoints,
         extend_funding_stream_addresses_as_required,
+        max_block_time_start_height,
         ..
     } = params;
 
@@ -1488,6 +1498,7 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         funding_streams: Some(funding_streams_vec),
         lockbox_disbursements,
         checkpoints: Some(checkpoints),
+        max_block_time_start_height: max_block_time_start_height.map(zakura_chain::block::Height),
         extend_funding_stream_addresses_as_required,
     }
 }

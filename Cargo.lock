@@ -6996,6 +6996,7 @@ dependencies = [
  "socket2 0.6.4",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower 0.5.3",
  "tower-layer",
@@ -8554,7 +8555,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

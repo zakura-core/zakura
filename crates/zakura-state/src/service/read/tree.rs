@@ -390,7 +390,7 @@ where
 /// If there is no subtree at the first index in the range, the returned list is empty.
 /// Otherwise, subtrees are continuous up to the finalized tip.
 ///
-/// See [`subtrees`] for more details.
+/// See [`subtrees_with_gaps`] for more details.
 pub fn sapling_subtrees<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -403,18 +403,31 @@ where
     C: AsRef<Chain>,
 {
     let (start_index, end_index) = subtree_range_bounds(&range);
-    let subtrees = subtrees(
-        chain,
-        range,
-        |chain, range| chain.sapling_subtrees_in_range(range),
-        |range| db.sapling_subtree_list_by_index_range(range),
-    );
+    let subtrees = sapling_subtrees_with_gaps(chain, db, range);
+    let subtrees = subtrees_from_start(subtrees, start_index);
 
     if let Some(start_index) = start_index {
         check_historical_sapling_subtrees_available(db, start_index, end_index, &subtrees)?;
     }
 
     Ok(subtrees)
+}
+
+/// Returns the raw union of Sapling subtree rows from `chain` and `db`, including rows after gaps.
+pub(crate) fn sapling_subtrees_with_gaps<C>(
+    chain: Option<C>,
+    db: &ZakuraDb,
+    range: impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex> + Clone,
+) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>>
+where
+    C: AsRef<Chain>,
+{
+    subtrees_with_gaps(
+        chain,
+        range,
+        |chain, range| chain.sapling_subtrees_in_range(range),
+        |range| db.sapling_subtree_list_by_index_range(range),
+    )
 }
 
 /// Returns the Orchard
@@ -445,7 +458,7 @@ where
 /// If there is no subtree at the first index in the range, the returned list is empty.
 /// Otherwise, subtrees are continuous up to the finalized tip.
 ///
-/// See [`subtrees`] for more details.
+/// See [`subtrees_with_gaps`] for more details.
 pub fn orchard_subtrees<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -458,18 +471,31 @@ where
     C: AsRef<Chain>,
 {
     let (start_index, end_index) = subtree_range_bounds(&range);
-    let subtrees = subtrees(
-        chain,
-        range,
-        |chain, range| chain.orchard_subtrees_in_range(range),
-        |range| db.orchard_subtree_list_by_index_range(range),
-    );
+    let subtrees = orchard_subtrees_with_gaps(chain, db, range);
+    let subtrees = subtrees_from_start(subtrees, start_index);
 
     if let Some(start_index) = start_index {
         check_historical_orchard_subtrees_available(db, start_index, end_index, &subtrees)?;
     }
 
     Ok(subtrees)
+}
+
+/// Returns the raw union of Orchard subtree rows from `chain` and `db`, including rows after gaps.
+pub(crate) fn orchard_subtrees_with_gaps<C>(
+    chain: Option<C>,
+    db: &ZakuraDb,
+    range: impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex> + Clone,
+) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>
+where
+    C: AsRef<Chain>,
+{
+    subtrees_with_gaps(
+        chain,
+        range,
+        |chain, range| chain.orchard_subtrees_in_range(range),
+        |range| db.orchard_subtree_list_by_index_range(range),
+    )
 }
 
 /// Returns the Ironwood
@@ -496,7 +522,7 @@ where
 /// If there is no subtree at the first index in the range, the returned list is
 /// empty. Otherwise, subtrees are continuous up to the finalized tip.
 ///
-/// See [`subtrees`] for more details.
+/// See [`subtrees_with_gaps`] for more details.
 pub fn ironwood_subtrees<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -509,18 +535,31 @@ where
     C: AsRef<Chain>,
 {
     let (start_index, end_index) = subtree_range_bounds(&range);
-    let subtrees = subtrees(
-        chain,
-        range,
-        |chain, range| chain.ironwood_subtrees_in_range(range),
-        |range| db.ironwood_subtree_list_by_index_range(range),
-    );
+    let subtrees = ironwood_subtrees_with_gaps(chain, db, range);
+    let subtrees = subtrees_from_start(subtrees, start_index);
 
     if let Some(start_index) = start_index {
         check_historical_ironwood_subtrees_available(db, start_index, end_index, &subtrees)?;
     }
 
     Ok(subtrees)
+}
+
+/// Returns the raw union of Ironwood subtree rows from `chain` and `db`, including rows after gaps.
+pub(crate) fn ironwood_subtrees_with_gaps<C>(
+    chain: Option<C>,
+    db: &ZakuraDb,
+    range: impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex> + Clone,
+) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>>
+where
+    C: AsRef<Chain>,
+{
+    subtrees_with_gaps(
+        chain,
+        range,
+        |chain, range| chain.ironwood_subtrees_in_range(range),
+        |range| db.ironwood_subtree_list_by_index_range(range),
+    )
 }
 
 /// Returns the first requested subtree index and the exclusive end bound.
@@ -546,23 +585,23 @@ fn subtree_range_bounds(
     (start, end)
 }
 
-/// Returns a list of [`NoteCommitmentSubtree`]s in the provided range.
+/// Drops all subtree rows unless the requested start row is present.
+fn subtrees_from_start<Node>(
+    subtrees: BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+    start_index: Option<NoteCommitmentSubtreeIndex>,
+) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>> {
+    if start_index.is_some_and(|start_index| subtrees.contains_key(&start_index)) {
+        subtrees
+    } else {
+        BTreeMap::new()
+    }
+}
+
+/// Returns a consistent chain-plus-database view without dropping rows after a missing start.
 ///
-/// If there is no subtree at the first index in the range, the returned list is empty.
-/// Otherwise, subtrees are continuous up to the finalized tip.
-///
-/// Accepts a `chain` from the non-finalized state, a `range` of subtree indexes to retrieve,
-/// a `read_chain` function for retrieving the `range` of subtrees from `chain`, and
-/// a `read_disk` function for retrieving the `range` from [`ZakuraDb`].
-///
-/// Returns a consistent set of subtrees for the supplied chain fork and database.
-/// Avoids reading the database if the subtrees are present in memory.
-///
-/// # Correctness
-///
-/// APIs that return single subtrees can't be used for `read_chain` and `read_disk`, because they
-/// can create an inconsistent list of subtrees after concurrent non-finalized and finalized updates.
-fn subtrees<C, Range, Node, ChainSubtreeFn, DbSubtreeFn>(
+/// APIs that return single subtrees can't be used here, because they can create an inconsistent
+/// list after concurrent non-finalized and finalized updates.
+fn subtrees_with_gaps<C, Range, Node, ChainSubtreeFn, DbSubtreeFn>(
     chain: Option<C>,
     range: Range,
     read_chain: ChainSubtreeFn,
@@ -599,7 +638,7 @@ where
     // because we know they will be inconsistent as well. (It is cryptographically impossible for tree roots
     // to be equal once the leaves have diverged.)
 
-    let results = match chain.map(|chain| read_chain(chain.as_ref(), range.clone())) {
+    match chain.map(|chain| read_chain(chain.as_ref(), range.clone())) {
         Some(chain_results) if chain_results.contains_key(&start_index) => return chain_results,
         Some(chain_results) => {
             let mut db_results = read_disk(range);
@@ -622,13 +661,6 @@ where
             db_results
         }
         None => read_disk(range),
-    };
-
-    // Check that we got the start subtree
-    if results.contains_key(&start_index) {
-        results
-    } else {
-        BTreeMap::new()
     }
 }
 

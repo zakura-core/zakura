@@ -192,7 +192,7 @@ where
     S::Future: Send + 'static,
     C: ChainTip + Clone + Send + Sync + 'static,
 {
-    init_with_zakura_custom_services(
+    init_with_zakura(
         config,
         inbound_service,
         latest_chain_tip,
@@ -205,8 +205,9 @@ where
     .await
 }
 
-/// Initialize a peer set with application-supplied Zakura protocol services.
-pub async fn init_with_zakura_custom_services<S, C>(
+/// Initialize a peer set with optional Zakura runtime components.
+#[allow(clippy::too_many_arguments)]
+pub async fn init_with_zakura<S, C>(
     config: Config,
     inbound_service: S,
     latest_chain_tip: C,

@@ -919,7 +919,9 @@ async fn artifact_subtree_gaps_return_typed_errors_for_every_pool() {
             .into_iter()
             .map(|index| SubtreeRecord {
                 index: NoteCommitmentSubtreeIndex(index),
-                end_height: Height(u32::from(index) + 1),
+                // Tip-bound serving only merges records completed at or below the verified tip.
+                // Keep every height eligible so the index gap, not the tip filter, truncates the run.
+                end_height: Height(1),
                 root,
             })
             .collect()

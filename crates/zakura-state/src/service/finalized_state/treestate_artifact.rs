@@ -1,7 +1,7 @@
 //! Binary artifacts that let a fast-synced node serve historical treestates.
 //!
 //! Two artifacts, with deliberately different trust stories (see
-//! `docs/design/historical-treestate-serving.md` §4.1, §4.2 and §4.6):
+//! `docs/design/verified-commitment-trees.md` §16):
 //!
 //! - The **frontier artifact** holds per-pool note commitment frontiers at a sparse height grid.
 //!   Every entry is checked against the authenticated root in `commitment_roots_by_height` before
@@ -137,18 +137,63 @@ pub enum TreestateArtifactError {
         trailing: usize,
     },
 
-    /// Entry heights are not strictly increasing.
+    /// A pool's declared subtree indexes are not the contiguous range `0..count`.
     ///
-    /// Ordering is what makes "nearest entry at or below `h`" a binary search rather than a scan,
-    /// and what makes the append-only prefix contract checkable.
-    #[error("{kind} artifact entries are out of order: {previous:?} is followed by {found:?}")]
-    OutOfOrder {
-        /// Which artifact was being parsed.
-        kind: &'static str,
-        /// The previous entry's key.
-        previous: u32,
-        /// The offending entry's key.
-        found: u32,
+    /// Frontier verification authenticates root values in vector order, but serving selects by the
+    /// declared index. Requiring indexes to equal their ordinal binds each authenticated root to
+    /// the only position it can correctly occupy.
+    #[error(
+        "{pool} subtree indexes are not contiguous from zero: \
+         expected index {expected}, found {found}"
+    )]
+    NonContiguousSubtreeIndex {
+        /// The pool whose indexes failed.
+        pool: &'static str,
+        /// The index required at this position.
+        expected: u16,
+        /// The index the record declared.
+        found: u16,
+    },
+
+    /// A pool's `end_height` values are not strictly increasing.
+    ///
+    /// Completed subtrees finish in index order, so heights must rise with indexes. A decrease or
+    /// plateau would let tip-bound serving admit or withhold a root relative to the wrong tip.
+    #[error(
+        "{pool} subtree end heights are out of order: \
+         index {previous_index} ends at {previous_height:?}, \
+         but index {found_index} ends at {found_height:?}"
+    )]
+    NonIncreasingEndHeight {
+        /// The pool whose heights failed.
+        pool: &'static str,
+        /// The preceding record's index.
+        previous_index: u16,
+        /// The preceding record's end height.
+        previous_height: Height,
+        /// The offending record's index.
+        found_index: u16,
+        /// The offending record's end height.
+        found_height: Height,
+    },
+
+    /// A record claims to complete at or above the artifact's last checkpoint.
+    ///
+    /// The artifact covers only subtrees completed before that checkpoint; a height at or above it
+    /// escapes the tip bound that keeps unverified blocks from being served from published roots.
+    #[error(
+        "{pool} subtree index {index} ends at {end_height:?}, \
+         which is not strictly below last checkpoint {last_checkpoint:?}"
+    )]
+    EndHeightAtOrAboveCheckpoint {
+        /// The pool whose height failed.
+        pool: &'static str,
+        /// The record's index.
+        index: u16,
+        /// The record's claimed end height.
+        end_height: Height,
+        /// The artifact's last checkpoint.
+        last_checkpoint: Height,
     },
 
     /// A subtree root is not a canonical node encoding for its pool.
@@ -269,6 +314,59 @@ impl Default for SubtreeArtifact {
     }
 }
 
+/// Validates one pool's declared indexes and end heights against the artifact checkpoint.
+///
+/// Indexes must be exactly `0..records.len()`. End heights must be strictly increasing and
+/// strictly below `last_checkpoint`, matching the export contract that only completed
+/// pre-checkpoint subtrees are published.
+fn validate_pool_metadata(
+    pool: &'static str,
+    last_checkpoint: Height,
+    records: &[SubtreeRecord],
+) -> Result<(), TreestateArtifactError> {
+    let mut previous_end_height = None;
+
+    for (ordinal, record) in records.iter().enumerate() {
+        let expected =
+            u16::try_from(ordinal).map_err(|_| TreestateArtifactError::TooManyRecords {
+                kind: SubtreeArtifact::KIND,
+                found: records.len(),
+                max: MAX_SUBTREE_RECORDS,
+            })?;
+        if record.index.0 != expected {
+            return Err(TreestateArtifactError::NonContiguousSubtreeIndex {
+                pool,
+                expected,
+                found: record.index.0,
+            });
+        }
+
+        if record.end_height >= last_checkpoint {
+            return Err(TreestateArtifactError::EndHeightAtOrAboveCheckpoint {
+                pool,
+                index: record.index.0,
+                end_height: record.end_height,
+                last_checkpoint,
+            });
+        }
+
+        if let Some((previous_index, previous_height)) = previous_end_height {
+            if record.end_height <= previous_height {
+                return Err(TreestateArtifactError::NonIncreasingEndHeight {
+                    pool,
+                    previous_index,
+                    previous_height,
+                    found_index: record.index.0,
+                    found_height: record.end_height,
+                });
+            }
+        }
+        previous_end_height = Some((record.index.0, record.end_height));
+    }
+
+    Ok(())
+}
+
 impl SubtreeArtifact {
     /// The name used in error messages.
     const KIND: &'static str = "subtree-root";
@@ -374,7 +472,6 @@ impl SubtreeArtifact {
         for (pool_index, count) in counts.into_iter().enumerate() {
             let pool = SUBTREE_POOLS[pool_index];
             let mut records = Vec::with_capacity(count);
-            let mut previous: Option<u32> = None;
 
             for _ in 0..count {
                 let index = u16::from_le_bytes(read_array::<2>(payload, offset, kind)?);
@@ -385,17 +482,6 @@ impl SubtreeArtifact {
                 )?));
                 let root = read_array::<32>(payload, offset + 6, kind)?;
                 offset += SUBTREE_RECORD_LEN;
-
-                if let Some(previous) = previous {
-                    if u32::from(index) <= previous {
-                        return Err(TreestateArtifactError::OutOfOrder {
-                            kind,
-                            previous,
-                            found: u32::from(index),
-                        });
-                    }
-                }
-                previous = Some(u32::from(index));
 
                 let root_is_valid = match pool {
                     SAPLING_POOL => sapling_crypto::Node::from_bytes(root)
@@ -428,12 +514,14 @@ impl SubtreeArtifact {
         }
 
         let mut pools = pools.into_iter();
-        Ok(Self {
+        let artifact = Self {
             last_checkpoint,
             sapling: pools.next().expect("three pools were decoded"),
             orchard: pools.next().expect("three pools were decoded"),
             ironwood: pools.next().expect("three pools were decoded"),
-        })
+        };
+        artifact.validate_metadata()?;
+        Ok(artifact)
     }
 
     /// Parses an artifact and verifies that it belongs to `expected_last_checkpoint`.
@@ -454,6 +542,22 @@ impl SubtreeArtifact {
         Ok(artifact)
     }
 
+    /// Checks declared indexes and end heights for every pool.
+    ///
+    /// Frontier verification authenticates ordered root *values*, not the metadata beside them.
+    /// Serving and tip-bound merging consume those metadata fields directly, so they must be
+    /// structurally sound before any root is published or proven.
+    pub fn validate_metadata(&self) -> Result<(), TreestateArtifactError> {
+        for (pool, records) in [
+            (SAPLING_POOL, self.sapling.as_slice()),
+            (ORCHARD_POOL, self.orchard.as_slice()),
+            (IRONWOOD_POOL, self.ironwood.as_slice()),
+        ] {
+            validate_pool_metadata(pool, self.last_checkpoint, records)?;
+        }
+        Ok(())
+    }
+
     /// Checks every root in this artifact against the frontiers that pin them.
     ///
     /// Subtree roots are interior nodes, so nothing else in the artifact's framing tests their
@@ -469,6 +573,8 @@ impl SubtreeArtifact {
         orchard: &orchard::tree::NoteCommitmentTree,
         ironwood: &orchard::tree::NoteCommitmentTree,
     ) -> Result<VerifiedSubtreeCounts, TreestateArtifactError> {
+        self.validate_metadata()?;
+
         let sapling_roots = self
             .sapling
             .iter()
@@ -920,6 +1026,127 @@ mod tests {
                 Err(TreestateArtifactError::MalformedSubtreeRoot { pool, index: 0 })
             );
         }
+    }
+
+    /// Declared indexes are what range selection and tip-bound serving consume. Frontier
+    /// verification only sees root values in vector order, so a shifted or gapped list would
+    /// otherwise associate an authenticated root with the wrong subtree index.
+    #[test]
+    fn subtree_artifact_rejects_noncontiguous_indexes() {
+        let mut shifted = sample_subtrees();
+        shifted.sapling[0].index = NoteCommitmentSubtreeIndex(1);
+        shifted.sapling[1].index = NoteCommitmentSubtreeIndex(2);
+        assert_eq!(
+            SubtreeArtifact::decode(&shifted.encode(&Network::Mainnet), &Network::Mainnet),
+            Err(TreestateArtifactError::NonContiguousSubtreeIndex {
+                pool: SAPLING_POOL,
+                expected: 0,
+                found: 1,
+            })
+        );
+
+        let mut gapped = sample_subtrees();
+        gapped.sapling[1].index = NoteCommitmentSubtreeIndex(3);
+        assert_eq!(
+            SubtreeArtifact::decode(&gapped.encode(&Network::Mainnet), &Network::Mainnet),
+            Err(TreestateArtifactError::NonContiguousSubtreeIndex {
+                pool: SAPLING_POOL,
+                expected: 1,
+                found: 3,
+            })
+        );
+    }
+
+    /// End heights drive tip-bound serving. They must rise with indexes and stay strictly below
+    /// the artifact checkpoint, or a root can become eligible before its block is verified — or
+    /// remain hidden after it should be public.
+    #[test]
+    fn subtree_artifact_rejects_invalid_end_heights() {
+        let mut non_increasing = sample_subtrees();
+        non_increasing.sapling[1].end_height = Height(7);
+        assert_eq!(
+            SubtreeArtifact::decode(&non_increasing.encode(&Network::Mainnet), &Network::Mainnet),
+            Err(TreestateArtifactError::NonIncreasingEndHeight {
+                pool: SAPLING_POOL,
+                previous_index: 0,
+                previous_height: Height(7),
+                found_index: 1,
+                found_height: Height(7),
+            })
+        );
+
+        let mut decreasing = sample_subtrees();
+        decreasing.sapling[1].end_height = Height(3);
+        assert_eq!(
+            SubtreeArtifact::decode(&decreasing.encode(&Network::Mainnet), &Network::Mainnet),
+            Err(TreestateArtifactError::NonIncreasingEndHeight {
+                pool: SAPLING_POOL,
+                previous_index: 0,
+                previous_height: Height(7),
+                found_index: 1,
+                found_height: Height(3),
+            })
+        );
+
+        let mut at_checkpoint = sample_subtrees();
+        at_checkpoint.sapling[1].end_height = Height(31);
+        assert_eq!(
+            SubtreeArtifact::decode(&at_checkpoint.encode(&Network::Mainnet), &Network::Mainnet),
+            Err(TreestateArtifactError::EndHeightAtOrAboveCheckpoint {
+                pool: SAPLING_POOL,
+                index: 1,
+                end_height: Height(31),
+                last_checkpoint: Height(31),
+            })
+        );
+
+        let mut above_checkpoint = sample_subtrees();
+        above_checkpoint.orchard[0].end_height = Height(40);
+        assert_eq!(
+            SubtreeArtifact::decode(
+                &above_checkpoint.encode(&Network::Mainnet),
+                &Network::Mainnet
+            ),
+            Err(TreestateArtifactError::EndHeightAtOrAboveCheckpoint {
+                pool: ORCHARD_POOL,
+                index: 0,
+                end_height: Height(40),
+                last_checkpoint: Height(31),
+            })
+        );
+    }
+
+    /// In-memory artifacts skip `decode`, so export and verify paths must reject bad metadata
+    /// before folding roots into a frontier.
+    #[test]
+    fn verify_against_frontiers_rejects_invalid_metadata() {
+        let empty = zakura_chain::sapling::tree::NoteCommitmentTree::default();
+        let empty_orchard = orchard::tree::NoteCommitmentTree::default();
+
+        let mut shifted = sample_subtrees();
+        shifted.sapling[0].index = NoteCommitmentSubtreeIndex(1);
+        shifted.sapling[1].index = NoteCommitmentSubtreeIndex(2);
+
+        assert_eq!(
+            shifted.verify_against_frontiers(&empty, &empty_orchard, &empty_orchard),
+            Err(TreestateArtifactError::NonContiguousSubtreeIndex {
+                pool: SAPLING_POOL,
+                expected: 0,
+                found: 1,
+            })
+        );
+
+        let mut at_checkpoint = sample_subtrees();
+        at_checkpoint.sapling[1].end_height = at_checkpoint.last_checkpoint;
+        assert_eq!(
+            at_checkpoint.verify_against_frontiers(&empty, &empty_orchard, &empty_orchard),
+            Err(TreestateArtifactError::EndHeightAtOrAboveCheckpoint {
+                pool: SAPLING_POOL,
+                index: 1,
+                end_height: Height(31),
+                last_checkpoint: Height(31),
+            })
+        );
     }
 
     #[test]

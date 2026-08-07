@@ -8,7 +8,7 @@
   "checkpoints_sha256": "732e1dc28025e9f9cc7a4ed79fcc44c5938448b3fab5d2495b131b66fe6cfb39",
   "frontier_sha256": "5550eccd414f01139e4ea7abab6ca0429b5d0639ffc1710b1bc15fae44cca090",
   "frontier_size": 2070,
-  "subtrees_sha256": "490395cc51367cbfce379e5447392a375f331083d406bcd0dcbc26e9782a3897",
+  "subtrees_sha256": "09adfc1f3aa1e21c0e64d18f3c709c856cf848f19b50e5b5ff43b9e1289b67e2",
   "subtrees_size": 72069,
   "meta_sha256": "879a3fdb5c08cc071b5525bbc457412e313cf8f1ed6d813bfaea23f2a66bc7c2"
 }

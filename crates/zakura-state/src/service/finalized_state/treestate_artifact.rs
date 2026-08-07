@@ -12,8 +12,8 @@
 //!   before a read service can use it.
 //!
 //! Both follow the framing the Sprout history artifact established: magic, version, network byte,
-//! explicit record counts, and a SHA-256 over the payload, with the parser validating the whole
-//! frame before any record is used.
+//! explicit record counts, and a SHA-256 over the non-digest header fields and payload, with the
+//! parser validating the whole frame before any record is used.
 
 use std::sync::OnceLock;
 
@@ -36,11 +36,14 @@ const SUBTREE_MAGIC: &[u8; 8] = b"ZKVCTST1";
 /// Reviewed completed-subtree roots shipped with the Mainnet last checkpoint.
 pub(super) const MAINNET_SUBTREES: &[u8] = include_bytes!("vct/mainnet-subtrees.bin");
 
-/// The format version both artifacts are written at.
+/// The format version subtree-root artifacts are written at.
 const VERSION: u16 = 1;
 
-/// Fixed header length: magic, version, network, last_checkpoint, three record counts, digest.
-const SUBTREE_HEADER_LEN: usize = 8 + 2 + 1 + 4 + 4 + 4 + 4 + 32;
+/// Offset of the digest after magic, version, network, last_checkpoint, and three record counts.
+const SUBTREE_DIGEST_OFFSET: usize = 8 + 2 + 1 + 4 + 4 + 4 + 4;
+
+/// Fixed header length, including the digest.
+const SUBTREE_HEADER_LEN: usize = SUBTREE_DIGEST_OFFSET + 32;
 
 /// Bytes per subtree record: index, end height, root.
 const SUBTREE_RECORD_LEN: usize = 2 + 4 + 32;
@@ -118,8 +121,8 @@ pub enum TreestateArtifactError {
         max: usize,
     },
 
-    /// The payload does not hash to the digest in the header.
-    #[error("{kind} artifact payload does not match the digest in its header")]
+    /// The authenticated header fields and payload do not hash to the stored digest.
+    #[error("{kind} artifact contents do not match the digest in its header")]
     DigestMismatch {
         /// Which artifact was being parsed.
         kind: &'static str,
@@ -293,7 +296,15 @@ impl SubtreeArtifact {
         out.extend_from_slice(&count(&self.sapling).to_le_bytes());
         out.extend_from_slice(&count(&self.orchard).to_le_bytes());
         out.extend_from_slice(&count(&self.ironwood).to_le_bytes());
-        out.extend_from_slice(&Sha256::digest(&payload));
+        debug_assert_eq!(out.len(), SUBTREE_DIGEST_OFFSET);
+
+        let digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(&out);
+            hasher.update(&payload);
+            hasher.finalize()
+        };
+        out.extend_from_slice(&digest);
         out.extend_from_slice(&payload);
 
         out
@@ -313,6 +324,25 @@ impl SubtreeArtifact {
                 kind,
                 found: version,
             });
+        }
+
+        let digest = read_array::<32>(bytes, SUBTREE_DIGEST_OFFSET, kind)?;
+        let payload = bytes
+            .get(SUBTREE_HEADER_LEN..)
+            .ok_or(TreestateArtifactError::Truncated {
+                kind,
+                offset: SUBTREE_HEADER_LEN,
+                needed: 0,
+            })?;
+
+        let actual_digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes[..SUBTREE_DIGEST_OFFSET]);
+            hasher.update(payload);
+            hasher.finalize()
+        };
+        if actual_digest.as_slice() != digest {
+            return Err(TreestateArtifactError::DigestMismatch { kind });
         }
 
         let found = read_array::<1>(bytes, 10, kind)?[0];
@@ -337,19 +367,6 @@ impl SubtreeArtifact {
                     max: MAX_SUBTREE_RECORDS,
                 });
             }
-        }
-
-        let digest = read_array::<32>(bytes, 27, kind)?;
-        let payload = bytes
-            .get(SUBTREE_HEADER_LEN..)
-            .ok_or(TreestateArtifactError::Truncated {
-                kind,
-                offset: SUBTREE_HEADER_LEN,
-                needed: 0,
-            })?;
-
-        if Sha256::digest(payload).as_slice() != digest {
-            return Err(TreestateArtifactError::DigestMismatch { kind });
         }
 
         let mut offset = 0;
@@ -737,7 +754,7 @@ mod tests {
 
     /// Proves the embedded Mainnet subtree roots against the embedded Mainnet frontier.
     ///
-    /// Everything else guarding this artifact is structural — framing, payload digest, manifest
+    /// Everything else guarding this artifact is structural — framing, artifact digest, manifest
     /// hash, handoff height — and passes just as happily on an artifact whose roots are wrong or
     /// absent. This is the only check that reads the roots themselves.
     ///
@@ -831,6 +848,19 @@ mod tests {
                 kind: "subtree-root"
             })
         );
+
+        // Every semantic header field is authenticated. Magic and version are checked separately
+        // because they identify the format and therefore select the digest algorithm.
+        for offset in [10, 11, 15, 19, 23] {
+            let mut flipped = good.clone();
+            flipped[offset] ^= 0x01;
+            assert_eq!(
+                SubtreeArtifact::decode(&flipped, &Network::Mainnet),
+                Err(TreestateArtifactError::DigestMismatch {
+                    kind: "subtree-root"
+                })
+            );
+        }
 
         // Flipping a root byte is the failure that matters most here: this artifact's records
         // cannot be re-derived cheaply by a consumer, so the digest is the only thing standing

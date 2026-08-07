@@ -24,6 +24,7 @@ SUBTREE_BUNDLE_NAME = "mainnet-treestate-subtrees.bin"
 SUBTREE_HEADER_PREFIX = struct.Struct("<8sHBIIII")
 SUBTREE_HEADER_LEN = SUBTREE_HEADER_PREFIX.size + 32
 SUBTREE_RECORD_LEN = 2 + 4 + 32
+SUBTREE_VERSION = 1
 MAX_SUBTREE_RECORDS = 2**16
 RESOLUTION_KEYS = {
     "height",
@@ -71,6 +72,13 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _subtree_digest(prefix: bytes, payload: bytes) -> bytes:
+    digest = hashlib.sha256()
+    digest.update(prefix)
+    digest.update(payload)
+    return digest.digest()
+
+
 def _subtree_pools(data: bytes, label: str) -> tuple[int, bytes, bytes, bytes]:
     if len(data) < SUBTREE_HEADER_LEN:
         raise BundleImportError(f"{label} is a truncated subtree-root artifact")
@@ -78,7 +86,7 @@ def _subtree_pools(data: bytes, label: str) -> tuple[int, bytes, bytes, bytes]:
     magic, version, network, last_checkpoint, *counts = SUBTREE_HEADER_PREFIX.unpack_from(data)
     if magic != b"ZKVCTST1":
         raise BundleImportError(f"{label} is not a subtree-root artifact")
-    if version != 1:
+    if version != SUBTREE_VERSION:
         raise BundleImportError(f"{label} has unsupported subtree-root version {version}")
     if network != 1:
         raise BundleImportError(f"{label} is not a Mainnet subtree-root artifact")
@@ -90,8 +98,8 @@ def _subtree_pools(data: bytes, label: str) -> tuple[int, bytes, bytes, bytes]:
     if len(payload) != expected_payload_len:
         raise BundleImportError(f"{label} has invalid subtree-root framing")
     expected_digest = data[SUBTREE_HEADER_PREFIX.size:SUBTREE_HEADER_LEN]
-    if hashlib.sha256(payload).digest() != expected_digest:
-        raise BundleImportError(f"{label} has an invalid subtree-root payload digest")
+    if _subtree_digest(data[:SUBTREE_HEADER_PREFIX.size], payload) != expected_digest:
+        raise BundleImportError(f"{label} has an invalid subtree-root digest")
 
     pools = []
     offset = 0
@@ -260,12 +268,12 @@ def _self_test() -> int:
         payload = b"".join(pools)
         prefix = SUBTREE_HEADER_PREFIX.pack(
             b"ZKVCTST1",
-            1,
+            SUBTREE_VERSION,
             1,
             2,
             *(len(pool) // SUBTREE_RECORD_LEN for pool in pools),
         )
-        return prefix + hashlib.sha256(payload).digest() + payload
+        return prefix + _subtree_digest(prefix, payload) + payload
 
     class SelfTest(unittest.TestCase):
         def setUp(self) -> None:

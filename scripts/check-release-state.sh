@@ -163,8 +163,11 @@ if any(count > 2**16 for count in counts):
 subtree_payload = subtrees[subtree_header_len:]
 if len(subtree_payload) != sum(counts) * (2 + 4 + 32):
     fail(f"{SUBTREES} payload length does not match its record counts")
-if hashlib.sha256(subtree_payload).digest() != subtrees[subtree_prefix.size:subtree_header_len]:
-    fail(f"{SUBTREES} payload digest does not match its header")
+if (
+    hashlib.sha256(subtrees[:subtree_prefix.size] + subtree_payload).digest()
+    != subtrees[subtree_prefix.size:subtree_header_len]
+):
+    fail(f"{SUBTREES} digest does not match its header")
 
 source = provenance["source"]
 meta_sha256 = provenance.get("meta_sha256")

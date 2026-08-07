@@ -1,7 +1,13 @@
 //! ZIP-317 tests.
 
-use super::conventional_actions;
+use super::{conventional_actions, conventional_fee_weight_ratio};
 use super::{mempool_checks, Amount, Error};
+
+use crate::{
+    block::Height,
+    parameters::NetworkUpgrade,
+    transaction::{LockTime, Transaction, UnminedTx},
+};
 
 #[test]
 fn zip317_unpaid_actions_err() {
@@ -25,6 +31,23 @@ fn zip317_mempool_checks_ok() {
 }
 
 #[test]
+fn zip317_caps_weight_ratio_at_ten() {
+    let transaction = UnminedTx::from(Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    });
+
+    let miner_fee = Amount::try_from(200_000).expect("fee is a valid amount");
+
+    assert_eq!(conventional_fee_weight_ratio(&transaction, miner_fee), 10.0);
+}
+
+#[test]
 fn zip317_counts_ironwood_actions() {
     use proptest::{
         prelude::any,
@@ -35,9 +58,7 @@ fn zip317_counts_ironwood_actions() {
     use crate::{
         amount::{Amount, NegativeAllowed},
         at_least_one, ironwood,
-        parameters::NetworkUpgrade,
         primitives::Halo2Proof,
-        transaction::{LockTime, Transaction},
     };
 
     let mut runner = TestRunner::default();

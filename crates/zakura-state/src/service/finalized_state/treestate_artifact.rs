@@ -7,12 +7,15 @@
 //!   Every entry is checked against the authenticated root in `commitment_roots_by_height` before
 //!   use, so the artifact carries no trust weight: a corrupt or hostile one is rejected rather
 //!   than absorbed. That is what lets it be coarse, small, and distributed outside the binary.
-//! - The **subtree-root artifact** holds completed subtree roots, which a node cannot check the
-//!   same way without replaying each subtree's 65,536 leaves.
+//! - The **subtree-root artifact** holds completed subtree roots. The final frontier pins all of
+//!   them through its ommers, so the embedded artifact is checked against the embedded frontier
+//!   before a read service can use it.
 //!
 //! Both follow the framing the Sprout history artifact established: magic, version, network byte,
 //! explicit record counts, and a SHA-256 over the payload, with the parser validating the whole
 //! frame before any record is used.
+
+use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -234,8 +237,9 @@ pub struct SubtreeRecord {
 
 /// Completed subtree roots per pool, in index order.
 ///
-/// Unlike [`FrontierArtifact`], a consumer cannot check these against a stored root without
-/// replaying each subtree's leaves, so this ships in the reviewed, committed bundle (§4.6).
+/// Unlike [`FrontierArtifact`], individual entries cannot be checked against per-height roots.
+/// The complete ordered lists can be checked efficiently against the final frontier that pins
+/// them, so embedded artifacts are verified as a whole before use.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubtreeArtifact {
     /// The last checkpoint this was generated against.
@@ -569,21 +573,47 @@ impl SubtreeArtifact {
     }
 }
 
-/// Returns the reviewed subtree roots coupled to `network`'s last checkpoint.
+/// Returns subtree roots verified against `network`'s embedded final frontier.
 ///
-/// Mainnet ships these bytes in the binary. Other networks do not use the Mainnet trust bundle.
+/// Mainnet verifies its embedded artifact once per process before any read service can use it.
+/// Other networks do not use the Mainnet artifact.
 pub(crate) fn embedded_historical_subtrees(network: &Network) -> Option<SubtreeArtifact> {
     match network {
-        Network::Mainnet => Some(
-            SubtreeArtifact::decode_at_last_checkpoint(
-                MAINNET_SUBTREES,
-                network,
-                network.checkpoint_list().max_height(),
+        Network::Mainnet => {
+            static VERIFIED_MAINNET_SUBTREES: OnceLock<SubtreeArtifact> = OnceLock::new();
+
+            Some(
+                VERIFIED_MAINNET_SUBTREES
+                    .get_or_init(|| {
+                        let artifact = SubtreeArtifact::decode_at_last_checkpoint(
+                            MAINNET_SUBTREES,
+                            network,
+                            network.checkpoint_list().max_height(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("invalid embedded Mainnet subtree-root artifact: {error}")
+                        });
+                        let frontiers = super::vct::embedded_final_frontiers(network)
+                            .expect("Mainnet has an embedded final frontier");
+
+                        artifact
+                            .verify_against_frontiers(
+                                &frontiers.sapling,
+                                &frontiers.orchard,
+                                &frontiers.ironwood,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "embedded Mainnet subtree-root artifact does not match \
+                                     the embedded final frontier: {error}"
+                                )
+                            });
+
+                        artifact
+                    })
+                    .clone(),
             )
-            .unwrap_or_else(|error| {
-                panic!("invalid embedded Mainnet subtree-root artifact: {error}")
-            }),
-        ),
+        }
         Network::Testnet(_) => None,
     }
 }

@@ -47,6 +47,11 @@ const SUBTREE_RECORD_LEN: usize = 2 + 4 + 32;
 /// Subtree indexes are `u16`, so a pool can never complete more than this many.
 const MAX_SUBTREE_RECORDS: usize = u16::MAX as usize + 1;
 
+const SAPLING_POOL: &str = "sapling";
+const ORCHARD_POOL: &str = "orchard";
+const IRONWOOD_POOL: &str = "ironwood";
+const SUBTREE_POOLS: [&str; 3] = [SAPLING_POOL, ORCHARD_POOL, IRONWOOD_POOL];
+
 /// Why an artifact could not be parsed or did not describe what the caller expected.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum TreestateArtifactError {
@@ -345,7 +350,8 @@ impl SubtreeArtifact {
 
         let mut offset = 0;
         let mut pools = Vec::with_capacity(3);
-        for count in counts {
+        for (pool_index, count) in counts.into_iter().enumerate() {
+            let pool = SUBTREE_POOLS[pool_index];
             let mut records = Vec::with_capacity(count);
             let mut previous: Option<u32> = None;
 
@@ -369,6 +375,19 @@ impl SubtreeArtifact {
                     }
                 }
                 previous = Some(u32::from(index));
+
+                let root_is_valid = match pool {
+                    SAPLING_POOL => sapling_crypto::Node::from_bytes(root)
+                        .into_option()
+                        .is_some(),
+                    ORCHARD_POOL | IRONWOOD_POOL => {
+                        orchard::tree::Node::try_from(root.as_slice()).is_ok()
+                    }
+                    _ => unreachable!("all artifact pools have canonical node decoders"),
+                };
+                if !root_is_valid {
+                    return Err(TreestateArtifactError::MalformedSubtreeRoot { pool, index });
+                }
 
                 records.push(SubtreeRecord {
                     index: NoteCommitmentSubtreeIndex(index),
@@ -436,7 +455,7 @@ impl SubtreeArtifact {
                 sapling_crypto::Node::from_bytes(record.root)
                     .into_option()
                     .ok_or(TreestateArtifactError::MalformedSubtreeRoot {
-                        pool: "sapling",
+                        pool: SAPLING_POOL,
                         index: record.index.0,
                     })
             })
@@ -456,8 +475,8 @@ impl SubtreeArtifact {
                 .collect::<Result<Vec<_>, _>>()
         };
 
-        let orchard_roots = pallas_roots("orchard", &self.orchard)?;
-        let ironwood_roots = pallas_roots("ironwood", &self.ironwood)?;
+        let orchard_roots = pallas_roots(ORCHARD_POOL, &self.orchard)?;
+        let ironwood_roots = pallas_roots(IRONWOOD_POOL, &self.ironwood)?;
 
         let verified = |pool: &'static str, result: Result<usize, SubtreeRootsError>| {
             result.map_err(|source| TreestateArtifactError::UnverifiedSubtreeRoots { pool, source })
@@ -465,15 +484,15 @@ impl SubtreeArtifact {
 
         Ok(VerifiedSubtreeCounts {
             sapling: verified(
-                "sapling",
+                SAPLING_POOL,
                 sapling.verify_completed_subtree_roots(&sapling_roots),
             )?,
             orchard: verified(
-                "orchard",
+                ORCHARD_POOL,
                 orchard.verify_completed_subtree_roots(&orchard_roots),
             )?,
             ironwood: verified(
-                "ironwood",
+                IRONWOOD_POOL,
                 ironwood.verify_completed_subtree_roots(&ironwood_roots),
             )?,
         })
@@ -763,7 +782,7 @@ mod tests {
         assert!(matches!(
             verify_subtree_artifact(&Network::Mainnet, &empty, None),
             Err(TreestateArtifactError::UnverifiedSubtreeRoots {
-                pool: "sapling",
+                pool: SAPLING_POOL,
                 source: SubtreeRootsError::CountMismatch { found: 0, .. },
             })
         ));
@@ -794,6 +813,53 @@ mod tests {
                 kind: "subtree-root"
             })
         );
+    }
+
+    #[test]
+    fn subtree_artifact_rejects_malformed_roots_with_a_valid_digest() {
+        for (pool, mut artifact) in [
+            (
+                SAPLING_POOL,
+                SubtreeArtifact {
+                    sapling: vec![SubtreeRecord {
+                        index: NoteCommitmentSubtreeIndex(0),
+                        end_height: Height(1),
+                        root: [0xff; 32],
+                    }],
+                    ..SubtreeArtifact::default()
+                },
+            ),
+            (
+                ORCHARD_POOL,
+                SubtreeArtifact {
+                    orchard: vec![SubtreeRecord {
+                        index: NoteCommitmentSubtreeIndex(0),
+                        end_height: Height(1),
+                        root: [0xff; 32],
+                    }],
+                    ..SubtreeArtifact::default()
+                },
+            ),
+            (
+                IRONWOOD_POOL,
+                SubtreeArtifact {
+                    ironwood: vec![SubtreeRecord {
+                        index: NoteCommitmentSubtreeIndex(0),
+                        end_height: Height(1),
+                        root: [0xff; 32],
+                    }],
+                    ..SubtreeArtifact::default()
+                },
+            ),
+        ] {
+            artifact.last_checkpoint = Height(31);
+            let bytes = artifact.encode(&Network::Mainnet);
+
+            assert_eq!(
+                SubtreeArtifact::decode(&bytes, &Network::Mainnet),
+                Err(TreestateArtifactError::MalformedSubtreeRoot { pool, index: 0 })
+            );
+        }
     }
 
     #[test]

@@ -28,16 +28,13 @@ use tower::Service;
 use tower_batch_control::{Batch, BatchControl, RequestWeight};
 use tower_fallback::Fallback;
 
-use super::spawn_fifo;
-
-mod memo;
+use super::{
+    memo::{CacheKey, Memoized, MemoizedItem, MEMO_CAPACITY},
+    spawn_fifo,
+};
 
 #[cfg(test)]
 mod tests;
-
-pub use memo::Memoized;
-
-use memo::{CacheKey, MEMO_CAPACITY};
 
 /// Adjusted batch size for halo2 batches.
 ///
@@ -164,7 +161,9 @@ impl Item {
         }
         batch.validate(thread_rng())
     }
+}
 
+impl MemoizedItem for Item {
     /// Returns a key that determines every input to this item's proof verification.
     ///
     /// [`Memoized`] reuses a previous `Ok` result whenever this key matches, so the key must
@@ -322,9 +321,17 @@ type VerifierService = Memoized<BatchFallbackService>;
 /// The stack is wrapped in a [`Memoized`] so that a proof gossiped into the mempool does not have
 /// to be verified again when the block that mines it arrives. Because each era builds its own
 /// verifier here, each era also gets its own memo, which is what binds a remembered result to the
-/// `vk` it was produced under.
-fn batch_verifier(vk: &'static ItemVerifyingKey) -> VerifierService {
-    Memoized::new(batch_fallback_verifier(vk), MEMO_CAPACITY)
+/// `vk` it was produced under. `memo_verifier_label` names that memo in the metrics, and must be
+/// distinct per era so the eras' hit rates can be told apart.
+fn batch_verifier(
+    vk: &'static ItemVerifyingKey,
+    memo_verifier_label: &'static str,
+) -> VerifierService {
+    Memoized::new(
+        batch_fallback_verifier(vk),
+        MEMO_CAPACITY,
+        memo_verifier_label,
+    )
 }
 
 /// Builds the un-memoized batching-and-fallback stack for `vk`.
@@ -349,7 +356,7 @@ fn batch_fallback_verifier(vk: &'static ItemVerifyingKey) -> BatchFallbackServic
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
 pub static VERIFIER_PRE_NU6_2: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_PRE_NU6_2));
+    Lazy::new(|| batch_verifier(&VERIFYING_KEY_PRE_NU6_2, "halo2_pre_nu6_2"));
 
 /// Global batch verification context for **NU6.2-until-NU6.3** Halo2 Action proofs.
 ///
@@ -360,7 +367,7 @@ pub static VERIFIER_PRE_NU6_2: Lazy<VerifierService> =
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
 pub static VERIFIER_NU6_2: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_2));
+    Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_2, "halo2_nu6_2"));
 
 /// Global batch verification context for **NU6.3-onward** Halo2 Action proofs.
 ///
@@ -373,7 +380,7 @@ pub static VERIFIER_NU6_2: Lazy<VerifierService> =
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
 pub static VERIFIER_NU6_3_ONWARD: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_3_ONWARD));
+    Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_3_ONWARD, "halo2_nu6_3_onward"));
 
 /// Selects the lazily initialized Halo2 verifier for `network_upgrade`.
 ///

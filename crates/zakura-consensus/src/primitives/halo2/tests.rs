@@ -42,8 +42,9 @@ use crate::{error::TransactionError, BoxError};
 
 use super::{
     bundle_version_discriminant, lazy_verifier_for, BatchFallbackService, CacheKey, Item,
-    ItemVerifyingKey, Memoized, OrchardFallback, Verifier, VERIFIER_NU6_2, VERIFIER_NU6_3_ONWARD,
-    VERIFIER_PRE_NU6_2, VERIFYING_KEY_NU6_2, VERIFYING_KEY_NU6_3_ONWARD, VERIFYING_KEY_PRE_NU6_2,
+    ItemVerifyingKey, Memoized, MemoizedItem, OrchardFallback, Verifier, VERIFIER_NU6_2,
+    VERIFIER_NU6_3_ONWARD, VERIFIER_PRE_NU6_2, VERIFYING_KEY_NU6_2, VERIFYING_KEY_NU6_3_ONWARD,
+    VERIFYING_KEY_PRE_NU6_2,
 };
 
 const EXPLICIT_FLUSH_TEST_MAX_BATCH_WEIGHT: usize = 10_000;
@@ -570,7 +571,7 @@ impl Service<Item> for CountingVerifier {
 async fn memo_skips_the_inner_service_for_an_already_verified_item() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let inner = CountingVerifier::new(true);
-    let mut verifier = Memoized::new(inner.clone(), 8);
+    let mut verifier = Memoized::new(inner.clone(), 8, "halo2_test");
 
     for _ in 0..3 {
         verifier
@@ -596,7 +597,7 @@ async fn memo_does_not_reuse_a_result_across_items() {
     other_sighash.0[0] ^= 1;
 
     let inner = CountingVerifier::new(true);
-    let mut verifier = Memoized::new(inner.clone(), 8);
+    let mut verifier = Memoized::new(inner.clone(), 8, "halo2_test");
 
     for sighash in [sighash, other_sighash] {
         verifier
@@ -624,7 +625,7 @@ async fn memo_does_not_reuse_a_result_across_items() {
 async fn memo_does_not_remember_failures() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let inner = CountingVerifier::new(false);
-    let mut verifier = Memoized::new(inner.clone(), 8);
+    let mut verifier = Memoized::new(inner.clone(), 8, "halo2_test");
 
     for _ in 0..3 {
         verifier
@@ -662,7 +663,7 @@ where
 async fn memo_evicts_in_insertion_order_and_stays_correct_when_full() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let inner = CountingVerifier::new(true);
-    let mut verifier = Memoized::new(inner.clone(), 2);
+    let mut verifier = Memoized::new(inner.clone(), 2, "halo2_test");
 
     let sighashes: Vec<_> = (0..3)
         .map(|i| {

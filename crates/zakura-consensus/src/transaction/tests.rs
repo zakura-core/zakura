@@ -3123,10 +3123,10 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
                 )
                 .expect("test fixture has no transparent inputs");
             let valid_bundle_one = sighasher
-                .sapling_bundle()
+                .sapling_bundle_and_parse_digest()
                 .expect("test fixture has Sapling shielded data");
             let valid_bundle_two = sighasher
-                .sapling_bundle()
+                .sapling_bundle_and_parse_digest()
                 .expect("test fixture has Sapling shielded data");
             let valid_sighash = sighasher.sighash(HashType::ALL, None);
 
@@ -3145,13 +3145,13 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
             )
             .expect("test fixture has no transparent inputs");
         let batch_bundle = sighasher
-            .sapling_bundle()
+            .sapling_bundle_and_parse_digest()
             .expect("test fixture has Sapling shielded data");
         let single_bundle = sighasher
-            .sapling_bundle()
+            .sapling_bundle_and_parse_digest()
             .expect("test fixture has Sapling shielded data");
         let fallback_bundle = sighasher
-            .sapling_bundle()
+            .sapling_bundle_and_parse_digest()
             .expect("test fixture has Sapling shielded data");
         let synchronous_check_bundle = sighasher
             .sapling_bundle()
@@ -3167,7 +3167,7 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
 
         let mut batch_verifier = crate::primitives::sapling::Verifier::default();
         let batch_result = batch_verifier.call(BatchControl::Item(
-            crate::primitives::sapling::Item::new(batch_bundle, sighash),
+            crate::primitives::sapling::Item::new(batch_bundle.0, batch_bundle.1, sighash),
         ));
         let flush_result = batch_verifier.call(BatchControl::Flush);
         let (batch_result, flush_result) = futures::join!(batch_result, flush_result);
@@ -3178,18 +3178,27 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
         );
 
         let single_result = crate::primitives::sapling::verify_single(
-            crate::primitives::sapling::Item::new(single_bundle, sighash),
+            crate::primitives::sapling::Item::new(single_bundle.0, single_bundle.1, sighash),
         )
         .await;
         assert_sapling_verification_error(
             single_result.expect_err("corrupted Sapling proof must be rejected"),
         );
 
-        let invalid_item = crate::primitives::sapling::Item::new(fallback_bundle, sighash);
+        let invalid_item =
+            crate::primitives::sapling::Item::new(fallback_bundle.0, fallback_bundle.1, sighash);
         let items = vec![
-            crate::primitives::sapling::Item::new(valid_bundle_one, valid_sighash),
+            crate::primitives::sapling::Item::new(
+                valid_bundle_one.0,
+                valid_bundle_one.1,
+                valid_sighash,
+            ),
             invalid_item.clone(),
-            crate::primitives::sapling::Item::new(valid_bundle_two, valid_sighash),
+            crate::primitives::sapling::Item::new(
+                valid_bundle_two.0,
+                valid_bundle_two.1,
+                valid_sighash,
+            ),
         ];
         let expected_results: Vec<_> = futures::future::join_all(
             items
@@ -3324,8 +3333,8 @@ fn v4_with_malformed_sapling_proof_returns_typed_error() {
         let check_bundle = sighasher
             .sapling_bundle()
             .expect("test fixture has Sapling shielded data");
-        let bundle = sighasher
-            .sapling_bundle()
+        let (bundle, parse_digest) = sighasher
+            .sapling_bundle_and_parse_digest()
             .expect("test fixture has Sapling shielded data");
         let sighash = sighasher.sighash(HashType::ALL, None);
 
@@ -3336,7 +3345,7 @@ fn v4_with_malformed_sapling_proof_returns_typed_error() {
         );
 
         let result = crate::primitives::sapling::verify_single(
-            crate::primitives::sapling::Item::new(bundle, sighash),
+            crate::primitives::sapling::Item::new(bundle, parse_digest, sighash),
         )
         .await;
         assert_sapling_verification_error(

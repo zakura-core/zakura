@@ -1243,6 +1243,17 @@ impl ReadStateService {
         read::best_tip(&self.latest_non_finalized_state(), &self.db)
     }
 
+    /// Returns the embedded subtree artifact only when it describes this database's fast-sync
+    /// last checkpoint.
+    ///
+    /// This check is made when serving rather than at construction because the durable last
+    /// checkpoint marker can be written after the read service starts.
+    fn historical_subtrees_at_last_checkpoint(&self) -> Option<&finalized_state::SubtreeArtifact> {
+        let artifact = self.historical_subtrees.as_deref()?;
+
+        (self.db.vct_synced_below() == Some(artifact.last_checkpoint)).then_some(artifact)
+    }
+
     /// Subscribe to VCT supplied-root repair needs discovered by the finalized writer.
     pub fn subscribe_vct_root_repairs(&self) -> tokio::sync::watch::Receiver<VctRootRepairStatus> {
         self.vct_root_repair_receiver.clone()
@@ -2426,6 +2437,7 @@ impl Service<ReadRequest> for ReadStateService {
                     .map(NoteCommitmentSubtreeIndex);
 
                 let best_chain = state.latest_best_chain();
+                let verified_tip = read::tip_height(best_chain.clone(), &state.db);
                 let sapling_subtrees = if let Some(end_index) = end_index {
                     read::sapling_subtrees(best_chain.clone(), &state.db, start_index..end_index)
                 } else {
@@ -2448,13 +2460,16 @@ impl Service<ReadRequest> for ReadStateService {
                 let sapling_subtrees = match sapling_subtrees {
                     Ok(subtrees) if subtrees.contains_key(&start_index) => subtrees,
                     result => {
-                        let published = if let Some(artifact) = state.historical_subtrees.as_ref() {
+                        let published = if let (Some(artifact), Some(verified_tip)) =
+                            (state.historical_subtrees_at_last_checkpoint(), verified_tip)
+                        {
                             let range = range_for(start_index, end_index);
                             let mut merged =
                                 read::sapling_subtrees_with_gaps(best_chain, &state.db, range);
                             read::merge_published_subtrees(
                                 &mut merged,
                                 artifact.sapling_range(range),
+                                verified_tip,
                             );
                             read::check_historical_sapling_subtrees_available(
                                 &state.db,
@@ -2484,6 +2499,7 @@ impl Service<ReadRequest> for ReadStateService {
                     .map(NoteCommitmentSubtreeIndex);
 
                 let best_chain = state.latest_best_chain();
+                let verified_tip = read::tip_height(best_chain.clone(), &state.db);
                 let orchard_subtrees = if let Some(end_index) = end_index {
                     read::orchard_subtrees(best_chain.clone(), &state.db, start_index..end_index)
                 } else {
@@ -2506,13 +2522,16 @@ impl Service<ReadRequest> for ReadStateService {
                 let orchard_subtrees = match orchard_subtrees {
                     Ok(subtrees) if subtrees.contains_key(&start_index) => subtrees,
                     result => {
-                        let published = if let Some(artifact) = state.historical_subtrees.as_ref() {
+                        let published = if let (Some(artifact), Some(verified_tip)) =
+                            (state.historical_subtrees_at_last_checkpoint(), verified_tip)
+                        {
                             let range = range_for(start_index, end_index);
                             let mut merged =
                                 read::orchard_subtrees_with_gaps(best_chain, &state.db, range);
                             read::merge_published_subtrees(
                                 &mut merged,
                                 artifact.orchard_range(range),
+                                verified_tip,
                             );
                             read::check_historical_orchard_subtrees_available(
                                 &state.db,
@@ -2542,6 +2561,7 @@ impl Service<ReadRequest> for ReadStateService {
                     .map(NoteCommitmentSubtreeIndex);
 
                 let best_chain = state.latest_best_chain();
+                let verified_tip = read::tip_height(best_chain.clone(), &state.db);
                 let ironwood_subtrees = if let Some(end_index) = end_index {
                     read::ironwood_subtrees(best_chain.clone(), &state.db, start_index..end_index)
                 } else {
@@ -2560,13 +2580,16 @@ impl Service<ReadRequest> for ReadStateService {
                 let ironwood_subtrees = match ironwood_subtrees {
                     Ok(subtrees) if subtrees.contains_key(&start_index) => subtrees,
                     result => {
-                        let published = if let Some(artifact) = state.historical_subtrees.as_ref() {
+                        let published = if let (Some(artifact), Some(verified_tip)) =
+                            (state.historical_subtrees_at_last_checkpoint(), verified_tip)
+                        {
                             let range = range_for(start_index, end_index);
                             let mut merged =
                                 read::ironwood_subtrees_with_gaps(best_chain, &state.db, range);
                             read::merge_published_subtrees(
                                 &mut merged,
                                 artifact.ironwood_range(range),
+                                verified_tip,
                             );
                             read::check_historical_ironwood_subtrees_available(
                                 &state.db,

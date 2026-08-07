@@ -278,11 +278,11 @@ pub(crate) fn first_missing_subtree_index<Node>(
     }
 }
 
-/// Returns an error if the Sapling subtree list `subtrees` is missing `start_index` because it
-/// completed inside the verified-commitment-trees absent band.
+/// Returns an error if the Sapling subtree list `subtrees` has a gap in the
+/// verified-commitment-trees absent band.
 ///
 /// See [`check_historical_subtree_available`].
-fn check_historical_sapling_subtrees_available(
+pub(crate) fn check_historical_sapling_subtrees_available(
     db: &ZakuraDb,
     start_index: NoteCommitmentSubtreeIndex,
     end_index: Option<NoteCommitmentSubtreeIndex>,
@@ -307,11 +307,11 @@ fn check_historical_sapling_subtrees_available(
     )
 }
 
-/// Returns an error if the Orchard subtree list `subtrees` is missing `start_index` because it
-/// completed inside the verified-commitment-trees absent band.
+/// Returns an error if the Orchard subtree list `subtrees` has a gap in the
+/// verified-commitment-trees absent band.
 ///
 /// See [`check_historical_subtree_available`].
-fn check_historical_orchard_subtrees_available(
+pub(crate) fn check_historical_orchard_subtrees_available(
     db: &ZakuraDb,
     start_index: NoteCommitmentSubtreeIndex,
     end_index: Option<NoteCommitmentSubtreeIndex>,
@@ -333,11 +333,11 @@ fn check_historical_orchard_subtrees_available(
     )
 }
 
-/// Returns an error if the Ironwood subtree list `subtrees` is missing `start_index` because it
-/// completed inside the verified-commitment-trees absent band.
+/// Returns an error if the Ironwood subtree list `subtrees` has a gap in the
+/// verified-commitment-trees absent band.
 ///
 /// See [`check_historical_subtree_available`].
-fn check_historical_ironwood_subtrees_available(
+pub(crate) fn check_historical_ironwood_subtrees_available(
     db: &ZakuraDb,
     start_index: NoteCommitmentSubtreeIndex,
     end_index: Option<NoteCommitmentSubtreeIndex>,

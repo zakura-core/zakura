@@ -2439,24 +2439,33 @@ impl Service<ReadRequest> for ReadStateService {
                 // The read above already applies the continuity contract and reports the absent
                 // band, so it answers on its own whenever the node's own rows cover
                 // `start_index`. Only when they do not is the published artifact consulted: the
-                // union of the raw range and the published records, with continuity re-applied
-                // over the whole thing, because a client asking from index 0 must get one list
-                // spanning both halves rather than just the published one. If that union still
+                // union of the raw range and the published records, with availability rechecked
+                // and continuity re-applied over the whole thing, because a client asking from
+                // index 0 must get one list spanning both halves rather than just the published
+                // one. If that union still
                 // does not reach `start_index`, the original result stands — including its typed
                 // absent-band error.
                 let sapling_subtrees = match sapling_subtrees {
                     Ok(subtrees) if subtrees.contains_key(&start_index) => subtrees,
                     result => {
-                        let published = state.historical_subtrees.as_ref().map(|artifact| {
+                        let published = if let Some(artifact) = state.historical_subtrees.as_ref() {
                             let range = range_for(start_index, end_index);
                             let mut merged = state.db.sapling_subtree_list_by_index_range(range);
                             read::merge_published_subtrees(
                                 &mut merged,
                                 artifact.sapling_range(range),
                             );
+                            read::check_historical_sapling_subtrees_available(
+                                &state.db,
+                                start_index,
+                                end_index,
+                                &merged,
+                            )?;
 
-                            read::contiguous_subtrees_from(merged, start_index)
-                        });
+                            Some(read::contiguous_subtrees_from(merged, start_index))
+                        } else {
+                            None
+                        };
 
                         match published {
                             Some(merged) if merged.contains_key(&start_index) => merged,
@@ -2487,24 +2496,33 @@ impl Service<ReadRequest> for ReadStateService {
                 // The read above already applies the continuity contract and reports the absent
                 // band, so it answers on its own whenever the node's own rows cover
                 // `start_index`. Only when they do not is the published artifact consulted: the
-                // union of the raw range and the published records, with continuity re-applied
-                // over the whole thing, because a client asking from index 0 must get one list
-                // spanning both halves rather than just the published one. If that union still
+                // union of the raw range and the published records, with availability rechecked
+                // and continuity re-applied over the whole thing, because a client asking from
+                // index 0 must get one list spanning both halves rather than just the published
+                // one. If that union still
                 // does not reach `start_index`, the original result stands — including its typed
                 // absent-band error.
                 let orchard_subtrees = match orchard_subtrees {
                     Ok(subtrees) if subtrees.contains_key(&start_index) => subtrees,
                     result => {
-                        let published = state.historical_subtrees.as_ref().map(|artifact| {
+                        let published = if let Some(artifact) = state.historical_subtrees.as_ref() {
                             let range = range_for(start_index, end_index);
                             let mut merged = state.db.orchard_subtree_list_by_index_range(range);
                             read::merge_published_subtrees(
                                 &mut merged,
                                 artifact.orchard_range(range),
                             );
+                            read::check_historical_orchard_subtrees_available(
+                                &state.db,
+                                start_index,
+                                end_index,
+                                &merged,
+                            )?;
 
-                            read::contiguous_subtrees_from(merged, start_index)
-                        });
+                            Some(read::contiguous_subtrees_from(merged, start_index))
+                        } else {
+                            None
+                        };
 
                         match published {
                             Some(merged) if merged.contains_key(&start_index) => merged,
@@ -2531,24 +2549,33 @@ impl Service<ReadRequest> for ReadStateService {
                 // The read above already applies the continuity contract and reports the absent
                 // band, so it answers on its own whenever the node's own rows cover
                 // `start_index`. Only when they do not is the published artifact consulted: the
-                // union of the raw range and the published records, with continuity re-applied
-                // over the whole thing, because a client asking from index 0 must get one list
-                // spanning both halves rather than just the published one. If that union still
+                // union of the raw range and the published records, with availability rechecked
+                // and continuity re-applied over the whole thing, because a client asking from
+                // index 0 must get one list spanning both halves rather than just the published
+                // one. If that union still
                 // does not reach `start_index`, the original result stands — including its typed
                 // absent-band error.
                 let ironwood_subtrees = match ironwood_subtrees {
                     Ok(subtrees) if subtrees.contains_key(&start_index) => subtrees,
                     result => {
-                        let published = state.historical_subtrees.as_ref().map(|artifact| {
+                        let published = if let Some(artifact) = state.historical_subtrees.as_ref() {
                             let range = range_for(start_index, end_index);
                             let mut merged = state.db.ironwood_subtree_list_by_index_range(range);
                             read::merge_published_subtrees(
                                 &mut merged,
                                 artifact.ironwood_range(range),
                             );
+                            read::check_historical_ironwood_subtrees_available(
+                                &state.db,
+                                start_index,
+                                end_index,
+                                &merged,
+                            )?;
 
-                            read::contiguous_subtrees_from(merged, start_index)
-                        });
+                            Some(read::contiguous_subtrees_from(merged, start_index))
+                        } else {
+                            None
+                        };
 
                         match published {
                             Some(merged) if merged.contains_key(&start_index) => merged,

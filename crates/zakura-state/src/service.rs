@@ -253,10 +253,10 @@ pub struct ReadStateService {
     _highest_completed_checkpoint_sender:
         Option<tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>>,
 
-    /// Published completed subtree roots for heights below the checkpoint handoff.
+    /// Published completed subtree roots for heights below the last checkpoint.
     ///
-    /// `None` when no artifact is configured or it failed to validate, in which case
-    /// `z_getsubtreesbyindex` keeps reporting the absent band rather than serving unchecked data.
+    /// `None` on networks without an embedded artifact, in which case `z_getsubtreesbyindex`
+    /// keeps reporting the absent band rather than serving unchecked data.
     historical_subtrees: Option<Arc<finalized_state::SubtreeArtifact>>,
 
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
@@ -1140,10 +1140,8 @@ impl ReadStateService {
             Option<finalized_state::HeaderRootAuthState>,
         >,
     ) -> Self {
-        let historical_subtrees = load_historical_subtree_artifact(
-            &finalized_state.network(),
-            finalized_state.db.config(),
-        );
+        let historical_subtrees =
+            finalized_state::embedded_historical_subtrees(&finalized_state.network()).map(Arc::new);
 
         let read_service = Self {
             network: finalized_state.network(),
@@ -1703,44 +1701,6 @@ fn range_for(
         Bound::Included(start_index),
         end_index.map_or(Bound::Unbounded, Bound::Excluded),
     )
-}
-
-/// Loads the subtree-root artifact named in `config`, if any.
-///
-/// A missing or invalid artifact is logged and skipped rather than fatal: the node still works, it
-/// just keeps reporting the absent band for `z_getsubtreesbyindex`. Refusing to start over a
-/// serving-only input would be a worse trade.
-fn load_historical_subtree_artifact(
-    network: &Network,
-    config: &Config,
-) -> Option<Arc<finalized_state::SubtreeArtifact>> {
-    let subtrees = config
-        .historical_subtree_artifact
-        .as_ref()
-        .and_then(|path| match std::fs::read(path) {
-            Ok(bytes) => match finalized_state::SubtreeArtifact::decode(&bytes, network) {
-                Ok(artifact) => {
-                    tracing::info!(
-                        ?path,
-                        sapling = artifact.sapling.len(),
-                        orchard = artifact.orchard.len(),
-                        ironwood = artifact.ironwood.len(),
-                        "loaded historical subtree-root artifact"
-                    );
-                    Some(Arc::new(artifact))
-                }
-                Err(error) => {
-                    tracing::warn!(?path, %error, "ignoring invalid historical subtree-root artifact");
-                    None
-                }
-            },
-            Err(error) => {
-                tracing::warn!(?path, %error, "cannot read historical subtree-root artifact");
-                None
-            }
-        });
-
-    subtrees
 }
 
 fn block_roots_by_height_range<C>(

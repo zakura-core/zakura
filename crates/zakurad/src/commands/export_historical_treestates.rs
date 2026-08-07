@@ -1,7 +1,9 @@
 //! `export-historical-treestates` subcommand - generates the subtree-root artifact.
 //!
-//! One read-only replay across the absent band emits the completed subtree roots described in
-//! `docs/design/historical-treestate-serving.md` §4.6. The replay is checked against the
+//! Generation is bound to the network last checkpoint. A legacy archive that still holds
+//! pre-last-checkpoint frontiers exports its stored subtree rows directly. A verified-commitment-trees
+//! fast-synced database falls back to authenticated replay across the absent band
+//! (`docs/design/historical-treestate-serving.md` §4.6). Replay checks itself against the
 //! authenticated roots the database already holds, so generation fails rather than publishing
 //! roots that do not match.
 
@@ -73,7 +75,11 @@ impl ExportHistoricalTreestatesCmd {
             export.subtrees.orchard.len(),
             export.subtrees.ironwood.len(),
         );
-        println!("blocks replayed: {}", export.replayed_blocks);
+        if export.replayed_blocks == 0 {
+            println!("source:          stored subtree rows");
+        } else {
+            println!("blocks replayed: {}", export.replayed_blocks);
+        }
         println!("elapsed:         {:.1}s", export.elapsed.as_secs_f64());
 
         let bytes = export.subtrees.encode(&self.network);

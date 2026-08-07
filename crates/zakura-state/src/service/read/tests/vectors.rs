@@ -974,7 +974,7 @@ fn first_missing_subtree_index_finds_the_end_of_the_run() {
 /// Merging the node's own subtree rows with published ones must still serve a continuous list.
 ///
 /// The gated read drops everything when it has no row at the requested start, so a node holding
-/// rows only *above* the handoff contributes nothing until the published records below it are
+/// rows only *above* the last checkpoint contributes nothing until the published records below it are
 /// merged in. A client doing spend-before-sync asks from index 0 and needs one list spanning both
 /// halves; serving only the published half would silently truncate its witness data.
 #[test]

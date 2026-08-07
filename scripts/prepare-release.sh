@@ -153,7 +153,8 @@ if [ "$dry_run" = 0 ]; then
         case "$dirty_path" in
           crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt|\
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin|\
-          crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json|\
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin|\
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json|\
           crates/zakurad/src/components/sync/end_of_support.rs)
             ;;
           *)

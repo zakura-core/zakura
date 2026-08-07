@@ -111,6 +111,7 @@ pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
     MAX_ON_DISK_HEIGHT,
 };
+pub(crate) use treestate_artifact::embedded_historical_subtrees;
 pub use treestate_artifact::{SubtreeArtifact, SubtreeRecord, TreestateArtifactError};
 pub use treestate_export::{
     export as export_subtree_artifact, TreestateExport, TreestateExportError,

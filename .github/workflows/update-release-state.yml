@@ -111,7 +111,7 @@ jobs:
           sort > "$RUNNER_TEMP/allowed-files" <<'EOF'
           crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-          crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
           crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
           crates/zakurad/src/components/sync/end_of_support.rs
           EOF

@@ -776,7 +776,7 @@ asserts to prove roots actually came over the wire rather than a silent legacy s
 | Verify-before-commit logic | `crates/zakura-state/src/service/finalized_state/commitment_aux_verify.rs` |
 | Embedded frontier plumbing, `select_source_mode`, counters | `crates/zakura-state/src/service/finalized_state/vct.rs` |
 | `checkpoint_sync` mirror field (mode input) | `crates/zakura-state/src/config.rs`; set in `crates/zakurad/src/commands/start.rs` |
-| Embedded Mainnet frontier and provenance | `crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin`, `.../mainnet-frontier.json` |
+| Embedded Mainnet VCT state and manifest | `crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin`, `.../mainnet-subtrees.bin`, `.../mainnet-vct-manifest.json` |
 | Commit-path hook, last checkpoint height, frozen-frontier policy | `crates/zakura-state/src/service/finalized_state.rs` |
 | `BlockRoots` serving read (authoritative index) | `crates/zakura-state/src/service.rs` |
 | Root-index lifecycle (`commitment_roots_by_height`, authentication frontier, body-commit/rollback policies) | `crates/zakura-state/src/service/finalized_state/zakura_db/commitment_roots_db.rs`, `.../block.rs`, `.../rollback.rs` |
@@ -849,7 +849,7 @@ redirects, bounded reads, digest verification at every hop, and a maximum bundle
 exit green without release-state changes when the bundle does not advance the committed
 list. Otherwise their shared importer verifies the committed `main-checkpoints.txt` is a
 byte-identical prefix of the bundle's list, replaces the checkpoint file and frontier, and
-writes `vct/mainnet-frontier.json` provenance (source `release-state-bundle`, heights,
+writes `vct/mainnet-vct-manifest.json` provenance (source `release-state-bundle`, heights,
 digests, bundle binding).
 
 The standalone update workflow also floors `ESTIMATED_RELEASE_HEIGHT`, validates everything
@@ -863,7 +863,7 @@ digests only prove faithful transport from our own publisher.
 
 ### 16.3 Committed provenance and the release gate
 
-`vct/mainnet-frontier.json` is committed next to the frontier. The
+`vct/mainnet-vct-manifest.json` is committed next to the frontier and subtree artifact. The
 `embedded_mainnet_final_frontiers_parse` unit test re-derives its digests from the embedded
 checkpoint list and frontier bytes on every PR, so a desynced checkpoint/frontier/provenance
 combination fails ordinary CI. The current frontier predates the pipeline and is recorded

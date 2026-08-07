@@ -115,7 +115,7 @@ pub fn contiguous_subtrees_from<Node>(
 ///
 /// The node computed and verified its own rows; a published record is trusted only after a digest
 /// the artifact carries itself, which is not a signature. A correct artifact holds only subtrees
-/// completed at or below the handoff and so never overlaps what the node stores, which means an
+/// completed at or below the last checkpoint and so never overlaps what the node stores, which means an
 /// overlap is precisely the corrupt-or-hostile case where precedence decides whether a wrong root
 /// reaches a client.
 pub fn merge_published_subtrees<Node>(

@@ -175,7 +175,7 @@ jobs:
           estimated_height="$(jq -r '.estimated_release_height' <<<"$report")"
           committed_height="$(
             jq -r '.finalized_height' \
-              crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+              crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
           )"
           configured_height="$(
             grep -oE 'ESTIMATED_RELEASE_HEIGHT: u32 = [0-9_]+' \

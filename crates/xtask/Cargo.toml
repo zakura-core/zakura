@@ -15,3 +15,4 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+sha2.workspace = true

@@ -9,6 +9,8 @@ use std::{io::Write, sync::Arc};
 
 pub mod block;
 pub mod chain;
+pub mod header_chain;
+pub mod header_chain_values;
 pub mod shielded;
 pub mod transparent;
 pub mod upgrade;
@@ -55,6 +57,22 @@ pub trait FromDisk: Sized {
     ///
     /// [1]: super::disk_db::ReadDisk
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self;
+}
+
+/// Stable disk-value encoding for corruption-facing data.
+///
+/// Unlike [`IntoDisk`] and [`FromDisk`], this contract reports malformed input
+/// and encoding failures to the caller. Implementations are responsible for
+/// bounding allocations and rejecting bytes after the one expected value.
+pub trait FallibleDiskValue: Sized {
+    /// Encoding and decoding failure.
+    type Error;
+
+    /// Encode one complete value.
+    fn encode(&self) -> Result<Vec<u8>, Self::Error>;
+
+    /// Decode one complete value.
+    fn decode(bytes: &[u8]) -> Result<Self, Self::Error>;
 }
 
 // Generic serialization impls

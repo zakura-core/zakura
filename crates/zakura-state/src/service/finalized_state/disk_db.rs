@@ -55,6 +55,14 @@ pub type DBThreadMode = rocksdb::SingleThreaded;
 /// Also the [`rocksdb::DBAccess`] used by database iterators.
 pub type DB = rocksdb::DBWithThreadMode<DBThreadMode>;
 
+/// Failure while visiting a raw column family without collecting its rows.
+pub(crate) enum RawVisitError<E> {
+    /// RocksDB failed while advancing the iterator.
+    RocksDb(rocksdb::Error),
+    /// The caller rejected the current key/value pair.
+    Visitor(E),
+}
+
 /// Wrapper struct to ensure low-level database access goes through the correct API.
 ///
 /// `rocksdb` allows concurrent writes through a shared reference,
@@ -1138,16 +1146,7 @@ impl DiskDb {
                 Ok(db)
             }
 
-            Err(e) if matches!(e.kind(), ErrorKind::Busy | ErrorKind::IOError) => panic!(
-                "Database likely already open {path:?} \
-                         Hint: Check if another zakurad process is running."
-            ),
-
-            Err(e) => panic!(
-                "Opening database {path:?} failed. \
-                        Hint: Try changing the state cache_dir in the Zakura config. \
-                        Error: {e}",
-            ),
+            Err(source) => Err(StateInitError::DatabaseOpen { path, source }),
         }
     }
 
@@ -1197,6 +1196,74 @@ impl DiskDb {
         // should just be &self. To avoid this restriction, clone the string before passing it to
         // this method. Currently Zebra uses static strings, so this doesn't matter.
         self.db.cf_handle(cf_name)
+    }
+
+    /// Read raw bytes from one column family without panicking on RocksDB failure.
+    pub(crate) fn raw_get_cf<C>(
+        &self,
+        cf: &C,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        self.db.get_cf(cf, key)
+    }
+
+    /// Read the first raw key/value pair from one column family.
+    pub(crate) fn raw_first_cf<C>(
+        &self,
+        cf: &C,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        self.db
+            .iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .next()
+            .transpose()
+            .map(|entry| entry.map(|(key, value)| (key.to_vec(), value.to_vec())))
+    }
+
+    /// Visit raw key/value pairs one at a time without collecting the column family.
+    pub(crate) fn raw_visit_cf<C, E>(
+        &self,
+        cf: &C,
+        visitor: &mut dyn FnMut(&[u8], &[u8]) -> Result<(), E>,
+    ) -> Result<(), RawVisitError<E>>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        for entry in self.db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+            let (key, value) = entry.map_err(RawVisitError::RocksDb)?;
+            visitor(&key, &value).map_err(RawVisitError::Visitor)?;
+        }
+        Ok(())
+    }
+
+    /// Collect a raw half-open key range without panicking on iterator failure.
+    pub(crate) fn raw_range_cf<C>(
+        &self,
+        cf: &C,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        let mut options = ReadOptions::default();
+        options.set_iterate_lower_bound(lower.to_vec());
+        if let Some(upper) = upper {
+            options.set_iterate_upper_bound(upper.to_vec());
+        }
+        self.db
+            .iterator_cf_opt(
+                cf,
+                options,
+                rocksdb::IteratorMode::From(lower, rocksdb::Direction::Forward),
+            )
+            .map(|result| result.map(|(key, value)| (key.to_vec(), value.to_vec())))
+            .collect()
     }
 
     // Read methods are located in the ReadDisk trait

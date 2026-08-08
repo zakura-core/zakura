@@ -8655,7 +8655,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "bincode",
  "chrono",
@@ -8701,6 +8701,7 @@ dependencies = [
  "tower 0.4.13",
  "tracing",
  "zakura-chain",
+ "zakura-header-chain",
  "zakura-node-services",
  "zakura-test",
 ]

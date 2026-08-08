@@ -7,20 +7,16 @@
 use std::{env, sync::Arc, time::Duration};
 
 use tokio::{runtime::Runtime, time::timeout};
-use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
+use tower::{buffer::Buffer, util::BoxService};
 
 use zakura_chain::{
     block::{self, Block, CountedHeader, Height},
     chain_tip::ChainTip,
     fmt::SummaryDebug,
-    orchard,
-    parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{Network, NetworkUpgrade},
-    sapling,
-    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
+    serialization::{ZcashDeserialize, ZcashDeserializeInto},
     transaction, transparent,
     value_balance::ValueBalance,
-    work::difficulty::ParameterDifficulty,
 };
 
 use zakura_test::{prelude::*, transcript::Transcript};
@@ -28,38 +24,13 @@ use zakura_test::{prelude::*, transcript::Transcript};
 use crate::{
     arbitrary::Prepare,
     init_test,
-    service::{
-        arbitrary::populated_state,
-        chain_tip::TipAction,
-        finalized_state::FinalizedState,
-        headers_by_height_range,
-        non_finalized_state::{Chain, NonFinalizedState},
-        read, StateService,
-    },
-    tests::{
-        setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
-        FakeChainHelper,
-    },
-    BoxError, CheckpointVerifiedBlock, Config, ReadRequest, ReadResponse, Request, Response,
-    SemanticallyVerifiedBlock, CHAIN_TIP_UPDATE_WAIT_LIMIT,
+    service::{arbitrary::populated_state, chain_tip::TipAction, StateService},
+    tests::setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
+    BoxError, CheckpointVerifiedBlock, Config, Request, Response, SemanticallyVerifiedBlock,
+    CHAIN_TIP_UPDATE_WAIT_LIMIT,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
-
-fn roots_from_height(start: Height, count: u32) -> Vec<BlockCommitmentRoots> {
-    (0..count)
-        .map(|offset| BlockCommitmentRoots {
-            height: Height(start.0 + offset),
-            sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
-            orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-            ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-            sapling_tx: 0,
-            orchard_tx: 0,
-            ironwood_tx: 0,
-            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
-        })
-        .collect()
-}
 
 async fn test_populated_state_responds_correctly(
     mut state: Buffer<BoxService<Request, Response, BoxError>, Request>,
@@ -327,8 +298,10 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     // Set the maximum checkpoint height to block 1, so the checkpoint phase ends once block 1 is
     // committed to the finalized state.
     let max_checkpoint_height = blocks[1].coinbase_height().unwrap();
+    let mut config = Config::ephemeral();
+    config.enable_zakura_header_seed_from_committed_blocks = true;
     let (mut state_service, _read, _tip, _tip_change) =
-        StateService::new(Config::ephemeral(), &network, max_checkpoint_height, 0).await;
+        StateService::new(config, &network, max_checkpoint_height, 0).await;
 
     // Commit blocks 0 and 1 to the finalized state and wait for each write to land on disk, so the
     // finalized tip catches up to the maximum checkpoint height and the last block hash we sent.
@@ -377,6 +350,73 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     assert!(
         state_service.block_write_sender.finalized.is_none(),
         "poll_ready should have handed off to non-finalized writes at the max checkpoint height",
+    );
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let store = crate::service::finalized_state::header_chain::HeaderChainStore::new(
+                state_service.read_service.db.header_chain_disk_db(),
+            );
+            if store
+                .is_initialized()
+                .expect("the header-chain format marker is readable")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the production writer attaches the header runtime at handoff");
+
+    Ok(())
+}
+
+/// Legacy-only nodes must preserve the ordinary state handoff without creating or
+/// reconstructing the native header runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_mode_handoff_keeps_header_runtime_detached() -> Result<()> {
+    use std::task::{Context, Waker};
+
+    use tower::Service;
+    use zakura_node_services::sync_lifecycle::HeaderRuntimeStatus;
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let genesis = zakura_test::vectors::MAINNET_BLOCKS
+        .get(&0)
+        .expect("the mainnet genesis vector is available")
+        .zcash_deserialize_into::<Arc<Block>>()?;
+
+    let (mut state, read, _tip, _tip_change) =
+        StateService::new(Config::ephemeral(), &network, Height(0), 0).await;
+    let result = state
+        .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis))
+        .await;
+    assert!(
+        matches!(result, Ok(Ok(_))),
+        "genesis should commit: {result:?}"
+    );
+
+    let mut cx = Context::from_waker(Waker::noop());
+    let _ = state.poll_ready(&mut cx);
+    assert!(
+        state.block_write_sender.finalized.is_none(),
+        "legacy state still hands off to semantic writes"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(matches!(
+        &*read.subscribe_header_runtime_status().borrow(),
+        HeaderRuntimeStatus::Detached { .. }
+    ));
+    assert!(read.subscribe_header_chain_snapshots().borrow().is_none());
+    assert!(
+        !crate::service::finalized_state::header_chain::HeaderChainStore::new(
+            state.read_service.db.header_chain_disk_db(),
+        )
+        .is_initialized()?,
+        "legacy handoff must not create durable header-runtime state"
     );
 
     Ok(())
@@ -463,660 +503,6 @@ async fn handoff_trigger_microbench() -> Result<()> {
     println!("  finalized_tip_hash() DB read : {tip_ns:>8.2} ns/call");
     println!("  helper, full guard           : {guard_ns:>8.2} ns/call");
     println!("  helper, steady state         : {steady_ns:>8.2} ns/call");
-
-    Ok(())
-}
-
-/// Checkpoint commits must not answer their oneshot until header-root auth and the
-/// chain tip are published. Tip waiters that await the commit response can otherwise
-/// resume between the DB write and those notifications; under `start_paused` that
-/// race times out on virtual time while the OS write thread is still finishing.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn checkpoint_commit_response_waits_for_auth_and_tip() -> std::result::Result<(), BoxError> {
-    let _init_guard = zakura_test::init();
-    let network = Network::Mainnet;
-    let (mut state_service, read_state, _, mut chain_tip_change) =
-        StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
-    let mut header_root_auth = read_state.subscribe_header_root_auth();
-    assert_eq!(*header_root_auth.borrow_and_update(), None);
-
-    let genesis =
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
-
-    assert_eq!(
-        state_service
-            .ready()
-            .await?
-            .call(Request::CommitCheckpointVerifiedBlock(
-                CheckpointVerifiedBlock::from(genesis.clone()),
-            ))
-            .await?,
-        Response::Committed(genesis.hash()),
-    );
-
-    // No tip wait needed: the oneshot must not return until both watches advance.
-    assert!(
-        matches!(header_root_auth.has_changed(), Ok(true)),
-        "commit response must not return until header-root auth is published"
-    );
-    assert!(
-        chain_tip_change.last_tip_change().is_some(),
-        "commit response must not return until the chain tip is published"
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn header_only_service_requests_preserve_body_boundary() -> std::result::Result<(), BoxError>
-{
-    let _init_guard = zakura_test::init();
-    let network = Network::Mainnet;
-    let (mut state_service, read_state, _, mut chain_tip_change) =
-        StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
-    let mut header_root_auth = read_state.subscribe_header_root_auth();
-    assert_eq!(*header_root_auth.borrow_and_update(), None);
-    let genesis =
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
-    let block1 =
-        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
-    let block2 =
-        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
-    let block1_hash = block1.hash();
-    let block2_hash = block2.hash();
-
-    assert_eq!(
-        state_service
-            .ready()
-            .await?
-            .call(Request::CommitCheckpointVerifiedBlock(
-                CheckpointVerifiedBlock::from(genesis.clone()),
-            ))
-            .await?,
-        Response::Committed(genesis.hash()),
-    );
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        chain_tip_change.wait_for_tip_change(),
-    )
-    .await
-    .expect("genesis chain-tip publication is prompt")
-    .expect("chain-tip watch remains open");
-    assert!(
-        matches!(header_root_auth.has_changed(), Ok(true)),
-        "authentication watch must publish before the chain-tip watch"
-    );
-    tokio::time::timeout(Duration::from_secs(1), header_root_auth.changed())
-        .await
-        .expect("genesis authentication publication is prompt")
-        .expect("authentication watch remains open");
-    let genesis_auth = header_root_auth
-        .borrow_and_update()
-        .expect("genesis commit publishes authentication state");
-    assert_eq!(genesis_auth.authenticated_height, Height::MIN);
-    assert_eq!(genesis_auth.authenticated_hash, genesis.hash());
-    assert_eq!(genesis_auth.completed_checkpoint_height, Height::MIN);
-
-    state_service.block_write_sender.finalized = None;
-    let state = Buffer::new(BoxService::new(state_service), 1);
-
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::FinalizedTip)
-            .await?,
-        ReadResponse::FinalizedTip(Some((Height(0), genesis.hash()))),
-    );
-
-    let genesis_size = u32::try_from(genesis.zcash_serialize_to_vec()?.len())
-        .expect("serialized block size fits in u32");
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::BlocksByHeightRange {
-                start: Height(0),
-                count: 3,
-            })
-            .await?,
-        ReadResponse::Blocks(vec![(
-            Height(0),
-            genesis.clone(),
-            genesis.zcash_serialize_to_vec()?.len(),
-        )]),
-    );
-
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::BlockSizeHints {
-                from: Height(0),
-                count: 1,
-            })
-            .await?,
-        ReadResponse::BlockSizeHints(vec![(Height(0), Some(genesis_size))]),
-    );
-
-    assert_eq!(
-        state
-            .clone()
-            .oneshot(Request::CommitHeaderRange {
-                anchor: genesis.hash(),
-                headers: vec![block1.header.clone(), block2.header.clone()],
-                body_sizes: vec![999_999, 0],
-                tree_aux_roots: roots_from_height(Height(1), 2),
-            })
-            .await?,
-        Response::Committed(block2_hash),
-    );
-    assert!(
-        matches!(header_root_auth.has_changed(), Ok(true)),
-        "authentication watch must publish before header commit success"
-    );
-    tokio::time::timeout(Duration::from_secs(1), header_root_auth.changed())
-        .await
-        .expect("header authentication publication is prompt")
-        .expect("authentication watch remains open");
-    assert_eq!(
-        header_root_auth
-            .borrow_and_update()
-            .expect("header commit keeps compact state available"),
-        genesis_auth,
-    );
-
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::BlockSizeHints {
-                from: Height(1),
-                count: 2,
-            })
-            .await?,
-        ReadResponse::BlockSizeHints(vec![(Height(1), Some(999_999)), (Height(2), None)]),
-    );
-
-    assert_eq!(
-        state.clone().oneshot(Request::Depth(block1_hash)).await?,
-        Response::Depth(None),
-    );
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::Depth(block1_hash))
-            .await?,
-        ReadResponse::Depth(None),
-    );
-    assert_eq!(
-        state
-            .clone()
-            .oneshot(Request::KnownBlock(block1_hash))
-            .await?,
-        Response::KnownBlock(None),
-    );
-    assert_eq!(
-        state
-            .clone()
-            .oneshot(Request::KnownBlock(block2_hash))
-            .await?,
-        Response::KnownBlock(None),
-    );
-    assert_eq!(
-        state
-            .clone()
-            .oneshot(Request::Block(Height(1).into()))
-            .await?,
-        Response::Block(None),
-    );
-    assert_eq!(
-        state
-            .clone()
-            .oneshot(Request::Block(Height(2).into()))
-            .await?,
-        Response::Block(None),
-    );
-    assert_eq!(
-        state
-            .clone()
-            .oneshot(Request::AnyChainBlock(block1_hash.into()))
-            .await?,
-        Response::Block(None),
-    );
-
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::BestChainBlockHash(Height(1)))
-            .await?,
-        ReadResponse::BlockHash(None),
-    );
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::TransactionIdsForBlock(Height(1).into()))
-            .await?,
-        ReadResponse::TransactionIdsForBlock(None),
-    );
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::HeadersByHeightRange {
-                start: Height(1),
-                count: 2,
-            })
-            .await?,
-        ReadResponse::Headers(vec![
-            (Height(1), block1_hash, block1.header.clone()),
-            (Height(2), block2_hash, block2.header.clone()),
-        ]),
-    );
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::BlocksByHeightRange {
-                start: Height(1),
-                count: 2,
-            })
-            .await?,
-        ReadResponse::Blocks(Vec::new()),
-    );
-
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::BestDurableHeaderTip)
-            .await?,
-        ReadResponse::BestDurableHeaderTip(Some((Height(2), block2_hash))),
-    );
-    assert!(read::tree::history_tree(
-        read_state.latest_best_chain(),
-        &read_state.db,
-        Height(0).into()
-    )
-    .is_some());
-    assert_eq!(
-        read::tree::history_tree(
-            read_state.latest_best_chain(),
-            &read_state.db,
-            Height(1).into()
-        ),
-        None
-    );
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::MissingBlockBodies {
-                from: Height(1),
-                limit: 10,
-            })
-            .await?,
-        ReadResponse::MissingBlockBodies(vec![Height(1), Height(2)]),
-    );
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::MissingBlockBodyMetadata {
-                from: Height(1),
-                limit: 10,
-            })
-            .await?,
-        ReadResponse::MissingBlockBodyMetadata(vec![
-            (Height(1), block1_hash, Some(999_999)),
-            (Height(2), block2_hash, None),
-        ]),
-    );
-    // A `from` at or below the verified body tip (genesis, height 0) is clamped up
-    // to the first missing height, so the already-bodied genesis is never offered
-    // for re-download.
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::MissingBlockBodyMetadata {
-                from: Height(0),
-                limit: 10,
-            })
-            .await?,
-        ReadResponse::MissingBlockBodyMetadata(vec![
-            (Height(1), block1_hash, Some(999_999)),
-            (Height(2), block2_hash, None),
-        ]),
-    );
-    // `limit` bounds the scan window, so a smaller window returns only its prefix.
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::MissingBlockBodyMetadata {
-                from: Height(1),
-                limit: 1,
-            })
-            .await?,
-        ReadResponse::MissingBlockBodyMetadata(vec![(Height(1), block1_hash, Some(999_999))]),
-    );
-    // A `from` above the best header tip has nothing to offer.
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::MissingBlockBodyMetadata {
-                from: Height(3),
-                limit: 10,
-            })
-            .await?,
-        ReadResponse::MissingBlockBodyMetadata(Vec::new()),
-    );
-
-    assert_eq!(
-        read_state.oneshot(ReadRequest::FinalizedTip).await?,
-        ReadResponse::FinalizedTip(Some((Height(0), genesis.hash()))),
-    );
-
-    Ok(())
-}
-
-/// A forged supplied root must surface from [`StateService`] as a top-level
-/// [`AuthenticateHeaderRootsError::Verification`] inside [`BoxError`], so the
-/// header-sync driver can map it to peer-attributable scoring. A wrapper that
-/// hid the typed error would silently disable scoring.
-#[tokio::test(flavor = "multi_thread")]
-async fn forged_header_roots_boxerror_is_peer_attributable() -> std::result::Result<(), BoxError> {
-    use zakura_chain::parameters::testnet;
-
-    use crate::{AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome};
-
-    let _init_guard = zakura_test::init();
-
-    let genesis =
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
-    let block1 =
-        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
-    let block2 =
-        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
-
-    let network = testnet::Parameters::build()
-        .with_network_name("RootAuthServiceTest")
-        .expect("test network name is valid")
-        .with_genesis_hash(genesis.hash())
-        .expect("genesis hash is valid")
-        .with_target_difficulty_limit(Network::Mainnet.target_difficulty_limit())
-        .expect("difficulty limit is valid")
-        .with_activation_heights(testnet::ConfiguredActivationHeights {
-            heartwood: Some(2),
-            canopy: Some(2),
-            ..Default::default()
-        })
-        .expect("activation heights are valid")
-        .clear_funding_streams()
-        .with_checkpoints(testnet::ConfiguredCheckpoints::HeightsAndHashes(vec![
-            (Height::MIN, genesis.hash()),
-            (Height(2), block2.hash()),
-        ]))
-        .expect("linked checkpoints are valid")
-        .to_network()
-        .expect("test network is valid");
-
-    let (mut state_service, read_state, _, mut chain_tip_change) =
-        StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
-    let mut header_root_auth = read_state.subscribe_header_root_auth();
-    assert_eq!(*header_root_auth.borrow_and_update(), None);
-
-    assert_eq!(
-        state_service
-            .ready()
-            .await?
-            .call(Request::CommitCheckpointVerifiedBlock(
-                CheckpointVerifiedBlock::from(genesis.clone()),
-            ))
-            .await?,
-        Response::Committed(genesis.hash()),
-    );
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        chain_tip_change.wait_for_tip_change(),
-    )
-    .await
-    .expect("genesis chain-tip publication is prompt")
-    .expect("chain-tip watch remains open");
-    tokio::time::timeout(Duration::from_secs(1), header_root_auth.changed())
-        .await
-        .expect("genesis authentication publication is prompt")
-        .expect("authentication watch remains open");
-    assert!(
-        header_root_auth.borrow_and_update().is_some(),
-        "genesis commit publishes authentication state"
-    );
-
-    assert_eq!(
-        state_service
-            .ready()
-            .await?
-            .call(Request::CommitHeaderRange {
-                anchor: genesis.hash(),
-                headers: vec![block1.header.clone(), block2.header.clone()],
-                body_sizes: vec![0, 0],
-                tree_aux_roots: roots_from_height(Height(1), 2),
-            })
-            .await?,
-        Response::Committed(block2.hash()),
-    );
-    tokio::time::timeout(Duration::from_secs(1), header_root_auth.changed())
-        .await
-        .expect("header commit keeps authentication watch live")
-        .expect("authentication watch remains open");
-    // Headers at the configured height-2 checkpoint advance coverage without
-    // moving the authenticated root frontier — that is what lets auth run.
-    let auth_after_headers = header_root_auth
-        .borrow_and_update()
-        .expect("header commit keeps compact state available");
-    assert_eq!(auth_after_headers.authenticated_height, Height::MIN);
-    assert_eq!(auth_after_headers.authenticated_hash, genesis.hash());
-    assert_eq!(auth_after_headers.completed_checkpoint_height, Height(2));
-
-    let mut forged = roots_from_height(Height(1), 2);
-    // Distinct valid Sapling root — wrong for this pre-Heartwood height.
-    forged[0].sapling_root = {
-        let (_, roots) = Network::Mainnet.block_sapling_roots_map();
-        let heartwood = NetworkUpgrade::Heartwood
-            .activation_height(&Network::Mainnet)
-            .expect("Mainnet Heartwood height exists");
-        roots
-            .get(&heartwood.0)
-            .map(|root| sapling::tree::Root::try_from(**root).expect("test root is valid"))
-            .expect("Mainnet Heartwood sapling root exists")
-    };
-
-    let error = state_service
-        .ready()
-        .await?
-        .call(Request::AuthenticateHeaderRoots {
-            expected_state: auth_after_headers,
-            anchor: genesis.hash(),
-            start: Height(1),
-            headers: vec![block1.header.clone(), block2.header.clone()],
-            roots: forged,
-        })
-        .await
-        .expect_err("forged roots must fail authentication");
-
-    let auth_error = error
-        .downcast_ref::<AuthenticateHeaderRootsError>()
-        .expect("StateService must box AuthenticateHeaderRootsError at the top level");
-    assert!(
-        matches!(
-            auth_error,
-            AuthenticateHeaderRootsError::Verification { .. }
-        ),
-        "forged roots must fail as Verification, got {auth_error:?}"
-    );
-    assert_eq!(
-        auth_error.outcome(),
-        AuthenticateHeaderRootsOutcome::Invalid,
-        "Verification is the peer-attributable invalid class"
-    );
-    assert_eq!(
-        read_state.db().commitment_roots(Height(1)),
-        None,
-        "failed authentication must not persist forged roots"
-    );
-
-    Ok(())
-}
-
-/// A node still in the finalized (checkpoint) write phase must be able to commit
-/// a Zakura header range.
-///
-/// This reproduces the Zakura catch-up deadlock. A freshly started node has an
-/// empty non-finalized chain set, so it keeps its finalized block-write sender
-/// and the block write task drains the finalized channel before handling any
-/// non-finalized message. The finalized->non-finalized transition only fires
-/// when a non-finalized block is queued as a child of the finalized tip (the
-/// legacy commit path). A node catching up to a peer that sits at a *static*
-/// tip over Zakura commits header ranges via `CommitHeaderRange` (a
-/// non-finalized message) but never queues such a block, so before the fix the
-/// request never completes: the header tip stays at genesis, block sync stays
-/// gated off (`best_header_tip <= verified_block_tip`), and the node stalls.
-///
-/// Unlike `header_only_service_requests_preserve_body_boundary`, this test does
-/// NOT drop `block_write_sender.finalized`, so it exercises the real catch-up
-/// state. Without the fix the `CommitHeaderRange` future never resolves and the
-/// bounded wait below fails the test.
-#[tokio::test(flavor = "multi_thread")]
-async fn commit_header_range_completes_while_in_finalized_write_phase(
-) -> std::result::Result<(), BoxError> {
-    let _init_guard = zakura_test::init();
-    let network = Network::Mainnet;
-    let (mut state_service, read_state, _, _) =
-        StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
-    let genesis =
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
-    let block1 =
-        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
-    let block2 =
-        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
-    let block2_hash = block2.hash();
-
-    assert_eq!(
-        state_service
-            .ready()
-            .await?
-            .call(Request::CommitCheckpointVerifiedBlock(
-                CheckpointVerifiedBlock::from(genesis.clone()),
-            ))
-            .await?,
-        Response::Committed(genesis.hash()),
-    );
-
-    // The node is still in the finalized write phase: committing a checkpoint
-    // block does not trigger the finalized->non-finalized transition, which is
-    // exactly the state a Zakura node catching up to a static tip is stuck in.
-    assert!(
-        state_service.block_write_sender.finalized.is_some(),
-        "a fresh node stays in the finalized write phase after a checkpoint commit",
-    );
-    let state = Buffer::new(BoxService::new(state_service), 1);
-
-    let committed = tokio::time::timeout(
-        Duration::from_secs(20),
-        state.clone().oneshot(Request::CommitHeaderRange {
-            anchor: genesis.hash(),
-            headers: vec![block1.header.clone(), block2.header.clone()],
-            body_sizes: vec![999_999, 0],
-            tree_aux_roots: roots_from_height(Height(1), 2),
-        }),
-    )
-    .await
-    .expect("CommitHeaderRange must not deadlock while in the finalized write phase")?;
-
-    assert_eq!(committed, Response::Committed(block2_hash));
-
-    assert_eq!(
-        state
-            .clone()
-            .oneshot(Request::CommitCheckpointVerifiedBlock(
-                CheckpointVerifiedBlock::from(block1.clone()),
-            ))
-            .await?,
-        Response::Committed(block1.hash()),
-    );
-
-    assert_eq!(
-        read_state.oneshot(ReadRequest::FinalizedTip).await?,
-        ReadResponse::FinalizedTip(Some((Height(1), block1.hash()))),
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn best_durable_header_tip_excludes_non_finalized_chain() -> Result<()> {
-    let _init_guard = zakura_test::init();
-    let network = Network::Mainnet;
-    let cache_dir = tempfile::tempdir().expect("test cache directory is created");
-    let config = Config {
-        cache_dir: cache_dir.path().to_path_buf(),
-        ephemeral: false,
-        ..Config::default()
-    };
-    let mut finalized_state =
-        FinalizedState::new(&config, &network).expect("test database is created");
-    finalized_state.db.shutdown(true);
-    drop(finalized_state);
-    let (read_state, db, non_finalized_sender) = super::init_read_only(config, &network)?;
-    let block1 = Arc::new(
-        network
-            .test_block(653599, 583999)
-            .expect("fake test block can be built for a post-Canopy height"),
-    );
-    let block2 = block1.make_fake_child();
-    let start = block1.coinbase_height().unwrap();
-    let block1_hash = block1.hash();
-    let block2_hash = block2.hash();
-    let mut chain = Chain::new(
-        &network,
-        (start - 1).unwrap(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        ValueBalance::fake_populated_pool(),
-    );
-    chain = chain.push(block1.clone().prepare().test_with_zero_spent_utxos())?;
-    chain = chain.push(block2.clone().prepare().test_with_zero_spent_utxos())?;
-    let chain = Arc::new(chain);
-    let mut non_finalized = NonFinalizedState::new(&network);
-    non_finalized.insert_test_chain(chain.clone());
-    non_finalized_sender
-        .send(non_finalized)
-        .expect("read state keeps the non-finalized watch open");
-
-    assert_eq!(
-        headers_by_height_range(Some(chain), &db, start, 2,),
-        vec![
-            (start, block1_hash, block1.header.clone()),
-            (start.next().unwrap(), block2_hash, block2.header.clone()),
-        ],
-    );
-    assert_eq!(
-        headers_by_height_range(None::<Arc<Chain>>, &db, start, 2),
-        Vec::new(),
-    );
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::HeadersByHeightRange { start, count: 2 })
-            .await
-            .expect("composite header read succeeds"),
-        ReadResponse::Headers(vec![
-            (start, block1_hash, block1.header.clone()),
-            (start.next().unwrap(), block2_hash, block2.header.clone()),
-        ]),
-        "the composite serving view includes restored non-finalized bodies",
-    );
-    assert_eq!(
-        read_state
-            .oneshot(ReadRequest::BestDurableHeaderTip)
-            .await
-            .expect("durable tip read succeeds"),
-        ReadResponse::BestDurableHeaderTip(None),
-        "the durable tip must not be synthesized from the non-finalized body tip",
-    );
 
     Ok(())
 }
@@ -1501,32 +887,6 @@ fn read_only_open_with_no_database_returns_error() {
 }
 
 #[test]
-fn read_only_completed_checkpoint_subscription_stays_open() {
-    let network = Network::Mainnet;
-    let cache_dir =
-        tempfile::tempdir().expect("creating a temporary cache directory should succeed");
-    let config = Config {
-        cache_dir: cache_dir.path().to_path_buf(),
-        ephemeral: false,
-        ..Config::default()
-    };
-
-    let mut finalized_state =
-        FinalizedState::new(&config, &network).expect("writable state creates the database");
-    finalized_state.db.shutdown(true);
-    drop(finalized_state);
-
-    let (read_service, _db, _non_finalized_sender) =
-        super::init_read_only(config, &network).expect("read-only state opens");
-    let receiver = read_service.subscribe_highest_completed_checkpoint();
-
-    assert_eq!(*receiver.borrow(), None);
-    assert!(!receiver.has_changed().expect("subscription remains open"));
-    drop(read_service);
-    assert!(receiver.has_changed().is_err());
-}
-
-#[test]
 fn read_only_secondary_workspace_is_deleted_on_drop() {
     let network = Network::Mainnet;
     let cache_dir =
@@ -1537,8 +897,8 @@ fn read_only_secondary_workspace_is_deleted_on_drop() {
         ..Config::default()
     };
 
-    let mut finalized_state =
-        FinalizedState::new(&config, &network).expect("writable state creates the database");
+    let mut finalized_state = super::finalized_state::FinalizedState::new(&config, &network)
+        .expect("writable state creates the database");
     finalized_state.db.shutdown(true);
     drop(finalized_state);
 
@@ -1605,5 +965,37 @@ fn read_only_open_with_ephemeral_config_returns_error() {
         Ok(_) => {
             panic!("expected an error when opening a read-only state with an ephemeral config")
         }
+    }
+}
+
+#[test]
+fn read_only_open_with_malformed_version_returns_typed_error() {
+    let network = Network::Mainnet;
+    let cache_dir = tempfile::tempdir().expect("creating a temporary cache directory succeeds");
+    let config = Config {
+        cache_dir: cache_dir.path().to_path_buf(),
+        ephemeral: false,
+        ..Config::default()
+    };
+    let version_path = config.version_file_path(
+        crate::constants::STATE_DATABASE_KIND,
+        crate::state_database_format_version_in_code().major,
+        &network,
+    );
+    std::fs::create_dir_all(
+        version_path
+            .parent()
+            .expect("the version path has a cache-directory parent"),
+    )
+    .expect("the version-file parent is created");
+    std::fs::write(&version_path, "not-a-semantic-version")
+        .expect("the malformed version fixture is written");
+
+    match super::init_read_only(config, &network) {
+        Err(crate::StateInitError::DatabaseFormatVersion { path, .. }) => {
+            assert_eq!(path, version_path);
+        }
+        Err(other) => panic!("expected DatabaseFormatVersion, got: {other:?}"),
+        Ok(_) => panic!("expected malformed state version to fail closed"),
     }
 }

@@ -114,7 +114,7 @@ zakura-chain = { path = "../zakura-chain", version = "5.0.0", features = [
 ] }
 zakura-consensus = { path = "../zakura-consensus", version = "6.0.0" }
 zakura-network = { path = "../zakura-network", version = "6.0.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "3.1.0", features = [
+zakura-node-services = { path = "../zakura-node-services", version = "4.0.0", features = [
     "rpc-client",
 ] }
 zakura-script = { path = "../zakura-script", version = "3.1.0" }

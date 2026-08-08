@@ -74,7 +74,7 @@ tracing = { workspace = true }
 
 sapling-crypto = { workspace = true }
 
-zakura-node-services = { path = "../zakura-node-services", version = "3.1.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "4.0.0" }
 zakura-chain = { path = "../zakura-chain", version = "5.0.0", features = ["async-error"] }
 
 # prod feature progress-bar

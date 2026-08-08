@@ -38,6 +38,72 @@ pub const RATELIMIT_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("ratelimit",
 pub const HEADER_SYNC_TABLE: ZakuraTraceTable =
     ZakuraTraceTable::new("header_sync", "header_sync.jsonl");
 
+/// Stable header-sync JSONL event and field names.
+#[allow(dead_code)]
+pub(crate) mod header_sync_trace {
+    pub(crate) const EVENT: &str = "event";
+    pub(crate) const PEER: &str = "peer";
+    pub(crate) const SESSION_ID: &str = "session_id";
+    pub(crate) const DIRECTION: &str = "direction";
+    pub(crate) const REASON: &str = "reason";
+    pub(crate) const BOUNDARY: &str = "boundary";
+    pub(crate) const DISPOSITION: &str = "disposition";
+    pub(crate) const STATE_VERSION: &str = "state_version";
+    pub(crate) const HEADER_GENERATION: &str = "header_generation";
+    pub(crate) const VERIFIED_GENERATION: &str = "verified_generation";
+    pub(crate) const BRANCH_ANCHOR: &str = "branch_anchor";
+    pub(crate) const BRANCH_TARGET: &str = "branch_target";
+    pub(crate) const REQUEST_ID: &str = "request_id";
+    pub(crate) const STREAM_VERSION: &str = "stream_version";
+    pub(crate) const TARGET_HASH: &str = "target_hash";
+    pub(crate) const COMMON_ANCESTOR_HEIGHT: &str = "common_ancestor_height";
+    pub(crate) const COMMON_ANCESTOR_HASH: &str = "common_ancestor_hash";
+    pub(crate) const LOCATOR_COUNT: &str = "locator_count";
+    pub(crate) const LOCATOR_HEAD: &str = "locator_head";
+    pub(crate) const HEADER_COUNT: &str = "header_count";
+    pub(crate) const COMPLETE: &str = "complete";
+    pub(crate) const TREE_AUX_SCHEMA: &str = "tree_aux_schema";
+    pub(crate) const OUTCOME: &str = "outcome";
+    pub(crate) const INBOUND_COUNT: &str = "inbound_count";
+    pub(crate) const OUTBOUND_COUNT: &str = "outbound_count";
+    pub(crate) const STAGE: &str = "stage";
+    pub(crate) const CATEGORY: &str = "category";
+    pub(crate) const ATTRIBUTION: &str = "attribution";
+    pub(crate) const CAUSE: &str = "cause";
+    pub(crate) const OPERATION: &str = "operation";
+    pub(crate) const WORK_ANCHOR_HEIGHT: &str = "work_anchor_height";
+    pub(crate) const WORK_ANCHOR_HASH: &str = "work_anchor_hash";
+    pub(crate) const SELECTED_TIP_HEIGHT: &str = "selected_tip_height";
+    pub(crate) const SELECTED_TIP_HASH: &str = "selected_tip_hash";
+    pub(crate) const MAX_HEADERS_PER_RESPONSE: &str = "max_headers_per_response";
+    pub(crate) const MAX_INFLIGHT_REQUESTS: &str = "max_inflight_requests";
+    pub(crate) const MAX_MESSAGE_BYTES: &str = "max_message_bytes";
+    pub(crate) const TREE_AUX_SCHEMA_MASK: &str = "tree_aux_schema_mask";
+    pub(crate) const OLD_SELECTED_HEIGHT: &str = "old_selected_height";
+    pub(crate) const OLD_SELECTED_HASH: &str = "old_selected_hash";
+    pub(crate) const NEW_SELECTED_HEIGHT: &str = "new_selected_height";
+    pub(crate) const NEW_SELECTED_HASH: &str = "new_selected_hash";
+    pub(crate) const HEIGHT: &str = "height";
+    pub(crate) const REPAIR_GENERATION: &str = "repair_generation";
+    pub(crate) const PHASE: &str = "phase";
+    pub(crate) const SUPPLIER_COUNT: &str = "supplier_count";
+
+    pub(crate) const HEADER_PEER_CONNECTED: &str = "header_peer_connected";
+    pub(crate) const HEADER_PEER_DISCONNECTED: &str = "header_peer_disconnected";
+    pub(crate) const HEADER_STATUS_SENT: &str = "header_status_sent";
+    pub(crate) const HEADER_STATUS_RECEIVED: &str = "header_status_received";
+    pub(crate) const HEADER_REQUEST_SENT: &str = "header_request_sent";
+    pub(crate) const HEADER_REQUEST_TERMINAL: &str = "header_request_terminal";
+    pub(crate) const HEADER_RESPONSE_RECEIVED: &str = "header_response_received";
+    pub(crate) const HEADER_RESPONSE_SERVED: &str = "header_response_served";
+    pub(crate) const HEADER_OUTCOME: &str = "header_outcome";
+    pub(crate) const HEADER_TARGET_ADMITTED: &str = "header_target_admitted";
+    pub(crate) const HEADER_TARGET_REJECTED: &str = "header_target_rejected";
+    pub(crate) const HEADER_PEER_VIOLATION: &str = "header_peer_violation";
+    pub(crate) const HEADER_SNAPSHOT_OBSERVED: &str = "header_snapshot_observed";
+    pub(crate) const HEADER_VCT_REPAIR_STATE: &str = "header_vct_repair_state";
+}
+
 /// Legacy compatibility request/response events.
 pub const LEGACY_REQUEST_TABLE: ZakuraTraceTable =
     ZakuraTraceTable::new("legacy_request", "legacy_request.jsonl");
@@ -67,10 +133,6 @@ pub mod queue_send_trace {
     pub const MESSAGE: &str = "message";
     /// Peer field.
     pub const PEER: &str = "peer";
-    /// Source peer field for forwarded messages.
-    pub const SOURCE_PEER: &str = "source_peer";
-    /// Destination peer field for forwarded messages.
-    pub const DESTINATION_PEER: &str = "destination_peer";
     /// Bounded send error label (`full`, `closed`, or `encode`).
     pub const ERROR: &str = "error";
     /// Logical send reason field.
@@ -83,12 +145,10 @@ pub mod queue_send_trace {
     pub const RANGE_START: &str = "range_start";
     /// Range count field.
     pub const RANGE_COUNT: &str = "range_count";
-    /// Returned response count field.
-    pub const RETURNED: &str = "returned";
-    /// Height field.
-    pub const HEIGHT: &str = "height";
-    /// Hash field.
-    pub const HASH: &str = "hash";
+    /// Ordered stream generation.
+    pub const SESSION_ID: &str = "session_id";
+    /// Correlated request identifier, when applicable.
+    pub const REQUEST_ID: &str = "request_id";
 }
 
 /// Shared block-sync trace event names and field keys.
@@ -238,8 +298,6 @@ pub mod block_sync_trace {
     pub const BLOCK_PEER_CONNECTED: &str = "block_peer_connected";
     /// Block-sync peer disconnected from the reactor.
     pub const BLOCK_PEER_DISCONNECTED: &str = "block_peer_disconnected";
-    /// Block-sync service session locally parked for a liveness reason.
-    pub const BLOCK_PEER_PARKED: &str = "block_peer_parked";
     /// Body range request sent to a peer.
     pub const BLOCK_GET_BLOCKS_SENT: &str = "block_get_blocks_sent";
     /// Reactor accepted an inbound event.
@@ -300,6 +358,8 @@ pub mod block_sync_trace {
     /// the peer is idle (unlike the per-delivery `block_body_received` row), so a trace can
     /// tell a settled controller (cwnd stable, reliability ≈ 1.0) from an oscillating one.
     pub const BLOCK_PEER_BBR: &str = "block_peer_bbr";
+    /// Block-sync service session locally parked for a liveness reason.
+    pub const BLOCK_PEER_PARKED: &str = "block_peer_parked";
 }
 
 /// Shared discovery trace event names and field keys.
@@ -314,122 +374,6 @@ pub mod discovery_trace {
 
     /// A discovery dial worker completed and was classified for backoff.
     pub const DISCOVERY_DIAL_RESULT: &str = "discovery_dial_result";
-}
-
-/// Shared header-sync trace event names and field keys.
-#[allow(dead_code)] // Preserved as schema constants for compatible trace consumers.
-pub mod header_sync_trace {
-    /// Trace row event field.
-    pub const EVENT: &str = "event";
-    /// Peer field.
-    pub const PEER: &str = "peer";
-    /// Action/event/message kind field.
-    pub const KIND: &str = "kind";
-    /// Source peer field for forwarded full-block floods.
-    pub const SOURCE_PEER: &str = "source_peer";
-    /// Height field.
-    pub const HEIGHT: &str = "height";
-    /// Hash field.
-    pub const HASH: &str = "hash";
-    /// Header anchor hash field.
-    pub const ANCHOR_HASH: &str = "anchor_hash";
-    /// Range start height field.
-    pub const RANGE_START: &str = "range_start";
-    /// Range count field.
-    pub const RANGE_COUNT: &str = "range_count";
-    /// Header validation stage field.
-    pub const VALIDATION_STAGE: &str = "validation_stage";
-    /// Concrete validation error kind field.
-    pub const ERROR_KIND: &str = "error_kind";
-    /// Advertised peer range cap field.
-    pub const ADVERTISED_CAP: &str = "advertised_cap";
-    /// Expected header count field.
-    pub const EXPECTED_COUNT: &str = "expected_count";
-    /// In-flight request count field.
-    pub const IN_FLIGHT_COUNT: &str = "in_flight_count";
-    /// Whether header-carried tree-aux roots were requested for this range.
-    pub const WANT_TREE_AUX_ROOTS: &str = "want_tree_aux_roots";
-    /// Whether the range is expected to terminate at a checkpoint.
-    pub const FINALIZED: &str = "finalized";
-    /// Header scheduler priority label (`forward` or `repair`).
-    pub const RANGE_PRIORITY: &str = "range_priority";
-    /// Highest verified full-block/body height observed by the header scheduler.
-    pub const VERIFIED_BLOCK_TIP: &str = "verified_block_tip";
-    /// Durable finalized height observed by the header scheduler.
-    pub const FINALIZED_HEIGHT: &str = "finalized_height";
-    /// Durable best header tip observed by the header scheduler.
-    pub const BEST_HEADER_TIP: &str = "best_header_tip";
-    /// Confirmable root heights missing before the first retained response.
-    pub const ROOT_AUTH_HOLE_HEIGHTS: &str = "root_auth_hole_heights";
-    /// First retained root-carrying response start, when one exists.
-    pub const FIRST_RETAINED_ROOT_HEIGHT: &str = "first_retained_root_height";
-    /// Number of header-carried tree-aux roots present on this send/receive.
-    pub const TREE_AUX_ROOTS_LEN: &str = "tree_aux_roots_len";
-    /// First encoded tree-aux root height.
-    pub const FIRST_ROOT_HEIGHT: &str = "first_root_height";
-    /// Last encoded tree-aux root height.
-    pub const LAST_ROOT_HEIGHT: &str = "last_root_height";
-    /// Zero-based index of the first mismatching root.
-    pub const ROOT_MISMATCH_OFFSET: &str = "root_mismatch_offset";
-    /// Expected height of the first mismatching root.
-    pub const EXPECTED_ROOT_HEIGHT: &str = "expected_root_height";
-    /// Actual height of the first mismatching root.
-    pub const ACTUAL_ROOT_HEIGHT: &str = "actual_root_height";
-    /// Destination peer count field.
-    pub const DESTINATION_PEER_COUNT: &str = "destination_peer_count";
-    /// Active reactor service sessions after this event.
-    pub const ACTIVE_CONNECTIONS: &str = "active_connections";
-    /// Ordered-stream generation that owns this header-sync event.
-    pub const SESSION_ID: &str = "session_id";
-    /// Header-sync v7 request identifier, when present.
-    pub const REQUEST_ID: &str = "request_id";
-    /// Negotiated header-sync stream version for this peer session.
-    pub const STREAM_VERSION: &str = "stream_version";
-    /// Bounded reason field.
-    pub const REASON: &str = "reason";
-
-    /// Reactor accepted an inbound event.
-    pub const HEADER_EVENT_RECEIVED: &str = "header_event_received";
-    /// Reactor queued an outbound driver action.
-    pub const HEADER_ACTION_DISPATCHED: &str = "header_action_dispatched";
-    /// Local status sent to a peer.
-    pub const HEADER_STATUS_SENT: &str = "header_status_sent";
-    /// Peer status received.
-    pub const HEADER_STATUS_RECEIVED: &str = "header_status_received";
-    /// Header-sync peer connected to the reactor.
-    pub const HEADER_PEER_CONNECTED: &str = "header_peer_connected";
-    /// Header-sync peer disconnected from the reactor.
-    pub const HEADER_PEER_DISCONNECTED: &str = "header_peer_disconnected";
-    /// Header range request sent.
-    pub const HEADER_GET_HEADERS_SENT: &str = "header_get_headers_sent";
-    /// Header range response received.
-    pub const HEADER_HEADERS_RECEIVED: &str = "header_headers_received";
-    /// Header range response served from local state.
-    pub const HEADER_HEADERS_SERVED: &str = "header_headers_served";
-    /// Header range committed.
-    pub const HEADER_RANGE_COMMITTED: &str = "header_range_committed";
-    /// Header range rejected.
-    pub const HEADER_RANGE_REJECTED: &str = "header_range_rejected";
-    /// NewBlock tip flood received.
-    pub const HEADER_NEW_BLOCK_RECEIVED: &str = "header_new_block_received";
-    /// NewBlock tip flood forwarded.
-    pub const HEADER_NEW_BLOCK_FORWARDED: &str = "header_new_block_forwarded";
-    /// NewBlock tip flood deduped.
-    pub const HEADER_NEW_BLOCK_DEDUPED: &str = "header_new_block_deduped";
-    /// Peer violation observed.
-    pub const HEADER_PEER_VIOLATION: &str = "header_peer_violation";
-    /// Peer violation recorded without disconnecting the peer.
-    pub const HEADER_PEER_VIOLATION_RECORDED: &str = "header_peer_violation_recorded";
-    /// Header frontier advanced.
-    pub const HEADER_FRONTIER_ADVANCED: &str = "header_frontier_advanced";
-    /// Header frontier re-anchored down to the verified block frontier.
-    pub const HEADER_FRONTIER_REANCHORED: &str = "header_frontier_reanchored";
-    /// Missing block bodies reported.
-    pub const HEADER_MISSING_BODIES_REPORTED: &str = "header_missing_bodies_reported";
-    /// Root-authentication frontier, retained boundary, and exact missing-root count changed.
-    pub const HEADER_ROOT_AUTH_DIAGNOSTICS: &str = "header_root_auth_diagnostics";
-    /// The reactor woke because a real retry, timeout, or status deadline expired.
-    pub const HEADER_MAINTENANCE_WAKEUP: &str = "header_maintenance_wakeup";
 }
 
 /// Shared commit/frontier adapter trace event names and field keys.
@@ -490,8 +434,6 @@ pub mod commit_state_trace {
     pub const IN_FLIGHT_COUNT: &str = "in_flight_count";
     /// Action kind field.
     pub const ACTION: &str = "action";
-    /// Whether an optional frontier was present.
-    pub const LOCAL_FRONTIER: &str = "local_frontier";
 
     /// Driver received a reactor action.
     pub const ACTION_RECEIVED: &str = "action_received";
@@ -520,52 +462,8 @@ pub mod commit_state_trace {
     pub const COMMIT_STALL_BEHIND_PREFIX: &str = "behind_committed_prefix";
     /// Verifier commit finished.
     pub const COMMIT_FINISH: &str = "commit_finish";
-    /// Post-commit frontier query started.
-    pub const FRONTIER_QUERY_START: &str = "frontier_query_start";
-    /// Post-commit frontier query finished.
-    pub const FRONTIER_QUERY_FINISH: &str = "frontier_query_finish";
     /// Driver sent an event back to a reactor.
     pub const REACTOR_EVENT_SENT: &str = "reactor_event_sent";
-    /// Delayed checkpoint frontier refresh attempted.
-    pub const CHECKPOINT_REFRESH_ATTEMPT: &str = "checkpoint_refresh_attempt";
-    /// Delayed checkpoint frontier refresh sent a frontier event.
-    pub const CHECKPOINT_REFRESH_SENT: &str = "checkpoint_refresh_sent";
-    /// Header-sync driver notified block sync about a header tip.
-    pub const BLOCK_SYNC_NOTIFY_SENT: &str = "block_sync_notify_sent";
-    /// Chain-tip mirror observed a watch action.
-    pub const CHAIN_TIP_ACTION: &str = "chain_tip_action";
-    /// Chain-tip mirror derived local frontiers.
-    pub const FRONTIER_DERIVED: &str = "frontier_derived";
-    /// Shared sync exchange accepted or ignored a frontier update.
-    pub const SYNC_FRONTIER_TRANSITION: &str = "sync_frontier_transition";
-    /// Monotonic shared sync exchange transition sequence.
-    pub const SEQUENCE: &str = "sequence";
-    /// Shared sync exchange transition cause.
-    pub const CAUSE: &str = "cause";
-    /// Previous finalized frontier height.
-    pub const OLD_FINALIZED_HEIGHT: &str = "old_finalized_height";
-    /// Previous finalized frontier hash.
-    pub const OLD_FINALIZED_HASH: &str = "old_finalized_hash";
-    /// Previous verified body frontier height.
-    pub const OLD_VERIFIED_BODY_HEIGHT: &str = "old_verified_body_height";
-    /// Previous verified body frontier hash.
-    pub const OLD_VERIFIED_BODY_HASH: &str = "old_verified_body_hash";
-    /// Previous best header frontier height.
-    pub const OLD_BEST_HEADER_HEIGHT: &str = "old_best_header_height";
-    /// Previous best header frontier hash.
-    pub const OLD_BEST_HEADER_HASH: &str = "old_best_header_hash";
-    /// New finalized frontier height.
-    pub const NEW_FINALIZED_HEIGHT: &str = "new_finalized_height";
-    /// New finalized frontier hash.
-    pub const NEW_FINALIZED_HASH: &str = "new_finalized_hash";
-    /// New verified body frontier height.
-    pub const NEW_VERIFIED_BODY_HEIGHT: &str = "new_verified_body_height";
-    /// New verified body frontier hash.
-    pub const NEW_VERIFIED_BODY_HASH: &str = "new_verified_body_hash";
-    /// New best header frontier height.
-    pub const NEW_BEST_HEADER_HEIGHT: &str = "new_best_header_height";
-    /// New best header frontier hash.
-    pub const NEW_BEST_HEADER_HASH: &str = "new_best_header_hash";
 }
 
 /// Cloneable Zakura trace emitter.

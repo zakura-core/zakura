@@ -18,9 +18,8 @@ use crate::{
         INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     zakura::{
-        DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR,
-        DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
+        DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BOOTSTRAP_PEERS,
+        DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
     CacheDir, Config, P2pStack,
 };
@@ -520,10 +519,6 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
         DEFAULT_HS_RANGE
     );
     assert_eq!(
-        config.zakura.header_sync.max_inflight_requests,
-        DEFAULT_HS_MAX_INFLIGHT
-    );
-    assert_eq!(
         config.zakura.header_sync.status_refresh_interval,
         Duration::from_secs(30)
     );
@@ -598,7 +593,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
         [zakura.header_sync]
         max_headers_per_response = 333
-        max_inflight_requests = 9
         status_refresh_interval = "45s"
 
         [zakura.block_sync]
@@ -618,7 +612,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("trace_dir = \"target/zakura-test-traces\""));
     assert!(serialized.contains("[zakura.header_sync]"));
     assert!(serialized.contains("max_headers_per_response = 333"));
-    assert!(serialized.contains("max_inflight_requests = 9"));
     assert!(serialized.contains("status_refresh_interval = \"45s\""));
     assert!(serialized.contains("[zakura.block_sync]"));
     assert!(!serialized.contains("replace_legacy_syncer"));
@@ -787,6 +780,30 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
         params.temporary_orchard_disabling_soft_fork_height(),
         Some(soft_fork_height),
     );
+}
+
+#[test]
+fn max_block_time_start_height_serialization_roundtrip() {
+    let _init_guard = zakura_test::init();
+    let start_height = Height(42);
+    let mut config = Config {
+        network: testnet::Parameters::build()
+            .with_max_block_time_start_height(start_height)
+            .to_network()
+            .expect("failed to build configured network"),
+        initial_testnet_peers: [].into(),
+        ..Config::for_test(P2pStack::Dual)
+    };
+    config.zakura.apply_network_defaults(&config.network);
+
+    let serialized = toml::to_string(&config).expect("the custom network serializes");
+    let deserialized: Config =
+        toml::from_str(&serialized).expect("the custom network deserializes");
+    assert_eq!(config, deserialized);
+    assert!(!deserialized.network.is_max_block_time_enforced(Height(41)));
+    assert!(deserialized
+        .network
+        .is_max_block_time_enforced(start_height));
 }
 
 /// With no `zakura_node_secret_key` and a writable identity directory, the

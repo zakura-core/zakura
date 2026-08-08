@@ -1031,6 +1031,7 @@ mod bbr_tests {
         for _ in 0..n {
             window.outstanding.push(OutstandingBlockRange {
                 request: BlockRangeRequest {
+                    owner: super::super::test_work_owner(),
                     start_height: block::Height(0),
                     count: 1,
                     anchor_hash: block::Hash([0; 32]),
@@ -1135,6 +1136,7 @@ mod bbr_tests {
             let height = block::Height(1 + i as u32);
             window.outstanding.push(OutstandingBlockRange {
                 request: BlockRangeRequest {
+                    owner: super::super::test_work_owner(),
                     start_height: height,
                     count: 1,
                     anchor_hash: block::Hash([0; 32]),

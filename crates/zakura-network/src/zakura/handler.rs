@@ -44,26 +44,28 @@ use zakura_chain::{
 use self::trace::ZakuraConnTrace;
 use super::discovery::{native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
 use super::trace::{reject_reason_label, ZakuraTrace};
+#[cfg(any(test, feature = "zakura-testkit"))]
+use crate::zakura::drive_header_sync_actions;
+#[cfg(any(test, feature = "zakura-testkit"))]
+use crate::zakura::HeaderSyncAction;
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        canonical_ip, direct_endpoint_builder, drive_header_sync_actions, spawn_block_sync_reactor,
-        spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
-        BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FramedRecv,
-        FramedSend, Frontier, FrontierChange, FrontierUpdate, HeaderRootAuthState,
-        HeaderSyncAction, HeaderSyncFrontiers, HeaderSyncPassthroughService, HeaderSyncService,
-        HeaderSyncStartup, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer,
-        RealClock, Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject,
-        Stream, StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig,
-        ZakuraConnId, ZakuraControlAck, ZakuraControlHello, ZakuraControlRole,
-        ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
-        ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
-        ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason, ZakuraSyncExchange,
+        canonical_ip, direct_endpoint_builder, spawn_block_sync_reactor, spawn_header_sync_reactor,
+        BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle, BlockSyncService, BlockSyncStartup,
+        BoxRunFuture, Clock, CloseCause, Frame, FramedRecv, FramedSend, FullStateFrontiers,
+        HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup, OrderedSessionDemand,
+        OrderedStreamOpening, OrderedStreamPolicy, Peer, RealClock, Service, ServicePeerDirection,
+        ServiceRegistry, ServiceStream, SinkReject, Stream, StreamMode, StreamPrelude,
+        ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraControlAck,
+        ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig,
+        ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits,
+        ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
         ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
         FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
         MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
-        TRANSCRIPT_HASH_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1,
-        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+        TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
 use crate::{BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
@@ -212,7 +214,7 @@ const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
 const _: () = assert!(DISCOVERY_STREAM_KIND == super::discovery::ZAKURA_STREAM_DISCOVERY);
 const _: () = assert!(HEADER_SYNC_STREAM_KIND == super::header_sync::ZAKURA_STREAM_HEADER_SYNC);
-const _: () = assert!(ZAKURA_STREAM_VERSION_7 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
+const _: () = assert!(ZAKURA_HEADER_SYNC_STREAM_VERSION == 8);
 const _: () =
     assert!(LEGACY_REQUEST_BLOCKS_BY_HASH == super::legacy_gossip::MSG_REQUEST_BLOCKS_BY_HASH);
 const _: () = assert!(
@@ -522,8 +524,8 @@ pub struct ZakuraEndpoint {
     handler: ZakuraProtocolHandler,
     header_sync: Option<super::HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
-    sync_frontier: Option<ZakuraSyncExchange>,
     header_sync_tasks: Option<Arc<HeaderSyncBackgroundTasks>>,
+    #[cfg(any(test, feature = "zakura-testkit"))]
     header_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<HeaderSyncAction>>>>>,
     block_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<BlockSyncAction>>>>>,
     /// Maintained native dials started by the legacy->Zakura upgrade hand-off,
@@ -543,13 +545,19 @@ struct HeaderSyncBackgroundTasks {
 #[derive(Clone, Debug)]
 pub struct ZakuraHeaderSyncDriverStartup {
     /// Durable state frontiers loaded at node startup.
-    pub frontiers: HeaderSyncFrontiers,
+    pub frontiers: FullStateFrontiers,
     /// Durable best header tip loaded from state.
     pub best_header_tip: Option<(block::Height, block::Hash)>,
     /// Hash of `frontiers.verified_block_tip`.
     pub verified_block_tip_hash: block::Hash,
-    /// Compact durable header-root authentication progress loaded from state.
-    pub header_root_auth: Option<HeaderRootAuthState>,
+    /// Durable header snapshots, whose value is absent until semantic handoff succeeds.
+    pub committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+    /// Coordinator-owned capability and ordered-service demand epochs.
+    pub service_demand: watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>,
+    /// VCT metadata repair needs published by the finalized writer.
+    pub vct_root_repairs: Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
+    /// Typed header-chain operations used directly by the reactor.
+    pub header_chain_port: Arc<dyn zakura_node_services::header_chain::HeaderChainPort>,
 }
 
 impl ZakuraEndpoint {
@@ -600,33 +608,8 @@ impl ZakuraEndpoint {
         self.block_sync.clone()
     }
 
-    /// Subscribe to the shared Zakura sync frontier stream.
-    pub fn subscribe_sync_frontier(&self) -> Option<watch::Receiver<FrontierUpdate>> {
-        self.sync_frontier
-            .as_ref()
-            .map(ZakuraSyncExchange::subscribe_frontier)
-    }
-
-    /// Return the currently cached shared Zakura sync frontier update.
-    pub fn current_sync_frontier(&self) -> Option<FrontierUpdate> {
-        self.sync_frontier
-            .as_ref()
-            .map(ZakuraSyncExchange::current_frontier)
-    }
-
-    /// Publish a shared Zakura sync frontier update.
-    pub fn publish_sync_frontier(&self, update: FrontierUpdate) {
-        self.publish_sync_frontier_from(update, "unknown");
-    }
-
-    /// Publish a shared Zakura sync frontier update with a trace source.
-    pub fn publish_sync_frontier_from(&self, update: FrontierUpdate, source: &'static str) {
-        if let Some(sync_frontier) = &self.sync_frontier {
-            sync_frontier.publish_frontier(update, source);
-        }
-    }
-
     /// Take the header-sync action receiver when this endpoint was started in external-driver mode.
+    #[cfg(any(test, feature = "zakura-testkit"))]
     pub async fn take_header_sync_actions(&self) -> Option<mpsc::Receiver<HeaderSyncAction>> {
         let actions = self.header_sync_actions.as_ref()?;
         actions.lock().await.take()
@@ -823,7 +806,6 @@ impl ZakuraEndpoint {
             handler,
             header_sync: None,
             block_sync: None,
-            sync_frontier: None,
             header_sync_tasks: None,
             header_sync_actions: None,
             block_sync_actions: None,
@@ -848,7 +830,6 @@ impl ZakuraEndpoint {
             handler,
             header_sync: Some(header_sync),
             block_sync: None,
-            sync_frontier: None,
             header_sync_tasks: Some(Arc::new(HeaderSyncBackgroundTasks {
                 shutdown,
                 tasks: Mutex::new(tasks),
@@ -878,7 +859,6 @@ impl ZakuraEndpoint {
             handler,
             header_sync: Some(header_sync),
             block_sync: Some(block_sync),
-            sync_frontier: None,
             header_sync_tasks: Some(Arc::new(HeaderSyncBackgroundTasks {
                 shutdown,
                 tasks: Mutex::new(tasks),
@@ -1369,11 +1349,10 @@ struct ConnectionServeContext {
     role: &'static str,
     direction: ServicePeerDirection,
     transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
-    /// Whether this node wins same-kind ordered-stream collisions on this
-    /// connection. Block sync can be opened by either peer, so it can arrive
-    /// twice; the winner keeps its own stream and the loser adopts the peer's.
-    /// Computed from the connection role so the two ends always agree: the
-    /// dialing side wins.
+    /// Whether this node is the deterministic proactive opener for symmetric
+    /// ordered streams on this connection. It also wins any same-kind collision
+    /// caused by an older peer racing its own offer. Computed from the node ids
+    /// so the two ends always agree: `local_node_id < remote_node_id`.
     i_open_collision_winner: bool,
     conn: ZakuraConnTrace,
 }
@@ -1385,8 +1364,9 @@ struct RegisteredConnectionServeContext {
     connection_token: CancellationToken,
     close_cause: CloseCause,
     accepted_capabilities: u64,
-    /// Whether this side dialed the connection. The initiator opens ordinary
-    /// ordered streams; either side may open block sync.
+    /// Whether this side dialed the connection. The dialer (initiator) opens
+    /// ordinary ordered streams. The node-id winner opens block sync (the sole
+    /// symmetric service), independently of which side dialed.
     is_initiator: bool,
     /// See [`ConnectionServeContext::i_open_collision_winner`].
     i_open_collision_winner: bool,
@@ -1408,6 +1388,7 @@ struct StreamWorkerContext {
 
 struct AdmittedOrderedSession {
     kind: u16,
+    version: u16,
     session_id: u64,
     recv: FramedRecv,
     send: FramedSend,
@@ -1583,18 +1564,36 @@ fn may_open_ordered_stream(policy: OrderedStreamPolicy, is_initiator: bool) -> b
     is_initiator || policy.opening == OrderedStreamOpening::EitherSide
 }
 
+/// Whether this endpoint proactively opens an ordered stream.
+///
+/// Either-side services use the connection's mirror-stable node-id tiebreak so
+/// exactly one endpoint opens the bidirectional session. Both endpoints still
+/// accept either-side streams, preserving compatibility with peers that race
+/// an offer during upgrade.
+fn opens_ordered_stream_locally(
+    policy: OrderedStreamPolicy,
+    is_initiator: bool,
+    i_open_collision_winner: bool,
+) -> bool {
+    match policy.opening {
+        OrderedStreamOpening::InitiatorOnly => is_initiator,
+        OrderedStreamOpening::EitherSide => i_open_collision_winner,
+    }
+}
+
 /// An ordered service session can be locally parked while its connection and
-/// sibling services remain healthy. Any side entitled by the transport policy
-/// to open a replacement keeps offering one with bounded backoff.
+/// sibling services remain healthy. The endpoint designated by the transport
+/// policy keeps offering a replacement with bounded backoff.
 fn should_reopen_ordered_session(
     exited: OrderedSessionExit,
     policy: OrderedStreamPolicy,
     is_initiator: bool,
+    i_open_collision_winner: bool,
     connection_cancelled: bool,
 ) -> bool {
     exited.stream.mode == StreamMode::Ordered
         && policy.reopen
-        && may_open_ordered_stream(policy, is_initiator)
+        && opens_ordered_stream_locally(policy, is_initiator, i_open_collision_winner)
         && !connection_cancelled
 }
 
@@ -1679,10 +1678,15 @@ pub(crate) fn service_registry(
     block_sync_config: ZakuraBlockSyncConfig,
     legacy_service: Arc<dyn Service>,
     discovery_service: Arc<super::DiscoveryService>,
+    service_demand: Option<
+        watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>,
+    >,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
     let mut services = vec![legacy_service.clone()];
     let header_sync_service = if let Some(header_sync) = &header_sync {
-        Arc::new(HeaderSyncService::new(header_sync.clone())) as Arc<dyn Service>
+        Arc::new(
+            HeaderSyncService::new(header_sync.clone()).with_service_demand(service_demand.clone()),
+        ) as Arc<dyn Service>
     } else {
         Arc::new(HeaderSyncPassthroughService::new(legacy_service.clone())) as Arc<dyn Service>
     };
@@ -1697,7 +1701,7 @@ pub(crate) fn service_registry(
             None => BlockSyncService::new(block_sync_config),
         },
     };
-    let block_sync = Arc::new(block_sync) as Arc<dyn Service>;
+    let block_sync = Arc::new(block_sync.with_service_demand(service_demand)) as Arc<dyn Service>;
     discovery_service.set_connection_owners(vec![
         legacy_service,
         header_sync_service,
@@ -1716,6 +1720,7 @@ pub(crate) fn service_registry(
 pub struct ZakuraProtocolHandler {
     supervisor: ZakuraSupervisorHandle,
     handshake_config: ZakuraHandshakeConfig,
+    supported_capabilities: Arc<AtomicU64>,
     limits: ZakuraLocalLimits,
     registry: Arc<ServiceRegistry>,
     trace: ZakuraTrace,
@@ -1791,15 +1796,13 @@ fn native_connection_transcript_hash(
     *initiator.as_bytes()
 }
 
-/// Whether the local node wins same-kind ordered-stream collisions against
-/// Both sides open their demanded ordered streams, so a kind both sides open
-/// arrives twice; the dialing side wins and keeps its own stream while the
-/// accepting side adopts the peer's. Both ends always know who initiated the
-/// connection, so they converge on a single surviving stream without any extra
-/// round trip — and without needing the local node id, which responder-side
-/// contexts may not have (no bound endpoint).
-fn i_open_collision_winner(is_initiator: bool) -> bool {
-    is_initiator
+/// Whether the local node is the proactive opener for symmetric ordered streams
+/// against `remote_node_id`. The lexicographically smaller node id opens, and
+/// the other endpoint accepts that stream. The result is also the collision
+/// tiebreak for compatibility with older peers that race their own offer. The
+/// two ends compute complementary answers from the same distinct node ids.
+fn i_open_collision_winner(local_node_id: &NodeId, remote_node_id: &NodeId) -> bool {
+    local_node_id.as_bytes() < remote_node_id.as_bytes()
 }
 
 impl ZakuraProtocolHandler {
@@ -1848,9 +1851,12 @@ impl ZakuraProtocolHandler {
     ) -> Self {
         let mut handshake_config = handshake_config;
         handshake_config.supported_capabilities = registry.supported_capabilities();
+        let supported_capabilities =
+            Arc::new(AtomicU64::new(handshake_config.supported_capabilities));
         Self {
             supervisor,
             handshake_config,
+            supported_capabilities,
             registry,
             trace,
             next_conn_id: Arc::new(AtomicU64::new(1)),
@@ -1873,7 +1879,27 @@ impl ZakuraProtocolHandler {
     #[cfg(any(test, feature = "zakura-testkit"))]
     pub(crate) fn with_supported_capabilities(mut self, supported_capabilities: u64) -> Self {
         self.handshake_config.supported_capabilities &= supported_capabilities;
+        self.supported_capabilities.store(
+            self.handshake_config.supported_capabilities,
+            Ordering::Relaxed,
+        );
         self
+    }
+
+    fn current_handshake_config(&self) -> ZakuraHandshakeConfig {
+        let mut config = self.handshake_config;
+        config.supported_capabilities = self.supported_capabilities.load(Ordering::Relaxed);
+        config
+    }
+
+    fn set_header_sync_enabled(&self, enabled: bool) {
+        if enabled {
+            self.supported_capabilities
+                .fetch_or(ZAKURA_CAP_HEADER_SYNC, Ordering::Relaxed);
+        } else {
+            self.supported_capabilities
+                .fetch_and(!ZAKURA_CAP_HEADER_SYNC, Ordering::Relaxed);
+        }
     }
 
     /// Attach the bound iroh endpoint so inbound Router-accepted connections can
@@ -1949,7 +1975,7 @@ impl ZakuraProtocolHandler {
                     &local_node_id,
                     &remote_node_id,
                 ),
-                i_open_collision_winner: i_open_collision_winner(false),
+                i_open_collision_winner: i_open_collision_winner(&local_node_id, &remote_node_id),
                 conn,
             },
         )
@@ -1988,11 +2014,12 @@ impl ZakuraProtocolHandler {
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
     ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
+        let handshake_config = self.current_handshake_config();
         conn.trace_handshake(
             "control.started",
             "responder",
             None,
-            self.handshake_config.network_label(),
+            handshake_config.network_label(),
         );
         let (mut send, mut recv) = timeout(self.limits.control_timeout, connection.accept_bi())
             .await
@@ -2000,13 +2027,13 @@ impl ZakuraProtocolHandler {
 
         let hello_bytes = read_control_payload(
             &mut recv,
-            self.handshake_config.max_control_frame_bytes,
+            handshake_config.max_control_frame_bytes,
             self.limits.control_timeout,
         )
         .await?;
         let hello = ZakuraControlHello::decode(&hello_bytes)?;
         let expected = ZakuraControlValidation {
-            local: &self.handshake_config,
+            local: &handshake_config,
             authenticated_remote_id: remote_peer_id.as_bytes(),
             selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_1,
             handshake_path: ZakuraHandshakePath::Native,
@@ -2027,9 +2054,8 @@ impl ZakuraProtocolHandler {
             selected_zakura_protocol: hello.selected_zakura_protocol,
             peer_nonce: local_nonce,
             remote_peer_nonce: hello.peer_nonce,
-            accepted_capabilities: hello.capabilities
-                & self.handshake_config.supported_capabilities,
-            accepted_channels: hello.required_channels & self.handshake_config.supported_channels,
+            accepted_capabilities: hello.capabilities & handshake_config.supported_capabilities,
+            accepted_channels: hello.required_channels & handshake_config.supported_channels,
             accepted_limits,
         };
         write_control_payload(&mut send, &ack.encode()?, self.limits.control_timeout).await?;
@@ -2037,7 +2063,7 @@ impl ZakuraProtocolHandler {
             "control.succeeded",
             "responder",
             Some(ack.selected_zakura_protocol),
-            self.handshake_config.network_label(),
+            handshake_config.network_label(),
         );
         Ok(NativeHandshakeNegotiated {
             limits: accepted_limits,
@@ -2095,11 +2121,20 @@ impl ZakuraProtocolHandler {
             .copied()
             .map(|stream| (stream.kind, OrderedSessionState::new(stream)))
             .collect();
+        // The dialer opens ordinary ordered streams. For symmetric block sync,
+        // the mirror-stable node-id tiebreak designates one proactive opener,
+        // avoiding crossed service generations while retaining one bidirectional
+        // session regardless of who dialed. The accept path still resolves raced
+        // offers from older peers with the same tiebreak.
         let mut ordered_streams = Vec::new();
         let mut deferred_ordered_streams = Vec::new();
         for stream in negotiated_ordered_streams.iter().copied() {
             let policy = self.registry.ordered_stream_policy(stream.kind);
-            if !may_open_ordered_stream(policy, context.is_initiator) {
+            if !opens_ordered_stream_locally(
+                policy,
+                context.is_initiator,
+                context.i_open_collision_winner,
+            ) {
                 continue;
             }
 
@@ -2207,6 +2242,7 @@ impl ZakuraProtocolHandler {
                     admitted.kind,
                     ServiceStream::new(
                         admitted.session_id,
+                        admitted.version,
                         admitted.recv,
                         admitted.send,
                         admitted.cancel_token,
@@ -2271,9 +2307,10 @@ impl ZakuraProtocolHandler {
                         && !session.has_active_session()
                         && should_reopen_ordered_session(
                         exited,
-                        policy,
-                        context.is_initiator,
-                        connection_token.is_cancelled(),
+                            policy,
+                            context.is_initiator,
+                            context.i_open_collision_winner,
+                            connection_token.is_cancelled(),
                     )
                     {
                         if let Some(delay) =
@@ -2297,7 +2334,11 @@ impl ZakuraProtocolHandler {
                     let stream = session.stream;
                     let policy = self.registry.ordered_stream_policy(stream.kind);
                     if connection_token.is_cancelled()
-                        || !may_open_ordered_stream(policy, context.is_initiator)
+                        || !opens_ordered_stream_locally(
+                            policy,
+                            context.is_initiator,
+                            context.i_open_collision_winner,
+                        )
                         || session.has_active_session()
                     {
                         continue;
@@ -2346,6 +2387,7 @@ impl ZakuraProtocolHandler {
                                 admitted.kind,
                                 ServiceStream::new(
                                     admitted.session_id,
+                                    admitted.version,
                                     admitted.recv,
                                     admitted.send,
                                     admitted.cancel_token,
@@ -2508,7 +2550,11 @@ impl ZakuraProtocolHandler {
                                     // local demand. Otherwise the entitled remote
                                     // opener observes the parked stream and retries.
                                     if policy.reopen
-                                        && may_open_ordered_stream(policy, context.is_initiator)
+                                        && opens_ordered_stream_locally(
+                                            policy,
+                                            context.is_initiator,
+                                            context.i_open_collision_winner,
+                                        )
                                     {
                                         session.schedule_demand(
                                             &mut ordered_session_waits,
@@ -2527,6 +2573,7 @@ impl ZakuraProtocolHandler {
                                     kind,
                                     ServiceStream::new(
                                         admitted.session_id,
+                                        admitted.version,
                                         admitted.recv,
                                         admitted.send,
                                         admitted.cancel_token.clone(),
@@ -2812,6 +2859,33 @@ impl ZakuraProtocolHandler {
             return None;
         }
 
+        if stream.mode == StreamMode::Ordered
+            && self
+                .registry
+                .ordered_streams_for_negotiated(admission.accepted_capabilities)
+                .into_iter()
+                .find(|selected| selected.kind == stream.kind)
+                .is_some_and(|selected| selected.version != stream.version)
+        {
+            debug!(
+                stream_kind = prelude.stream_kind,
+                stream_version = prelude.stream_version,
+                "rejecting a lower ordered-stream version than the mutually selected version"
+            );
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_UNKNOWN_STREAM));
+            metrics::counter!(
+                "zakura.p2p.stream.rejected.unselected_version",
+                "stream_kind" => stream_kind,
+            )
+            .increment(1);
+            admission.conn.trace_stream(
+                "rejected.unselected_version",
+                stream_id,
+                Some(stream_kind),
+            );
+            return None;
+        }
+
         if stream.mode != StreamMode::RequestResponse && prelude.request_id.is_some() {
             debug!("rejecting non-request Zakura stream with request id");
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
@@ -2901,9 +2975,9 @@ impl ZakuraProtocolHandler {
         remote_ip: Option<IpAddr>,
         context: ConnectionServeContext,
     ) -> Result<(), ZakuraHandlerError> {
-        // Both sides now proactively open their demanded ordered streams
-        // (connection symmetry), so bound the precheck by what this side will
-        // actually open: the demand-narrowed escalation set.
+        // Bound the precheck by the demand-narrowed set of service sessions this
+        // connection can admit. This counts a symmetric session regardless of
+        // which endpoint is its deterministic proactive opener.
         let ordered_stream_count = self
             .registry
             .ordered_streams_for_escalation(
@@ -2911,10 +2985,6 @@ impl ZakuraProtocolHandler {
                 &peer_id,
                 context.direction,
             )
-            .len();
-        let negotiated_ordered_stream_count = self
-            .registry
-            .ordered_streams_for_negotiated(context.accepted_capabilities)
             .len();
         if ordered_stream_count > usize::from(context.limits.max_open_streams) {
             debug!(
@@ -2925,12 +2995,12 @@ impl ZakuraProtocolHandler {
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"ordered streams");
             return Ok(());
         }
-        if negotiated_ordered_stream_count > 0
-            && usize::from(context.limits.max_inbound_queue_depth) < negotiated_ordered_stream_count
+        if ordered_stream_count > 0
+            && usize::from(context.limits.max_inbound_queue_depth) < ordered_stream_count
         {
             debug!(
                 max_inbound_queue_depth = context.limits.max_inbound_queue_depth,
-                ordered_stream_count = negotiated_ordered_stream_count,
+                ordered_stream_count,
                 "rejecting Zakura peer before registration because inbound queue depth cannot be split"
             );
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"queue split");
@@ -3104,6 +3174,63 @@ fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: NodeId
         .len()
 }
 
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct HeaderCapabilityEpochs {
+    applied_ready: Option<zakura_node_services::sync_lifecycle::LifecycleEpoch>,
+}
+
+impl HeaderCapabilityEpochs {
+    fn from_initial(demand: &zakura_node_services::sync_lifecycle::SyncServiceDemand) -> Self {
+        let applied_ready = demand.header.capability_epoch();
+        Self { applied_ready }
+    }
+
+    fn observe(
+        &mut self,
+        demand: &zakura_node_services::sync_lifecycle::SyncServiceDemand,
+    ) -> Option<zakura_node_services::sync_lifecycle::LifecycleEpoch> {
+        let epoch = demand.header.capability_epoch()?;
+        if self.applied_ready.is_some_and(|applied| epoch <= applied) {
+            return None;
+        }
+        self.applied_ready = Some(epoch);
+        Some(epoch)
+    }
+}
+
+/// Enable header sync for new handshakes and disconnect connections that were
+/// negotiated before the capability became available.
+///
+/// Negotiated capabilities are immutable for a connection. Keeping an
+/// existing connection alive after checkpoint bootstrap would therefore leave
+/// it permanently unable to open a header-sync stream, even though subsequent
+/// handshakes advertise the capability.
+async fn enable_header_sync_and_renegotiate(
+    handler: &ZakuraProtocolHandler,
+    supervisor: &ZakuraSupervisorHandle,
+    capability_epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch,
+) -> usize {
+    handler.set_header_sync_enabled(true);
+
+    let peers = supervisor.registered_ids().await;
+    let mut disconnected = 0;
+    for peer in &peers {
+        disconnected += usize::from(supervisor.disconnect_peer(peer).await);
+    }
+
+    if disconnected > 0 {
+        metrics::counter!("zakura.p2p.header_sync.capability_reconnects")
+            .increment(u64::try_from(disconnected).expect("peer count always fits in u64"));
+        info!(
+            disconnected,
+            capability_epoch = capability_epoch.get(),
+            "reconnecting peers to negotiate header sync after checkpoint bootstrap"
+        );
+    }
+
+    disconnected
+}
+
 /// Start a Zakura endpoint and router when P2P v2 is enabled.
 pub async fn spawn_zakura_endpoint(
     config: &Config,
@@ -3156,7 +3283,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     )?;
     let anchor = config.zakura.header_sync.anchor(&config.network)?;
     let frontiers = header_sync_driver_startup.as_ref().map_or(
-        HeaderSyncFrontiers {
+        FullStateFrontiers {
             finalized_height: anchor.0,
             verified_block_tip: anchor.0,
             verified_block_hash: anchor.1,
@@ -3166,29 +3293,6 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     let best_header_tip = header_sync_driver_startup
         .as_ref()
         .map_or(Some(anchor), |startup| startup.best_header_tip);
-    let sync_frontier = header_sync_driver_startup.as_ref().map(|driver_startup| {
-        let body_sync_tip = driver_startup.header_root_auth.map_or(
-            driver_startup.best_header_tip.unwrap_or(anchor),
-            |_| {
-                (
-                    driver_startup.frontiers.verified_block_tip,
-                    driver_startup.verified_block_tip_hash,
-                )
-            },
-        );
-        let initial = FrontierUpdate {
-            frontier: crate::zakura::chain_frontier_from_parts(
-                driver_startup.frontiers.finalized_height,
-                Frontier::new(
-                    driver_startup.frontiers.verified_block_tip,
-                    driver_startup.verified_block_tip_hash,
-                ),
-                Frontier::new(body_sync_tip.0, body_sync_tip.1),
-            ),
-            change: FrontierChange::Snapshot,
-        };
-        ZakuraSyncExchange::new(initial, trace.clone())
-    });
     let mut startup = HeaderSyncStartup::new(
         config.network.clone(),
         anchor,
@@ -3197,44 +3301,32 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         config.zakura.header_sync.clone(),
         limits.max_frame_bytes,
     );
-    startup.header_root_auth = header_sync_driver_startup
-        .as_ref()
-        .and_then(|driver| driver.header_root_auth);
+    startup.use_direct_port();
     startup.trace = trace.clone();
-    startup.frontier_updates = sync_frontier
+    startup.committed_snapshots = header_sync_driver_startup
         .as_ref()
-        .map(ZakuraSyncExchange::subscribe_frontier);
+        .map(|driver| driver.committed_snapshots.clone());
+    startup.vct_root_repairs = header_sync_driver_startup
+        .as_ref()
+        .and_then(|driver| driver.vct_root_repairs.clone());
+    if let Some(driver) = header_sync_driver_startup.as_ref() {
+        startup.header_chain_port = driver.header_chain_port.clone();
+    }
     let header_sync_shutdown = CancellationToken::new();
     startup.shutdown = header_sync_shutdown.clone();
-    if header_sync_driver_startup.is_some() {
-        startup.range_state_actions_enabled = true;
-        startup.inbound_new_block_acceptance_enabled = config.zakura.header_sync.accept_new_blocks;
-    }
     let (header_sync, header_sync_actions, header_sync_task) = spawn_header_sync_reactor(startup)?;
     let block_sync_driver_enabled = header_sync_driver_startup.is_some();
     let (block_sync, block_sync_actions, block_sync_task) =
         if let Some(driver_startup) = header_sync_driver_startup.as_ref() {
-            let body_sync_tip = driver_startup.header_root_auth.map_or(
-                driver_startup.best_header_tip.unwrap_or(anchor),
-                |_| {
-                    (
-                        driver_startup.frontiers.verified_block_tip,
-                        driver_startup.verified_block_tip_hash,
-                    )
-                },
-            );
-            let frontier_updates = sync_frontier
-                .as_ref()
-                .expect("sync frontier is initialized when block sync driver is enabled")
-                .subscribe_frontier();
-            let mut startup = BlockSyncStartup::new_with_exchange(
+            let best_header_tip = driver_startup.best_header_tip.unwrap_or(anchor);
+            let mut startup = BlockSyncStartup::new_with_committed_snapshots(
                 BlockSyncFrontiers {
                     finalized_height: driver_startup.frontiers.finalized_height,
                     verified_block_tip: driver_startup.frontiers.verified_block_tip,
                     verified_block_hash: driver_startup.verified_block_tip_hash,
                 },
-                body_sync_tip,
-                frontier_updates,
+                best_header_tip,
+                driver_startup.committed_snapshots.clone(),
                 config.zakura.block_sync.clone(),
             );
             startup.shutdown = header_sync_shutdown.clone();
@@ -3250,6 +3342,9 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         block_sync.clone(),
     ));
     let legacy_service = sink_factory(supervisor.clone(), trace.clone());
+    let service_demand = header_sync_driver_startup
+        .as_ref()
+        .map(|startup| startup.service_demand.clone());
     let registry = service_registry(
         &supervisor,
         Some(header_sync.clone()),
@@ -3257,11 +3352,13 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         config.zakura.block_sync.clone(),
         legacy_service,
         discovery_service,
+        service_demand.clone(),
     )?;
     let mut tasks = vec![header_sync_task];
     if let Some(task) = block_sync_task {
         tasks.push(task);
     }
+    #[cfg(any(test, feature = "zakura-testkit"))]
     let header_sync_actions = if block_sync_driver_enabled {
         Some(Arc::new(Mutex::new(Some(header_sync_actions))))
     } else {
@@ -3274,6 +3371,8 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         tasks.push(action_driver_task);
         None
     };
+    #[cfg(not(any(test, feature = "zakura-testkit")))]
+    drop(header_sync_actions);
     let block_sync_actions = block_sync_actions
         .filter(|_| block_sync_driver_enabled)
         .map(|actions| Arc::new(Mutex::new(Some(actions))));
@@ -3281,6 +3380,9 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         shutdown: header_sync_shutdown,
         tasks: Mutex::new(tasks),
     });
+    let header_sync_ready = service_demand
+        .as_ref()
+        .is_some_and(|demand| demand.borrow().header.is_enabled());
     let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
         supervisor.clone(),
         config.network.clone(),
@@ -3292,6 +3394,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     // Give the handler the bound endpoint so inbound accepts can resolve the
     // peer's source IP and enforce the per-IP connection cap.
     .with_endpoint(endpoint.clone());
+    handler.set_header_sync_enabled(header_sync_ready);
     let router = Router::builder(endpoint)
         .accept(P2P_V2_ALPN, handler.clone())
         .spawn();
@@ -3301,12 +3404,42 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         handler,
         header_sync: Some(header_sync),
         block_sync,
-        sync_frontier,
         header_sync_tasks: Some(header_sync_tasks),
+        #[cfg(any(test, feature = "zakura-testkit"))]
         header_sync_actions,
         block_sync_actions,
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
     };
+
+    if let Some(mut service_demand) = service_demand {
+        let capability_handler = endpoint.handler.clone();
+        let capability_supervisor = endpoint.supervisor.clone();
+        let shutdown = endpoint.background_shutdown_token();
+        let task = tokio::spawn(async move {
+            let mut epochs = HeaderCapabilityEpochs::from_initial(&service_demand.borrow());
+            loop {
+                let ready_epoch = epochs.observe(&service_demand.borrow());
+                if let Some(epoch) = ready_epoch {
+                    enable_header_sync_and_renegotiate(
+                        &capability_handler,
+                        &capability_supervisor,
+                        epoch,
+                    )
+                    .await;
+                }
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    changed = service_demand.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        endpoint.push_header_sync_task(task).await;
+    }
 
     // Log our own dial address once iroh has resolved it, so operators can hand
     // out `<node_id>@<direct_addr>` for other nodes' `zakura.bootstrap_peers`.
@@ -3391,10 +3524,11 @@ pub(crate) async fn serve_native_dial_connection(
             .clone()
             .try_acquire_owned()
             .map_err(|_| ZakuraHandlerError::ResourceLimit("pending handshake"))?;
+        let handshake_config = endpoint.handler.current_handshake_config();
         run_native_initiator_handshake(
             &connection,
             limits,
-            &endpoint.handler.handshake_config,
+            &handshake_config,
             &local_peer_id,
             &endpoint.handler.trace,
             &conn,
@@ -3425,7 +3559,7 @@ pub(crate) async fn serve_native_dial_connection(
                     &local_node_id,
                     &remote_node_id,
                 ),
-                i_open_collision_winner: i_open_collision_winner(true),
+                i_open_collision_winner: i_open_collision_winner(&local_node_id, &remote_node_id),
                 conn,
             },
         )
@@ -3531,6 +3665,7 @@ fn spawn_persistent_stream_worker(
     let (from_service_tx, from_service_rx) = mpsc::channel(queue_depth);
     let admitted = AdmittedOrderedSession {
         kind: prelude.stream_kind,
+        version: prelude.stream_version,
         session_id: context.stream_id,
         recv: FramedRecv::new(to_service_rx),
         send: FramedSend::new(from_service_tx),
@@ -4783,12 +4918,7 @@ fn per_stream_inbound_queue_depth(
         return total;
     }
 
-    let per_stream = total.saturating_div(ordered_stream_count).max(1);
-    debug_assert!(
-        per_stream.saturating_mul(ordered_stream_count) <= total,
-        "ordered stream queue split must stay within the negotiated aggregate limit"
-    );
-    per_stream
+    total.saturating_div(ordered_stream_count).max(1)
 }
 
 fn should_run_freshness_reaper(
@@ -4798,11 +4928,8 @@ fn should_run_freshness_reaper(
     ordered_stream_count > 0 || request_response_stream_count == 0
 }
 
-/// The stream-kind versions this handler serves. Most known kinds are at version 1;
-/// header sync is at version 7, which correlates each `Headers` response with the
-/// request that solicited it. Earlier header-sync versions are not served.
+/// The common stream version used by services whose declarations remain at version 1.
 const ZAKURA_STREAM_VERSION_1: u16 = 1;
-const ZAKURA_STREAM_VERSION_7: u16 = 7;
 
 /// Returns whether the handler can serve a stream with this kind and version.
 ///
@@ -5000,11 +5127,10 @@ mod tests {
         zakura::{
             legacy_gossip::{LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec},
             testkit::{await_until, LocalEndpointFactory, ZakuraTestNode},
-            HeaderSyncEvent, HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession,
-            HeaderSyncRequestId, HeaderSyncStatus, ServicePeerLimits, ZakuraDiscoveryConfig,
-            ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, LOCAL_MAX_MESSAGE_BYTES,
-            MAX_HS_MESSAGE_BYTES, MSG_HS_STATUS, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-            ZAKURA_CAP_LEGACY_GOSSIP,
+            HeaderSyncEvent, HeaderSyncMisbehavior, HeaderSyncPeerSession, ServicePeerLimits,
+            LOCAL_MAX_MESSAGE_BYTES, MAX_HS_MESSAGE_BYTES, ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            ZAKURA_CAP_BLOCK_SYNC, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
         },
         P2pStack,
     };
@@ -5017,7 +5143,180 @@ mod tests {
         serialization::{ZcashDeserialize, MAX_PROTOCOL_MESSAGE_LEN},
         transaction::{self, UnminedTxId},
     };
-    use zakura_test::vectors::BLOCK_TESTNET_141042_BYTES;
+    use zakura_test::vectors::{BLOCK_MAINNET_GENESIS_BYTES, BLOCK_TESTNET_141042_BYTES};
+
+    /// Regression for the mainnet dual-stack body-sync stall on
+    /// `temp-zakura-sync-test-7` (2026-07-14, run
+    /// `20260714T073939Z-cca353fd1287`): body sync froze at height 2,725,606 for
+    /// 10 minutes with 54,670 blocks of pending work and 6.4 GB of free download
+    /// budget, while header sync happily tracked the tip at 3,411,947. Block sync
+    /// had decayed to `peers: 0` -- permanently.
+    ///
+    /// The cause is entirely in the transport. Block sync evicts a peer that
+    /// missed its no-progress liveness deadline and parks it for
+    /// `no_progress_peer_cooldown` (180s). The transport knows nothing about that
+    /// park and redials the peer ~30s later, well inside the cooldown. At
+    /// connection setup the transport asks block sync once whether it wants the
+    /// peer; it is still parked, so the block-sync stream is withheld -- and that
+    /// decision was never revisited. The connection itself stays up and healthy
+    /// (header sync and discovery keep riding it, which is exactly why headers
+    /// kept reaching the tip), so no redial follows, so there is no new setup to
+    /// ask again; and when the park lapsed nothing re-offered the stream. Every
+    /// block-sync peer was eventually evicted this way, so block sync ended at
+    /// zero peers on a node holding live connections to those very peers.
+    ///
+    /// This drives the real `serve_connection` over a real local QUIC connection
+    /// with the real `BlockSyncService`, parking the peer exactly as the liveness
+    /// deadline does. The park must defer the stream, not lose it: once the
+    /// cooldown lapses on a still-live connection, block sync must get its stream
+    /// without waiting for a redial that is never coming.
+    #[tokio::test]
+    async fn parked_block_sync_peer_gets_a_stream_when_its_cooldown_lapses() -> Result<(), BoxError>
+    {
+        const COOLDOWN: Duration = Duration::from_secs(3);
+
+        let _guard = zakura_test::init();
+
+        let genesis = Block::zcash_deserialize(&BLOCK_MAINNET_GENESIS_BYTES[..])?;
+        let anchor = (block::Height(0), genesis.hash());
+        let frontiers = FullStateFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: genesis.hash(),
+        };
+        let node = |seed| {
+            ZakuraTestNode::builder(seed)
+                .header_sync_driver(Config::default().network, anchor, frontiers, Some(anchor))
+                .spawn()
+        };
+        let dialer = node(140).await?;
+        let listener = node(141).await?;
+
+        let listener_peer =
+            ZakuraPeerId::new(listener.node_addr().await.node_id.as_bytes().to_vec())?;
+        let block_sync = dialer
+            .block_sync()
+            .expect("the header-sync driver spawns the block-sync reactor");
+
+        // The peer just missed its no-progress liveness deadline: block sync
+        // evicts and parks it. The transport's redial lands inside the cooldown.
+        block_sync.park_peer_for_test(&listener_peer, COOLDOWN);
+        dialer
+            .connect_native(&listener, Duration::from_secs(10))
+            .await?;
+
+        // The park is in force, so block sync is withheld from this connection.
+        assert_eq!(
+            block_sync.peer_snapshot().outbound_peers,
+            0,
+            "a parked peer must not be given a block-sync stream while its cooldown runs",
+        );
+
+        // The cooldown lapses while the connection stays up. Nothing will redial
+        // -- the connection is healthy -- so the only way block sync ever gets
+        // this peer back is for the transport to re-check its demand.
+        await_until(
+            "block sync opens a stream to the peer whose park expired",
+            Duration::from_secs(30),
+            || block_sync.peer_snapshot().outbound_peers == 1,
+        )
+        .await?;
+
+        dialer.shutdown().await;
+        listener.shutdown().await;
+        Ok(())
+    }
+
+    #[test]
+    fn header_capability_mask_tracks_explicit_runtime_enablement() {
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(1),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            ZakuraLocalLimits::from_config(&Config::default()),
+        );
+        handler.supported_capabilities.store(
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC,
+            Ordering::Relaxed,
+        );
+
+        handler.set_header_sync_enabled(false);
+        assert_eq!(
+            handler.current_handshake_config().supported_capabilities,
+            ZAKURA_CAP_DISCOVERY
+        );
+
+        handler.set_header_sync_enabled(true);
+        assert_eq!(
+            handler.current_handshake_config().supported_capabilities,
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC
+        );
+    }
+
+    #[test]
+    fn header_capability_epoch_is_applied_once_and_rejects_stale_demand() {
+        use zakura_node_services::sync_lifecycle::{
+            BlockServiceDemand, HeaderServiceDemand, LifecycleEpoch, SyncServiceDemand,
+        };
+
+        let disabled = SyncServiceDemand {
+            header: HeaderServiceDemand::Disabled {
+                runtime_epoch: LifecycleEpoch::INITIAL,
+            },
+            block: BlockServiceDemand::ServingAndApplying {
+                apply_epoch: LifecycleEpoch::INITIAL,
+            },
+        };
+        let mut epochs = HeaderCapabilityEpochs::from_initial(&disabled);
+        let ready = SyncServiceDemand {
+            header: HeaderServiceDemand::Enabled {
+                capability_epoch: LifecycleEpoch::new(2),
+            },
+            ..disabled
+        };
+        assert_eq!(epochs.observe(&ready), Some(LifecycleEpoch::new(2)));
+        assert_eq!(epochs.observe(&ready), None);
+        let stale = SyncServiceDemand {
+            header: HeaderServiceDemand::Enabled {
+                capability_epoch: LifecycleEpoch::new(1),
+            },
+            ..disabled
+        };
+        assert_eq!(epochs.observe(&stale), None);
+    }
+
+    #[tokio::test]
+    async fn enabling_header_sync_reconnects_peers_negotiated_without_it() {
+        let supervisor = ZakuraSupervisorHandle::new(4);
+        let handler = ZakuraProtocolHandler::new(
+            supervisor.clone(),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            ZakuraLocalLimits::from_config(&Config::default()),
+        );
+        handler.set_header_sync_enabled(false);
+
+        let first_token = CancellationToken::new();
+        let second_token = CancellationToken::new();
+        register_test_peer(&supervisor, test_peer(31), first_token.clone()).await;
+        register_test_peer(&supervisor, test_peer(32), second_token.clone()).await;
+
+        assert_eq!(
+            enable_header_sync_and_renegotiate(
+                &handler,
+                &supervisor,
+                zakura_node_services::sync_lifecycle::LifecycleEpoch::new(1),
+            )
+            .await,
+            2
+        );
+        assert_ne!(
+            handler.current_handshake_config().supported_capabilities & ZAKURA_CAP_HEADER_SYNC,
+            0
+        );
+        assert!(first_token.is_cancelled());
+        assert!(second_token.is_cancelled());
+    }
 
     /// With no configured `zakura.listen_addr`, the native endpoint must bind
     /// loopback-only. Otherwise iroh's default bind (`0.0.0.0:0` / `[::]:0`)
@@ -5103,47 +5402,6 @@ mod tests {
                 };
                 let _ = self.stream_tx.send(streams).await;
             }
-            Ok(())
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct RecordingService {
-        deliveries: std::sync::Mutex<Vec<(ZakuraPeerId, u16, u16)>>,
-    }
-
-    impl RecordingService {
-        fn deliveries(&self) -> Vec<(ZakuraPeerId, u16, u16)> {
-            self.deliveries
-                .lock()
-                .expect("recording sink mutex is never poisoned")
-                .clone()
-        }
-    }
-
-    impl Service for RecordingService {
-        fn name(&self) -> &'static str {
-            "recording"
-        }
-
-        fn streams(&self) -> &[Stream] {
-            crate::zakura::legacy_gossip::legacy_gossip_streams()
-        }
-
-        fn add_peer(&self, _peer: Peer) {}
-
-        fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
-
-        fn deliver_frame(
-            &self,
-            peer_id: ZakuraPeerId,
-            stream_kind: u16,
-            frame: Frame,
-        ) -> Result<(), SinkReject> {
-            self.deliveries
-                .lock()
-                .map_err(|error| SinkReject::local(format!("recording sink poisoned: {error}")))?
-                .push((peer_id, stream_kind, frame.message_type));
             Ok(())
         }
     }
@@ -5795,16 +6053,20 @@ mod tests {
 
     #[test]
     fn ordered_stream_collision_winner_is_mirror_stable() {
-        // The two ends of one connection hold complementary roles and must
-        // reach complementary answers, so exactly one side keeps its own
-        // opened stream while the other adopts the peer's.
+        // Both ends compute the collision winner from the same pair of node ids
+        // and must reach complementary answers, so exactly one side keeps its
+        // own opened stream while the other adopts the peer's.
+        let node_a = LocalEndpointFactory::secret_key(1).public();
+        let node_b = LocalEndpointFactory::secret_key(2).public();
+        assert_ne!(node_a, node_b);
         assert_ne!(
-            i_open_collision_winner(true),
-            i_open_collision_winner(false),
+            i_open_collision_winner(&node_a, &node_b),
+            i_open_collision_winner(&node_b, &node_a),
             "exactly one side must win a same-kind ordered-stream collision",
         );
-        // The winner is deterministic: the dialing side.
-        assert!(i_open_collision_winner(true));
+        // The winner is deterministic: the lexicographically smaller node id.
+        let a_wins = node_a.as_bytes() < node_b.as_bytes();
+        assert_eq!(i_open_collision_winner(&node_a, &node_b), a_wins);
     }
 
     fn header_sync_test_session(
@@ -5817,48 +6079,13 @@ mod tests {
         )
     }
 
-    fn test_discovery_service(
-        supervisor: &ZakuraSupervisorHandle,
-    ) -> Arc<crate::zakura::DiscoveryService> {
-        let (_handle, service) =
-            test_discovery_service_with_peer_limits(supervisor, ServicePeerLimits::default());
-        service
-    }
-
-    fn test_discovery_service_with_peer_limits(
-        supervisor: &ZakuraSupervisorHandle,
-        peer_limits: ServicePeerLimits,
-    ) -> (ZakuraDiscoveryHandle, Arc<crate::zakura::DiscoveryService>) {
-        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
-        let handle = ZakuraDiscoveryHandle::new(
-            ZakuraDiscoveryLocalConfig {
-                secret_key: SecretKey::from_bytes(&[7u8; 32]),
-                direct_addrs: Vec::new(),
-                services: crate::zakura::discovery::default_advertised_services(),
-                zakura_protocol_min: handshake.zakura_protocol_min,
-                zakura_protocol_max: handshake.zakura_protocol_max,
-                network_id: handshake.network_id,
-                chain_id: handshake.chain_id,
-                last_authored_sequence: None,
-            },
-            ZakuraDiscoveryConfig {
-                peer_limits,
-                ..ZakuraDiscoveryConfig::default()
-            },
-            supervisor.subscribe(),
-        )
-        .expect("test discovery handle builds");
-        let service = Arc::new(crate::zakura::DiscoveryService::new(handle.clone()));
-        (handle, service)
-    }
-
     fn header_sync_startup(shutdown: CancellationToken) -> HeaderSyncStartup {
         let network = Network::Mainnet;
         let anchor = (block::Height(0), network.genesis_hash());
         let mut startup = HeaderSyncStartup::new(
             network,
             anchor,
-            HeaderSyncFrontiers {
+            FullStateFrontiers {
                 finalized_height: anchor.0,
                 verified_block_tip: anchor.0,
                 verified_block_hash: anchor.1,
@@ -5869,24 +6096,6 @@ mod tests {
         );
         startup.shutdown = shutdown;
         startup
-    }
-
-    async fn next_header_sync_action(
-        actions: &mut mpsc::Receiver<HeaderSyncAction>,
-    ) -> HeaderSyncAction {
-        tokio::time::timeout(Duration::from_secs(2), actions.recv())
-            .await
-            .expect("header-sync action arrives before timeout")
-            .expect("header-sync action channel stays open")
-    }
-
-    fn status_at_genesis(network: &Network) -> HeaderSyncStatus {
-        HeaderSyncStatus {
-            tip_height: block::Height(0),
-            tip_hash: network.genesis_hash(),
-            anchor_height: block::Height(0),
-            ..HeaderSyncStatus::default()
-        }
     }
 
     async fn register_test_peer(
@@ -6178,198 +6387,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_routes_legacy_and_header_sync_and_drops_unknown() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let shutdown = CancellationToken::new();
-        let startup = header_sync_startup(shutdown.clone());
-        let (header_sync, mut actions, task) = spawn_header_sync_reactor(startup)?;
-        let recorder = Arc::new(RecordingService::default());
-        let supervisor = ZakuraSupervisorHandle::new(1);
-        let registry = service_registry(
-            &supervisor,
-            Some(header_sync.clone()),
-            None,
-            ZakuraBlockSyncConfig::default(),
-            recorder.clone(),
-            test_discovery_service(&supervisor),
-        )?;
-        let peer = test_peer(6);
-
-        let (session, _recv) = header_sync_test_session(peer.clone());
-        header_sync
-            .send(HeaderSyncEvent::PeerConnected(session))
-            .await?;
-        assert!(matches!(
-            next_header_sync_action(&mut actions).await,
-            HeaderSyncAction::SendMessage {
-                msg: HeaderSyncMessage::Status(_),
-                ..
-            }
-        ));
-
-        let gossip_frame = Frame {
-            message_type: 11,
-            flags: 0,
-            payload: Vec::new(),
-        };
-        let request_frame = Frame {
-            message_type: 12,
-            flags: 0,
-            payload: Vec::new(),
-        };
-        let get_headers_frame = HeaderSyncMessage::GetHeaders {
-            start_height: block::Height(1),
-            count: 1,
-            want_tree_aux_roots: false,
-        }
-        .encode_frame(Some(
-            HeaderSyncRequestId::new(1).expect("non-zero request id"),
-        ))?;
-
-        let (gossip_result, request_result, header_sync_result) = tokio::join!(
-            async { registry.deliver(peer.clone(), LEGACY_GOSSIP_STREAM_KIND, gossip_frame) },
-            async { registry.deliver(peer.clone(), LEGACY_REQUEST_STREAM_KIND, request_frame) },
-            async { registry.deliver(peer.clone(), HEADER_SYNC_STREAM_KIND, get_headers_frame) },
-        );
-
-        gossip_result?;
-        request_result?;
-        header_sync_result?;
-        registry.deliver(
-            peer.clone(),
-            99,
-            Frame {
-                message_type: 13,
-                flags: 0,
-                payload: Vec::new(),
-            },
-        )?;
-
-        let action = next_header_sync_action(&mut actions).await;
-        assert!(
-            matches!(
-                action,
-                HeaderSyncAction::Misbehavior {
-                    reason: HeaderSyncMisbehavior::GetHeadersSpam,
-                    ..
-                }
-            ),
-            "kind-5 GetHeaders must reach the header-sync reactor, got {action:?}"
-        );
-
-        let deliveries = recorder.deliveries();
-        assert_eq!(deliveries.len(), 2);
-        assert!(deliveries.iter().any(|(_, kind, message_type)| *kind
-            == LEGACY_GOSSIP_STREAM_KIND
-            && *message_type == 11));
-        assert!(deliveries.iter().any(|(_, kind, message_type)| *kind
-            == LEGACY_REQUEST_STREAM_KIND
-            && *message_type == 12));
-        assert!(!deliveries
-            .iter()
-            .any(|(_, kind, _)| *kind == HEADER_SYNC_STREAM_KIND));
-
-        let rejected = registry
-            .request(
-                peer,
-                HEADER_SYNC_STREAM_KIND,
-                99,
-                LOCAL_MAX_CONTROL_FRAME_BYTES,
-                LOCAL_MAX_CONTROL_FRAME_BYTES,
-                Frame {
-                    message_type: 1,
-                    flags: 0,
-                    payload: Vec::new(),
-                },
-            )
-            .await;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
-
-        shutdown.cancel();
-        task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn malformed_header_sync_frame_is_protocol_reject_when_reactor_queue_closed(
-    ) -> Result<(), BoxError> {
-        let shutdown = CancellationToken::new();
-        let startup = header_sync_startup(shutdown.clone());
-        let (header_sync, _actions, task) = spawn_header_sync_reactor(startup)?;
-        let service = HeaderSyncService::new(header_sync);
-        let peer = test_peer(11);
-
-        shutdown.cancel();
-        task.await?;
-
-        let valid_status_frame =
-            HeaderSyncMessage::Status(status_at_genesis(&Network::Mainnet)).encode_frame(None)?;
-        let valid_result =
-            service.deliver_frame(peer.clone(), HEADER_SYNC_STREAM_KIND, valid_status_frame);
-        assert!(
-            matches!(valid_result, Err(SinkReject::Local(_))),
-            "valid header-sync frames depend on local reactor queue availability"
-        );
-
-        let malformed_frame = Frame {
-            message_type: u16::from(MSG_HS_STATUS),
-            flags: 0,
-            payload: Vec::new(),
-        };
-        let malformed_result =
-            service.deliver_frame(peer, HEADER_SYNC_STREAM_KIND, malformed_frame);
-        assert!(
-            matches!(malformed_result, Err(SinkReject::Protocol(_))),
-            "malformed header-sync frames must disconnect independently of reactor queue availability"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn header_sync_peer_connected_has_ready_outbound_source() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let shutdown = CancellationToken::new();
-        let startup = header_sync_startup(shutdown.clone());
-        let (header_sync, mut actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let service = HeaderSyncService::new(header_sync);
-        let peer = test_peer(12);
-        let cancel_token = CancellationToken::new();
-        let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
-        let (outbound_tx, mut outbound_rx) = crate::zakura::framed_channel(1);
-
-        let mut streams = HashMap::new();
-        streams.insert(HEADER_SYNC_STREAM_KIND, (inbound_rx, outbound_tx));
-        service.add_peer(Peer::new(
-            peer.clone(),
-            None,
-            ZAKURA_CAP_HEADER_SYNC,
-            streams,
-            cancel_token.clone(),
-        ));
-
-        let received = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .expect("header-sync outbound source is immediately ready")
-            .expect("header-sync outbound receiver stays open");
-        assert_eq!(received.message_type, u16::from(MSG_HS_STATUS));
-
-        assert!(matches!(
-            next_header_sync_action(&mut actions).await,
-            HeaderSyncAction::SendMessage {
-                msg: HeaderSyncMessage::Status(_),
-                ..
-            }
-        ));
-
-        cancel_token.cancel();
-        service.remove_peer(&peer, 0);
-        shutdown.cancel();
-        reactor_task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn lazy_escalation_service_demand_respects_directional_caps() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let shutdown = CancellationToken::new();
@@ -6402,244 +6419,129 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_add_remove_updates_header_sync_peers() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
+    async fn header_ordered_session_waits_for_coordinator_capability_epoch() -> Result<(), BoxError>
+    {
+        use zakura_node_services::sync_lifecycle::{
+            BlockServiceDemand, HeaderServiceDemand, LifecycleEpoch, SyncServiceDemand,
+        };
+
         let shutdown = CancellationToken::new();
-        let startup = header_sync_startup(shutdown.clone());
-        let (header_sync, mut actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let peer = test_peer(7);
-        let supervisor = ZakuraSupervisorHandle::new(1);
-        let registry = service_registry(
-            &supervisor,
-            Some(header_sync.clone()),
-            None,
-            ZakuraBlockSyncConfig::default(),
-            Arc::new(RecordingService::default()),
-            test_discovery_service(&supervisor),
-        )?;
-        let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
-        let (outbound_tx, _outbound_rx) = crate::zakura::framed_channel(1);
-        let mut streams = HashMap::new();
-        streams.insert(HEADER_SYNC_STREAM_KIND, (inbound_rx, outbound_tx));
-        registry.add_peer(Peer::new(
-            peer.clone(),
+        let (header_sync, _actions, reactor_task) =
+            spawn_header_sync_reactor(header_sync_startup(shutdown.clone()))?;
+        let disabled = SyncServiceDemand {
+            header: HeaderServiceDemand::Disabled {
+                runtime_epoch: LifecycleEpoch::INITIAL,
+            },
+            block: BlockServiceDemand::ServingOnly {
+                apply_epoch: LifecycleEpoch::INITIAL,
+            },
+        };
+        let (demand_tx, demand_rx) = watch::channel(disabled);
+        let service = HeaderSyncService::new(header_sync).with_service_demand(Some(demand_rx));
+        let peer = test_peer(171);
+        assert!(!service.wants_peer(
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ));
+        let OrderedSessionDemand::WaitForChange(changed) = service.ordered_session_demand(
+            test_conn_id(),
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ) else {
+            panic!("disabled coordinator demand must park the ordered header session");
+        };
+
+        demand_tx
+            .send(SyncServiceDemand {
+                header: HeaderServiceDemand::Enabled {
+                    capability_epoch: LifecycleEpoch::new(1),
+                },
+                ..disabled
+            })
+            .expect("the header service retains its demand receiver");
+        tokio::time::timeout(Duration::from_secs(1), changed)
+            .await
+            .expect("the capability epoch wakes ordered-session demand");
+        assert!(service.wants_peer(
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ));
+
+        shutdown.cancel();
+        reactor_task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn header_sync_peer_connected_has_immediately_ready_outbound_source(
+    ) -> Result<(), BoxError> {
+        let shutdown = CancellationToken::new();
+        let mut startup = header_sync_startup(shutdown.clone());
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let snapshot = zakura_header_chain::EngineSnapshot {
+            mode: zakura_header_chain::EngineMode::Integrated,
+            state_version: zakura_header_chain::StateVersion::new(1),
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+            frontiers: zakura_header_chain::FrontierSet {
+                finalized: anchor,
+                header_best: anchor,
+                verified_best: anchor,
+            },
+            header_best_score: zakura_header_chain::ChainScore::new(
+                zakura_header_chain::SuffixWork::zero(),
+                anchor.hash,
+            ),
+            oldest_retained_height: anchor.height,
+            alarms: Default::default(),
+        };
+        let (_snapshot_tx, snapshot_rx) = watch::channel(Some(snapshot));
+        startup.committed_snapshots = Some(snapshot_rx);
+        let (header_sync, _actions, reactor_task) = spawn_header_sync_reactor(startup)?;
+        let codec = header_sync.codec();
+        let service = HeaderSyncService::new(header_sync);
+        let peer = test_peer(18);
+        let connection_cancel = CancellationToken::new();
+        let service_cancel = connection_cancel.child_token();
+        let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(8);
+        let (outbound_tx, mut outbound_rx) = crate::zakura::framed_channel(8);
+        let session_id = 7;
+        let streams = HashMap::from([(
+            ZAKURA_STREAM_HEADER_SYNC,
+            ServiceStream::new(
+                session_id,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION,
+                inbound_rx,
+                outbound_tx,
+                service_cancel,
+            ),
+        )]);
+
+        service.add_peer(Peer::new_with_service_streams(
+            test_conn_id(),
+            peer,
             None,
             ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Inbound,
             streams,
-            CancellationToken::new(),
-        ));
-        assert!(matches!(
-            next_header_sync_action(&mut actions).await,
-            HeaderSyncAction::SendMessage {
-                msg: HeaderSyncMessage::Status(_),
-                ..
-            }
+            connection_cancel.clone(),
+            CloseCause::new(),
         ));
 
-        header_sync
-            .send(HeaderSyncEvent::WireMessage {
-                peer: peer.clone(),
-                msg: HeaderSyncMessage::Status(status_at_genesis(&Network::Mainnet)),
-            })
-            .await?;
-        assert_eq!(header_sync.peer_snapshot().inbound_peers, 1);
-
-        registry.remove_peer(&peer, 0, ZAKURA_CAP_HEADER_SYNC);
-
-        // Deregistering must drop the peer from header-sync state and release its
-        // slot. Its in-flight wire events are then dropped by the session guard
-        // rather than scored, so the freed slot is the observable.
-        timeout(Duration::from_secs(2), async {
-            while header_sync.peer_snapshot().inbound_peers != 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("deregistered peer must be removed from header-sync state");
-
-        shutdown.cancel();
-        reactor_task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn discovery_admission_is_independent_when_header_sync_is_full() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let shutdown = CancellationToken::new();
-        let mut startup = header_sync_startup(shutdown.clone());
-        startup.config.peer_limits = ServicePeerLimits {
-            max_inbound_peers: 0,
-            ..ServicePeerLimits::default()
-        };
-        let (header_sync, mut actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let supervisor = ZakuraSupervisorHandle::new(1);
-        let (discovery_handle, discovery_service) = test_discovery_service_with_peer_limits(
-            &supervisor,
-            ServicePeerLimits {
-                max_inbound_peers: 1,
-                ..ServicePeerLimits::default()
-            },
-        );
-        let registry = service_registry(
-            &supervisor,
-            Some(header_sync.clone()),
-            None,
-            ZakuraBlockSyncConfig::default(),
-            Arc::new(RecordingService::default()),
-            discovery_service,
-        )?;
-        let peer_node_id = SecretKey::from_bytes(&[13u8; 32]).public();
-        let peer = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
-        let (_hs_inbound_tx, hs_inbound_rx) = crate::zakura::framed_channel(1);
-        let (hs_outbound_tx, mut hs_outbound_rx) = crate::zakura::framed_channel(1);
-        let (_discovery_inbound_tx, discovery_inbound_rx) = crate::zakura::framed_channel(1);
-        let (discovery_outbound_tx, mut discovery_outbound_rx) = crate::zakura::framed_channel(4);
-        let streams = HashMap::from([
-            (HEADER_SYNC_STREAM_KIND, (hs_inbound_rx, hs_outbound_tx)),
-            (
-                DISCOVERY_STREAM_KIND,
-                (discovery_inbound_rx, discovery_outbound_tx),
-            ),
-        ]);
-
-        registry.add_peer(Peer::new(
-            peer.clone(),
-            None,
-            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY,
-            streams,
-            CancellationToken::new(),
-        ));
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            let mut snapshots = discovery_handle.subscribe_peer_snapshot();
-            while snapshots.borrow().inbound_peers != 1 {
-                snapshots
-                    .changed()
-                    .await
-                    .expect("discovery snapshot channel stays open");
-            }
-        })
-        .await
-        .expect("discovery admits while header-sync is full");
-
-        assert_eq!(header_sync.peer_snapshot().inbound_peers, 0);
-        assert_eq!(header_sync.peer_snapshot().inbound_slots_free, 0);
-        assert!(
-            !matches!(
-                tokio::time::timeout(Duration::from_millis(100), hs_outbound_rx.recv()).await,
-                Ok(Some(_))
-            ),
-            "header-sync rejected peer must not receive Status"
-        );
-        let discovery_frame =
-            tokio::time::timeout(Duration::from_secs(1), discovery_outbound_rx.recv())
-                .await
-                .expect("discovery source sends its normal hello")
-                .expect("discovery outbound stream stays open");
-        assert_eq!(discovery_frame.message_type, 1);
-
-        while let Ok(Some(action)) =
-            tokio::time::timeout(Duration::from_millis(50), actions.recv()).await
-        {
-            assert!(
-                !matches!(action, HeaderSyncAction::Misbehavior { peer: action_peer, .. } if action_peer == peer),
-                "header-sync cap rejection must not score peer misbehavior"
-            );
-        }
-
-        registry.remove_peer(&peer, 0, ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            let mut snapshots = discovery_handle.subscribe_peer_snapshot();
-            while snapshots.borrow().inbound_peers != 0 {
-                snapshots
-                    .changed()
-                    .await
-                    .expect("discovery snapshot channel stays open");
-            }
-        })
-        .await
-        .expect("discovery peer state is removed");
-
-        shutdown.cancel();
-        reactor_task.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn header_sync_admission_is_independent_when_discovery_is_full() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let shutdown = CancellationToken::new();
-        let mut startup = header_sync_startup(shutdown.clone());
-        startup.config.peer_limits = ServicePeerLimits {
-            max_inbound_peers: 1,
-            ..ServicePeerLimits::default()
-        };
-        let (header_sync, mut actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let supervisor = ZakuraSupervisorHandle::new(1);
-        let (discovery_handle, discovery_service) = test_discovery_service_with_peer_limits(
-            &supervisor,
-            ServicePeerLimits {
-                max_inbound_peers: 0,
-                ..ServicePeerLimits::default()
-            },
-        );
-        let registry = service_registry(
-            &supervisor,
-            Some(header_sync.clone()),
-            None,
-            ZakuraBlockSyncConfig::default(),
-            Arc::new(RecordingService::default()),
-            discovery_service,
-        )?;
-        let peer_node_id = SecretKey::from_bytes(&[14u8; 32]).public();
-        let peer = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
-        let (_hs_inbound_tx, hs_inbound_rx) = crate::zakura::framed_channel(1);
-        let (hs_outbound_tx, mut hs_outbound_rx) = crate::zakura::framed_channel(1);
-        let (_discovery_inbound_tx, discovery_inbound_rx) = crate::zakura::framed_channel(1);
-        let (discovery_outbound_tx, mut discovery_outbound_rx) = crate::zakura::framed_channel(1);
-        let streams = HashMap::from([
-            (HEADER_SYNC_STREAM_KIND, (hs_inbound_rx, hs_outbound_tx)),
-            (
-                DISCOVERY_STREAM_KIND,
-                (discovery_inbound_rx, discovery_outbound_tx),
-            ),
-        ]);
-
-        registry.add_peer(Peer::new(
-            peer.clone(),
-            None,
-            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY,
-            streams,
-            CancellationToken::new(),
-        ));
-
-        let header_frame = tokio::time::timeout(Duration::from_secs(1), hs_outbound_rx.recv())
+        let frame = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
             .await
-            .expect("header-sync sends immediate Status")
-            .expect("header-sync outbound stream stays open");
-        assert_eq!(header_frame.message_type, u16::from(MSG_HS_STATUS));
+            .expect("the first outbound source is immediately ready")
+            .expect("the admitted source remains open");
         assert!(matches!(
-            next_header_sync_action(&mut actions).await,
-            HeaderSyncAction::SendMessage {
-                peer: action_peer,
-                msg: HeaderSyncMessage::Status(_),
-                ..
-            } if action_peer == peer
+            codec
+                .decode_frame(frame, None)
+                .expect("the first outbound frame decodes"),
+            crate::zakura::HeaderSyncMessage::Status(_)
         ));
-        assert_eq!(header_sync.peer_snapshot().inbound_peers, 1);
-        assert_eq!(discovery_handle.peer_snapshot().inbound_peers, 0);
-        assert!(
-            !matches!(
-                tokio::time::timeout(Duration::from_millis(100), discovery_outbound_rx.recv())
-                    .await,
-                Ok(Some(_))
-            ),
-            "discovery rejected peer must not receive discovery source messages"
-        );
-
-        registry.remove_peer(&peer, 0, ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(header_sync.peer_snapshot().inbound_peers, 0);
+        assert!(!connection_cancel.is_cancelled());
 
         shutdown.cancel();
         reactor_task.await?;
@@ -6996,12 +6898,15 @@ mod tests {
         Ok(())
     }
 
+    /// Reopen exists because a header-sync stream can die while its connection is
+    /// healthy (the responder parks it at capacity or with no demand). It is not tied
+    /// to any particular header-sync version.
     /// Reopen policy follows the transport's opening roles.
     #[test]
     fn ordered_session_reopen_follows_transport_opening_policy() {
         let initiator_opened = Stream {
             kind: ZAKURA_STREAM_HEADER_SYNC,
-            version: 1,
+            version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
             frame_cap: 1,
             capability: ZAKURA_CAP_HEADER_SYNC,
             mode: StreamMode::Ordered,
@@ -7019,24 +6924,28 @@ mod tests {
             exit,
             initiator_policy,
             true,
-            false
-        ));
-        assert!(!should_reopen_ordered_session(
-            exit,
-            initiator_policy,
             false,
             false
         ));
         assert!(!should_reopen_ordered_session(
             exit,
             initiator_policy,
+            false,
             true,
+            false
+        ));
+        assert!(!should_reopen_ordered_session(
+            exit,
+            initiator_policy,
+            true,
+            false,
             true
         ));
         assert!(!should_reopen_ordered_session(
             exit,
             OrderedStreamPolicy::default(),
             true,
+            false,
             false,
         ));
 
@@ -7049,6 +6958,7 @@ mod tests {
             },
             initiator_policy,
             true,
+            false,
             false,
         ));
 
@@ -7067,14 +6977,18 @@ mod tests {
             either_peer,
             either_policy,
             true,
+            true,
             false
         ));
-        assert!(should_reopen_ordered_session(
+        assert!(!should_reopen_ordered_session(
             either_peer,
             either_policy,
             false,
+            false,
             false
         ));
+        assert!(opens_ordered_stream_locally(either_policy, false, true));
+        assert!(!opens_ordered_stream_locally(either_policy, true, false));
 
         let request_response = OrderedSessionExit {
             stream: Stream {
@@ -7088,13 +7002,60 @@ mod tests {
             request_response,
             either_policy,
             true,
+            true,
             false,
         ));
     }
 
     #[test]
+    fn either_side_session_has_one_proactive_opener_across_connection_roles() {
+        let policy = OrderedStreamPolicy {
+            opening: OrderedStreamOpening::EitherSide,
+            reopen: true,
+        };
+        let exit = OrderedSessionExit {
+            stream: Stream {
+                kind: ZAKURA_STREAM_BLOCK_SYNC,
+                version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                frame_cap: 1,
+                capability: ZAKURA_CAP_BLOCK_SYNC,
+                mode: StreamMode::Ordered,
+            },
+            session_id: 1,
+            opened_locally: false,
+        };
+
+        for winner_is_initiator in [false, true] {
+            let opens = [
+                opens_ordered_stream_locally(policy, winner_is_initiator, true),
+                opens_ordered_stream_locally(policy, !winner_is_initiator, false),
+            ];
+            assert_eq!(opens, [true, false]);
+            assert_eq!(opens.into_iter().filter(|opens| *opens).count(), 1);
+
+            let reopens = [
+                should_reopen_ordered_session(exit, policy, winner_is_initiator, true, false),
+                should_reopen_ordered_session(exit, policy, !winner_is_initiator, false, false),
+            ];
+            assert_eq!(reopens, [true, false]);
+            assert_eq!(reopens.into_iter().filter(|reopens| *reopens).count(), 1);
+        }
+
+        // Both endpoints continue accepting an offer for interoperability with
+        // peers that still proactively open either-side streams themselves.
+        assert!(may_open_ordered_stream(policy, true));
+        assert!(may_open_ordered_stream(policy, false));
+    }
+
+    #[test]
     fn stale_ordered_session_exit_keeps_newer_active_generation() {
-        let stream = test_ordered_stream();
+        let stream = Stream {
+            kind: ZAKURA_STREAM_HEADER_SYNC,
+            version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            frame_cap: 1,
+            capability: ZAKURA_CAP_HEADER_SYNC,
+            mode: StreamMode::Ordered,
+        };
         let mut session = OrderedSessionState::new(stream);
         session.remote_session_id = Some(2);
 
@@ -7102,26 +7063,6 @@ mod tests {
         assert_eq!(session.remote_session_id, Some(2));
         assert!(session.remove_active_session(false, 2));
         assert_eq!(session.remote_session_id, None);
-    }
-
-    #[test]
-    fn ordered_session_reopen_backoff_grows_and_caps() {
-        assert_eq!(
-            ordered_session_reopen_backoff(0),
-            ORDERED_STREAM_REOPEN_BACKOFF
-        );
-        assert_eq!(
-            ordered_session_reopen_backoff(1),
-            ORDERED_STREAM_REOPEN_BACKOFF * 2
-        );
-        assert_eq!(
-            ordered_session_reopen_backoff(5),
-            ORDERED_STREAM_REOPEN_BACKOFF_CAP
-        );
-        assert_eq!(
-            ordered_session_reopen_backoff(u32::MAX),
-            ORDERED_STREAM_REOPEN_BACKOFF_CAP
-        );
     }
 
     fn test_ordered_stream() -> Stream {
@@ -7310,87 +7251,24 @@ mod tests {
         );
     }
 
-    /// Regression for the mainnet dual-stack body-sync stall on
-    /// `temp-zakura-sync-test-7` (2026-07-14, run
-    /// `20260714T073939Z-cca353fd1287`): body sync froze at height 2,725,606 for
-    /// 10 minutes with 54,670 blocks of pending work and 6.4 GB of free download
-    /// budget, while header sync happily tracked the tip at 3,411,947. Block sync
-    /// had decayed to `peers: 0` -- permanently.
-    ///
-    /// The cause is entirely in the transport. Block sync evicts a peer that
-    /// missed its no-progress liveness deadline and parks it for
-    /// `no_progress_peer_cooldown` (180s). The transport knows nothing about that
-    /// park and redials the peer ~30s later, well inside the cooldown. At
-    /// connection setup the transport asks block sync once whether it wants the
-    /// peer; it is still parked, so the block-sync stream is withheld -- and that
-    /// decision was never revisited. The connection itself stays up and healthy
-    /// (header sync and discovery keep riding it, which is exactly why headers
-    /// kept reaching the tip), so no redial follows, so there is no new setup to
-    /// ask again; and when the park lapsed nothing re-offered the stream. Every
-    /// block-sync peer was eventually evicted this way, so block sync ended at
-    /// zero peers on a node holding live connections to those very peers.
-    ///
-    /// This drives the real `serve_connection` over a real local QUIC connection
-    /// with the real `BlockSyncService`, parking the peer exactly as the liveness
-    /// deadline does. The park must defer the stream, not lose it: once the
-    /// cooldown lapses on a still-live connection, block sync must get its stream
-    /// without waiting for a redial that is never coming.
-    #[tokio::test]
-    async fn parked_block_sync_peer_gets_a_stream_when_its_cooldown_lapses() -> Result<(), BoxError>
-    {
-        const COOLDOWN: Duration = Duration::from_secs(3);
-
-        let _guard = zakura_test::init();
-
-        let genesis =
-            Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
-        let anchor = (block::Height(0), genesis.hash());
-        let frontiers = HeaderSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: genesis.hash(),
-        };
-        let node = |seed| {
-            ZakuraTestNode::builder(seed)
-                .header_sync_driver(Config::default().network, anchor, frontiers, Some(anchor))
-                .spawn()
-        };
-        let dialer = node(140).await?;
-        let listener = node(141).await?;
-
-        let listener_peer =
-            ZakuraPeerId::new(listener.node_addr().await.node_id.as_bytes().to_vec())?;
-        let block_sync = dialer
-            .block_sync()
-            .expect("the header-sync driver spawns the block-sync reactor");
-
-        // The peer just missed its no-progress liveness deadline: block sync
-        // evicts and parks it. The transport's redial lands inside the cooldown.
-        block_sync.park_peer_for_test(&listener_peer, COOLDOWN);
-        dialer
-            .connect_native(&listener, Duration::from_secs(10))
-            .await?;
-
-        // The park is in force, so block sync is withheld from this connection.
+    #[test]
+    fn ordered_session_reopen_backoff_grows_and_caps() {
         assert_eq!(
-            block_sync.peer_snapshot().outbound_peers,
-            0,
-            "a parked peer must not be given a block-sync stream while its cooldown runs",
+            ordered_session_reopen_backoff(0),
+            ORDERED_STREAM_REOPEN_BACKOFF
         );
-
-        // The cooldown lapses while the connection stays up. Nothing will redial
-        // -- the connection is healthy -- so the only way block sync ever gets
-        // this peer back is for the transport to re-check its demand.
-        await_until(
-            "block sync opens a stream to the peer whose park expired",
-            Duration::from_secs(30),
-            || block_sync.peer_snapshot().outbound_peers == 1,
-        )
-        .await?;
-
-        dialer.shutdown().await;
-        listener.shutdown().await;
-        Ok(())
+        assert_eq!(
+            ordered_session_reopen_backoff(1),
+            ORDERED_STREAM_REOPEN_BACKOFF * 2
+        );
+        assert_eq!(
+            ordered_session_reopen_backoff(5),
+            ORDERED_STREAM_REOPEN_BACKOFF_CAP
+        );
+        assert_eq!(
+            ordered_session_reopen_backoff(u32::MAX),
+            ORDERED_STREAM_REOPEN_BACKOFF_CAP
+        );
     }
 
     #[tokio::test]
@@ -7478,7 +7356,7 @@ mod tests {
             mode: StreamMode::Ordered,
         };
         let mut workers = JoinSet::new();
-        let (ordered_stream_exit_tx, mut ordered_stream_exit_rx) = mpsc::unbounded_channel();
+        let (ordered_session_exit_tx, mut ordered_session_exit_rx) = mpsc::unbounded_channel();
         let admitted = spawn_persistent_stream_worker(
             &mut workers,
             server_send,
@@ -7488,13 +7366,13 @@ mod tests {
             context,
             1,
             true,
-            ordered_stream_exit_tx,
+            ordered_session_exit_tx,
         );
 
         admitted.cancel_token.cancel();
         // The exit must be reported, or the connection loop never prunes the dead
         // generation and never reopens the stream.
-        let exited = timeout(Duration::from_secs(1), ordered_stream_exit_rx.recv())
+        let exited = timeout(Duration::from_secs(1), ordered_session_exit_rx.recv())
             .await
             .expect("stream cancellation reports worker exit")
             .expect("exit channel stays open");
@@ -8178,14 +8056,14 @@ mod tests {
             close_cause: CloseCause::new(),
             freshness_tx,
         };
-        let (ordered_stream_exit_tx, _ordered_stream_exit_rx) = mpsc::unbounded_channel();
+        let (ordered_session_exit_tx, _ordered_session_exit_rx) = mpsc::unbounded_channel();
         let admitted = handler
             .admit_bi_stream(
                 server_send,
                 server_recv,
                 &mut admission,
                 16,
-                ordered_stream_exit_tx,
+                ordered_session_exit_tx,
             )
             .await;
 
@@ -8351,7 +8229,7 @@ mod tests {
                 },
                 Stream {
                     kind: HEADER_SYNC_STREAM_KIND,
-                    version: ZAKURA_STREAM_VERSION_7,
+                    version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
                     frame_cap: 1024,
                     capability: ZAKURA_CAP_HEADER_SYNC,
                     mode: StreamMode::Ordered,
@@ -8371,7 +8249,7 @@ mod tests {
             (LEGACY_GOSSIP_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (LEGACY_REQUEST_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (DISCOVERY_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
-            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_7),
+            (HEADER_SYNC_STREAM_KIND, ZAKURA_HEADER_SYNC_STREAM_VERSION),
             (ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_VERSION_1),
         ] {
             assert!(
@@ -8383,7 +8261,7 @@ mod tests {
                 "registered kind {kind} at version 0 must be rejected"
             );
             assert!(
-                !is_supported_stream(&registry, kind, version.saturating_add(1)),
+                !is_supported_stream(&registry, kind, u16::MAX),
                 "registered kind {kind} at an unsupported version must be rejected"
             );
         }
@@ -8395,6 +8273,14 @@ mod tests {
         assert!(
             !is_supported_stream(&registry, HEADER_SYNC_STREAM_KIND, 5),
             "header-sync v5 is rejected after the expanded Ironwood root-record wire break"
+        );
+        assert!(
+            !is_supported_stream(&registry, HEADER_SYNC_STREAM_KIND, 7),
+            "the predecessor header-sync stream version is rejected"
+        );
+        assert!(
+            registry.ordered_streams_for_negotiated(1 << 4).is_empty(),
+            "the retired predecessor capability opens no header-sync stream"
         );
 
         assert_eq!(stream_kind_label(2), "gossip");

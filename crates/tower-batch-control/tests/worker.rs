@@ -36,7 +36,7 @@ async fn wakes_pending_waiters_on_close() {
     // kill the worker task
     drop(worker);
 
-    let err = assert_ready_err!(response.poll());
+    let err = assert_ready_err!(response.poll(), "worker close should fail the response");
     assert!(
         err.is::<error::Closed>(),
         "response should fail with a Closed, got: {err:?}",
@@ -46,7 +46,7 @@ async fn wakes_pending_waiters_on_close() {
         ready1.is_woken(),
         "dropping worker should wake ready task 1",
     );
-    let err = assert_ready_err!(ready1.poll());
+    let err = assert_ready_err!(ready1.poll(), "worker close should fail ready task 1");
     assert!(
         err.is::<error::ServiceError>(),
         "ready 1 should fail with a ServiceError {{ Closed }}, got: {err:?}",
@@ -56,7 +56,7 @@ async fn wakes_pending_waiters_on_close() {
         ready2.is_woken(),
         "dropping worker should wake ready task 2",
     );
-    let err = assert_ready_err!(ready1.poll());
+    let err = assert_ready_err!(ready2.poll(), "worker close should fail ready task 2");
     assert!(
         err.is::<error::ServiceError>(),
         "ready 2 should fail with a ServiceError {{ Closed }}, got: {err:?}",
@@ -93,7 +93,7 @@ async fn wakes_pending_waiters_on_failure() {
     // worker task terminates
     assert_ready!(worker.poll());
 
-    let err = assert_ready_err!(response.poll());
+    let err = assert_ready_err!(response.poll(), "worker failure should fail the response");
     assert!(
         err.is::<error::ServiceError>(),
         "response should fail with a ServiceError, got: {err:?}"
@@ -103,7 +103,7 @@ async fn wakes_pending_waiters_on_failure() {
         ready1.is_woken(),
         "dropping worker should wake ready task 1"
     );
-    let err = assert_ready_err!(ready1.poll());
+    let err = assert_ready_err!(ready1.poll(), "worker failure should fail ready task 1");
     assert!(
         err.is::<error::ServiceError>(),
         "ready 1 should fail with a ServiceError, got: {err:?}"
@@ -113,7 +113,7 @@ async fn wakes_pending_waiters_on_failure() {
         ready2.is_woken(),
         "dropping worker should wake ready task 2"
     );
-    let err = assert_ready_err!(ready1.poll());
+    let err = assert_ready_err!(ready2.poll(), "worker failure should fail ready task 2");
     assert!(
         err.is::<error::ServiceError>(),
         "ready 2 should fail with a ServiceError, got: {err:?}"

@@ -106,6 +106,20 @@ impl ZakuraPeerId {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    /// Returns a stable fixed-width identity for scheduler and state ownership.
+    pub fn digest(&self) -> [u8; 32] {
+        if let Ok(digest) = <[u8; 32]>::try_from(self.0.as_slice()) {
+            return digest;
+        }
+        let hash = Blake2bParams::new()
+            .hash_length(32)
+            .personal(b"ZakuraPeerId-v1")
+            .hash(&self.0);
+        hash.as_bytes()
+            .try_into()
+            .expect("the peer identity digest has the configured 32-byte length")
+    }
 }
 
 /// A small stable network id for fast Zakura rejects.
@@ -1833,6 +1847,16 @@ mod tests {
             local_zebra_nonce: Nonce(10),
             remote_zebra_nonce: Nonce(20),
         }
+    }
+
+    #[test]
+    fn peer_id_digest_preserves_native_ids_and_canonicalizes_bounded_legacy_ids() {
+        let native = ZakuraPeerId::new(vec![7; 32]).expect("the native node ID is valid");
+        assert_eq!(native.digest(), [7; 32]);
+
+        let legacy = ZakuraPeerId::new(vec![1, 2, 3]).expect("the bounded legacy ID is valid");
+        assert_eq!(legacy.digest(), legacy.digest());
+        assert_ne!(legacy.digest(), native.digest());
     }
 
     fn init() -> P2pV2UpgradeInit {

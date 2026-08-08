@@ -9,10 +9,11 @@ use tokio::sync::Mutex;
 use super::{LocalEndpointFactory, ZakuraTestNode};
 use crate::{
     zakura::{
-        legacy_gossip::ZAKURA_STREAM_GOSSIP, run_native_initiator_handshake, Frame, StreamPrelude,
-        ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES,
-        LEGACY_GOSSIP_VERSION, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC, ZAKURA_BLOCK_SYNC_STREAM_VERSION,
-        ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_DISCOVERY_STREAM_VERSION,
+        legacy_gossip::ZAKURA_STREAM_GOSSIP, run_native_initiator_handshake, Frame,
+        HeaderSyncCodec, HeaderSyncMessage, StreamPrelude, ZakuraHandshakeConfig,
+        ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES, LEGACY_GOSSIP_VERSION, P2P_V2_ALPN,
+        STREAM_PRELUDE_MAGIC, ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_HEADER_SYNC,
+        ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_DISCOVERY_STREAM_VERSION,
         ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY,
         ZAKURA_STREAM_HEADER_SYNC,
     },
@@ -72,6 +73,38 @@ impl HostilePeer {
         Ok(ZakuraPeerId::new(
             self.endpoint.node_id().as_bytes().to_vec(),
         )?)
+    }
+
+    /// Encode and send one canonical protocol-v8 header-sync message.
+    pub async fn send_header_sync_message(
+        &self,
+        codec: &HeaderSyncCodec,
+        message: &HeaderSyncMessage,
+    ) -> Result<(), BoxError> {
+        let frame = codec.encode_frame(message)?;
+        self.send_raw_frame(ZAKURA_STREAM_HEADER_SYNC, frame).await
+    }
+
+    /// Receive and decode one canonical protocol-v8 header-sync message.
+    pub async fn recv_header_sync_message(
+        &self,
+        codec: &HeaderSyncCodec,
+    ) -> Result<HeaderSyncMessage, BoxError> {
+        let frame = self.recv_ordered_frame(ZAKURA_STREAM_HEADER_SYNC).await?;
+        Ok(codec.decode_frame(frame, None)?)
+    }
+
+    /// Wait until the victim closes this QUIC connection.
+    pub async fn wait_for_connection_close(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), BoxError> {
+        tokio::time::timeout(timeout, self.connection.closed())
+            .await
+            .map_err(|_| -> BoxError {
+                "timed out waiting for hostile connection closure".into()
+            })?;
+        Ok(())
     }
 
     /// Open one stream and send a valid prelude and frame.
@@ -459,7 +492,12 @@ impl HostilePeer {
 
     /// Selected header-sync stream version for an explicit capability mask.
     pub fn selected_header_sync_version(capabilities: u64) -> Option<u16> {
-        (capabilities & ZAKURA_CAP_HEADER_SYNC != 0).then_some(ZAKURA_HEADER_SYNC_STREAM_VERSION)
+        if capabilities & ZAKURA_CAP_HEADER_SYNC != 0 {
+            Some(ZAKURA_HEADER_SYNC_STREAM_VERSION)
+        } else {
+            (capabilities & ZAKURA_CAP_HEADER_SYNC != 0)
+                .then_some(ZAKURA_HEADER_SYNC_STREAM_VERSION)
+        }
     }
 
     async fn read_prelude(recv: &mut RecvStream) -> Result<StreamPrelude, BoxError> {

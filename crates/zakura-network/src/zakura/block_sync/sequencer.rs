@@ -28,6 +28,8 @@ use super::{events::BlockApplyToken, reorder::*, state::*, *};
 /// of thousands of decoded bodies resident at once).
 #[derive(Clone, Debug)]
 pub(super) struct ApplyingBlock {
+    pub(super) owner: zakura_header_chain::BodyWorkOwner,
+    pub(super) source: zakura_header_chain::SourceId,
     pub(super) token: BlockApplyToken,
     pub(super) hash: block::Hash,
     /// `previous_block_hash` captured at receipt, so reset-conflict checks never
@@ -58,6 +60,8 @@ pub(super) enum AcceptOutcome {
 /// dispatches the matching `SubmitBlock` action.
 #[derive(Clone, Debug)]
 pub(super) struct SubmitItem {
+    pub(super) owner: zakura_header_chain::BodyWorkOwner,
+    pub(super) source: zakura_header_chain::SourceId,
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
     pub(super) token: BlockApplyToken,
@@ -70,6 +74,8 @@ pub(super) struct SubmitItem {
 /// from `applying`, so this record lives until the exact completion arrives.
 #[derive(Copy, Clone, Debug)]
 struct InFlightSubmission {
+    owner: zakura_header_chain::BodyWorkOwner,
+    source: zakura_header_chain::SourceId,
     height: block::Height,
     hash: block::Hash,
     /// Serialized block size received from the wire.
@@ -99,7 +105,7 @@ pub(super) struct Sequencer {
     applying: BTreeMap<block::Height, ApplyingBlock>,
     submitted_applies: BTreeMap<block::Height, Vec<(block::Hash, usize)>>,
     in_flight_submissions: BTreeMap<BlockApplyToken, InFlightSubmission>,
-    next_apply_token: BlockApplyToken,
+    next_apply_token: Option<BlockApplyToken>,
 
     /// Running totals maintained incrementally so `publish_view` stays O(1).
     ///
@@ -127,7 +133,7 @@ impl Sequencer {
             applying: BTreeMap::new(),
             submitted_applies: BTreeMap::new(),
             in_flight_submissions: BTreeMap::new(),
-            next_apply_token: 1,
+            next_apply_token: Some(1),
             applying_buffered_bytes: 0,
             applying_decoded_attributed_memory_bytes: 0,
             detached_submission_decoded_attributed_memory_bytes: 0,
@@ -333,6 +339,8 @@ impl Sequencer {
     ) -> AcceptOutcome {
         let previous_block_hash = block.header.previous_block_hash;
         self.accept_buffered_body(
+            super::test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
             height,
             hash,
             previous_block_hash,
@@ -342,8 +350,11 @@ impl Sequencer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn accept_buffered_body(
         &mut self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
         height: block::Height,
         hash: block::Hash,
         previous_block_hash: block::Hash,
@@ -371,10 +382,16 @@ impl Sequencer {
             body.retain_for_backlog()
         };
 
-        match self
-            .reorder
-            .insert_body(height, hash, previous_block_hash, body, bytes, source_peer)
-        {
+        match self.reorder.insert_body(
+            owner,
+            source,
+            height,
+            hash,
+            previous_block_hash,
+            body,
+            bytes,
+            source_peer,
+        ) {
             ReorderInsertResult::Inserted => AcceptOutcome::Buffered { covered: height },
             ReorderInsertResult::Duplicate => AcceptOutcome::Redundant {
                 release_bytes: bytes,
@@ -415,6 +432,8 @@ impl Sequencer {
             self.applying.insert(
                 drained.height,
                 ApplyingBlock {
+                    owner: drained.owner,
+                    source: drained.source,
                     token: 0,
                     hash: drained.hash,
                     previous_block_hash: drained.previous_block_hash,
@@ -467,8 +486,10 @@ impl Sequencer {
         {
             return None;
         }
-        let token = self.next_apply_token();
+        let token = self.next_apply_token()?;
         let (
+            owner,
+            source,
             hash,
             bytes,
             block,
@@ -482,6 +503,8 @@ impl Sequencer {
             applying.token = token;
             applying.submitted = true;
             (
+                applying.owner,
+                applying.source,
                 applying.hash,
                 applying.bytes,
                 block,
@@ -496,6 +519,8 @@ impl Sequencer {
         self.in_flight_submissions.insert(
             token,
             InFlightSubmission {
+                owner,
+                source,
                 height,
                 hash,
                 bytes,
@@ -506,6 +531,8 @@ impl Sequencer {
         self.in_flight_submission_count = self.in_flight_submission_count.saturating_add(1);
         self.in_flight_submission_bytes = self.in_flight_submission_bytes.saturating_add(bytes);
         Some(SubmitItem {
+            owner,
+            source,
             height,
             hash,
             token,
@@ -548,10 +575,10 @@ impl Sequencer {
         }
     }
 
-    fn next_apply_token(&mut self) -> BlockApplyToken {
-        let token = self.next_apply_token;
-        self.next_apply_token = self.next_apply_token.checked_add(1).unwrap_or(1);
-        token
+    fn next_apply_token(&mut self) -> Option<BlockApplyToken> {
+        let token = self.next_apply_token?;
+        self.next_apply_token = token.checked_add(1);
+        Some(token)
     }
 
     pub(super) fn record_submitted_apply(&mut self, height: block::Height, hash: block::Hash) {
@@ -589,6 +616,8 @@ impl Sequencer {
     /// exactly matches the token identity assigned at dispatch.
     pub(super) fn finish_submission(
         &mut self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
         token: BlockApplyToken,
         height: block::Height,
         hash: block::Hash,
@@ -596,7 +625,11 @@ impl Sequencer {
         let Some(submission) = self.in_flight_submissions.get(&token) else {
             return false;
         };
-        if submission.height != height || submission.hash != hash {
+        if submission.owner != owner
+            || submission.source != source
+            || submission.height != height
+            || submission.hash != hash
+        {
             return false;
         }
         let bytes = submission.bytes;
@@ -622,6 +655,8 @@ impl Sequencer {
     /// Keep the applying entry marked submitted so it is not dispatched again.
     pub(super) fn finish_attached_submission(
         &mut self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
         token: BlockApplyToken,
         height: block::Height,
         hash: block::Hash,
@@ -645,7 +680,7 @@ impl Sequencer {
         self.applying_decoded_attributed_memory_bytes = self
             .applying_decoded_attributed_memory_bytes
             .saturating_sub(decoded_before.saturating_sub(decoded_after));
-        self.finish_submission(token, height, hash)
+        self.finish_submission(owner, source, token, height, hash)
     }
 
     fn release_in_flight_submission(
@@ -700,15 +735,24 @@ impl Sequencer {
 
     // ---- apply finished ----
 
-    /// The `(token, hash)` of the body currently applying at `height`, for
-    /// validating an apply-finished completion against the in-flight submission.
-    pub(super) fn applying_token_hash(
+    /// Exact owner, source, token, and hash currently applying at `height`.
+    pub(super) fn applying_identity(
         &self,
         height: block::Height,
-    ) -> Option<(BlockApplyToken, block::Hash)> {
-        self.applying
-            .get(&height)
-            .map(|applying| (applying.token, applying.hash))
+    ) -> Option<(
+        zakura_header_chain::BodyWorkOwner,
+        zakura_header_chain::SourceId,
+        BlockApplyToken,
+        block::Hash,
+    )> {
+        self.applying.get(&height).map(|applying| {
+            (
+                applying.owner,
+                applying.source,
+                applying.token,
+                applying.hash,
+            )
+        })
     }
 
     pub(super) fn remove_applying(&mut self, height: block::Height) -> Option<ApplyingBlock> {

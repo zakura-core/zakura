@@ -113,7 +113,6 @@ slow-timeout = { period = "15m", terminate-after = 1 }
 failure-output = "immediate"
 default-filter = 'package(zakura-network) and test(~zakura::testkit::blocksync_fuzz)'
 
-
 [profile.sync-checkpoints-local]
 test-threads = 1
 slow-timeout = { period = "15m", terminate-after = 1 }

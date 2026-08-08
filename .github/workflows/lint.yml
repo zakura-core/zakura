@@ -9,8 +9,10 @@ on:
       - "**/Cargo.lock"
       - .cargo/config.toml
       - .github/workflows/lint.yml
+      - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
+      - crates/zakura-header-chain/conformance.toml
       - ".github/workflows/scripts/**"
       - ".github/actions/**"
       # ci-python-tests covers these suites, so changes to them must trigger it.
@@ -25,8 +27,10 @@ on:
       - "**/Cargo.lock"
       - .cargo/config.toml
       - .github/workflows/lint.yml
+      - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
+      - crates/zakura-header-chain/conformance.toml
       - ".github/workflows/scripts/**"
       - ".github/actions/**"
       # ci-python-tests covers these suites, so changes to them must trigger it.
@@ -206,6 +210,24 @@ jobs:
       - name: Ensure no arbitrary or proptest dependency on default build
         if: ${{ !cancelled() }}
         run: cargo +stable tree --package zakura -e=features,no-dev | grep -Eq "arbitrary|proptest" && exit 1 || exit 0
+
+  header-conformance:
+    name: header conformance
+    permissions:
+      contents: read
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
+          toolchain: stable
+          cache: false
+      - name: Validate header-chain conformance manifest
+        run: cargo xtask header-conformance
 
   unused-deps:
     name: unused-deps

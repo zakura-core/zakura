@@ -25,6 +25,17 @@ on:
         type: boolean
         required: false
         default: false
+      p2p_stack:
+        description: "P2P stack override; auto preserves each node's fleet role"
+        type: choice
+        required: false
+        options: [auto, dual, zakura, legacy]
+        default: auto
+      header_sync_trace:
+        description: "Write structured header/block-sync traces to the data volume"
+        type: boolean
+        required: false
+        default: false
       node:
         description: "Optional single deployer node name; blank deploys the whole fleet"
         required: false
@@ -111,6 +122,28 @@ jobs:
         run: |
           set -euo pipefail
 
+          requested_p2p_stack="${{ inputs.p2p_stack }}"
+          default_p2p_stack="dual"
+
+          if [ "$requested_p2p_stack" != "auto" ]; then
+            if [ -z "${{ inputs.node }}" ]; then
+              echo "p2p_stack overrides require one explicit node" >&2
+              exit 1
+            fi
+            default_p2p_stack="$requested_p2p_stack"
+          fi
+
+          if [ "${{ inputs.header_sync_trace }}" = "true" ] \
+            && [ -z "${{ inputs.node }}" ]; then
+            echo "header_sync_trace requires one explicit node" >&2
+            exit 1
+          fi
+
+          zakura_trace_line=""
+          if [ "${{ inputs.header_sync_trace }}" = "true" ]; then
+            zakura_trace_line='trace_dir = "/mnt/data/traces/header-chain-canary"'
+          fi
+
           cat > nodes.ci.toml <<EOF
           [defaults]
           service_name    = "zakurad"
@@ -121,7 +154,7 @@ jobs:
           rpc_listen_addr = "0.0.0.0:18232"
           rpc_enable_cookie_auth = false
           storage_mode    = "archive"
-          p2p_stack       = "dual"
+          p2p_stack       = "${default_p2p_stack}"
           metrics_endpoint = "127.0.0.1:9999"
           tracing_filter  = "info,zakura_network::zakura=info"
           checkpoint_sync = false
@@ -129,6 +162,7 @@ jobs:
 
           [defaults.zakura]
           listen_addr = "0.0.0.0:8234"
+          ${zakura_trace_line}
           bootstrap_peers = [
               "57ad39fad4f0bca46cf1ea831772a99d5027b372fef2be5a0ea68e1b5bb4da49@167.99.103.111:8234",
               "2bbb907b5d90598ef49f2e637066586b311a64587479be6ed43e8388587fcd2a@164.92.209.78:8234",

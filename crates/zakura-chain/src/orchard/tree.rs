@@ -391,6 +391,28 @@ pub struct NoteCommitmentTree {
 }
 
 impl NoteCommitmentTree {
+    /// Builds a tree whose state is exactly the given frontier.
+    ///
+    /// A frontier is the rightmost path of an append-only Merkle tree, and is
+    /// all the state this tree keeps: this constructor cannot produce a tree
+    /// that the append path could not have produced, because a malformed
+    /// frontier cannot exist
+    /// ([`Frontier::from_parts`](incrementalmerkletree::frontier::Frontier::from_parts)
+    /// validates before a value can be constructed) and capacity is enforced
+    /// by the `MERKLE_DEPTH` const generic. Verifying that the frontier
+    /// belongs to the chain remains the caller's responsibility, as it is for
+    /// every other way of obtaining one.
+    ///
+    /// The root cache starts empty and is recomputed on first use.
+    pub fn from_frontier(
+        frontier: incrementalmerkletree::frontier::Frontier<Node, MERKLE_DEPTH>,
+    ) -> Self {
+        Self {
+            inner: frontier,
+            cached_root: Default::default(),
+        }
+    }
+
     /// Adds a note commitment x-coordinate to the tree.
     ///
     /// The leaves of the tree are actually a base field element, the
@@ -788,6 +810,41 @@ mod tests {
 
         Option::<pallas::Base>::from(pallas::Base::from_repr(bytes))
             .expect("small little-endian integers are canonical field elements")
+    }
+
+    /// A tree rebuilt from its own frontier answers exactly like the
+    /// original, and keeps appending identically.
+    #[test]
+    fn from_frontier_round_trips_root_position_and_appends() {
+        let mut original = NoteCommitmentTree::default();
+        for value in 0..37 {
+            original
+                .append(note_commitment(value))
+                .expect("small test tree is not full");
+        }
+
+        let live = original.frontier().expect("37 appends leave a leaf");
+        let frontier = incrementalmerkletree::frontier::Frontier::from_parts(
+            live.position(),
+            *live.leaf(),
+            live.ommers().to_vec(),
+        )
+        .expect("the parts of a live frontier are valid");
+
+        let mut rebuilt = NoteCommitmentTree::from_frontier(frontier);
+
+        assert_eq!(rebuilt.root(), original.root());
+        assert_eq!(rebuilt.count(), original.count());
+        assert_eq!(rebuilt.position(), original.position());
+
+        original
+            .append(note_commitment(37))
+            .expect("small test tree is not full");
+        rebuilt
+            .append(note_commitment(37))
+            .expect("small test tree is not full");
+
+        assert_eq!(rebuilt.root(), original.root());
     }
 
     /// Verbatim copy of the pre-cache `merkle_crh_orchard`: it rebuilds the

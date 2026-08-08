@@ -555,3 +555,113 @@ async fn memoized_verifier_still_rejects_a_corrupted_proof_after_verifying_a_val
         "expected SaplingVerificationFailed, got: {error:?}"
     );
 }
+
+/// An inner service whose readiness always fails, standing in for a dead batch worker.
+#[derive(Clone)]
+struct UnreadyVerifier {
+    poll_readies: Arc<AtomicUsize>,
+}
+
+impl UnreadyVerifier {
+    fn new() -> Self {
+        Self {
+            poll_readies: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn poll_readies(&self) -> usize {
+        self.poll_readies.load(Ordering::SeqCst)
+    }
+}
+
+impl Service<Item> for UnreadyVerifier {
+    type Response = ();
+    type Error = BoxError;
+    type Future = future::Ready<Result<(), BoxError>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.poll_readies.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(Err(BoxError::from("batch worker finished unexpectedly")))
+    }
+
+    fn call(&mut self, _item: Item) -> Self::Future {
+        unreachable!("a service whose poll_ready failed must not be called")
+    }
+}
+
+/// A Sapling memo hit is answered even when the inner service can no longer become ready.
+///
+/// The Sapling verifier shares [`Memoized`] with Halo2, so this is the same property
+/// `memo_hit_survives_an_inner_service_that_never_becomes_ready` pins there. It is worth pinning
+/// per pool as well: the shared `poll_ready` must not start delegating again for either of them,
+/// and a `Batch` whose worker has exited would otherwise turn a remembered `Ok` into a
+/// verification failure.
+#[tokio::test]
+async fn memo_hit_survives_an_inner_service_that_never_becomes_ready() {
+    let tx = sapling_transaction();
+
+    let healthy = CountingVerifier::new(true);
+    let mut verifier = Memoized::new(healthy.clone(), 8, "groth16_sapling_test");
+    verifier
+        .ready()
+        .await
+        .expect("the memo must become ready")
+        .call(item(&tx, NetworkUpgrade::Nu5).expect("the transaction has a bundle"))
+        .await
+        .expect("the first verification must succeed");
+    assert_eq!(healthy.calls(), 1, "the first verification must be a miss");
+
+    let dead = UnreadyVerifier::new();
+    let mut verifier = verifier.with_inner(dead.clone());
+
+    verifier
+        .ready()
+        .await
+        .expect("the memo must be ready even when the inner service is not")
+        .call(item(&tx, NetworkUpgrade::Nu5).expect("the transaction has a bundle"))
+        .await
+        .expect("a memo hit must be answered from the memo, not from the dead inner service");
+
+    assert_eq!(
+        dead.poll_readies(),
+        0,
+        "a hit must not poll the inner service for readiness at all"
+    );
+}
+
+/// A Sapling memo miss still propagates an inner readiness failure, and does not record it as a
+/// success.
+#[tokio::test]
+async fn memo_miss_propagates_an_inner_readiness_failure() {
+    let tx = sapling_transaction();
+    let dead = UnreadyVerifier::new();
+    let mut verifier = Memoized::new(dead.clone(), 8, "groth16_sapling_test");
+
+    verifier
+        .ready()
+        .await
+        .expect("the memo itself is always ready")
+        .call(item(&tx, NetworkUpgrade::Nu5).expect("the transaction has a bundle"))
+        .await
+        .expect_err("a miss must surface the inner service's readiness failure");
+
+    assert!(
+        dead.poll_readies() > 0,
+        "a miss must acquire inner readiness"
+    );
+
+    let counting = CountingVerifier::new(true);
+    let mut verifier = verifier.with_inner(counting.clone());
+    verifier
+        .ready()
+        .await
+        .expect("the memo must become ready")
+        .call(item(&tx, NetworkUpgrade::Nu5).expect("the transaction has a bundle"))
+        .await
+        .expect("the retry must succeed");
+    assert_eq!(
+        counting.calls(),
+        1,
+        "the bundle must still be verified, so the readiness failure was not recorded as an Ok"
+    );
+}

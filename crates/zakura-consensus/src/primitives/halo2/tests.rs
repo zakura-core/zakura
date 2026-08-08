@@ -743,7 +743,7 @@ async fn memo_hit_survives_an_inner_service_that_never_becomes_ready() {
 
     // Warm the memo through a healthy inner service.
     let healthy = CountingVerifier::new(true);
-    let mut verifier = Memoized::new(healthy.clone(), 8);
+    let mut verifier = Memoized::new(healthy.clone(), 8, "halo2_test");
     verify_through(&mut verifier, item.clone()).await;
     assert_eq!(healthy.calls(), 1, "the first verification must be a miss");
 
@@ -775,7 +775,7 @@ async fn memo_hit_survives_an_inner_service_that_never_becomes_ready() {
 async fn memo_miss_propagates_an_inner_readiness_failure() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let dead = UnreadyVerifier::new();
-    let mut verifier = Memoized::new(dead.clone(), 8);
+    let mut verifier = Memoized::new(dead.clone(), 8, "halo2_test");
 
     verifier
         .ready()

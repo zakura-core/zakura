@@ -206,7 +206,9 @@ impl<S> Memoized<S> {
 
 impl<S, I> Service<I> for Memoized<S>
 where
-    I: MemoizedItem,
+    // `Send + 'static` because a miss moves the item into the boxed future that awaits inner
+    // readiness — see `poll_ready`.
+    I: MemoizedItem + Send + 'static,
     S: Service<I, Response = (), Error = BoxError> + Clone + Send + 'static,
     S::Future: Send + 'static,
 {

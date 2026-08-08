@@ -117,6 +117,16 @@ impl ServiceRegistry {
             .map(|index| Arc::clone(&self.services[*index]))
     }
 
+    /// Lookup the declared stream for `kind`.
+    pub fn stream_for_kind(&self, kind: u16) -> Option<Stream> {
+        let service = self.service_for_kind(kind)?;
+        service
+            .streams()
+            .iter()
+            .find(|stream| stream.kind == kind)
+            .copied()
+    }
+
     /// Lookup the single capability bit for `kind` and `version`.
     pub fn capability_for_stream(&self, kind: u16, version: u16) -> Option<u64> {
         self.stream(kind, version).map(|stream| stream.capability)
@@ -124,12 +134,8 @@ impl ServiceRegistry {
 
     /// Lookup a declared stream by kind and version.
     pub fn stream(&self, kind: u16, version: u16) -> Option<Stream> {
-        let service = self.service_for_kind(kind)?;
-        service
-            .streams()
-            .iter()
-            .find(|stream| stream.kind == kind && stream.version == version)
-            .copied()
+        self.stream_for_kind(kind)
+            .filter(|stream| stream.version == version)
     }
 
     /// Returns true when a registered service owns `kind` at `version`.

@@ -60,8 +60,7 @@ use crate::{
         ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
         ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason, ZakuraSyncExchange,
         ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
-        FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
-        MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
+        FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
         TRANSCRIPT_HASH_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1,
         ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
@@ -1399,6 +1398,8 @@ struct StreamWorkerContext {
     stream_id: u64,
     _permit: OwnedSemaphorePermit,
     limits: ZakuraConnectionLimits,
+    inbound_frame_cap: u32,
+    outbound_frame_cap: u32,
     message_bucket: SharedMessageBucket,
     connection_token: CancellationToken,
     stream_token: CancellationToken,
@@ -2580,6 +2581,13 @@ impl ZakuraProtocolHandler {
                             payload,
                             mut completion,
                         } => {
+                            let Some(stream) = self.registry.stream_for_kind(stream_kind) else {
+                                let _ = completion.send(Err(format!(
+                                    "Zakura outbound request stream kind {stream_kind} is not registered"
+                                )
+                                .into()));
+                                continue;
+                            };
                             let result = tokio::select! {
                                 biased;
                                 _ = completion.closed() => {
@@ -2590,7 +2598,7 @@ impl ZakuraProtocolHandler {
                                 result = write_outbound_request_frame(
                                     &connection,
                                     limits,
-                                    stream_kind,
+                                    stream,
                                     request_id,
                                     message_type,
                                     flags,
@@ -2672,7 +2680,7 @@ impl ZakuraProtocolHandler {
             stream_kind: stream.kind,
             stream_version: stream.version,
             request_id: None,
-            max_frame_bytes: app_frame_cap_for_stream_kind(&limits, stream.kind),
+            max_frame_bytes: inbound_frame_cap_for_stream(&limits, stream),
         };
         let prelude_bytes = prelude.encode()?;
         timeout(
@@ -2695,6 +2703,8 @@ impl ZakuraProtocolHandler {
             stream_id,
             _permit: permit,
             limits,
+            inbound_frame_cap: prelude.max_frame_bytes,
+            outbound_frame_cap: application_frame_cap(&limits, stream),
             message_bucket,
             connection_token,
             stream_token,
@@ -2863,6 +2873,12 @@ impl ZakuraProtocolHandler {
             stream_id,
             _permit: permit,
             limits: admission.limits,
+            inbound_frame_cap: inbound_frame_cap_for_stream(&admission.limits, stream),
+            outbound_frame_cap: peer_accepted_frame_cap(
+                &admission.limits,
+                stream,
+                prelude.max_frame_bytes,
+            ),
             message_bucket,
             connection_token: admission.connection_token.clone(),
             stream_token,
@@ -3593,7 +3609,7 @@ async fn persistent_stream_worker(
                 _ = reader_context.stream_token.cancelled() => break,
                 frame = read_frame(
                     &mut recv,
-                    inbound_frame_cap_for_stream_kind(&reader_context.limits, stream_kind),
+                    reader_context.inbound_frame_cap,
                     reader_context.limits.idle_timeout,
                     // A persistent ordered stream is legitimately quiet between
                     // frames; do not let an inter-frame gap time out and cancel
@@ -3672,7 +3688,12 @@ async fn persistent_stream_worker(
             } => {
                 match outbound {
                     Some(frame) => {
-                        if let Err(error) = write_ordered_frame(&mut send, frame, context.limits, stream_kind).await {
+                        if let Err(error) = write_ordered_frame(
+                            &mut send,
+                            frame,
+                            context.limits,
+                            context.outbound_frame_cap,
+                        ).await {
                             if ordered_stream_write_was_stopped(&error) {
                                 debug!(?error, "closing Zakura ordered stream after peer stopped receiving");
                                 break;
@@ -3767,7 +3788,7 @@ async fn request_stream_worker(
         _ = context.connection_token.cancelled() => return,
         frame = read_frame(
             &mut recv,
-            inbound_frame_cap_for_stream_kind(&context.limits, prelude.stream_kind),
+            context.inbound_frame_cap,
             context.limits.idle_timeout,
             // A request stream carries its request frame immediately after the
             // prelude, so a peer that opens one and then goes silent is treated
@@ -3807,12 +3828,13 @@ async fn request_stream_worker(
         }
     }
 
+    let response_frame_cap = context.outbound_frame_cap;
     let response_frames = match registry
         .request(
             context.peer_id.clone(),
             prelude.stream_kind,
             request_id,
-            app_frame_cap_for_stream_kind(&context.limits, prelude.stream_kind),
+            response_frame_cap,
             context.limits.max_message_bytes,
             frame,
         )
@@ -3840,7 +3862,9 @@ async fn request_stream_worker(
     };
 
     for frame in response_frames {
-        if let Err(error) = write_response_frame(&mut send, frame, context.limits).await {
+        if let Err(error) =
+            write_response_frame(&mut send, frame, context.limits, response_frame_cap).await
+        {
             debug!(?error, "failed to write Zakura request response frame");
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
             return;
@@ -4040,7 +4064,7 @@ async fn write_ordered_frame(
     send: &mut SendStream,
     frame: Frame,
     limits: ZakuraConnectionLimits,
-    stream_kind: u16,
+    max_frame_bytes: u32,
 ) -> Result<(), BoxError> {
     // Mirror `write_response_frame`: a persistent ordered-stream frame whose
     // payload exceeds the peer's negotiated `max_message_bytes` would be
@@ -4056,7 +4080,7 @@ async fn write_ordered_frame(
         )
         .into());
     }
-    let frame = frame.encode(app_frame_cap_for_stream_kind(&limits, stream_kind))?;
+    let frame = frame.encode(max_frame_bytes)?;
     timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, send.write_all(&frame))
         .await
         .map_err(|_| -> BoxError { "Zakura outbound frame write timed out".into() })??;
@@ -4066,7 +4090,7 @@ async fn write_ordered_frame(
 async fn write_outbound_request_frame(
     connection: &Connection,
     limits: ZakuraConnectionLimits,
-    stream_kind: u16,
+    stream: Stream,
     request_id: u64,
     message_type: u16,
     flags: u16,
@@ -4077,7 +4101,7 @@ async fn write_outbound_request_frame(
         write_outbound_request_frame_inner(
             connection,
             limits,
-            stream_kind,
+            stream,
             request_id,
             message_type,
             flags,
@@ -4091,7 +4115,7 @@ async fn write_outbound_request_frame(
 async fn write_outbound_request_frame_inner(
     connection: &Connection,
     limits: ZakuraConnectionLimits,
-    stream_kind: u16,
+    stream: Stream,
     request_id: u64,
     message_type: u16,
     flags: u16,
@@ -4108,12 +4132,14 @@ async fn write_outbound_request_frame_inner(
         .map_err(|_| -> BoxError { "Zakura outbound request stream open timed out".into() })
         .map_err(OutboundRequestError::Local)?
         .map_err(|error| OutboundRequestError::Local(Box::new(error)))?;
+    let outbound_frame_cap = application_frame_cap(&limits, stream);
+    let inbound_frame_cap = inbound_frame_cap_for_stream(&limits, stream);
     let prelude = StreamPrelude {
         magic: STREAM_PRELUDE_MAGIC,
-        stream_kind,
-        stream_version: ZAKURA_STREAM_VERSION_1,
+        stream_kind: stream.kind,
+        stream_version: stream.version,
         request_id: Some(request_id),
-        max_frame_bytes: app_frame_cap_for_stream_kind(&limits, stream_kind),
+        max_frame_bytes: inbound_frame_cap,
     };
     let frame = Frame {
         message_type,
@@ -4124,7 +4150,7 @@ async fn write_outbound_request_frame_inner(
         OutboundRequestError::Local(BoxError::from(format!("failed to encode prelude: {error}")))
     })?;
     let frame = frame
-        .encode(app_frame_cap_for_stream_kind(&limits, stream_kind))
+        .encode(outbound_frame_cap)
         .map_err(|error| OutboundRequestError::Local(Box::new(error)))?;
     timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, send.write_all(&prelude))
         .await
@@ -4142,7 +4168,7 @@ async fn write_outbound_request_frame_inner(
     loop {
         match read_frame(
             &mut recv,
-            inbound_frame_cap_for_stream_kind(&limits, stream_kind),
+            inbound_frame_cap,
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
             // the responder streams its frames promptly, so a silent gap before
@@ -4702,11 +4728,12 @@ async fn write_response_frame(
     send: &mut SendStream,
     frame: Frame,
     limits: ZakuraConnectionLimits,
+    max_frame_bytes: u32,
 ) -> Result<(), ZakuraHandlerError> {
     if frame.payload.len() > limits.max_message_bytes as usize {
         return Err(ZakuraHandlerError::Oversize);
     }
-    let frame = frame.encode(limits.max_frame_bytes)?;
+    let frame = frame.encode(max_frame_bytes)?;
     timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, send.write_all(&frame))
         .await
         .map_err(|_| ZakuraHandlerError::Timeout("frame write"))??;
@@ -4744,18 +4771,16 @@ fn stream_kind_label(stream_kind: u16) -> &'static str {
     }
 }
 
-fn app_frame_cap_for_stream_kind(limits: &ZakuraConnectionLimits, stream_kind: u16) -> u32 {
-    match stream_kind {
-        HEADER_SYNC_STREAM_KIND => {
-            let header_sync_cap =
-                u32::try_from(MAX_HS_MESSAGE_BYTES.saturating_add(FRAME_HEADER_BYTES))
-                    .expect("header-sync frame cap fits in u32");
-            limits.max_frame_bytes.min(header_sync_cap)
-        }
-        ZAKURA_STREAM_BLOCK_SYNC => limits.max_frame_bytes.min(MAX_BS_FRAME_BYTES),
-        _ => limits.max_frame_bytes.min(LOCAL_MAX_CONTROL_FRAME_BYTES),
-    }
-    .max(1)
+fn application_frame_cap(limits: &ZakuraConnectionLimits, stream: Stream) -> u32 {
+    limits.max_frame_bytes.min(stream.frame_cap)
+}
+
+fn peer_accepted_frame_cap(
+    limits: &ZakuraConnectionLimits,
+    stream: Stream,
+    peer_max_frame_bytes: u32,
+) -> u32 {
+    application_frame_cap(limits, stream).min(peer_max_frame_bytes)
 }
 
 /// Frame cap for reading frames received from a peer, never larger than the
@@ -4767,10 +4792,10 @@ fn app_frame_cap_for_stream_kind(limits: &ZakuraConnectionLimits, stream_kind: u
 /// handed to `read_frame` must also be limited to the message size. Otherwise a
 /// frame whose `payload_len` falls between the two limits is allocated and read
 /// in full before the later message-level validation rejects or decodes it.
-fn inbound_frame_cap_for_stream_kind(limits: &ZakuraConnectionLimits, stream_kind: u16) -> u32 {
+fn inbound_frame_cap_for_stream(limits: &ZakuraConnectionLimits, stream: Stream) -> u32 {
     let frame_header_bytes =
         u32::try_from(FRAME_HEADER_BYTES).expect("frame header byte count fits in u32");
-    app_frame_cap_for_stream_kind(limits, stream_kind)
+    application_frame_cap(limits, stream)
         .min(limits.max_message_bytes.saturating_add(frame_header_bytes))
 }
 
@@ -4801,6 +4826,7 @@ fn should_run_freshness_reaper(
 /// The stream-kind versions this handler serves. Most known kinds are at version 1;
 /// header sync is at version 7, which correlates each `Headers` response with the
 /// request that solicited it. Earlier header-sync versions are not served.
+#[cfg(test)]
 const ZAKURA_STREAM_VERSION_1: u16 = 1;
 const ZAKURA_STREAM_VERSION_7: u16 = 7;
 
@@ -5002,9 +5028,9 @@ mod tests {
             testkit::{await_until, LocalEndpointFactory, ZakuraTestNode},
             HeaderSyncEvent, HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession,
             HeaderSyncRequestId, HeaderSyncStatus, ServicePeerLimits, ZakuraDiscoveryConfig,
-            ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, LOCAL_MAX_MESSAGE_BYTES,
-            MAX_HS_MESSAGE_BYTES, MSG_HS_STATUS, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-            ZAKURA_CAP_LEGACY_GOSSIP,
+            ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, LOCAL_MAX_CONTROL_FRAME_BYTES,
+            LOCAL_MAX_MESSAGE_BYTES, MAX_BS_FRAME_BYTES, MAX_HS_MESSAGE_BYTES, MSG_HS_STATUS,
+            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
         },
         P2pStack,
     };
@@ -7450,12 +7476,21 @@ mod tests {
         let permit = Arc::new(Semaphore::new(1))
             .try_acquire_owned()
             .expect("test semaphore starts with one permit");
+        let stream = Stream {
+            kind: stream_kind,
+            version: ZAKURA_STREAM_VERSION_1,
+            frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
+            capability: ZAKURA_CAP_DISCOVERY,
+            mode: StreamMode::Ordered,
+        };
         let context = StreamWorkerContext {
             conn: ZakuraConnTrace::without_peer(1),
             peer_id: test_peer(55),
             stream_id: 1,
             _permit: permit,
             limits,
+            inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
+            outbound_frame_cap: application_frame_cap(&limits, stream),
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
             connection_token: connection_token.clone(),
             stream_token: stream_token.clone(),
@@ -7467,15 +7502,7 @@ mod tests {
             stream_kind,
             stream_version: ZAKURA_STREAM_VERSION_1,
             request_id: None,
-            max_frame_bytes: app_frame_cap_for_stream_kind(&limits, stream_kind),
-        };
-
-        let stream = Stream {
-            kind: stream_kind,
-            version: ZAKURA_STREAM_VERSION_1,
-            frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
-            capability: ZAKURA_CAP_DISCOVERY,
-            mode: StreamMode::Ordered,
+            max_frame_bytes: inbound_frame_cap_for_stream(&limits, stream),
         };
         let mut workers = JoinSet::new();
         let (ordered_stream_exit_tx, mut ordered_stream_exit_rx) = mpsc::unbounded_channel();
@@ -7630,12 +7657,21 @@ mod tests {
             let permit = Arc::new(Semaphore::new(1))
                 .try_acquire_owned()
                 .expect("test semaphore starts with one permit");
+            let stream = Stream {
+                kind: stream_kind,
+                version: ZAKURA_STREAM_VERSION_1,
+                frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
+                capability: ZAKURA_CAP_LEGACY_GOSSIP,
+                mode: StreamMode::Ordered,
+            };
             let context = StreamWorkerContext {
                 conn: ZakuraConnTrace::without_peer(1),
                 peer_id: test_peer(80),
                 stream_id,
                 _permit: permit,
                 limits,
+                inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
+                outbound_frame_cap: application_frame_cap(&limits, stream),
                 message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
                     limits.message_rate_per_second,
                 ))),
@@ -7649,7 +7685,7 @@ mod tests {
                 stream_kind,
                 stream_version: ZAKURA_STREAM_VERSION_1,
                 request_id: None,
-                max_frame_bytes: app_frame_cap_for_stream_kind(&limits, stream_kind),
+                max_frame_bytes: inbound_frame_cap_for_stream(&limits, stream),
             };
             // Drain the inbound side so the worker never blocks forwarding a
             // read frame to a full service channel (which would itself stop the
@@ -7761,7 +7797,14 @@ mod tests {
         // permits.
         let mut limits = test_connection_limits();
         limits.max_message_bytes = 256;
-        let stream_kind = DISCOVERY_STREAM_KIND;
+        let stream = Stream {
+            kind: DISCOVERY_STREAM_KIND,
+            version: ZAKURA_STREAM_VERSION_1,
+            frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
+            capability: ZAKURA_CAP_DISCOVERY,
+            mode: StreamMode::Ordered,
+        };
+        let frame_cap = application_frame_cap(&limits, stream);
 
         // A payload above the message cap but well within the frame cap, so only
         // the message cap can reject it.
@@ -7771,11 +7814,11 @@ mod tests {
             payload: vec![0xab; 4096],
         };
         assert!(
-            oversized.payload.len() <= app_frame_cap_for_stream_kind(&limits, stream_kind) as usize,
+            oversized.payload.len() <= frame_cap as usize,
             "test payload must fit the frame cap so only the message cap can reject it"
         );
 
-        let result = write_ordered_frame(&mut send, oversized, limits, stream_kind).await;
+        let result = write_ordered_frame(&mut send, oversized, limits, frame_cap).await;
         assert!(
             result.is_err(),
             "write_ordered_frame must reject a payload over the negotiated max_message_bytes \
@@ -7788,7 +7831,7 @@ mod tests {
             flags: 0,
             payload: vec![0xcd; 128],
         };
-        write_ordered_frame(&mut send, within_cap, limits, stream_kind)
+        write_ordered_frame(&mut send, within_cap, limits, frame_cap)
             .await
             .expect("a frame within the negotiated message cap must still be written");
 
@@ -7927,7 +7970,13 @@ mod tests {
         // A payload between the message cap and the frame cap. admit_inbound_message
         // would reject it, but only after read_frame allocated and read it.
         const OVER_MESSAGE_PAYLOAD_LEN: u32 = 2048;
-        let stream_kind = LEGACY_GOSSIP_STREAM_KIND;
+        let stream = Stream {
+            kind: LEGACY_GOSSIP_STREAM_KIND,
+            version: ZAKURA_STREAM_VERSION_1,
+            frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
+            capability: ZAKURA_CAP_LEGACY_GOSSIP,
+            mode: StreamMode::Ordered,
+        };
 
         let limits = ZakuraConnectionLimits {
             max_frame_bytes: MAX_FRAME_BYTES,
@@ -7936,8 +7985,8 @@ mod tests {
         };
         // Production now passes the message-limited inbound cap; the raw
         // application cap (what the unfixed read path used) stays at the frame cap.
-        let inbound_cap = inbound_frame_cap_for_stream_kind(&limits, stream_kind);
-        let raw_cap = app_frame_cap_for_stream_kind(&limits, stream_kind);
+        let inbound_cap = inbound_frame_cap_for_stream(&limits, stream);
+        let raw_cap = application_frame_cap(&limits, stream);
         assert!(
             inbound_cap < raw_cap,
             "the inbound cap must be tighter than the raw frame cap when the caps diverge \
@@ -8228,7 +8277,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_specific_application_frame_caps_keep_gossip_and_discovery_tight() {
+    fn declared_stream_frame_caps_are_authoritative() {
         let limits = ZakuraLocalLimits::from_config(&Config::default());
         let negotiated = limits.clamp(&ZakuraAcceptedLimits {
             max_frame_bytes: u32::MAX,
@@ -8237,75 +8286,58 @@ mod tests {
             max_inbound_queue_depth: u16::MAX,
             idle_timeout_millis: u32::MAX,
         });
-        let header_sync_frame_bytes =
-            u32::try_from(MAX_HS_MESSAGE_BYTES.saturating_add(FRAME_HEADER_BYTES))
-                .expect("header-sync frame cap fits in u32");
-
-        assert_eq!(
-            app_frame_cap_for_stream_kind(&negotiated, LEGACY_GOSSIP_STREAM_KIND),
-            LOCAL_MAX_CONTROL_FRAME_BYTES
-        );
-        assert_eq!(
-            app_frame_cap_for_stream_kind(&negotiated, LEGACY_REQUEST_STREAM_KIND),
-            LOCAL_MAX_CONTROL_FRAME_BYTES
-        );
-        assert_eq!(
-            app_frame_cap_for_stream_kind(&negotiated, DISCOVERY_STREAM_KIND),
-            LOCAL_MAX_CONTROL_FRAME_BYTES
-        );
-        assert_eq!(
-            app_frame_cap_for_stream_kind(&negotiated, HEADER_SYNC_STREAM_KIND),
-            header_sync_frame_bytes
-        );
-
-        let over_tight_cap = usize::try_from(LOCAL_MAX_CONTROL_FRAME_BYTES).unwrap() + 1;
-        let header_sync_cap = usize::try_from(header_sync_frame_bytes).unwrap();
-        let gossip_frame = Frame {
-            message_type: 1,
-            flags: 0,
-            payload: vec![0; over_tight_cap.saturating_sub(FRAME_HEADER_BYTES)],
-        };
-        let header_sync_frame = Frame {
-            message_type: 1,
-            flags: 0,
-            payload: vec![0; header_sync_cap.saturating_sub(FRAME_HEADER_BYTES)],
+        const CUSTOM_FRAME_CAP: u32 = 64 * 1024;
+        let custom_stream = Stream {
+            kind: 42,
+            version: ZAKURA_STREAM_VERSION_1,
+            frame_cap: CUSTOM_FRAME_CAP,
+            capability: 1 << 20,
+            mode: StreamMode::RequestResponse,
         };
 
-        assert!(
-            gossip_frame
-                .encode(app_frame_cap_for_stream_kind(
-                    &negotiated,
-                    LEGACY_GOSSIP_STREAM_KIND
-                ))
-                .is_err(),
-            "gossip frames over the tight stream cap must be rejected"
+        assert_eq!(
+            application_frame_cap(&negotiated, custom_stream),
+            CUSTOM_FRAME_CAP,
+            "a custom declaration below the negotiated cap must remain authoritative"
         );
-        assert!(
-            gossip_frame
-                .encode(app_frame_cap_for_stream_kind(
-                    &negotiated,
-                    DISCOVERY_STREAM_KIND
-                ))
-                .is_err(),
-            "discovery frames over the tight stream cap must be rejected"
+        assert_eq!(
+            peer_accepted_frame_cap(&negotiated, custom_stream, CUSTOM_FRAME_CAP / 2),
+            CUSTOM_FRAME_CAP / 2,
+            "writes on peer-opened streams must also honor the peer's advertised receive cap"
         );
-        assert!(
-            gossip_frame
-                .encode(app_frame_cap_for_stream_kind(
-                    &negotiated,
-                    LEGACY_REQUEST_STREAM_KIND
-                ))
-                .is_err(),
-            "legacy request frames over the tight stream cap must be rejected"
+        assert_eq!(
+            peer_accepted_frame_cap(&negotiated, custom_stream, CUSTOM_FRAME_CAP * 2),
+            CUSTOM_FRAME_CAP,
+            "a peer cannot raise the locally declared stream cap"
         );
+
+        let at_cap = Frame {
+            message_type: 1,
+            flags: 0,
+            payload: vec![
+                0;
+                usize::try_from(CUSTOM_FRAME_CAP)
+                    .expect("custom test cap fits usize")
+                    .saturating_sub(FRAME_HEADER_BYTES)
+            ],
+        };
+        let over_cap = Frame {
+            message_type: 1,
+            flags: 0,
+            payload: vec![0; at_cap.payload.len() + 1],
+        };
+
         assert!(
-            header_sync_frame
-                .encode(app_frame_cap_for_stream_kind(
-                    &negotiated,
-                    HEADER_SYNC_STREAM_KIND
-                ))
+            at_cap
+                .encode(application_frame_cap(&negotiated, custom_stream))
                 .is_ok(),
-            "header-sync frames up to MAX_HS_MESSAGE_BYTES must still be accepted"
+            "a frame exactly at the declared custom cap must be accepted"
+        );
+        assert!(
+            over_cap
+                .encode(application_frame_cap(&negotiated, custom_stream))
+                .is_err(),
+            "a frame one byte over the declared custom cap must be rejected"
         );
     }
 

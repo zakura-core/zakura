@@ -632,12 +632,8 @@ mod tests {
         let mut original = build_tree(37);
 
         let live = original.frontier().expect("37 appends leave a leaf");
-        let frontier = Frontier::from_parts(
-            live.position(),
-            *live.leaf(),
-            live.ommers().to_vec(),
-        )
-        .expect("the parts of a live frontier are valid");
+        let frontier = Frontier::from_parts(live.position(), *live.leaf(), live.ommers().to_vec())
+            .expect("the parts of a live frontier are valid");
 
         let mut rebuilt = NoteCommitmentTree::from_frontier(frontier);
 

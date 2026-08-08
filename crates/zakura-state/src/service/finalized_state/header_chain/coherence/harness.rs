@@ -227,6 +227,13 @@ impl Harness {
         Frontier::new(header.height, header.hash)
     }
 
+    pub fn branch_frontier(&self, branch: usize, index: usize) -> Frontier {
+        let branches = &self.universe.branches;
+        let headers = &branches[branch % branches.len()].headers;
+        let header = &headers[index.min(headers.len() - 1)];
+        Frontier::new(header.height, header.hash)
+    }
+
     pub fn corrupt_selected_hash(&self, height: block::Height, hash: block::Hash) {
         let mut batch = DiskWriteBatch::new();
         self.runtime()
@@ -311,6 +318,16 @@ impl Harness {
         assert!(
             self.runtime().reader().selected_locator().is_err(),
             "a corrupt selected projection must not produce a locator"
+        );
+    }
+
+    pub fn assert_selected_roots_fail_closed(&self, height: block::Height) {
+        assert!(
+            self.runtime()
+                .reader()
+                .selected_block_roots(height, 1)
+                .is_err(),
+            "a corrupt selected projection must not produce auxiliary roots"
         );
     }
 

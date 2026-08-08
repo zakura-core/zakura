@@ -11,7 +11,7 @@ use crate::{
     amount::{Amount, NonNegative},
     parameters::NetworkUpgrade,
     serialization::ZcashSerialize,
-    transaction::{AuthDigest, Hash, HashType, SigHash, Transaction},
+    transaction::{AuthDigest, Hash, HashType, ParseDigest, SigHash, Transaction},
     transparent::{self, Script},
     Error,
 };
@@ -213,6 +213,15 @@ pub(crate) struct PrecomputedTxData {
     tx_data: zp_tx::TransactionData<PrecomputedAuth>,
     txid_parts: TxDigests<blake2b_simd::Hash>,
     all_previous_outputs: Arc<Vec<transparent::Output>>,
+
+    /// A digest of the input `librustzcash` parsed to produce [`Self::tx_data`], present only
+    /// when that produced a Sapling bundle.
+    ///
+    /// Computed here, next to the parse it describes, so that a caller cannot pair a bundle
+    /// with a digest of some other transaction — see
+    /// [`Self::sapling_bundle_and_parse_digest`]. Skipped when there is no Sapling bundle, so
+    /// transparent and Orchard-only transactions do not pay for a hash nothing will read.
+    sapling_parse_digest: Option<ParseDigest>,
 }
 
 impl PrecomputedTxData {
@@ -254,7 +263,7 @@ impl PrecomputedTxData {
         nu: NetworkUpgrade,
         all_previous_outputs: Arc<Vec<transparent::Output>>,
     ) -> Result<PrecomputedTxData, Error> {
-        let tx = tx.to_librustzcash(nu)?;
+        let (tx, parse_input) = tx.to_librustzcash_with_parse_input(nu)?;
 
         let txid_parts = tx.deref().digest(zp_tx::txid::TxIdDigester);
 
@@ -272,10 +281,18 @@ impl PrecomputedTxData {
             (),
         );
 
+        // Derived from what `librustzcash` actually parsed, not from what we think it would
+        // have parsed, so the digest and the bundle cannot disagree.
+        let sapling_parse_digest = tx_data
+            .sapling_bundle()
+            .is_some()
+            .then(|| parse_input.digest());
+
         Ok(PrecomputedTxData {
             tx_data,
             txid_parts,
             all_previous_outputs,
+            sapling_parse_digest,
         })
     }
 
@@ -298,6 +315,36 @@ impl PrecomputedTxData {
         &self,
     ) -> Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>> {
         self.tx_data.sapling_bundle().cloned()
+    }
+
+    /// Returns the Sapling bundle in `tx_data`, together with the digest of the input it was
+    /// parsed from.
+    ///
+    /// The two are returned as a pair on purpose: a memo key built from the digest is only
+    /// sound for the bundle that *this* parse produced, and pairing them here removes any way
+    /// for a caller to combine one transaction's bundle with another's digest. See
+    /// [`ParseDigest`].
+    ///
+    /// # Panics
+    ///
+    /// If a Sapling bundle was parsed but no digest was recorded for it, which
+    /// [`PrecomputedTxData::new`] makes impossible. This must panic rather than return `None`:
+    /// the caller reads `None` as "there is no Sapling bundle to verify", so degrading here
+    /// would skip Sapling verification entirely.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn sapling_bundle_and_parse_digest(
+        &self,
+    ) -> Option<(
+        sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>,
+        ParseDigest,
+    )> {
+        let bundle = self.tx_data.sapling_bundle().cloned()?;
+
+        let digest = self.sapling_parse_digest.expect(
+            "a Sapling parse digest is computed whenever the parse produced a Sapling bundle",
+        );
+
+        Some((bundle, digest))
     }
 }
 

@@ -1,8 +1,11 @@
-//! A bounded memo of Halo2 Orchard Action proofs that have already verified.
+//! A bounded memo of shielded bundle verifications that have already succeeded.
 //!
-//! A transaction's Orchard proof is verified once when the transaction arrives over mempool
-//! gossip, and again when it arrives inside a block. This service skips the second verification
-//! when it can prove the two are the same computation.
+//! A transaction's shielded proofs and signatures are verified once when the transaction arrives
+//! over mempool gossip, and again when it arrives inside a block. This service skips the second
+//! verification when it can prove the two are the same computation.
+//!
+//! Used by the Halo2 Orchard/Ironwood verifiers ([`super::halo2`]) and the Sapling verifier
+//! ([`super::sapling`]).
 //!
 //! # Why this is not the mempool bypass
 //!
@@ -21,14 +24,20 @@
 //! block's time and the block's spent outputs; the only thing that does not re-run is a
 //! deterministic computation whose every input is pinned by the key.
 //!
-//! That makes key completeness the whole of the safety argument:
+//! That makes key completeness the whole of the safety argument, and it is the responsibility of
+//! each [`MemoizedItem`] implementation. The two in the tree discharge it differently:
 //!
-//!   * `bundle` and `sighash` are committed to by [`Item::cache_key`], which destructures [`Item`]
-//!     exhaustively so that adding a field is a compile error until someone decides whether it
-//!     belongs in the key;
-//!   * `vk` is committed to structurally, by giving each Orchard circuit era its own memo. Eras
-//!     cannot mix in a memo for the same reason they cannot mix in a batch — see
-//!     [`super::verifier_for`].
+//!   * [`halo2::Item`](super::halo2::Item) hashes the bundle's own consensus encoding, using
+//!     upstream's `pub` total encoder, and destructures the item exhaustively so that adding a
+//!     field is a compile error until someone decides whether it belongs in the key. Its
+//!     verifying key is committed to structurally, by giving each Orchard circuit era its own
+//!     memo — eras cannot mix in a memo for the same reason they cannot mix in a batch, see
+//!     [`super::halo2::verifier_for`].
+//!
+//!   * [`sapling::Item`](super::sapling::Item) has no such encoder available, so it commits to
+//!     the transaction bytes the bundle was parsed from instead. See
+//!     [`sapling::Item::cache_key`](super::sapling::Item) for why that is a stronger argument
+//!     rather than a weaker one.
 //!
 //! Only `Ok` results are recorded. A batch error is not per-item evidence, because
 //! [`Fallback`](tower_fallback::Fallback) resolves batch failures by re-verifying each item
@@ -48,19 +57,32 @@ use tower::{Service, ServiceExt};
 
 use crate::BoxError;
 
-use super::Item;
-
-/// The number of verified-proof keys retained per Orchard circuit era.
+/// The number of verified-bundle keys retained per memo.
 ///
 /// Sized to hold several blocks of history plus a full mempool, so that a transaction gossiped
 /// well before the block that mines it is still remembered. At 32-byte keys this is on the order
-/// of a megabyte per era.
+/// of a megabyte per memo.
 pub const MEMO_CAPACITY: usize = 20_000;
 
-/// A key that determines every input to one [`Item`]'s proof verification.
+/// A key that determines every input to one item's verification.
 ///
-/// See [`Item::cache_key`] for the construction and for why completeness matters.
+/// See [`MemoizedItem::cache_key`] for why completeness matters.
 pub type CacheKey = [u8; 32];
+
+/// An item whose verification result can be memoized.
+///
+/// # Correctness
+///
+/// [`Self::cache_key`] must commit to *every* input the wrapped verifier reads. A key that omits
+/// an input lets one item's `Ok` be reused for a different computation, which is a consensus
+/// failure — see the module docs. Deriving a key from things that "obviously" determine the
+/// bundle is how this goes wrong: the txid does not commit to authorizing data at all under
+/// ZIP 244 (that was CVE-2026-34377), and even `(auth digest, sighash)` is incomplete, because
+/// the Orchard and Ironwood bundles of one v6 transaction share both.
+pub trait MemoizedItem {
+    /// Returns a key that determines every input to this item's verification.
+    fn cache_key(&self) -> CacheKey;
+}
 
 /// A bounded set of keys for items that have already verified successfully.
 ///
@@ -77,15 +99,20 @@ struct VerifiedProofs {
 
     /// The maximum number of keys to retain.
     capacity: usize,
+
+    /// The `verifier` metrics label for this memo, matching the label the same verifier's batch
+    /// metrics use, so the two can be joined.
+    verifier: &'static str,
 }
 
 impl VerifiedProofs {
     /// Creates an empty memo that retains at most `capacity` keys.
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, verifier: &'static str) -> Self {
         Self {
             keys: HashSet::with_capacity(capacity),
             insertion_order: VecDeque::with_capacity(capacity),
             capacity,
+            verifier,
         }
     }
 
@@ -103,7 +130,7 @@ impl VerifiedProofs {
         }
 
         self.insertion_order.push_back(key);
-        metrics::counter!("zakura.consensus.halo2.memo.insert").increment(1);
+        metrics::counter!("zakura.consensus.memo.insert", "verifier" => self.verifier).increment(1);
 
         while self.insertion_order.len() > self.capacity {
             let evicted = self
@@ -111,24 +138,29 @@ impl VerifiedProofs {
                 .pop_front()
                 .expect("queue is longer than the capacity, which is at least one");
             self.keys.remove(&evicted);
-            metrics::counter!("zakura.consensus.halo2.memo.evict").increment(1);
+            metrics::counter!("zakura.consensus.memo.evict", "verifier" => self.verifier)
+                .increment(1);
         }
 
         // Cast is safe: the length is bounded by `capacity`, far below f64's exact integer range.
-        metrics::gauge!("zakura.consensus.halo2.memo.size").set(self.keys.len() as f64);
+        metrics::gauge!("zakura.consensus.memo.size", "verifier" => self.verifier)
+            .set(self.keys.len() as f64);
     }
 }
 
-/// A service that skips inner verification for items whose proof has already verified.
+/// A service that skips inner verification for items that have already verified.
 ///
-/// This wraps one Orchard circuit era's batch-and-fallback stack. The memo is shared between
-/// clones, so every handle to a global verifier sees the same set of verified proofs.
+/// This wraps one verifier's batch-and-fallback stack. The memo is shared between clones, so
+/// every handle to a global verifier sees the same set of verified bundles.
 pub struct Memoized<S> {
     /// The verification service to consult on a miss.
     inner: S,
 
-    /// The keys of items that have already verified under this era's key.
+    /// The keys of items that have already verified under this memo's key construction.
     verified: Arc<Mutex<VerifiedProofs>>,
+
+    /// The `verifier` metrics label for this memo.
+    verifier: &'static str,
 }
 
 impl<S: Clone> Clone for Memoized<S> {
@@ -136,16 +168,19 @@ impl<S: Clone> Clone for Memoized<S> {
         Self {
             inner: self.inner.clone(),
             verified: self.verified.clone(),
+            verifier: self.verifier,
         }
     }
 }
 
 impl<S> Memoized<S> {
-    /// Wraps `inner` in a memo that retains at most `capacity` verified-proof keys.
-    pub(super) fn new(inner: S, capacity: usize) -> Self {
+    /// Wraps `inner` in a memo that retains at most `capacity` verified-bundle keys, reporting
+    /// metrics under the `verifier` label.
+    pub(super) fn new(inner: S, capacity: usize, verifier: &'static str) -> Self {
         Self {
             inner,
-            verified: Arc::new(Mutex::new(VerifiedProofs::new(capacity))),
+            verified: Arc::new(Mutex::new(VerifiedProofs::new(capacity, verifier))),
+            verifier,
         }
     }
 
@@ -164,13 +199,17 @@ impl<S> Memoized<S> {
         Memoized {
             inner,
             verified: self.verified.clone(),
+            verifier: self.verifier,
         }
     }
 }
 
-impl<S> Service<Item> for Memoized<S>
+impl<S, I> Service<I> for Memoized<S>
 where
-    S: Service<Item, Response = (), Error = BoxError> + Clone + Send + 'static,
+    // `Send + 'static` because a miss moves the item into the boxed future that awaits inner
+    // readiness — see `poll_ready`.
+    I: MemoizedItem + Send + 'static,
+    S: Service<I, Response = (), Error = BoxError> + Clone + Send + 'static,
     S::Future: Send + 'static,
 {
     type Response = ();
@@ -204,7 +243,7 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, item: Item) -> Self::Future {
+    fn call(&mut self, item: I) -> Self::Future {
         // Derived once here, outside `Fallback`, which clones every request eagerly.
         let key = item.cache_key();
 
@@ -214,11 +253,12 @@ where
             .expect("verified proof memo mutex should not be poisoned")
             .contains(&key)
         {
-            metrics::counter!("zakura.consensus.halo2.memo.hit").increment(1);
+            metrics::counter!("zakura.consensus.memo.hit", "verifier" => self.verifier)
+                .increment(1);
             return future::ready(Ok(())).boxed();
         }
 
-        metrics::counter!("zakura.consensus.halo2.memo.miss").increment(1);
+        metrics::counter!("zakura.consensus.memo.miss", "verifier" => self.verifier).increment(1);
 
         let verified = self.verified.clone();
         let mut inner = self.inner.clone();

@@ -17,11 +17,22 @@ use tower_batch_control::{Batch, BatchControl, RequestWeight};
 use tower_fallback::Fallback;
 
 use sapling_crypto::{bundle::Authorized, BatchValidator, Bundle};
-use zakura_chain::transaction::SigHash;
+use zakura_chain::transaction::{ParseDigest, SigHash};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::value::ZatBalance;
 
 use crate::{error::TransactionError, BoxError};
+
+use super::memo::{CacheKey, Memoized, MemoizedItem, MEMO_CAPACITY};
+
+#[cfg(test)]
+mod tests;
+
+/// The BLAKE2b personalization for [`Item`] memo cache keys.
+///
+/// Domain-separates these keys from every other BLAKE2b-256 hash in the protocol, so that a
+/// memo key can never be confused with a txid, an auth digest, a sighash, or a Halo2 memo key.
+const SAPLING_MEMO_PERSONALIZATION: &[u8; 16] = b"ZakuraSapngMemo1";
 
 /// Sapling prover containing spend and output params for the Sapling circuit.
 ///
@@ -46,12 +57,90 @@ pub struct Item {
     bundle: Bundle<Authorized, ZatBalance>,
     /// The sighash of the transaction that contains the Sapling shielded data.
     sighash: SigHash,
+    /// A digest of the input `librustzcash` parsed to produce [`Self::bundle`].
+    ///
+    /// Only used to derive [`Item::cache_key`]; verification never reads it.
+    parse_digest: ParseDigest,
 }
 
 impl Item {
-    /// Creates a new [`Item`] from a Sapling bundle and sighash.
-    pub fn new(bundle: Bundle<Authorized, ZatBalance>, sighash: SigHash) -> Self {
-        Self { bundle, sighash }
+    /// Creates a new [`Item`] from a Sapling bundle, its parse digest, and the sighash.
+    ///
+    /// `bundle` and `parse_digest` must come from the *same* parse — take them together from
+    /// [`SigHasher::sapling_bundle_and_parse_digest`], which is what makes that structural.
+    ///
+    /// [`SigHasher::sapling_bundle_and_parse_digest`]: zakura_chain::transaction::SigHasher::sapling_bundle_and_parse_digest
+    pub fn new(
+        bundle: Bundle<Authorized, ZatBalance>,
+        parse_digest: ParseDigest,
+        sighash: SigHash,
+    ) -> Self {
+        Self {
+            bundle,
+            sighash,
+            parse_digest,
+        }
+    }
+}
+
+impl MemoizedItem for Item {
+    /// Returns a key that determines every input to this item's bundle verification.
+    ///
+    /// [`Memoized`] reuses a previous `Ok` result whenever this key matches, so the key must
+    /// commit to everything [`BatchValidator::check_bundle`] reads: the bundle and the sighash.
+    ///
+    /// # Why this commits to the transaction bytes rather than the bundle
+    ///
+    /// The Halo2 memo hashes its bundle's own consensus encoding, using `orchard`'s `pub`
+    /// `write_v5_bundle`. Sapling has no such encoder: `zcash_primitives`' Sapling
+    /// `write_v5_bundle` is `pub(crate)`, `sapling-crypto` has no bundle serialization at all,
+    /// and `zakura-chain`'s `ZcashSerialize` impl is for its own `sapling::ShieldedData`, not for
+    /// the `sapling_crypto::Bundle` the verifier holds. Hand-writing one would reach the bundle's
+    /// fields through getters, so an upstream field addition would be a silent omission from the
+    /// key rather than a compile error — precisely the failure this design exists to prevent.
+    ///
+    /// So this commits to [`ParseDigest`] instead. Every bundle the verifiers see is the output
+    /// of `zcash_primitives::transaction::Transaction::read` applied to exactly the bytes and
+    /// branch id that digest covers, so the digest determines the bundle **by construction**.
+    /// The argument is not "we enumerated the bundle's fields correctly", it is "the bundle is a
+    /// pure function of these inputs" — strictly stronger, and immune to upstream adding a field.
+    ///
+    /// The sighash is committed to separately rather than derived, because the shielded sighash
+    /// depends on the spent transparent outputs (their values and `scriptPubKey`s enter the
+    /// ZIP 244 transparent sig digest), which are not in the transaction bytes.
+    ///
+    /// This over-commits: two transactions sharing a Sapling bundle would miss. That is
+    /// irrelevant in practice — the sighash is in the key regardless and already commits to
+    /// nearly the whole transaction, and the memo's job is to recognise the *same* transaction
+    /// arriving twice (mempool, then block), where the bytes are identical.
+    ///
+    /// The verifying keys are *not* in the key. Unlike Orchard, Sapling has one spend and one
+    /// output verifying key for all of history, from the bundled [`LocalTxProver`] parameters,
+    /// so there are no eras to separate and one memo suffices.
+    fn cache_key(&self) -> CacheKey {
+        // Destructured exhaustively on purpose: adding a field to `Item` is a compile error here
+        // until someone decides whether it belongs in the key. `bundle` is deliberately not
+        // hashed — `parse_digest` already determines it, which is the whole point of the
+        // construction above.
+        let Item {
+            bundle: _,
+            sighash,
+            parse_digest,
+        } = self;
+
+        let mut hasher = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(SAPLING_MEMO_PERSONALIZATION)
+            .to_state();
+
+        hasher.update(parse_digest.as_bytes());
+        hasher.update(&sighash.0);
+
+        hasher
+            .finalize()
+            .as_bytes()
+            .try_into()
+            .expect("hash_length(32) produces exactly 32 bytes")
     }
 }
 
@@ -220,15 +309,26 @@ pub fn verify_single(
     .boxed()
 }
 
+/// The batching-and-fallback stack for Sapling bundle verification, before memoization.
+type BatchFallbackService = Fallback<
+    Batch<Verifier, Item>,
+    ServiceFn<fn(Item) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
+>;
+
+/// The concrete type of the global Sapling verification service.
+type VerifierService = Memoized<BatchFallbackService>;
+
 /// Global batch verification context for Sapling shielded data.
-pub static VERIFIER: Lazy<
-    Fallback<
-        Batch<Verifier, Item>,
-        ServiceFn<
-            fn(Item) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-        >,
-    >,
-> = Lazy::new(|| {
+///
+/// The stack is wrapped in a [`Memoized`] so that a bundle verified when its transaction was
+/// gossiped into the mempool does not have to be verified again when the block that mines it
+/// arrives. Sapling needs only one memo: unlike Orchard, its spend and output verifying keys are
+/// the same for all of history, so there are no circuit eras to keep apart.
+pub static VERIFIER: Lazy<VerifierService> =
+    Lazy::new(|| Memoized::new(batch_fallback_verifier(), MEMO_CAPACITY, "groth16_sapling"));
+
+/// Builds the un-memoized batching-and-fallback stack.
+fn batch_fallback_verifier() -> BatchFallbackService {
     Fallback::new(
         Batch::new(
             Verifier::default(),
@@ -236,16 +336,6 @@ pub static VERIFIER: Lazy<
             None,
             super::MAX_BATCH_LATENCY,
         ),
-        tower::service_fn(verify_single),
+        tower::service_fn(verify_single as fn(Item) -> _),
     )
-});
-
-#[cfg(test)]
-mod tests {
-    use super::sapling_prover;
-
-    #[test]
-    fn sapling_prover_is_reused() {
-        assert!(std::ptr::eq(sapling_prover(), sapling_prover()));
-    }
 }

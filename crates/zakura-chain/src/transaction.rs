@@ -45,8 +45,8 @@ use crate::{
     memory::{vec_capacity_bytes, AttributedMemorySize},
     orchard,
     parameters::{
-        Network, NetworkUpgrade, OVERWINTER_VERSION_GROUP_ID, SAPLING_VERSION_GROUP_ID,
-        TX_V5_VERSION_GROUP_ID,
+        ConsensusBranchId, Network, NetworkUpgrade, OVERWINTER_VERSION_GROUP_ID,
+        SAPLING_VERSION_GROUP_ID, TX_V5_VERSION_GROUP_ID,
     },
     primitives::{ed25519, Bctv14Proof, Groth16Proof},
     sapling,
@@ -59,6 +59,74 @@ use crate::{
     value_balance::{ValueBalance, ValueBalanceError},
     Error,
 };
+
+/// The BLAKE2b personalization for [`ParseDigest`].
+///
+/// Domain-separates these digests from every other BLAKE2b-256 hash in the protocol, so that a
+/// parse digest can never be confused with a txid, an auth digest, or a sighash.
+const PARSE_DIGEST_PERSONALIZATION: &[u8; 16] = b"ZakuraLrzParse_1";
+
+/// The exact input from which `librustzcash` parsed a transaction: Zakura's own serialization
+/// of it, and the consensus branch id it was parsed under.
+///
+/// Held only long enough to derive a [`ParseDigest`] from it.
+pub(crate) struct ParseInput {
+    /// The consensus branch id passed to `zcash_primitives::transaction::Transaction::read`.
+    branch_id: ConsensusBranchId,
+
+    /// The bytes passed to `zcash_primitives::transaction::Transaction::read`.
+    bytes: Vec<u8>,
+}
+
+impl ParseInput {
+    /// Returns a digest that determines every bundle `librustzcash` parsed from this input.
+    pub(crate) fn digest(&self) -> ParseDigest {
+        let mut hasher = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(PARSE_DIGEST_PERSONALIZATION)
+            .to_state();
+
+        hasher.update(&u32::from(self.branch_id).to_le_bytes());
+        hasher.update(&self.bytes);
+
+        ParseDigest(
+            hasher
+                .finalize()
+                .as_bytes()
+                .try_into()
+                .expect("hash_length(32) produces exactly 32 bytes"),
+        )
+    }
+}
+
+/// A digest of the exact input from which `librustzcash` parsed a transaction's shielded
+/// bundles.
+///
+/// # Correctness
+///
+/// [`Transaction::to_librustzcash`] is
+/// `zcash_primitives::transaction::Transaction::read(&self.zcash_serialize_to_vec()?, branch_id)`,
+/// and it is the only route from a [`Transaction`] to the `sapling_crypto`, `orchard` and
+/// Ironwood bundles the consensus verifiers see. Every one of those bundles is therefore a pure
+/// function of *(these bytes, this branch id)*, so this digest determines them **by
+/// construction** — without anyone having to enumerate a bundle's fields and get the enumeration
+/// right.
+///
+/// That is what makes it safe to use as part of a verification memo key. Callers must still
+/// commit to any input the bundle alone does not determine: the shielded sighash, for instance,
+/// depends on the spent transparent outputs, which are not in these bytes.
+///
+/// A change that constructs a bundle by some path other than [`Transaction::to_librustzcash`]
+/// breaks this argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParseDigest([u8; 32]);
+
+impl ParseDigest {
+    /// Returns the digest bytes.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 /// A Zcash transaction.
 ///
@@ -1733,10 +1801,29 @@ impl Transaction {
     /// If the tx contains a network upgrade, this network upgrade must match the passed `nu`. The
     /// passed `nu` must also contain a consensus branch id convertible to its `librustzcash`
     /// equivalent.
+    ///
+    /// # Correctness
+    ///
+    /// This is the *only* route from a [`Transaction`] to the `sapling_crypto`, `orchard` and
+    /// Ironwood bundles the consensus verifiers see, which is what makes
+    /// [`ParseInput::digest`] a complete key for those bundles. A change that builds a bundle
+    /// by any other path invalidates that argument — see [`ParseInput`].
     pub(crate) fn to_librustzcash(
         &self,
         nu: NetworkUpgrade,
     ) -> Result<zcash_primitives::transaction::Transaction, crate::Error> {
+        self.to_librustzcash_with_parse_input(nu).map(|(tx, _)| tx)
+    }
+
+    /// Converts [`Transaction`] to [`zcash_primitives::transaction::Transaction`], also
+    /// returning the exact input that was parsed to produce it.
+    ///
+    /// See [`Self::to_librustzcash`] for the conversion, and [`ParseInput`] for what the
+    /// returned input is for.
+    pub(crate) fn to_librustzcash_with_parse_input(
+        &self,
+        nu: NetworkUpgrade,
+    ) -> Result<(zcash_primitives::transaction::Transaction, ParseInput), crate::Error> {
         if self.network_upgrade().is_some_and(|tx_nu| tx_nu != nu) {
             return Err(crate::Error::InvalidConsensusBranchId);
         }
@@ -1745,14 +1832,15 @@ impl Transaction {
             return Err(crate::Error::InvalidConsensusBranchId);
         };
 
-        let Ok(branch_id) = consensus::BranchId::try_from(branch_id) else {
+        let Ok(consensus_branch_id) = consensus::BranchId::try_from(branch_id) else {
             return Err(crate::Error::InvalidConsensusBranchId);
         };
 
-        Ok(zcash_primitives::transaction::Transaction::read(
-            &self.zcash_serialize_to_vec()?[..],
-            branch_id,
-        )?)
+        let bytes = self.zcash_serialize_to_vec()?;
+
+        let tx = zcash_primitives::transaction::Transaction::read(&bytes[..], consensus_branch_id)?;
+
+        Ok((tx, ParseInput { branch_id, bytes }))
     }
 
     // Common Sapling & Orchard Properties

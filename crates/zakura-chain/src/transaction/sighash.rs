@@ -7,7 +7,7 @@ use std::sync::Arc;
 use zcash_protocol::value::ZatBalance;
 use zcash_transparent::sighash::SighashType;
 
-use super::{zip244::Zip244SighashCache, Transaction};
+use super::{zip244::Zip244SighashCache, ParseDigest, Transaction};
 
 use crate::parameters::NetworkUpgrade;
 use crate::{transparent, Error};
@@ -307,6 +307,19 @@ impl SigHasher {
         &self,
     ) -> Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>> {
         self.precomputed_tx_data.sapling_bundle()
+    }
+
+    /// Returns the Sapling bundle in the precomputed transaction data, together with the digest
+    /// of the input it was parsed from.
+    ///
+    /// See [`PrecomputedTxData::sapling_bundle_and_parse_digest`].
+    pub fn sapling_bundle_and_parse_digest(
+        &self,
+    ) -> Option<(
+        sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>,
+        ParseDigest,
+    )> {
+        self.precomputed_tx_data.sapling_bundle_and_parse_digest()
     }
 }
 

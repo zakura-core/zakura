@@ -32,7 +32,8 @@ use zakura_chain::{
     primitives::Groth16Proof,
     serialization::DateTime32,
     transaction::{
-        self, HashType, SigHash, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx,
+        self, HashType, ParseDigest, SigHash, Transaction, UnminedTx, UnminedTxId,
+        VerifiedUnminedTx,
     },
     transparent,
 };
@@ -924,7 +925,9 @@ where
 
         Self::verify_v4_transaction_network_upgrade(&tx, nu)?;
 
-        let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
+        let sapling_bundle = cached_ffi_transaction
+            .sighasher()
+            .sapling_bundle_and_parse_digest();
 
         let sighash = cached_ffi_transaction
             .sighasher()
@@ -1015,7 +1018,9 @@ where
 
         Self::verify_v5_transaction_network_upgrade(&transaction, nu)?;
 
-        let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
+        let sapling_bundle = cached_ffi_transaction
+            .sighasher()
+            .sapling_bundle_and_parse_digest();
         let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
 
         let sighash = cached_ffi_transaction
@@ -1085,7 +1090,9 @@ where
 
         Self::verify_v6_transaction_network_upgrade(&transaction, nu)?;
 
-        let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
+        let sapling_bundle = cached_ffi_transaction
+            .sighasher()
+            .sapling_bundle_and_parse_digest();
         let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
         let ironwood_bundle = cached_ffi_transaction.sighasher().ironwood_bundle();
 
@@ -1219,8 +1226,16 @@ where
     }
 
     /// Verifies a transaction's Sapling shielded data.
+    ///
+    /// `bundle_and_parse_digest` pairs the bundle with a digest of the input it was parsed from,
+    /// which is how the Sapling verification memo keys its entries — see
+    /// [`primitives::sapling::Item`]. The two arrive together so that a bundle can never be
+    /// keyed by a digest of some other transaction.
     fn verify_sapling_bundle(
-        bundle: Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>>,
+        bundle_and_parse_digest: Option<(
+            sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>,
+            ParseDigest,
+        )>,
         sighash: &SigHash,
     ) -> AsyncChecks {
         let mut async_checks = AsyncChecks::new();
@@ -1272,12 +1287,10 @@ where
         // > signature changes to prohibit non-canonical encodings.
         //
         // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
-        if let Some(bundle) = bundle {
-            async_checks.push(
-                primitives::sapling::VERIFIER
-                    .clone()
-                    .oneshot(primitives::sapling::Item::new(bundle, *sighash)),
-            );
+        if let Some((bundle, parse_digest)) = bundle_and_parse_digest {
+            async_checks.push(primitives::sapling::VERIFIER.clone().oneshot(
+                primitives::sapling::Item::new(bundle, parse_digest, *sighash),
+            ));
         }
 
         async_checks

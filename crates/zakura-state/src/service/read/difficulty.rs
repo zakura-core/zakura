@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use zakura_chain::{
     block::{self, Block, Hash, Height},
     history_tree::HistoryTree,
-    parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
+    parameters::{Network, NetworkUpgrade},
     serialization::{DateTime32, Duration32},
     work::difficulty::{CompactDifficulty, PartialCumulativeWork, Work},
 };
@@ -31,11 +31,6 @@ use crate::{
     },
     BoxError, GetBlockTemplateChainInfo,
 };
-
-/// The amount of extra time we allow for a miner to mine a standard difficulty block on testnet.
-///
-/// This is a Zebra-specific standard rule.
-pub const EXTRA_TIME_TO_MINE_A_BLOCK: u32 = POST_BLOSSOM_POW_TARGET_SPACING * 2;
 
 fn finalized_state_query_interrupted_error() -> BoxError {
     "Zakura is committing too many blocks to the state, \
@@ -325,21 +320,19 @@ fn adjust_difficulty_and_time_for_testnet(
         .checked_add(Duration32::from_seconds(1))
         .expect("a valid block time plus a small constant is in-range");
 
-    // If a miner is likely to find a block with the cur_time and standard difficulty
-    // within a target block interval or two, keep the original difficulty.
-    // Otherwise, try to use the minimum difficulty.
+    // Offer a minimum-difficulty template only once `cur_time` is strictly past
+    // `previous_block_time + 6 * PoWTargetSpacing` (the latest time a standard-difficulty
+    // block may use; a minimum-difficulty block's time must be strictly greater).
     //
-    // This is a Zebra-specific standard rule.
+    // A minimum-difficulty block is only consensus-valid if its time is more than
+    // `6 * PoWTargetSpacing` after the previous block. Switching before then would require
+    // future-dating the block timestamp purely to obtain minimum difficulty.
     //
     // We don't need to undo the clamping here:
     // - if cur_time is clamped to min_time, then we're more likely to have a minimum
     //    difficulty block, which makes mining easier;
     // - if cur_time gets clamped to max_time, this is almost always a minimum difficulty block.
-    let local_std_difficulty_limit = std_difficulty_max_time
-        .checked_sub(Duration32::from_seconds(EXTRA_TIME_TO_MINE_A_BLOCK))
-        .expect("a valid block time minus a small constant is in-range");
-
-    if result.cur_time <= local_std_difficulty_limit {
+    if result.cur_time <= std_difficulty_max_time {
         // Standard difficulty: the cur and max time need to exclude min difficulty blocks
 
         // The maximum time can only be decreased, and only as far as min_time.
@@ -367,5 +360,79 @@ fn adjust_difficulty_and_time_for_testnet(
             relevant_data.iter().cloned(),
         )
         .expected_difficulty_threshold();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zakura_chain::work::difficulty::ParameterDifficulty as _;
+
+    const ACTIVE_HEIGHT: Height = Height(2_000_000);
+    const PREVIOUS_TIME: u32 = 1_600_000_000;
+    const MINIMUM_DIFFICULTY_GAP: u32 = 6 * 75;
+
+    fn recent_block_data(network: &Network) -> Vec<(CompactDifficulty, DateTime<Utc>)> {
+        let threshold = network.target_difficulty_limit().to_compact();
+        (0..POW_ADJUSTMENT_BLOCK_SPAN)
+            .map(|offset| {
+                let offset = u32::try_from(offset)
+                    .expect("the difficulty adjustment block span fits in u32");
+                (threshold, DateTime32::from(PREVIOUS_TIME - offset).into())
+            })
+            .collect()
+    }
+
+    fn chain_info(cur_time: u32) -> GetBlockTemplateChainInfo {
+        GetBlockTemplateChainInfo {
+            tip_hash: Hash([0; 32]),
+            tip_height: Height(0),
+            chain_history_root: None,
+            expected_difficulty: CompactDifficulty::default(),
+            cur_time: DateTime32::from(cur_time),
+            min_time: DateTime32::from(PREVIOUS_TIME - 100),
+            max_time: DateTime32::from(PREVIOUS_TIME + BLOCK_MAX_TIME_SINCE_MEDIAN),
+        }
+    }
+
+    #[test]
+    fn eager_window_stays_standard_difficulty_and_is_not_future_dated() {
+        let network = Network::new_default_testnet();
+        let cur_time = PREVIOUS_TIME + 400;
+        let mut result = chain_info(cur_time);
+
+        adjust_difficulty_and_time_for_testnet(
+            &mut result,
+            &network,
+            ACTIVE_HEIGHT,
+            recent_block_data(&network),
+        );
+
+        assert_eq!(result.expected_difficulty, CompactDifficulty::default());
+        assert_eq!(result.cur_time, DateTime32::from(cur_time));
+        assert_eq!(
+            result.max_time,
+            DateTime32::from(PREVIOUS_TIME + MINIMUM_DIFFICULTY_GAP)
+        );
+    }
+
+    #[test]
+    fn past_threshold_switches_to_minimum_difficulty() {
+        let network = Network::new_default_testnet();
+        let cur_time = PREVIOUS_TIME + MINIMUM_DIFFICULTY_GAP + 1;
+        let mut result = chain_info(cur_time);
+
+        adjust_difficulty_and_time_for_testnet(
+            &mut result,
+            &network,
+            ACTIVE_HEIGHT,
+            recent_block_data(&network),
+        );
+
+        assert_eq!(
+            result.expected_difficulty,
+            network.target_difficulty_limit().to_compact()
+        );
+        assert_eq!(result.cur_time, DateTime32::from(cur_time));
     }
 }

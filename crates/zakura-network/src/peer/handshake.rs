@@ -250,6 +250,16 @@ pub fn get_unspecified_ipv4_addr(network: Network) -> SocketAddr {
 
 use ConnectedAddr::*;
 
+fn missing_required_services(
+    is_syncing: bool,
+    connected_addr: &ConnectedAddr,
+    services: PeerServices,
+) -> bool {
+    is_syncing
+        && matches!(connected_addr, OutboundDirect { .. } | OutboundProxy { .. })
+        && !services.contains(PeerServices::NODE_NETWORK)
+}
+
 impl ConnectedAddr {
     /// Returns a new outbound directly connected addr.
     pub fn new_outbound_direct(addr: PeerSocketAddr) -> ConnectedAddr {
@@ -786,6 +796,10 @@ where
         .single()
         .expect("in-range number of seconds and valid nanosecond");
 
+    let is_syncing = !minimum_peer_version
+        .chain_tip()
+        .is_at_or_near_network_tip(&config.network);
+
     let (their_addr, our_services, our_listen_addr) = match connected_addr {
         // Version messages require an address, so we use
         // an unspecified address for Isolated connections
@@ -931,6 +945,29 @@ where
 
         // Disconnect if peer is using an obsolete version.
         return Err(HandshakeError::ObsoleteVersion(remote.version));
+    }
+
+    // While syncing, outbound peers must be able to serve historical blocks. Otherwise,
+    // non-serving peers can occupy every outbound slot and stall a fresh sync.
+    if missing_required_services(is_syncing, connected_addr, remote.services) {
+        debug!(
+            remote_ip = %addr_label,
+            ?remote.services,
+            ?remote.user_agent,
+            "disconnecting from non-serving peer",
+        );
+
+        metrics::counter!(
+            "zcash.net.peers.missing_services",
+            "remote_ip" => addr_label,
+            "remote_services" => format!("{:?}", remote.services),
+            "user_agent" => remote.user_agent.clone(),
+        )
+        .increment(1);
+
+        return Err(HandshakeError::MissingRequiredServices {
+            services: remote.services,
+        });
     }
 
     let negotiated_version = min(constants::CURRENT_NETWORK_PROTOCOL_VERSION, remote.version);
@@ -1541,6 +1578,9 @@ where
                         HandshakeError::Io(_) => "io_error",
                         HandshakeError::Serialization(_) => "serialization",
                         HandshakeError::ObsoleteVersion(_) => "obsolete_version",
+                        HandshakeError::MissingRequiredServices { .. } => {
+                            "missing_required_services"
+                        }
                         HandshakeError::Timeout => "timeout",
                         HandshakeError::ZakuraUpgradeSelected
                         | HandshakeError::ZakuraUpgrade(_)

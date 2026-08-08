@@ -44,7 +44,7 @@ use std::{
 };
 
 use futures::{future::BoxFuture, FutureExt};
-use tower::Service;
+use tower::{Service, ServiceExt};
 
 use crate::BoxError;
 
@@ -153,19 +153,55 @@ impl<S> Memoized<S> {
     pub fn inner(&self) -> &S {
         &self.inner
     }
+
+    /// Returns a memo sharing this one's remembered keys, but consulting `inner` on a miss.
+    ///
+    /// Test-only. It exists so a test can warm the memo through a healthy service and then swap
+    /// in a broken one, which is how the hit path is exercised in isolation from the inner
+    /// service.
+    #[cfg(test)]
+    pub(super) fn with_inner<T>(&self, inner: T) -> Memoized<T> {
+        Memoized {
+            inner,
+            verified: self.verified.clone(),
+        }
+    }
 }
 
 impl<S> Service<Item> for Memoized<S>
 where
-    S: Service<Item, Response = (), Error = BoxError>,
+    S: Service<Item, Response = (), Error = BoxError> + Clone + Send + 'static,
     S::Future: Send + 'static,
 {
     type Response = ();
     type Error = BoxError;
     type Future = BoxFuture<'static, Result<(), BoxError>>;
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
+    /// Always ready.
+    ///
+    /// This deliberately does **not** delegate to the inner service, because at this point the
+    /// item is not yet known and so neither is whether the inner service will be used at all.
+    /// Delegating would reserve inner capacity for every request, including the hits that never
+    /// spend it:
+    ///
+    ///   * [`Batch::poll_ready`](tower_batch_control::Batch) holds a semaphore permit in the
+    ///     service until [`Batch::call`] consumes it. A hit returns without calling the inner
+    ///     service, so that permit is only released when the handle is dropped — until then it
+    ///     is capacity denied to a genuine miss.
+    ///
+    ///   * More importantly, `Batch::poll_ready` returns an error when its worker has exited or
+    ///     its channel has closed. Callers poll readiness *before* `call`, so that error would
+    ///     be returned for an item whose result this memo already holds — reporting a verified
+    ///     proof as a verification failure, which is exactly the "an error need not be a verdict"
+    ///     case the module docs are about. Returning ready here means a hit is answered from the
+    ///     memo whatever state the batch worker is in.
+    ///
+    /// Readiness is instead awaited inside [`Self::call`], on the miss path, where it belongs.
+    /// The semaphore still bounds concurrent batch requests: a miss acquires its permit before
+    /// calling, exactly as before. What changes is only *when* the wait happens, which for the
+    /// `oneshot` call sites this service has is the same instant either way.
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, item: Item) -> Self::Future {
@@ -185,10 +221,15 @@ where
         metrics::counter!("zakura.consensus.halo2.memo.miss").increment(1);
 
         let verified = self.verified.clone();
-        let response = self.inner.call(item);
+        let mut inner = self.inner.clone();
 
         async move {
-            let result = response.await;
+            // Readiness is acquired here rather than in `poll_ready` so that only misses reserve
+            // inner capacity. See `poll_ready`.
+            let result = match inner.ready().await {
+                Ok(inner) => inner.call(item).await,
+                Err(error) => Err(error),
+            };
 
             // Only successes are recorded: see the module docs.
             if result.is_ok() {

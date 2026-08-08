@@ -646,7 +646,7 @@ async fn memo_does_not_remember_failures() {
 /// Verifies `item` through `verifier`, asserting that it succeeds.
 async fn verify_through<S>(verifier: &mut Memoized<S>, item: Item)
 where
-    S: Service<Item, Response = (), Error = BoxError>,
+    S: Service<Item, Response = (), Error = BoxError> + Clone + Send + 'static,
     S::Future: Send + 'static,
 {
     verifier
@@ -690,4 +690,112 @@ async fn memo_evicts_in_insertion_order_and_stays_correct_when_full() {
     // The oldest was evicted, so it is verified again rather than silently mis-answered.
     verify_through(&mut verifier, Item::new(bundle.clone(), sighashes[0])).await;
     assert_eq!(inner.calls(), 4, "an evicted entry must be re-verified");
+}
+
+/// An inner service whose readiness always fails, standing in for a dead batch worker.
+///
+/// `Batch::poll_ready` reports an error when its worker has exited, panicked, or closed its
+/// channel. `call` panics here because it must never be reached: a service that is not ready
+/// must not be called, and the tests below are about what happens *before* that point.
+#[derive(Clone)]
+struct UnreadyVerifier {
+    poll_readies: Arc<AtomicUsize>,
+}
+
+impl UnreadyVerifier {
+    fn new() -> Self {
+        Self {
+            poll_readies: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn poll_readies(&self) -> usize {
+        self.poll_readies.load(Ordering::SeqCst)
+    }
+}
+
+impl Service<Item> for UnreadyVerifier {
+    type Response = ();
+    type Error = BoxError;
+    type Future = future::Ready<Result<(), BoxError>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.poll_readies.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(Err(BoxError::from("batch worker finished unexpectedly")))
+    }
+
+    fn call(&mut self, _item: Item) -> Self::Future {
+        unreachable!("a service whose poll_ready failed must not be called")
+    }
+}
+
+/// A memo hit is answered even when the inner service can no longer become ready.
+///
+/// `Memoized::poll_ready` must not delegate to the inner service. Callers poll readiness before
+/// `call`, so delegating would surface a dead batch worker's error for an item whose result the
+/// memo already holds — reporting a verified proof as a verification failure, and rejecting a
+/// valid block. That is the "an error need not be a verdict" case the module docs are about.
+#[tokio::test]
+async fn memo_hit_survives_an_inner_service_that_never_becomes_ready() {
+    let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+    let item = Item::new(bundle, sighash);
+
+    // Warm the memo through a healthy inner service.
+    let healthy = CountingVerifier::new(true);
+    let mut verifier = Memoized::new(healthy.clone(), 8);
+    verify_through(&mut verifier, item.clone()).await;
+    assert_eq!(healthy.calls(), 1, "the first verification must be a miss");
+
+    // Swap in an inner service that can never become ready, keeping the same memo.
+    let dead = UnreadyVerifier::new();
+    let mut verifier = verifier.with_inner(dead.clone());
+
+    verifier
+        .ready()
+        .await
+        .expect("the memo must be ready even when the inner service is not")
+        .call(item)
+        .await
+        .expect("a memo hit must be answered from the memo, not from the dead inner service");
+
+    assert_eq!(
+        dead.poll_readies(),
+        0,
+        "a hit must not poll the inner service for readiness at all"
+    );
+}
+
+/// A miss still propagates an inner readiness failure.
+///
+/// Moving readiness off `poll_ready` must not make the memo swallow it: an item that is not in
+/// the memo has to reach the inner service, and if that service cannot become ready the request
+/// must fail rather than be reported as verified.
+#[tokio::test]
+async fn memo_miss_propagates_an_inner_readiness_failure() {
+    let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+    let dead = UnreadyVerifier::new();
+    let mut verifier = Memoized::new(dead.clone(), 8);
+
+    verifier
+        .ready()
+        .await
+        .expect("the memo itself is always ready")
+        .call(Item::new(bundle.clone(), sighash))
+        .await
+        .expect_err("a miss must surface the inner service's readiness failure");
+
+    assert!(
+        dead.poll_readies() > 0,
+        "a miss must acquire inner readiness"
+    );
+
+    // And the failure must not be remembered as a success.
+    let mut verifier = verifier.with_inner(CountingVerifier::new(true));
+    let counting = verifier.inner().clone();
+    verify_through(&mut verifier, Item::new(bundle, sighash)).await;
+    assert_eq!(
+        counting.calls(),
+        1,
+        "the item must still be verified, so the readiness failure was not recorded as an Ok"
+    );
 }

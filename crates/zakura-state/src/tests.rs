@@ -85,7 +85,7 @@ fn round_trip_work_expanded() {
     let _init_guard = zakura_test::init();
 
     proptest!(|(work_before in any::<Work>())| {
-        let work: U256 = work_before.as_u128().into();
+        let work = work_before.as_u256();
         let expanded = work_to_expanded(work);
         let work_after = Work::try_from(expanded).unwrap();
         prop_assert_eq!(work_before, work_after);

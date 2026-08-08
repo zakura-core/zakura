@@ -99,27 +99,39 @@ impl Solution {
     /// proof-of-work parameters by choosing the on-wire solution length.
     #[allow(clippy::unwrap_in_result)]
     pub fn check(&self, header: &Header, network: &Network) -> Result<(), Error> {
+        self.validate_shape(network)?;
+
         // TODO:
         // - Add Equihash parameters field to `testnet::Parameters`
         // - Update `Solution::Regtest` variant to hold a `Vec` to support arbitrary parameters - rename to `Other`
-        let (n, k) = match (network.is_regtest(), self) {
+        let (n, k) = if network.is_regtest() {
+            (REGTEST_N, REGTEST_K)
+        } else {
+            (200, 9)
+        };
+
+        self.check_equihash(header, n, k)
+    }
+
+    /// Validate that this solution's encoded shape matches the authenticated network parameters,
+    /// without verifying the Equihash proof.
+    pub fn validate_shape(&self, network: &Network) -> Result<(), Error> {
+        match (network.is_regtest(), self) {
             // Mainnet and Testnet require the memory-hard (200, 9) parameters,
             // encoded as a 1344-byte `Common` solution.
-            (false, Solution::Common(_)) => (200, 9),
+            (false, Solution::Common(_)) => Ok(()),
             // Regtest requires the toy (48, 5) parameters used by zcashd.
-            (true, Solution::Regtest(_)) => (REGTEST_N, REGTEST_K),
+            (true, Solution::Regtest(_)) => Ok(()),
             // Reject a solution variant that does not match the active
             // network before selecting parameters. Otherwise the
             // attacker-controlled solution length could change the PoW
             // parameter set.
             (false, Solution::Regtest(_)) | (true, Solution::Common(_)) => {
-                return Err(Error::InvalidSolutionSize {
+                Err(Error::InvalidSolutionSize {
                     network: network.clone(),
                 })
             }
-        };
-
-        self.check_equihash(header, n, k)
+        }
     }
 
     /// Returns `Ok(())` if this solution is valid for `header` under the given

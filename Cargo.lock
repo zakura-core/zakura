@@ -8357,7 +8357,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "bech32",
  "bitflags",
@@ -8476,6 +8476,19 @@ dependencies = [
  "zcash_protocol",
  "zcash_script",
  "zcash_transparent",
+]
+
+[[package]]
+name = "zakura-header-chain"
+version = "1.0.0-rc0"
+dependencies = [
+ "chrono",
+ "proptest",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "toml 1.1.2+spec-1.1.0",
+ "zakura-chain",
+ "zakura-test",
 ]
 
 [[package]]

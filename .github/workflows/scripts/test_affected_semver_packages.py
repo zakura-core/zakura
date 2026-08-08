@@ -119,6 +119,22 @@ class AffectedSemverPackagesTest(unittest.TestCase):
 
         self.assertEqual(affected, ["base"])
 
+    def test_excludes_publishable_crate_without_registry_baseline(self):
+        packages = [
+            self.package("zakura-header-chain"),
+            self.package(
+                "dependent",
+                dependencies=[self.dependency("zakura-header-chain")],
+            ),
+        ]
+
+        affected = affected_semver_packages.affected_publishable_packages(
+            self.metadata(packages),
+            changed_files=["zakura-header-chain/src/lib.rs"],
+        )
+
+        self.assertEqual(affected, ["dependent"])
+
 
 if __name__ == "__main__":
     unittest.main()

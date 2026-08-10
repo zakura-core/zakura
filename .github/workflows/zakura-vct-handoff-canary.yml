@@ -4,6 +4,12 @@ name: VCT handoff canary
 # frontier, forces the Zakura P2P/tree_aux path, and succeeds only after C is
 # finalized, the best chain reaches C+1, and VCT fast-path metrics increment.
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
+      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
   workflow_call:
     inputs:
       target_ref:
@@ -25,7 +31,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: zakura-vct-handoff-canary-${{ inputs.target_ref || 'main' }}
+  group: zakura-vct-handoff-canary-${{ inputs.target_ref || github.event.pull_request.head.sha || 'main' }}
   cancel-in-progress: false
 
 jobs:
@@ -36,7 +42,7 @@ jobs:
       contents: read
       pull-requests: write
     with:
-      ref: ${{ inputs.target_ref || 'main' }}
+      ref: ${{ inputs.target_ref || github.event.pull_request.head.sha || 'main' }}
       snapshot_mode: pre-checkpoint
       network: mainnet
       duration_minutes: "60"
@@ -54,7 +60,7 @@ jobs:
       contents: read
     env:
       SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
-      TARGET_REF: ${{ inputs.target_ref || 'main' }}
+      TARGET_REF: ${{ inputs.target_ref || github.event.pull_request.head.sha || 'main' }}
       TARGET_SHA: ${{ needs.handoff.outputs.target_sha }}
       MAX_CHECKPOINT: ${{ needs.handoff.outputs.max_checkpoint }}
       START_HEIGHT: ${{ needs.handoff.outputs.start_height }}

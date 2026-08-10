@@ -1,7 +1,7 @@
 # This workflow is the only supported path for creating v* release tags.
-# It proves the Mainnet VCT handoff and builds/verifies every release asset
-# before a protected environment allows the release GitHub App to publish a
-# draft and create the immutable tag.
+# It dispatches an advisory Mainnet VCT handoff canary and builds/verifies every
+# release asset before a protected environment allows the release GitHub App to
+# publish a draft and create the immutable tag.
 #
 # It dispatches from main, or from a hotfix/vX.Y.Z branch named for the exact
 # tag it releases (see docs/security-hotfix-release.md). The
@@ -201,16 +201,24 @@ jobs:
           jq . <<<"$report" >> "$GITHUB_STEP_SUMMARY"
 
   handoff-canary:
-    name: Verify VCT handoff crossing
+    name: Dispatch VCT handoff crossing
     needs: [validate]
     if: ${{ !inputs.source_first_release }}
-    uses: ./.github/workflows/zakura-vct-handoff-canary.yml
+    runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: read
-      pull-requests: write
-    with:
-      target_ref: ${{ needs.validate.outputs.target_sha }}
-    secrets: inherit
+    steps:
+      - name: Dispatch non-blocking handoff canary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ github.ref_name }}
+          TARGET_SHA: ${{ needs.validate.outputs.target_sha }}
+        run: |
+          gh workflow run zakura-vct-handoff-canary.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$SOURCE_REF" \
+            -f target_ref="$TARGET_SHA"
 
   build-assets:
     name: Build and verify release assets
@@ -236,17 +244,14 @@ jobs:
   publish:
     name: Publish release and create tag
     runs-on: ubuntu-latest
-    needs: [validate, handoff-canary, build-assets]
-    # Tolerate release gates being skipped only when emergency Mode B asked
-    # for the source-first path.
+    needs: [validate, build-assets]
+    # Tolerate asset staging being skipped only when emergency Mode B asked for
+    # the source-first path. The separately dispatched handoff canary is
+    # advisory and reports failures without delaying publication.
     if: >-
       ${{
         !cancelled()
         && needs.validate.result == 'success'
-        && (
-          needs.handoff-canary.result == 'success'
-          || (inputs.source_first_release && needs.handoff-canary.result == 'skipped')
-        )
         && (
           needs.build-assets.result == 'success'
           || (inputs.source_first_release && needs.build-assets.result == 'skipped')

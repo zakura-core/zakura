@@ -167,21 +167,17 @@ impl Item {
 
     /// Returns a key that determines every input to this item's proof verification.
     ///
-    /// [`Cached`] reuses a previous `Ok` result whenever this key matches, so the key must
-    /// commit to everything [`BatchValidator::add_bundle`] reads. It hashes the bundle's own
-    /// consensus encoding, which is injective and covers all of it: the per-action value
-    /// commitments, nullifiers, validating keys, note commitments and spend authorization
-    /// signatures, the bundle flags, value balance, anchor, proof, and binding signature.
+    /// [`Cached`] reuses a previous `Ok` result whenever this key matches, so the key must commit
+    /// to everything [`BatchValidator::add_bundle`] reads. Hashing the bundle's own consensus
+    /// encoding does that, being injective over the whole bundle.
     ///
-    /// The verifying key is *not* in the key. It does not need to be: each Orchard circuit era
-    /// has its own verifier and therefore its own cache, so an entry can only ever be read back
-    /// under the key it was written against. See [`verifier_for`].
+    /// The verifying key is deliberately absent: each Orchard circuit era has its own verifier and
+    /// so its own cache, so an entry is only ever read back under the key it was written against
+    /// (see [`verifier_for`]).
     ///
-    /// Deriving this by hand from things that "obviously" determine the bundle is how this goes
-    /// wrong. The txid does not commit to authorizing data at all under ZIP 244 — that was
-    /// CVE-2026-34377 — and even `(auth digest, sighash)` is incomplete, because the Orchard and
-    /// Ironwood bundles of one v6 transaction share both. Hashing the encoding avoids having to
-    /// get that reasoning right.
+    /// Deriving the key by hand instead is how this goes wrong. The txid does not commit to
+    /// authorizing data under ZIP 244 (CVE-2026-34377), and even `(auth digest, sighash)` is
+    /// incomplete, because the Orchard and Ironwood bundles of one v6 transaction share both.
     fn cache_key(&self) -> CacheKey {
         // Destructured exhaustively on purpose: adding a field to `Item` is a compile error here
         // until someone decides whether it belongs in the key.
@@ -196,10 +192,9 @@ impl Item {
         hasher.update(&sighash.0);
 
         // A total encoder is required, because `cache_key` cannot fail. `write_v5_bundle` and
-        // `write_v6_bundle` both delegate to one private `write_bundle` and differ only in v6's
-        // precondition on the bundle version, so v5 encodes every version — including the
-        // Ironwood ones outside its documented v5 contract — and the choice between the two
-        // cannot change the bytes. The version itself is the discriminant above.
+        // `write_v6_bundle` both delegate to one private `write_bundle`, differing only in v6's
+        // precondition on the bundle version, so v5 encodes every version — including Ironwood's,
+        // outside its documented v5 contract — and the choice cannot change the bytes.
         let mut encoded = Vec::new();
         write_v5_bundle(Some(bundle.as_ref()), &mut encoded)
             .expect("encoding a bundle into a Vec cannot fail: the encoder only reports IO errors");

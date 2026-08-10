@@ -38,7 +38,6 @@ progress-bar = [
 # tor = ["arti-client", "tor-rtcompat"]
 
 # Testing features that activate extra dependencies
-header-fuzz = []
 proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl"]
 zakura-testkit = []
 
@@ -94,9 +93,7 @@ proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
 zakura-chain = { path = "../zakura-chain", version = "4.0.0", features = ["async-error"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0-rc0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.1.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "3.1.0" }
 
 [dev-dependencies]
 anyhow = { workspace = true }

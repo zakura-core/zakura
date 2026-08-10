@@ -92,6 +92,8 @@ pub enum AuditViolation {
 /// Reconstructible categories replaced by one atomic recovery transaction.
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RecoveryRepair {
+    /// A fully audited store was rebound to the currently configured trust-anchor manifest.
+    TrustAnchorConfiguration,
     /// Parent/child adjacency differed from source nodes.
     ChildIndex,
     /// Future-time index differed from node states.
@@ -160,7 +162,7 @@ pub fn audit_store<S: StoreAuditRead>(
     store: &S,
     config: &EngineConfig,
 ) -> Result<RecoveryPlan, RecoveryFailure> {
-    audit_store_at(store, config, Utc::now())
+    audit_store_at_with_policy(store, config, Utc::now(), false)
 }
 
 /// Audit authoritative rows using an injected consensus-local recovery time.
@@ -169,14 +171,36 @@ pub fn audit_store_at<S: StoreAuditRead>(
     config: &EngineConfig,
     now: DateTime<Utc>,
 ) -> Result<RecoveryPlan, RecoveryFailure> {
+    audit_store_at_with_policy(store, config, now, false)
+}
+
+/// Audit every authoritative row against the current configuration, then plan an atomic
+/// trust-anchor-manifest rebind when that digest is the only configuration difference.
+///
+/// This startup-only compatibility path permits release checkpoint extensions, but it does not
+/// permit mode, network, disk format, bootstrap origin, checkpoint, or source-row mismatches.
+pub fn audit_store_for_trust_anchor_update<S: StoreAuditRead>(
+    store: &S,
+    config: &EngineConfig,
+) -> Result<RecoveryPlan, RecoveryFailure> {
+    audit_store_at_with_policy(store, config, Utc::now(), true)
+}
+
+fn audit_store_at_with_policy<S: StoreAuditRead>(
+    store: &S,
+    config: &EngineConfig,
+    now: DateTime<Utc>,
+    allow_trust_anchor_update: bool,
+) -> Result<RecoveryPlan, RecoveryFailure> {
     let before = store.snapshot()?;
     let mut metadata = store.metadata()?;
     let mut violations = Vec::new();
+    let trust_anchor_changed = metadata.anchor_manifest_digest != config.trust_anchor_digest();
     if before != metadata.snapshot()
         || metadata.disk_format.0 != 1
         || metadata.mode != config.mode
         || metadata.network_id != config.network.kind()
-        || metadata.anchor_manifest_digest != config.trust_anchor_digest()
+        || trust_anchor_changed && !allow_trust_anchor_update
         || metadata.work_origin != config.bootstrap_anchor().frontier
     {
         violations.push(AuditViolation::Configuration);
@@ -280,6 +304,9 @@ pub fn audit_store_at<S: StoreAuditRead>(
     let verified_projection = verified_path(&node_map, &metadata)?;
 
     let mut repairs = BTreeSet::new();
+    if trust_anchor_changed {
+        repairs.insert(RecoveryRepair::TrustAnchorConfiguration);
+    }
     if elapsed_deferrals {
         repairs.insert(RecoveryRepair::ElapsedDeferrals);
         repairs.insert(RecoveryRepair::DeferredIndex);
@@ -332,6 +359,7 @@ pub fn audit_store_at<S: StoreAuditRead>(
 
     if !repairs.is_empty() {
         metadata.state_version = metadata.state_version.checked_next()?;
+        metadata.anchor_manifest_digest = config.trust_anchor_digest();
         if repairs.contains(&RecoveryRepair::SelectedProjection)
             || repairs.contains(&RecoveryRepair::InheritedEligibility)
             || repairs.contains(&RecoveryRepair::ElapsedDeferrals)
@@ -1054,6 +1082,74 @@ mod tests {
         let plan = audit_store(&store, &config).expect("the coherent fixture audits cleanly");
         assert!(plan.is_clean());
         assert_eq!(plan.metadata, store.metadata);
+    }
+
+    #[test]
+    fn trust_anchor_update_rebinds_only_after_current_pins_audit() {
+        let (mut store, mut config) = fixture();
+        let previous_state_version = store.metadata.state_version;
+        config.replace_local_checkpoints(
+            CheckpointSet::new([Frontier::new(block::Height(10), block::Hash([0x91; 32]))])
+                .expect("the extension checkpoint is unique"),
+        );
+
+        assert!(matches!(
+            audit_store(&store, &config),
+            Err(RecoveryFailure::Source { violations })
+                if violations == vec![AuditViolation::Configuration]
+        ));
+        let plan = audit_store_for_trust_anchor_update(&store, &config)
+            .expect("a future checkpoint extension can rebind an otherwise coherent store");
+        assert_eq!(
+            plan.repairs,
+            BTreeSet::from([RecoveryRepair::TrustAnchorConfiguration])
+        );
+        assert_eq!(
+            plan.metadata.state_version,
+            previous_state_version
+                .checked_next()
+                .expect("the fixture state version can advance")
+        );
+        assert_eq!(
+            plan.metadata.anchor_manifest_digest,
+            config.trust_anchor_digest()
+        );
+        assert_eq!(
+            plan.metadata.header_generation,
+            store.metadata.header_generation
+        );
+        assert_eq!(
+            plan.metadata.verified_generation,
+            store.metadata.verified_generation
+        );
+
+        store.metadata = plan.metadata;
+        store.snapshot = store.metadata.snapshot();
+        assert!(audit_store(&store, &config)
+            .expect("the rebound store passes the strict audit")
+            .is_clean());
+
+        let mut wrong_mode = config.clone();
+        wrong_mode.mode = EngineMode::HeadersOnly;
+        assert!(matches!(
+            audit_store_for_trust_anchor_update(&store, &wrong_mode),
+            Err(RecoveryFailure::Source { violations })
+                if violations.contains(&AuditViolation::Configuration)
+        ));
+
+        let mut conflicting = config;
+        conflicting.replace_local_checkpoints(
+            CheckpointSet::new([Frontier::new(
+                store.nodes[1].height,
+                block::Hash([0x92; 32]),
+            )])
+            .expect("the conflicting checkpoint is unique"),
+        );
+        assert!(matches!(
+            audit_store_for_trust_anchor_update(&store, &conflicting),
+            Err(RecoveryFailure::Source { violations })
+                if violations.iter().any(|violation| matches!(violation, AuditViolation::TrustPin(_, _)))
+        ));
     }
 
     #[test]

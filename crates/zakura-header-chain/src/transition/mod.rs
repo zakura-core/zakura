@@ -17,8 +17,8 @@ pub(crate) use invariants::verify_plan;
 pub use invariants::InvariantViolation;
 pub use planner::{TransitionFailure, TransitionPlan};
 pub use recovery::{
-    audit_store, audit_store_at, AuditViolation, RecoveryFailure, RecoveryPlan, RecoveryRepair,
-    StoreAuditRead, ValidationContextRecord,
+    audit_store, audit_store_at, audit_store_for_trust_anchor_update, AuditViolation,
+    RecoveryFailure, RecoveryPlan, RecoveryRepair, StoreAuditRead, ValidationContextRecord,
 };
 pub use store::StoreError;
 pub use types::*;

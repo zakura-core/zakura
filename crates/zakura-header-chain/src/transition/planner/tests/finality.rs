@@ -731,3 +731,49 @@ fn integrated_finality_requires_authority_and_exact_verified_path() {
         FinalitySource::FullState { evidence } if evidence == finality_id
     ));
 }
+
+#[test]
+fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let insert = insertion(&store, 1, EvidenceId::from_digest([0x91; 32]));
+    let insert_plan = apply_transition(&store, insert, &context(&config, &clock, None))
+        .expect("network insertion prepares the checkpoint header");
+    store.commit(&insert_plan);
+
+    let old_tip = store.metadata.frontiers.verified_best;
+    let checkpoint = store.metadata.frontiers.header_best;
+    let header = store
+        .graph
+        .node(checkpoint.hash)
+        .expect("the checkpoint header was inserted")
+        .header
+        .clone();
+    let evidence = EvidenceId::from_digest([0x92; 32]);
+    let request = TransitionRequest {
+        expected_version: store.metadata.state_version,
+        event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+            full_state_transition_id: evidence,
+            old_tip,
+            new_path: vec![crate::VerifiedHeaderRef {
+                height: checkpoint.height,
+                hash: checkpoint.hash,
+                header,
+            }],
+            cause: crate::VerifiedChangeCause::CheckpointFinalizedGrow,
+        }),
+    };
+
+    let plan = apply_transition(&store, request, &context(&config, &clock, Some(&authority)))
+        .expect("checkpoint authority advances verification and finality together");
+    assert_eq!(plan.change_set.metadata.frontiers.verified_best, checkpoint);
+    assert_eq!(plan.change_set.metadata.frontiers.finalized, checkpoint);
+    assert!(matches!(
+        plan.change_set
+            .finality_append
+            .expect("checkpoint finality is recorded")
+            .source,
+        FinalitySource::FullState { evidence: actual } if actual == evidence
+    ));
+}

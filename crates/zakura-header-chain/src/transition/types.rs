@@ -420,7 +420,7 @@ pub struct TreeAuxRecordV1 {
     pub sapling_root: sapling::tree::Root,
     /// End-of-block Orchard root, empty below NU5.
     pub orchard_root: orchard::tree::Root,
-    /// End-of-block Ironwood root, empty before configured NU7.
+    /// End-of-block Ironwood root, empty below NU6.3.
     pub ironwood_root: ironwood::tree::Root,
     /// Per-block Sapling shielded transaction count.
     pub sapling_tx_count: u64,
@@ -515,6 +515,8 @@ pub struct VerifiedHeaderRef {
 pub enum VerifiedChangeCause {
     /// Direct or forward growth.
     Grow,
+    /// Checkpoint-verified growth that atomically advances integrated full-state finality.
+    CheckpointFinalizedGrow,
     /// Same-height, lower-height, or forward-height branch reset.
     Reset,
 }
@@ -1096,6 +1098,7 @@ fn hash_transition_payload(hasher: &mut Sha256, event: &TransitionEvent) {
             hasher.update([match event.cause {
                 VerifiedChangeCause::Grow => 0,
                 VerifiedChangeCause::Reset => 1,
+                VerifiedChangeCause::CheckpointFinalizedGrow => 2,
             }]);
             hash_verified_path(hasher, &event.new_path);
         }

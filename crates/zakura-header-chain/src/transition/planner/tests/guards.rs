@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn retention_references_admit_all_staged_targets_and_candidate_tips() {
+    let (store, config) = TestStore::new(EngineMode::HeadersOnly);
+    let clock = ManualClock(Utc::now());
+    let references = vec![
+        store.metadata.frontiers.finalized.hash;
+        crate::MAX_STAGED_TARGETS_V1 + crate::MAX_CANDIDATE_TIPS_V1
+    ];
+
+    apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::ReevaluateDeferred,
+        },
+        &TransitionContext {
+            config: &config,
+            clock: &clock,
+            full_state_authority: None,
+            retention_references: &references,
+        },
+    )
+    .expect("one transition admits every active header target and full-state fork tip");
+}
+
+#[test]
 fn retention_references_are_bounded_before_ancestry_walks() {
     let (store, config) = TestStore::new(EngineMode::HeadersOnly);
     let clock = ManualClock(Utc::now());

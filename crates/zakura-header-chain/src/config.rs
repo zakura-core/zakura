@@ -29,10 +29,10 @@ pub const MAX_HEADERS_PER_TRANSITION_V1: usize = 4_000;
 pub const MAX_AUX_DELIVERIES_PER_HEADER_V1: usize = 16;
 /// Exact v1 maximum auxiliary deliveries retained across the graph.
 pub const MAX_AUX_DELIVERIES_TOTAL_V1: usize = MAX_NON_FINALIZED_NODES_V1;
-/// Exact v1 maximum active retained-path references supplied to one transition.
-pub const MAX_RETENTION_REFERENCES_V1: usize = MAX_STAGED_TARGETS_V1;
 /// Exact v1 maximum number of candidate tips.
 pub const MAX_CANDIDATE_TIPS_V1: usize = MAX_NON_FINALIZED_CHAIN_FORKS;
+/// Exact v1 maximum active retained-path references supplied to one transition.
+pub const MAX_RETENTION_REFERENCES_V1: usize = MAX_STAGED_TARGETS_V1 + MAX_CANDIDATE_TIPS_V1;
 
 /// Header-engine integration and finality mode.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -342,7 +342,7 @@ const _: () = assert!(MAX_STAGED_TARGETS_V1 == 16);
 const _: () = assert!(MAX_HEADERS_PER_TRANSITION_V1 == 4_000);
 const _: () = assert!(MAX_AUX_DELIVERIES_PER_HEADER_V1 == 16);
 const _: () = assert!(MAX_AUX_DELIVERIES_TOTAL_V1 == 65_536);
-const _: () = assert!(MAX_RETENTION_REFERENCES_V1 == 16);
+const _: () = assert!(MAX_RETENTION_REFERENCES_V1 == 26);
 
 #[cfg(test)]
 mod tests {
@@ -361,6 +361,11 @@ mod tests {
         assert_eq!(limits.local_finality_depth.get(), 1_000);
         assert_eq!(limits.max_candidate_tips.get(), 10);
         assert_eq!(limits.max_non_finalized_nodes.get(), 65_536);
+        assert_eq!(
+            limits.max_retention_references.get(),
+            MAX_STAGED_TARGETS_V1 + limits.max_candidate_tips.get(),
+            "one atomic transition can retain every active header target and full-state fork tip"
+        );
     }
 
     #[test]

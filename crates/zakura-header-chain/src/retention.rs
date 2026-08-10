@@ -6,7 +6,7 @@ use zakura_chain::block;
 
 use crate::{
     graph::{HeaderGraphEdit, HeaderGraphView},
-    EngineLimits, Frontier, GraphError,
+    BodyValidationState, EngineLimits, Frontier, GraphError,
 };
 
 /// Deterministic result of enforcing DAG resource bounds.
@@ -29,6 +29,16 @@ pub(crate) fn enforce_retention<G: HeaderGraphEdit>(
     let mut protected = HashSet::new();
     protect_path(store, header_best.hash, &mut protected)?;
     protect_path(store, verified_best.hash, &mut protected)?;
+    let verified_body_hashes = store
+        .view_nodes()
+        .into_iter()
+        .filter_map(|node| {
+            matches!(node.body, BodyValidationState::Verified { .. }).then_some(node.hash)
+        })
+        .collect::<Vec<_>>();
+    for hash in verified_body_hashes {
+        protect_path(store, hash, &mut protected)?;
+    }
     for reference in validation_context_references {
         if !protected.contains(&reference) && store.view_node(reference).is_some() {
             protect_path(store, reference, &mut protected)?;
@@ -381,6 +391,59 @@ mod tests {
             .expect("retention returns a typed refusal");
         assert!(plan.admission_refused);
         assert!(plan.resource_stalled);
+        assert!(store.node(selected.hash).is_some());
+    }
+
+    #[test]
+    fn verified_body_branch_survives_independent_header_retention() {
+        let mut store = store();
+        let anchor = store.finalized();
+        let verified_body = insert(&mut store, anchor.hash, 1, []);
+        store
+            .set_body_state(
+                verified_body.hash,
+                BodyValidationState::Verified {
+                    evidence: crate::EvidenceId::from_digest([0x51; 32]),
+                },
+            )
+            .expect("the full-state side branch becomes verified");
+        let selected_parent = insert(&mut store, anchor.hash, 2, []);
+        let selected = insert(&mut store, selected_parent.hash, 3, []);
+        let header_only = insert(&mut store, anchor.hash, 4, []);
+
+        let plan = enforce_retention(&mut store, selected, selected, [], limits(2, 100))
+            .expect("retention evicts an unowned header-only branch");
+
+        assert!(!plan.admission_refused);
+        assert!(store.node(selected.hash).is_some());
+        assert!(store.node(verified_body.hash).is_some());
+        assert!(store.node(header_only.hash).is_none());
+        assert_eq!(store.eligible_tips().len(), 2);
+    }
+
+    #[test]
+    fn verified_body_paths_fail_closed_when_they_fill_retention_capacity() {
+        let mut store = store();
+        let anchor = store.finalized();
+        let first = insert(&mut store, anchor.hash, 1, []);
+        let verified_body = insert(&mut store, first.hash, 2, []);
+        store
+            .set_body_state(
+                verified_body.hash,
+                BodyValidationState::Verified {
+                    evidence: crate::EvidenceId::from_digest([0x52; 32]),
+                },
+            )
+            .expect("the full-state branch becomes verified");
+        let selected = insert(&mut store, anchor.hash, 3, []);
+
+        let plan = enforce_retention(&mut store, selected, selected, [], limits(1, 1))
+            .expect("retention reports pressure without deleting full-state-owned nodes");
+
+        assert!(plan.admission_refused);
+        assert!(plan.resource_stalled);
+        assert!(store.node(first.hash).is_some());
+        assert!(store.node(verified_body.hash).is_some());
         assert!(store.node(selected.hash).is_some());
     }
 

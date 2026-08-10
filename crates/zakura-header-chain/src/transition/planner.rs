@@ -202,21 +202,32 @@ pub(super) fn apply_transition_engine(
     }
     let (mut header_best, _) = graph.view_select_header_best()?;
 
-    if let TransitionEvent::FullStateFinalized(event) = &request.event {
-        if event.new_finalized.height < before.frontiers.finalized.height {
+    let full_state_finalized = match &request.event {
+        TransitionEvent::FullStateFinalized(event) => {
+            Some((event.new_finalized, event.full_state_transition_id))
+        }
+        TransitionEvent::VerifiedChainChanged(event)
+            if event.cause == crate::VerifiedChangeCause::CheckpointFinalizedGrow =>
+        {
+            event.new_path.last().map(|header| {
+                (
+                    Frontier::new(header.height, header.hash),
+                    event.full_state_transition_id,
+                )
+            })
+        }
+        _ => None,
+    };
+    if let Some((new_finalized, evidence)) = full_state_finalized {
+        if new_finalized.height < before.frontiers.finalized.height {
             return Err(TransitionFailure::InvalidEvidence("finality retreated"));
         }
-        if !verified.contains(&event.new_finalized) {
+        if !verified.contains(&new_finalized) {
             return Err(TransitionFailure::InvalidEvidence(
                 "integrated finality is not on the verified projection",
             ));
         }
-        finality = Some((
-            event.new_finalized,
-            FinalitySource::FullState {
-                evidence: event.full_state_transition_id,
-            },
-        ));
+        finality = Some((new_finalized, FinalitySource::FullState { evidence }));
     } else if context.config.mode == EngineMode::HeadersOnly {
         let depth = context.config.limits.local_finality_depth.get();
         if header_best
@@ -1054,7 +1065,8 @@ fn apply_event<G: HeaderGraphEdit>(
                 return Err(TransitionFailure::StalePreparation);
             }
             let mut parent = match event.cause {
-                crate::VerifiedChangeCause::Grow => event.old_tip,
+                crate::VerifiedChangeCause::Grow
+                | crate::VerifiedChangeCause::CheckpointFinalizedGrow => event.old_tip,
                 crate::VerifiedChangeCause::Reset => graph.view_finalized(),
             };
             if matches!(event.cause, crate::VerifiedChangeCause::Reset) {

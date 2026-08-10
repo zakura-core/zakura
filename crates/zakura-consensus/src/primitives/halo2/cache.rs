@@ -1,40 +1,31 @@
 //! A bounded cache of Halo2 Orchard Action proofs that have already verified.
 //!
-//! A transaction's Orchard proof is verified once when the transaction arrives over mempool
-//! gossip, and again when it arrives inside a block. This service skips the second verification
-//! when it can prove the two are the same computation.
+//! An Orchard proof is verified once when its transaction arrives over mempool gossip, and again
+//! when the transaction arrives in a block. This service skips the second verification.
 //!
 //! # Why this is not the mempool bypass
 //!
-//! Zebra used to skip *whole-transaction* verification for block transactions already accepted
-//! into the mempool. That was removed upstream as a security fix (PR #10494), after two rounds of
-//! patching, because the cached proposition was `valid(tx, height, block time, spent outputs)` —
-//! not a function of the key it was stored under. A transaction valid at one height is not
-//! necessarily valid at another: expiry, lock time, the consensus branch id, the Orchard soft-fork
-//! gates and the proof-size rule all move with height, and the network upgrade even selects which
-//! Orchard circuit verifying key applies. Zakura keeps the regression tests for both failures
-//! (`block_with_garbage_orchard_proofs_is_rejected` and
-//! `mempool_cached_result_bypasses_expiry_check_for_block_at_next_height`).
+//! Zebra used to skip *whole-transaction* verification for block transactions already in the
+//! mempool, and removed it as a security fix (PR #10494). Whole-transaction validity depends on
+//! height, block time and spent outputs, none of which were in the key — and a transaction valid
+//! at one height need not be valid at the next. Zakura keeps the regression tests for both
+//! failures: `block_with_garbage_orchard_proofs_is_rejected` and
+//! `mempool_cached_result_bypasses_expiry_check_for_block_at_next_height`.
 //!
-//! What is cached here is `verify(bundle, sighash, vk) -> bool`, which *is* a pure function.
-//! On a hit, `transaction::Verifier::call` still runs end to end at the block's height, with the
-//! block's time and the block's spent outputs; the only thing that does not re-run is a
-//! deterministic computation whose every input is pinned by the key.
+//! This cache holds `verify(bundle, sighash, vk)`, which is a pure function. On a hit the
+//! transaction verifier still runs end to end against the block's height, time and spent outputs;
+//! only the proof check is skipped. So the safety argument is just that the key names every input:
 //!
-//! That makes key completeness the whole of the safety argument:
+//!   * `bundle` and `sighash` come from [`Item::cache_key`], which destructures [`Item`]
+//!     exhaustively, so adding a field is a compile error until someone decides whether it belongs
+//!     in the key;
+//!   * `vk` is structural — each Orchard circuit era gets its own cache, for the same reason eras
+//!     cannot share a batch (see [`super::verifier_for`]).
 //!
-//!   * `bundle` and `sighash` are committed to by [`Item::cache_key`], which destructures [`Item`]
-//!     exhaustively so that adding a field is a compile error until someone decides whether it
-//!     belongs in the key;
-//!   * `vk` is committed to structurally, by giving each Orchard circuit era its own cache. Eras
-//!     cannot mix in a cache for the same reason they cannot mix in a batch — see
-//!     [`super::verifier_for`].
-//!
-//! Only `Ok` results are recorded. A batch error is not per-item evidence, because
-//! [`Fallback`](tower_fallback::Fallback) resolves batch failures by re-verifying each item
-//! singly; and an error out of the service need not be a verdict at all — it can report that the
-//! batch worker shut down. Recording that as "this proof is invalid" would make the node reject a
-//! valid block, which is a chain split in the other direction.
+//! Only `Ok` results are cached. An error is not per-item evidence, because
+//! [`Fallback`](tower_fallback::Fallback) re-verifies a failed batch one item at a time, and it
+//! need not be a verdict at all — a shut-down batch worker looks the same. Caching that as
+//! "invalid" would reject a valid block.
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -185,7 +176,7 @@ where
     /// spend it:
     ///
     ///   * [`Batch::poll_ready`](tower_batch_control::Batch) holds a semaphore permit in the
-    ///     service until [`Batch::call`] consumes it. A hit returns without calling the inner
+    ///     service until `Batch::call` consumes it. A hit returns without calling the inner
     ///     service, so that permit is only released when the handle is dropped — until then it
     ///     is capacity denied to a genuine miss.
     ///

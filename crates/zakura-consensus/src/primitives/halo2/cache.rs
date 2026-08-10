@@ -1,31 +1,22 @@
 //! A bounded cache of Halo2 Orchard Action proofs that have already verified.
 //!
-//! An Orchard proof is verified once when its transaction arrives over mempool gossip, and again
+//! Zakura verifies an Orchard proof when its transaction arrives over mempool gossip, and again
 //! when the transaction arrives in a block. This service skips the second verification.
 //!
 //! # Why this is not the mempool bypass
 //!
-//! Zebra used to skip *whole-transaction* verification for block transactions already in the
-//! mempool, and removed it as a security fix (PR #10494). Whole-transaction validity depends on
-//! height, block time and spent outputs, none of which were in the key — and a transaction valid
-//! at one height need not be valid at the next. Zakura keeps the regression tests for both
-//! failures: `block_with_garbage_orchard_proofs_is_rejected` and
-//! `mempool_cached_result_bypasses_expiry_check_for_block_at_next_height`.
+//! Zebra once skipped whole-transaction verification for transactions already in the mempool, and
+//! removed it as a security fix (PR #10494). Transaction validity depends on height, block time
+//! and spent outputs, and that cache's key named none of them.
 //!
-//! This cache holds `verify(bundle, sighash, vk)`, which is a pure function. On a hit the
-//! transaction verifier still runs end to end against the block's height, time and spent outputs;
-//! only the proof check is skipped. So the safety argument is just that the key names every input:
+//! This cache holds `verify(bundle, sighash, vk)`, a pure function of its key. A hit still runs
+//! the whole transaction verifier against the block's height, time and spent outputs, and skips
+//! only the proof check. [`Item::cache_key`] commits to `bundle` and `sighash`; each Orchard
+//! circuit era has its own cache, which commits to `vk` (see [`super::verifier_for`]).
 //!
-//!   * `bundle` and `sighash` come from [`Item::cache_key`], which destructures [`Item`]
-//!     exhaustively, so adding a field is a compile error until someone decides whether it belongs
-//!     in the key;
-//!   * `vk` is structural — each Orchard circuit era gets its own cache, for the same reason eras
-//!     cannot share a batch (see [`super::verifier_for`]).
-//!
-//! Only `Ok` results are cached. An error is not per-item evidence, because
-//! [`Fallback`](tower_fallback::Fallback) re-verifies a failed batch one item at a time, and it
-//! need not be a verdict at all — a shut-down batch worker looks the same. Caching that as
-//! "invalid" would reject a valid block.
+//! Only `Ok` results are cached. A batch error is not per-item evidence, because
+//! [`Fallback`](tower_fallback::Fallback) re-verifies failures singly, and it may not be a verdict
+//! at all — a shut-down batch worker reports the same way. Caching it would reject a valid block.
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -170,27 +161,19 @@ where
 
     /// Always ready.
     ///
-    /// This deliberately does **not** delegate to the inner service, because at this point the
-    /// item is not yet known and so neither is whether the inner service will be used at all.
-    /// Delegating would reserve inner capacity for every request, including the hits that never
-    /// spend it:
+    /// This does not delegate to the inner service, because the item is not known yet, so neither
+    /// is whether the inner service will be used at all. Delegating would reserve inner capacity
+    /// for every request, including the hits that never spend it:
     ///
-    ///   * [`Batch::poll_ready`](tower_batch_control::Batch) holds a semaphore permit in the
-    ///     service until `Batch::call` consumes it. A hit returns without calling the inner
-    ///     service, so that permit is only released when the handle is dropped — until then it
-    ///     is capacity denied to a genuine miss.
+    ///   * [`Batch::poll_ready`](tower_batch_control::Batch) holds a semaphore permit until
+    ///     `Batch::call` consumes it. A hit never calls, so it holds that permit until the handle
+    ///     drops, denying capacity to a genuine miss.
+    ///   * `Batch::poll_ready` also errors once its worker exits. Callers poll before they call,
+    ///     so that error would surface for an item this cache already holds, reporting a verified
+    ///     proof as a verification failure.
     ///
-    ///   * More importantly, `Batch::poll_ready` returns an error when its worker has exited or
-    ///     its channel has closed. Callers poll readiness *before* `call`, so that error would
-    ///     be returned for an item whose result this cache already holds — reporting a verified
-    ///     proof as a verification failure, which is exactly the "an error need not be a verdict"
-    ///     case the module docs are about. Returning ready here means a hit is answered from the
-    ///     cache whatever state the batch worker is in.
-    ///
-    /// Readiness is instead awaited inside [`Self::call`], on the miss path, where it belongs.
-    /// The semaphore still bounds concurrent batch requests: a miss acquires its permit before
-    /// calling, exactly as before. What changes is only *when* the wait happens, which for the
-    /// `oneshot` call sites this service has is the same instant either way.
+    /// [`Self::call`] awaits readiness on the miss path instead. The semaphore still bounds
+    /// concurrent batch requests; only the timing of the wait changes.
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }

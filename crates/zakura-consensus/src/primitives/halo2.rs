@@ -168,16 +168,14 @@ impl Item {
     /// Returns a key that determines every input to this item's proof verification.
     ///
     /// [`Cached`] reuses a previous `Ok` result whenever this key matches, so the key must commit
-    /// to everything [`BatchValidator::add_bundle`] reads. Hashing the bundle's own consensus
-    /// encoding does that, being injective over the whole bundle.
+    /// to everything [`BatchValidator::add_bundle`] reads. The bundle's consensus encoding is
+    /// injective, so hashing it commits to the whole bundle. The verifying key is absent on
+    /// purpose: each Orchard circuit era has its own cache, so an entry is only read back under
+    /// the key it was written against (see [`verifier_for`]).
     ///
-    /// The verifying key is deliberately absent: each Orchard circuit era has its own verifier and
-    /// so its own cache, so an entry is only ever read back under the key it was written against
-    /// (see [`verifier_for`]).
-    ///
-    /// Deriving the key by hand instead is how this goes wrong. The txid does not commit to
-    /// authorizing data under ZIP 244 (CVE-2026-34377), and even `(auth digest, sighash)` is
-    /// incomplete, because the Orchard and Ironwood bundles of one v6 transaction share both.
+    /// Do not derive this key by hand. The txid does not commit to authorizing data under ZIP 244
+    /// (CVE-2026-34377), and `(auth digest, sighash)` is also incomplete: the Orchard and Ironwood
+    /// bundles of one v6 transaction share both.
     fn cache_key(&self) -> CacheKey {
         // Destructured exhaustively on purpose: adding a field to `Item` is a compile error here
         // until someone decides whether it belongs in the key.

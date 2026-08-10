@@ -30,14 +30,14 @@ use tower_fallback::Fallback;
 
 use super::spawn_fifo;
 
-mod memo;
+mod cache;
 
 #[cfg(test)]
 mod tests;
 
-pub use memo::Memoized;
+pub use cache::Cached;
 
-use memo::{CacheKey, MEMO_CAPACITY};
+use cache::{CacheKey, CACHE_CAPACITY};
 
 /// Adjusted batch size for halo2 batches.
 ///
@@ -59,11 +59,11 @@ type Sender = watch::Sender<Option<VerifyResult>>;
 /// This is the key used to verify individual items.
 pub type ItemVerifyingKey = VerifyingKey;
 
-/// The BLAKE2b personalization for [`Item`] memo cache keys.
+/// The BLAKE2b personalization for [`Item`] cache keys.
 ///
 /// Domain-separates these keys from every other BLAKE2b-256 hash in the protocol, so that a
-/// memo key can never be confused with a txid, an auth digest, or a sighash.
-const HALO2_MEMO_PERSONALIZATION: &[u8; 15] = b"ZakuraHalo2Memo";
+/// cache key can never be confused with a txid, an auth digest, or a sighash.
+const HALO2_CACHE_PERSONALIZATION: &[u8; 16] = b"ZakuraHalo2Cache";
 
 // The Orchard Action circuit, and therefore its verifying key, changes across protocol eras.
 // A proof produced under one circuit version does not verify under the other keys. So we keep
@@ -167,14 +167,14 @@ impl Item {
 
     /// Returns a key that determines every input to this item's proof verification.
     ///
-    /// [`Memoized`] reuses a previous `Ok` result whenever this key matches, so the key must
+    /// [`Cached`] reuses a previous `Ok` result whenever this key matches, so the key must
     /// commit to everything [`BatchValidator::add_bundle`] reads. It hashes the bundle's own
     /// consensus encoding, which is injective and covers all of it: the per-action value
     /// commitments, nullifiers, validating keys, note commitments and spend authorization
     /// signatures, the bundle flags, value balance, anchor, proof, and binding signature.
     ///
     /// The verifying key is *not* in the key. It does not need to be: each Orchard circuit era
-    /// has its own verifier and therefore its own memo, so an entry can only ever be read back
+    /// has its own verifier and therefore its own cache, so an entry can only ever be read back
     /// under the key it was written against. See [`verifier_for`].
     ///
     /// Deriving this by hand from things that "obviously" determine the bundle is how this goes
@@ -189,7 +189,7 @@ impl Item {
 
         let mut hasher = blake2b_simd::Params::new()
             .hash_length(32)
-            .personal(HALO2_MEMO_PERSONALIZATION)
+            .personal(HALO2_CACHE_PERSONALIZATION)
             .to_state();
 
         hasher.update(&[bundle_version_discriminant(bundle.bundle_version())]);
@@ -301,15 +301,15 @@ impl Service<Item> for OrchardFallback {
     }
 }
 
-/// The batching-and-fallback stack for one Orchard circuit era, before memoization.
+/// The batching-and-fallback stack for one Orchard circuit era, before caching.
 type BatchFallbackService = Fallback<Batch<Verifier, Item>, OrchardFallback>;
 
 /// The concrete type of a global Halo2 verification service.
 ///
 /// Each Orchard circuit era gets its own instance — see [`VERIFIER_PRE_NU6_2`], [`VERIFIER_NU6_2`],
-/// or [`VERIFIER_NU6_3_ONWARD`] — so that batches, fallbacks, verifying keys, and memos are fully
+/// or [`VERIFIER_NU6_3_ONWARD`] — so that batches, fallbacks, verifying keys, and caches are fully
 /// separated per era.
-type VerifierService = Memoized<BatchFallbackService>;
+type VerifierService = Cached<BatchFallbackService>;
 
 /// Builds a global Halo2 verifier that validates every item against `vk`.
 ///
@@ -319,15 +319,15 @@ type VerifierService = Memoized<BatchFallbackService>;
 /// Callers select the correct era's key by which `VERIFYING_KEY_*` they pass; there is no runtime
 /// key resolution.
 ///
-/// The stack is wrapped in a [`Memoized`] so that a proof gossiped into the mempool does not have
+/// The stack is wrapped in a [`Cached`] so that a proof gossiped into the mempool does not have
 /// to be verified again when the block that mines it arrives. Because each era builds its own
-/// verifier here, each era also gets its own memo, which is what binds a remembered result to the
+/// verifier here, each era also gets its own cache, which is what binds a remembered result to the
 /// `vk` it was produced under.
 fn batch_verifier(vk: &'static ItemVerifyingKey) -> VerifierService {
-    Memoized::new(batch_fallback_verifier(vk), MEMO_CAPACITY)
+    Cached::new(batch_fallback_verifier(vk), CACHE_CAPACITY)
 }
 
-/// Builds the un-memoized batching-and-fallback stack for `vk`.
+/// Builds the uncached batching-and-fallback stack for `vk`.
 fn batch_fallback_verifier(vk: &'static ItemVerifyingKey) -> BatchFallbackService {
     Fallback::new(
         Batch::new(

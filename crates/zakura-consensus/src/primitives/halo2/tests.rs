@@ -41,8 +41,8 @@ use zcash_protocol::value::ZatBalance;
 use crate::{error::TransactionError, BoxError};
 
 use super::{
-    bundle_version_discriminant, lazy_verifier_for, BatchFallbackService, CacheKey, Item,
-    ItemVerifyingKey, Memoized, OrchardFallback, Verifier, VERIFIER_NU6_2, VERIFIER_NU6_3_ONWARD,
+    bundle_version_discriminant, lazy_verifier_for, BatchFallbackService, CacheKey, Cached, Item,
+    ItemVerifyingKey, OrchardFallback, Verifier, VERIFIER_NU6_2, VERIFIER_NU6_3_ONWARD,
     VERIFIER_PRE_NU6_2, VERIFYING_KEY_NU6_2, VERIFYING_KEY_NU6_3_ONWARD, VERIFYING_KEY_PRE_NU6_2,
 };
 
@@ -273,7 +273,7 @@ async fn explicit_flush_rejects_single_proof_under_each_wrong_era_key() {
 
 // Cache key completeness.
 //
-// [`Memoized`] reuses a previous `Ok` for any item whose key matches, so a key that misses one of
+// [`Cached`] reuses a previous `Ok` for any item whose key matches, so a key that misses one of
 // verification's inputs is a consensus bug: it would accept a proof that was never checked. These
 // tests pin every input down.
 
@@ -442,7 +442,7 @@ fn rebuilt_as(
 ///
 /// A v6 transaction verifies both of its bundles against the same sighash under the same network
 /// upgrade, and — because both pools use the NU6.3 circuit — through the same verifier and so the
-/// same memo. A key that did not separate the pools would answer one pool's verification with the
+/// same cache. A key that did not separate the pools would answer one pool's verification with the
 /// other's result.
 ///
 /// The two bundles here are built from identical parts, and with cross-address transfers disabled
@@ -524,7 +524,7 @@ fn bundle_version_discriminants_are_distinct() {
     );
 }
 
-// Memoization behaviour.
+// Caching behaviour.
 
 /// An inner verification service that counts calls and returns a fixed result.
 #[derive(Clone)]
@@ -567,16 +567,16 @@ impl Service<Item> for CountingVerifier {
 }
 
 #[tokio::test]
-async fn memo_skips_the_inner_service_for_an_already_verified_item() {
+async fn cache_skips_the_inner_service_for_an_already_verified_item() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let inner = CountingVerifier::new(true);
-    let mut verifier = Memoized::new(inner.clone(), 8);
+    let mut verifier = Cached::new(inner.clone(), 8);
 
     for _ in 0..3 {
         verifier
             .ready()
             .await
-            .expect("the memo must become ready")
+            .expect("the cache must become ready")
             .call(Item::new(bundle.clone(), sighash))
             .await
             .expect("a valid item must verify");
@@ -590,19 +590,19 @@ async fn memo_skips_the_inner_service_for_an_already_verified_item() {
 }
 
 #[tokio::test]
-async fn memo_does_not_reuse_a_result_across_items() {
+async fn cache_does_not_reuse_a_result_across_items() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let mut other_sighash = sighash;
     other_sighash.0[0] ^= 1;
 
     let inner = CountingVerifier::new(true);
-    let mut verifier = Memoized::new(inner.clone(), 8);
+    let mut verifier = Cached::new(inner.clone(), 8);
 
     for sighash in [sighash, other_sighash] {
         verifier
             .ready()
             .await
-            .expect("the memo must become ready")
+            .expect("the cache must become ready")
             .call(Item::new(bundle.clone(), sighash))
             .await
             .expect("the inner service accepts everything in this test");
@@ -621,16 +621,16 @@ async fn memo_does_not_reuse_a_result_across_items() {
 /// and an error can report that the batch worker shut down rather than that a proof is invalid.
 /// Remembering either as "invalid" would make the node reject valid blocks.
 #[tokio::test]
-async fn memo_does_not_remember_failures() {
+async fn cache_does_not_remember_failures() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let inner = CountingVerifier::new(false);
-    let mut verifier = Memoized::new(inner.clone(), 8);
+    let mut verifier = Cached::new(inner.clone(), 8);
 
     for _ in 0..3 {
         verifier
             .ready()
             .await
-            .expect("the memo must become ready")
+            .expect("the cache must become ready")
             .call(Item::new(bundle.clone(), sighash))
             .await
             .expect_err("the inner service rejects everything in this test");
@@ -644,7 +644,7 @@ async fn memo_does_not_remember_failures() {
 }
 
 /// Verifies `item` through `verifier`, asserting that it succeeds.
-async fn verify_through<S>(verifier: &mut Memoized<S>, item: Item)
+async fn verify_through<S>(verifier: &mut Cached<S>, item: Item)
 where
     S: Service<Item, Response = (), Error = BoxError> + Clone + Send + 'static,
     S::Future: Send + 'static,
@@ -652,17 +652,17 @@ where
     verifier
         .ready()
         .await
-        .expect("the memo must become ready")
+        .expect("the cache must become ready")
         .call(item)
         .await
         .expect("the inner service accepts everything in this test");
 }
 
 #[tokio::test]
-async fn memo_evicts_in_insertion_order_and_stays_correct_when_full() {
+async fn cache_evicts_in_insertion_order_and_stays_correct_when_full() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let inner = CountingVerifier::new(true);
-    let mut verifier = Memoized::new(inner.clone(), 2);
+    let mut verifier = Cached::new(inner.clone(), 2);
 
     let sighashes: Vec<_> = (0..3)
         .map(|i| {
@@ -729,34 +729,34 @@ impl Service<Item> for UnreadyVerifier {
     }
 }
 
-/// A memo hit is answered even when the inner service can no longer become ready.
+/// A cache hit is answered even when the inner service can no longer become ready.
 ///
-/// `Memoized::poll_ready` must not delegate to the inner service. Callers poll readiness before
+/// `Cached::poll_ready` must not delegate to the inner service. Callers poll readiness before
 /// `call`, so delegating would surface a dead batch worker's error for an item whose result the
-/// memo already holds — reporting a verified proof as a verification failure, and rejecting a
+/// cache already holds — reporting a verified proof as a verification failure, and rejecting a
 /// valid block. That is the "an error need not be a verdict" case the module docs are about.
 #[tokio::test]
-async fn memo_hit_survives_an_inner_service_that_never_becomes_ready() {
+async fn cache_hit_survives_an_inner_service_that_never_becomes_ready() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let item = Item::new(bundle, sighash);
 
-    // Warm the memo through a healthy inner service.
+    // Warm the cache through a healthy inner service.
     let healthy = CountingVerifier::new(true);
-    let mut verifier = Memoized::new(healthy.clone(), 8);
+    let mut verifier = Cached::new(healthy.clone(), 8);
     verify_through(&mut verifier, item.clone()).await;
     assert_eq!(healthy.calls(), 1, "the first verification must be a miss");
 
-    // Swap in an inner service that can never become ready, keeping the same memo.
+    // Swap in an inner service that can never become ready, keeping the same cache.
     let dead = UnreadyVerifier::new();
     let mut verifier = verifier.with_inner(dead.clone());
 
     verifier
         .ready()
         .await
-        .expect("the memo must be ready even when the inner service is not")
+        .expect("the cache must be ready even when the inner service is not")
         .call(item)
         .await
-        .expect("a memo hit must be answered from the memo, not from the dead inner service");
+        .expect("a cache hit must be answered from the cache, not from the dead inner service");
 
     assert_eq!(
         dead.poll_readies(),
@@ -767,19 +767,19 @@ async fn memo_hit_survives_an_inner_service_that_never_becomes_ready() {
 
 /// A miss still propagates an inner readiness failure.
 ///
-/// Moving readiness off `poll_ready` must not make the memo swallow it: an item that is not in
-/// the memo has to reach the inner service, and if that service cannot become ready the request
+/// Moving readiness off `poll_ready` must not make the cache swallow it: an item that is not in
+/// the cache has to reach the inner service, and if that service cannot become ready the request
 /// must fail rather than be reported as verified.
 #[tokio::test]
-async fn memo_miss_propagates_an_inner_readiness_failure() {
+async fn cache_miss_propagates_an_inner_readiness_failure() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let dead = UnreadyVerifier::new();
-    let mut verifier = Memoized::new(dead.clone(), 8);
+    let mut verifier = Cached::new(dead.clone(), 8);
 
     verifier
         .ready()
         .await
-        .expect("the memo itself is always ready")
+        .expect("the cache itself is always ready")
         .call(Item::new(bundle.clone(), sighash))
         .await
         .expect_err("a miss must surface the inner service's readiness failure");

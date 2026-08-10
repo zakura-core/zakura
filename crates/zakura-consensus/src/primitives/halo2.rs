@@ -195,9 +195,11 @@ impl Item {
         hasher.update(&[bundle_version_discriminant(bundle.bundle_version())]);
         hasher.update(&sighash.0);
 
-        // `write_v5_bundle` is the total encoder: it is `write_v6_bundle` without the precondition
-        // that rejects pre-NU6.3 bundle versions, and the two produce identical bytes otherwise.
-        // The v5/v6 distinction it therefore does not encode is supplied by the discriminant above.
+        // A total encoder is required, because `cache_key` cannot fail. `write_v5_bundle` and
+        // `write_v6_bundle` both delegate to one private `write_bundle` and differ only in v6's
+        // precondition on the bundle version, so v5 encodes every version — including the
+        // Ironwood ones outside its documented v5 contract — and the choice between the two
+        // cannot change the bytes. The version itself is the discriminant above.
         let mut encoded = Vec::new();
         write_v5_bundle(Some(bundle.as_ref()), &mut encoded)
             .expect("encoding a bundle into a Vec cannot fail: the encoder only reports IO errors");

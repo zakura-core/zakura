@@ -20,7 +20,10 @@ use std::{
 use bitvec::prelude::*;
 use halo2::pasta::{group::ff::PrimeField, pallas};
 use hex::ToHex;
-use incrementalmerkletree::{frontier::NonEmptyFrontier, Hashable};
+use incrementalmerkletree::{
+    frontier::{Frontier, NonEmptyFrontier},
+    Hashable,
+};
 use lazy_static::lazy_static;
 use thiserror::Error;
 use zcash_primitives::merkle_tree::HashSer;
@@ -391,22 +394,20 @@ pub struct NoteCommitmentTree {
 }
 
 impl NoteCommitmentTree {
-    /// Builds a tree whose state is exactly the given frontier.
+    /// Wraps an existing [`Frontier`] as a note commitment tree.
     ///
-    /// A frontier is the rightmost path of an append-only Merkle tree, and is
-    /// all the state this tree keeps: this constructor cannot produce a tree
-    /// that the append path could not have produced, because a malformed
-    /// frontier cannot exist
-    /// ([`Frontier::from_parts`](incrementalmerkletree::frontier::Frontier::from_parts)
-    /// validates before a value can be constructed) and capacity is enforced
-    /// by the `MERKLE_DEPTH` const generic. Verifying that the frontier
-    /// belongs to the chain remains the caller's responsibility, as it is for
-    /// every other way of obtaining one.
+    /// [`Frontier::from_parts`] validates only that the position and ommer
+    /// count are consistent and that the frontier fits within
+    /// [`MERKLE_DEPTH`]. It does not verify that the nodes were derived from
+    /// note commitments or that the root belongs to an authenticated chain
+    /// and shielded pool state.
+    ///
+    /// Callers must derive the frontier from validated commitments or
+    /// authenticate its root against the expected chain and shielded pool
+    /// state before treating the resulting tree as authoritative.
     ///
     /// The root cache starts empty and is recomputed on first use.
-    pub fn from_frontier(
-        frontier: incrementalmerkletree::frontier::Frontier<Node, MERKLE_DEPTH>,
-    ) -> Self {
+    pub fn from_frontier(frontier: Frontier<Node, MERKLE_DEPTH>) -> Self {
         Self {
             inner: frontier,
             cached_root: Default::default(),

@@ -35,6 +35,8 @@ pub(crate) struct GraphOverlay<'a> {
     base_nodes_cloned: Cell<usize>,
     #[cfg(test)]
     eligibility_nodes_visited: Cell<usize>,
+    #[cfg(test)]
+    finality_nodes_visited: Cell<usize>,
 }
 
 impl<'a> GraphOverlay<'a> {
@@ -52,6 +54,8 @@ impl<'a> GraphOverlay<'a> {
             base_nodes_cloned: Cell::new(0),
             #[cfg(test)]
             eligibility_nodes_visited: Cell::new(0),
+            #[cfg(test)]
+            finality_nodes_visited: Cell::new(0),
         }
     }
 
@@ -99,6 +103,8 @@ impl<'a> GraphOverlay<'a> {
             base_nodes_cloned: Cell::new(0),
             #[cfg(test)]
             eligibility_nodes_visited: Cell::new(0),
+            #[cfg(test)]
+            finality_nodes_visited: Cell::new(0),
         }
     }
 
@@ -476,17 +482,47 @@ impl<'a> GraphOverlay<'a> {
         if !node.is_eligible() {
             return Err(GraphError::IneligibleFinalized(finalized.hash));
         }
-        let mut retained = HashSet::new();
-        let mut pending = vec![finalized.hash];
-        while let Some(hash) = pending.pop() {
-            if retained.insert(hash) {
-                pending.extend(self.children(hash));
+
+        let current = self.finalized;
+        let mut finalized_path = Vec::new();
+        let mut cursor = finalized;
+        while cursor.height > current.height {
+            #[cfg(test)]
+            self.finality_nodes_visited
+                .set(self.finality_nodes_visited.get().saturating_add(1));
+            let parent_hash = self
+                .node(cursor.hash)
+                .ok_or(GraphError::UnknownNode(cursor.hash))?
+                .parent_hash;
+            finalized_path.push((parent_hash, cursor.hash));
+            cursor = Frontier::new(block::Height(cursor.height.0 - 1), parent_hash);
+        }
+        if cursor != current {
+            return Err(GraphError::FinalizedNotDescendant {
+                current: current.hash,
+                candidate: finalized.hash,
+            });
+        }
+
+        let mut deleted = HashSet::new();
+        for (ancestor, retained_child) in finalized_path {
+            deleted.insert(ancestor);
+            for sibling in self.children(ancestor) {
+                if sibling == retained_child {
+                    continue;
+                }
+                let mut pending = vec![sibling];
+                while let Some(hash) = pending.pop() {
+                    if deleted.insert(hash) {
+                        #[cfg(test)]
+                        self.finality_nodes_visited
+                            .set(self.finality_nodes_visited.get().saturating_add(1));
+                        pending.extend(self.children(hash));
+                    }
+                }
             }
         }
-        let mut deleted: Vec<_> = self
-            .retained_hashes()
-            .filter(|hash| !retained.contains(hash))
-            .collect();
+        let mut deleted: Vec<_> = deleted.into_iter().collect();
         deleted.sort_unstable_by_key(|hash| hash.0);
         for hash in &deleted {
             self.delete_node(*hash)?;
@@ -653,6 +689,11 @@ impl<'a> GraphOverlay<'a> {
             self.eligibility_nodes_visited.get(),
         )
     }
+
+    #[cfg(test)]
+    fn finality_nodes_visited(&self) -> usize {
+        self.finality_nodes_visited.get()
+    }
 }
 
 fn flatten_edges(
@@ -690,6 +731,26 @@ mod tests {
         header.previous_block_hash = parent;
         header.nonce = [marker; 32].into();
         Arc::new(header)
+    }
+
+    fn insert_child(store: &mut MemHeaderStore, parent: block::Hash, marker: u8) -> Frontier {
+        let header = header(parent, marker);
+        let work = header
+            .difficulty_threshold
+            .to_work()
+            .expect("the fixture target has valid work");
+        match store
+            .insert(
+                header,
+                work,
+                HeaderValidationState::Valid,
+                [],
+                BodyValidationState::Unknown,
+            )
+            .expect("the fixture child inserts")
+        {
+            InsertResult::Inserted(frontier) | InsertResult::AlreadyPresent(frontier) => frontier,
+        }
     }
 
     #[test]
@@ -835,6 +896,28 @@ mod tests {
             applied.node(third.hash).map(|node| node.parent_hash),
             Some(second.hash)
         );
+    }
+
+    #[test]
+    fn advancing_finality_does_not_walk_the_retained_descendant_subtree() {
+        let mut base = store();
+        let anchor = base.finalized();
+        let finalized = insert_child(&mut base, anchor.hash, 1);
+        let mut retained_tip = finalized;
+        for marker in 2..=64 {
+            retained_tip = insert_child(&mut base, retained_tip.hash, marker);
+        }
+
+        let mut overlay = GraphOverlay::new(&base);
+        let deleted = overlay
+            .advance_finalized(finalized)
+            .expect("the direct eligible descendant becomes finalized");
+
+        assert_eq!(deleted, vec![anchor.hash]);
+        assert_eq!(overlay.finality_nodes_visited(), 1);
+        assert_eq!(overlay.finalized(), finalized);
+        assert!(overlay.node(retained_tip.hash).is_some());
+        assert_eq!(overlay.node_count(), 64);
     }
 
     #[test]

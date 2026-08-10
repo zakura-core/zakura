@@ -116,6 +116,16 @@ pub enum GraphError {
     /// Finality attempted to root the graph at an ineligible header.
     #[error("cannot finalize ineligible retained header {0:?}")]
     IneligibleFinalized(block::Hash),
+    /// Finality attempted to move to a retained header outside the current finalized subtree.
+    #[error(
+        "new finalized header {candidate:?} is not a descendant of current finalized header {current:?}"
+    )]
+    FinalizedNotDescendant {
+        /// Current finalized root.
+        current: block::Hash,
+        /// Proposed finalized root.
+        candidate: block::Hash,
+    },
     /// Retention attempted to remove a node that still has retained children.
     #[error("cannot remove non-leaf header {0:?}")]
     NodeHasChildren(block::Hash),

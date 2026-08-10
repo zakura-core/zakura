@@ -1426,7 +1426,7 @@ fn anchor_reasons(
     let mut reasons = Vec::new();
     if let Some(pin) = context
         .config
-        .settled_manifest
+        .settled_manifest()
         .pin_for_network(&context.config.network)
     {
         if pin.activation.height == height && pin.activation.hash != hash {
@@ -1436,7 +1436,7 @@ fn anchor_reasons(
             });
         }
     }
-    if let Some(expected) = context.config.local_checkpoints.hash(height) {
+    if let Some(expected) = context.config.local_checkpoints().hash(height) {
         if expected != hash {
             reasons.push(EligibilityReason::CheckpointConflict { height, expected });
         }
@@ -1649,15 +1649,17 @@ fn resource_stalled(
 }
 
 fn invariant_pins(context: &TransitionContext<'_>) -> Vec<Frontier> {
-    let mut pins: Vec<_> = context.config.local_checkpoints.iter().collect();
+    let mut pins: Vec<_> = context.config.local_checkpoints().iter().collect();
     if let Some(pin) = context
         .config
-        .settled_manifest
+        .settled_manifest()
         .pin_for_network(&context.config.network)
     {
-        pins.push(pin.activation);
+        let key = (pin.activation.height, pin.activation.hash.0);
+        if let Err(index) = pins.binary_search_by_key(&key, |pin| (pin.height, pin.hash.0)) {
+            pins.insert(index, pin.activation);
+        }
     }
-    pins.sort_unstable_by_key(|pin| (pin.height, pin.hash.0));
     pins
 }
 

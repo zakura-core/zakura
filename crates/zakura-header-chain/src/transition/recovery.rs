@@ -177,7 +177,7 @@ pub fn audit_store_at<S: StoreAuditRead>(
         || metadata.mode != config.mode
         || metadata.network_id != config.network.kind()
         || metadata.anchor_manifest_digest != config.trust_anchor_digest()
-        || metadata.work_origin != config.bootstrap_anchor.frontier
+        || metadata.work_origin != config.bootstrap_anchor().frontier
     {
         violations.push(AuditViolation::Configuration);
     }
@@ -504,7 +504,7 @@ fn check_trust_pins(
     config: &EngineConfig,
     violations: &mut Vec<AuditViolation>,
 ) {
-    let settled = config.settled_manifest.pin_for_network(&config.network);
+    let settled = config.settled_manifest().pin_for_network(&config.network);
     for node in nodes {
         for reason in &node.eligibility.direct_reasons {
             let valid = match reason {
@@ -515,7 +515,7 @@ fn check_trust_pins(
                             && node.hash != *expected
                     }),
                 EligibilityReason::CheckpointConflict { height, expected } => config
-                    .local_checkpoints
+                    .local_checkpoints()
                     .hash(*height)
                     .is_some_and(|configured| {
                         configured == *expected && *height == node.height && node.hash != *expected
@@ -548,7 +548,7 @@ fn check_trust_pins(
             settled.map(|pin| (pin.activation.hash, true))
         } else {
             config
-                .local_checkpoints
+                .local_checkpoints()
                 .hash(node.height)
                 .map(|hash| (hash, false))
         };
@@ -693,7 +693,7 @@ fn check_authoritative_rows<S: StoreAuditRead>(
     })?;
     if first.is_none_or(|record| {
         record.epoch != crate::FinalityEpoch::new(0)
-            || record.previous != config.bootstrap_anchor.frontier
+            || record.previous != config.bootstrap_anchor().frontier
             || record.current.height < record.previous.height
             || record.current.height == record.previous.height && record.current != record.previous
     }) || invalid_history
@@ -707,14 +707,14 @@ fn check_authoritative_rows<S: StoreAuditRead>(
     }
 
     let finalized = metadata.frontiers.finalized;
-    if finalized != config.bootstrap_anchor.frontier
+    if finalized != config.bootstrap_anchor().frontier
         && store.authenticated_canonical_hash(finalized.height)? != Some(finalized.hash)
     {
         violations.push(AuditViolation::Finality);
     }
-    let settled = config.settled_manifest.pin_for_network(&config.network);
+    let settled = config.settled_manifest().pin_for_network(&config.network);
     let pins = config
-        .local_checkpoints
+        .local_checkpoints()
         .iter()
         .chain(settled.into_iter().map(|pin| pin.activation));
     for pin in pins.filter(|pin| pin.height <= metadata.frontiers.finalized.height) {
@@ -1173,7 +1173,7 @@ mod tests {
             evidence: EvidenceId::from_digest([0x71; 32]),
         };
         store.finality.push(FinalityRecord {
-            previous: config.bootstrap_anchor.frontier,
+            previous: config.bootstrap_anchor().frontier,
             current: child,
             source: FinalitySource::FullState {
                 evidence: EvidenceId::from_digest([0x72; 32]),
@@ -1186,8 +1186,9 @@ mod tests {
         assert!(violations(&store, &config).contains(&AuditViolation::Finality));
 
         store.canonical.insert(child.height, child.hash);
-        config.local_checkpoints =
-            CheckpointSet::new([child]).expect("the one-pin fixture is unique");
+        config.replace_local_checkpoints(
+            CheckpointSet::new([child]).expect("the one-pin fixture is unique"),
+        );
         store.metadata.anchor_manifest_digest = config.trust_anchor_digest();
         store.snapshot = store.metadata.snapshot();
         store
@@ -1296,9 +1297,10 @@ mod tests {
         assert!(violations(&store, &config).contains(&AuditViolation::EligibilityRoot(child_hash)));
 
         let mut checkpointed = config.clone();
-        checkpointed.local_checkpoints =
+        checkpointed.replace_local_checkpoints(
             CheckpointSet::new([Frontier::new(block::Height(1), block::Hash([0xaa; 32]))])
-                .expect("the checkpoint fixture is unique");
+                .expect("the checkpoint fixture is unique"),
+        );
         let mut store = base.clone();
         store.metadata.anchor_manifest_digest = checkpointed.trust_anchor_digest();
         store.snapshot = store.metadata.snapshot();

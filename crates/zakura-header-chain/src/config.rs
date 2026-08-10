@@ -197,13 +197,15 @@ pub struct EngineConfig {
     /// Authenticated network parameters.
     pub network: Network,
     /// Exact trusted bootstrap anchor.
-    pub bootstrap_anchor: TrustedAnchor,
+    bootstrap_anchor: TrustedAnchor,
     /// Optional authenticated local checkpoints.
-    pub local_checkpoints: CheckpointSet,
+    local_checkpoints: CheckpointSet,
     /// Mandatory release-authenticated settled pins.
-    pub settled_manifest: SettledUpgradeManifest,
+    settled_manifest: SettledUpgradeManifest,
     /// Frozen engine resource limits.
     pub limits: EngineLimits,
+    /// Cached digest of the immutable trust-anchor fields.
+    trust_anchor_digest: [u8; 32],
 }
 
 impl EngineConfig {
@@ -232,6 +234,8 @@ impl EngineConfig {
                 .pin_for_network(&network)
                 .ok_or(EngineConfigError::MissingSettledPin(network.kind()))?;
         }
+        let trust_anchor_digest =
+            trust_anchor_digest(&settled_manifest, &bootstrap_anchor, &local_checkpoints);
         Ok(Self {
             mode,
             network,
@@ -239,22 +243,56 @@ impl EngineConfig {
             local_checkpoints,
             settled_manifest,
             limits: EngineLimits::v1(),
+            trust_anchor_digest,
         })
     }
 
-    /// Digest binding every absolute trust anchor used by validation and startup.
-    pub fn trust_anchor_digest(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(b"zakura-header-chain-trust-anchors-v1");
-        hasher.update(self.settled_manifest.digest());
-        hasher.update(self.bootstrap_anchor.frontier.height.0.to_le_bytes());
-        hasher.update(self.bootstrap_anchor.frontier.hash.0);
-        for checkpoint in self.local_checkpoints.iter() {
-            hasher.update(checkpoint.height.0.to_le_bytes());
-            hasher.update(checkpoint.hash.0);
-        }
-        hasher.finalize().into()
+    /// Return the exact trusted bootstrap anchor.
+    pub const fn bootstrap_anchor(&self) -> &TrustedAnchor {
+        &self.bootstrap_anchor
     }
+
+    /// Return the authenticated local checkpoint set.
+    pub const fn local_checkpoints(&self) -> &CheckpointSet {
+        &self.local_checkpoints
+    }
+
+    /// Return the mandatory release-authenticated settled pins.
+    pub const fn settled_manifest(&self) -> &SettledUpgradeManifest {
+        &self.settled_manifest
+    }
+
+    /// Digest binding every absolute trust anchor used by validation and startup.
+    pub const fn trust_anchor_digest(&self) -> [u8; 32] {
+        self.trust_anchor_digest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_local_checkpoints(&mut self, local_checkpoints: CheckpointSet) {
+        self.local_checkpoints = local_checkpoints;
+        self.trust_anchor_digest = trust_anchor_digest(
+            &self.settled_manifest,
+            &self.bootstrap_anchor,
+            &self.local_checkpoints,
+        );
+    }
+}
+
+fn trust_anchor_digest(
+    settled_manifest: &SettledUpgradeManifest,
+    bootstrap_anchor: &TrustedAnchor,
+    local_checkpoints: &CheckpointSet,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-header-chain-trust-anchors-v1");
+    hasher.update(settled_manifest.digest());
+    hasher.update(bootstrap_anchor.frontier.height.0.to_le_bytes());
+    hasher.update(bootstrap_anchor.frontier.hash.0);
+    for checkpoint in local_checkpoints.iter() {
+        hasher.update(checkpoint.height.0.to_le_bytes());
+        hasher.update(checkpoint.hash.0);
+    }
+    hasher.finalize().into()
 }
 
 /// Invalid immutable engine or trust-anchor configuration.
@@ -553,6 +591,23 @@ mod tests {
         assert_ne!(
             plain.trust_anchor_digest(),
             checkpointed.trust_anchor_digest()
+        );
+        assert_eq!(
+            checkpointed.trust_anchor_digest(),
+            trust_anchor_digest(
+                checkpointed.settled_manifest(),
+                checkpointed.bootstrap_anchor(),
+                checkpointed.local_checkpoints(),
+            ),
+            "the cached digest must preserve the canonical trust-anchor transcript",
+        );
+
+        let mut replaced = plain.clone();
+        replaced.replace_local_checkpoints(checkpointed.local_checkpoints().clone());
+        assert_eq!(
+            replaced.trust_anchor_digest(),
+            checkpointed.trust_anchor_digest(),
+            "test-only checkpoint replacement must refresh the cached digest",
         );
 
         let mismatched = TrustedAnchor {

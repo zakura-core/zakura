@@ -151,8 +151,9 @@ fn insertion_enforces_every_immutable_configured_checkpoint() {
 
     let mut matching_store = store.clone();
     let mut matching_config = config.clone();
-    matching_config.local_checkpoints =
-        CheckpointSet::new([child]).expect("the matching checkpoint fixture is unique");
+    matching_config.replace_local_checkpoints(
+        CheckpointSet::new([child]).expect("the matching checkpoint fixture is unique"),
+    );
     matching_store.metadata.anchor_manifest_digest = matching_config.trust_anchor_digest();
     matching_store.lease = ValidationLease::new(
         matching_store.lease.parent,
@@ -179,8 +180,9 @@ fn insertion_enforces_every_immutable_configured_checkpoint() {
     let expected = Frontier::new(child.height, block::Hash([0x45; 32]));
     let mut conflicting_store = store;
     let mut conflicting_config = config;
-    conflicting_config.local_checkpoints =
-        CheckpointSet::new([expected]).expect("the conflicting checkpoint fixture is unique");
+    conflicting_config.replace_local_checkpoints(
+        CheckpointSet::new([expected]).expect("the conflicting checkpoint fixture is unique"),
+    );
     conflicting_store.metadata.anchor_manifest_digest = conflicting_config.trust_anchor_digest();
     conflicting_store.lease = ValidationLease::new(
         conflicting_store.lease.parent,
@@ -298,7 +300,7 @@ fn production_settled_pins_create_exact_permanent_conflict_reasons() {
         )
         .expect("the production configuration installs its settled pin");
         let pin = config
-            .settled_manifest
+            .settled_manifest()
             .pin_for_network(&network)
             .expect("the release manifest has a production pin");
         assert!(anchor_reasons(

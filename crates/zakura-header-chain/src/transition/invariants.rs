@@ -346,10 +346,10 @@ fn verify_pins<G: HeaderGraphView>(
 ) -> Result<(), InvariantViolation> {
     for pin in pins {
         for projection in [selected, verified] {
-            if let Some(frontier) = projection
-                .iter()
-                .find(|frontier| frontier.height == pin.height)
+            if let Ok(index) =
+                projection.binary_search_by_key(&pin.height, |frontier| frontier.height)
             {
+                let frontier = projection[index];
                 if frontier.hash != pin.hash {
                     return Err(InvariantViolation::TrustPin(pin.height));
                 }

@@ -195,9 +195,11 @@ pub struct NoteCommitmentTree {
 impl NoteCommitmentTree {
     /// Wraps an existing [`Frontier`] as a note commitment tree.
     ///
+    /// # Correctness
+    ///
     /// [`Frontier::from_parts`] validates only that the position and ommer
     /// count are consistent and that the frontier fits within
-    /// [`MERKLE_DEPTH`]. It does not verify that the nodes were derived from
+    /// `MERKLE_DEPTH`. It does not verify that the nodes were derived from
     /// note commitments or that the root belongs to an authenticated chain
     /// and shielded pool state.
     ///

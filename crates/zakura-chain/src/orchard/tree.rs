@@ -269,11 +269,10 @@ impl ToHex for Node {
 
 /// Required to serialize [`NoteCommitmentTree`]s in a format compatible with `zcashd`.
 ///
-/// Zebra stores Orchard note commitment trees as [`Frontier`][1]s while the
+/// Zebra stores Orchard note commitment trees as [`Frontier`]s while the
 /// [`z_gettreestate`][2] RPC requires [`CommitmentTree`][3]s. Implementing
 /// [`HashSer`] for [`Node`]s allows the conversion.
 ///
-/// [1]: incrementalmerkletree::frontier::Frontier
 /// [2]: https://zcash.github.io/rpc/z_gettreestate.html
 /// [3]: incrementalmerkletree::frontier::CommitmentTree
 impl HashSer for Node {
@@ -396,9 +395,11 @@ pub struct NoteCommitmentTree {
 impl NoteCommitmentTree {
     /// Wraps an existing [`Frontier`] as a note commitment tree.
     ///
+    /// # Correctness
+    ///
     /// [`Frontier::from_parts`] validates only that the position and ommer
     /// count are consistent and that the frontier fits within
-    /// [`MERKLE_DEPTH`]. It does not verify that the nodes were derived from
+    /// `MERKLE_DEPTH`. It does not verify that the nodes were derived from
     /// note commitments or that the root belongs to an authenticated chain
     /// and shielded pool state.
     ///

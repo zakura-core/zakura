@@ -8484,6 +8484,7 @@ version = "1.0.0-rc0"
 dependencies = [
  "chrono",
  "proptest",
+ "rayon",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",

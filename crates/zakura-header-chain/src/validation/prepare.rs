@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use chrono::{Duration, Timelike};
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zakura_chain::{block, parameters::Network};
@@ -216,15 +217,16 @@ fn prepare_headers_inner(
         });
     }
 
-    let hashes: Vec<_> = input
+    let hash_results: Vec<_> = input
         .headers
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(offset, header)| {
             validate_encoding_version_hash(header)
                 .map_err(|error| invalid(offset, HeaderRule::EncodingVersionHash, error))
         })
-        .collect::<Result<_, _>>()?;
+        .collect();
+    let hashes: Vec<_> = hash_results.into_iter().collect::<Result<_, _>>()?;
     if contextual_lease.is_some() {
         let mut expected_parent = parent_frontier.hash;
         for (offset, (header, hash)) in input.headers.iter().zip(&hashes).enumerate() {
@@ -244,27 +246,69 @@ fn prepare_headers_inner(
     let future_limit = now
         .checked_add_signed(Duration::hours(2))
         .ok_or(HeaderFailure::ClockRange)?;
+    let mut parent_height = parent_frontier.height;
+    let heights: Vec<_> = (0..input.headers.len())
+        .map(|offset| {
+            let height = infer_height(parent_height, None)
+                .map_err(|error| invalid(offset, HeaderRule::InferredHeight, error))?;
+            parent_height = height;
+            Ok(height)
+        })
+        .collect::<Result<_, HeaderFailure>>()?;
+    let context_free: Vec<_> = input
+        .headers
+        .par_iter()
+        .zip(&hashes)
+        .zip(&heights)
+        .enumerate()
+        .map(|(offset, ((header, hash), height))| {
+            validate_commitment_structure(header, &rules.network, *height)
+                .map_err(|error| invalid(offset, HeaderRule::CommitmentStructure, error))?;
+            let target = validate_compact_target(header, &rules.network)
+                .map_err(|error| invalid(offset, HeaderRule::CompactTarget, error))?;
+            if !rules.pow_policy.is_authenticated_custom_waiver() {
+                validate_hash_filter(*hash, target)
+                    .map_err(|error| invalid(offset, HeaderRule::HashToTarget, error))?;
+            }
+            rules
+                .pow_policy
+                .validate_solution(header)
+                .map_err(|error| invalid(offset, HeaderRule::Equihash, error))?;
+
+            let canonical_header_time = header
+                .time
+                .with_nanosecond(0)
+                .ok_or(HeaderFailure::ClockRange)?;
+            let validation = if canonical_header_time > future_limit {
+                HeaderValidationState::DeferredUntil(
+                    canonical_header_time
+                        .checked_sub_signed(Duration::hours(2))
+                        .ok_or(HeaderFailure::ClockRange)?,
+                )
+            } else {
+                HeaderValidationState::Valid
+            };
+            let block_work = header
+                .difficulty_threshold
+                .to_work()
+                .ok_or_else(|| invalid(offset, HeaderRule::Work, "invalid compact target"))?;
+
+            Ok(PreparedHeader {
+                header: header.clone(),
+                hash: *hash,
+                height: *height,
+                block_work,
+                validation,
+            })
+        })
+        .collect();
     let mut parent = parent_frontier;
     let mut context = contextual_lease.map(|lease| lease.predecessors.clone());
     let mut prepared = Vec::with_capacity(input.headers.len());
 
-    for (offset, header) in input.headers.iter().enumerate() {
-        let hash = hashes[offset];
-        let height = infer_height(parent.height, None)
-            .map_err(|error| invalid(offset, HeaderRule::InferredHeight, error))?;
-        validate_commitment_structure(header, &rules.network, height)
-            .map_err(|error| invalid(offset, HeaderRule::CommitmentStructure, error))?;
-        let target = validate_compact_target(header, &rules.network)
-            .map_err(|error| invalid(offset, HeaderRule::CompactTarget, error))?;
-        if !rules.pow_policy.is_authenticated_custom_waiver() {
-            validate_hash_filter(hash, target)
-                .map_err(|error| invalid(offset, HeaderRule::HashToTarget, error))?;
-        }
-        rules
-            .pow_policy
-            .validate_solution(header)
-            .map_err(|error| invalid(offset, HeaderRule::Equihash, error))?;
-
+    for (offset, prepared_header) in context_free.into_iter().enumerate() {
+        let prepared_header = prepared_header?;
+        let header = &prepared_header.header;
         if let Some(context) = context.as_ref() {
             let adjustment = AdjustedDifficulty::new_from_header_time(
                 header.time,
@@ -284,33 +328,7 @@ fn prepare_headers_inner(
             validate_contextual_difficulty_and_time(header.difficulty_threshold, adjustment)
                 .map_err(|error| invalid(offset, HeaderRule::ContextualDifficultyAndTime, error))?;
         }
-
-        let canonical_header_time = header
-            .time
-            .with_nanosecond(0)
-            .ok_or(HeaderFailure::ClockRange)?;
-        let validation = if canonical_header_time > future_limit {
-            HeaderValidationState::DeferredUntil(
-                canonical_header_time
-                    .checked_sub_signed(Duration::hours(2))
-                    .ok_or(HeaderFailure::ClockRange)?,
-            )
-        } else {
-            HeaderValidationState::Valid
-        };
-        let block_work = header
-            .difficulty_threshold
-            .to_work()
-            .ok_or_else(|| invalid(offset, HeaderRule::Work, "invalid compact target"))?;
-
-        prepared.push(PreparedHeader {
-            header: header.clone(),
-            hash,
-            height,
-            block_work,
-            validation,
-        });
-        parent = crate::Frontier::new(height, hash);
+        parent = crate::Frontier::new(prepared_header.height, prepared_header.hash);
         if let Some(context) = context.as_mut() {
             context.insert(
                 0,
@@ -321,6 +339,7 @@ fn prepare_headers_inner(
             );
             context.truncate(POW_ADJUSTMENT_BLOCK_SPAN);
         }
+        prepared.push(prepared_header);
     }
 
     let mut hasher = Sha256::new();

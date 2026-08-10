@@ -1,4 +1,5 @@
 use super::*;
+use crate::InvariantViolation;
 
 #[test]
 fn finalization_projection_delta_removes_only_the_retired_prefix() {
@@ -737,13 +738,13 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
-    let insert = insertion(&store, 1, EvidenceId::from_digest([0x91; 32]));
+    let insert = insertion(&store, 8, EvidenceId::from_digest([0x91; 32]));
     let insert_plan = apply_transition(&store, insert, &context(&config, &clock, None))
         .expect("network insertion prepares the checkpoint header");
     store.commit(&insert_plan);
 
     let old_tip = store.metadata.frontiers.verified_best;
-    let checkpoint = store.metadata.frontiers.header_best;
+    let checkpoint = store.selected[1];
     let header = store
         .graph
         .node(checkpoint.hash)
@@ -769,6 +770,13 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
         .expect("checkpoint authority advances verification and finality together");
     assert_eq!(plan.change_set.metadata.frontiers.verified_best, checkpoint);
     assert_eq!(plan.change_set.metadata.frontiers.finalized, checkpoint);
+    assert_eq!(plan.cause(), TransitionCause::CheckpointFinality);
+    assert!(
+        super::super::super::invariants::is_incremental_checkpoint_finality(
+            &test_engine(&store),
+            &plan
+        )
+    );
     assert!(matches!(
         plan.change_set
             .finality_append
@@ -776,4 +784,44 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
             .source,
         FinalitySource::FullState { evidence: actual } if actual == evidence
     ));
+
+    let mut unverified = plan.clone();
+    unverified.change_set.put_nodes[0].body = BodyValidationState::Unknown;
+    unverified.graph_delta.put_nodes[0].body = BodyValidationState::Unknown;
+    unverified
+        .projected
+        .node_mut(checkpoint.hash)
+        .expect("the projected checkpoint is retained")
+        .body = BodyValidationState::Unknown;
+    assert_eq!(
+        verify_plan(&test_engine(&store), &unverified),
+        Err(InvariantViolation::VerifiedProjection(checkpoint.hash))
+    );
+
+    let selected_tip = store.metadata.frontiers.header_best;
+    let mut evicted_selected = plan.clone();
+    evicted_selected
+        .change_set
+        .delete_nodes
+        .push(selected_tip.hash);
+    evicted_selected
+        .change_set
+        .index_changes
+        .deleted
+        .push(selected_tip.hash);
+    evicted_selected
+        .graph_delta
+        .delete_nodes
+        .push(selected_tip.hash);
+    assert_eq!(
+        verify_plan(&test_engine(&store), &evicted_selected),
+        Err(InvariantViolation::SelectedProjection(selected_tip.hash))
+    );
+
+    let mut pin_conflict = plan;
+    pin_conflict.trust_pins = vec![Frontier::new(checkpoint.height, block::Hash([0xff; 32]))];
+    assert_eq!(
+        verify_plan(&test_engine(&store), &pin_conflict),
+        Err(InvariantViolation::TrustPin(checkpoint.height))
+    );
 }

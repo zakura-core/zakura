@@ -251,6 +251,12 @@ pub(super) fn apply_transition_engine(
 
     let mut cause = if header_rebase == HeaderInsertionRebase::Rebased {
         TransitionCause::HeaderWorkRebased
+    } else if matches!(
+        request.event,
+        TransitionEvent::VerifiedChainChanged(ref event)
+            if event.cause == crate::VerifiedChangeCause::CheckpointFinalizedGrow
+    ) {
+        TransitionCause::CheckpointFinality
     } else {
         TransitionCause::Event
     };

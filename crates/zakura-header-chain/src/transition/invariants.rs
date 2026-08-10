@@ -9,7 +9,7 @@ use crate::graph::GraphOverlay;
 use crate::graph::HeaderGraphView;
 use crate::{
     AuxDelta, BodyValidationState, EligibilityReason, EngineMode, FinalitySource, Frontier,
-    HeaderChainEngine, HeaderNode, ProjectionDelta, TransitionPlan,
+    HeaderChainEngine, HeaderNode, ProjectionDelta, TransitionCause, TransitionPlan,
 };
 
 /// Stable, category-specific projected-state invariant failures.
@@ -61,6 +61,17 @@ pub enum InvariantViolation {
 
 /// Verify the complete projected state before an adapter may commit `plan`.
 pub(crate) fn verify_plan(
+    before: &HeaderChainEngine,
+    plan: &TransitionPlan,
+) -> Result<(), InvariantViolation> {
+    if is_incremental_checkpoint_finality(before, plan) {
+        return verify_incremental_checkpoint_finality(before, plan);
+    }
+
+    verify_plan_exhaustive(before, plan)
+}
+
+fn verify_plan_exhaustive(
     before: &HeaderChainEngine,
     plan: &TransitionPlan,
 ) -> Result<(), InvariantViolation> {
@@ -167,6 +178,183 @@ pub(crate) fn verify_plan(
         return Err(InvariantViolation::Limits);
     }
     verify_generations(before, plan, &selected, &verified)?;
+    verify_aux(before, &graph, plan)?;
+    Ok(())
+}
+
+pub(super) fn is_incremental_checkpoint_finality(
+    before: &HeaderChainEngine,
+    plan: &TransitionPlan,
+) -> bool {
+    let source = before.snapshot();
+    let metadata = &plan.change_set.metadata;
+    let Some(record) = plan.change_set.finality_append else {
+        return false;
+    };
+    let finalized = record.current;
+
+    plan.cause() == TransitionCause::CheckpointFinality
+        && source.mode == EngineMode::Integrated
+        && matches!(record.source, FinalitySource::FullState { .. })
+        && record.previous == source.frontiers.finalized
+        && finalized.height > source.frontiers.finalized.height
+        && metadata.frontiers.finalized == finalized
+        && metadata.frontiers.verified_best == finalized
+        && metadata.frontiers.header_best == source.frontiers.header_best
+        && before.verified_projection() == [source.frontiers.finalized]
+        && before
+            .selected_projection()
+            .binary_search_by_key(&finalized.height, |frontier| frontier.height)
+            .ok()
+            .is_some_and(|index| before.selected_projection()[index] == finalized)
+        && plan.change_set.selected_projection
+            == (ProjectionDelta {
+                remove_before: Some(finalized.height),
+                remove_from: None,
+                put: Vec::new(),
+            })
+        && plan.change_set.verified_projection
+            == (ProjectionDelta {
+                remove_before: Some(finalized.height),
+                remove_from: Some(finalized.height),
+                put: vec![finalized],
+            })
+        && plan.change_set.put_nodes.len() == 1
+        && plan.change_set.put_nodes[0].hash == finalized.hash
+        && plan.change_set.eligibility_changes.is_empty()
+        && plan
+            .change_set
+            .aux_changes
+            .iter()
+            .all(|change| matches!(change, AuxDelta::Delete { .. }))
+        && plan.graph_delta().finalized == Some(finalized)
+        && plan.graph_delta().add_children.is_empty()
+        && plan
+            .graph_delta()
+            .remove_children
+            .iter()
+            .all(|(parent, _)| plan.graph_delta().delete_nodes.contains(parent))
+}
+
+fn verify_incremental_checkpoint_finality(
+    before: &HeaderChainEngine,
+    plan: &TransitionPlan,
+) -> Result<(), InvariantViolation> {
+    let source = before.snapshot();
+    if source != plan.before {
+        return Err(InvariantViolation::SourceSnapshot);
+    }
+    before
+        .graph()
+        .validate_delta(plan.graph_delta())
+        .map_err(|_| InvariantViolation::Index(block::Hash([0; 32])))?;
+    let delta_graph = GraphOverlay::from_delta(before.graph(), plan.graph_delta());
+    let delta_finalized = delta_graph.view_finalized();
+    #[cfg(any(test, feature = "fuzz-impl"))]
+    let graph = plan.projected_graph().clone();
+    #[cfg(not(any(test, feature = "fuzz-impl")))]
+    let graph = delta_graph;
+    let metadata = &plan.change_set.metadata;
+    let record = plan
+        .change_set
+        .finality_append
+        .expect("the incremental checkpoint shape requires finality evidence");
+    let finalized = record.current;
+    let source_metadata = before.metadata();
+
+    if source_metadata.state_version != source.state_version
+        || metadata.mode != source.mode
+        || metadata.work_origin != source_metadata.work_origin
+    {
+        return Err(InvariantViolation::SourceSnapshot);
+    }
+    if metadata.frontiers.finalized != graph.view_finalized()
+        || metadata.frontiers.finalized != delta_finalized
+        || record.previous != source.frontiers.finalized
+        || record.current != metadata.frontiers.finalized
+        || record.epoch != metadata.finality_epoch
+        || !matches!(record.source, FinalitySource::FullState { .. })
+    {
+        return Err(InvariantViolation::Protected(finalized.hash));
+    }
+
+    let changed = &plan.change_set.put_nodes[0];
+    let previous = before
+        .graph()
+        .node(changed.hash)
+        .ok_or(InvariantViolation::Protected(changed.hash))?;
+    if changed.hash != previous.hash || changed.header != previous.header {
+        return Err(InvariantViolation::NodeHash(changed.hash));
+    }
+    if changed.height != previous.height || changed.parent_hash != previous.parent_hash {
+        return Err(InvariantViolation::Parent(changed.hash));
+    }
+    if changed.block_work != previous.block_work
+        || changed.work_coordinate() != previous.work_coordinate()
+    {
+        return Err(InvariantViolation::Work(changed.hash));
+    }
+    if changed.validation != previous.validation
+        || changed.eligibility.direct_reasons != previous.eligibility.direct_reasons
+        || changed.eligibility.inherited_from.is_some()
+    {
+        return Err(InvariantViolation::Eligibility(changed.hash));
+    }
+    if changed.aux_delivery_ids != previous.aux_delivery_ids {
+        return Err(InvariantViolation::Auxiliary(changed.hash));
+    }
+    if !matches!(changed.body, BodyValidationState::Verified { .. }) {
+        return Err(InvariantViolation::VerifiedProjection(changed.hash));
+    }
+    let projected_changed = graph
+        .view_node(changed.hash)
+        .ok_or(InvariantViolation::Protected(changed.hash))?;
+    if projected_changed != changed {
+        return Err(InvariantViolation::Index(changed.hash));
+    }
+
+    verify_indexes(before, plan)?;
+    let selected = before.selected_projection();
+    for hash in &plan.change_set.delete_nodes {
+        let Some(node) = before.graph().node(*hash) else {
+            return Err(InvariantViolation::Index(*hash));
+        };
+        if node.height >= finalized.height
+            && selected
+                .binary_search_by_key(&node.height, |frontier| frontier.height)
+                .ok()
+                .is_some_and(|index| selected[index].hash == *hash)
+        {
+            return Err(InvariantViolation::SelectedProjection(*hash));
+        }
+    }
+
+    let best = graph
+        .view_select_header_best()
+        .map_err(|_| InvariantViolation::Selection)?;
+    if best.0 != metadata.frontiers.header_best || best.1 != metadata.header_best_score {
+        return Err(InvariantViolation::Selection);
+    }
+    if let Ok(index) = plan
+        .trust_pins
+        .binary_search_by_key(&finalized.height, |pin| pin.height)
+    {
+        if plan.trust_pins[index].hash != finalized.hash {
+            return Err(InvariantViolation::TrustPin(finalized.height));
+        }
+    }
+    verify_protected(&graph, plan)?;
+    if graph.view_node_count().saturating_sub(1) > plan.limits.max_non_finalized_nodes.get()
+        || graph.view_eligible_tips().len() > plan.limits.max_candidate_tips.get()
+    {
+        return Err(InvariantViolation::Limits);
+    }
+    verify_generations(
+        before,
+        plan,
+        &[metadata.frontiers.header_best],
+        &[metadata.frontiers.verified_best],
+    )?;
     verify_aux(before, &graph, plan)?;
     Ok(())
 }

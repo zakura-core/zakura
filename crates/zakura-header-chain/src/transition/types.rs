@@ -1457,6 +1457,8 @@ pub struct ChangeSet {
 pub enum TransitionCause {
     /// One of the externally typed evidence categories.
     Event,
+    /// Checkpoint body growth advanced integrated finality on the retained selected path.
+    CheckpointFinality,
     /// Ordinary header work was admitted after a durable monotone-finality rebase.
     HeaderWorkRebased,
     /// The complete prepared range was already consumed by monotone finality.

@@ -1074,7 +1074,7 @@ fn fast_sync_metadata_cf_upgrade_is_no_migration() {
 
 #[test]
 fn node_software_metadata_cf_upgrade_is_no_migration() {
-    let upgrades: Vec<_> = format_upgrades(Some(Version::new(28, 0, 3)), None).collect();
+    let upgrades: Vec<_> = format_upgrades(Some(Version::new(28, 0, 3))).collect();
     let upgrade = upgrades
         .iter()
         .find(|upgrade| upgrade.version() == Version::new(28, 1, 0))

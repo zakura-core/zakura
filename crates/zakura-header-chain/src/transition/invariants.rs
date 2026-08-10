@@ -154,7 +154,12 @@ pub(crate) fn verify_plan(
         &verified,
         metadata.frontiers.verified_best,
     )?;
-    verify_pins(&graph, &plan.trust_pins, &selected, &verified)?;
+    verify_pins(
+        &plan.trust_pins,
+        &selected,
+        &verified,
+        &plan.change_set.put_nodes,
+    )?;
     verify_protected(&graph, plan)?;
     if graph.view_node_count().saturating_sub(1) > plan.limits.max_non_finalized_nodes.get()
         || graph.view_eligible_tips().len() > plan.limits.max_candidate_tips.get()
@@ -338,11 +343,11 @@ fn verify_verified<G: HeaderGraphView>(
     Ok(())
 }
 
-fn verify_pins<G: HeaderGraphView>(
-    graph: &G,
+fn verify_pins(
     pins: &[Frontier],
     selected: &[Frontier],
     verified: &[Frontier],
+    changed_nodes: &[HeaderNode],
 ) -> Result<(), InvariantViolation> {
     for pin in pins {
         for projection in [selected, verified] {
@@ -355,13 +360,10 @@ fn verify_pins<G: HeaderGraphView>(
                 }
             }
         }
-        for hash in graph.view_hashes_at_height(pin.height) {
-            if hash == pin.hash {
-                continue;
-            }
-            let node = graph
-                .view_node(hash)
-                .ok_or(InvariantViolation::TrustPin(pin.height))?;
+        for node in changed_nodes
+            .iter()
+            .filter(|node| node.height == pin.height && node.hash != pin.hash)
+        {
             let has_reason = node.eligibility.direct_reasons.iter().any(|reason| {
                 matches!(reason,
                     EligibilityReason::SettledUpgradeConflict { height, expected }

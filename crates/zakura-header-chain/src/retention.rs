@@ -26,6 +26,13 @@ pub(crate) fn enforce_retention<G: HeaderGraphEdit>(
     validation_context_references: impl IntoIterator<Item = block::Hash>,
     limits: EngineLimits,
 ) -> Result<RetentionPlan, GraphError> {
+    let over_tip_limit = store.view_eligible_tips().len() > limits.max_candidate_tips.get();
+    let over_node_limit =
+        store.view_node_count().saturating_sub(1) > limits.max_non_finalized_nodes.get();
+    if !over_tip_limit && !over_node_limit {
+        return Ok(RetentionPlan::default());
+    }
+
     let mut protected = HashSet::new();
     protect_path(store, header_best.hash, &mut protected)?;
     protect_path(store, verified_best.hash, &mut protected)?;
@@ -46,29 +53,34 @@ pub(crate) fn enforce_retention<G: HeaderGraphEdit>(
     }
 
     let plan = RetentionPlan::default();
-    let under_pressure = store.view_eligible_tips().len() > limits.max_candidate_tips.get()
-        || store.view_node_count().saturating_sub(1) > limits.max_non_finalized_nodes.get();
-    if under_pressure {
-        evict_permanently_ineligible(store, &protected)?;
+    evict_permanently_ineligible(store, &protected)?;
+    if store.view_eligible_tips().len() <= limits.max_candidate_tips.get()
+        && store.view_node_count().saturating_sub(1) <= limits.max_non_finalized_nodes.get()
+    {
+        return Ok(plan);
     }
 
-    let mut eligible_candidates = unprotected_eligible_tips(store, &protected)?;
-    while store.view_eligible_tips().len() > limits.max_candidate_tips.get() {
-        let Some(tip) = eligible_candidates.pop() else {
-            return Ok(stalled(plan));
-        };
-        if store.view_node(tip.hash).is_some() {
-            evict_tip_branch(store, tip.hash, &protected)?;
+    if store.view_eligible_tips().len() > limits.max_candidate_tips.get() {
+        let mut eligible_candidates = unprotected_eligible_tips(store, &protected)?;
+        while store.view_eligible_tips().len() > limits.max_candidate_tips.get() {
+            let Some(tip) = eligible_candidates.pop() else {
+                return Ok(stalled(plan));
+            };
+            if store.view_node(tip.hash).is_some() {
+                evict_tip_branch(store, tip.hash, &protected)?;
+            }
         }
     }
 
-    let mut leaf_candidates = unprotected_leaves(store, &protected)?;
-    while store.view_node_count().saturating_sub(1) > limits.max_non_finalized_nodes.get() {
-        let Some(hash) = leaf_candidates.pop() else {
-            return Ok(stalled(plan));
-        };
-        if store.view_node(hash).is_some() {
-            evict_tip_branch(store, hash, &protected)?;
+    if store.view_node_count().saturating_sub(1) > limits.max_non_finalized_nodes.get() {
+        let mut leaf_candidates = unprotected_leaves(store, &protected)?;
+        while store.view_node_count().saturating_sub(1) > limits.max_non_finalized_nodes.get() {
+            let Some(hash) = leaf_candidates.pop() else {
+                return Ok(stalled(plan));
+            };
+            if store.view_node(hash).is_some() {
+                evict_tip_branch(store, hash, &protected)?;
+            }
         }
     }
 
@@ -378,6 +390,35 @@ mod tests {
         assert!(store.node(permanent.hash).is_none());
         assert!(store.node(selected.hash).is_some());
         assert!(store.node(spare.hash).is_some());
+    }
+
+    #[test]
+    fn retention_below_both_limits_has_no_graph_work_or_effects() {
+        let mut store = store();
+        let anchor = store.finalized();
+        let permanent = insert(
+            &mut store,
+            anchor.hash,
+            1,
+            [EligibilityReason::CheckpointConflict {
+                height: block::Height(1),
+                expected: block::Hash([9; 32]),
+            }],
+        );
+        let selected = insert(&mut store, anchor.hash, 2, []);
+        let before_node_count = store.node_count();
+        let before_tips = store.eligible_tips();
+        let before_permanent = store.node(permanent.hash).cloned();
+        let before_selected = store.node(selected.hash).cloned();
+
+        let plan = enforce_retention(&mut store, selected, anchor, [], limits(10, 10))
+            .expect("a graph below both limits needs no eviction planning");
+
+        assert_eq!(plan, RetentionPlan::default());
+        assert_eq!(store.node_count(), before_node_count);
+        assert_eq!(store.eligible_tips(), before_tips);
+        assert_eq!(store.node(permanent.hash), before_permanent.as_ref());
+        assert_eq!(store.node(selected.hash), before_selected.as_ref());
     }
 
     #[test]

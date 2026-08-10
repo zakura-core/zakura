@@ -6,6 +6,7 @@ name: VCT handoff canary
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
@@ -37,6 +38,16 @@ concurrency:
 jobs:
   handoff:
     name: Cross Mainnet VCT handoff
+    # This job inherits fleet secrets, so PR execution is limited to the
+    # same-repository release-state PRs opened by the trusted update workflow.
+    if: >-
+      ${{
+        github.event_name != 'pull_request'
+        || (
+          github.event.pull_request.head.repo.full_name == github.repository
+          && contains(github.event.pull_request.labels.*.name, 'A-release-state')
+        )
+      }}
     uses: ./.github/workflows/zakura-pr-node.yml
     permissions:
       contents: read

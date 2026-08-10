@@ -116,7 +116,7 @@ pub enum GraphError {
     /// Finality attempted to root the graph at an ineligible header.
     #[error("cannot finalize ineligible retained header {0:?}")]
     IneligibleFinalized(block::Hash),
-    /// Finality attempted to move to a retained header outside the current finalized subtree.
+    /// Finality selected a retained header outside the current finalized subtree.
     #[error(
         "new finalized header {candidate:?} is not a descendant of current finalized header {current:?}"
     )]
@@ -148,9 +148,9 @@ pub enum GraphError {
 /// Result of an idempotent DAG insertion.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum InsertResult {
-    /// A new node and all reconstructible indexes were inserted.
+    /// The graph inserted a new node and all reconstructible indexes.
     Inserted(Frontier),
-    /// The exact same node was already retained.
+    /// The graph already retained the exact same node.
     AlreadyPresent(Frontier),
 }
 
@@ -245,7 +245,7 @@ impl MemHeaderStore {
         children
     }
 
-    /// Insert one admitted header after its exact parent is retained.
+    /// Insert one admitted header after the graph retains its exact parent.
     pub(crate) fn insert(
         &mut self,
         header: Arc<block::Header>,

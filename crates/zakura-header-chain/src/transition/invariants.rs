@@ -15,46 +15,46 @@ use crate::{
 /// Stable, category-specific projected-state invariant failures.
 #[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
 pub enum InvariantViolation {
-    /// 1. A row key, canonical header, and locally computed hash disagree.
+    /// 1. The verifier found conflicting row-key, canonical-header, and computed hashes.
     #[error("node hash invariant failed at {0:?}")]
     NodeHash(block::Hash),
-    /// 2. A non-anchor node lacks one exact height-minus-one parent.
+    /// 2. The verifier found a non-anchor node without an exact height-minus-one parent.
     #[error("parent invariant failed at {0:?}")]
     Parent(block::Hash),
-    /// 3. Hash, parent/child, height, or planned indexes do not round-trip.
+    /// 3. The verifier could not round-trip a hash, parent/child, height, or planned index.
     #[error("index invariant failed at {0:?}")]
     Index(block::Hash),
-    /// 4. A work coordinate has the wrong origin or parent-plus-block value.
+    /// 4. The verifier found an incorrect work origin or parent-plus-block value.
     #[error("work invariant failed at {0:?}")]
     Work(block::Hash),
-    /// 5. Cached inherited eligibility differs from exact ancestry.
+    /// 5. The verifier found cached inherited eligibility that differs from exact ancestry.
     #[error("eligibility invariant failed at {0:?}")]
     Eligibility(block::Hash),
-    /// 6. The selected projection is not a gapless finalized-to-tip path.
+    /// 6. The verifier found a gap in the finalized-to-tip selected projection.
     #[error("selected projection invariant failed at {0:?}")]
     SelectedProjection(block::Hash),
-    /// 7. `header_best` is not the maximum eligible score.
+    /// 7. The verifier found an eligible score above `header_best`.
     #[error("selection invariant failed")]
     Selection,
-    /// 8. The verified projection contradicts its mode or body evidence.
+    /// 8. The verifier found a verified projection that contradicts its mode or body evidence.
     #[error("verified projection invariant failed at {0:?}")]
     VerifiedProjection(block::Hash),
-    /// 9. A retained path conflicts with an authenticated trust pin.
+    /// 9. The verifier found a retained path that conflicts with an authenticated trust pin.
     #[error("trust-pin invariant failed at height {0:?}")]
     TrustPin(block::Height),
-    /// 10. Finalized, selected, or verified protected state was evicted.
+    /// 10. The transition evicted finalized, selected, or verified protected state.
     #[error("protected-path invariant failed at {0:?}")]
     Protected(block::Hash),
     /// 11. The projected DAG exceeds a frozen resource limit.
     #[error("resource-limit invariant failed")]
     Limits,
-    /// 12. State or frontier generation increments disagree with actual changes.
+    /// 12. The verifier found generation increments that disagree with actual changes.
     #[error("generation invariant failed")]
     Generation,
-    /// 13. Auxiliary evidence lacks a retained foreign key or provenance link.
+    /// 13. The verifier found auxiliary evidence without a retained foreign key or provenance link.
     #[error("auxiliary invariant failed at {0:?}")]
     Auxiliary(block::Hash),
-    /// The coherent source view changed or failed while checking the plan.
+    /// The coherent source view changed or failed during plan verification.
     #[error("source snapshot changed during invariant verification")]
     SourceSnapshot,
 }

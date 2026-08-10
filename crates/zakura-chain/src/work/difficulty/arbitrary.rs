@@ -46,8 +46,8 @@ impl Arbitrary for Work {
     type Parameters = ();
 
     fn arbitrary_with(_args: ()) -> Self::Strategy {
-        // Keep the established practical-work distribution used by state test
-        // generators. Full-width boundaries have deterministic vectors.
+        // State test generators use this established practical-work distribution.
+        // Deterministic vectors cover the full-width boundaries.
         (1..u128::MAX)
             .prop_map(|work| Work(U256::from(work)))
             .boxed()

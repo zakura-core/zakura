@@ -113,8 +113,8 @@ pub struct ExpandedDifficulty(U256);
 /// choose the best chain. But its precise value and bit pattern are not
 /// consensus-critical.
 ///
-/// Work is kept at its exact 256-bit width so valid hard targets are not
-/// rejected or narrowed before cumulative-work comparisons.
+/// Zakura keeps work at its exact 256-bit width.
+/// This width preserves valid hard targets for cumulative-work comparisons.
 ///
 /// > a node chooses the “best” block chain visible to it by finding the chain of valid blocks
 /// > with the greatest total work. The work of a block with value nBits for the nBits field in
@@ -818,12 +818,12 @@ fn u256_to_f64(value: U256) -> f64 {
     let mantissa_bits = usize::try_from(f64::MANTISSA_DIGITS)
         .expect("the f64 mantissa width fits in usize on every supported target");
     if bits <= mantissa_bits {
-        // Values with at most 53 bits are represented exactly by f64.
+        // An f64 represents values with at most 53 bits exactly.
         return value.as_u64() as f64;
     }
 
     let shift = bits - mantissa_bits;
     let significant = (value >> shift).as_u64();
-    // `significant` has exactly the 53 high bits, so this conversion is exact.
+    // The f64 mantissa represents the 53 high bits in `significant` exactly.
     significant as f64 * 2.0_f64.powi(i32::try_from(shift).expect("a U256 shift fits in i32"))
 }

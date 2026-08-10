@@ -37,9 +37,9 @@ pub const MAX_RETENTION_REFERENCES_V1: usize = MAX_STAGED_TARGETS_V1 + MAX_CANDI
 /// Header-engine integration and finality mode.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum EngineMode {
-    /// Full state is the only authority allowed to advance finality.
+    /// Only full state advances finality.
     Integrated,
-    /// A selected header 1,000 blocks deep becomes a disclosed local trust pin.
+    /// The engine turns a selected header 1,000 blocks deep into a disclosed local trust pin.
     HeadersOnly,
 }
 
@@ -52,7 +52,8 @@ pub struct TrustedAnchor {
     pub header: Arc<block::Header>,
 }
 
-/// Authenticated local checkpoint map; height-only or hash-only entries are impossible.
+/// The local checkpoint map authenticates both height and hash.
+/// The map rejects height-only and hash-only entries.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CheckpointSet(BTreeMap<block::Height, block::Hash>);
 
@@ -170,7 +171,7 @@ impl SettledUpgradeManifest {
         self.digest
     }
 
-    /// Return the mandatory pin for a production network; custom networks have none.
+    /// Return a production network's mandatory pin or `None` for a custom network.
     pub fn pin_for_network(&self, network: &Network) -> Option<SettledUpgradePin> {
         let production_kind = match network {
             Network::Mainnet => Some(NetworkKind::Mainnet),

@@ -113,8 +113,7 @@ impl Solution {
         self.check_equihash(header, n, k)
     }
 
-    /// Validate that this solution's encoded shape matches the authenticated network parameters,
-    /// without verifying the Equihash proof.
+    /// Validate only the solution's encoded shape against the authenticated network parameters.
     pub fn validate_shape(&self, network: &Network) -> Result<(), Error> {
         match (network.is_regtest(), self) {
             // Mainnet and Testnet require the memory-hard (200, 9) parameters,

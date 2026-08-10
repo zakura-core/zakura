@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 // AUD-10/AUD-12: invalidation must reselect eligible work without erasing
-// independent exclusion reasons; this fixture exercises both in one graph.
+// independent exclusion reasons. This fixture exercises both rules in one graph.
 fn operator_invalidation_promotes_alternate_and_preserves_nested_reasons() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());

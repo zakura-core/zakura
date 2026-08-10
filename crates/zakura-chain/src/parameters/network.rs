@@ -232,9 +232,10 @@ impl Network {
 
     /// Returns true if the maximum block time rule is active for `network` and `height`.
     ///
-    /// Mainnet returns true; its height-1 exception is applied by validation.
-    /// Public Testnet activates at its historical consensus height. Configured
-    /// networks and Regtest use their authenticated local parameter.
+    /// Mainnet activates this rule at every height.
+    /// Validation applies Mainnet's height-1 exception.
+    /// Public Testnet activates this rule at its historical consensus height.
+    /// Configured networks and Regtest use their authenticated local parameter.
     ///
     /// Part of the consensus rules at <https://zips.z.cash/protocol/protocol.pdf#blockheader>
     pub fn is_max_block_time_enforced(&self, height: block::Height) -> bool {

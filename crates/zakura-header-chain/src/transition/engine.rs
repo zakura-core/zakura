@@ -24,13 +24,13 @@ pub enum EngineHydrationError {
     Graph(#[from] GraphError),
 }
 
-/// A verified transition could not be installed on its original in-memory source.
+/// The engine could not install a verified transition on its original in-memory source.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CommittedTransitionError {
-    /// Another transition changed the engine after this transition was planned.
+    /// Another transition changed the engine after the planner created this transition.
     #[error("committed header transition no longer matches its source snapshot")]
     StaleSource,
-    /// The verified graph delta could not be applied.
+    /// The graph rejected the verified delta.
     #[error(transparent)]
     Graph(#[from] GraphError),
 }
@@ -48,7 +48,7 @@ pub enum DurableTransitionFacts {
         /// Contiguous finality records from the work's stable anchor to current finality.
         finality_path: Vec<crate::FinalityRecord>,
     },
-    /// The exact preserved migration pin, when the requested pin is in durable finality history.
+    /// The exact preserved migration pin, if durable finality history contains the requested pin.
     MigratedFinalityPin(Option<Frontier>),
 }
 

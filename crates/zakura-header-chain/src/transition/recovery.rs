@@ -24,7 +24,7 @@ pub struct ValidationContextRecord {
     pub height: block::Height,
 }
 
-/// Complete exhaustive row/index view used only while publication is disabled.
+/// The startup audit uses this complete row and index view while publication is disabled.
 pub trait StoreAuditRead {
     /// Return the atomic externally meaningful snapshot.
     fn snapshot(&self) -> Result<EngineSnapshot, StoreError>;
@@ -61,54 +61,54 @@ pub trait StoreAuditRead {
 /// Stable exhaustive-audit violation categories.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuditViolation {
-    /// Canonical header and stored hash disagreed.
+    /// The audit found conflicting canonical-header and stored hashes.
     NodeHash(block::Hash),
-    /// A non-anchor node had no exact height-minus-one parent.
+    /// The audit found a non-anchor node without an exact height-minus-one parent.
     Parent(block::Hash),
-    /// Exact cumulative work did not equal parent plus block work.
+    /// The audit found cumulative work that did not equal parent plus block work.
     Work(block::Hash),
-    /// Body invalidity and direct eligibility evidence disagreed.
+    /// The audit found conflicting body-invalidity and direct-eligibility evidence.
     BodyEligibility(block::Hash),
-    /// Header validation state contradicted deterministic header facts.
+    /// The audit found header validation state that contradicted deterministic header facts.
     HeaderValidation(block::Hash),
-    /// A trust pin was absent or lacked its exact conflict reason.
+    /// The audit found an absent trust pin or an absent conflict reason.
     TrustPin(block::Height, block::Hash),
-    /// Authoritative reason roots disagreed with node source rows.
+    /// The audit found authoritative reason roots that disagreed with node source rows.
     EligibilityRoot(block::Hash),
-    /// Auxiliary provenance or a node foreign key was invalid.
+    /// The audit found invalid auxiliary provenance or an invalid node foreign key.
     Auxiliary(block::Hash),
-    /// Immutable validation context was malformed or discontinuous.
+    /// The audit found malformed or discontinuous immutable validation context.
     ValidationContext(block::Hash),
-    /// Finality history contradicted finalized metadata.
+    /// The audit found finality history that contradicted finalized metadata.
     Finality,
-    /// Mode, network, manifest, schema, or snapshot contradicted configuration.
+    /// The audit found mode, network, manifest, schema, or snapshot data that contradicted configuration.
     Configuration,
-    /// A protected source path was absent or discontinuous.
+    /// The audit found an absent or discontinuous protected source path.
     ProtectedPath(block::Hash),
-    /// Authoritative rows exceeded frozen limits without the permitted alarm.
+    /// The audit found authoritative rows above frozen limits without the permitted alarm.
     Limits,
 }
 
 /// Reconstructible categories replaced by one atomic recovery transaction.
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RecoveryRepair {
-    /// A fully audited store was rebound to the currently configured trust-anchor manifest.
+    /// Recovery rebinds a fully audited store to the configured trust-anchor manifest.
     TrustAnchorConfiguration,
-    /// Parent/child adjacency differed from source nodes.
+    /// Recovery rebuilds parent/child adjacency from source nodes.
     ChildIndex,
-    /// Future-time index differed from node states.
+    /// Recovery rebuilds the future-time index from node states.
     DeferredIndex,
-    /// Legitimately elapsed future-time deferrals were promoted before publication.
+    /// Recovery promotes elapsed future-time deferrals before publication.
     ElapsedDeferrals,
-    /// Selected projection/frontier differed from recomputation.
+    /// Recovery replaces the selected projection and frontier with recomputed values.
     SelectedProjection,
-    /// Verified projection differed from its authoritative frontier.
+    /// Recovery rebuilds the verified projection from its authoritative frontier.
     VerifiedProjection,
-    /// Cached inherited eligibility differed from ancestry.
+    /// Recovery rebuilds cached inherited eligibility from ancestry.
     InheritedEligibility,
-    /// Oldest-retained metadata differed from source nodes.
+    /// Recovery rebuilds oldest-retained metadata from source nodes.
     RetentionMetadata,
-    /// Selected-tip body-unavailability alarm differed from its durable node.
+    /// Recovery rebuilds the selected-tip body-unavailability alarm from its durable node.
     BodyAvailabilityAlarm,
 }
 
@@ -143,7 +143,7 @@ impl RecoveryPlan {
 /// Startup audit failed before publication became available.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum RecoveryFailure {
-    /// Exhaustive rows could not be read.
+    /// The store could not read the exhaustive rows.
     #[error(transparent)]
     Store(#[from] StoreError),
     /// Authoritative source invariants failed.
@@ -152,7 +152,7 @@ pub enum RecoveryFailure {
         /// Deterministically ordered violations.
         violations: Vec<AuditViolation>,
     },
-    /// A repair-required monotonic counter was exhausted.
+    /// Recovery exhausted a monotonic counter that the repair requires.
     #[error(transparent)]
     Counter(#[from] CounterExhausted),
 }
@@ -174,11 +174,12 @@ pub fn audit_store_at<S: StoreAuditRead>(
     audit_store_at_with_policy(store, config, now, false)
 }
 
-/// Audit every authoritative row against the current configuration, then plan an atomic
-/// trust-anchor-manifest rebind when that digest is the only configuration difference.
+/// Audit every authoritative row against the current configuration.
+/// The audit plans an atomic trust-anchor-manifest rebind when only that digest differs.
 ///
-/// This startup-only compatibility path permits release checkpoint extensions, but it does not
-/// permit mode, network, disk format, bootstrap origin, checkpoint, or source-row mismatches.
+/// This startup-only compatibility path permits release checkpoint extensions.
+/// The path rejects mode, network, disk format, bootstrap origin, checkpoint, and source-row
+/// mismatches.
 pub fn audit_store_for_trust_anchor_update<S: StoreAuditRead>(
     store: &S,
     config: &EngineConfig,

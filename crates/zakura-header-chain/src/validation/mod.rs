@@ -202,7 +202,8 @@ enum PowPolicyKind {
     AuthenticatedCustomWaiver,
 }
 
-/// Network-bound proof-of-work policy; callers cannot construct a production waiver.
+/// Network-bound proof-of-work policy.
+/// Callers cannot construct a production waiver.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PowPolicy {
     network: Network,

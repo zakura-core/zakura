@@ -30,7 +30,8 @@ impl BodyRuleId {
 pub enum HeaderValidationState {
     /// Every header rule, including the injected-clock rule, passed.
     Valid,
-    /// Deterministic rules passed, but local time does not admit this header yet.
+    /// The header passed deterministic rules.
+    /// Local time does not admit the header yet.
     DeferredUntil(DateTime<Utc>),
 }
 
@@ -238,7 +239,7 @@ pub struct BodyUnavailableSummary {
     pub supplier_set_digest: [u8; 32],
     /// Whether the persistent unavailability alarm has fired.
     pub alarmed: bool,
-    /// Earliest time another repeated-supplier attempt or alarm probe is allowed.
+    /// Earliest time the scheduler permits another repeated-supplier attempt or alarm probe.
     pub next_probe_at: DateTime<Utc>,
 }
 

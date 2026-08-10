@@ -116,7 +116,7 @@ pub struct HeaderChainError {
     pub subject: ErrorSubject,
     /// Normative rule that failed, when applicable.
     pub rule: Option<RuleId>,
-    /// Stable evidence record, when one was retained.
+    /// Stable evidence record, if the engine retained one.
     pub evidence: Option<EvidenceId>,
     /// Explicit peer attribution boundary.
     pub attribution: Attribution,

@@ -8,8 +8,8 @@ import subprocess
 import sys
 
 
-# Remove this exclusion after the crate's first crates.io publish gives
-# cargo-semver-checks a stable baseline to compare.
+# The crate's first crates.io publication will give cargo-semver-checks a stable
+# comparison baseline. Maintainers must remove this exclusion after that publication.
 UNPUBLISHED_BASELINE_EXCLUSIONS = {"zakura-header-chain"}
 
 

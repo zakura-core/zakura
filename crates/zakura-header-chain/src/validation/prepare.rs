@@ -50,8 +50,8 @@ impl HeaderRules {
         })
     }
 
-    /// Bind authenticated network parameters to a state-issued validation lease. The state
-    /// transition independently rechecks the lease's anchor digest before any mutation.
+    /// Bind authenticated network parameters to a state-issued validation lease.
+    /// The state transition independently rechecks the lease's anchor digest before mutation.
     pub fn for_validation_lease(lease: &ValidationLease) -> Result<Self, PowPolicyError> {
         let network = lease.network.clone();
         Ok(Self {
@@ -134,7 +134,8 @@ impl HeaderRule {
     }
 }
 
-/// Failure to prepare a batch. Only local future time is represented in a successful batch.
+/// Failure to prepare a batch.
+/// A successful batch can represent only a local future-time deferral.
 #[derive(Debug, Error)]
 pub enum HeaderFailure {
     /// The caller supplied no headers for an insertion event.

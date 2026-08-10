@@ -16,7 +16,7 @@ use crate::{
     TargetCompletion, TransitionCause, TransitionContext, TransitionEvent, TransitionRequest,
 };
 
-/// A complete write set plus the private graph delta it was verified against.
+/// A complete write set and the private graph delta that the verifier checked.
 #[derive(Clone, Debug)]
 pub struct TransitionPlan {
     pub(super) before: EngineSnapshot,
@@ -61,7 +61,7 @@ impl TransitionPlan {
     }
 }
 
-/// Typed failure produced before any durable mutation is attempted.
+/// Typed failure that the planner produces before it attempts a durable mutation.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum TransitionFailure {
     /// The caller's version or asynchronous owner was stale.
@@ -70,13 +70,13 @@ pub enum TransitionFailure {
         /// Current durable version.
         current: StateVersion,
     },
-    /// Durable rows could not be read coherently.
+    /// The store could not read durable rows coherently.
     #[error(transparent)]
     Store(#[from] StoreError),
     /// The projected graph would be incoherent.
     #[error(transparent)]
     Graph(#[from] GraphError),
-    /// A monotonic durable counter was exhausted.
+    /// The transition exhausted a monotonic durable counter.
     #[error(transparent)]
     Counter(#[from] CounterExhausted),
     /// Persisted immutable configuration differs from this engine.
@@ -91,7 +91,7 @@ pub enum TransitionFailure {
     /// Prepared work no longer matches its durable validation context.
     #[error("prepared header context is stale")]
     StalePreparation,
-    /// One domain-local replay key was reused for a different payload.
+    /// A caller reused one domain-local replay key for a different payload.
     #[error("transition replay key conflicts with the previously committed payload")]
     ConflictingReplay,
     /// Event fields contradict canonical headers or durable ancestry.

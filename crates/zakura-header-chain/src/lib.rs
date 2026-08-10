@@ -1,7 +1,7 @@
 //! Fork-aware header-chain domain types and transition engine.
 //!
-//! This crate is intentionally synchronous and policy-focused. It owns no
-//! network transport, async runtime, consensus service, or database backend.
+//! This synchronous crate defines header-chain policy.
+//! Higher-level crates own network transport, async runtime, consensus services, and databases.
 
 mod config;
 mod error;

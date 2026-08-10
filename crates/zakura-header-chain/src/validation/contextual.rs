@@ -1,6 +1,6 @@
 //! Block difficulty adjustment calculations for contextual validation.
 //!
-//! This module supports the following consensus rule calculations:
+//! This module calculates the following consensus rules:
 //!  * `ThresholdBits` from the Zcash Specification,
 //!  * the Testnet minimum difficulty adjustment from ZIPs 205 and 208, and
 //!  * `median-time-past`.
@@ -52,14 +52,13 @@ pub const POW_MAX_ADJUST_DOWN_PERCENT: i32 = 32;
 /// Part of the block header consensus rules in the Zcash specification.
 pub const BLOCK_MAX_TIME_SINCE_MEDIAN: u32 = 90 * 60;
 
-/// Contains the context needed to calculate the adjusted difficulty for a block.
+/// This context calculates a block's adjusted difficulty.
 pub struct AdjustedDifficulty {
     /// The `header.time` field from the candidate block
     candidate_time: DateTime<Utc>,
     /// The coinbase height from the candidate block
     ///
-    /// If we only have the header, this field is calculated from the previous
-    /// block height.
+    /// Header validation calculates this field from the previous block height.
     candidate_height: block::Height,
     /// The configured network
     network: Network,
@@ -71,8 +70,8 @@ pub struct AdjustedDifficulty {
     /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks, in reverse height
     /// order.
     ///
-    /// Only the first and last `PoWMedianBlockSpan` times are used. Times
-    /// `11..=16` are ignored.
+    /// The calculation uses only the first and last `PoWMedianBlockSpan` times.
+    /// The calculation ignores times `11..=16`.
     relevant_times: BoundedVec<DateTime<Utc>, 1, POW_ADJUSTMENT_BLOCK_SPAN>,
 }
 
@@ -82,10 +81,10 @@ pub enum AdjustedDifficultyError {
     /// A full block did not expose its consensus height.
     #[error("candidate block has no coinbase height")]
     MissingCoinbaseHeight,
-    /// Contextual validation was requested for genesis.
+    /// The caller requested contextual validation for genesis.
     #[error("genesis has no predecessor difficulty context")]
     Genesis,
-    /// The candidate height could not be derived from its predecessor.
+    /// The predecessor height could not produce a candidate height.
     #[error("candidate height overflows the block-height range")]
     HeightOverflow,
     /// The context did not contain exactly the height-dependent predecessor span.
@@ -99,17 +98,15 @@ pub enum AdjustedDifficultyError {
 }
 
 impl AdjustedDifficulty {
-    /// Initialise and return a new `AdjustedDifficulty` using a `candidate_block`,
-    /// `network`, and a `context`.
+    /// Create an `AdjustedDifficulty` from a `candidate_block`, `network`, and `context`.
     ///
-    /// The `context` contains the previous
+    /// The caller supplies the previous
     /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) `difficulty_threshold`s and
     /// `time`s from the relevant chain for `candidate_block`, in reverse height
     /// order, starting with the previous block.
     ///
-    /// Note that the `time`s might not be in reverse chronological order, because
-    /// block times are supplied by miners.
-    ///
+    /// Miners supply block times.
+    /// The `time` values might not follow reverse chronological order.
     pub fn new_from_block<C>(
         candidate_block: &Block,
         network: &Network,
@@ -132,11 +129,9 @@ impl AdjustedDifficulty {
         )
     }
 
-    /// Initialise and return a new [`AdjustedDifficulty`] using a
-    /// `candidate_header_time`, `previous_block_height`, `network`, and a `context`.
+    /// Create an [`AdjustedDifficulty`] from header time, parent height, network, and context.
     ///
-    /// Designed for use when validating block headers, where the full block has not
-    /// been downloaded yet.
+    /// Header validation uses this constructor before the node downloads the full block.
     ///
     /// See [`Self::new_from_block`] for detailed information about the `context`.
     ///
@@ -204,12 +199,12 @@ impl AdjustedDifficulty {
         self.network.clone()
     }
 
-    /// Calculate the expected `difficulty_threshold` for a candidate block, based
-    /// on the `candidate_time`, `candidate_height`, `network`, and the
+    /// Calculate the expected `difficulty_threshold` from the candidate block's time and height,
+    /// the network, and the
     /// `difficulty_threshold`s and `time`s from the previous
     /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks in the relevant chain.
     ///
-    /// Implements `ThresholdBits` from the Zcash specification, and the Testnet
+    /// This method implements `ThresholdBits` from the Zcash specification and the Testnet
     /// minimum difficulty adjustment from ZIPs 205 and 208.
     pub fn expected_difficulty_threshold(&self) -> CompactDifficulty {
         if NetworkUpgrade::is_testnet_min_difficulty_block(
@@ -228,14 +223,12 @@ impl AdjustedDifficulty {
         }
     }
 
-    /// Calculate the `difficulty_threshold` for a candidate block, based on the
-    /// `candidate_height`, `network`, and the relevant `difficulty_threshold`s and
-    /// `time`s.
+    /// Calculate a candidate block's `difficulty_threshold` from its height, network, and context.
     ///
     /// See [`Self::expected_difficulty_threshold`] for details.
     ///
-    /// Implements `ThresholdBits` from the Zcash specification. (Which excludes the
-    /// Testnet minimum difficulty adjustment.)
+    /// This method implements `ThresholdBits` from the Zcash specification.
+    /// `ThresholdBits` excludes the Testnet minimum difficulty adjustment.
     fn threshold_bits(&self) -> CompactDifficulty {
         let averaging_window_height = u32::try_from(POW_AVERAGING_WINDOW)
             .expect("averaging window is much smaller than u32::MAX");
@@ -244,9 +237,9 @@ impl AdjustedDifficulty {
             // # Consensus
             //
             // `ThresholdBits(height)` is `PoWLimit` for `height <= PoWAveragingWindow`.
-            // Zebra's full-block contextual validation on Mainnet and Testnet
-            // starts after the mandatory checkpoint, so this early-chain path is
-            // only reachable through header sync and non-checkpointed test networks.
+            // Zakura starts full-block contextual validation after the mandatory checkpoint on
+            // Mainnet and Testnet. Only header sync and non-checkpointed test networks reach this
+            // early-chain path.
             return self.network.target_difficulty_limit().to_compact();
         }
 
@@ -262,15 +255,13 @@ impl AdjustedDifficulty {
         threshold.to_compact()
     }
 
-    /// Calculate the arithmetic mean of the averaging window thresholds: the
-    /// expanded `difficulty_threshold`s from the previous `PoWAveragingWindow` (17)
-    /// blocks in the relevant chain.
+    /// Calculate the arithmetic mean of the expanded `difficulty_threshold` values from the
+    /// previous `PoWAveragingWindow` blocks in the relevant chain.
     ///
     /// Implements `MeanTarget` from the Zcash specification.
     fn mean_target_difficulty(&self) -> ExpandedDifficulty {
-        // `threshold_bits` returns `PoWLimit` before calling this function for
-        // early-chain heights. At later heights, a valid relevant chain contains
-        // at least 17 blocks.
+        // `threshold_bits` returns `PoWLimit` before it calls this function at early-chain heights.
+        // A valid relevant chain contains at least 17 blocks at later heights.
 
         let averaging_window_thresholds =
             &self.relevant_difficulty_thresholds.as_slice()[0..POW_AVERAGING_WINDOW];
@@ -297,30 +288,30 @@ impl AdjustedDifficulty {
         )
     }
 
-    /// Calculate the bounded median timespan. The median timespan is the
-    /// difference of medians of the timespan times, which are the `time`s from
+    /// Calculate the bounded median timespan.
+    /// The calculation subtracts the medians of the `time` values from
     /// the previous `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks in the
     /// relevant chain.
     ///
-    /// Uses the candidate block's `height' and `network` to calculate the
+    /// This method uses the candidate block's height and network to calculate the
     /// `AveragingWindowTimespan` for that block.
     ///
-    /// The median timespan is damped by the `PoWDampingFactor`, and bounded by
-    /// `PoWMaxAdjustDown` and `PoWMaxAdjustUp`.
+    /// `PoWDampingFactor` damps the median timespan.
+    /// `PoWMaxAdjustDown` and `PoWMaxAdjustUp` bound the median timespan.
     ///
     /// Implements `ActualTimespanBounded` from the Zcash specification.
     ///
-    /// Note: This calculation only uses `PoWMedianBlockSpan` (11) times at the
-    /// start and end of the timespan times. timespan times `[11..=16]` are ignored.
+    /// This calculation uses only `PoWMedianBlockSpan` times at each end of the timespan.
+    /// The calculation ignores times `11..=16`.
     fn median_timespan_bounded(&self) -> Duration {
         let averaging_window_timespan = NetworkUpgrade::averaging_window_timespan_for_height(
             &self.network,
             self.candidate_height,
         );
-        // This value is exact, but we need to truncate its nanoseconds component
+        // The duration value is exact. The calculation must truncate its nanoseconds component.
         let damped_variance =
             (self.median_timespan() - averaging_window_timespan) / POW_DAMPING_FACTOR;
-        // num_seconds truncates negative values towards zero, matching the Zcash specification
+        // `num_seconds` truncates negative values toward zero as the Zcash specification requires.
         let damped_variance = Duration::seconds(damped_variance.num_seconds());
 
         // `ActualTimespanDamped` in the Zcash specification
@@ -339,8 +330,8 @@ impl AdjustedDifficulty {
         )
     }
 
-    /// Calculate the median timespan. The median timespan is the difference of
-    /// medians of the timespan times, which are the `time`s from the previous
+    /// Calculate the median timespan.
+    /// The calculation subtracts the medians of the `time` values from
     /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks in the relevant chain.
     ///
     /// Implements `ActualTimespan` from the Zcash specification.
@@ -371,9 +362,8 @@ impl AdjustedDifficulty {
     /// Calculate the median of the `time`s from the previous
     /// `PoWMedianBlockSpan` (11) blocks in the relevant chain.
     ///
-    /// Implements `median-time-past` and `MedianTime(candidate_height)` from the
-    /// Zcash specification. (These functions are identical, but they are
-    /// specified in slightly different ways.)
+    /// This method implements `median-time-past` and `MedianTime(candidate_height)` from the
+    /// Zcash specification. Both specification functions produce the same result.
     pub fn median_time_past(&self) -> DateTime<Utc> {
         let median_times: Vec<DateTime<Utc>> = self
             .relevant_times
@@ -392,7 +382,7 @@ impl AdjustedDifficulty {
     ///
     /// # Panics
     ///
-    /// If provided an empty Vec
+    /// This method panics if the caller provides an empty `Vec`.
     pub fn median_time(mut median_block_span_times: Vec<DateTime<Utc>>) -> DateTime<Utc> {
         median_block_span_times.sort_unstable();
 
@@ -456,7 +446,7 @@ pub fn validate_contextual_difficulty_and_time(
         });
     }
 
-    // Mainnet height 1 and Testnet heights below 653,606 are outside this rule.
+    // This rule excludes Mainnet height 1 and Testnet heights below 653,606.
     if candidate_height.0 >= 2
         && network.is_max_block_time_enforced(candidate_height)
         && candidate_time > block_time_max

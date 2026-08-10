@@ -31,7 +31,7 @@ pub struct AlarmSet {
     pub resource_stalled: bool,
     /// The selected branch has exhausted its current body suppliers/retry episode.
     pub header_best_body_unavailable: Option<BodyUnavailableSummary>,
-    /// An imported headers-only trust pin was refuted by deterministic body validation.
+    /// Deterministic body validation refuted an imported headers-only trust pin.
     pub migrated_pin_refuted: Option<Frontier>,
 }
 
@@ -56,7 +56,7 @@ pub struct EngineSnapshot {
     pub alarms: AlarmSet,
 }
 
-/// Singleton durable metadata row that is the logical root of one committed state.
+/// Singleton durable metadata row that serves as the logical root of one committed state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineMetadata {
     /// Durable schema version.
@@ -315,8 +315,9 @@ impl PreparedHeaderBatch {
 
     /// Rebase this sealed batch after an exact prepared header that became finalized.
     ///
-    /// The remaining headers retain their validated results and absolute heights; the suffix is
-    /// resealed to the now-durable parent. Returns the removed header count.
+    /// The remaining headers retain their validated results and absolute heights.
+    /// The method reseals the suffix to the now-durable parent.
+    /// The method returns the removed header count.
     pub(crate) fn rebase_after(&mut self, parent: Frontier) -> Result<usize, TransitionTypeError> {
         if self.receipt.parent == parent {
             return Ok(0);
@@ -349,7 +350,8 @@ impl PreparedHeaderBatch {
     }
 }
 
-/// Bounded advisory body-size metadata; it cannot allocate or grant admission credit.
+/// Bounded advisory body-size metadata.
+/// This metadata cannot allocate or grant admission credit.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BodySizeHint {
     /// Wire value zero: no size is known.
@@ -385,7 +387,7 @@ pub enum AuxAuthentication {
         /// One-header-later authentication boundary.
         boundary_hash: block::Hash,
     },
-    /// This delivery was rejected without invalidating its header.
+    /// Authentication rejected this delivery without invalidating its header.
     Rejected {
         /// Stable rejection evidence.
         evidence: EvidenceId,
@@ -438,12 +440,12 @@ pub type PreparedAuxDelivery = AuxDelivery;
 /// Completion contract attached to one atomic header insertion.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TargetCompletion {
-    /// Peer-advertised target was completed from this exact common ancestor.
+    /// Header sync completed the peer-advertised target from this exact common ancestor.
     TargetComplete {
         /// Exact locator intersection.
         common_ancestor: Frontier,
     },
-    /// A bounded prefix of a larger peer-advertised target was completed.
+    /// Header sync completed a bounded prefix of a larger peer-advertised target.
     ///
     /// Prefix admission bounds requester memory while preserving exact validation and
     /// ownership for the last header actually supplied in this batch.
@@ -451,11 +453,11 @@ pub enum TargetCompletion {
         /// Exact locator intersection.
         common_ancestor: Frontier,
     },
-    /// One already-selected interior header was redelivered solely to replace auxiliary metadata.
+    /// A peer redelivered one selected interior header only to replace auxiliary metadata.
     SelectedAuxiliaryRepair {
         /// Exact selected predecessor used as the single-entry locator.
         common_ancestor: Frontier,
-        /// Exact already-selected header whose metadata was redelivered.
+        /// Exact selected header whose metadata the peer redelivered.
         selected_target: Frontier,
     },
 }
@@ -510,7 +512,8 @@ pub struct VerifiedHeaderRef {
     pub header: Arc<block::Header>,
 }
 
-/// Explicit full-state selected-path change kind; height never infers it.
+/// Explicit full-state selected-path change kind.
+/// Height never determines the change kind.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum VerifiedChangeCause {
     /// Direct or forward growth.
@@ -534,7 +537,7 @@ pub struct VerifiedChainChanged {
     pub cause: VerifiedChangeCause,
 }
 
-/// Full-state acceptance of a block on a path that did not become the verified winner.
+/// Full-state acceptance of a block outside the verified winning path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedBlockAccepted {
     /// Internal full-state transition identity and authority proof.
@@ -556,7 +559,8 @@ pub enum BodyCommitmentKind {
     Other(&'static str),
 }
 
-/// Supplier-attributed mismatched body payload; it cannot affect eligibility.
+/// Supplier-attributed mismatched body payload.
+/// This mismatch cannot affect eligibility.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BodyPayloadMismatch {
     /// Stable delivery evidence.
@@ -587,17 +591,17 @@ pub struct ConsensusBodyInvalid {
 /// Retryable body failure category with no eligibility effect.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TransientBodyFailureKind {
-    /// Required state context is not available yet.
+    /// The verifier does not have the required state context yet.
     MissingContext,
-    /// Work was canceled or superseded.
+    /// The coordinator canceled or superseded the work.
     Canceled,
-    /// Local storage failed transiently.
+    /// Local storage returned a transient failure.
     Storage,
-    /// Verifier service was unavailable.
+    /// The verifier service became unavailable.
     VerifierUnavailable,
     /// External wait timed out.
     Timeout,
-    /// Local resources are temporarily exhausted.
+    /// The node temporarily exhausted local resources.
     ResourceExhausted,
 }
 
@@ -658,10 +662,10 @@ pub enum BodyVerificationOutcome {
     Retryable(TransientBodyFailure),
 }
 
-/// Evidence-free verifier classification used before supplier and stable evidence are attached.
+/// Evidence-free classification that the verifier returns before the caller attaches supplier and evidence data.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BodyVerificationClass {
-    /// The exact body was already accepted by full state.
+    /// Full state already accepted the exact body.
     Duplicate,
     /// Delivered body data disagrees with a commitment in its admitted header.
     PayloadMismatch(BodyCommitmentKind),
@@ -737,7 +741,7 @@ pub struct FullStateFinalized {
 pub struct MigratedPinRefutation {
     /// Stable internal full-state transition identity.
     pub full_state_transition_id: EvidenceId,
-    /// Exact preserved headers-only pin whose ancestry was refuted.
+    /// Exact preserved headers-only pin whose ancestry full state refuted.
     pub pin: Frontier,
     /// Exact body-invalid header on the imported path at or below `pin`.
     pub invalid_header: Frontier,
@@ -1350,7 +1354,8 @@ fn hash_aux_authentication(hasher: &mut Sha256, authentication: AuxAuthenticatio
 pub struct TransitionRequest {
     /// Exact durable version observed by the caller.
     pub expected_version: StateVersion,
-    /// Typed evidence; callers never submit desired consequences.
+    /// Typed evidence.
+    /// Callers never submit desired consequences.
     pub event: TransitionEvent,
 }
 
@@ -1359,7 +1364,7 @@ pub struct TransitionRequest {
 pub struct ProjectionDelta {
     /// Exclusive upper height for retired prefix rows.
     pub remove_before: Option<block::Height>,
-    /// First height whose old suffix is removed.
+    /// First height at which the plan removes the old suffix.
     pub remove_from: Option<block::Height>,
     /// Exact replacement suffix in ascending height order.
     pub put: Vec<Frontier>,
@@ -1392,7 +1397,7 @@ pub enum AuxDelta {
     Put(Box<AuxDelivery>),
     /// Delete one bounded delivery record.
     Delete {
-        /// Header whose auxiliary record is deleted.
+        /// Header whose auxiliary record the plan deletes.
         header_hash: block::Hash,
         /// Exact delivery identity deleted from that header.
         delivery_id: EvidenceId,
@@ -1461,11 +1466,12 @@ pub enum TransitionCause {
     CheckpointFinality,
     /// Full state authenticated or rejected auxiliary metadata without changing the DAG.
     AuxAuthentication,
-    /// Ordinary header work was admitted after a durable monotone-finality rebase.
+    /// The planner admitted ordinary header work after a durable monotone-finality rebase.
     HeaderWorkRebased,
-    /// The complete prepared range was already consumed by monotone finality.
+    /// Monotone finality already consumed the complete prepared range.
     HeaderWorkAlreadyApplied,
-    /// Admission was refused without applying the event because protected state filled a limit.
+    /// The planner refused admission because protected state filled a limit.
+    /// The planner did not apply the event.
     ResourceStalled,
     /// Headers-only depth finality occurred in the same insertion/reselection.
     HeadersOnlyFinality,
@@ -1473,12 +1479,14 @@ pub enum TransitionCause {
     Recovery,
 }
 
-/// Work that must be retired before new forward scheduling.
+/// Work that the coordinator must retire before scheduling new forward work.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RetiredWork {
-    /// Header generation changed; all old forward owners are stale.
+    /// The header generation changed.
+    /// The change makes all old forward owners stale.
     pub header_generation_changed: bool,
-    /// Verified generation changed; all old body-forward owners are stale.
+    /// The verified generation changed.
+    /// The change makes all old body-forward owners stale.
     pub verified_generation_changed: bool,
     /// Exact owners retired for narrower causes.
     pub owners: Vec<HeaderSyncWorkOwner>,
@@ -1502,7 +1510,7 @@ pub struct StaleReceipt {
     pub branch: Option<BranchId>,
 }
 
-/// A resource refusal whose alarm state has already been durably committed.
+/// A resource refusal whose alarm state the adapter has already committed durably.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct CommittedStallReceipt {
     /// Durable version after recording or retaining the resource-stall alarm.
@@ -1522,7 +1530,7 @@ pub enum ApplyResult {
     NoChange(NoChangeReceipt),
     /// Ownership/version was stale before effects.
     Stale(StaleReceipt),
-    /// Admission was refused after durably recording or retaining its resource alarm.
+    /// The planner refused admission after it durably recorded or retained the resource alarm.
     ResourceStalled(CommittedStallReceipt),
 }
 
@@ -1535,7 +1543,7 @@ pub enum TransitionTypeError {
     /// Header insertion batches must fit the frozen engine transition bound.
     #[error("prepared header batch exceeds the engine transition limit")]
     OversizedHeaderBatch,
-    /// A new finalized parent was not an exact member of the prepared path.
+    /// The prepared path did not contain the new finalized parent.
     #[error("prepared header batch cannot rebase to the requested parent")]
     InvalidPreparedRebase,
     /// Advisory body size exceeded the canonical block limit.

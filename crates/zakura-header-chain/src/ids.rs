@@ -158,8 +158,8 @@ impl BranchId {
 
 /// Header-generation and branch authority captured before asynchronous header work.
 ///
-/// Global state versions and verified-body generations are deliberately absent:
-/// neither can authorize or stale pure header work.
+/// This authority omits global state versions and verified-body generations.
+/// Neither value can authorize or stale pure header work.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct HeaderWorkAuthority {
     /// Selected-header generation that scheduled the work.
@@ -367,7 +367,7 @@ impl HeaderSyncWorkOwner {
 
     /// Rebind ordinary header work to state-proven current authority.
     ///
-    /// Body-affecting repair authority is deliberately non-rebasable.
+    /// The engine never rebases body-affecting repair authority.
     pub(crate) const fn rebase_header(self, authority: HeaderWorkAuthority) -> Option<Self> {
         match self {
             Self::Header(owner) => Some(Self::Header(HeaderWorkOwner {

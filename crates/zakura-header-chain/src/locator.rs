@@ -16,7 +16,7 @@ pub struct HeaderLocator(Vec<Frontier>);
 /// Exact selected-header request context for one auxiliary VCT repair.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VctRepairContext {
-    /// Already-selected header whose auxiliary metadata must be redelivered.
+    /// Selected header whose auxiliary metadata a peer must redeliver.
     pub target: Frontier,
     /// Single-entry locator naming the target's direct selected predecessor.
     pub locator: HeaderLocator,

@@ -93,7 +93,8 @@ pub enum StaleReason {
 pub enum CompletionDecision {
     /// The completion still has exact current authority.
     Current,
-    /// The completion is terminally stale and must have no effects.
+    /// The coordinator treats the completion as terminally stale.
+    /// The completion must have no effects.
     Stale(StaleReason),
 }
 

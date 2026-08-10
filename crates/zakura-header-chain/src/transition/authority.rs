@@ -4,7 +4,8 @@ use chrono::{DateTime, Utc};
 
 use crate::{EngineConfig, InsertHeaders, OperatorBodyRetry, TransitionEvent, ValidationLease};
 
-/// Consensus-local time source; transition events cannot supply their own time.
+/// The consensus-local clock supplies time to transition events.
+/// Transition events cannot supply time.
 pub trait Clock: Send + Sync {
     /// Return the current consensus-local time.
     fn now(&self) -> DateTime<Utc>;

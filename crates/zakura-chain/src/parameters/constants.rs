@@ -30,11 +30,10 @@ pub const SLOW_START_SHIFT: Height = Height(SLOW_START_INTERVAL.0 / 2);
 pub const MAX_BLOCK_REORG_HEIGHT: u32 = 1000;
 
 /// The maximum number of non-finalized chain forks Zakura will track.
-/// When this limit is reached, we drop the chain with the lowest work.
+/// Zakura drops the chain with the lowest work when the fork count reaches this limit.
 ///
-/// When the network is under heavy transaction load, there are around 5 active forks in the last
-/// 100 blocks. (1 fork per 20 blocks.) When block propagation is efficient, there is around
-/// 1 fork per 300 blocks.
+/// Heavy transaction load produces about five active forks per 100 blocks.
+/// Efficient block propagation produces about one active fork per 300 blocks.
 ///
 /// This limits non-finalized chain memory, in the worst case, to around:
 /// `10 forks * 1000 blocks * 2 MB per block = 20 GB`

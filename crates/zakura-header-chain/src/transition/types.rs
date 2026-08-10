@@ -1459,6 +1459,8 @@ pub enum TransitionCause {
     Event,
     /// Checkpoint body growth advanced integrated finality on the retained selected path.
     CheckpointFinality,
+    /// Full state authenticated or rejected auxiliary metadata without changing the DAG.
+    AuxAuthentication,
     /// Ordinary header work was admitted after a durable monotone-finality rebase.
     HeaderWorkRebased,
     /// The complete prepared range was already consumed by monotone finality.

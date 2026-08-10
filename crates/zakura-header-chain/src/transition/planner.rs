@@ -257,6 +257,8 @@ pub(super) fn apply_transition_engine(
             if event.cause == crate::VerifiedChangeCause::CheckpointFinalizedGrow
     ) {
         TransitionCause::CheckpointFinality
+    } else if matches!(request.event, TransitionEvent::AuxEvidence(_)) {
+        TransitionCause::AuxAuthentication
     } else {
         TransitionCause::Event
     };

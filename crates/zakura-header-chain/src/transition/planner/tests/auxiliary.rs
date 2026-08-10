@@ -1,4 +1,5 @@
 use super::*;
+use crate::{AuxDelta, InvariantViolation};
 
 fn unauthenticated_delivery(
     insert: &crate::InsertHeaders,
@@ -461,12 +462,29 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
         authenticated.change_set.metadata.verified_generation,
         before.verified_generation
     );
+    assert_eq!(authenticated.cause(), TransitionCause::AuxAuthentication);
+    assert!(
+        super::super::super::invariants::is_incremental_aux_authentication(
+            &test_engine(&store),
+            &authenticated
+        )
+    );
     assert_eq!(
         authenticated.change_set.aux_changes,
         vec![crate::AuxDelta::Put(Box::new(crate::AuxDelivery {
             authentication,
             ..delivery
         }))]
+    );
+
+    let mut corrupt = authenticated.clone();
+    let AuxDelta::Put(corrupt_delivery) = &mut corrupt.change_set.aux_changes[0] else {
+        unreachable!("the authenticated plan replaces one delivery");
+    };
+    corrupt_delivery.source = SourceId::from_digest([0xee; 32]);
+    assert_eq!(
+        verify_plan(&test_engine(&store), &corrupt),
+        Err(InvariantViolation::Auxiliary(header_hash))
     );
     store.commit(&authenticated);
 
@@ -487,6 +505,7 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
         &context(&config, &clock, Some(&Authority)),
     )
     .expect("two exact metadata deliveries reject in one atomic transition");
+    assert_eq!(rejected.cause(), TransitionCause::AuxAuthentication);
     assert_eq!(
         rejected.change_set.aux_changes,
         vec![

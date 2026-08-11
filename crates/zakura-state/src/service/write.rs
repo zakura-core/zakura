@@ -59,10 +59,22 @@ use crate::service::{
     non_finalized_state::Chain,
 };
 
+mod vct_sweep;
 mod vct_write;
 
+use vct_sweep::VctAuthSweeper;
 use vct_write::VctWriteManager;
 pub use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
+
+/// Everything the header-time VCT authentication sweep needs from the state write task.
+struct HeaderSweepContext<'a> {
+    /// Committed state supplying the anchor tip, its history tree, and the fast-path gate.
+    finalized_state: &'a FinalizedState,
+    /// Running verified prefix above the committed body tip.
+    sweeper: &'a mut VctAuthSweeper,
+    /// Owner of the single-slot VCT metadata repair signal.
+    repair: &'a mut VctWriteManager,
+}
 
 /// A full-state mutation staged until its matching header transition commits durably.
 #[allow(dead_code)] // Constructed when the dark header engine is attached to the writer task.
@@ -387,6 +399,7 @@ impl HeaderChainWriter {
         };
         Ok(VctAuxWindowRead::Ready(Box::new(VctAuxWindow {
             snapshot: window.snapshot,
+            current_header: window.current.header,
             current,
             successor_height,
             successor,
@@ -698,6 +711,26 @@ impl HeaderChainWriter {
                 deliveries,
                 authentication: AuxAuthentication::Rejected { evidence },
             })),
+        };
+        let authority = PreparedAuthority::for_event(&request.event)?;
+        let mut context = self.context();
+        context.full_state_authority = Some(&authority);
+
+        self.runtime.apply(request, &context).map(Some)
+    }
+
+    /// Promote one verified delivery to authenticated outside a block commit.
+    ///
+    /// The committer promotes in the same batch as the block it is committing. The
+    /// header-time sweep has no block, so it applies the identical transition on its own;
+    /// `Ok(None)` means the delivery was already authenticated and needs no transition.
+    fn authenticate_vct_aux(
+        &self,
+        window: &VctAuxWindow,
+        proof: VctAuthenticationProof,
+    ) -> Result<Option<ApplyResult>, HeaderChainStoreError> {
+        let Some((_evidence, request)) = Self::vct_authentication_request(window, proof) else {
+            return Ok(None);
         };
         let authority = PreparedAuthority::for_event(&request.event)?;
         let mut context = self.context();
@@ -1665,6 +1698,7 @@ fn receive_until_deferred_deadline<M: DeferredHeaderMaintenance>(
 fn handle_header_chain_control_message(
     header_chain: Option<&HeaderChainWriter>,
     message: NonFinalizedWriteMessage,
+    sweep: HeaderSweepContext<'_>,
 ) -> Result<(), NonFinalizedWriteMessage> {
     match message {
         NonFinalizedWriteMessage::ApplyHeaderChainInsert { prepared, rsp_tx } => {
@@ -1690,7 +1724,16 @@ fn handle_header_chain_control_message(
                         &context,
                     )
                 });
+            let committed = matches!(result, Ok(ApplyResult::Committed));
             let _ = rsp_tx.send(result);
+            // The headers this insert admitted are exactly what proves the deliveries below
+            // them, so sweep now — after answering, so authentication never delays header
+            // sync.
+            if let (Some(writer), true) = (header_chain, committed) {
+                sweep
+                    .sweeper
+                    .sweep(sweep.finalized_state, writer, sweep.repair);
+            }
             Ok(())
         }
         NonFinalizedWriteMessage::RecordHeaderChainBodyUnavailable { prepared, rsp_tx }
@@ -1796,6 +1839,8 @@ impl WriteBlockWorkerTask {
         // Root-stall tracking for the VCT fast-sync checkpoint path.
         // See [`VctWriteManager`].
         let mut vct_write_manager = VctWriteManager::new(vct_root_repair_sender.clone());
+        // Header-time authentication for the same path. See [`VctAuthSweeper`].
+        let mut vct_auth_sweeper = VctAuthSweeper::default();
 
         if let Err(exit) = attach_header_chain_if_genesis_is_committed(
             header_chain,
@@ -1812,9 +1857,15 @@ impl WriteBlockWorkerTask {
         loop {
             match non_finalized_block_write_receiver.try_recv() {
                 Ok(msg) => {
-                    if let Err(msg) =
-                        handle_header_chain_control_message(header_chain.as_ref(), msg)
-                    {
+                    if let Err(msg) = handle_header_chain_control_message(
+                        header_chain.as_ref(),
+                        msg,
+                        HeaderSweepContext {
+                            finalized_state,
+                            sweeper: &mut vct_auth_sweeper,
+                            repair: &mut vct_write_manager,
+                        },
+                    ) {
                         deferred_non_finalized_messages.push_back(msg);
                     }
                 }
@@ -1827,6 +1878,12 @@ impl WriteBlockWorkerTask {
                 None => match finalized_block_write_receiver.try_recv() {
                     Ok(block) => block,
                     Err(TryRecvError::Empty) => {
+                        // An idle committer is exactly when the sweep should work: it drains
+                        // any authentication backlog left by a restart or by header batches
+                        // larger than one sweep, without ever delaying a block commit.
+                        if let Some(writer) = header_chain.as_ref() {
+                            vct_auth_sweeper.sweep(finalized_state, writer, &mut vct_write_manager);
+                        }
                         std::thread::park_timeout(Duration::from_millis(10));
                         continue;
                     }

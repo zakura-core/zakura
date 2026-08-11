@@ -151,6 +151,7 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
             oldest_retained_height: block::Height(0),
             alarms: AlarmSet::default(),
         },
+        current_header: regtest_genesis_block().header.clone(),
         current: authenticated,
         successor_height: None,
         successor: None,
@@ -207,6 +208,7 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
     .expect("the exact successor delivery constructs a witness");
     let auth_window = VctAuxWindow {
         snapshot: window.snapshot,
+        current_header: window.current_header.clone(),
         current: unauthenticated,
         successor_height: Some(successor_height),
         successor: Some(successor.clone()),
@@ -277,6 +279,7 @@ fn stale_vct_aux_rejection_has_zero_durable_effects() {
         .reject_vct_aux(
             &VctAuxWindow {
                 snapshot: stale,
+                current_header: anchor.header.clone(),
                 current,
                 successor_height: None,
                 successor: None,

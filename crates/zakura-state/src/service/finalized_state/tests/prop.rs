@@ -158,6 +158,7 @@ fn exact_vct_aux_window(
     };
     VctAuxWindow {
         snapshot,
+        current_header: block.header.clone(),
         current,
         successor_height: Some(successor_height),
         successor: NextVctBlock::from_delivery(

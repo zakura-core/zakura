@@ -46,6 +46,14 @@ pub(super) struct VctWriteManager {
     root_repair_sender: watch::Sender<VctRootRepairStatus>,
     /// Last repair status published by this manager.
     root_repair_status: VctRootRepairStatus,
+    /// Height the committer is currently parked on for lack of a verifiable root.
+    committer_need: Option<Height>,
+    /// Height whose metadata the header-time sweep evicted and has not re-verified.
+    ///
+    /// The sweep runs far above the committer, so this is usually the higher of the two
+    /// needs. It is tracked separately because the committer clears its own need on every
+    /// successful commit, which must not withdraw a repair the sweep still wants.
+    sweep_need: Option<Height>,
 }
 
 impl Default for VctWriteManager {
@@ -65,7 +73,29 @@ impl VctWriteManager {
             stall_logged: false,
             root_repair_sender,
             root_repair_status: VctRootRepairStatus::default(),
+            committer_need: None,
+            sweep_need: None,
         }
+    }
+
+    /// Ask for replacement metadata at `height` because the header-time sweep evicted it.
+    pub(super) fn request_sweep_repair(&mut self, height: Height) {
+        self.sweep_need = Some(height);
+        // An eviction always replaces a candidate, so it starts a new repair episode even
+        // when the effective height does not change.
+        self.republish(true);
+    }
+
+    /// Withdraw the sweep's repair need after it re-verified the evicted height.
+    pub(super) fn clear_sweep_repair(&mut self) {
+        self.sweep_need = None;
+        self.republish(false);
+    }
+
+    /// Test-only: raise the committer's own repair need without a parked commit attempt.
+    #[cfg(test)]
+    pub(super) fn request_committer_repair_for_test(&mut self, height: Height) {
+        self.publish_root_repair_needed(height, true);
     }
 
     /// Takes the block parked for retry, if any.
@@ -174,30 +204,46 @@ impl VctWriteManager {
     }
 
     fn publish_root_repair_needed(&mut self, height: Height, had_root_candidate: bool) {
-        let same_height =
-            self.root_repair_status.state == VctRootRepairState::Unavailable { height };
-        if same_height && !had_root_candidate {
-            return;
-        }
-
-        self.root_repair_status = VctRootRepairStatus {
-            state: VctRootRepairState::Unavailable { height },
-            generation: self.root_repair_status.generation.saturating_add(1),
-        };
-        let _ = self.root_repair_sender.send(self.root_repair_status);
-        metrics::counter!("state.vct.root.repair.requested").increment(1);
+        self.committer_need = Some(height);
+        // Replacing a candidate starts a new repair episode even at the same height; a bare
+        // re-poll of the same stall must not.
+        self.republish(had_root_candidate);
     }
 
     fn publish_root_repair_idle(&mut self) {
-        if self.root_repair_status.state == VctRootRepairState::Idle {
+        self.committer_need = None;
+        self.republish(false);
+    }
+
+    /// Publish the lowest outstanding repair need, or idle when neither source wants one.
+    ///
+    /// The repair channel is a single latest-value slot, so the two independent needs are
+    /// merged here: the lower height is the one whose replacement unblocks the other.
+    fn republish(&mut self, force_new_episode: bool) {
+        let effective = match (self.committer_need, self.sweep_need) {
+            (Some(committer), Some(sweep)) => Some(committer.min(sweep)),
+            (need, None) | (None, need) => need,
+        };
+        let state = effective.map_or(VctRootRepairState::Idle, |height| {
+            VctRootRepairState::Unavailable { height }
+        });
+        if state == self.root_repair_status.state && !force_new_episode {
             return;
         }
 
+        let requested = state != VctRootRepairState::Idle;
         self.root_repair_status = VctRootRepairStatus {
-            state: VctRootRepairState::Idle,
-            generation: self.root_repair_status.generation,
+            state,
+            generation: if requested {
+                self.root_repair_status.generation.saturating_add(1)
+            } else {
+                self.root_repair_status.generation
+            },
         };
         let _ = self.root_repair_sender.send(self.root_repair_status);
+        if requested {
+            metrics::counter!("state.vct.root.repair.requested").increment(1);
+        }
     }
 }
 

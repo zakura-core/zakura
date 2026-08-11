@@ -39,9 +39,9 @@ header sync (runs ahead of bodies)
 header-sync reactor (zakura-network): validate root count + per-height alignment; reject
    │ unrequested or non-finalized roots as MalformedMessage (§8.1)
    ▼
-CommitHeaderRange (zakura-state): commit the headers; the reactor retains the root payload
-   │ until state authenticates it (AuthenticateHeaderRoots) and persists the verified prefix
-   │ into commitment_roots_by_height, ahead of body commit (§4.2)
+InsertHeaders (zakura-state): commit the headers and their hash-keyed auxiliary deliveries
+   │ into the header-chain DAG, then authenticate each delivery against its successor
+   │ header as soon as that successor is selected (§6.0), evicting a failing one at once
    ▼
 PeerSource (DB-backed reader) ── vct_root(height) ──▶ finalized committer
    │
@@ -62,7 +62,7 @@ peer GetHeaders { want_tree_aux_roots } ─▶ header-sync reactor ─▶ header
 
 (1) Node starts under `consensus.checkpoint_sync = true` on
 Mainnet → the committer is built in peer mode.
-(2) Header sync requests the per-height roots in-band with the finalized header ranges it already fetches (`want_tree_aux_roots`); the received roots are retained until state authenticates them against the committed header chain, then persisted ahead of the committer (§4.2). (3) Each checkpoint block: look up its root; verify it (own header now, successor header next block, plus
+(2) Header sync requests the per-height roots in-band with the finalized header ranges it already fetches (`want_tree_aux_roots`); each root is stored as an auxiliary delivery on its header's DAG node and authenticated there as soon as the successor header that proves it arrives, far ahead of the committer (§4.2, §6.0). (3) Each checkpoint block: look up its root; verify it (own header now, successor header next block, plus
 the direct below-Heartwood/below-NU5/below-Nu6_3 checks); fold it in; freeze the frontier (§6, §7).
 (4) At the last checkpoint height, verify and write the embedded frontier and unfreeze.
 (5) Above the last checkpoint height, ordinary semantic verification resumes from the real frontier. A bad/missing root anywhere in the frozen window parks the block and retries in place; it never writes wrong state. Roots are not individually re-requested, so a hole that no in-flight re-delivery of the same header range fills is a fail-closed stall, surfaced loudly by the §8 metrics.
@@ -78,7 +78,7 @@ the direct below-Heartwood/below-NU5/below-Nu6_3 checks); fold it in; freeze the
 | **Frozen frontier** | During VCT fast sync below the last checkpoint, Zebra folds verified modern-pool roots into the root indexes but does not advance the full Sapling/Orchard/Ironwood frontiers for every block. Sprout continues to advance locally. If a required modern-pool root is missing, the committer must stop and retry later, because recomputing from a stale modern frontier would write invalid state (§8). |
 | **Verify-before-commit** | Authenticating each root against the node's header commitments (ZIP-221 MMR one-block-lag + direct sub-Heartwood/sub-NU5/sub-Nu6_3 checks) before it affects state (§6). |
 | **Fail closed** | Stop and retry without writing state when a required root is missing or invalid (§8). |
-| **Header-authenticated roots** | Peer-supplied roots carried in the header-sync `Headers` message, authenticated by state against the canonical header chain, and only then persisted to `commitment_roots_by_height` ahead of body commit (§4.2; [header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md)). Verify-before-commit re-checks them at body time (§6). |
+| **Header-authenticated roots** | Peer-supplied roots carried in the header-sync `Headers` message, attached to their header's DAG node as auxiliary deliveries and authenticated against the one-header-later commitment as soon as that header arrives, ahead of body commit (§4.2, §6.0). Verify-before-commit re-checks them at body time (§6). |
 | **All-or-nothing** | A `Headers` message carries roots for _every_ header in the range or none; a partial root set is rejected on the wire and never served (§5.4). |
 | **Kill switch** | `consensus.vct_fast_sync = false`: keep checkpoint sync but force the legacy committer (§4.4). |
 
@@ -165,12 +165,13 @@ Header sync sets `want_tree_aux_roots` on all of its range requests — the fina
 (checkpoint-verified) ranges below the last checkpoint and the non-finalized forward range
 alike. The wire rejects roots a request opted out of, a root count that does not match the
 header count, and per-height misalignment as `MalformedMessage` (§8.1). When a header range
-commits via `CommitHeaderRange`, the reactor retains its root payload in memory; state then
-**authenticates the payload against the canonical header chain and persists the verified
-prefix into the `commitment_roots_by_height` column family ahead of body commit** (§5.3;
-[header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md)). Only roots below
-the last checkpoint are ever _consumed_ by the committer, and only after verify-before-commit
-(§6); authenticated rows for header-ahead heights above the body tip also back serving (§9). The committer then reads them per height through the `PeerSource` seam.
+is inserted via `InsertHeaders`, its roots attach to their header's DAG node as auxiliary
+deliveries; state then **authenticates each delivery against the one-header-later commitment
+that proves it, as soon as that successor header arrives** (§6.0), and records the verdict as
+header-chain evidence. Only roots below the last checkpoint are ever _consumed_ by the
+committer, and only after verify-before-commit (§6). The committer then reads them per height
+through the `PeerSource` seam, and writes the `commitment_roots_by_height` row itself once the
+body commits — the index holds no height the node has not committed.
 The same header commit stores non-zero advertised body-size hints in
 `zakura_header_body_size_by_height`, so block sync can later request realistic ranges even
 before the corresponding bodies are committed. Headers, body-size hints, and roots arrive
@@ -327,9 +328,9 @@ height)`) derives the same payload from a database's per-height trees — the se
 consumer agree is `vct_db_produced_payload_round_trips`.
 
 Because the production `PeerSource` reads straight from the database, peer mode no longer
-exports a root-writer handle. Header sync delivers roots with header ranges, state
-authenticates and persists them through `AuthenticateHeaderRoots`
-on the normal write path, and the committer reads them back through the same database. The
+exports a root-writer handle. Header sync delivers roots with header ranges, state stores and
+authenticates them as header-chain auxiliary deliveries on the normal write path (§6.0), and
+the committer reads the authenticated delivery back for the height it is committing. The
 old per-state `TreeAuxRootsWriter` / `PeerSourceHandle` / targeted-refetch signal are removed.
 The persisted roots store no peer identity; peer accountability for bad roots is the header-sync
 reactor's misbehavior reporting (§8.1), preserving the `zakura-state` / `zakura-network` crate
@@ -394,6 +395,37 @@ is checked against that candidate. A wrong root makes that check fail and the bl
 **rejected, not recomputed** (§8). The standalone `verify_commitment_roots` returns the first
 offending height; over `[start..=end]` it confirms `[start..=end-1]`, and `end+1` confirms
 `end`.
+
+### 6.0 Header-time authentication (the early check)
+
+The committer is the trust boundary, but it only reaches a height when that height's body
+commits. During fast sync the header chain runs far ahead of the bodies, so a wrong root can
+sit in the DAG for a long time before anything notices, and the repair that replaces it only
+starts once the committer stalls on it.
+
+`service/write/vct_sweep.rs` closes that gap. As header batches arrive, the state writer walks
+the selected path above the committed body tip, keeps its own running ZIP-221 MMR anchored at
+that tip, and for each height `H` verifies the selected delivery against the delivery at `H+1`
+— the same one-header-later boundary the committer uses, reached through the header-only
+kernel `verify_supplied_roots_from_parts` rather than a block body. A delivery that verifies is
+promoted to `Authenticated` through the same auxiliary-evidence transition the committer emits;
+a delivery that fails is marked `Rejected` and arms metadata repair immediately.
+
+Three properties keep this additive rather than load-bearing:
+
+- **The committer still verifies everything it commits.** The sweep is an extra check, never a
+  substitute, so the trust boundary does not move and a sweep that never runs is only slower.
+- **Rejection attribution matches the committer's.** A failure that the boundary cannot
+  separate from its predecessor's roots evicts both, exactly as `classify_failure` already
+  resolves it at commit time. A failure on a delivery's own pre-activation fields evicts only
+  that delivery.
+- **Promotion pins selection.** `select_vct_aux_delivery` prefers an authenticated delivery,
+  and an authenticated delivery is immutable, so a later delivery cannot silently displace
+  roots the running MMR already folded.
+
+Repair need is published on the existing single-slot watch channel: the sweep and the committer
+track their needs independently and the lower height is published, so an early eviction is not
+withdrawn by the committer's next successful commit.
 
 ### 6.1 Direct header checks below Heartwood, NU5, and Nu6_3
 
@@ -567,11 +599,10 @@ provenance/cooldown/demotion/hedging policy. Bad roots are handled in three laye
   invalid marker byte — is reported through header sync's existing misbehavior path
   (`report_misbehavior(.., MalformedMessage)`), and the range is retried. None of those roots
   reach state.
-- **At header-root authentication**, before any row is persisted, state verifies each
-  peer-supplied payload against the canonical header chain; an invalid payload writes nothing,
-  is attributed to the exact supplying peer, and is re-fetched from another peer
-  ([header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md) §9).
-  This is where a well-formed wrong root is normally caught.
+- **At header-time authentication**, as each successor header arrives and long before the
+  committer reaches the height, state verifies the delivery against the commitment that proves
+  it; an invalid delivery is evicted, attributed to the exact supplying peer, and re-fetched
+  from another peer (§6.0). This is where a well-formed wrong root is normally caught.
 - **At verify-before-commit**, as defense in depth, a stored root that still fails
   authentication against the header commitment (§6) refuses the commit with the retryable
   `VctSuppliedRootUnavailable` error (§8). The row is not deleted (it is below the durable
@@ -750,15 +781,11 @@ asserts to prove roots actually came over the wire rather than a silent legacy s
   exercise serving and committing finalized ranges with roots end-to-end, including the
   all-or-nothing serving helper (roots attached only on complete coverage, otherwise rootless
   headers) and routing received roots into `CommitHeaderRange`.
-- **State persistence:** `CommitHeaderRange` shape-checks roots but persists none;
-  `AuthenticateHeaderRoots` validates canonical hashes and contiguity, persists only the
-  confirmed prefix atomically with the durable frontier, refuses to overwrite the
-  verified row of an already-committed height, replaces a header-supplied
-  root with the body-derived row when its body commits
-  (`write_block_replaces_matching_header_supplied_roots_with_verified_row`), and trims
-  header-supplied roots above a header-store rollback target. The full authentication test
-  plan is in
-  [header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md) Appendix A.
+- **State persistence:** `InsertHeaders` shape-checks roots and stores them as auxiliary
+  deliveries but writes no root row; `service/write/vct_sweep.rs` authenticates each delivery
+  against its successor's commitment and records the verdict as header-chain evidence, evicting
+  an invalid delivery and arming repair for it. Only a committed body writes a
+  `commitment_roots_by_height` row, and rollback truncates rows above its target height.
 - **Real-data manual runs (`#[ignore]`, env-gated):** `verifies_real_nu5_range_over_synced_forks`
   verifies the real NU5/V2 range against synced archive forks (corrupted root rejected at H+1).
 - **Headline end-to-end (manual, follow-up):** a fresh node fast-syncing

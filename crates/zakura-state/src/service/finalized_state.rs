@@ -1485,6 +1485,30 @@ impl FinalizedState {
             .install_test_source(source, requires_verified_successor);
     }
 
+    /// Test-only: enable the production VCT source, whose per-header roots come only from
+    /// hash-scoped auxiliary deliveries, with the handoff placed above `last_exact_height`.
+    ///
+    /// This is what the header-time authentication sweep runs against: it needs
+    /// [`Self::vct_requires_exact_roots`] to hold over the swept range and nothing else.
+    #[cfg(test)]
+    pub(in crate::service) fn enable_vct_exact_root_source_for_test(
+        &mut self,
+        last_exact_height: block::Height,
+    ) {
+        self.vct.install_test_source(
+            Box::new(commitment_aux::EmbeddedFrontierSource::new(
+                commitment_aux::FinalFrontiers {
+                    height: last_exact_height,
+                    sapling: Arc::new(Default::default()),
+                    orchard: Arc::new(Default::default()),
+                    sprout: Arc::new(Default::default()),
+                    ironwood: Arc::new(Default::default()),
+                },
+            )),
+            true,
+        );
+    }
+
     /// Test-only: the fast-sync handoff height recorded in the database marker, if any.
     #[cfg(test)]
     pub(crate) fn vct_fast_synced_below(&self) -> Option<block::Height> {

@@ -104,6 +104,11 @@ impl NextVctBlock {
 pub(crate) struct VctAuxWindow {
     /// Exact committed snapshot under which state selected both deliveries.
     pub(crate) snapshot: zakura_header_chain::EngineSnapshot,
+    /// Retained header owning the current delivery.
+    ///
+    /// The committer already holds this header in the block it is about to commit, but the
+    /// header-time sweep verifies ahead of bodies and has no block, so the window carries it.
+    pub(crate) current_header: Arc<Header>,
     /// Exact auxiliary delivery whose roots verification folds for the current block.
     pub(crate) current: AuxDelivery,
     /// Height of the retained direct successor, even when state lacks its auxiliary delivery.

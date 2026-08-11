@@ -351,7 +351,7 @@ impl PreparedHeaderBatch {
 }
 
 /// Bounded advisory body-size metadata.
-/// This metadata cannot allocate or grant admission credit.
+/// Body-size metadata cannot allocate or grant admission credit.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BodySizeHint {
     /// Wire value zero: no size is known.
@@ -560,7 +560,7 @@ pub enum BodyCommitmentKind {
 }
 
 /// Supplier-attributed mismatched body payload.
-/// This mismatch cannot affect eligibility.
+/// A payload mismatch cannot affect eligibility.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BodyPayloadMismatch {
     /// Stable delivery evidence.

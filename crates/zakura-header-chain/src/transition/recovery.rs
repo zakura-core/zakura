@@ -177,7 +177,7 @@ pub fn audit_store_at<S: StoreAuditRead>(
 /// Audit every authoritative row against the current configuration.
 /// The audit plans an atomic trust-anchor-manifest rebind when only that digest differs.
 ///
-/// This startup-only compatibility path permits release checkpoint extensions.
+/// The startup compatibility path permits release checkpoint extensions.
 /// The path rejects mode, network, disk format, bootstrap origin, checkpoint, and source-row
 /// mismatches.
 pub fn audit_store_for_trust_anchor_update<S: StoreAuditRead>(

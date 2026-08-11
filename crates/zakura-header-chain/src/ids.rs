@@ -158,7 +158,7 @@ impl BranchId {
 
 /// Header-generation and branch authority captured before asynchronous header work.
 ///
-/// This authority omits global state versions and verified-body generations.
+/// Header work authority omits global state versions and verified-body generations.
 /// Neither value can authorize or stale pure header work.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct HeaderWorkAuthority {

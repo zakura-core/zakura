@@ -35,7 +35,7 @@ pub const MAX_BLOCK_REORG_HEIGHT: u32 = 1000;
 /// Heavy transaction load produces about five active forks per 100 blocks.
 /// Efficient block propagation produces about one active fork per 300 blocks.
 ///
-/// This limits non-finalized chain memory, in the worst case, to around:
+/// The fork cap limits non-finalized chain memory to around:
 /// `10 forks * 1000 blocks * 2 MB per block = 20 GB`
 pub const MAX_NON_FINALIZED_CHAIN_FORKS: usize = 10;
 

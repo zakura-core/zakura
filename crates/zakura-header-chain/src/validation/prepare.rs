@@ -187,7 +187,7 @@ pub fn prepare_context_free_headers(
 
 /// Validate a complete batch without mutation and seal its results to `lease`.
 ///
-/// This compatibility entry point retains contextual validation until production callers have
+/// The compatibility entry point retains contextual validation until production callers have
 /// moved to [`prepare_context_free_headers`] and the engine performs the graph-dependent rules.
 pub fn prepare_headers(
     input: HeaderBatchInput<'_>,

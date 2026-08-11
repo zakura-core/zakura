@@ -96,7 +96,7 @@ pub struct SettledUpgradePin {
     pub activation: Frontier,
 }
 
-/// Immutable settled pins compiled into this release.
+/// This release compiles immutable settled pins.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettledUpgradeManifest {
     pins: Vec<SettledUpgradePin>,

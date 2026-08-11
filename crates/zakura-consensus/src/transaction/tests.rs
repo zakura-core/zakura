@@ -5384,9 +5384,15 @@ async fn mempool_transaction_with_sufficient_fee_is_rejected_by_script() {
     );
 }
 
-/// Test for CVE-2026-34377 https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-3vmh-33xr-9cqh
+/// Regression test for the whole-transaction mempool bypass removed in Zebra PR #10494.
 ///
-/// Ensure a block with a transaction with garbage Orchard proofs is rejected, even if the mempool has a valid version of the same transaction.
+/// The mock mempool can return a valid transaction with the same txid as the block transaction,
+/// whose authorizing data is corrupted. Current Zakura does not query that verdict during block
+/// verification; if the old bypass is reintroduced, the mock response makes the block skip its
+/// normal checks and this test fails.
+///
+/// This does not populate or exercise the Halo2 proof cache. See
+/// [`the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it`] for that coverage.
 #[tokio::test(flavor = "multi_thread")]
 async fn block_with_garbage_orchard_proofs_is_rejected() {
     use zakura_chain::{primitives::Halo2Proof, transaction::VerifiedUnminedTx};
@@ -5442,7 +5448,8 @@ async fn block_with_garbage_orchard_proofs_is_rejected() {
     }
     assert_eq!(tx.hash(), garbage_tx.hash());
 
-    // simulate valid version in mempool
+    // Arm the mock mempool with a valid same-txid version. The current block verifier does not
+    // query it, but the removed whole-transaction bypass would.
     let spent_output = known_utxos
         .get(&input_outpoint)
         .unwrap()
@@ -5486,31 +5493,14 @@ async fn block_with_garbage_orchard_proofs_is_rejected() {
     assert!(resp.is_err(), "garbage proof must be rejected");
 }
 
-/// Regression test for the mempool-cache expiry bypass vulnerability.
+/// A block transaction mined past its expiry height is rejected.
 ///
-/// A non-coinbase transaction with `nExpiryHeight = H+1` that was cached in the
-/// mempool as valid at height `H+1` can be presented inside a block at height
-/// `H+2`.  The block transaction verifier must re-run the expiry check even
-/// when it hits the mempool cache fast path in `find_verified_unmined_tx`;
-/// skipping that check lets Zebra accept a block that honest nodes reject,
-/// causing a consensus split.
-///
-/// # Attack window
-///
-/// The attack is possible because:
-/// * The mempool is active while Zebra is "close to tip" (not only at exact tip).
-/// * The download/verification pipeline accepts blocks up to
-///   `tip + full_verify_concurrency_limit` ahead of the current tip.
-/// * `find_verified_unmined_tx` returns the cached result before the normal
-///   expiry validation.
-///
-/// Concretely: while Zebra's best tip is still `H`, the mempool can already
-/// hold a `VerifiedUnminedTx` for a transaction with `nExpiryHeight = H+1`.
-/// If the verifier is simultaneously asked to semantically verify a candidate
-/// block at `H+2` that contains the same transaction, the cache hit fires and
-/// the block passes semantic verification with an expired transaction inside.
+/// This is baseline coverage for the height-dependent check. It does not populate either a
+/// transaction-verdict cache or the Halo2 proof cache: the transaction is transparent-only and is
+/// submitted only as a block request. The Halo2 cache expiry regression is covered by
+/// [`the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it`].
 #[tokio::test(flavor = "multi_thread")]
-async fn mempool_cached_result_bypasses_expiry_check_for_block_at_next_height() {
+async fn block_transaction_past_expiry_height_is_rejected() {
     let _init_guard = zakura_test::init();
 
     let network = Network::Mainnet;
@@ -5563,12 +5553,7 @@ async fn mempool_cached_result_bypasses_expiry_check_for_block_at_next_height() 
         .ok()
         .expect("send should succeed");
 
-    // Submit the same transaction as a Block request at expired_block_height
-    // (H+2).  The known_outpoint_hashes set satisfies the dependency check
-    // inside find_verified_unmined_tx so the cache hit fires immediately.
-    //
-    // The verifier must return Err(TransactionError::ExpiredTransaction)
-    // because H+2 > nExpiryHeight.
+    // Submit the transaction at H+2, where it is expired because H+2 > nExpiryHeight.
     let result = timeout(
         test_timeout(),
         verifier.clone().oneshot(Request::Block {
@@ -5585,17 +5570,15 @@ async fn mempool_cached_result_bypasses_expiry_check_for_block_at_next_height() 
 
     // Buffer boxes the service error, so downcast to check the specific variant.
     let err = result.expect_err(
-        "expected block verification to fail for a transaction with \
-         expired nExpiryHeight mined via the mempool cache path",
+        "expected block verification to fail for a transaction with expired nExpiryHeight",
     );
     let tx_err = err
         .downcast::<TransactionError>()
         .expect("error should downcast to TransactionError");
     assert!(
         matches!(*tx_err, TransactionError::ExpiredTransaction { .. }),
-        "expected ExpiredTransaction error for block at height {expired_block_height:?} \
-         with nExpiryHeight {mempool_height:?} via mempool cache; \
-         got: {tx_err:?}"
+        "expected ExpiredTransaction error for block at height {expired_block_height:?} with \
+         nExpiryHeight {mempool_height:?}; got: {tx_err:?}"
     );
 }
 
@@ -6045,7 +6028,7 @@ fn block_request(tx: &Transaction, height: block::Height) -> Request {
 /// That is the shape of CVE-2026-34377, and a cache keyed on the txid would answer all three with
 /// the valid transaction's result. The fourth is the one field of the four that lives outside the
 /// Orchard bundle: it changes the txid too, and reaches the cache key through the sighash.
-const AUTHORIZATION_MUTATIONS: &[(&str, fn(&mut Transaction))] = &[
+const CACHE_KEY_MUTATIONS: &[(&str, fn(&mut Transaction))] = &[
     ("Halo2 proof", |tx| {
         orchard_shielded_data_for_mutation(tx).proof.0[0] ^= 1;
     }),
@@ -6100,7 +6083,7 @@ fn orchard_shielded_data_for_mutation(tx: &mut Transaction) -> &mut orchard::Shi
 ///      height past its expiry is still rejected. That is the mempool bypass Zebra removed as a
 ///      security fix in PR #10494, and the reason this cache holds a proof rather than a verdict
 ///      on a transaction;
-///   3. a twin with mutated authorizing data never inherits the record.
+///   3. a transaction with any verification input mutated never inherits the record.
 #[test]
 fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
     let _init_guard = zakura_test::init();
@@ -6114,10 +6097,8 @@ fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
             .expect("a V5 transaction has an expiry height");
         let network_upgrade = NetworkUpgrade::current(&Network::Mainnet, expiry_height);
         let item = orchard_item(&tx, network_upgrade);
-        let cache = primitives::halo2::verifier_for(network_upgrade);
-
         assert_eq!(
-            cache.inner_calls_for(&item),
+            primitives::halo2::inner_calls_for(network_upgrade, &item),
             0,
             "this transaction's bundle must not have been verified before this test"
         );
@@ -6135,7 +6116,7 @@ fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
         .expect("a real mainnet Orchard transaction must verify at its expiry height");
 
         assert_eq!(
-            cache.inner_calls_for(&item),
+            primitives::halo2::inner_calls_for(network_upgrade, &item),
             1,
             "the mempool verification must reach the inner Halo2 verifier"
         );
@@ -6145,7 +6126,7 @@ fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
             .expect("the same transaction must verify in a block");
 
         assert_eq!(
-            cache.inner_calls_for(&item),
+            primitives::halo2::inner_calls_for(network_upgrade, &item),
             1,
             "the block verification must be answered from the cache"
         );
@@ -6167,21 +6148,21 @@ fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
             "the rejection must be the expiry rule, not some other failure"
         );
 
-        // 3. No twin inherits the cached result.
-        for (mutated_field, mutate) in AUTHORIZATION_MUTATIONS {
-            let mut twin = tx.clone();
-            mutate(&mut twin);
-            let twin_item = orchard_item(&twin, network_upgrade);
+        // 3. No mutated transaction inherits the cached result.
+        for (mutated_field, mutate) in CACHE_KEY_MUTATIONS {
+            let mut mutated_tx = tx.clone();
+            mutate(&mut mutated_tx);
+            let mutated_item = orchard_item(&mutated_tx, network_upgrade);
 
-            // A collision here would already be the failure: the twin would inherit the valid
-            // transaction's result instead of being verified.
+            // A collision here would already be the failure: the mutation would inherit the
+            // valid transaction's result instead of being verified.
             assert_eq!(
-                cache.inner_calls_for(&twin_item),
+                primitives::halo2::inner_calls_for(network_upgrade, &mutated_item),
                 0,
-                "the {mutated_field} twin must get its own cache key, not the valid transaction's"
+                "the {mutated_field} mutation must get a different cache key"
             );
 
-            let Err(error) = verify(&mut verifier, block_request(&twin, expiry_height)).await
+            let Err(error) = verify(&mut verifier, block_request(&mutated_tx, expiry_height)).await
             else {
                 panic!("a transaction with a mutated {mutated_field} must be rejected");
             };
@@ -6193,9 +6174,9 @@ fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
             );
 
             assert_eq!(
-                cache.inner_calls_for(&twin_item),
+                primitives::halo2::inner_calls_for(network_upgrade, &mutated_item),
                 1,
-                "the {mutated_field} twin must reach the inner Halo2 verifier"
+                "the {mutated_field} mutation must reach the inner Halo2 verifier"
             );
         }
     });

@@ -35,9 +35,7 @@ mod cache;
 #[cfg(test)]
 mod tests;
 
-pub use cache::Cached;
-
-use cache::{CacheKey, CACHE_CAPACITY};
+use cache::Cached;
 
 /// Adjusted batch size for halo2 batches.
 ///
@@ -48,6 +46,18 @@ use cache::{CacheKey, CACHE_CAPACITY};
 /// To compensate for larger proofs, we process the batch once there are over
 /// [`HALO2_MAX_BATCH_SIZE`] total actions among pending items in the queue.
 const HALO2_MAX_BATCH_SIZE: usize = super::MAX_BATCH_SIZE;
+
+/// The number of verified-proof keys retained per Orchard circuit era.
+///
+/// Sized to hold several blocks of history plus a full mempool, so that a transaction gossiped
+/// well before the block that mines it is still remembered. At 32-byte keys this is on the order
+/// of a megabyte per era.
+const CACHE_CAPACITY: usize = 20_000;
+
+/// A key that determines every input to one [`Item`]'s proof verification.
+///
+/// See [`Item::cache_key`] for the construction and for why completeness matters.
+type CacheKey = [u8; 32];
 
 /// The type of verification results.
 type VerifyResult = bool;
@@ -428,6 +438,17 @@ fn lazy_verifier_for(network_upgrade: NetworkUpgrade) -> &'static Lazy<VerifierS
 /// is a compile error here until it is bound to a key on purpose.
 pub fn verifier_for(network_upgrade: NetworkUpgrade) -> &'static VerifierService {
     lazy_verifier_for(network_upgrade)
+}
+
+/// Returns how many times `item` has reached its era's inner Halo2 verifier.
+#[cfg(test)]
+pub(crate) fn inner_calls_for(network_upgrade: NetworkUpgrade, item: &Item) -> usize {
+    verifier_for(network_upgrade).inner_calls_for(item)
+}
+
+/// Attempts to flush the batching service wrapped by `verifier`.
+pub(super) fn try_flush(verifier: &VerifierService) -> Result<bool, BoxError> {
+    verifier.inner().primary().clone().try_flush()
 }
 
 /// Halo2 proof verifier implementation

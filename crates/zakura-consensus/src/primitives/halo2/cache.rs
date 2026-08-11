@@ -30,19 +30,7 @@ use tower::{Service, ServiceExt};
 
 use crate::BoxError;
 
-use super::Item;
-
-/// The number of verified-proof keys retained per Orchard circuit era.
-///
-/// Sized to hold several blocks of history plus a full mempool, so that a transaction gossiped
-/// well before the block that mines it is still remembered. At 32-byte keys this is on the order
-/// of a megabyte per era.
-pub const CACHE_CAPACITY: usize = 20_000;
-
-/// A key that determines every input to one [`Item`]'s proof verification.
-///
-/// See [`Item::cache_key`] for the construction and for why completeness matters.
-pub type CacheKey = [u8; 32];
+use super::{CacheKey, Item};
 
 /// A bounded set of keys for items that have already verified successfully.
 ///
@@ -105,6 +93,9 @@ impl VerifiedProofs {
 ///
 /// This wraps one Orchard circuit era's batch-and-fallback stack. The cache is shared between
 /// clones, so every handle to a global verifier sees the same set of verified proofs.
+///
+/// This type is public only because it appears in existing public verifier signatures. The
+/// private `cache` module does not re-export it, and its constructor and accessors are private.
 pub struct Cached<S> {
     /// The verification service to consult on a miss.
     inner: S,
@@ -142,7 +133,7 @@ impl<S> Cached<S> {
     }
 
     /// Returns the wrapped verification service.
-    pub fn inner(&self) -> &S {
+    pub(super) fn inner(&self) -> &S {
         &self.inner
     }
 
@@ -155,7 +146,7 @@ impl<S> Cached<S> {
     /// Readiness failures are not counted: an item that never reached the inner service was never
     /// verified by it.
     #[cfg(test)]
-    pub(crate) fn inner_calls_for(&self, item: &Item) -> usize {
+    pub(super) fn inner_calls_for(&self, item: &Item) -> usize {
         let key = item.cache_key();
 
         self.inner_calls

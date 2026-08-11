@@ -35,10 +35,14 @@ canary soak, announcement) apply on top of this checklist.
       branch cut from the previous release. Do not rebase the branch onto a
       different base after choosing the mode.
 - [ ] Make the required changes, minimal and with tests.
-- [ ] For a public (non-embargoed) hotfix: open this PR from the branch with
+- [ ] For a public (non-embargoed) previous-release-base hotfix
+      (`--mode branch`): open this PR from the branch with
       `&template=hotfix-release-checklist.md` in the compare URL, and add the
-      `do-not-merge` label — the release is dispatched from the branch itself,
-      and the PR is merged (as a merge commit) only after the release.
+      `do-not-merge` label. Release from the branch, then forward-merge this PR
+      after the release.
+- [ ] For a main-base hotfix (`--mode main`): do not add `do-not-merge`.
+      The T-0 orchestrator squash-merges this PR before dispatching the release
+      from `main`.
 - [ ] Add the `A-release` and `C-exclude-from-changelog` labels **when
       opening the PR**: the changelog fragment check only accepts a
       fragment-consuming release branch in release-PR mode, and relabeling

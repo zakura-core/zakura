@@ -30,6 +30,10 @@ canary soak, announcement) apply on top of this checklist.
       those names belong to the regular release process, and disjoint
       namespaces are what prevent an embargo-blind collision with it (see
       the process doc's branch namespace rule).
+- [ ] Choose and review the release mode before opening the public PR: use
+      `--mode main` for a branch cut from `main`, or `--mode branch` for a
+      branch cut from the previous release. Do not rebase the branch onto a
+      different base after choosing the mode.
 - [ ] Make the required changes, minimal and with tests.
 - [ ] For a public (non-embargoed) hotfix: open this PR from the branch with
       `&template=hotfix-release-checklist.md` in the compare URL, and add the
@@ -91,14 +95,14 @@ allows `hotfix/v*`).
       and verifies each step's target state (resumable — re-runs skip
       completed steps):
 
-      ```sh
-      ./scripts/release-t0.sh publish --hotfix --tag v<version> \
-          --mode branch --head-sha <final-commit>
-      ```
+  ```sh
+  ./scripts/release-t0.sh publish --hotfix --tag v<version> \
+      --mode branch --head-sha <final-commit>
+  ```
 
-      Manual fallback: push `hotfix/v<version>`, dispatch `Create release`
-      **from the branch** with the exact tag, and verify each step landed
-      before the next.
+  Manual fallback: push `hotfix/v<version>`, dispatch `Create release`
+  **from the branch** with the exact tag, and verify each step landed before
+  the next.
 - [ ] Approve the `release` environment deployment when the script announces
       it (right commit? right tag?). The workflow publishes a complete
       pre-release and creates the protected tag; the tag push starts Docker

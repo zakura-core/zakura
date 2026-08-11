@@ -283,7 +283,7 @@ impl<'a> GraphOverlay<'a> {
                     direct_reasons,
                     inherited_from,
                 },
-                body,
+                body_validation_state: body,
                 aux_delivery_ids: Vec::new(),
             },
         );
@@ -351,13 +351,13 @@ impl<'a> GraphOverlay<'a> {
         if node.eligibility.direct_reasons.iter().any(|existing| {
             matches!(existing, EligibilityReason::ConsensusBodyInvalid { .. })
                 && *existing != reason
-        }) || matches!(node.body, BodyValidationState::ConsensusInvalid { .. })
-            && node.body != body
+        }) || matches!(node.body_validation_state, BodyValidationState::ConsensusInvalid { .. })
+            && node.body_validation_state != body
         {
             return Err(GraphError::BodyEligibilityMismatch(hash));
         }
-        let changed = node.body != body || !node.eligibility.direct_reasons.contains(&reason);
-        node.body = body;
+        let changed = node.body_validation_state != body || !node.eligibility.direct_reasons.contains(&reason);
+        node.body_validation_state = body;
         node.eligibility.direct_reasons.insert(reason);
         if changed {
             self.recompute_descendant_eligibility(hash)?;
@@ -382,8 +382,8 @@ impl<'a> GraphOverlay<'a> {
         {
             return Err(GraphError::BodyEligibilityMismatch(hash));
         }
-        let changed = node.body != body;
-        node.body = body;
+        let changed = node.body_validation_state != body;
+        node.body_validation_state = body;
         Ok(changed)
     }
 

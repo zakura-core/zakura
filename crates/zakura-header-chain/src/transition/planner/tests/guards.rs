@@ -144,7 +144,7 @@ fn header_acceptance_cannot_construct_body_or_state_validity() {
         plan.change_set
             .put_nodes
             .iter()
-            .all(|node| node.body == BodyValidationState::Unknown),
+            .all(|node| node.body_validation_state == BodyValidationState::Unknown),
         "header acceptance creates no body-valid fact"
     );
     assert_eq!(

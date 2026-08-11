@@ -40,7 +40,7 @@ pub(crate) fn enforce_retention<G: HeaderGraphEdit>(
         .view_nodes()
         .into_iter()
         .filter_map(|node| {
-            matches!(node.body, BodyValidationState::Verified { .. }).then_some(node.hash)
+            matches!(node.body_validation_state, BodyValidationState::Verified { .. }).then_some(node.hash)
         })
         .collect::<Vec<_>>();
     for hash in verified_body_hashes {

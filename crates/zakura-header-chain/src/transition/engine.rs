@@ -286,7 +286,7 @@ fn verify_projection(
             ))?;
         if require_verified_bodies
             && *frontier != graph.finalized()
-            && !matches!(node.body, crate::BodyValidationState::Verified { .. })
+            && !matches!(node.body_validation_state, crate::BodyValidationState::Verified { .. })
         {
             return Err(EngineHydrationError::Incoherent(
                 "verified projection contains an unverified body",

@@ -98,7 +98,7 @@ fn full_commit_ensures_exact_node_body_and_independent_selection() {
         .expect("the full-state header is inserted into the projected DAG");
     assert_eq!(accepted_node.parent_hash, anchor.hash);
     assert_eq!(
-        accepted_node.body,
+        accepted_node.body_validation_state,
         BodyValidationState::Verified { evidence }
     );
     assert_eq!(plan.change_set.metadata.frontiers.verified_best, accepted);
@@ -167,7 +167,7 @@ fn accepted_side_path_does_not_replace_the_verified_winner() {
         ProjectionDelta::default()
     );
     assert!(matches!(
-        plan.projected.node(accepted).map(|node| &node.body),
+        plan.projected.node(accepted).map(|node| &node.body_validation_state),
         Some(BodyValidationState::Verified {
             evidence: actual
         }) if *actual == evidence

@@ -20,6 +20,12 @@ use crate::{
 mod overlay;
 pub(crate) use overlay::{GraphDelta, GraphOverlay};
 
+/// Read-only access to one coherent retained header graph.
+///
+/// This abstraction allows fork-choice, planning, and invariant code to query
+/// either the committed in-memory graph or a graph overlay containing proposed
+/// changes. It exposes retained nodes, ancestry, eligibility, finality, and
+/// derived fork-choice views without granting mutation or persistence access.
 pub(crate) trait HeaderGraphView {
     fn view_finalized(&self) -> Frontier;
     fn view_node_count(&self) -> usize;
@@ -38,6 +44,14 @@ pub(crate) trait HeaderGraphView {
     ) -> Result<Option<Frontier>, GraphError>;
 }
 
+/// In-memory mutation operations for a retained header-graph view.
+///
+/// Implementations apply node and eligibility changes while maintaining the
+/// graph’s child, height, and eligible-tip indexes. Mutations may be provisional,
+/// as with `GraphOverlay`; this trait does not durably commit or publish them.
+///
+/// Callers remain responsible for event authority and transition-level
+/// invariant validation.
 pub(crate) trait HeaderGraphEdit: HeaderGraphView {
     fn edit_node_mut(&mut self, hash: block::Hash) -> Result<&mut HeaderNode, GraphError>;
     fn edit_insert(
@@ -158,9 +172,14 @@ pub enum InsertResult {
 #[derive(Clone, Debug)]
 pub struct MemHeaderStore {
     finalized: Frontier,
+    // Nodes by hash.
     nodes: HashMap<block::Hash, HeaderNode>,
+    // Children by parent hash.
     children: HashMap<block::Hash, HashSet<block::Hash>>,
     heights: HashMap<block::Height, HashSet<block::Hash>>,
+
+    // A hash belongs to this when: a header is eligible (validated, no exclusion reasons, no ineligible ancestors)
+    // and has no eligible children.
     eligible_tips: HashSet<block::Hash>,
 }
 
@@ -188,7 +207,7 @@ impl MemHeaderStore {
             work_coordinate: WorkCoordinate::new(finalized.hash, cumulative_work),
             validation: HeaderValidationState::Valid,
             eligibility: EligibilityState::default(),
-            body: BodyValidationState::Unknown,
+            body_validation_state: BodyValidationState::Unknown,
             aux_delivery_ids: Vec::new(),
         };
         let mut nodes = HashMap::new();
@@ -246,6 +265,7 @@ impl MemHeaderStore {
     }
 
     /// Insert one admitted header after the graph retains its exact parent.
+    /// Removes the parent from eligible tips as a side effect.
     pub(crate) fn insert(
         &mut self,
         header: Arc<block::Header>,
@@ -254,6 +274,7 @@ impl MemHeaderStore {
         direct_reasons: impl IntoIterator<Item = EligibilityReason>,
         body: BodyValidationState,
     ) -> Result<InsertResult, GraphError> {
+        // Check if the header already exists in the graph. If so, return the existing frontier.
         let hash = header.hash();
         if let Some(existing) = self.nodes.get(&hash) {
             if existing.header == header {
@@ -313,7 +334,7 @@ impl MemHeaderStore {
                 direct_reasons,
                 inherited_from,
             },
-            body,
+            body_validation_state: body,
             aux_delivery_ids: Vec::new(),
         };
         self.nodes.insert(hash, node);
@@ -331,7 +352,9 @@ impl MemHeaderStore {
         Ok(InsertResult::Inserted(Frontier::new(height, hash)))
     }
 
-    /// Add one independent direct reason, then recompute the affected subtree cache.
+    /// Marks an already-retained header as newly ineligible without deleting it.
+    /// Its descendants also become ineligible, so the method recomputes ancestry
+    /// eligibility and eligible-tip indexes.
     pub(crate) fn add_reason(
         &mut self,
         hash: block::Hash,
@@ -353,7 +376,11 @@ impl MemHeaderStore {
         Ok(changed)
     }
 
-    /// Remove exactly one operator invalidation, preserving every unrelated reason.
+    /// Removes the operator eligibility reason matching `id` and
+    /// `invalidation_evidence` from `hash`.
+    ///
+    /// Returns `true` if a reason was removed. On removal, recomputes inherited
+    /// eligibility for the affected subtree. Other eligibility reasons are preserved.
     pub(crate) fn remove_operator_invalidation(
         &mut self,
         hash: block::Hash,
@@ -379,7 +406,20 @@ impl MemHeaderStore {
         Ok(changed)
     }
 
-    /// Atomically record one commitment-matching deterministic body failure.
+    /// Records an authoritative consensus failure for the retained block body at `hash`.
+    ///
+    /// Sets the node's body state to `ConsensusInvalid { evidence, rule }` and adds
+    /// the matching permanent eligibility reason as one in-memory state change.
+    /// The node and its descendants are then excluded from fork choice.
+    ///
+    /// Returns `true` when state changes and `false` when the identical failure was
+    /// already recorded.
+    ///
+    /// Returns an error if `hash` is unknown or existing body-invalid state/reason
+    /// conflicts with the supplied evidence or rule.
+    ///
+    /// This method does not validate the body itself. Callers must supply an
+    /// authenticated, commitment-matching consensus result.
     pub(crate) fn set_consensus_body_invalid(
         &mut self,
         hash: block::Hash,
@@ -390,7 +430,7 @@ impl MemHeaderStore {
             .nodes
             .get_mut(&hash)
             .ok_or(GraphError::UnknownNode(hash))?;
-        let body = BodyValidationState::ConsensusInvalid {
+        let body_validation_state = BodyValidationState::ConsensusInvalid {
             evidence,
             rule: rule.clone(),
         };
@@ -398,13 +438,13 @@ impl MemHeaderStore {
         if node.eligibility.direct_reasons.iter().any(|existing| {
             matches!(existing, EligibilityReason::ConsensusBodyInvalid { .. })
                 && *existing != reason
-        }) || matches!(node.body, BodyValidationState::ConsensusInvalid { .. })
-            && node.body != body
+        }) || matches!(node.body_validation_state, BodyValidationState::ConsensusInvalid { .. })
+            && node.body_validation_state != body_validation_state
         {
             return Err(GraphError::BodyEligibilityMismatch(hash));
         }
-        let changed = node.body != body || !node.eligibility.direct_reasons.contains(&reason);
-        node.body = body;
+        let changed = node.body_validation_state != body_validation_state || !node.eligibility.direct_reasons.contains(&reason);
+        node.body_validation_state = body_validation_state;
         node.eligibility.direct_reasons.insert(reason);
         if changed {
             self.recompute_descendant_eligibility(hash)?;
@@ -412,13 +452,24 @@ impl MemHeaderStore {
         Ok(changed)
     }
 
-    /// Update body availability or verification without changing fork choice eligibility.
+    /// Replaces the non-invalid body-validation state for retained header `hash`.
+    ///
+    /// Accepts `Unknown`, `CommitmentMatched`, `Verified`, or `Unavailable`.
+    /// Returns `true` when the state changes and `false` when it is unchanged.
+    /// This operation does not alter fork-choice eligibility.
+    ///
+    /// Returns an error if the node is unknown, `body` is `ConsensusInvalid`, or
+    /// the node already carries a consensus-body-invalid eligibility reason.
+    /// Use `set_consensus_body_invalid` to record consensus failure atomically.
+    ///
+    /// This method does not enforce legal body-state transitions; the caller must
+    /// ensure the replacement state is authoritative.
     pub(crate) fn set_body_state(
         &mut self,
         hash: block::Hash,
-        body: BodyValidationState,
+        body_validation_state: BodyValidationState,
     ) -> Result<bool, GraphError> {
-        if matches!(body, BodyValidationState::ConsensusInvalid { .. }) {
+        if matches!(body_validation_state, BodyValidationState::ConsensusInvalid { .. }) {
             return Err(GraphError::BodyEligibilityMismatch(hash));
         }
         let node = self
@@ -433,12 +484,22 @@ impl MemHeaderStore {
         {
             return Err(GraphError::BodyEligibilityMismatch(hash));
         }
-        let changed = node.body != body;
-        node.body = body;
+        let changed = node.body_validation_state != body_validation_state;
+        node.body_validation_state = body_validation_state;
         Ok(changed)
     }
 
-    /// Update local-time validation state and recompute descendant eligibility.
+    /// Replaces the local-time validation state of retained header `hash`.
+    ///
+    /// A deferred header (the one passing all deterministic checks but being far back in the future)
+    /// is ineligible until changed to `Valid`. When the state
+    /// changes, propagates the resulting eligibility change through its descendants
+    /// and refreshes eligible fork tips.
+    ///
+    /// Returns `true` when the state changes and `false` when unchanged.
+    /// Returns an error if `hash` is unknown or the retained graph is inconsistent.
+    ///
+    /// The caller must ensure the new state is justified by the authoritative clock.
     pub(crate) fn set_validation(
         &mut self,
         hash: block::Hash,
@@ -567,14 +628,6 @@ impl MemHeaderStore {
         Ok(store)
     }
 
-    /// Rebuild all in-memory indexes from nodes returned by an exhaustive store audit.
-    pub fn from_audited_nodes(
-        finalized: Frontier,
-        nodes: impl IntoIterator<Item = HeaderNode>,
-    ) -> Result<Self, GraphError> {
-        Self::from_nodes(finalized, nodes)
-    }
-
     pub(crate) fn nodes(&self) -> impl Iterator<Item = &HeaderNode> {
         self.nodes.values()
     }
@@ -585,6 +638,15 @@ impl MemHeaderStore {
             .ok_or(GraphError::UnknownNode(hash))
     }
 
+    /// Propagates an eligibility change at `root` through its retained subtree.
+    ///
+    /// Assumes `root` already contains its updated direct eligibility state.
+    /// For every descendant, recomputes `inherited_from` from its parent’s current
+    /// eligibility. Then refreshes eligible-tip membership for the root, all
+    /// descendants, and their parents.
+    ///
+    /// Returns `GraphError::UnknownNode` if a child edge references a missing node
+    /// or a retained child references a missing parent.
     pub(crate) fn recompute_all_eligibility(&mut self) -> Result<(), GraphError> {
         let mut frontiers: Vec<_> = self
             .nodes
@@ -612,6 +674,20 @@ impl MemHeaderStore {
         Ok(())
     }
 
+    /// Moves the graph’s finality anchor to an eligible retained frontier.
+    ///
+    /// Retains the new anchor and all of its descendants, and removes every other
+    /// node, including its ancestors and competing branches. Rebuilds affected
+    /// height, child, and eligible-tip indexes, and clears inherited ineligibility
+    /// from the new root.
+    ///
+    /// Returns the hashes of removed nodes in deterministic raw-byte order.
+    ///
+    /// Returns an error without modifying the graph if the frontier’s hash is
+    /// unknown, its recorded height differs, or the node is ineligible.
+    ///
+    /// The caller must establish authority to advance finality before invoking this
+    /// method. Durable commit and publication are handled by the transition layer.
     pub(crate) fn advance_finalized(
         &mut self,
         finalized: Frontier,
@@ -625,13 +701,19 @@ impl MemHeaderStore {
         if !node.is_eligible() {
             return Err(GraphError::IneligibleFinalized(finalized.hash));
         }
+        // Visited hashes
         let mut retained = HashSet::new();
+        // Nodes to visit
         let mut pending = vec![finalized.hash];
+
+        // Traverse the graph in depth-first order, starting from the new finalized frontier.
         while let Some(hash) = pending.pop() {
             if retained.insert(hash) {
                 pending.extend(self.children(hash));
             }
         }
+
+        // Remove all nodes that were left behind the frontier after it moved.
         let mut deleted: Vec<_> = self
             .nodes
             .keys()
@@ -758,9 +840,22 @@ impl MemHeaderStore {
             .collect();
     }
 
+    /// Validates and installs a complete overlay-produced graph delta.
+    ///
+    /// Applies node deletions and replacements together with their corresponding
+    /// height-index, child-edge, eligible-tip, and finality changes. Existing node
+    /// replacements must preserve immutable identity fields such as height.
+    ///
+    /// Returns an error without modifying the store if a deletion references an
+    /// unknown node or the delta both deletes and replaces the same hash.
+    ///
+    /// This method does not recompute or fully validate derived indexes. The caller
+    /// must supply a coherent `GraphDelta`, normally produced and invariant-checked
+    /// through `GraphOverlay`.
     pub(crate) fn apply_delta(&mut self, delta: &GraphDelta) -> Result<(), GraphError> {
         self.validate_delta(delta)?;
 
+        // Apply deletions
         for hash in &delta.delete_nodes {
             let node = self
                 .nodes
@@ -774,6 +869,8 @@ impl MemHeaderStore {
                 }
             }
         }
+
+        // Apply replacements
         for node in &delta.put_nodes {
             let old = self.nodes.insert(node.hash, node.clone());
             if old.is_none() {
@@ -783,6 +880,8 @@ impl MemHeaderStore {
                     .insert(node.hash);
             }
         }
+
+        // Apply child-edge removals and additions
         for (parent, child) in &delta.remove_children {
             if let Some(children) = self.children.get_mut(parent) {
                 children.remove(child);
@@ -791,9 +890,14 @@ impl MemHeaderStore {
                 }
             }
         }
+
+        // Apply child-edge additions
         for (parent, child) in &delta.add_children {
             self.children.entry(*parent).or_default().insert(*child);
         }
+
+
+        // Apply eligible-tip removals and additions
         for hash in &delta.remove_eligible_tips {
             self.eligible_tips.remove(hash);
         }
@@ -805,6 +909,8 @@ impl MemHeaderStore {
         Ok(())
     }
 
+    /// Validates a complete overlay-produced graph delta. Returns an error if a deletion references an
+    /// unknown node or the delta both deletes and replaces the same hash.
     pub(crate) fn validate_delta(&self, delta: &GraphDelta) -> Result<(), GraphError> {
         for hash in &delta.delete_nodes {
             if !self.nodes.contains_key(hash) {
@@ -1615,13 +1721,13 @@ mod tests {
             unknown_tip
         );
         assert_eq!(
-            store.node(verified_hash).expect("retained").body,
+            store.node(verified_hash).expect("retained").body_validation_state,
             BodyValidationState::Verified {
                 evidence: crate::EvidenceId::from_digest([4; 32])
             }
         );
         assert_eq!(
-            store.node(unknown_tip.hash).expect("retained").body,
+            store.node(unknown_tip.hash).expect("retained").body_validation_state,
             BodyValidationState::Unavailable(crate::BodyUnavailableSummary {
                 attempts: 10,
                 suppliers: 0,

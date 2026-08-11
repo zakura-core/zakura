@@ -349,7 +349,7 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
     let body_unavailable_alarm = match &node_map
         .get(&selected_tip.hash)
         .ok_or_else(|| source_failure(AuditViolation::ProtectedPath(selected_tip.hash)))?
-        .body
+        .body_validation_state
     {
         crate::BodyValidationState::Unavailable(summary) if summary.alarmed => Some(*summary),
         _ => None,
@@ -432,7 +432,7 @@ fn check_nodes(
             .direct_reasons
             .iter()
             .find(|reason| matches!(reason, EligibilityReason::ConsensusBodyInvalid { .. }));
-        let matches = match (&node.body, body_reason) {
+        let matches = match (&node.body_validation_state, body_reason) {
             (
                 BodyValidationState::ConsensusInvalid {
                     evidence: left_evidence,
@@ -790,7 +790,7 @@ fn verified_path(
     if path.iter().skip(1).any(|frontier| {
         nodes
             .get(&frontier.hash)
-            .is_none_or(|node| !matches!(node.body, BodyValidationState::Verified { .. }))
+            .is_none_or(|node| !matches!(node.body_validation_state, BodyValidationState::Verified { .. }))
     }) {
         return Err(source_failure(AuditViolation::ProtectedPath(
             metadata.frontiers.verified_best.hash,
@@ -1162,7 +1162,7 @@ mod tests {
             alarmed: true,
             ..Default::default()
         };
-        store.nodes[1].body = crate::BodyValidationState::Unavailable(summary);
+        store.nodes[1].body_validation_state = crate::BodyValidationState::Unavailable(summary);
 
         let plan = audit_store(&store, &config).expect("the derived alarm is reconstructible");
         assert_eq!(
@@ -1266,7 +1266,7 @@ mod tests {
         store.metadata.finality_epoch = FinalityEpoch::new(1);
         store.snapshot = store.metadata.snapshot();
         store.verified = vec![child];
-        store.nodes[1].body = BodyValidationState::Verified {
+        store.nodes[1].body_validation_state = BodyValidationState::Verified {
             evidence: EvidenceId::from_digest([0x71; 32]),
         };
         store.finality.push(FinalityRecord {
@@ -1363,14 +1363,14 @@ mod tests {
             WorkCoordinate::new(store.metadata.work_origin.hash, Default::default()),
             store.nodes[1].validation,
             store.nodes[1].eligibility.clone(),
-            store.nodes[1].body.clone(),
+            store.nodes[1].body_validation_state.clone(),
             Vec::new(),
         )
         .expect("the isolated node fields remain canonical");
         assert!(violations(&store, &config).contains(&AuditViolation::Work(child_hash)));
 
         let mut store = base.clone();
-        store.nodes[1].body = BodyValidationState::ConsensusInvalid {
+        store.nodes[1].body_validation_state = BodyValidationState::ConsensusInvalid {
             evidence: EvidenceId::from_digest([2; 32]),
             rule: BodyRuleId::new("body.rule"),
         };

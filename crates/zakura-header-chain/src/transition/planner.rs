@@ -575,7 +575,7 @@ fn select_fully_verified_path<G: HeaderGraphView>(
     for node in nodes {
         if node.hash != finalized.hash
             && node.is_eligible()
-            && matches!(node.body, BodyValidationState::Verified { .. })
+            && matches!(node.body_validation_state, BodyValidationState::Verified { .. })
             && connected.contains(&node.parent_hash)
         {
             connected.insert(node.hash);
@@ -1175,7 +1175,7 @@ fn apply_event<G: HeaderGraphEdit>(
                 ));
             }
             if matches!(
-                graph.view_node(event.hash).map(|node| &node.body),
+                graph.view_node(event.hash).map(|node| &node.body_validation_state),
                 Some(BodyValidationState::Verified { .. })
             ) {
                 return Err(TransitionFailure::InvalidEvidence(
@@ -1188,7 +1188,7 @@ fn apply_event<G: HeaderGraphEdit>(
             )?;
         }
         TransitionEvent::BodySupplierDiscovered(event) => {
-            let old = match graph.view_node(event.hash).map(|node| &node.body) {
+            let old = match graph.view_node(event.hash).map(|node| &node.body_validation_state) {
                 Some(BodyValidationState::Unavailable(summary))
                     if event.hash == graph.view_select_header_best()?.0.hash && summary.alarmed =>
                 {
@@ -1236,7 +1236,7 @@ fn apply_event<G: HeaderGraphEdit>(
                 ));
             }
             if !matches!(
-                graph.view_node(event.hash).map(|node| &node.body),
+                graph.view_node(event.hash).map(|node| &node.body_validation_state),
                 Some(BodyValidationState::Unavailable(summary)) if summary.alarmed
             ) {
                 return Err(TransitionFailure::InvalidEvidence(
@@ -1250,7 +1250,7 @@ fn apply_event<G: HeaderGraphEdit>(
         }
         TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(event)) => {
             if matches!(
-                graph.view_node(event.hash).map(|node| &node.body),
+                graph.view_node(event.hash).map(|node| &node.body_validation_state),
                 Some(BodyValidationState::Verified { .. })
             ) {
                 return Err(TransitionFailure::InvalidEvidence(
@@ -1503,7 +1503,7 @@ fn derive_plan(
     let header_best_node = graph
         .view_node(header_best.hash)
         .ok_or(GraphError::UnknownNode(header_best.hash))?;
-    metadata.alarms.header_best_body_unavailable = match &header_best_node.body {
+    metadata.alarms.header_best_body_unavailable = match &header_best_node.body_validation_state {
         BodyValidationState::Unavailable(summary) if summary.alarmed => Some(*summary),
         _ => None,
     };

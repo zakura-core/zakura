@@ -274,7 +274,7 @@ pub struct HeaderNode {
     /// Direct and inherited eligibility state.
     pub eligibility: EligibilityState,
     /// Full-state body knowledge.
-    pub body: BodyValidationState,
+    pub body_validation_state: BodyValidationState,
     /// Hash-keyed auxiliary delivery evidence IDs.
     pub aux_delivery_ids: Vec<EvidenceId>,
 }
@@ -322,7 +322,7 @@ impl HeaderNode {
             work_coordinate,
             validation,
             eligibility,
-            body,
+            body_validation_state: body,
             aux_delivery_ids,
         })
     }

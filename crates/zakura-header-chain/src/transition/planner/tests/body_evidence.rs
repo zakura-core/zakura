@@ -90,7 +90,7 @@ fn new_body_supplier_preserves_only_the_selected_persistent_alarm() {
         plan.projected
             .node(selected.hash)
             .expect("the selected node remains retained")
-            .body,
+            .body_validation_state,
         BodyValidationState::Unavailable(updated)
     );
     assert_eq!(

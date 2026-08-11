@@ -463,7 +463,7 @@ fn operator_body_retry_restarts_the_selected_alarm_with_the_same_suppliers() {
         plan.projected
             .node(selected.hash)
             .expect("the selected node remains retained")
-            .body,
+            .body_validation_state,
         BodyValidationState::Unavailable(fresh)
     );
     assert_eq!(

@@ -786,13 +786,13 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
     ));
 
     let mut unverified = plan.clone();
-    unverified.change_set.put_nodes[0].body = BodyValidationState::Unknown;
-    unverified.graph_delta.put_nodes[0].body = BodyValidationState::Unknown;
+    unverified.change_set.put_nodes[0].body_validation_state = BodyValidationState::Unknown;
+    unverified.graph_delta.put_nodes[0].body_validation_state = BodyValidationState::Unknown;
     unverified
         .projected
         .node_mut(checkpoint.hash)
         .expect("the projected checkpoint is retained")
-        .body = BodyValidationState::Unknown;
+        .body_validation_state = BodyValidationState::Unknown;
     assert_eq!(
         verify_plan(&test_engine(&store), &unverified),
         Err(InvariantViolation::VerifiedProjection(checkpoint.hash))

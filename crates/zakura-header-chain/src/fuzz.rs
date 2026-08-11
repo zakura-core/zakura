@@ -1455,7 +1455,7 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
             .graph
             .node(invalid.hash)
             .expect("the transient target remains retained");
-        assert_eq!(node.body, BodyValidationState::Unavailable(availability));
+        assert_eq!(node.body_validation_state, BodyValidationState::Unavailable(availability));
         assert!(node.eligibility.direct_reasons.is_empty());
         assert_eq!(node.eligibility.inherited_from, None);
         hasher.update([match kind {
@@ -1496,7 +1496,7 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
         .node(invalid.hash)
         .expect("the invalid target remains retained as evidence");
     assert_eq!(
-        invalid_node.body,
+        invalid_node.body_validation_state,
         BodyValidationState::ConsensusInvalid {
             evidence: invalid_evidence,
             rule: rule.clone(),
@@ -1913,7 +1913,7 @@ fn retained_digest(store: &FuzzStore) -> [u8; 32] {
         hasher.update(node.work_coordinate().cumulative_work().to_big_endian());
         hasher.update(format!("{:?}", node.validation));
         hasher.update(format!("{:?}", node.eligibility));
-        hasher.update(format!("{:?}", node.body));
+        hasher.update(format!("{:?}", node.body_validation_state));
         for delivery in &node.aux_delivery_ids {
             hasher.update(delivery.digest());
         }

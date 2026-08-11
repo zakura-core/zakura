@@ -377,7 +377,7 @@ fn verify_incremental_checkpoint_finality(
     if changed.aux_delivery_ids != previous.aux_delivery_ids {
         return Err(InvariantViolation::Auxiliary(changed.hash));
     }
-    if !matches!(changed.body, BodyValidationState::Verified { .. }) {
+    if !matches!(changed.body_validation_state, BodyValidationState::Verified { .. }) {
         return Err(InvariantViolation::VerifiedProjection(changed.hash));
     }
     let projected_changed = graph
@@ -595,7 +595,7 @@ fn verify_verified<G: HeaderGraphView>(
     if mode == EngineMode::Integrated {
         for frontier in projection.iter().skip(1) {
             if !matches!(
-                graph.view_node(frontier.hash).map(|node| node.body.clone()),
+                graph.view_node(frontier.hash).map(|node| node.body_validation_state.clone()),
                 Some(BodyValidationState::Verified { .. })
             ) {
                 return Err(InvariantViolation::VerifiedProjection(frontier.hash));

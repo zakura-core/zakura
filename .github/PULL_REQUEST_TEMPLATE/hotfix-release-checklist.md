@@ -96,13 +96,19 @@ allows `hotfix/v*`).
       completed steps):
 
   ```sh
+  # Main base: squash-merge the public PR, then release from main.
+  ./scripts/release-t0.sh publish --hotfix --tag v<version> \
+      --mode main --pr <N> --head-sha <final-commit>
+
+  # Previous-release base: push and release from the hotfix branch.
   ./scripts/release-t0.sh publish --hotfix --tag v<version> \
       --mode branch --head-sha <final-commit>
   ```
 
-  Manual fallback: push `hotfix/v<version>`, dispatch `Create release`
-  **from the branch** with the exact tag, and verify each step landed before
-  the next.
+  Manual fallback: for a main-base hotfix, squash-merge the public PR and
+  dispatch `Create release` from `main`; for a previous-release-base hotfix,
+  push `hotfix/v<version>` and dispatch from that branch. Use the exact tag
+  and verify each step landed before the next.
 - [ ] Approve the `release` environment deployment when the script announces
       it (right commit? right tag?). The workflow publishes a complete
       pre-release and creates the protected tag; the tag push starts Docker

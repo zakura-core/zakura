@@ -1579,6 +1579,20 @@ fn test_block_db_round_trip_with(
         }
 
         assert_eq!(stored_block, original_block);
+
+        // The raw read path assembles exactly the bytes the block serializes
+        // to, including the CompactSize transaction count and the transaction
+        // order in multi-transaction blocks.
+        #[cfg(feature = "indexer")]
+        assert_eq!(
+            state
+                .raw_block_bytes(finalized.height.into())
+                .expect("raw block was stored at height"),
+            original_block
+                .zcash_serialize_to_vec()
+                .expect("serialization to vec never fails"),
+            "raw block bytes must match the block's consensus serialization",
+        );
     }
 }
 

@@ -2070,6 +2070,27 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::Blocks(blocks))
             }
 
+            // Used by the indexer gRPC server.
+            #[cfg(feature = "indexer")]
+            ReadRequest::RawBlocksByHeightRange { start, count } => {
+                let blocks = (0..count)
+                    .map_while(|offset| {
+                        start
+                            .0
+                            .checked_add(offset)
+                            .map(block::Height)
+                            .and_then(|height| {
+                                state
+                                    .db
+                                    .raw_block_bytes(height.into())
+                                    .map(|bytes| (height, bytes))
+                            })
+                    })
+                    .collect();
+
+                Ok(ReadResponse::RawBlocks(blocks))
+            }
+
             ReadRequest::SaplingTree(hash_or_height) => {
                 let tree =
                     read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height)?;

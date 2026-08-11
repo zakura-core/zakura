@@ -391,6 +391,44 @@ impl ZakuraDb {
         Some((Arc::new(block), size))
     }
 
+    /// Returns the Zcash consensus serialization of the [`Block`] with
+    /// [`block::Hash`] or [`Height`], if it exists in the finalized chain and
+    /// its raw transaction data is available.
+    ///
+    /// The block is assembled from the stored raw bytes — the header, the
+    /// CompactSize-encoded transaction count, and the raw transactions — so
+    /// the transactions are never deserialized.
+    ///
+    /// Returns `None` if the block does not exist, or if its transaction bodies
+    /// are missing because they have been pruned.
+    #[cfg(feature = "indexer")]
+    #[allow(clippy::unwrap_in_result)]
+    pub fn raw_block_bytes(&self, hash_or_height: HashOrHeight) -> Option<Vec<u8>> {
+        let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
+
+        let tx_count = CompactSizeMessage::try_from(raw_txs.len())
+            .expect("must work for a previously serialized block");
+        let tx_count = tx_count
+            .zcash_serialize_to_vec()
+            .expect("must work for a previously serialized block");
+
+        let size = raw_header.raw_bytes().len()
+            + tx_count.len()
+            + raw_txs
+                .iter()
+                .map(|raw_tx| raw_tx.raw_bytes().len())
+                .sum::<usize>();
+
+        let mut bytes = Vec::with_capacity(size);
+        bytes.extend_from_slice(raw_header.raw_bytes());
+        bytes.extend_from_slice(&tx_count);
+        for raw_tx in &raw_txs {
+            bytes.extend_from_slice(raw_tx.raw_bytes());
+        }
+
+        Some(bytes)
+    }
+
     /// Returns the raw [`Block`] with [`block::Hash`] or
     /// [`Height`], if it exists in the finalized chain and its raw transaction
     /// data is available.

@@ -1543,6 +1543,23 @@ pub enum ReadRequest {
         count: u32,
     },
 
+    /// Returns contiguous committed blocks by height from the finalized state,
+    /// in ascending order, as their raw Zcash consensus serializations.
+    ///
+    /// The response stops before the first height without a committed body, so
+    /// it never includes non-finalized blocks and ends at the finalized tip.
+    ///
+    /// Returns
+    ///
+    /// [`ReadResponse::RawBlocks(Vec<(block::Height, Vec<u8>)>)`](crate::ReadResponse::RawBlocks).
+    #[cfg(feature = "indexer")]
+    RawBlocksByHeightRange {
+        /// First height to read.
+        start: block::Height,
+        /// Maximum number of blocks to return.
+        count: u32,
+    },
+
     /// Looks up a Sapling note commitment tree either by a hash or height.
     ///
     /// Returns
@@ -1746,6 +1763,8 @@ impl ReadRequest {
             ReadRequest::MissingBlockBodyMetadata { .. } => "missing_block_body_metadata",
             ReadRequest::BlockSizeHints { .. } => "block_size_hints",
             ReadRequest::BlocksByHeightRange { .. } => "blocks_by_height_range",
+            #[cfg(feature = "indexer")]
+            ReadRequest::RawBlocksByHeightRange { .. } => "raw_blocks_by_height_range",
             ReadRequest::SaplingTree { .. } => "sapling_tree",
             ReadRequest::OrchardTree { .. } => "orchard_tree",
             ReadRequest::IronwoodTree { .. } => "ironwood_tree",

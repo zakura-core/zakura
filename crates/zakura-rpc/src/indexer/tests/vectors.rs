@@ -18,7 +18,10 @@ use zakura_test::{
     prelude::color_eyre::{eyre::eyre, Result},
 };
 
-use crate::indexer::{self, indexer_client::IndexerClient, BlockRequest, Empty};
+#[cfg(feature = "indexer")]
+use zakura_chain::serialization::ZcashSerialize;
+
+use crate::indexer::{self, indexer_client::IndexerClient, BlockRangeRequest, BlockRequest, Empty};
 
 #[tokio::test]
 async fn rpc_server_spawn() -> Result<()> {
@@ -34,7 +37,29 @@ async fn rpc_server_spawn() -> Result<()> {
 
     test_chain_tip_change(client.clone(), mock_chain_tip_sender).await?;
     test_mempool_change(client.clone(), mempool_transaction_sender).await?;
-    test_get_block(client.clone(), mock_read_service).await?;
+    test_get_block(client.clone(), mock_read_service.clone()).await?;
+    #[cfg(feature = "indexer")]
+    test_get_block_range(client.clone(), mock_read_service).await?;
+    #[cfg(not(feature = "indexer"))]
+    test_get_block_range_unimplemented(client.clone()).await?;
+
+    Ok(())
+}
+
+/// Tests that `GetBlockRange` is rejected as unimplemented when the crate is
+/// built without the `indexer` feature, which gates the raw block read path.
+#[cfg(not(feature = "indexer"))]
+async fn test_get_block_range_unimplemented(
+    mut client: IndexerClient<tonic::transport::Channel>,
+) -> Result<()> {
+    let status = client
+        .get_block_range(tonic::Request::new(BlockRangeRequest {
+            start_height: 1,
+            end_height: 2,
+        }))
+        .await
+        .expect_err("get_block_range should be unimplemented without the indexer feature");
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
 
     Ok(())
 }
@@ -93,6 +118,272 @@ async fn test_get_block(
     let (decoded_block, decoded_hash) = response.decode().expect("response should decode");
     assert_eq!(decoded_hash, expected_hash);
     assert_eq!(decoded_block.hash(), expected_hash);
+
+    Ok(())
+}
+
+/// Tests that `GetBlockRange` streams the requested blocks in ascending order,
+/// ends cleanly when the state stops early, reads the range in bounded chunks,
+/// and rejects invalid ranges.
+#[cfg(feature = "indexer")]
+async fn test_get_block_range(
+    client: IndexerClient<tonic::transport::Channel>,
+    mut mock_read_service: MockService<ReadRequest, ReadResponse, PanicAssertion, BoxError>,
+) -> Result<()> {
+    // A range whose end is below its start is rejected without touching the
+    // state.
+    let status = client
+        .clone()
+        .get_block_range(tonic::Request::new(BlockRangeRequest {
+            start_height: 2,
+            end_height: 1,
+        }))
+        .await
+        .expect_err("a block range with end below start should be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    // Heights above the maximum valid block height are rejected without
+    // touching the state.
+    let status = client
+        .clone()
+        .get_block_range(tonic::Request::new(BlockRangeRequest {
+            start_height: u32::MAX,
+            end_height: u32::MAX,
+        }))
+        .await
+        .expect_err("an out-of-range block height should be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    // Blocks requested by height range are streamed in ascending order, with
+    // the same bytes `GetBlock` serves for the same heights.
+    let block1: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let block2: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+
+    let mut request_client = client.clone();
+    let request_task = tokio::spawn(async move {
+        request_client
+            .get_block_range(tonic::Request::new(BlockRangeRequest {
+                start_height: 1,
+                end_height: 2,
+            }))
+            .await
+    });
+
+    mock_read_service
+        .expect_request(ReadRequest::RawBlocksByHeightRange {
+            start: Height(1),
+            count: 2,
+        })
+        .await
+        .respond(ReadResponse::RawBlocks(vec![
+            (Height(1), block1.zcash_serialize_to_vec()?),
+            (Height(2), block2.zcash_serialize_to_vec()?),
+        ]));
+
+    let mut stream = request_task
+        .await?
+        .expect("get_block_range should succeed")
+        .into_inner();
+
+    for (expected_height, expected_block) in [(1u32, &block1), (2, &block2)] {
+        let response = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("should receive a streamed block before timeout")
+            .expect("response stream should not end before the requested range")
+            .expect("streamed block response should not be an error message");
+
+        assert_eq!(response.height, expected_height);
+        assert_eq!(response.data, expected_block.zcash_serialize_to_vec()?);
+
+        // The streamed bytes are identical to `GetBlock`'s answer at the same
+        // height.
+        let mut get_block_client = client.clone();
+        let get_block_task = tokio::spawn(async move {
+            get_block_client
+                .get_block(tonic::Request::new(BlockRequest {
+                    hash_or_height: expected_height.to_be_bytes().to_vec(),
+                }))
+                .await
+        });
+
+        mock_read_service
+            .expect_request(ReadRequest::Block(HashOrHeight::Height(Height(
+                expected_height,
+            ))))
+            .await
+            .respond(ReadResponse::Block(Some(expected_block.clone())));
+
+        let get_block_response = get_block_task
+            .await?
+            .expect("get_block should succeed")
+            .into_inner();
+        assert_eq!(response.data, get_block_response.data);
+
+        let (decoded_block, decoded_height) = response.decode().expect("response should decode");
+        assert_eq!(decoded_height, Height(expected_height));
+        assert_eq!(decoded_block.hash(), expected_block.hash());
+    }
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("the stream should end before timeout")
+            .is_none(),
+        "the stream should end after the last requested block"
+    );
+
+    // When the state stops before the end of the range — at its finalized tip
+    // or before a missing block body — the stream ends cleanly after the last
+    // served block instead of returning an error.
+    let mut request_client = client.clone();
+    let request_task = tokio::spawn(async move {
+        request_client
+            .get_block_range(tonic::Request::new(BlockRangeRequest {
+                start_height: 1,
+                end_height: 5,
+            }))
+            .await
+    });
+
+    mock_read_service
+        .expect_request(ReadRequest::RawBlocksByHeightRange {
+            start: Height(1),
+            count: 5,
+        })
+        .await
+        .respond(ReadResponse::RawBlocks(vec![
+            (Height(1), block1.zcash_serialize_to_vec()?),
+            (Height(2), block2.zcash_serialize_to_vec()?),
+        ]));
+
+    let mut stream = request_task
+        .await?
+        .expect("get_block_range should succeed")
+        .into_inner();
+
+    let mut received = Vec::new();
+    while let Some(message) = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("the stream should make progress before timeout")
+    {
+        received.push(
+            message
+                .expect("streamed block response should not be an error message")
+                .height,
+        );
+    }
+    assert_eq!(
+        received,
+        [1, 2],
+        "the stream should end cleanly after the last served block"
+    );
+
+    // A long range is read from the state in bounded chunks: each following
+    // read starts after the last block of the previous one, and the trailing
+    // read requests only the remainder.
+    let mut request_client = client.clone();
+    let request_task = tokio::spawn(async move {
+        request_client
+            .get_block_range(tonic::Request::new(BlockRangeRequest {
+                start_height: 0,
+                end_height: 129,
+            }))
+            .await
+    });
+
+    let mock_driver = {
+        let mut mock_read_service = mock_read_service.clone();
+        tokio::spawn(async move {
+            for (start, count) in [(0u32, 64u32), (64, 64), (128, 2)] {
+                mock_read_service
+                    .expect_request(ReadRequest::RawBlocksByHeightRange {
+                        start: Height(start),
+                        count,
+                    })
+                    .await
+                    .respond(ReadResponse::RawBlocks(
+                        (start..start + count)
+                            .map(|height| (Height(height), height.to_be_bytes().to_vec()))
+                            .collect(),
+                    ));
+            }
+        })
+    };
+
+    let mut stream = request_task
+        .await?
+        .expect("get_block_range should succeed")
+        .into_inner();
+
+    for expected_height in 0..=129u32 {
+        let response = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("should receive a streamed block before timeout")
+            .expect("response stream should not end before the requested range")
+            .expect("streamed block response should not be an error message");
+
+        assert_eq!(response.height, expected_height);
+    }
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("the stream should end before timeout")
+            .is_none(),
+        "the stream should end after the last requested block"
+    );
+
+    mock_driver.await?;
+
+    // A short chunk stops the stream: when a mid-range read returns fewer
+    // blocks than requested, the task must end the stream instead of
+    // requesting the next chunk.
+    let mut request_client = client.clone();
+    let request_task = tokio::spawn(async move {
+        request_client
+            .get_block_range(tonic::Request::new(BlockRangeRequest {
+                start_height: 0,
+                end_height: 129,
+            }))
+            .await
+    });
+
+    mock_read_service
+        .expect_request(ReadRequest::RawBlocksByHeightRange {
+            start: Height(0),
+            count: 64,
+        })
+        .await
+        .respond(ReadResponse::RawBlocks(
+            (0..10)
+                .map(|height| (Height(height), height.to_be_bytes().to_vec()))
+                .collect(),
+        ));
+
+    let mut stream = request_task
+        .await?
+        .expect("get_block_range should succeed")
+        .into_inner();
+
+    let mut received = Vec::new();
+    while let Some(message) = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("the stream should make progress before timeout")
+    {
+        received.push(
+            message
+                .expect("streamed block response should not be an error message")
+                .height,
+        );
+    }
+    assert_eq!(
+        received,
+        (0..10u32).collect::<Vec<_>>(),
+        "the stream should end after a short mid-range read"
+    );
+    mock_read_service.expect_no_requests().await;
 
     Ok(())
 }

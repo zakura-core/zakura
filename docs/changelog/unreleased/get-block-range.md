@@ -1,0 +1,17 @@
+## Added
+
+- Added the `GetBlockRange` method to the indexer gRPC service, streaming a
+  height range of finalized blocks in ascending order. Blocks are served from
+  the stored raw bytes instead of the per-block deserialize/re-serialize round
+  trip `GetBlock` performs, so indexers can backfill finalized history without
+  a request round trip per block. Serving block ranges requires building with
+  the `indexer` compile-time feature; without it the method returns
+  `UNIMPLEMENTED` ([#0000](https://github.com/zakura-core/zakura/pull/0000)).
+
+## Changed
+
+- The generated `Indexer` gRPC service trait in the `zakura-rpc` crate has a
+  new required `get_block_range` method and `GetBlockRangeStream` associated
+  type, a breaking change for external implementers of the trait; `zakura-rpc`
+  takes its major version bump to 7.0.0 in this PR
+  ([#0000](https://github.com/zakura-core/zakura/pull/0000)).

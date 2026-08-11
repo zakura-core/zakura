@@ -15,9 +15,9 @@ use zakura_state::{
 };
 
 use super::{
-    indexer_server::Indexer, server::IndexerRPC, BlockAndHash, BlockHashAndHeight, BlockRequest,
-    Empty, MempoolChangeMessage, NonFinalizedStateChangeRequest, BLOCK_HASH_BYTE_LEN,
-    BLOCK_HEIGHT_BYTE_LEN,
+    indexer_server::Indexer, server::IndexerRPC, BlockAndHash, BlockAndHeight, BlockHashAndHeight,
+    BlockRangeRequest, BlockRequest, Empty, MempoolChangeMessage, NonFinalizedStateChangeRequest,
+    BLOCK_HASH_BYTE_LEN, BLOCK_HEIGHT_BYTE_LEN,
 };
 
 /// The maximum number of messages that can be queued to be streamed to a client.
@@ -26,10 +26,22 @@ const RESPONSE_BUFFER_SIZE: usize = 64;
 /// How long to wait for a backpressured send before treating the consumer as hung
 /// and dropping the subscription.
 ///
-/// All three indexer streams apply backpressure so a slow consumer doesn't miss
+/// All indexer streams apply backpressure so a slow consumer doesn't miss
 /// notifications, but without a bound a consumer whose connection is half-open (dead
 /// TCP not yet detected) would block the listener task indefinitely.
 const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The maximum number of blocks read from the state in a single request while
+/// streaming a block range.
+///
+/// Reading [`RESPONSE_BUFFER_SIZE`] blocks per read means one state read fills
+/// at most one response buffer, so a `get_block_range` stream holds at most two
+/// buffers' worth of blocks while it waits for a slow consumer.
+//
+// The cast is safe because `RESPONSE_BUFFER_SIZE` is a small constant that
+// fits in a `u32`.
+#[cfg(feature = "indexer")]
+const BLOCK_RANGE_CHUNK_SIZE: u32 = RESPONSE_BUFFER_SIZE as u32;
 
 #[tonic::async_trait]
 impl<ReadStateService, Tip> Indexer for IndexerRPC<ReadStateService, Tip>
@@ -43,6 +55,7 @@ where
         Pin<Box<dyn Stream<Item = Result<BlockAndHash, Status>> + Send>>;
     type MempoolChangeStream =
         Pin<Box<dyn Stream<Item = Result<MempoolChangeMessage, Status>> + Send>>;
+    type GetBlockRangeStream = Pin<Box<dyn Stream<Item = Result<BlockAndHeight, Status>> + Send>>;
 
     async fn chain_tip_change(
         &self,
@@ -309,6 +322,131 @@ where
             Err(error) => Err(Status::unavailable(format!(
                 "failed to read block: {error}"
             ))),
+        }
+    }
+
+    async fn get_block_range(
+        &self,
+        request: tonic::Request<BlockRangeRequest>,
+    ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
+        // Serving raw block ranges needs the raw read path in
+        // `zakura-state/indexer`, so the method sits behind this crate's
+        // `indexer` feature and is not implemented without it.
+        #[cfg(not(feature = "indexer"))]
+        {
+            let _ = request;
+            return Err(Status::unimplemented(
+                "GetBlockRange requires the `indexer` compile-time feature",
+            ));
+        }
+
+        #[cfg(feature = "indexer")]
+        {
+            let BlockRangeRequest {
+                start_height,
+                end_height,
+            } = request.into_inner();
+
+            // Invalid ranges are rejected up front, without touching the state.
+            let block::Height(start) = block::Height::try_from(start_height).map_err(|_| {
+                Status::invalid_argument(format!("start height out of range: {start_height}"))
+            })?;
+            let block::Height(end) = block::Height::try_from(end_height).map_err(|_| {
+                Status::invalid_argument(format!("end height out of range: {end_height}"))
+            })?;
+
+            if end < start {
+                return Err(Status::invalid_argument(format!(
+                    "end height {end_height} must not be below start height {start_height}"
+                )));
+            }
+
+            let span = Span::current();
+            let read_state = self.read_state.clone();
+            let (response_sender, response_receiver) =
+                tokio::sync::mpsc::channel(RESPONSE_BUFFER_SIZE);
+            let response_stream = ReceiverStream::new(response_receiver);
+
+            tokio::spawn(async move {
+                // Serve the range in bounded chunks so the task never buffers more
+                // than one chunk of blocks beyond the response buffer. When the
+                // state returns fewer blocks than a chunk asked for, it stopped at
+                // the finalized tip or before a missing block body, so the stream
+                // ends cleanly there, following the `BlocksByHeightRange`
+                // convention.
+                let mut next = start;
+                while next <= end {
+                    // The subtraction and increment never overflow: `next <= end`,
+                    // and `end` is a valid `Height`, which is far below `u32::MAX`.
+                    let count = (end - next + 1).min(BLOCK_RANGE_CHUNK_SIZE);
+
+                    let blocks = match read_state
+                        .clone()
+                        .oneshot(ReadRequest::RawBlocksByHeightRange {
+                            start: block::Height(next),
+                            count,
+                        })
+                        .await
+                    {
+                        Ok(ReadResponse::RawBlocks(blocks)) => blocks,
+                        Ok(_) => unreachable!("unexpected response type from ReadStateService"),
+                        Err(error) => {
+                            span.in_scope(|| {
+                                tracing::error!(
+                                    ?error,
+                                    "failed to read blocks for get_block_range"
+                                );
+                            });
+
+                            // A stalled consumer must not pin this task, so
+                            // the error send is bounded like the data sends.
+                            let send = response_sender.send(Err(Status::unavailable(format!(
+                                "failed to read blocks: {error}"
+                            ))));
+                            let _ = tokio::time::timeout(SEND_TIMEOUT, send).await;
+                            return;
+                        }
+                    };
+
+                    let block_count = u32::try_from(blocks.len())
+                        .expect("the state returns at most `count` blocks, which is a u32");
+
+                    for (height, data) in blocks {
+                        let send = response_sender.send(Ok(BlockAndHeight::new(height, data)));
+                        match tokio::time::timeout(SEND_TIMEOUT, send).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => {
+                                span.in_scope(|| {
+                                    tracing::info!(
+                                        "client disconnected, dropping get_block_range task"
+                                    );
+                                });
+                                return;
+                            }
+                            Err(_) => {
+                                span.in_scope(|| {
+                                    tracing::warn!(
+                                        "slow consumer, dropping get_block_range stream after \
+                                         send timed out"
+                                    );
+                                });
+                                return;
+                            }
+                        }
+                    }
+
+                    if block_count < count {
+                        break;
+                    }
+
+                    next += count;
+                }
+
+                // Dropping the sender ends the stream cleanly at the end of the
+                // served range.
+            });
+
+            Ok(Response::new(Box::pin(response_stream)))
         }
     }
 }

@@ -585,6 +585,31 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
         )]),
     );
 
+    // The raw range read returns the exact consensus serialization and stops
+    // before the first height without a committed body.
+    #[cfg(feature = "indexer")]
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::RawBlocksByHeightRange {
+                start: Height(0),
+                count: 3,
+            })
+            .await?,
+        ReadResponse::RawBlocks(vec![(Height(0), genesis.zcash_serialize_to_vec()?)]),
+    );
+    #[cfg(feature = "indexer")]
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::RawBlocksByHeightRange {
+                start: Height(0),
+                count: 0,
+            })
+            .await?,
+        ReadResponse::RawBlocks(Vec::new()),
+    );
+
     assert_eq!(
         read_state
             .clone()
@@ -717,6 +742,17 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
             })
             .await?,
         ReadResponse::Blocks(Vec::new()),
+    );
+    #[cfg(feature = "indexer")]
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::RawBlocksByHeightRange {
+                start: Height(1),
+                count: 2,
+            })
+            .await?,
+        ReadResponse::RawBlocks(Vec::new()),
     );
 
     assert_eq!(

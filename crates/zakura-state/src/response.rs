@@ -486,6 +486,11 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::BlocksByHeightRange`].
     Blocks(Vec<(block::Height, Arc<Block>, usize)>),
 
+    /// Response to [`ReadRequest::RawBlocksByHeightRange`], with each block's
+    /// raw Zcash consensus serialization.
+    #[cfg(feature = "indexer")]
+    RawBlocks(Vec<(block::Height, Vec<u8>)>),
+
     /// The response to a `UnspentBestChainUtxo` request, from verified blocks in the
     /// _best_ non-finalized chain, or the finalized chain.
     UnspentBestChainUtxo(Option<transparent::Utxo>),
@@ -683,7 +688,9 @@ impl TryFrom<ReadResponse> for Response {
             }
 
             #[cfg(feature = "indexer")]
-            ReadResponse::TransactionId(_) => Err("there is no corresponding Response for this ReadResponse"),
+            ReadResponse::TransactionId(_) | ReadResponse::RawBlocks(_) => {
+                Err("there is no corresponding Response for this ReadResponse")
+            }
 
             ReadResponse::ValidBlockProposal => Ok(Response::ValidBlockProposal),
 

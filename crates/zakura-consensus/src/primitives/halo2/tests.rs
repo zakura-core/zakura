@@ -692,6 +692,106 @@ async fn cache_evicts_in_insertion_order_and_stays_correct_when_full() {
     assert_eq!(inner.calls(), 4, "an evicted entry must be re-verified");
 }
 
+/// Clones of a cache answer from the same set of verified proofs.
+///
+/// Production never calls a global verifier directly: [`super::verifier_for`] hands out a
+/// `&'static` handle and every request goes through a fresh `.clone()` of it. A cache that lived
+/// in the handle rather than behind the shared `Arc` would be empty for every request, so this
+/// pins the sharing that makes the cache reachable at all.
+#[tokio::test]
+async fn cache_is_shared_between_clones() {
+    let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+    let item = Item::new(bundle, sighash);
+
+    let inner = CountingVerifier::new(true);
+    let verifier = Cached::new(inner.clone(), 8);
+
+    let mut warming_clone = verifier.clone();
+    verify_through(&mut warming_clone, item.clone()).await;
+    assert_eq!(inner.calls(), 1, "the first verification must be a miss");
+
+    let mut reading_clone = verifier.clone();
+    verify_through(&mut reading_clone, item).await;
+    assert_eq!(
+        inner.calls(),
+        1,
+        "a clone must answer from the result another clone recorded"
+    );
+}
+
+/// An inner service that never returns a result, standing in for a verification in flight.
+#[derive(Clone)]
+struct PendingVerifier {
+    calls: Arc<AtomicUsize>,
+}
+
+impl PendingVerifier {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl Service<Item> for PendingVerifier {
+    type Response = ();
+    type Error = BoxError;
+    type Future = future::Pending<Result<(), BoxError>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _item: Item) -> Self::Future {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        future::pending()
+    }
+}
+
+/// A verification that is cancelled before it returns is not remembered.
+///
+/// The cache records a key from inside the response future, so dropping that future has to leave
+/// the cache untouched. Recording on the way in would remember a proof that was never checked:
+/// callers drop these futures routinely, because a block or mempool verification abandons its
+/// remaining checks as soon as one of them fails.
+#[tokio::test]
+async fn cancelling_a_verification_does_not_populate_the_cache() {
+    let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+    let item = Item::new(bundle, sighash);
+
+    let hanging = PendingVerifier::new();
+    let mut verifier = Cached::new(hanging.clone(), 8);
+
+    // Start a verification and drop it before the inner service can answer.
+    let in_flight = verifier
+        .ready()
+        .await
+        .expect("the cache must become ready")
+        .call(item.clone());
+    tokio::time::timeout(Duration::from_millis(50), in_flight)
+        .await
+        .expect_err("the inner service never returns, so the verification cannot complete");
+    assert_eq!(
+        hanging.calls(),
+        1,
+        "the cancelled verification must have reached the inner service"
+    );
+
+    // Retrying must verify again rather than read an entry the cancelled call never earned.
+    let mut verifier = verifier.with_inner(CountingVerifier::new(true));
+    let counting = verifier.inner().clone();
+    verify_through(&mut verifier, item).await;
+    assert_eq!(
+        counting.calls(),
+        1,
+        "a cancelled verification must not be remembered as a success"
+    );
+}
+
 /// An inner service whose readiness always fails, standing in for a dead batch worker.
 ///
 /// `Batch::poll_ready` reports an error when its worker has exited, panicked, or closed its

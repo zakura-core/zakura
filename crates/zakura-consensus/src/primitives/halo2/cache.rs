@@ -111,6 +111,12 @@ pub struct Cached<S> {
 
     /// The keys of items that have already verified under this era's key.
     verified: Arc<Mutex<VerifiedProofs>>,
+
+    /// The keys of the items that reached the inner service, in call order.
+    ///
+    /// Test-only. See [`Self::inner_calls_for`].
+    #[cfg(test)]
+    inner_calls: Arc<Mutex<Vec<CacheKey>>>,
 }
 
 impl<S: Clone> Clone for Cached<S> {
@@ -118,6 +124,8 @@ impl<S: Clone> Clone for Cached<S> {
         Self {
             inner: self.inner.clone(),
             verified: self.verified.clone(),
+            #[cfg(test)]
+            inner_calls: self.inner_calls.clone(),
         }
     }
 }
@@ -128,12 +136,34 @@ impl<S> Cached<S> {
         Self {
             inner,
             verified: Arc::new(Mutex::new(VerifiedProofs::new(capacity))),
+            #[cfg(test)]
+            inner_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     /// Returns the wrapped verification service.
     pub fn inner(&self) -> &S {
         &self.inner
+    }
+
+    /// Returns how many times an item equivalent to `item` has reached the inner service.
+    ///
+    /// Test-only. It counts one item rather than all calls because the global verifiers are shared
+    /// by every test in the process, so a plain call counter would also see verifications a test
+    /// did not make. Counting one transaction's own item isolates a test from the rest.
+    ///
+    /// Readiness failures are not counted: an item that never reached the inner service was never
+    /// verified by it.
+    #[cfg(test)]
+    pub(crate) fn inner_calls_for(&self, item: &Item) -> usize {
+        let key = item.cache_key();
+
+        self.inner_calls
+            .lock()
+            .expect("inner call record mutex should not be poisoned")
+            .iter()
+            .filter(|called| **called == key)
+            .count()
     }
 
     /// Returns a cache sharing this one's remembered keys, but consulting `inner` on a miss.
@@ -146,6 +176,7 @@ impl<S> Cached<S> {
         Cached {
             inner,
             verified: self.verified.clone(),
+            inner_calls: self.inner_calls.clone(),
         }
     }
 }
@@ -197,11 +228,22 @@ where
         let verified = self.verified.clone();
         let mut inner = self.inner.clone();
 
+        #[cfg(test)]
+        let inner_calls = self.inner_calls.clone();
+
         async move {
             // Readiness is acquired here rather than in `poll_ready` so that only misses reserve
             // inner capacity. See `poll_ready`.
             let result = match inner.ready().await {
-                Ok(inner) => inner.call(item).await,
+                Ok(inner) => {
+                    #[cfg(test)]
+                    inner_calls
+                        .lock()
+                        .expect("inner call record mutex should not be poisoned")
+                        .push(key);
+
+                    inner.call(item).await
+                }
                 Err(error) => Err(error),
             };
 

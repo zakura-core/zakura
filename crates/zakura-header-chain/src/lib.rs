@@ -41,9 +41,7 @@ pub use node::{
     BodyRuleId, BodyUnavailableSummary, BodyValidationState, DurableNodeError, EligibilityReason,
     EligibilityState, HeaderNode, HeaderValidationState,
 };
-pub use ownership::{
-    CompletionDecision, CompletionGate, CompletionOwner, PendingOwners, StaleReason,
-};
+pub use ownership::{CompletionDecision, CompletionOwner, Gate, PendingOwners, StaleReason};
 pub use transition::*;
 pub use validation::{
     infer_height, prepare_context_free_headers, prepare_headers, validate_commitment_structure,

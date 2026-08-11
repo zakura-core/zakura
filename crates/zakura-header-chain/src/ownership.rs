@@ -181,9 +181,9 @@ impl PendingOwners<HeaderSyncWorkOwner> {
 
 /// Sole pure decision point used before any completion effect.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct CompletionGate;
+pub struct Gate;
 
-impl CompletionGate {
+impl Gate {
     /// Compare one structurally registered attempt with its completion.
     pub fn check_registered<O: CompletionOwner>(
         current: &EngineSnapshot,
@@ -295,7 +295,7 @@ mod tests {
         source: SourceId,
         owner: &BodyWorkOwner,
     ) -> (CompletionDecision, NoEffectsProbe) {
-        let decision = CompletionGate::check(current, pending, source, owner);
+        let decision = Gate::check(current, pending, source, owner);
         let mut probe = NoEffectsProbe::default();
         if decision == CompletionDecision::Current {
             probe.frontier_writes += 1;
@@ -318,32 +318,32 @@ mod tests {
         let mut pending = PendingOwners::default();
         assert_eq!(pending.insert(source, expected), None);
         assert_eq!(
-            CompletionGate::check(&current, &pending, source, &expected),
+            Gate::check(&current, &pending, source, &expected),
             CompletionDecision::Current
         );
 
         let mut changed = current.clone();
         changed.state_version = StateVersion::new(10);
         assert_eq!(
-            CompletionGate::check(&changed, &pending, source, &expected),
+            Gate::check(&changed, &pending, source, &expected),
             CompletionDecision::Current
         );
         changed = current.clone();
         changed.header_generation = HeaderGeneration::new(10);
         assert_eq!(
-            CompletionGate::check(&changed, &pending, source, &expected),
+            Gate::check(&changed, &pending, source, &expected),
             CompletionDecision::Stale(StaleReason::HeaderGeneration)
         );
         changed = current.clone();
         changed.verified_generation = VerifiedGeneration::new(10);
         assert_eq!(
-            CompletionGate::check(&changed, &pending, source, &expected),
+            Gate::check(&changed, &pending, source, &expected),
             CompletionDecision::Stale(StaleReason::VerifiedGeneration)
         );
         changed = current.clone();
         changed.frontiers.finalized.hash = block::Hash([4; 32]);
         assert_eq!(
-            CompletionGate::check(&changed, &pending, source, &expected),
+            Gate::check(&changed, &pending, source, &expected),
             CompletionDecision::Stale(StaleReason::BranchAnchor)
         );
 
@@ -351,12 +351,12 @@ mod tests {
         contradictory.session_id = 99;
         pending.insert(source, contradictory);
         assert_eq!(
-            CompletionGate::check(&current, &pending, source, &expected),
+            Gate::check(&current, &pending, source, &expected),
             CompletionDecision::Stale(StaleReason::OwnerMismatch)
         );
         pending.remove(source, expected.request_id);
         assert_eq!(
-            CompletionGate::check(&current, &pending, source, &expected),
+            Gate::check(&current, &pending, source, &expected),
             CompletionDecision::Stale(StaleReason::MissingOwner)
         );
     }

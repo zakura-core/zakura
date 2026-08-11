@@ -9,10 +9,11 @@
 //! removed it as a security fix (PR #10494). Transaction validity depends on height, block time
 //! and spent outputs, and that cache's key named none of them.
 //!
-//! This cache holds `verify(bundle, sighash, vk)`, a pure function of its key. A hit still runs
-//! the whole transaction verifier against the block's height, time and spent outputs, and skips
-//! only the proof check. [`Item::cache_key`] commits to `bundle` and `sighash`; each Orchard
-//! circuit era has its own cache, which commits to `vk` (see [`super::verifier_for`]).
+//! This cache remembers successful bundle verification by witnessed transaction
+//! ID and value pool. A hit still runs the whole transaction verifier against
+//! the block's height, time and spent outputs, and skips only the proof and
+//! signature checks. Each Orchard circuit era has its own cache, which binds an
+//! entry to its verifying key (see [`super::verifier_for`]).
 //!
 //! Only `Ok` results are cached. A batch error is not per-item evidence, because
 //! [`Fallback`](tower_fallback::Fallback) re-verifies failures singly, and it may not be a verdict
@@ -147,7 +148,9 @@ impl<S> Cached<S> {
     /// verified by it.
     #[cfg(test)]
     pub(super) fn inner_calls_for(&self, item: &Item) -> usize {
-        let key = item.cache_key();
+        let Some(key) = item.cache_key() else {
+            return 0;
+        };
 
         self.inner_calls
             .lock()
@@ -201,17 +204,19 @@ where
     }
 
     fn call(&mut self, item: Item) -> Self::Future {
-        // Derived once here, outside `Fallback`, which clones every request eagerly.
+        // Copied once here, outside `Fallback`, which clones every request eagerly.
         let key = item.cache_key();
 
-        if self
-            .verified
-            .lock()
-            .expect("verified proof cache mutex should not be poisoned")
-            .contains(&key)
-        {
-            metrics::counter!("zakura.consensus.halo2.cache.hit").increment(1);
-            return future::ready(Ok(())).boxed();
+        if let Some(key) = key {
+            if self
+                .verified
+                .lock()
+                .expect("verified proof cache mutex should not be poisoned")
+                .contains(&key)
+            {
+                metrics::counter!("zakura.consensus.halo2.cache.hit").increment(1);
+                return future::ready(Ok(())).boxed();
+            }
         }
 
         metrics::counter!("zakura.consensus.halo2.cache.miss").increment(1);
@@ -228,10 +233,12 @@ where
             let result = match inner.ready().await {
                 Ok(inner) => {
                     #[cfg(test)]
-                    inner_calls
-                        .lock()
-                        .expect("inner call record mutex should not be poisoned")
-                        .push(key);
+                    if let Some(key) = key {
+                        inner_calls
+                            .lock()
+                            .expect("inner call record mutex should not be poisoned")
+                            .push(key);
+                    }
 
                     inner.call(item).await
                 }
@@ -239,7 +246,7 @@ where
             };
 
             // Only successes are recorded: see the module docs.
-            if result.is_ok() {
+            if let (Ok(()), Some(key)) = (&result, key) {
                 verified
                     .lock()
                     .expect("verified proof cache mutex should not be poisoned")

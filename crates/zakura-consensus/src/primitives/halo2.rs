@@ -12,13 +12,15 @@ use std::{
 use futures::{future::BoxFuture, FutureExt};
 use once_cell::sync::Lazy;
 use orchard::{
-    bundle::{BatchError, BatchValidator, BundleVersion},
+    bundle::{BatchError, BatchValidator},
     circuit::{OrchardCircuitVersion, VerifyingKey},
-    ProtocolVersion, ValuePool,
+    ValuePool,
 };
 use rand::thread_rng;
-use zakura_chain::{parameters::NetworkUpgrade, transaction::SigHash};
-use zcash_primitives::transaction::components::orchard::write_v5_bundle;
+use zakura_chain::{
+    parameters::NetworkUpgrade,
+    transaction::{SigHash, WtxId},
+};
 use zcash_protocol::value::ZatBalance;
 
 use crate::{error::TransactionError, BoxError};
@@ -49,15 +51,27 @@ const HALO2_MAX_BATCH_SIZE: usize = super::MAX_BATCH_SIZE;
 
 /// The number of verified-proof keys retained per Orchard circuit era.
 ///
-/// Sized to hold several blocks of history plus a full mempool, so that a transaction gossiped
-/// well before the block that mines it is still remembered. At 32-byte keys this is on the order
-/// of a megabyte per era.
+/// Sized to hold several blocks of history plus a full mempool, so that a
+/// transaction gossiped well before the block that mines it is still
+/// remembered. The witnessed transaction ID and pool tag use about 1.3 MB per
+/// era before collection overhead.
 const CACHE_CAPACITY: usize = 20_000;
 
-/// A key that determines every input to one [`Item`]'s proof verification.
+/// A witnessed transaction and value pool whose Halo2 bundle has verified.
 ///
-/// See [`Item::cache_key`] for the construction and for why completeness matters.
-type CacheKey = [u8; 32];
+/// [`WtxId`] contains both the transaction ID, which commits to the bundle's
+/// effecting data, and the authorizing-data digest, which commits to its proof
+/// and signatures. The pool distinguishes the Orchard and Ironwood bundles in
+/// a v6 transaction, because they share one [`WtxId`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct CacheKey {
+    /// The witnessed transaction ID containing the txid and authorizing-data
+    /// digest.
+    wtx_id: WtxId,
+
+    /// The bundle slot verified for this transaction.
+    pool: ValuePool,
+}
 
 /// The type of verification results.
 type VerifyResult = bool;
@@ -68,12 +82,6 @@ type Sender = watch::Sender<Option<VerifyResult>>;
 /// The type of a prepared verifying key.
 /// This is the key used to verify individual items.
 pub type ItemVerifyingKey = VerifyingKey;
-
-/// The BLAKE2b personalization for [`Item`] cache keys.
-///
-/// Domain-separates these keys from every other BLAKE2b-256 hash in the protocol, so that a
-/// cache key can never be confused with a txid, an auth digest, or a sighash.
-const HALO2_CACHE_PERSONALIZATION: &[u8; 16] = b"ZakuraHalo2Cache";
 
 // The Orchard Action circuit, and therefore its verifying key, changes across protocol eras.
 // A proof produced under one circuit version does not verify under the other keys. So we keep
@@ -132,9 +140,10 @@ lazy_static::lazy_static! {
 
 /// A Halo2 verification item, used as the request type of the service.
 ///
-/// An [`Item`] is key-agnostic: it carries only the bundle and sighash. The verifying key (pre-
-/// vs post-NU6.2) is supplied by whichever [`Verifier`] processes the item, so an item is always
-/// validated against exactly one key and eras are never mixed within a batch.
+/// The verifying key (pre- vs post-NU6.2) is supplied by whichever [`Verifier`]
+/// processes the item, so an item is always validated against exactly one key
+/// and eras are never mixed within a batch. Production items also carry a
+/// cache key derived from their transaction's [`WtxId`] and bundle pool.
 #[derive(Clone, Debug)]
 pub struct Item {
     // `Arc`-wrapped so cloning an `Item` — which `tower-fallback` does eagerly for every request —
@@ -142,6 +151,7 @@ pub struct Item {
     // needs `&Bundle`.
     bundle: Arc<orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>>,
     sighash: SigHash,
+    cache_key: Option<CacheKey>,
 }
 
 impl RequestWeight for Item {
@@ -152,6 +162,10 @@ impl RequestWeight for Item {
 
 impl Item {
     /// Creates a new [`Item`] from a bundle and sighash.
+    ///
+    /// Items constructed without their transaction's [`WtxId`] are verified
+    /// normally but are not cached. The transaction verifier uses
+    /// [`Self::new_with_wtx_id`] so its items can reuse successful results.
     pub fn new(
         bundle: orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>,
         sighash: SigHash,
@@ -159,6 +173,23 @@ impl Item {
         Self {
             bundle: Arc::new(bundle),
             sighash,
+            cache_key: None,
+        }
+    }
+
+    /// Creates a cacheable item using its already-computed witnessed
+    /// transaction ID.
+    pub(crate) fn new_with_wtx_id(
+        bundle: orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>,
+        sighash: SigHash,
+        wtx_id: WtxId,
+    ) -> Self {
+        let pool = bundle.bundle_version().value_pool();
+
+        Self {
+            bundle: Arc::new(bundle),
+            sighash,
+            cache_key: Some(CacheKey { wtx_id, pool }),
         }
     }
 
@@ -175,70 +206,21 @@ impl Item {
         batch.validate(thread_rng())
     }
 
-    /// Returns a key that determines every input to this item's proof verification.
+    /// Returns this item's cache key, if it was constructed with a witnessed
+    /// transaction ID.
     ///
-    /// [`Cached`] reuses a previous `Ok` result whenever this key matches, so the key must commit
-    /// to everything [`BatchValidator::add_bundle`] reads. The bundle's consensus encoding is
-    /// injective, so hashing it commits to the whole bundle. The verifying key is absent on
-    /// purpose: each Orchard circuit era has its own cache, so an entry is only read back under
-    /// the key it was written against (see [`verifier_for`]).
+    /// [`WtxId`] commits to the transaction's effecting and authorizing data.
+    /// The pool selects one of the two possible v6 bundles. The verifying key is
+    /// absent on purpose: each Orchard circuit era has its own cache, so an
+    /// entry is only read back under the key it was written against (see
+    /// [`verifier_for`]).
     ///
-    /// Do not derive this key by hand. The txid does not commit to authorizing data under ZIP 244
-    /// (CVE-2026-34377), and `(auth digest, sighash)` is also incomplete: the Orchard and Ironwood
-    /// bundles of one v6 transaction share both.
-    fn cache_key(&self) -> CacheKey {
-        // Destructured exhaustively on purpose: adding a field to `Item` is a compile error here
-        // until someone decides whether it belongs in the key.
-        let Item { bundle, sighash } = self;
-
-        let mut hasher = blake2b_simd::Params::new()
-            .hash_length(32)
-            .personal(HALO2_CACHE_PERSONALIZATION)
-            .to_state();
-
-        hasher.update(&[bundle_version_discriminant(bundle.bundle_version())]);
-        hasher.update(&sighash.0);
-
-        // A total encoder is required, because `cache_key` cannot fail. `write_v5_bundle` and
-        // `write_v6_bundle` both delegate to one private `write_bundle`, differing only in v6's
-        // precondition on the bundle version, so v5 encodes every version — including Ironwood's,
-        // outside its documented v5 contract — and the choice cannot change the bytes.
-        let mut encoded = Vec::new();
-        write_v5_bundle(Some(bundle.as_ref()), &mut encoded)
-            .expect("encoding a bundle into a Vec cannot fail: the encoder only reports IO errors");
-        hasher.update(&encoded);
-
-        hasher
-            .finalize()
-            .as_bytes()
-            .try_into()
-            .expect("hash_length(32) produces exactly 32 bytes")
+    /// The txid alone is insufficient because it excludes authorizing data
+    /// under ZIP 244 (CVE-2026-34377). The pool is also required because both
+    /// bundles in a v6 transaction share the same [`WtxId`].
+    fn cache_key(&self) -> Option<CacheKey> {
+        self.cache_key
     }
-}
-
-/// Returns a stable one-byte discriminant for `version`.
-///
-/// A bundle's consensus encoding contains its flag byte but not its [`BundleVersion`], and two
-/// bundles in different value pools can share a flag byte, so [`Item::cache_key`] commits to the
-/// value pool and protocol version separately. Today the pool affects verification only through
-/// the flags, but the bundle version already selects other version-dependent behaviour in the
-/// `orchard` crate, and one byte removes the need to re-check that on every dependency bump.
-///
-/// Both matches are exhaustive: a new value pool or protocol version is a compile error here
-/// until it is given a discriminant on purpose.
-fn bundle_version_discriminant(version: BundleVersion) -> u8 {
-    let pool = match version.value_pool() {
-        ValuePool::Orchard => 0x00,
-        ValuePool::Ironwood => 0x10,
-    };
-
-    let protocol = match version.protocol_version() {
-        ProtocolVersion::InsecureV1 => 0x00,
-        ProtocolVersion::V2 => 0x01,
-        ProtocolVersion::V3 => 0x02,
-    };
-
-    pool | protocol
 }
 
 trait QueueBatchVerify {
@@ -246,7 +228,12 @@ trait QueueBatchVerify {
 }
 
 impl QueueBatchVerify for BatchValidator<'_> {
-    fn queue(&mut self, Item { bundle, sighash }: Item) -> Result<(), BatchError> {
+    fn queue(
+        &mut self,
+        Item {
+            bundle, sighash, ..
+        }: Item,
+    ) -> Result<(), BatchError> {
         self.add_bundle(bundle.as_ref(), sighash.0)
     }
 }

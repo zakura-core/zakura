@@ -430,6 +430,10 @@ where
 
         let tx = req.transaction();
         let tx_id = req.tx_id();
+        let wtx_id = match tx_id {
+            UnminedTxId::Witnessed(wtx_id) => Some(wtx_id),
+            UnminedTxId::Legacy(_) => None,
+        };
         let span = tracing::debug_span!("tx", ?tx_id);
 
         async move {
@@ -597,6 +601,7 @@ where
                     &network,
                     script_verifier,
                     cached_ffi_transaction.clone(),
+                    wtx_id.expect("a v5 transaction has a witnessed transaction ID"),
                 )?,
                 Transaction::V6 {
                     ..
@@ -605,6 +610,7 @@ where
                     &network,
                     script_verifier,
                     cached_ffi_transaction.clone(),
+                    wtx_id.expect("a v6 transaction has a witnessed transaction ID"),
                 )?,
             };
 
@@ -1009,6 +1015,7 @@ where
         network: &Network,
         script_verifier: script::Verifier,
         cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        wtx_id: transaction::WtxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
         let nu = request.upgrade(network);
@@ -1028,7 +1035,12 @@ where
             cached_ffi_transaction,
         )?
         .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
-        .and(Self::verify_orchard_bundle(orchard_bundle, &sighash, nu)))
+        .and(Self::verify_orchard_bundle(
+            orchard_bundle,
+            &sighash,
+            nu,
+            wtx_id,
+        )))
     }
 
     /// Verifies if a V5 `transaction` is supported by `network_upgrade`.
@@ -1079,6 +1091,7 @@ where
         network: &Network,
         script_verifier: script::Verifier,
         cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        wtx_id: transaction::WtxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
         let nu = request.upgrade(network);
@@ -1099,8 +1112,18 @@ where
             cached_ffi_transaction,
         )?
         .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
-        .and(Self::verify_orchard_bundle(orchard_bundle, &sighash, nu))
-        .and(Self::verify_orchard_bundle(ironwood_bundle, &sighash, nu)))
+        .and(Self::verify_orchard_bundle(
+            orchard_bundle,
+            &sighash,
+            nu,
+            wtx_id,
+        ))
+        .and(Self::verify_orchard_bundle(
+            ironwood_bundle,
+            &sighash,
+            nu,
+            wtx_id,
+        )))
     }
 
     /// Verifies if a V6 `transaction` is supported by `network_upgrade`.
@@ -1302,6 +1325,7 @@ where
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,
         network_upgrade: NetworkUpgrade,
+        wtx_id: transaction::WtxId,
     ) -> AsyncChecks {
         let mut async_checks = AsyncChecks::new();
 
@@ -1326,7 +1350,9 @@ where
             async_checks.push(
                 primitives::halo2::verifier_for(network_upgrade)
                     .clone()
-                    .oneshot(primitives::halo2::Item::new(bundle, *sighash)),
+                    .oneshot(primitives::halo2::Item::new_with_wtx_id(
+                        bundle, *sighash, wtx_id,
+                    )),
             );
         }
 

@@ -33,7 +33,7 @@ use zakura_chain::{
     parameters::NetworkUpgrade,
     primitives::Halo2Proof,
     serialization::ZcashDeserializeInto,
-    transaction::{HashType, SigHash, Transaction},
+    transaction::{AuthDigest, Hash, HashType, SigHash, Transaction, WtxId},
     transparent,
 };
 use zcash_protocol::value::ZatBalance;
@@ -41,9 +41,9 @@ use zcash_protocol::value::ZatBalance;
 use crate::{error::TransactionError, BoxError};
 
 use super::{
-    bundle_version_discriminant, lazy_verifier_for, BatchFallbackService, CacheKey, Cached, Item,
-    ItemVerifyingKey, OrchardFallback, Verifier, VERIFIER_NU6_2, VERIFIER_NU6_3_ONWARD,
-    VERIFIER_PRE_NU6_2, VERIFYING_KEY_NU6_2, VERIFYING_KEY_NU6_3_ONWARD, VERIFYING_KEY_PRE_NU6_2,
+    lazy_verifier_for, BatchFallbackService, CacheKey, Cached, Item, ItemVerifyingKey,
+    OrchardFallback, Verifier, VERIFIER_NU6_2, VERIFIER_NU6_3_ONWARD, VERIFIER_PRE_NU6_2,
+    VERIFYING_KEY_NU6_2, VERIFYING_KEY_NU6_3_ONWARD, VERIFYING_KEY_PRE_NU6_2,
 };
 
 const EXPLICIT_FLUSH_TEST_MAX_BATCH_WEIGHT: usize = 10_000;
@@ -273,24 +273,42 @@ async fn explicit_flush_rejects_single_proof_under_each_wrong_era_key() {
 
 // Cache key completeness.
 //
-// [`Cached`] reuses a previous `Ok` for any item whose key matches, so a key that misses one of
-// verification's inputs is a consensus bug: it would accept a proof that was never checked. These
-// tests pin every input down.
+// [`Cached`] reuses a previous `Ok` for any item whose key matches, so the key
+// must uniquely identify the transaction and its bundle slot.
 
-/// Returns the cache key of `bundle` under `sighash`.
-fn cache_key(bundle: &Bundle<Authorized, ZatBalance>, sighash: SigHash) -> CacheKey {
-    Item::new(bundle.clone(), sighash).cache_key()
+/// Returns a deterministic witnessed transaction ID for cache behaviour tests.
+fn test_wtx_id(tag: u8) -> WtxId {
+    WtxId {
+        id: Hash([tag; 32]),
+        auth_digest: AuthDigest([tag.wrapping_add(1); 32]),
+    }
 }
 
-/// Returns `tx` with `mutate` applied to its Orchard shielded data, along with the resulting
-/// bundle and sighash.
+/// Returns a cacheable verification item.
+fn cacheable_item(
+    bundle: &Bundle<Authorized, ZatBalance>,
+    sighash: SigHash,
+    wtx_id: WtxId,
+) -> Item {
+    Item::new_with_wtx_id(bundle.clone(), sighash, wtx_id)
+}
+
+/// Returns the cache key for `bundle`'s pool in `wtx_id`.
+fn cache_key(bundle: &Bundle<Authorized, ZatBalance>, sighash: SigHash, wtx_id: WtxId) -> CacheKey {
+    cacheable_item(bundle, sighash, wtx_id)
+        .cache_key()
+        .expect("an item constructed with a wtxid is cacheable")
+}
+
+/// Returns `tx` with `mutate` applied to its Orchard authorizing data.
 ///
-/// The mutations below all change *authorizing* data only, which under ZIP 244 leaves the txid
-/// untouched. That is the shape of CVE-2026-34377: a key derived from the txid would collide here.
-fn mutated_bundle_and_sighash(
+/// These mutations leave the txid unchanged but change the authorizing-data
+/// digest in its [`WtxId`]. That is the shape of CVE-2026-34377: a key derived
+/// from the txid alone would collide here.
+fn mutated_transaction(
     tx: &Transaction,
     mutate: impl FnOnce(&mut zakura_chain::orchard::ShieldedData),
-) -> (Bundle<Authorized, ZatBalance>, SigHash) {
+) -> Transaction {
     let mut mutated = tx.clone();
     mutate(
         mutated
@@ -304,38 +322,46 @@ fn mutated_bundle_and_sighash(
         "mutating authorizing data must leave the txid unchanged, or this test proves nothing"
     );
 
-    bundle_and_sighash(&mutated).expect("a mutated Orchard transaction still has a bundle")
+    mutated
 }
 
 #[test]
 fn cache_key_is_deterministic() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+    let wtx_id = test_wtx_id(1);
 
     assert_eq!(
-        cache_key(&bundle, sighash),
-        cache_key(&bundle, sighash),
-        "the same bundle and sighash must always produce the same key"
+        cache_key(&bundle, sighash, wtx_id),
+        cache_key(&bundle, sighash, wtx_id),
+        "the same wtxid and pool must always produce the same key"
     );
 }
 
 #[test]
-fn cache_key_changes_with_the_sighash() {
+fn cache_key_commits_to_the_txid_and_authorizing_data() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+    let original_wtx_id = test_wtx_id(1);
+    let original = cache_key(&bundle, sighash, original_wtx_id);
 
-    let mut other_sighash = sighash;
-    other_sighash.0[0] ^= 1;
-
+    let mut different_txid = original_wtx_id;
+    different_txid.id.0[0] ^= 1;
     assert_ne!(
-        cache_key(&bundle, sighash),
-        cache_key(&bundle, other_sighash),
-        "the sighash is an input to verification, so it must be an input to the key"
+        original,
+        cache_key(&bundle, sighash, different_txid),
+        "the transaction ID must be part of the cache key"
+    );
+
+    let mut different_authorizing_data = original_wtx_id;
+    different_authorizing_data.auth_digest.0[0] ^= 1;
+    assert_ne!(
+        original,
+        cache_key(&bundle, sighash, different_authorizing_data),
+        "the authorizing-data digest must be part of the cache key"
     );
 }
 
-/// Every piece of authorizing data that verification reads changes the key.
-///
-/// This is the direct unit-level analogue of `block_with_garbage_orchard_proofs_is_rejected`:
-/// those are exactly the fields that CVE-2026-34377 substituted while keeping the txid fixed.
+/// Every piece of authorizing data verified in the Halo2 batch changes the
+/// witnessed transaction ID, and therefore the cache key.
 #[test]
 fn cache_key_changes_with_every_piece_of_authorizing_data() {
     let tx = pre_nu6_2_transactions()
@@ -343,82 +369,34 @@ fn cache_key_changes_with_every_piece_of_authorizing_data() {
         .next()
         .expect("there is at least one pre-NU6.2 Orchard transaction");
     let (bundle, sighash) = bundle_and_sighash(&tx).expect("the transaction has a bundle");
-    let original = cache_key(&bundle, sighash);
+    let original = cache_key(&bundle, sighash, WtxId::from(&tx));
 
-    let (garbage_proof, garbage_proof_sighash) = mutated_bundle_and_sighash(&tx, |data| {
-        data.proof = Halo2Proof(vec![0xDE, 0xAD, 0xBE, 0xEF]);
-    });
-    assert_ne!(
-        original,
-        cache_key(&garbage_proof, garbage_proof_sighash),
-        "the proof is what is being verified, so it must be an input to the key"
-    );
-
-    let (garbage_binding_sig, garbage_binding_sig_sighash) =
-        mutated_bundle_and_sighash(&tx, |data| {
+    for (name, mutate) in [
+        (
+            "Halo2 proof",
+            (|data: &mut zakura_chain::orchard::ShieldedData| {
+                data.proof = Halo2Proof(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            }) as fn(&mut zakura_chain::orchard::ShieldedData),
+        ),
+        ("binding signature", |data| {
             data.binding_sig = [0xFF; 64].into();
-        });
-    assert_ne!(
-        original,
-        cache_key(&garbage_binding_sig, garbage_binding_sig_sighash),
-        "the binding signature is batch-verified alongside the proof, so it must be in the key"
-    );
-
-    let (garbage_spend_auth_sigs, garbage_spend_auth_sigs_sighash) =
-        mutated_bundle_and_sighash(&tx, |data| {
+        }),
+        ("spend authorization signatures", |data| {
             for action in data.actions.iter_mut() {
                 action.spend_auth_sig = [0xFF; 64].into();
             }
-        });
-    assert_ne!(
-        original,
-        cache_key(&garbage_spend_auth_sigs, garbage_spend_auth_sigs_sighash),
-        "spend authorization signatures are batch-verified too, so they must be in the key"
-    );
-}
+        }),
+    ] {
+        let mutated = mutated_transaction(&tx, mutate);
+        let (mutated_bundle, mutated_sighash) =
+            bundle_and_sighash(&mutated).expect("the mutated transaction still has a bundle");
 
-/// Two different bundles that share a sighash get different keys.
-///
-/// This is the regression test for the collision that a `(auth digest, sighash)` key would have:
-/// a v6 transaction verifies its Orchard bundle and its Ironwood bundle against the same sighash
-/// under the same network upgrade, so those two would have shared a key and the first result
-/// would have been returned for the second bundle. Hashing the bundle's own encoding means only
-/// byte-identical bundles can share a key, and byte-identical bundles verify identically.
-#[test]
-fn cache_key_distinguishes_different_bundles_with_the_same_sighash() {
-    let transactions = pre_nu6_2_transactions();
-    let mut keys = Vec::new();
-    let mut bundles = Vec::new();
-
-    // One arbitrary sighash, shared by every bundle, so that only the bundle can distinguish them.
-    let (_, shared_sighash) =
-        bundle_and_sighash(&transactions[0]).expect("the transaction has a bundle");
-
-    for tx in &transactions {
-        let (bundle, _) = bundle_and_sighash(tx).expect("the transaction has a bundle");
-
-        if bundles
-            .iter()
-            .any(|seen| format!("{seen:?}") == format!("{bundle:?}"))
-        {
-            continue;
-        }
-
-        keys.push(cache_key(&bundle, shared_sighash));
-        bundles.push(bundle);
+        assert_ne!(
+            original,
+            cache_key(&mutated_bundle, mutated_sighash, WtxId::from(&mutated)),
+            "mutating the {name} must change the cache key"
+        );
     }
-
-    assert!(
-        bundles.len() > 1,
-        "this test needs at least two distinct Orchard bundles in the test vectors"
-    );
-
-    let unique: std::collections::HashSet<_> = keys.iter().collect();
-    assert_eq!(
-        unique.len(),
-        keys.len(),
-        "distinct bundles sharing a sighash must not share a cache key"
-    );
 }
 
 /// Returns `bundle`'s parts rebuilt under `flags` and `version`.
@@ -452,6 +430,7 @@ fn rebuilt_as(
 #[test]
 fn cache_key_distinguishes_the_orchard_and_ironwood_pools() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+    let wtx_id = test_wtx_id(1);
 
     // Cross-address transfers are disallowed in the NU6.3 Orchard pool and optional in Ironwood,
     // so this is the one flag set both pools can encode — and they encode it identically.
@@ -472,55 +451,9 @@ fn cache_key_distinguishes_the_orchard_and_ironwood_pools() {
         "this test is only meaningful if the two pools encode these flags identically"
     );
     assert_ne!(
-        cache_key(&orchard, sighash),
-        cache_key(&ironwood, sighash),
+        cache_key(&orchard, sighash, wtx_id),
+        cache_key(&ironwood, sighash, wtx_id),
         "the Orchard and Ironwood bundles of one transaction must not share a cache key"
-    );
-}
-
-/// The bundle version is committed to even when nothing else about the bundle changes.
-///
-/// The consensus encoding of a bundle contains its flag byte but not its [`BundleVersion`], and
-/// the same flags encode to the same byte in more than one version — so without the explicit
-/// discriminant these two bundles would hash identically.
-#[test]
-fn cache_key_changes_with_the_bundle_version() {
-    let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
-
-    let rebuilt = rebuilt_as(&bundle, *bundle.flags(), BundleVersion::orchard_v2());
-
-    assert_eq!(
-        bundle.flag_byte(),
-        rebuilt.flag_byte(),
-        "this test is only meaningful if the encoded flags are identical"
-    );
-    assert_ne!(
-        cache_key(&bundle, sighash),
-        cache_key(&rebuilt, sighash),
-        "the bundle version must be committed to separately from the encoding"
-    );
-}
-
-/// Every bundle version gets its own discriminant.
-#[test]
-fn bundle_version_discriminants_are_distinct() {
-    let versions = [
-        BundleVersion::orchard_insecure_v1(),
-        BundleVersion::orchard_v2(),
-        BundleVersion::orchard_v3(),
-        BundleVersion::ironwood_v3(),
-    ];
-
-    let discriminants: Vec<_> = versions
-        .into_iter()
-        .map(bundle_version_discriminant)
-        .collect();
-    let unique: std::collections::HashSet<_> = discriminants.iter().collect();
-
-    assert_eq!(
-        unique.len(),
-        versions.len(),
-        "each bundle version must have its own discriminant: {discriminants:?}"
     );
 }
 
@@ -577,7 +510,7 @@ async fn cache_skips_the_inner_service_for_an_already_verified_item() {
             .ready()
             .await
             .expect("the cache must become ready")
-            .call(Item::new(bundle.clone(), sighash))
+            .call(cacheable_item(&bundle, sighash, test_wtx_id(1)))
             .await
             .expect("a valid item must verify");
     }
@@ -590,20 +523,41 @@ async fn cache_skips_the_inner_service_for_an_already_verified_item() {
 }
 
 #[tokio::test]
-async fn cache_does_not_reuse_a_result_across_items() {
+async fn items_without_a_wtxid_are_not_cached() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
-    let mut other_sighash = sighash;
-    other_sighash.0[0] ^= 1;
-
     let inner = CountingVerifier::new(true);
     let mut verifier = Cached::new(inner.clone(), 8);
 
-    for sighash in [sighash, other_sighash] {
+    for _ in 0..2 {
         verifier
             .ready()
             .await
             .expect("the cache must become ready")
             .call(Item::new(bundle.clone(), sighash))
+            .await
+            .expect("an item without a wtxid must still verify");
+    }
+
+    assert_eq!(
+        inner.calls(),
+        2,
+        "an item without a wtxid must never inherit a cached result"
+    );
+}
+
+#[tokio::test]
+async fn cache_does_not_reuse_a_result_across_items() {
+    let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+
+    let inner = CountingVerifier::new(true);
+    let mut verifier = Cached::new(inner.clone(), 8);
+
+    for wtx_id in [test_wtx_id(1), test_wtx_id(2)] {
+        verifier
+            .ready()
+            .await
+            .expect("the cache must become ready")
+            .call(cacheable_item(&bundle, sighash, wtx_id))
             .await
             .expect("the inner service accepts everything in this test");
     }
@@ -631,7 +585,7 @@ async fn cache_does_not_remember_failures() {
             .ready()
             .await
             .expect("the cache must become ready")
-            .call(Item::new(bundle.clone(), sighash))
+            .call(cacheable_item(&bundle, sighash, test_wtx_id(1)))
             .await
             .expect_err("the inner service rejects everything in this test");
     }
@@ -664,16 +618,10 @@ async fn cache_evicts_in_insertion_order_and_stays_correct_when_full() {
     let inner = CountingVerifier::new(true);
     let mut verifier = Cached::new(inner.clone(), 2);
 
-    let sighashes: Vec<_> = (0..3)
-        .map(|i| {
-            let mut sighash = sighash;
-            sighash.0[0] ^= i + 1;
-            sighash
-        })
-        .collect();
+    let wtx_ids = [test_wtx_id(1), test_wtx_id(2), test_wtx_id(3)];
 
-    for sighash in &sighashes {
-        verify_through(&mut verifier, Item::new(bundle.clone(), *sighash)).await;
+    for wtx_id in &wtx_ids {
+        verify_through(&mut verifier, cacheable_item(&bundle, sighash, *wtx_id)).await;
     }
     assert_eq!(
         inner.calls(),
@@ -682,13 +630,13 @@ async fn cache_evicts_in_insertion_order_and_stays_correct_when_full() {
     );
 
     // The two most recent are still remembered.
-    for sighash in &sighashes[1..] {
-        verify_through(&mut verifier, Item::new(bundle.clone(), *sighash)).await;
+    for wtx_id in &wtx_ids[1..] {
+        verify_through(&mut verifier, cacheable_item(&bundle, sighash, *wtx_id)).await;
     }
     assert_eq!(inner.calls(), 3, "entries within the capacity must be kept");
 
     // The oldest was evicted, so it is verified again rather than silently mis-answered.
-    verify_through(&mut verifier, Item::new(bundle.clone(), sighashes[0])).await;
+    verify_through(&mut verifier, cacheable_item(&bundle, sighash, wtx_ids[0])).await;
     assert_eq!(inner.calls(), 4, "an evicted entry must be re-verified");
 }
 
@@ -701,7 +649,7 @@ async fn cache_evicts_in_insertion_order_and_stays_correct_when_full() {
 #[tokio::test]
 async fn cache_is_shared_between_clones() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
-    let item = Item::new(bundle, sighash);
+    let item = cacheable_item(&bundle, sighash, test_wtx_id(1));
 
     let inner = CountingVerifier::new(true);
     let verifier = Cached::new(inner.clone(), 8);
@@ -761,7 +709,7 @@ impl Service<Item> for PendingVerifier {
 #[tokio::test]
 async fn cancelling_a_verification_does_not_populate_the_cache() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
-    let item = Item::new(bundle, sighash);
+    let item = cacheable_item(&bundle, sighash, test_wtx_id(1));
 
     let hanging = PendingVerifier::new();
     let mut verifier = Cached::new(hanging.clone(), 8);
@@ -838,7 +786,7 @@ impl Service<Item> for UnreadyVerifier {
 #[tokio::test]
 async fn cache_hit_survives_an_inner_service_that_never_becomes_ready() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
-    let item = Item::new(bundle, sighash);
+    let item = cacheable_item(&bundle, sighash, test_wtx_id(1));
 
     // Warm the cache through a healthy inner service.
     let healthy = CountingVerifier::new(true);
@@ -880,7 +828,7 @@ async fn cache_miss_propagates_an_inner_readiness_failure() {
         .ready()
         .await
         .expect("the cache itself is always ready")
-        .call(Item::new(bundle.clone(), sighash))
+        .call(cacheable_item(&bundle, sighash, test_wtx_id(1)))
         .await
         .expect_err("a miss must surface the inner service's readiness failure");
 
@@ -892,7 +840,11 @@ async fn cache_miss_propagates_an_inner_readiness_failure() {
     // And the failure must not be remembered as a success.
     let mut verifier = verifier.with_inner(CountingVerifier::new(true));
     let counting = verifier.inner().clone();
-    verify_through(&mut verifier, Item::new(bundle, sighash)).await;
+    verify_through(
+        &mut verifier,
+        cacheable_item(&bundle, sighash, test_wtx_id(1)),
+    )
+    .await;
     assert_eq!(
         counting.calls(),
         1,

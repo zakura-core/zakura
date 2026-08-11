@@ -5952,7 +5952,11 @@ fn orchard_item(tx: &Transaction, network_upgrade: NetworkUpgrade) -> primitives
         .orchard_bundle()
         .expect("the transaction was selected for having an Orchard bundle");
 
-    primitives::halo2::Item::new(bundle, sighasher.sighash(HashType::ALL, None))
+    primitives::halo2::Item::new_with_wtx_id(
+        bundle,
+        sighasher.sighash(HashType::ALL, None),
+        tx.into(),
+    )
 }
 
 /// Builds a transaction verifier over mock state and mempool services, and returns the state.
@@ -6027,7 +6031,8 @@ fn block_request(tx: &Transaction, height: block::Height) -> Request {
 /// The first three change only authorizing data, which under ZIP 244 leaves the txid unchanged.
 /// That is the shape of CVE-2026-34377, and a cache keyed on the txid would answer all three with
 /// the valid transaction's result. The fourth is the one field of the four that lives outside the
-/// Orchard bundle: it changes the txid too, and reaches the cache key through the sighash.
+/// Orchard bundle: it changes the txid component of the witnessed transaction
+/// ID.
 const CACHE_KEY_MUTATIONS: &[(&str, fn(&mut Transaction))] = &[
     ("Halo2 proof", |tx| {
         orchard_shielded_data_for_mutation(tx).proof.0[0] ^= 1;

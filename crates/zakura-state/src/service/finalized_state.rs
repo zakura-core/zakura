@@ -119,12 +119,7 @@ pub use vct_treestate_audit::{
     SubtreeVerification, VctTreestateInventory,
 };
 #[allow(unused_imports)]
-pub use zakura_db::commitment_roots_db::{
-    AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,
-    CommitmentRootIndexIssue, HeaderRootAuthFrontier, HeaderRootAuthFrontierError,
-    HeaderRootAuthState, HeaderRootAuthUpdate, HeaderWitnessState, COMMITMENT_ROOTS_BY_HEIGHT,
-    HEADER_ROOT_AUTH_FRONTIER,
-};
+pub use zakura_db::commitment_roots_db::{CommitmentRootIndexIssue, COMMITMENT_ROOTS_BY_HEIGHT};
 #[allow(unused_imports)]
 pub use zakura_db::highest_completed_checkpoint::*;
 pub use zakura_db::ZakuraDb;
@@ -203,7 +198,6 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     BLOCK_INFO,
     // Verified-commitment-trees serving index
     COMMITMENT_ROOTS_BY_HEIGHT,
-    HEADER_ROOT_AUTH_FRONTIER,
     // Storage policy
     PRUNING_METADATA,
     VCT_SYNC_METADATA,

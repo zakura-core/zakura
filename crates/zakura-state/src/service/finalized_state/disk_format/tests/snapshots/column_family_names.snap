@@ -19,7 +19,6 @@ expression: cf_names
   "header_engine_meta_v1",
   "header_finality_history_v1",
   "header_node_by_hash_v1",
-  "header_root_auth_frontier",
   "header_selected_v1",
   "header_validation_context_v1",
   "header_verified_v1",

@@ -101,9 +101,7 @@ pub use service::finalized_state::{
 };
 pub use service::finalized_state::{
     produce_final_frontiers_bytes, produce_settled_final_frontiers_bytes,
-    validate_final_frontiers_bytes, AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome,
-    AuthenticatedHeaderRoots, FinalFrontiersGenerationError, FinalFrontiersValidationError,
-    HeaderRootAuthState, HeaderRootAuthUpdate, HeaderWitnessState,
+    validate_final_frontiers_bytes, FinalFrontiersGenerationError, FinalFrontiersValidationError,
 };
 pub use service::read::{
     derive_historical_frontiers, DerivedFrontiers, HistoricalTreeCache, MAX_MEMOIZED_FRONTIERS,

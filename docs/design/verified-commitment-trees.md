@@ -20,14 +20,14 @@ policy) is plumbing around that invariant. A root that cannot be obtained or ver
 never guessed: while VCT fast sync is using verified roots below the last checkpoint, the committer
 stops and retries rather than recomputing from a stale frontier (§8).
 
-> **Root persistence is authenticated.** Peer-supplied roots are no longer written to the
-> database when their header range commits. The header-sync reactor retains each
-> root-carrying payload in memory, state authenticates it against the canonical header chain
-> behind a durable ascending frontier (`AuthenticateHeaderRoots`), and only the verified
-> prefix enters the authoritative `commitment_roots_by_height` index. That lane is specified
-> in [header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md); this
-> document describes the surrounding VCT fast-sync machinery and reflects the
-> authenticated-root behavior.
+> **Root persistence is authenticated.** Peer-supplied roots are never written to the
+> authoritative `commitment_roots_by_height` index unauthenticated. On the fork-aware header
+> chain each root arrives as a hash-keyed auxiliary delivery on its header's DAG node, is
+> authenticated against the one-header-later commitment that proves it (§6.0 as headers
+> arrive, and again at commit in §6), and only reaches the index through a committed body.
+> The superseded ascending-frontier lane (`AuthenticateHeaderRoots`), which keyed roots by
+> height instead of by header hash, is **removed**; it is specified for historical reference in
+> [header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md).
 
 **Data flow (fetch + commit path):**
 
@@ -55,7 +55,7 @@ finalized committer: verify-before-commit (§6) ──fold roots, skip recompute
 ```text
 peer GetHeaders { want_tree_aux_roots } ─▶ header-sync reactor ─▶ header-sync driver (zakurad)
    ─▶ ReadRequest::BlockRoots ─▶ the authoritative commitment_roots_by_height index:
-      body-derived rows plus header-authenticated rows ahead of bodies (all-or-nothing; §9)
+      body-derived rows only, and never above the finalized body tip (all-or-nothing; §9)
 ```
 
 **Lifecycle of one fast sync.**
@@ -622,16 +622,15 @@ dependency on `zakura-network` peer types.
 A node serves roots from local state via `ReadRequest::BlockRoots { start_height, count }` →
 `ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`. The read handler:
 
-- clamps the range to the best **header** tip (which may run ahead of committed bodies);
-- serves the contiguous prefix of the authoritative `commitment_roots_by_height` index —
-  body-derived rows below the body tip and header-authenticated rows above it (so a
-  fast-synced node lacking historical per-height trees can still serve), falling back to
-  `produce_block_roots` over per-height trees only on a pre-index archive database;
+- refuses any range reaching above the finalized body tip;
+- serves the contiguous prefix of the authoritative `commitment_roots_by_height` index — all
+  body-derived (so a fast-synced node lacking historical per-height trees can still serve),
+  falling back to `produce_block_roots` over per-height trees only on a pre-index archive
+  database;
 - returns an empty vec for out-of-range/empty requests.
 
-Every served row is already authenticated or body-derived; there is no provisional tier and a
-forwarding node introduces no additional trust
-([header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md) §14.1).
+Every served row is body-derived, and the serve refuses any range reaching above the finalized
+body tip; there is no provisional tier and a forwarding node introduces no additional trust.
 
 When this read backs a header-sync serve, the header-sync driver attaches roots only when it has
 a **complete aligned set** for the served header range
@@ -706,14 +705,19 @@ commitment before it influences the anchor set or the history MMR.** Consequence
   header-sync `Headers` message as all-or-nothing metadata (§4.2, §5.4) and
   are read back by a DB-backed `PeerSource`. This increment persisted them provisionally at
   header commit; that behavior was replaced by increment 6d.
-- **Increment 6d — header-root authentication (done).** Peer-supplied roots are no longer
-  persisted unauthenticated. The reactor retains root-carrying committed-header payloads in
-  memory, state authenticates each range against the canonical header chain behind a durable
-  ascending frontier (`AuthenticateHeaderRoots`), and only verified prefixes enter
-  `commitment_roots_by_height`; a one-time database format upgrade truncates pre-existing
-  header-ahead rows for re-authentication. Adds the bounded `VctRootRepair` re-delivery path
+- **Increment 6d — header-root authentication (done, superseded by 6e).** Peer-supplied roots are
+  no longer persisted unauthenticated. State authenticated each range against the canonical
+  header chain behind a durable ascending frontier (`AuthenticateHeaderRoots`), and only
+  verified prefixes entered `commitment_roots_by_height`; a one-time database format upgrade
+  truncates pre-existing header-ahead rows. Adds the bounded `VctRootRepair` re-delivery path
   for missing or rejected covered heights. Specified in
   [header-sync-vct-root-authentication.md](header-sync-vct-root-authentication.md).
+- **Increment 6e — fork-aware header-time authentication (done).** The height-keyed lane assumed
+  one canonical chain, so it could not express a root on a competing fork. Each root now attaches
+  to its header's DAG node as a hash-keyed auxiliary delivery and is authenticated there (§6.0),
+  reusing 6d's verification kernel unchanged. The `AuthenticateHeaderRoots` request, its durable
+  ascending frontier, and the `header_root_auth_frontier` column family are **removed**; the
+  index is written only by committed bodies.
 - **Increment 7 — indexing follower lane (archive only).** Relocate `tx_by_loc` + address
   indexes and the per-height trees + subtree CFs onto an async follower, so archive mode regains
   historical RPC without re-adding the frontier recompute to the consensus path.

@@ -33,11 +33,12 @@ pub(crate) mod add_ironwood_tree;
 pub(crate) mod add_subtrees;
 pub(crate) mod block_info_and_address_received;
 pub(crate) mod cache_genesis_roots;
+pub(crate) mod drop_header_root_auth_frontier;
 pub(crate) mod fix_tree_key_type;
-pub(crate) mod header_root_auth_frontier;
 pub(crate) mod no_migration;
 pub(crate) mod prune_trees;
 pub(crate) mod tree_keys_and_caches_upgrade;
+pub(crate) mod unauthenticated_commitment_roots;
 
 #[cfg(not(feature = "indexer"))]
 pub(crate) mod drop_tx_locs_by_spends;
@@ -130,12 +131,13 @@ fn format_upgrades(
             "repair VCT Sprout history",
             Version::new(28, 0, 1),
         )),
-        Box::new(header_root_auth_frontier::Upgrade),
+        Box::new(unauthenticated_commitment_roots::Upgrade),
         Box::new(no_migration::NoMigration::new(
             "add fork-aware header-chain column families and codecs",
             Version::new(28, 1, 3),
         )),
-    ] as [Box<dyn DiskFormatUpgrade>; 12])
+        Box::new(drop_header_root_auth_frontier::Upgrade),
+    ] as [Box<dyn DiskFormatUpgrade>; 13])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -1074,11 +1076,12 @@ fn vct_format_changes_include_root_auth_metadata_updates() {
 
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0))).collect();
 
-    assert_eq!(upgrades.len(), 4);
+    assert_eq!(upgrades.len(), 5);
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
     assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
     assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
     assert_eq!(upgrades[3].version(), Version::new(28, 1, 3));
+    assert_eq!(upgrades[4].version(), Version::new(28, 1, 4));
     assert!(
         !upgrades[3].needs_migration(),
         "the header-chain column families are created on open without rebasing authenticated roots"

@@ -1007,8 +1007,7 @@ where
     /// - the `network` to consider when verifying
     /// - the `script_verifier` to use for verifying the transparent transfers
     /// - the prepared `cached_ffi_transaction` used by the script verifier
-    /// - the sapling shielded data of the transaction, if any
-    /// - the orchard shielded data of the transaction, if any
+    /// - the transaction's precomputed `wtx_id`, used by the Halo2 cache
     #[allow(clippy::unwrap_in_result)]
     fn verify_v5_transaction(
         request: &Request,
@@ -1321,6 +1320,10 @@ where
     /// [`primitives::halo2::verifier_for`] maps the upgrade to
     /// the verifier holding the matching key; the verifiers keep separate
     /// batches, so eras are never mixed.
+    ///
+    /// `wtx_id` identifies the transaction containing `bundle`; the cache adds
+    /// the bundle's value pool to distinguish the Orchard and Ironwood slots in
+    /// a v6 transaction.
     fn verify_orchard_bundle(
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,

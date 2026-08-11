@@ -164,8 +164,9 @@ impl Item {
     /// Creates a new [`Item`] from a bundle and sighash.
     ///
     /// Items constructed without their transaction's [`WtxId`] are verified
-    /// normally but are not cached. The transaction verifier uses
-    /// [`Self::new_with_wtx_id`] so its items can reuse successful results.
+    /// normally but are not cached. The transaction verifier supplies the
+    /// witnessed transaction ID through a crate-private constructor so its
+    /// items can reuse successful results.
     pub fn new(
         bundle: orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>,
         sighash: SigHash,
@@ -179,6 +180,10 @@ impl Item {
 
     /// Creates a cacheable item using its already-computed witnessed
     /// transaction ID.
+    ///
+    /// `wtx_id` must identify the transaction containing `bundle`. The
+    /// transaction verifier preserves this invariant by passing the ID it
+    /// computed from the same [`Request`](crate::transaction::Request).
     pub(crate) fn new_with_wtx_id(
         bundle: orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>,
         sighash: SigHash,

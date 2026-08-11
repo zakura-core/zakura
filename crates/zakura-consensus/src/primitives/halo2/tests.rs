@@ -418,15 +418,13 @@ fn rebuilt_as(
 
 /// The Orchard and Ironwood pools of one v6 transaction never share a cache key.
 ///
-/// A v6 transaction verifies both of its bundles against the same sighash under the same network
-/// upgrade, and — because both pools use the NU6.3 circuit — through the same verifier and so the
-/// same cache. A key that did not separate the pools would answer one pool's verification with the
-/// other's result.
+/// A v6 transaction gives both bundles the same [`WtxId`]. Both pools also use
+/// the NU6.3 circuit and therefore the same cache, so the value-pool tag names
+/// which bundle slot earned an entry.
 ///
 /// The two bundles here are built from identical parts, and with cross-address transfers disabled
 /// their flag bytes are identical too, so their consensus encodings are byte-for-byte the same.
-/// Only the pool discriminant tells them apart. This is the collision that `(auth digest, sighash)`
-/// would have had.
+/// Only the pool tag tells them apart.
 #[test]
 fn cache_key_distinguishes_the_orchard_and_ironwood_pools() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();

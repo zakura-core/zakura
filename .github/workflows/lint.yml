@@ -1,15 +1,26 @@
 name: Lint
 
 on:
-  # No `paths:` filter on pull_request: the workflow triggers on every PR and the
-  # `changes` job below gates the heavy lint jobs so they still skip on PRs that
-  # touch no lint-relevant files. This keeps the `lint success` required check
-  # reporting on every PR instead of sitting in "Expected" forever.
   pull_request:
     branches: [main, "feat/**", "release/**"]
-    # Allows maintainers to trigger checks on an unchanged PR head when
-    # backfilling newly required status contexts.
-    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      # Crates contain compiled assets, protobufs, snapshots, and test vectors
+      # whose changes must run the Rust checks even though they are not `.rs`.
+      - crates/**
+      - .cargo/config.toml
+      - deny.toml
+      - rust-toolchain.toml
+      - .github/workflows/lint.yml
+      - qa/supply-chain/**
+      - "scripts/**.sh"
+      - ".github/workflows/scripts/**"
+      - ".github/actions/**"
+      # ci-python-tests covers these suites, so changes to them must trigger it.
+      - "deploy/**"
+      - ".github/scripts/**"
 
   push:
     branches: [main, "feat/**", "release/**"]
@@ -59,58 +70,8 @@ env:
   CLICOLOR: 1
 
 jobs:
-  # Detect whether a pull request touches lint-relevant paths. Only pull_request
-  # is path-gated here; push carries its own `paths:` filter and merge_group /
-  # schedule / workflow_dispatch always run the full lint suite.
-  changes:
-    name: detect lint-relevant changes
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      lint: ${{ steps.filter.outputs.lint }}
-    steps:
-      - id: filter
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          TOTAL_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
-        run: |
-          # Non-PR events run the heavy jobs unconditionally (see their `if`), so
-          # the filter result is only consumed on pull_request.
-          if [[ "$EVENT_NAME" != "pull_request" ]]; then
-            echo "lint=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # The PR files endpoint returns at most 3,000 files. Run the full lint
-          # suite when the count is missing or reaches that limit so a truncated
-          # response cannot hide a lint-relevant path.
-          if ! [[ "$TOTAL_CHANGED_FILES" =~ ^[0-9]+$ ]] || \
-             (( TOTAL_CHANGED_FILES >= 3000 )); then
-            echo "lint=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          changed=$(gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
-            --jq '.[] | .filename, (.previous_filename // empty)')
-
-          if grep -qE '(^crates/|\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^deny\.toml$|^rust-toolchain\.toml$|^\.github/workflows/lint\.yml$|^qa/supply-chain/|^scripts/.*\.sh$|^\.github/workflows/scripts/|^\.github/actions/|^deploy/|^\.github/scripts/)' <<< "$changed"; then
-            echo "lint=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "lint=false" >> "$GITHUB_OUTPUT"
-          fi
-
   rust-checks:
     name: rust checks
-    needs: changes
-    # Run for pushes (own paths filter), the merge queue, nightly, and on demand;
-    # on a pull request only when a lint-relevant path changed.
-    if: needs.changes.outputs.lint == 'true' || github.event_name != 'pull_request'
     permissions:
       contents: read
       id-token: write
@@ -142,8 +103,6 @@ jobs:
 
   msrv:
     name: MSRV
-    needs: changes
-    if: needs.changes.outputs.lint == 'true' || github.event_name != 'pull_request'
     permissions:
       contents: read
       id-token: write
@@ -196,8 +155,6 @@ jobs:
 
   fast-lints:
     name: fast lints
-    needs: changes
-    if: needs.changes.outputs.lint == 'true' || github.event_name != 'pull_request'
     permissions:
       contents: read
       statuses: write
@@ -292,8 +249,6 @@ jobs:
 
   supply-chain:
     name: supply chain
-    needs: changes
-    if: needs.changes.outputs.lint == 'true' || github.event_name != 'pull_request'
     permissions:
       contents: read
       statuses: write
@@ -361,7 +316,6 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     needs:
-      - changes
       - rust-checks
       - msrv
       - docs
@@ -375,7 +329,4 @@ jobs:
         with:
           jobs: ${{ toJSON(needs) }}
           # docs and unused-deps run only on the nightly schedule / on demand.
-          # rust-checks, msrv, fast-lints, and supply-chain are skipped on pull
-          # requests that touch no lint-relevant paths. All are skipped (not
-          # failed) on those paths; a genuine failure still fails this aggregate.
-          allowed-skips: docs, unused-deps, rust-checks, msrv, fast-lints, supply-chain
+          allowed-skips: docs, unused-deps

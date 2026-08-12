@@ -29,7 +29,7 @@ use zakura_chain::{
     transaction::{self, Transaction},
     transparent,
     value_balance::ValueBalance,
-    work::difficulty::PartialCumulativeWork,
+    work::difficulty::{PartialCumulativeWork, U256},
 };
 
 use crate::{
@@ -2268,11 +2268,13 @@ impl DiskWriteBatch {
                 }
             }
 
+            // The comparison above is exact 256-bit. These fields are diagnostic only, so
+            // they saturate into the narrower reporting type rather than panicking.
             if new_work <= existing_work {
                 return Err(CommitHeaderRangeError::LowerWorkConflict {
                     height: first_conflicting_height,
-                    existing_work: existing_work.as_u128(),
-                    new_work: new_work.as_u128(),
+                    existing_work: saturating_work_for_display(existing_work),
+                    new_work: saturating_work_for_display(new_work),
                 });
             }
         }
@@ -2348,4 +2350,11 @@ impl DiskWriteBatch {
         let block_header_by_height = zakura_db.db.cf_handle("block_header_by_height").unwrap();
         self.zs_delete(&block_header_by_height, height);
     }
+}
+
+/// Narrows exact 256-bit cumulative work for error reporting, saturating at [`u128::MAX`].
+///
+/// Fork-choice comparisons stay exact; only the reported diagnostic is narrowed.
+fn saturating_work_for_display(work: PartialCumulativeWork) -> u128 {
+    work.as_u256().min(U256::from(u128::MAX)).low_u128()
 }

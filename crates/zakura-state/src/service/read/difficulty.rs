@@ -9,7 +9,7 @@ use zakura_chain::{
     history_tree::HistoryTree,
     parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
     serialization::{DateTime32, Duration32},
-    work::difficulty::{CompactDifficulty, PartialCumulativeWork, Work},
+    work::difficulty::{CompactDifficulty, PartialCumulativeWork, Work, U256},
 };
 
 use crate::{
@@ -143,7 +143,12 @@ pub fn solution_rate(
         return None;
     }
 
-    Some(total_work.as_u128() / work_duration as u128)
+    // `work_duration` is positive here, so the cast cannot wrap.
+    let rate = total_work.as_u256() / U256::from(work_duration as u128);
+
+    // The RPC solution rate stays u128. Saturate rather than panic: cumulative work is
+    // exact 256-bit, so a custom-network chain could in principle exceed the narrower type.
+    Some(rate.min(U256::from(u128::MAX)).low_u128())
 }
 
 /// Do a consistency check by checking the finalized tip before and after all other database

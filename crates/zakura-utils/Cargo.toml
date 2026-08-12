@@ -65,7 +65,7 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 
 zakura-node-services = { path = "../zakura-node-services", version = "3.1.0" }
-zakura-chain = { path = "../zakura-chain", version = "4.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "5.0.0" }
 
 # These crates are needed for the zakura-checkpoints binary
 itertools = { workspace = true, optional = true }

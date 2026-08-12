@@ -10,6 +10,12 @@ updates:
     schedule:
       interval: monthly
       timezone: America/New_York
+    # Cooldown delays adoption of fresh releases — the window when a
+    # compromised dependency is most likely to slip through. See:
+    # https://astral.sh/blog/open-source-security-at-astral#dependency-security
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
     # Limit dependabot to 1 PR per reviewer
     open-pull-requests-limit: 6
     labels:
@@ -46,6 +52,12 @@ updates:
       interval: weekly
       day: wednesday
       timezone: America/New_York
+    # Cooldown delays adoption of fresh releases — the window when a
+    # compromised dependency is most likely to slip through. See:
+    # https://astral.sh/blog/open-source-security-at-astral#dependency-security
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
     open-pull-requests-limit: 4
     labels:
       - 'C-exclude-from-changelog'

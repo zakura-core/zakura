@@ -1,0 +1,46 @@
+name: Workflow audit
+
+# zizmor (https://github.com/zizmorcore/zizmor) statically audits our GitHub
+# Actions workflows and composite actions for security smells: template
+# injection, unpinned/imposter action uses, dangerous triggers, cache
+# poisoning, credential persistence, and more.
+#
+# Deliberately NOT path-filtered: unlike a workflow that only runs when
+# `.github/**` changes, this runs on every pull request so its `zizmor` check
+# always reports and can be made a required status check without ever hanging
+# in "Expected". The audit re-scans the whole `.github/` tree each run, so it is
+# cheap on PRs that touch no workflow files (a few seconds, nothing to flag).
+
+on:
+  pull_request:
+    branches: [main, "feat/**", "release/**"]
+  push:
+    branches: [main, "feat/**", "release/**"]
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d #v0.5.6
+        with:
+          advanced-security: false
+          annotations: true
+          # Catch every finding, including informational. Known-safe patterns
+          # must be silenced with a line-level `# zizmor: ignore[<rule>]`
+          # comment at the site, with a justification — not by raising this
+          # threshold — otherwise a new template injection or unpinned action
+          # slips in silently on a later workflow edit.
+          min-severity: informational

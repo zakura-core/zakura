@@ -59,24 +59,63 @@ pub enum InvariantViolation {
     SourceSnapshot,
 }
 
+/// Selects which projected graph and node set the verifier inspects.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum VerificationMode {
+    /// Materialized projected graph and every retained node (test/fuzz oracle).
+    #[cfg(any(test, feature = "fuzz-impl"))]
+    Exhaustive,
+    /// Delta overlay and changed-boundary nodes (shipped production path).
+    Production,
+}
+
+fn default_verification_mode() -> VerificationMode {
+    #[cfg(any(test, feature = "fuzz-impl"))]
+    {
+        VerificationMode::Exhaustive
+    }
+    #[cfg(not(any(test, feature = "fuzz-impl")))]
+    {
+        VerificationMode::Production
+    }
+}
+
 /// Verify the complete projected state before an adapter may commit `plan`.
 pub(crate) fn verify_plan(
     before: &HeaderChainEngine,
     plan: &TransitionPlan,
 ) -> Result<(), InvariantViolation> {
+    verify_plan_with_mode(before, plan, default_verification_mode())
+}
+
+/// Verify `plan` using the exact production overlay and boundary-node path.
+#[cfg(any(test, feature = "fuzz-impl"))]
+pub(crate) fn verify_plan_production(
+    before: &HeaderChainEngine,
+    plan: &TransitionPlan,
+) -> Result<(), InvariantViolation> {
+    verify_plan_with_mode(before, plan, VerificationMode::Production)
+}
+
+fn verify_plan_with_mode(
+    before: &HeaderChainEngine,
+    plan: &TransitionPlan,
+    mode: VerificationMode,
+) -> Result<(), InvariantViolation> {
     if is_incremental_aux_authentication(before, plan) {
-        return verify_incremental_aux_authentication(before, plan);
+        return verify_incremental_aux_authentication(before, plan, mode);
     }
     if is_incremental_checkpoint_finality(before, plan) {
-        return verify_incremental_checkpoint_finality(before, plan);
+        return verify_incremental_checkpoint_finality(before, plan, mode);
     }
 
-    verify_plan_exhaustive(before, plan)
+    verify_plan_exhaustive(before, plan, mode)
 }
 
 fn verify_plan_exhaustive(
     before: &HeaderChainEngine,
     plan: &TransitionPlan,
+    mode: VerificationMode,
 ) -> Result<(), InvariantViolation> {
     let source = before.snapshot();
     if source != plan.before {
@@ -90,7 +129,38 @@ fn verify_plan_exhaustive(
     let delta_graph = GraphOverlay::from_delta(before.graph(), plan.graph_delta())
         .map_err(|_| InvariantViolation::Index(block::Hash([0; 32])))?;
     let delta_finalized = delta_graph.view_finalized_frontier();
-    let graph = delta_graph;
+    #[cfg(any(test, feature = "fuzz-impl"))]
+    if mode == VerificationMode::Exhaustive {
+        return verify_plan_against_graph(
+            before,
+            plan,
+            &source,
+            source_metadata,
+            plan.projected_graph(),
+            delta_finalized,
+            mode,
+        );
+    }
+    verify_plan_against_graph(
+        before,
+        plan,
+        &source,
+        source_metadata,
+        &delta_graph,
+        delta_finalized,
+        mode,
+    )
+}
+
+fn verify_plan_against_graph<G: HeaderGraphView>(
+    before: &HeaderChainEngine,
+    plan: &TransitionPlan,
+    source: &crate::EngineSnapshot,
+    source_metadata: &crate::EngineMetadata,
+    graph: &G,
+    delta_finalized: Frontier,
+    mode: VerificationMode,
+) -> Result<(), InvariantViolation> {
     let metadata = &plan.change_set.metadata;
     let expected_work_origin = if plan.graph_delta().rebases_work_coordinates() {
         source.frontiers.finalized
@@ -143,15 +213,14 @@ fn verify_plan_exhaustive(
     } else if metadata.finality_epoch != source_metadata.finality_epoch {
         return Err(InvariantViolation::Generation);
     }
-    let nodes = changed_boundary_nodes(before, &graph, plan);
-    for node in nodes {
-        verify_node(&graph, node, metadata.work_origin.hash)?;
+    for node in verification_nodes(before, graph, plan, mode) {
+        verify_node(graph, node, metadata.work_origin.hash)?;
     }
     verify_indexes(before, plan)?;
-    let selected = projected_path(before, &source, &plan.change_set.selected_projection, true)?;
-    let verified = projected_path(before, &source, &plan.change_set.verified_projection, false)?;
+    let selected = projected_path(before, source, &plan.change_set.selected_projection, true)?;
+    let verified = projected_path(before, source, &plan.change_set.verified_projection, false)?;
     verify_projection(
-        &graph,
+        graph,
         &selected,
         metadata.frontiers.header_best,
         InvariantViolation::SelectedProjection,
@@ -163,7 +232,7 @@ fn verify_plan_exhaustive(
         return Err(InvariantViolation::Selection);
     }
     verify_verified(
-        &graph,
+        graph,
         metadata.mode,
         &verified,
         metadata.frontiers.verified_best,
@@ -174,14 +243,14 @@ fn verify_plan_exhaustive(
         &verified,
         &plan.change_set.put_nodes,
     )?;
-    verify_protected(&graph, plan)?;
+    verify_protected(graph, plan)?;
     if graph.view_header_node_count().saturating_sub(1) > plan.limits.max_non_finalized_nodes.get()
         || graph.view_eligible_header_tips().len() > plan.limits.max_candidate_tips.get()
     {
         return Err(InvariantViolation::Limits);
     }
     verify_generations(before, plan, &selected, &verified)?;
-    verify_aux(before, &graph, plan)?;
+    verify_aux(before, graph, plan, mode)?;
     Ok(())
 }
 
@@ -224,6 +293,7 @@ pub(super) fn is_incremental_aux_authentication(
 fn verify_incremental_aux_authentication(
     before: &HeaderChainEngine,
     plan: &TransitionPlan,
+    mode: VerificationMode,
 ) -> Result<(), InvariantViolation> {
     if before.snapshot() != plan.before {
         return Err(InvariantViolation::SourceSnapshot);
@@ -252,7 +322,7 @@ fn verify_incremental_aux_authentication(
         before.selected_projection(),
         before.verified_projection(),
     )?;
-    verify_aux(before, before.graph(), plan)?;
+    verify_aux(before, before.graph(), plan, mode)?;
     Ok(())
 }
 
@@ -307,6 +377,7 @@ pub(super) fn is_incremental_checkpoint_finality(
 fn verify_incremental_checkpoint_finality(
     before: &HeaderChainEngine,
     plan: &TransitionPlan,
+    mode: VerificationMode,
 ) -> Result<(), InvariantViolation> {
     let source = before.snapshot();
     if source != plan.before {
@@ -319,7 +390,35 @@ fn verify_incremental_checkpoint_finality(
     let delta_graph = GraphOverlay::from_delta(before.graph(), plan.graph_delta())
         .map_err(|_| InvariantViolation::Index(block::Hash([0; 32])))?;
     let delta_finalized = delta_graph.view_finalized_frontier();
-    let graph = delta_graph;
+    #[cfg(any(test, feature = "fuzz-impl"))]
+    if mode == VerificationMode::Exhaustive {
+        return verify_incremental_checkpoint_against_graph(
+            before,
+            plan,
+            &source,
+            plan.projected_graph(),
+            delta_finalized,
+            mode,
+        );
+    }
+    verify_incremental_checkpoint_against_graph(
+        before,
+        plan,
+        &source,
+        &delta_graph,
+        delta_finalized,
+        mode,
+    )
+}
+
+fn verify_incremental_checkpoint_against_graph<G: HeaderGraphView>(
+    before: &HeaderChainEngine,
+    plan: &TransitionPlan,
+    source: &crate::EngineSnapshot,
+    graph: &G,
+    delta_finalized: Frontier,
+    mode: VerificationMode,
+) -> Result<(), InvariantViolation> {
     let metadata = &plan.change_set.metadata;
     let record = plan
         .change_set
@@ -412,7 +511,7 @@ fn verify_incremental_checkpoint_finality(
             return Err(InvariantViolation::TrustPin(finalized.height));
         }
     }
-    verify_protected(&graph, plan)?;
+    verify_protected(graph, plan)?;
     if graph.view_header_node_count().saturating_sub(1) > plan.limits.max_non_finalized_nodes.get()
         || graph.view_eligible_header_tips().len() > plan.limits.max_candidate_tips.get()
     {
@@ -424,7 +523,7 @@ fn verify_incremental_checkpoint_finality(
         &[metadata.frontiers.header_best],
         &[metadata.frontiers.verified_best],
     )?;
-    verify_aux(before, &graph, plan)?;
+    verify_aux(before, graph, plan, mode)?;
     Ok(())
 }
 
@@ -736,6 +835,7 @@ fn verify_aux<G: HeaderGraphView>(
     before: &HeaderChainEngine,
     graph: &G,
     plan: &TransitionPlan,
+    mode: VerificationMode,
 ) -> Result<(), InvariantViolation> {
     let mut put_ids = HashSet::new();
     for change in &plan.change_set.aux_changes {
@@ -784,15 +884,16 @@ fn verify_aux<G: HeaderGraphView>(
             AuxDelta::Delete { .. } => None,
         })
         .collect();
-    #[cfg(any(test, feature = "fuzz-impl"))]
-    let nodes = graph.view_header_nodes();
-    #[cfg(not(any(test, feature = "fuzz-impl")))]
-    let nodes: Vec<_> = plan
-        .change_set
-        .put_nodes
-        .iter()
-        .filter_map(|changed| graph.view_header_node(changed.hash))
-        .collect();
+    let nodes: Vec<&HeaderNode> = match mode {
+        #[cfg(any(test, feature = "fuzz-impl"))]
+        VerificationMode::Exhaustive => graph.view_header_nodes(),
+        VerificationMode::Production => plan
+            .change_set
+            .put_nodes
+            .iter()
+            .filter_map(|changed| graph.view_header_node(changed.hash))
+            .collect(),
+    };
     for node in nodes {
         let mut deliveries = before.aux_deliveries(node.hash).to_vec();
         deliveries.retain(|delivery| !deleted_ids.contains(&delivery.delivery_id));
@@ -822,6 +923,19 @@ fn verify_aux<G: HeaderGraphView>(
         }
     }
     Ok(())
+}
+
+fn verification_nodes<'a, G: HeaderGraphView>(
+    before: &HeaderChainEngine,
+    graph: &'a G,
+    plan: &TransitionPlan,
+    mode: VerificationMode,
+) -> Vec<&'a HeaderNode> {
+    match mode {
+        #[cfg(any(test, feature = "fuzz-impl"))]
+        VerificationMode::Exhaustive => graph.view_header_nodes(),
+        VerificationMode::Production => changed_boundary_nodes(before, graph, plan),
+    }
 }
 
 fn changed_boundary_nodes<'a, G: HeaderGraphView>(

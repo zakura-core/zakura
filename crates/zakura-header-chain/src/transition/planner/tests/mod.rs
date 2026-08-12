@@ -295,9 +295,15 @@ fn apply_transition(
         }
         _ => DurableTransitionFacts::None,
     };
-    engine
+    let plan = engine
         .apply(request, context, durable)
-        .map(crate::EngineTransition::into_plan)
+        .map(crate::EngineTransition::into_plan)?;
+    if let Err(error) = crate::verify_plan_production(&engine, &plan) {
+        panic!(
+            "production overlay and boundary-node verification must accept plans that pass the exhaustive verifier: {error:?}"
+        );
+    }
+    Ok(plan)
 }
 
 fn batch(

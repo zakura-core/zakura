@@ -14,6 +14,8 @@ pub use engine::{
     HeaderChainEngine,
 };
 pub(crate) use invariants::verify_plan;
+#[cfg(any(test, feature = "fuzz-impl"))]
+pub(crate) use invariants::verify_plan_production;
 pub use invariants::InvariantViolation;
 pub use planner::{TransitionFailure, TransitionPlan};
 pub use recovery::{

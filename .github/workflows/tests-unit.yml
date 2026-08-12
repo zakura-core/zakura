@@ -42,8 +42,9 @@ on:
 # to run, cancelling any workflows in between
 concurrency:
   # PR numbers are repository-wide, unlike same-named head branches from forks.
-  # Other events use their full ref (including each merge-queue ref).
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Other events use their unique run ID so different event types cannot cancel
+  # each other when they share a ref, such as push and nightly runs on `main`.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 permissions:

@@ -102,6 +102,124 @@ fn same_transition_auxiliary_eviction_has_no_generation_effect() {
     assert!(plan.change_set.aux_changes.is_empty());
 }
 
+#[test]
+fn auxiliary_deletes_for_evicted_headers_are_sorted_by_hash_and_delivery_id() {
+    use zakura_chain::work::difficulty::{ExpandedDifficulty, U256};
+
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let old_finalized = store.graph.finalized();
+    let easy = store
+        .graph
+        .node(old_finalized.hash)
+        .expect("the anchor exists")
+        .header
+        .difficulty_threshold;
+    let easy_target: U256 = easy
+        .to_expanded()
+        .expect("the fixture target expands")
+        .into();
+    let hard = ExpandedDifficulty::from(easy_target >> 3).into();
+
+    let verified_tip = insert_verified_branch(&mut store.graph, old_finalized, 3, easy, 0xe1);
+    let verified_path =
+        path(&store.graph, verified_tip).expect("the verified fixture path is retained");
+    let new_finalized = verified_path[1];
+    let selected_tip = insert_verified_branch(&mut store.graph, old_finalized, 2, hard, 0xe2);
+    synchronize_fixture(&mut store, verified_tip);
+    assert_eq!(store.metadata.frontiers.header_best, selected_tip);
+
+    let owner = crate::HeaderWorkOwner {
+        authority: crate::HeaderWorkAuthority {
+            header_generation: store.metadata.header_generation,
+            branch: BranchId::new(old_finalized.hash, selected_tip.hash),
+        },
+        session_id: 1,
+        request_id: NonZeroU64::new(1).expect("one is nonzero"),
+    }
+    .into();
+    let source = SourceId::from_digest([0xe3; 32]);
+    let competing = store.selected.iter().copied().skip(1).collect::<Vec<_>>();
+    assert_eq!(
+        competing.len(),
+        2,
+        "the competing branch has two retained headers"
+    );
+    // Attach deliveries out of sorted order so the plan must impose (hash, id) order.
+    let deliveries = [
+        crate::AuxDelivery {
+            delivery_id: EvidenceId::from_digest([0xf2; 32]),
+            header_hash: competing[1].hash,
+            source,
+            owner,
+            body_size: crate::BodySizeHint::Unknown,
+            tree_aux: None,
+            authentication: crate::AuxAuthentication::Unauthenticated,
+        },
+        crate::AuxDelivery {
+            delivery_id: EvidenceId::from_digest([0xf0; 32]),
+            header_hash: competing[0].hash,
+            source,
+            owner,
+            body_size: crate::BodySizeHint::Unknown,
+            tree_aux: None,
+            authentication: crate::AuxAuthentication::Unauthenticated,
+        },
+        crate::AuxDelivery {
+            delivery_id: EvidenceId::from_digest([0xf1; 32]),
+            header_hash: competing[0].hash,
+            source,
+            owner,
+            body_size: crate::BodySizeHint::Unknown,
+            tree_aux: None,
+            authentication: crate::AuxAuthentication::Unauthenticated,
+        },
+    ];
+    for delivery in &deliveries {
+        store
+            .graph
+            .node_mut(delivery.header_hash)
+            .expect("the competing header remains retained")
+            .aux_delivery_ids
+            .push(delivery.delivery_id);
+        store.aux.push(*delivery);
+    }
+
+    let plan = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::FullStateFinalized(crate::FullStateFinalized {
+                full_state_transition_id: EvidenceId::from_digest([0xe4; 32]),
+                new_finalized,
+                verified_path_proof: vec![old_finalized.hash, new_finalized.hash],
+            }),
+        },
+        &context(&config, &clock, Some(&authority)),
+    )
+    .expect("authenticated full-state finality prunes the competing branch");
+
+    let mut expected: Vec<_> = deliveries
+        .iter()
+        .map(|delivery| AuxDelta::Delete {
+            header_hash: delivery.header_hash,
+            delivery_id: delivery.delivery_id,
+        })
+        .collect();
+    expected.sort_unstable_by_key(|change| match change {
+        AuxDelta::Delete {
+            header_hash,
+            delivery_id,
+        } => (header_hash.0, *delivery_id),
+        AuxDelta::Put(_) => unreachable!("the fixture constructs only deletes"),
+    });
+    assert_eq!(plan.change_set.aux_changes, expected);
+    assert!(competing
+        .iter()
+        .all(|frontier| plan.change_set.delete_nodes.contains(&frontier.hash)));
+}
+
 fn body_owner(snapshot: &EngineSnapshot, session_id: u64, request_id: u64) -> crate::BodyWorkOwner {
     crate::BodyWorkAuthority::for_snapshot(snapshot).bind(
         session_id,

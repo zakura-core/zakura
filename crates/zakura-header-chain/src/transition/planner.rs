@@ -344,13 +344,22 @@ pub(super) fn apply_transition_engine(
         crate::AuxDelta::Put(delivery) => graph.view_header_node(delivery.header_hash).is_some(),
         crate::AuxDelta::Delete { .. } => true,
     });
-    for hash in &evicted {
-        for delivery in engine.aux_deliveries(*hash) {
-            aux_changes.push(crate::AuxDelta::Delete {
-                header_hash: *hash,
-                delivery_id: delivery.delivery_id,
-            });
-        }
+    let mut aux_deletes: Vec<_> = evicted
+        .iter()
+        .flat_map(|hash| {
+            engine
+                .aux_deliveries(*hash)
+                .iter()
+                .map(|delivery| (*hash, delivery.delivery_id))
+        })
+        .collect();
+    // HashSet iteration is nondeterministic; match adjacent ChangeSet ordering.
+    aux_deletes.sort_unstable_by_key(|(hash, delivery_id)| (hash.0, *delivery_id));
+    for (header_hash, delivery_id) in aux_deletes {
+        aux_changes.push(crate::AuxDelta::Delete {
+            header_hash,
+            delivery_id,
+        });
     }
     let plan = derive_plan(DerivePlanInputs {
         before,

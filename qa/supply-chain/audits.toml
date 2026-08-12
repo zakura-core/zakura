@@ -275,6 +275,12 @@ criteria = "safe-to-deploy"
 version = "0.4.3"
 notes = "Reviewed all packaged library, optional CLI source, tests, and manifest. Library code performs numeric formatting and fixed-array suffix lookup with no unsafe code or build script; the optional CLI only reads arguments or stdin and writes stdout. The public formatter can panic for f64 values beyond its suffix range, but Zakura calls it only with finite u64-derived database size values, whose maximum remains within that range. All-feature library and binary tests passed."
 
+[[audits.humantime-serde]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.1"
+notes = "Reviewed all packaged source, manifest, and tests. This crate only wraps Duration and SystemTime parsing and formatting from separately policy-checked humantime in Serde traits. Unsafe code is forbidden and there is no build script, runtime I/O, or ambient capability. All 4 behavioral unit tests and 3 doctests passed; an upstream version-sync metadata test fails because html_root_url still names version 1.0 instead of 1.1."
+
 [[audits.hyper]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -611,9 +617,21 @@ criteria = "safe-to-deploy"
 delta = "1.0.210 -> 1.0.211"
 
 [[audits.serde_spanned]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.1"
+notes = "Reviewed all packaged source and manifests. This no_std-capable crate stores a value and byte range and provides a small Serde map adapter over caller-supplied data. Unsafe code is forbidden and there is no build script, I/O, or ambient capability. The all-feature library target compiled; its sole packaged doctest cannot resolve the monorepo-only toml dev dependency omitted from the published manifest."
+
+[[audits.serde_spanned]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.6.6 -> 0.6.7"
+
+[[audits.serde_urlencoded]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.7.1"
+notes = "Reviewed all packaged source, manifest, and tests. The crate maps caller-supplied Serde values and readers to application/x-www-form-urlencoded data through separately policy-checked dependencies. Unsafe code is forbidden; it does not acquire filesystem, network, process, or other ambient capabilities and has no build script. All 19 integration tests and 3 doctests passed."
 
 [[audits.serde_with]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -649,6 +667,12 @@ delta = "3.9.0 -> 3.11.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 version = "0.0.12"
+
+[[audits.serdect]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.0"
+notes = "Reviewed all packaged source, manifest, and tests. This no_std Serde adapter performs bounded binary or Base16 serialization using the separately audited base16ct dependency, with optional zeroization. Unsafe code is forbidden and there is no build script, runtime I/O, or ambient capability. All 40 integration tests and 2 doctests passed with all features."
 
 [[audits.shardtree]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

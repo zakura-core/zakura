@@ -786,10 +786,6 @@ criteria = "safe-to-deploy"
 version = "2.4.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.humantime-serde]]
-version = "1.1.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.hybrid-array]]
 version = "0.2.3"
 criteria = "safe-to-deploy"
@@ -1795,24 +1791,12 @@ criteria = "safe-to-deploy"
 version = "1.0.150"
 criteria = "safe-to-deploy"
 
-[[exemptions.serde_spanned]]
-version = "1.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_urlencoded]]
-version = "0.7.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.serde_with]]
 version = "3.21.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.serde_with_macros]]
 version = "3.21.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.serdect]]
-version = "0.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.sha1]]

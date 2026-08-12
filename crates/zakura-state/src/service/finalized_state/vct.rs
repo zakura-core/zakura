@@ -130,6 +130,36 @@ pub(crate) enum VctAuxRejection {
     None,
 }
 
+impl VctAuxRejection {
+    /// The rejection provides a stable metrics label.
+    pub(crate) fn attribution_label(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Successor => "successor",
+            Self::Ambiguous => "ambiguous",
+            Self::None => "none",
+        }
+    }
+
+    /// The rejection indicates whether the writer stores a dispute.
+    pub(crate) fn is_ambiguous(self) -> bool {
+        self == Self::Ambiguous
+    }
+
+    /// The rejection identifies the lowest delivery that repair must replace.
+    pub(crate) fn repair_height(
+        self,
+        current: block::Height,
+        successor: Option<block::Height>,
+    ) -> Option<block::Height> {
+        match self {
+            Self::Current | Self::Ambiguous => Some(current),
+            Self::Successor => successor,
+            Self::None => None,
+        }
+    }
+}
+
 impl VctAuxWindow {
     /// Return the exact current roots when the delivery still agrees with the block.
     pub(crate) fn current_roots(
@@ -166,9 +196,12 @@ fn classify_vct_aux_failure(
     successor: Option<AuxDelivery>,
     failure: VctCommitFailure,
 ) -> VctAuxRejection {
-    let current_unauthenticated = current.authentication == AuxAuthentication::Unauthenticated;
+    let current_untrusted = matches!(
+        current.authentication,
+        AuxAuthentication::Unauthenticated | AuxAuthentication::Disputed { .. }
+    );
     if failure == VctCommitFailure::CurrentRoots {
-        return if current_unauthenticated {
+        return if current_untrusted {
             VctAuxRejection::Current
         } else {
             VctAuxRejection::None
@@ -176,15 +209,18 @@ fn classify_vct_aux_failure(
     }
 
     let Some(successor) = successor else {
-        return if current_unauthenticated {
+        return if current_untrusted {
             VctAuxRejection::Current
         } else {
             VctAuxRejection::None
         };
     };
-    let successor_unauthenticated = successor.authentication == AuxAuthentication::Unauthenticated;
+    let successor_untrusted = matches!(
+        successor.authentication,
+        AuxAuthentication::Unauthenticated | AuxAuthentication::Disputed { .. }
+    );
 
-    match (current_unauthenticated, successor_unauthenticated) {
+    match (current_untrusted, successor_untrusted) {
         (true, true) => VctAuxRejection::Ambiguous,
         (true, false) => VctAuxRejection::Current,
         (false, true) => VctAuxRejection::Successor,

@@ -323,8 +323,9 @@ fn verify_incremental_aux_authentication(
         let mut expected = *existing;
         expected.authentication = delivery.authentication;
         if expected != **delivery
-            || existing.authentication != crate::AuxAuthentication::Unauthenticated
-            || delivery.authentication == crate::AuxAuthentication::Unauthenticated
+            || !existing
+                .authentication
+                .permits_transition_to(delivery.authentication)
         {
             return Err(InvariantViolation::Auxiliary(delivery.header_hash));
         }

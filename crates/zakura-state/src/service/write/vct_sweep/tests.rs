@@ -1,9 +1,9 @@
 //! Tests for header-time authentication of VCT auxiliary metadata.
 //!
-//! The fixture builds a deterministic Heartwood/NU5 chain whose headers carry exact ZIP-221
-//! commitments, commits a prefix as bodies, and then feeds the remaining headers into the
-//! header chain with auxiliary deliveries — the shape fast sync produces, where headers run
-//! ahead of bodies.
+//! The fixture builds a deterministic chain across each configured network upgrade.
+//! Each header carries its exact ZIP-221 commitment.
+//! The fixture commits a body prefix.
+//! The fixture admits the remaining headers with auxiliary deliveries.
 
 use std::{num::NonZeroU64, sync::Arc};
 
@@ -46,6 +46,16 @@ const HEARTWOOD: u32 = 5;
 /// NU5 activates here, so headers from this height commit to an authorizing-data root and the
 /// sweep's boundary check needs the successor delivery, not just the successor header.
 const NU5: u32 = 10;
+/// NU6 activates here.
+const NU6: u32 = 14;
+/// NU6.1 activates here.
+const NU6_1: u32 = 16;
+/// NU6.2 activates here.
+const NU6_2: u32 = 18;
+/// NU6.3 activates here.
+const NU6_3: u32 = 20;
+/// NU7 activates here.
+const NU7: u32 = 22;
 /// Highest generated height.
 const TOP: u32 = 24;
 /// Highest height committed as a body; every height above it is header-only.
@@ -73,11 +83,11 @@ fn parameters(checkpoint_blocks: Option<&[Arc<Block>]>) -> Network {
             heartwood: Some(HEARTWOOD),
             canopy: Some(6),
             nu5: Some(NU5),
-            nu6: Some(200),
-            nu6_1: Some(210),
-            nu6_2: Some(220),
-            nu6_3: Some(230),
-            nu7: Some(240),
+            nu6: Some(NU6),
+            nu6_1: Some(NU6_1),
+            nu6_2: Some(NU6_2),
+            nu6_3: Some(NU6_3),
+            nu7: Some(NU7),
         })
         .expect("the compressed activation schedule is ordered")
         .with_disable_pow(true)
@@ -157,7 +167,12 @@ fn generate_chain(network: &Network) -> Vec<Arc<Block>> {
                 joinsplit_data: None,
                 sapling_shielded_data: None,
             },
-            NetworkUpgrade::Nu5 => Transaction::V5 {
+            NetworkUpgrade::Nu5
+            | NetworkUpgrade::Nu6
+            | NetworkUpgrade::Nu6_1
+            | NetworkUpgrade::Nu6_2
+            | NetworkUpgrade::Nu6_3
+            | NetworkUpgrade::Nu7 => Transaction::V5 {
                 network_upgrade: upgrade,
                 lock_time: LockTime::unlocked(),
                 expiry_height: height,
@@ -166,7 +181,6 @@ fn generate_chain(network: &Network) -> Vec<Arc<Block>> {
                 sapling_shielded_data: None,
                 orchard_shielded_data: None,
             },
-            _ => unreachable!("the generated chain stops during NU5"),
         };
         let transactions = vec![Arc::new(transaction)];
         let merkle_root = transactions.iter().cloned().collect();
@@ -194,8 +208,15 @@ fn generate_chain(network: &Network) -> Vec<Arc<Block>> {
                 .hash()
                 .expect("the history tree exists after Heartwood activation")
                 .into(),
-            NetworkUpgrade::Nu5 => ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
-                &history_tree.hash().expect("the history tree exists at NU5"),
+            NetworkUpgrade::Nu5
+            | NetworkUpgrade::Nu6
+            | NetworkUpgrade::Nu6_1
+            | NetworkUpgrade::Nu6_2
+            | NetworkUpgrade::Nu6_3
+            | NetworkUpgrade::Nu7 => ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                &history_tree
+                    .hash()
+                    .expect("the history tree exists after NU5 activation"),
                 &block.auth_data_root(),
             )
             .into(),
@@ -437,8 +458,122 @@ impl Fixture {
         );
     }
 
+    fn redeliver(&mut self, height: Height, corruption: Option<Corruption>, marker: u8) {
+        let snapshot = self.writer.runtime.publisher().snapshot();
+        let parent = self.chain[height.0.saturating_sub(1) as usize].clone();
+        let target = self.chain[height.0 as usize].clone();
+        let lease = self
+            .writer
+            .runtime
+            .reader()
+            .validation_context(parent.hash())
+            .expect("the selected repair parent context read succeeds")
+            .expect("the selected repair parent is retained");
+        let rules =
+            HeaderRules::for_validation_lease(&lease).expect("the custom network waives PoW");
+        let batch = zakura_header_chain::prepare_headers(
+            HeaderBatchInput::new(std::slice::from_ref(&target.header)),
+            &lease,
+            &rules,
+            &SystemClock,
+        )
+        .expect("the replacement header passes production validation");
+        let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+            .bind(
+                u64::from(marker),
+                NonZeroU64::new(1).expect("one is nonzero"),
+            )
+            .into();
+        let source = SourceId::from_digest([marker; 32]);
+        let mut record = zakura_header_chain::TreeAuxRecordV1 {
+            height,
+            sapling_root: empty_sapling_root(),
+            orchard_root: empty_orchard_root(),
+            ironwood_root: empty_ironwood_root(),
+            sapling_tx_count: target.sapling_transactions_count(),
+            orchard_tx_count: target.orchard_transactions_count(),
+            ironwood_tx_count: target.ironwood_transactions_count(),
+            auth_data_root: target.auth_data_root(),
+        };
+        if let Some(corruption) = corruption {
+            corruption.apply(&mut record);
+        }
+        let mut delivery_id = [marker; 32];
+        delivery_id[..4].copy_from_slice(&height.0.to_le_bytes());
+        let delivery = AuxDelivery {
+            delivery_id: EvidenceId::from_digest(delivery_id),
+            header_hash: target.hash(),
+            source,
+            owner,
+            body_size: BodySizeHint::Unknown,
+            tree_aux: Some(record),
+            authentication: AuxAuthentication::Unauthenticated,
+        };
+        let result = self
+            .writer
+            .runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: snapshot.state_version,
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner,
+                        source,
+                        parent_hash: parent.hash(),
+                        target_tip_hash: target.hash(),
+                        completion: TargetCompletion::SelectedAuxiliaryRepair {
+                            common_ancestor: Frontier::new(
+                                Height(height.0.saturating_sub(1)),
+                                parent.hash(),
+                            ),
+                            selected_target: Frontier::new(height, target.hash()),
+                        },
+                        batch,
+                        aux: vec![delivery],
+                    })),
+                },
+                &TransitionContext {
+                    config: &self.writer.config,
+                    clock: &SystemClock,
+                    full_state_authority: None,
+                    retention_references: &[],
+                },
+            )
+            .expect("the selected auxiliary replacement commits");
+        assert!(matches!(result, ApplyResult::Committed));
+    }
+
+    fn authentications(&self, height: Height) -> Vec<AuxAuthentication> {
+        let hash = self.chain[height.0 as usize].hash();
+        let window = self
+            .writer
+            .runtime
+            .selected_aux_window(height, hash)
+            .expect("the selected auxiliary window is coherent")
+            .expect("the selected auxiliary header exists");
+        window
+            .current_deliveries
+            .into_iter()
+            .map(|delivery| delivery.authentication)
+            .collect()
+    }
+
     fn sweep(&mut self, sweeper: &mut VctAuthSweeper) {
-        sweeper.sweep(&self.finalized_state, &self.writer, &mut self.repair);
+        for _ in 0..=TOP - BODY_TIP {
+            sweeper.sweep(
+                &self.finalized_state,
+                &self.writer,
+                &mut self.repair,
+                || false,
+            );
+            if self.repair_state() != VctRootRepairState::Idle
+                || sweeper
+                    .verified
+                    .as_ref()
+                    .is_some_and(|run| run.frontier.height >= Height(LAST_PROVABLE))
+            {
+                break;
+            }
+        }
     }
 
     /// The authentication state currently recorded for the selected delivery at `height`.
@@ -559,6 +694,28 @@ fn authenticates_every_supplied_delivery_ahead_of_its_body() {
 }
 
 #[test]
+fn queued_commit_work_yields_before_authentication() {
+    let _init_guard = zakura_test::init();
+    let mut fixture = Fixture::new();
+    fixture.insert_headers(None, None);
+    let before = fixture.writer.runtime.publisher().snapshot();
+    let mut sweeper = VctAuthSweeper::default();
+
+    sweeper.sweep(
+        &fixture.finalized_state,
+        &fixture.writer,
+        &mut fixture.repair,
+        || true,
+    );
+
+    assert_eq!(fixture.writer.runtime.publisher().snapshot(), before);
+    assert_eq!(
+        fixture.authentication(Height(BODY_TIP + 1)),
+        Some(AuxAuthentication::Unauthenticated)
+    );
+}
+
+#[test]
 fn stops_below_a_height_with_no_supplied_metadata() {
     let _init_guard = zakura_test::init();
     let hole = Height(BODY_TIP + 4);
@@ -599,7 +756,7 @@ fn stops_below_a_height_with_no_supplied_metadata() {
 }
 
 #[test]
-fn evicts_a_wrong_note_commitment_root_and_arms_repair_before_the_committer() {
+fn disputes_an_ambiguous_note_commitment_boundary_and_arms_repair() {
     let _init_guard = zakura_test::init();
     let bad = Height(BODY_TIP + 3);
     let mut fixture = Fixture::new();
@@ -608,11 +765,10 @@ fn evicts_a_wrong_note_commitment_root_and_arms_repair_before_the_committer() {
 
     fixture.sweep(&mut sweeper);
 
-    assert_eq!(
+    assert!(matches!(
         fixture.authentication(bad),
-        None,
-        "the only delivery at the corrupted height is rejected, so none is selectable"
-    );
+        Some(AuxAuthentication::Disputed { .. })
+    ));
     assert!(
         fixture.is_selected(bad),
         "rejecting metadata must not invalidate or deselect its header"
@@ -620,7 +776,7 @@ fn evicts_a_wrong_note_commitment_root_and_arms_repair_before_the_committer() {
     assert_eq!(
         fixture.repair_state(),
         VctRootRepairState::Unavailable { height: bad },
-        "the eviction asks for replacement metadata immediately"
+        "the dispute asks for replacement metadata immediately"
     );
     assert!(
         fixture
@@ -633,11 +789,11 @@ fn evicts_a_wrong_note_commitment_root_and_arms_repair_before_the_committer() {
 }
 
 #[test]
-fn an_ambiguous_boundary_evicts_both_deliveries_it_implicates() {
+fn an_ambiguous_boundary_disputes_both_deliveries_without_rejecting_them() {
     let _init_guard = zakura_test::init();
     // A wrong authorizing-data root at H first shows up in H's own commitment check, which
     // mixes it with the roots folded for H - 1. Neither delivery can be cleared, so the
-    // sweep evicts both — the same resolution the committer already makes at commit time.
+    // The sweep disputes both deliveries until a replacement identifies the bad delivery.
     let bad = Height(BODY_TIP + 3);
     let predecessor = Height(bad.0 - 1);
     let mut fixture = Fixture::new();
@@ -646,15 +802,129 @@ fn an_ambiguous_boundary_evicts_both_deliveries_it_implicates() {
 
     fixture.sweep(&mut sweeper);
 
-    assert_eq!(fixture.authentication(bad), None);
-    assert_eq!(fixture.authentication(predecessor), None);
+    let bad_authentication = fixture
+        .authentication(bad)
+        .expect("the corrupt successor remains available as disputed evidence");
+    let predecessor_authentication = fixture
+        .authentication(predecessor)
+        .expect("the honest predecessor remains available as disputed evidence");
+    assert!(matches!(
+        (bad_authentication, predecessor_authentication),
+        (
+            AuxAuthentication::Disputed { evidence: bad_evidence },
+            AuxAuthentication::Disputed {
+                evidence: predecessor_evidence
+            }
+        ) if bad_evidence == predecessor_evidence
+    ));
     assert!(fixture.is_selected(bad) && fixture.is_selected(predecessor));
     assert_eq!(
         fixture.repair_state(),
         VctRootRepairState::Unavailable {
             height: predecessor
         },
-        "repair restarts at the lower of the two evicted heights"
+        "repair restarts at the lower disputed height"
+    );
+}
+
+#[test]
+fn a_replacement_successor_preserves_and_authenticates_the_honest_predecessor() {
+    let _init_guard = zakura_test::init();
+    let bad = Height(BODY_TIP + 4);
+    let predecessor = Height(bad.0 - 1);
+    let mut fixture = Fixture::new();
+    fixture.insert_headers(None, Some((bad, Corruption::AuthDataRoot)));
+    let mut sweeper = VctAuthSweeper::default();
+    fixture.sweep(&mut sweeper);
+
+    fixture.redeliver(bad, None, 0x71);
+    fixture.redeliver(bad, None, 0x72);
+    fixture.sweep(&mut sweeper);
+
+    assert!(matches!(
+        fixture.authentication(predecessor),
+        Some(AuxAuthentication::Authenticated { .. })
+    ));
+    let successor_states = fixture.authentications(bad);
+    assert!(successor_states
+        .iter()
+        .any(|state| matches!(state, AuxAuthentication::Disputed { .. })));
+    assert!(successor_states
+        .iter()
+        .any(|state| matches!(state, AuxAuthentication::Authenticated { .. })));
+    assert_eq!(fixture.repair_state(), VctRootRepairState::Idle);
+}
+
+#[test]
+fn a_replacement_predecessor_preserves_the_honest_successor() {
+    let _init_guard = zakura_test::init();
+    let bad = Height(BODY_TIP + 3);
+    let successor = Height(bad.0 + 1);
+    let mut fixture = Fixture::new();
+    fixture.insert_headers(None, Some((bad, Corruption::SaplingRoot)));
+    let mut sweeper = VctAuthSweeper::default();
+    fixture.sweep(&mut sweeper);
+
+    fixture.redeliver(bad, None, 0x73);
+    fixture.sweep(&mut sweeper);
+
+    let predecessor_states = fixture.authentications(bad);
+    assert!(predecessor_states
+        .iter()
+        .any(|state| matches!(state, AuxAuthentication::Disputed { .. })));
+    assert!(predecessor_states
+        .iter()
+        .any(|state| matches!(state, AuxAuthentication::Authenticated { .. })));
+    assert!(matches!(
+        fixture.authentication(successor),
+        Some(AuxAuthentication::Authenticated { .. })
+    ));
+    assert_eq!(fixture.repair_state(), VctRootRepairState::Idle);
+}
+
+#[test]
+fn a_fresh_manager_recreates_repair_from_a_durable_dispute() {
+    let _init_guard = zakura_test::init();
+    let bad = Height(BODY_TIP + 3);
+    let repair_height = Height(bad.0 - 1);
+    let mut fixture = Fixture::new();
+    fixture.insert_headers(None, Some((bad, Corruption::AuthDataRoot)));
+    let mut sweeper = VctAuthSweeper::default();
+    fixture.sweep(&mut sweeper);
+
+    let (repair_sender, repair_receiver) = watch::channel(VctRootRepairStatus::default());
+    fixture.repair = VctWriteManager::new(repair_sender);
+    fixture.repair_receiver = repair_receiver;
+    let mut restarted = VctAuthSweeper::default();
+    fixture.sweep(&mut restarted);
+
+    assert_eq!(
+        fixture.repair_state(),
+        VctRootRepairState::Unavailable {
+            height: repair_height
+        }
+    );
+}
+
+#[test]
+fn a_transient_anchor_gate_preserves_an_existing_repair() {
+    let _init_guard = zakura_test::init();
+    let repair_height = Height(BODY_TIP + 2);
+    let mut fixture = Fixture::new();
+    fixture.insert_headers(None, None);
+    fixture.repair.request_sweep_repair(repair_height);
+    fixture
+        .finalized_state
+        .enable_vct_exact_root_source_for_test(Height(BODY_TIP));
+    let mut sweeper = VctAuthSweeper::default();
+
+    fixture.sweep(&mut sweeper);
+
+    assert_eq!(
+        fixture.repair_state(),
+        VctRootRepairState::Unavailable {
+            height: repair_height
+        }
     );
 }
 
@@ -848,7 +1118,7 @@ fn only_supplied_auxiliary_fields_are_blamed_on_a_delivery() {
     ] {
         assert!(
             !blames_delivery(&error),
-            "{error} must never evict metadata"
+            "{error} must never reject metadata"
         );
     }
 }
@@ -856,13 +1126,13 @@ fn only_supplied_auxiliary_fields_are_blamed_on_a_delivery() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
-    /// Whatever the corruption, the sweep never authenticates a corrupted delivery, never
-    /// folds past it, and never evicts a delivery that the corruption does not implicate.
+    /// The sweep never authenticates a corrupted delivery.
+    /// The sweep never folds past a corrupted delivery.
+    /// The sweep never rejects a delivery that the corruption does not implicate.
     ///
-    /// The last clause is the safety property: a rejection is permanent, so evicting a
-    /// delivery no peer needs to replace would stall the node with no way back.
+    /// A permanent rejection must identify the rejected delivery.
     #[test]
-    fn never_authenticates_or_over_evicts_a_corrupted_delivery(
+    fn never_authenticates_or_over_rejects_a_corrupted_delivery(
         offset in 1u32..(TOP - BODY_TIP),
         corruption in prop_oneof![
             Just(Corruption::AuthDataRoot),
@@ -886,11 +1156,11 @@ proptest! {
             ),
             "a corrupted delivery at {bad:?} must never be authenticated"
         );
-        // The boundary that proves H mixes H's roots with H - 1's, so an ambiguous failure
-        // may also evict the honest delivery at H - 1. Nothing below that is implicated, and
-        // whether H - 1 survives depends on which field was corrupted.
-        let lowest_evictable = Height(bad.0.saturating_sub(1));
-        for height in (BODY_TIP + 1..lowest_evictable.0).map(Height) {
+        // The boundary for H combines roots from H and H - 1.
+        // An ambiguous failure can dispute the honest delivery at H - 1.
+        // The failure does not implicate any lower delivery.
+        let lowest_affected = Height(bad.0.saturating_sub(1));
+        for height in (BODY_TIP + 1..lowest_affected.0).map(Height) {
             prop_assert!(
                 matches!(
                     fixture.authentication(height),
@@ -926,14 +1196,14 @@ proptest! {
         for height in (BODY_TIP + 1..=TOP).map(Height) {
             prop_assert!(
                 fixture.is_selected(height),
-                "evicting metadata never deselects {height:?}"
+                "authentication state changes never deselect {height:?}"
             );
         }
         prop_assert!(
             matches!(
                 fixture.repair_state(),
                 VctRootRepairState::Unavailable { height }
-                    if height >= lowest_evictable && height <= bad
+                    if height >= lowest_affected && height <= bad
             ),
             "repair is asked for at the corruption or the one neighbour it implicates"
         );

@@ -190,6 +190,39 @@ fn root_repair_signal_advances_generation_after_rejected_replacement() {
 }
 
 #[test]
+fn a_hidden_higher_sweep_need_keeps_the_lower_committer_episode() {
+    let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let mut manager = VctWriteManager::new(tx);
+    let committer_height = Height(42);
+    let sweep_height = Height(84);
+
+    manager.request_committer_repair_for_test(committer_height);
+    let committer = *rx.borrow_and_update();
+    assert_eq!(
+        committer.state,
+        VctRootRepairState::Unavailable {
+            height: committer_height
+        }
+    );
+
+    manager.request_sweep_repair(sweep_height);
+    assert!(
+        !rx.has_changed().expect("watch channel remains open"),
+        "a hidden higher need must not restart the effective committer episode"
+    );
+
+    manager.on_commit_success();
+    let sweep = *rx.borrow_and_update();
+    assert_eq!(
+        sweep.state,
+        VctRootRepairState::Unavailable {
+            height: sweep_height
+        }
+    );
+    assert_eq!(sweep.generation, committer.generation + 1);
+}
+
+#[test]
 fn root_repair_signal_ignores_await_successor_and_clears_on_commit() {
     let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
     let mut manager = VctWriteManager::new(tx);

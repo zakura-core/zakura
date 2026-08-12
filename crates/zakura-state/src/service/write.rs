@@ -39,7 +39,7 @@ use crate::{
             header_chain::{
                 migration::{initialize_header_chain_reconciled, HeaderChainInitializationError},
                 select_vct_aux_delivery, HeaderChainReader, HeaderChainRuntime, HeaderChainStore,
-                HeaderChainStoreError,
+                HeaderChainStoreError, SelectedAuxWindow,
             },
             DiskWriteBatch, FinalizedState, NextVctBlock, VctAuthenticationProof, VctAuxRejection,
             VctAuxWindow, ZakuraDb,
@@ -65,16 +65,6 @@ mod vct_write;
 use vct_sweep::VctAuthSweeper;
 use vct_write::VctWriteManager;
 pub use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
-
-/// Everything the header-time VCT authentication sweep needs from the state write task.
-struct HeaderSweepContext<'a> {
-    /// Committed state supplying the anchor tip, its history tree, and the fast-path gate.
-    finalized_state: &'a FinalizedState,
-    /// Running verified prefix above the committed body tip.
-    sweeper: &'a mut VctAuthSweeper,
-    /// Owner of the single-slot VCT metadata repair signal.
-    repair: &'a mut VctWriteManager,
-}
 
 /// A full-state mutation staged until its matching header transition commits durably.
 #[allow(dead_code)] // Constructed when the dark header engine is attached to the writer task.
@@ -365,7 +355,24 @@ impl HeaderChainWriter {
         height: block::Height,
         hash: block::Hash,
     ) -> Result<VctAuxWindowRead, HeaderChainStoreError> {
-        let Some(window) = self.runtime.selected_aux_window(height, hash)? else {
+        let window = self.runtime.selected_aux_window(height, hash)?;
+        Self::prepare_vct_aux_window(height, window)
+    }
+
+    pub(crate) fn vct_aux_window_at(
+        &self,
+        index: usize,
+        frontier: Frontier,
+    ) -> Result<VctAuxWindowRead, HeaderChainStoreError> {
+        let window = self.runtime.selected_aux_window_at(index, frontier)?;
+        Self::prepare_vct_aux_window(frontier.height, window)
+    }
+
+    fn prepare_vct_aux_window(
+        height: block::Height,
+        window: Option<SelectedAuxWindow>,
+    ) -> Result<VctAuxWindowRead, HeaderChainStoreError> {
+        let Some(window) = window else {
             return Ok(VctAuxWindowRead::Missing { height });
         };
         let Some(current) = select_vct_aux_delivery(window.current_deliveries) else {
@@ -704,12 +711,17 @@ impl HeaderChainWriter {
             .expect("the empty auxiliary rejection returned above");
         let owner = BodyWorkAuthority::for_snapshot(&window.snapshot)
             .bind(first.owner.session_id(), first.owner.request_id());
+        let authentication = if rejection.is_ambiguous() {
+            AuxAuthentication::Disputed { evidence }
+        } else {
+            AuxAuthentication::Rejected { evidence }
+        };
         let request = TransitionRequest {
             expected_version: window.snapshot.state_version,
             event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence {
                 owner,
                 deliveries,
-                authentication: AuxAuthentication::Rejected { evidence },
+                authentication,
             })),
         };
         let authority = PreparedAuthority::for_event(&request.event)?;
@@ -743,7 +755,10 @@ impl HeaderChainWriter {
         window: &VctAuxWindow,
         proof: VctAuthenticationProof,
     ) -> Option<(EvidenceId, TransitionRequest)> {
-        if window.current.authentication != AuxAuthentication::Unauthenticated {
+        if !matches!(
+            window.current.authentication,
+            AuxAuthentication::Unauthenticated | AuxAuthentication::Disputed { .. }
+        ) {
             return None;
         }
         let VctAuthenticationProof::Successor {
@@ -1698,7 +1713,6 @@ fn receive_until_deferred_deadline<M: DeferredHeaderMaintenance>(
 fn handle_header_chain_control_message(
     header_chain: Option<&HeaderChainWriter>,
     message: NonFinalizedWriteMessage,
-    sweep: HeaderSweepContext<'_>,
 ) -> Result<(), NonFinalizedWriteMessage> {
     match message {
         NonFinalizedWriteMessage::ApplyHeaderChainInsert { prepared, rsp_tx } => {
@@ -1724,16 +1738,7 @@ fn handle_header_chain_control_message(
                         &context,
                     )
                 });
-            let committed = matches!(result, Ok(ApplyResult::Committed));
             let _ = rsp_tx.send(result);
-            // The headers this insert admitted are exactly what proves the deliveries below
-            // them, so sweep now — after answering, so authentication never delays header
-            // sync.
-            if let (Some(writer), true) = (header_chain, committed) {
-                sweep
-                    .sweeper
-                    .sweep(sweep.finalized_state, writer, sweep.repair);
-            }
             Ok(())
         }
         NonFinalizedWriteMessage::RecordHeaderChainBodyUnavailable { prepared, rsp_tx }
@@ -1857,15 +1862,9 @@ impl WriteBlockWorkerTask {
         loop {
             match non_finalized_block_write_receiver.try_recv() {
                 Ok(msg) => {
-                    if let Err(msg) = handle_header_chain_control_message(
-                        header_chain.as_ref(),
-                        msg,
-                        HeaderSweepContext {
-                            finalized_state,
-                            sweeper: &mut vct_auth_sweeper,
-                            repair: &mut vct_write_manager,
-                        },
-                    ) {
+                    if let Err(msg) =
+                        handle_header_chain_control_message(header_chain.as_ref(), msg)
+                    {
                         deferred_non_finalized_messages.push_back(msg);
                     }
                 }
@@ -1878,11 +1877,15 @@ impl WriteBlockWorkerTask {
                 None => match finalized_block_write_receiver.try_recv() {
                     Ok(block) => block,
                     Err(TryRecvError::Empty) => {
-                        // An idle committer is exactly when the sweep should work: it drains
-                        // any authentication backlog left by a restart or by header batches
-                        // larger than one sweep, without ever delaying a block commit.
+                        // The sweep runs after both block queues become empty.
+                        // The sweep yields when finalized block work arrives.
                         if let Some(writer) = header_chain.as_ref() {
-                            vct_auth_sweeper.sweep(finalized_state, writer, &mut vct_write_manager);
+                            vct_auth_sweeper.sweep(
+                                finalized_state,
+                                writer,
+                                &mut vct_write_manager,
+                                || !finalized_block_write_receiver.is_empty(),
+                            );
                         }
                         std::thread::park_timeout(Duration::from_millis(10));
                         continue;
@@ -2084,12 +2087,7 @@ impl WriteBlockWorkerTask {
                         (vct_aux_for_outcome.as_ref(), error.vct_failure())
                     {
                         let rejection = window.classify_failure(failure);
-                        let attribution = match rejection {
-                            VctAuxRejection::Current => "current",
-                            VctAuxRejection::Successor => "successor",
-                            VctAuxRejection::Ambiguous => "ambiguous",
-                            VctAuxRejection::None => "none",
-                        };
+                        let attribution = rejection.attribution_label();
                         metrics::counter!(
                             "state.vct.aux.verification_failure.count",
                             "attribution" => attribution
@@ -2104,16 +2102,10 @@ impl WriteBlockWorkerTask {
                         if let Some(writer) = header_chain.as_ref() {
                             match writer.reject_vct_aux(window, rejection, failure) {
                                 Ok(Some(ApplyResult::Committed | ApplyResult::NoChange(_))) => {
-                                    rejected_aux_height = match rejection {
-                                        VctAuxRejection::Current | VctAuxRejection::Ambiguous => {
-                                            Some(ordered_block.0.height)
-                                        }
-                                        VctAuxRejection::Successor => window
-                                            .successor
-                                            .as_ref()
-                                            .map(|successor| successor.height),
-                                        VctAuxRejection::None => None,
-                                    };
+                                    rejected_aux_height = rejection.repair_height(
+                                        ordered_block.0.height,
+                                        window.successor.as_ref().map(|successor| successor.height),
+                                    );
                                 }
                                 Ok(Some(ApplyResult::Stale(receipt))) => {
                                     tracing::debug!(

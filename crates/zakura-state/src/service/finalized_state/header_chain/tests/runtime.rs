@@ -463,6 +463,24 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         .expect("the in-memory selected auxiliary window is coherent")
         .expect("the selected child is retained in the committed engine");
     assert_eq!(window, durable_window);
+    let (_, selected_projection) = runtime
+        .selected_projection_snapshot()
+        .expect("the in-memory selected projection is coherent");
+    let child_index = selected_projection
+        .binary_search_by_key(&child.height, |frontier| frontier.height)
+        .expect("the selected projection contains the child");
+    assert_eq!(
+        runtime
+            .selected_aux_window_at(child_index, Frontier::new(child.height, child.hash))
+            .expect("the captured projection index is coherent"),
+        Some(window.clone())
+    );
+    assert_eq!(
+        runtime
+            .selected_aux_window_at(child_index + 1, Frontier::new(child.height, child.hash))
+            .expect("a stale projection index is a normal read outcome"),
+        None
+    );
     assert_eq!(
         window.snapshot,
         runtime.publisher().snapshot(),

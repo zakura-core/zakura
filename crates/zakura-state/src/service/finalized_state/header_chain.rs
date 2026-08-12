@@ -127,10 +127,12 @@ pub(crate) fn select_vct_aux_delivery(deliveries: Vec<AuxDelivery>) -> Option<Au
         })
         .min_by_key(|delivery| {
             (
-                !matches!(
-                    delivery.authentication,
-                    zakura_header_chain::AuxAuthentication::Authenticated { .. }
-                ),
+                match delivery.authentication {
+                    zakura_header_chain::AuxAuthentication::Authenticated { .. } => 0,
+                    zakura_header_chain::AuxAuthentication::Unauthenticated => 1,
+                    zakura_header_chain::AuxAuthentication::Disputed { .. } => 2,
+                    zakura_header_chain::AuxAuthentication::Rejected { .. } => 3,
+                },
                 delivery.delivery_id,
             )
         })
@@ -1580,6 +1582,26 @@ impl HeaderChainReader {
 }
 
 impl HeaderChainRuntime {
+    /// The runtime captures one generation-bound selected path.
+    pub(crate) fn selected_projection_snapshot(
+        &self,
+    ) -> Result<(EngineSnapshot, Vec<Frontier>), HeaderChainStoreError> {
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let snapshot = engine.snapshot();
+        let projection = engine.selected_projection().to_vec();
+        if projection.first().copied() != Some(snapshot.frontiers.finalized)
+            || projection.last().copied() != Some(snapshot.frontiers.header_best)
+        {
+            return Err(HeaderChainStoreError::Incoherent(
+                "selected projection disagrees with its published bounds",
+            ));
+        }
+        Ok((snapshot, projection))
+    }
+
     pub(crate) fn selected_aux_window(
         &self,
         height: block::Height,
@@ -1595,26 +1617,46 @@ impl HeaderChainRuntime {
         else {
             return Ok(None);
         };
-        let current_frontier = engine.selected_projection()[index];
-        if current_frontier.hash != hash {
+        Self::selected_aux_window_at_locked(&engine, index, Frontier::new(height, hash))
+    }
+
+    /// The runtime reads one selected window at a captured projection index.
+    pub(crate) fn selected_aux_window_at(
+        &self,
+        index: usize,
+        frontier: Frontier,
+    ) -> Result<Option<SelectedAuxWindow>, HeaderChainStoreError> {
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        Self::selected_aux_window_at_locked(&engine, index, frontier)
+    }
+
+    fn selected_aux_window_at_locked(
+        engine: &HeaderChainEngine,
+        index: usize,
+        expected: Frontier,
+    ) -> Result<Option<SelectedAuxWindow>, HeaderChainStoreError> {
+        let Some(current_frontier) = engine.selected_projection().get(index).copied() else {
+            return Ok(None);
+        };
+        if current_frontier != expected {
             return Ok(None);
         }
-        let current =
-            engine
-                .graph()
-                .header_node(hash)
-                .cloned()
-                .ok_or(HeaderChainStoreError::Incoherent(
-                    "selected projection references a missing in-memory node",
-                ))?;
-        if current.height != height || current.hash != hash {
+        let current = engine.graph().header_node(expected.hash).cloned().ok_or(
+            HeaderChainStoreError::Incoherent(
+                "selected projection references a missing in-memory node",
+            ),
+        )?;
+        if current.height != expected.height || current.hash != expected.hash {
             return Err(HeaderChainStoreError::Incoherent(
                 "selected projection disagrees with its in-memory node",
             ));
         }
-        let current_deliveries = coherent_engine_aux_deliveries(&engine, &current)?;
+        let current_deliveries = coherent_engine_aux_deliveries(engine, &current)?;
         let successor = if let Some(frontier) = engine.selected_projection().get(index + 1) {
-            let expected_height = height.next().map_err(|_| {
+            let expected_height = expected.height.next().map_err(|_| {
                 HeaderChainStoreError::Incoherent("selected auxiliary successor height overflowed")
             })?;
             let node = engine.graph().header_node(frontier.hash).cloned().ok_or(
@@ -1625,13 +1667,13 @@ impl HeaderChainRuntime {
             if frontier.height != expected_height
                 || node.height != expected_height
                 || node.hash != frontier.hash
-                || node.parent_hash != hash
+                || node.parent_hash != expected.hash
             {
                 return Err(HeaderChainStoreError::Incoherent(
                     "selected in-memory successor is not contiguous",
                 ));
             }
-            let deliveries = coherent_engine_aux_deliveries(&engine, &node)?;
+            let deliveries = coherent_engine_aux_deliveries(engine, &node)?;
             Some((node, deliveries))
         } else {
             None
@@ -4230,8 +4272,8 @@ impl HeaderChainStore {
             let key = HeaderEligibilityRootKey::try_from_bytes(&key)
                 .map_err(|_| StoreError::Incoherent("invalid eligibility-root key"))?;
             let reason = HeaderEligibilityReasonDisk::decode(&value)
-                .map_err(|_| StoreError::Incoherent("invalid eligibility-root value"))?
-                .into_domain();
+                .map_err(|_| StoreError::Incoherent("invalid eligibility-root value"))?;
+            let reason = reason.into_domain();
             if reason_kind(&reason) != key.kind || reason_evidence(&reason) != key.evidence {
                 return Err(StoreError::Incoherent(
                     "eligibility-root key/value mismatch",

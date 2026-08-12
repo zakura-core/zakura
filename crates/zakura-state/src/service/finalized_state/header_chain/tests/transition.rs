@@ -373,10 +373,6 @@ fn failed_batch_encoding_has_zero_durable_effects() {
         evidence,
         rule: rule.clone(),
     };
-    anchor
-        .eligibility
-        .direct_reasons
-        .insert(EligibilityReason::ConsensusBodyInvalid { evidence, rule });
     let mut next_metadata = metadata.clone();
     next_metadata.state_version = StateVersion::new(2);
     let changes = ChangeSet {

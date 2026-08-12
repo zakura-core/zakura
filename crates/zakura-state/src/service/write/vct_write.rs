@@ -48,12 +48,19 @@ pub(super) struct VctWriteManager {
     root_repair_status: VctRootRepairStatus,
     /// Height the committer is currently parked on for lack of a verifiable root.
     committer_need: Option<Height>,
-    /// Height whose metadata the header-time sweep evicted and has not re-verified.
+    /// The height identifies metadata that the sweep must replace.
+    /// The sweep must re-verify the replacement metadata.
     ///
     /// The sweep runs far above the committer, so this is usually the higher of the two
     /// needs. It is tracked separately because the committer clears its own need on every
     /// successful commit, which must not withdraw a repair the sweep still wants.
     sweep_need: Option<Height>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum RepairSource {
+    Committer,
+    Sweep,
 }
 
 impl Default for VctWriteManager {
@@ -78,18 +85,21 @@ impl VctWriteManager {
         }
     }
 
-    /// Ask for replacement metadata at `height` because the header-time sweep evicted it.
+    /// The method requests replacement metadata at `height`.
     pub(super) fn request_sweep_repair(&mut self, height: Height) {
+        let changed = self.sweep_need != Some(height);
         self.sweep_need = Some(height);
-        // An eviction always replaces a candidate, so it starts a new repair episode even
-        // when the effective height does not change.
-        self.republish(true);
+        self.republish(changed.then_some(RepairSource::Sweep));
     }
 
-    /// Withdraw the sweep's repair need after it re-verified the evicted height.
+    /// The method withdraws the repair need after the sweep re-verifies the height.
     pub(super) fn clear_sweep_repair(&mut self) {
         self.sweep_need = None;
-        self.republish(false);
+        self.republish(None);
+    }
+
+    pub(super) fn sweep_repair_height(&self) -> Option<Height> {
+        self.sweep_need
     }
 
     /// Test-only: raise the committer's own repair need without a parked commit attempt.
@@ -207,27 +217,36 @@ impl VctWriteManager {
         self.committer_need = Some(height);
         // Replacing a candidate starts a new repair episode even at the same height; a bare
         // re-poll of the same stall must not.
-        self.republish(had_root_candidate);
+        self.republish(had_root_candidate.then_some(RepairSource::Committer));
     }
 
     fn publish_root_repair_idle(&mut self) {
         self.committer_need = None;
-        self.republish(false);
+        self.republish(None);
     }
 
     /// Publish the lowest outstanding repair need, or idle when neither source wants one.
     ///
     /// The repair channel is a single latest-value slot, so the two independent needs are
     /// merged here: the lower height is the one whose replacement unblocks the other.
-    fn republish(&mut self, force_new_episode: bool) {
+    fn republish(&mut self, changed_source: Option<RepairSource>) {
         let effective = match (self.committer_need, self.sweep_need) {
-            (Some(committer), Some(sweep)) => Some(committer.min(sweep)),
-            (need, None) | (None, need) => need,
+            (Some(committer), Some(sweep)) if committer <= sweep => {
+                Some((committer, RepairSource::Committer))
+            }
+            (Some(_), Some(sweep)) => Some((sweep, RepairSource::Sweep)),
+            (Some(committer), None) => Some((committer, RepairSource::Committer)),
+            (None, Some(sweep)) => Some((sweep, RepairSource::Sweep)),
+            (None, None) => None,
         };
-        let state = effective.map_or(VctRootRepairState::Idle, |height| {
+        let state = effective.map_or(VctRootRepairState::Idle, |(height, _)| {
             VctRootRepairState::Unavailable { height }
         });
-        if state == self.root_repair_status.state && !force_new_episode {
+        let effective_source = effective.map(|(_, source)| source);
+        let effective_episode_changed = changed_source.is_some_and(|source| {
+            effective_source == Some(source) && state == self.root_repair_status.state
+        });
+        if state == self.root_repair_status.state && !effective_episode_changed {
             return;
         }
 

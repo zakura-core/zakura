@@ -1,19 +1,24 @@
 //! Header-time authentication for peer-supplied verified-commitment-trees (vct) metadata.
 //!
-//! The committer authenticates the auxiliary delivery it is about to fold, in the same
-//! RocksDB batch as the finalized block. That is the trust boundary and this module does not
-//! move it. What it adds is *timing*: during fast sync the header chain runs far ahead of the
-//! bodies, so a wrong root sits in the DAG unnoticed until the committer finally reaches its
-//! height. This sweep walks the selected path as headers arrive, authenticates each delivery
-//! against the one-header-later commitment that already proves it, and evicts a delivery that
-//! fails — arming metadata repair immediately instead of at commit.
+//! The committer authenticates each auxiliary delivery before it folds the delivery.
+//! The committer writes the authentication state and finalized block in one RocksDB batch.
+//! This module preserves that trust boundary.
 //!
-//! The cryptographic kernel is [`verify_supplied_roots_from_parts`], written by Roman Akhtariev
-//! for `main`'s ahead-of-body header-root authentication lane (zakura#346, #351, #352, #455). It is
-//! reused unchanged; this module only supplies the fork-aware inputs `main` did not have and
-//! records the verdict as header-chain auxiliary evidence instead of a height-keyed disk row.
+//! During fast sync, the header chain runs ahead of the block bodies.
+//! The sweep authenticates each selected delivery against its successor commitment.
+//! The sweep records attributable failures as rejections.
+//! The sweep records ambiguous failures as disputes.
+//! The sweep requests replacement metadata immediately after either failure.
+//!
+//! Roman Akhtariev wrote [`verify_supplied_roots_from_parts`] for the ahead-of-body
+//! authentication lane on `main` (zakura#346, #351, #352, #455).
+//! This module reuses that verification function.
+//! This module supplies fork-aware inputs and records header-chain auxiliary evidence.
 
-use std::cmp::Ordering;
+use std::{
+    cmp::Ordering,
+    time::{Duration, Instant},
+};
 
 use zakura_chain::{
     block::{Commitment, CommitmentError, Height},
@@ -36,13 +41,11 @@ use crate::{
     },
 };
 
-/// How many selected heights one sweep may authenticate before yielding the state writer.
-///
-/// A sweep runs on the thread that also commits blocks, so it yields after a bounded number of
-/// heights and the next sweep picks up where it stopped. The bound is a height count rather
-/// than a deadline so the work one sweep does is a function of the chain, not of machine load.
-/// Roughly one large header batch, which is what one sweep is normally asked to cover.
-const MAX_HEIGHTS_PER_SWEEP: u32 = 2_048;
+/// The sweep authenticates at most this many selected heights before it yields.
+const MAX_HEIGHTS_PER_SWEEP: u32 = 128;
+
+/// The sweep consumes at most this much writer time before it yields.
+const MAX_SWEEP_TIME: Duration = Duration::from_millis(5);
 
 /// A contiguous run of selected heights whose auxiliary roots are verified and folded.
 struct VerifiedRun {
@@ -58,51 +61,73 @@ struct VerifiedRun {
 pub(super) struct VctAuthSweeper {
     /// Verified prefix above the committed body tip, absent until the first sweep anchors.
     verified: Option<VerifiedRun>,
-    /// Height whose delivery this sweep evicted and has not yet re-verified.
-    evicted: Option<Height>,
 }
 
 impl VctAuthSweeper {
     /// Authenticate a bounded run of selected deliveries above the committed body tip.
     ///
-    /// Every step is best-effort: an unreadable window, an absent delivery, or a stale
-    /// transition stops this sweep without advancing, and the next one retries. The committer
-    /// re-verifies whatever it commits regardless, so a sweep that never runs is only slower,
-    /// never wrong.
+    /// The sweep keeps its durable repair need when a transient condition stops progress.
+    /// The committer re-verifies every delivery before it commits the matching block.
     pub(super) fn sweep(
         &mut self,
         finalized_state: &FinalizedState,
         writer: &HeaderChainWriter,
         repair: &mut VctWriteManager,
+        mut should_yield: impl FnMut() -> bool,
     ) {
+        let started = Instant::now();
         let network = finalized_state.network();
         let Some((body_tip, body_tip_hash)) = finalized_state.db.tip() else {
-            self.forget(repair);
+            self.reset_run();
             return;
         };
         // Outside the fast path the committer rebuilds every note-commitment tree from bodies,
         // so peer metadata carries no authority and there is nothing to authenticate early.
         let Ok(first) = body_tip.next() else {
-            self.forget(repair);
+            self.reset_run();
             return;
         };
         if !finalized_state.vct_requires_exact_roots(first) {
-            self.forget(repair);
+            self.reset_run();
             return;
         }
 
-        let reader = writer.runtime.reader();
+        let (selected_snapshot, selected_path) = match writer.runtime.selected_projection_snapshot()
+        {
+            Ok(selected) => selected,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "VCT: header-time authentication could not capture the selected path"
+                );
+                self.reset_run();
+                return;
+            }
+        };
+        let selected_at = |height: Height| {
+            selected_path
+                .binary_search_by_key(&height, |frontier| frontier.height)
+                .ok()
+                .map(|index| selected_path[index])
+        };
         // The run stays usable while its frontier is still the selected header at its height:
         // the selected path is a chain, so a still-selected frontier proves its whole verified
         // ancestry is still selected. Anything else — the committer passing the frontier, or a
         // reorg under it — rebuilds from the committed tip.
         let anchored = self.verified.as_ref().is_some_and(|run| {
             run.frontier.height >= body_tip
-                && reader.selected_hash(run.frontier.height).ok().flatten()
-                    == Some(run.frontier.hash)
+                && selected_at(run.frontier.height) == Some(run.frontier)
         });
-        if !anchored && !self.anchor(finalized_state, &reader, &network, body_tip, body_tip_hash) {
-            self.forget(repair);
+        if !anchored
+            && !self.anchor(
+                finalized_state,
+                &network,
+                selected_at(body_tip),
+                body_tip,
+                body_tip_hash,
+            )
+        {
+            self.reset_run();
             return;
         }
 
@@ -111,18 +136,20 @@ impl VctAuthSweeper {
             .take()
             .expect("an unanchored sweep returned above");
         let mut budget = MAX_HEIGHTS_PER_SWEEP;
-        let mut cursor = run.frontier.height.next().ok().and_then(|height| {
-            reader
-                .selected_hash(height)
-                .ok()
-                .flatten()
-                .map(|hash| (height, hash))
-        });
+        let Ok(run_index) =
+            selected_path.binary_search_by_key(&run.frontier.height, |frontier| frontier.height)
+        else {
+            self.reset_run();
+            return;
+        };
+        let mut cursor_index = run_index + 1;
 
-        while let Some((height, hash)) = cursor {
-            if budget == 0 {
+        while let Some(frontier) = selected_path.get(cursor_index).copied() {
+            if budget == 0 || started.elapsed() >= MAX_SWEEP_TIME || should_yield() {
                 break;
             }
+            let height = frontier.height;
+            let hash = frontier.hash;
             budget -= 1;
             if !finalized_state.vct_requires_exact_roots(height) {
                 break;
@@ -138,11 +165,14 @@ impl VctAuthSweeper {
                 break;
             }
 
-            let window = match writer.vct_aux_window(height, hash) {
+            let window = match writer.vct_aux_window_at(cursor_index, frontier) {
                 Ok(VctAuxWindowRead::Ready(window)) => *window,
                 // No selected delivery carries roots for this height yet. The committer's own
                 // stall path already asks for a re-delivery when it reaches the hole.
-                Ok(VctAuxWindowRead::Missing { .. }) => break,
+                Ok(VctAuxWindowRead::Missing { height }) => {
+                    repair.request_sweep_repair(height);
+                    break;
+                }
                 Err(error) => {
                     tracing::warn!(
                         ?error,
@@ -154,14 +184,26 @@ impl VctAuthSweeper {
             };
             // Without the successor header there is no commitment that proves these roots.
             let Some(successor) = window.successor.clone() else {
+                if let Some(height) = window.successor_height {
+                    repair.request_sweep_repair(height);
+                }
                 break;
             };
+            if disputed_pair(&window, &successor) {
+                repair.request_sweep_repair(height);
+                break;
+            }
             let (Some(current_roots), Some(successor_roots)) = (
                 supplied_roots(&window.current),
                 successor.delivery.as_ref().and_then(supplied_roots),
             ) else {
+                repair.request_sweep_repair(height);
                 break;
             };
+
+            if window.snapshot.header_generation != selected_snapshot.header_generation {
+                break;
+            }
 
             match verify_supplied_roots_from_parts(
                 &network,
@@ -178,20 +220,20 @@ impl VctAuthSweeper {
                     run.history_tree = verified.history_tree().clone();
                     run.frontier = Frontier::new(height, hash);
                     metrics::counter!("state.vct.aux.sweep.authenticated.count").increment(1);
-                    cursor = Some((successor.height, successor.hash));
+                    cursor_index += 1;
                 }
                 Err((failed_height, error)) => {
-                    self.evict(writer, repair, &window, &successor, failed_height, &error);
+                    self.record_failure(writer, repair, &window, &successor, failed_height, &error);
                     break;
                 }
             }
         }
 
-        if self
-            .evicted
-            .is_some_and(|evicted| evicted <= run.frontier.height)
+        if repair
+            .sweep_repair_height()
+            .is_some_and(|height| height <= run.frontier.height)
         {
-            self.clear_eviction(repair);
+            repair.clear_sweep_repair();
         }
         metrics::gauge!("state.vct.aux.sweep.frontier.height")
             .set(f64::from(run.frontier.height.0));
@@ -202,12 +244,12 @@ impl VctAuthSweeper {
     fn anchor(
         &mut self,
         finalized_state: &FinalizedState,
-        reader: &crate::service::finalized_state::header_chain::HeaderChainReader,
         network: &Network,
+        selected_body_tip: Option<Frontier>,
         body_tip: Height,
         body_tip_hash: zakura_chain::block::Hash,
     ) -> bool {
-        if reader.selected_hash(body_tip).ok().flatten() != Some(body_tip_hash) {
+        if selected_body_tip != Some(Frontier::new(body_tip, body_tip_hash)) {
             // The selected projection has not caught up with the committed body tip, so there
             // is no branch to sweep yet.
             return false;
@@ -240,8 +282,9 @@ impl VctAuthSweeper {
         true
     }
 
-    /// Record one failed delivery, mark it rejected, and ask for replacement metadata now.
-    fn evict(
+    /// The method records one failed delivery.
+    /// The method requests replacement metadata.
+    fn record_failure(
         &mut self,
         writer: &HeaderChainWriter,
         repair: &mut VctWriteManager,
@@ -265,12 +308,7 @@ impl VctAuthSweeper {
             );
             return;
         };
-        let attribution = match rejection {
-            VctAuxRejection::Current => "current",
-            VctAuxRejection::Successor => "successor",
-            VctAuxRejection::Ambiguous => "ambiguous",
-            VctAuxRejection::None => "none",
-        };
+        let attribution = rejection.attribution_label();
         metrics::counter!(
             "state.vct.aux.sweep.rejected.count",
             "attribution" => attribution
@@ -286,15 +324,11 @@ impl VctAuthSweeper {
 
         match writer.reject_vct_aux(window, rejection, failure) {
             Ok(Some(ApplyResult::Committed | ApplyResult::NoChange(_))) => {
-                let evicted = match rejection {
-                    // An ambiguous boundary rejects both deliveries, and repair restarts at
-                    // the lower of the two.
-                    VctAuxRejection::Current | VctAuxRejection::Ambiguous => height,
-                    VctAuxRejection::Successor => successor.height,
-                    VctAuxRejection::None => return,
+                let Some(repair_height) = rejection.repair_height(height, Some(successor.height))
+                else {
+                    return;
                 };
-                self.evicted = Some(evicted);
-                repair.request_sweep_repair(evicted);
+                repair.request_sweep_repair(repair_height);
             }
             Ok(Some(result)) => {
                 tracing::debug!(?result, "VCT: header-time rejection did not commit");
@@ -309,17 +343,20 @@ impl VctAuthSweeper {
         }
     }
 
-    /// Drop the verified run and any repair need it owns.
-    fn forget(&mut self, repair: &mut VctWriteManager) {
+    /// The method drops only the volatile verified run.
+    fn reset_run(&mut self) {
         self.verified = None;
-        self.clear_eviction(repair);
     }
+}
 
-    fn clear_eviction(&mut self, repair: &mut VctWriteManager) {
-        if self.evicted.take().is_some() {
-            repair.clear_sweep_repair();
-        }
-    }
+fn disputed_pair(window: &VctAuxWindow, successor: &NextVctBlock) -> bool {
+    matches!(
+        (window.current.authentication, successor.delivery.map(|delivery| delivery.authentication)),
+        (
+            zakura_header_chain::AuxAuthentication::Disputed { evidence: current },
+            Some(zakura_header_chain::AuxAuthentication::Disputed { evidence: next })
+        ) if current == next
+    )
 }
 
 /// Record one verified delivery as authenticated by its exact one-header-later boundary.
@@ -374,9 +411,7 @@ fn promote(
 
 /// Attribute a sweep verification failure to the exact delivery that can be blamed for it.
 ///
-/// Returns `None` when no auxiliary delivery is provably at fault, which leaves both
-/// deliveries alone: a wrong rejection is permanent and would evict metadata that no peer
-/// needs to replace.
+/// The function returns `None` when the evidence does not identify a faulty delivery.
 fn attribute(
     window: &VctAuxWindow,
     height: Height,
@@ -420,8 +455,8 @@ fn attribute(
         // fields, which no other delivery can influence. The committer never sees this case
         // because its successor item carries no roots.
         SuppliedRootsError::InvalidHeaderCommitment(error) if blames_delivery(error) => {
-            let unauthenticated = successor_delivery_is_unauthenticated(window);
-            unauthenticated.then_some((
+            let untrusted = successor_delivery_is_untrusted(window);
+            untrusted.then_some((
                 VctCommitFailure::SuccessorBoundary,
                 VctAuxRejection::Successor,
             ))
@@ -447,13 +482,17 @@ fn blames_delivery(error: &CommitmentError) -> bool {
     )
 }
 
-fn successor_delivery_is_unauthenticated(window: &VctAuxWindow) -> bool {
+fn successor_delivery_is_untrusted(window: &VctAuxWindow) -> bool {
     window
         .successor
         .as_ref()
         .and_then(|successor| successor.delivery)
         .is_some_and(|delivery| {
-            delivery.authentication == zakura_header_chain::AuxAuthentication::Unauthenticated
+            matches!(
+                delivery.authentication,
+                zakura_header_chain::AuxAuthentication::Unauthenticated
+                    | zakura_header_chain::AuxAuthentication::Disputed { .. }
+            )
         })
 }
 

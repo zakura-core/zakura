@@ -53,6 +53,26 @@ pub enum AuxAuthentication {
         /// Stable rejection evidence.
         evidence: EvidenceId,
     },
+    /// A boundary failure does not identify which of two deliveries is wrong.
+    Disputed {
+        /// Stable evidence binds both deliveries to one failed boundary.
+        evidence: EvidenceId,
+    },
+}
+
+impl AuxAuthentication {
+    pub(crate) fn permits_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Unauthenticated, next) if next != Self::Unauthenticated
+        ) || matches!(
+            (self, next),
+            (
+                Self::Disputed { .. },
+                Self::Authenticated { .. } | Self::Rejected { .. }
+            )
+        )
+    }
 }
 
 /// Hash-keyed auxiliary delivery with complete provenance.

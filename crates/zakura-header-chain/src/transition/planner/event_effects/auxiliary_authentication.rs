@@ -62,7 +62,10 @@ pub(super) fn apply(
         if existing.authentication == event.authentication {
             continue;
         }
-        if existing.authentication != crate::AuxAuthentication::Unauthenticated {
+        if !existing
+            .authentication
+            .permits_transition_to(event.authentication)
+        {
             return Err(InvalidTransitionEvidence::Auxiliary(
                 AuxiliaryViolation::ImmutableAuthentication,
             )

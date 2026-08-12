@@ -3,12 +3,39 @@
 use zakura_chain::block;
 
 use crate::{
-    BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch, BodyRuleId, BodySizeHint,
-    BodyUnavailableSummary, BodyVerificationOutcome, ConsensusBodyInvalid, EventAdmission,
-    EvidenceId, Frontier, MigratedPinRefutation, OperatorInvalidationId, OperatorReconsider,
-    SourceId, TransientBodyFailure, TransientBodyFailureKind, TransitionEvent, TransitionTypeError,
-    VerifiedBodyEvidence,
+    AuxAuthentication, BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch, BodyRuleId,
+    BodySizeHint, BodyUnavailableSummary, BodyVerificationOutcome, ConsensusBodyInvalid,
+    EventAdmission, EvidenceId, Frontier, MigratedPinRefutation, OperatorInvalidationId,
+    OperatorReconsider, SourceId, TransientBodyFailure, TransientBodyFailureKind, TransitionEvent,
+    TransitionTypeError, VerifiedBodyEvidence,
 };
+
+#[test]
+fn auxiliary_authentication_transitions_only_refine_evidence() {
+    let evidence = EvidenceId::from_digest([1; 32]);
+    let other_evidence = EvidenceId::from_digest([2; 32]);
+    let disputed = AuxAuthentication::Disputed { evidence };
+    let authenticated = AuxAuthentication::Authenticated {
+        evidence: other_evidence,
+        boundary_hash: block::Hash([3; 32]),
+    };
+    let rejected = AuxAuthentication::Rejected {
+        evidence: other_evidence,
+    };
+
+    for next in [disputed, authenticated, rejected] {
+        assert!(AuxAuthentication::Unauthenticated.permits_transition_to(next));
+    }
+    for next in [authenticated, rejected] {
+        assert!(disputed.permits_transition_to(next));
+    }
+    for current in [disputed, authenticated, rejected] {
+        assert!(!current.permits_transition_to(AuxAuthentication::Unauthenticated));
+        assert!(!current.permits_transition_to(disputed));
+    }
+    assert!(!authenticated.permits_transition_to(rejected));
+    assert!(!rejected.permits_transition_to(authenticated));
+}
 
 #[test]
 fn body_size_hints_enforce_zero_sentinel_and_canonical_limit() {

@@ -18,7 +18,10 @@ on:
       - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+      - .cargo/config.toml
       - .config/nextest.toml
+      - rust-toolchain.toml
+      - .github/actions/setup-zakura-build/**
       - .github/workflows/tests-unit.yml
 
   # Run the full unit-test suite when a PR is queued so the merge queue validates
@@ -76,6 +79,8 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           TOTAL_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
         run: |
+          compare_files_jq='(if (.files | length) >= 300 then ".github/workflows/tests-unit.yml" else empty end), (.files[] | .filename, (.previous_filename // empty))'
+
           case "$EVENT_NAME" in
             pull_request)
               # The PR files endpoint returns at most 3,000 files. Run the full
@@ -90,25 +95,27 @@ jobs:
 
               changed=$(gh api --paginate \
                 "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
-                --jq '.[].filename')
+                --jq '.[] | .filename, (.previous_filename // empty)')
               ;;
             push)
               # The first push of a branch and force-pushes that orphan the old
               # tip have no usable `before` commit. Compare against the default
-              # branch in that case.
+              # branch in that case. The compare endpoint caps its file list at
+              # 300, so the jq expression emits this workflow's own relevant
+              # path at that limit and conservatively runs the config suite.
               if [[ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]] || \
                  ! changed=$(gh api \
                    "repos/${GITHUB_REPOSITORY}/compare/${BEFORE_SHA}...${GITHUB_SHA}" \
-                   --jq '.files[].filename'); then
+                   --jq "$compare_files_jq"); then
                 changed=$(gh api \
                   "repos/${GITHUB_REPOSITORY}/compare/${DEFAULT_BRANCH}...${GITHUB_SHA}" \
-                  --jq '.files[].filename')
+                  --jq "$compare_files_jq")
               fi
               ;;
             merge_group)
               changed=$(gh api \
                 "repos/${GITHUB_REPOSITORY}/compare/${MERGE_BASE_SHA}...${MERGE_HEAD_SHA}" \
-                --jq '.files[].filename')
+                --jq "$compare_files_jq")
               ;;
             workflow_dispatch)
               echo "config=true" >> "$GITHUB_OUTPUT"
@@ -152,7 +159,7 @@ jobs:
           # the build archive consumed by zakura-config, so `config` implies
           # `rust` even for paths outside the old workflow-level filter.
           if [[ "$config" == "true" ]] || \
-             grep -qE '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/zakura-chain/src/parameters/checkpoint/main-checkpoints\.txt$|^crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier\.(bin|json)$|^\.config/nextest\.toml$|^\.github/workflows/tests-unit\.yml$)' <<< "$changed"; then
+             grep -qE '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/zakura-chain/src/parameters/checkpoint/main-checkpoints\.txt$|^crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier\.(bin|json)$|^\.cargo/config\.toml$|^\.config/nextest\.toml$|^\.github/workflows/tests-unit\.yml$)' <<< "$changed"; then
             rust=true
           else
             rust=false

@@ -15,6 +15,7 @@ on:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
       - .cargo/config.toml
+      - deny.toml
       - .github/workflows/lint.yml
       - qa/supply-chain/**
       - "scripts/**.sh"
@@ -89,9 +90,9 @@ jobs:
 
           changed=$(gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
-            --jq '.[].filename')
+            --jq '.[] | .filename, (.previous_filename // empty)')
 
-          if grep -qE '(\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^\.github/workflows/lint\.yml$|^qa/supply-chain/|^scripts/.*\.sh$|^\.github/workflows/scripts/|^\.github/actions/|^deploy/|^\.github/scripts/)' <<< "$changed"; then
+          if grep -qE '(\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^deny\.toml$|^\.github/workflows/lint\.yml$|^qa/supply-chain/|^scripts/.*\.sh$|^\.github/workflows/scripts/|^\.github/actions/|^deploy/|^\.github/scripts/)' <<< "$changed"; then
             echo "lint=true" >> "$GITHUB_OUTPUT"
           else
             echo "lint=false" >> "$GITHUB_OUTPUT"

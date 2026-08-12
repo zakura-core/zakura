@@ -145,7 +145,7 @@ jobs:
         leg: ${{ fromJSON(needs.plan.outputs.legs) }}
     steps:
       - name: Checkout (for the run + digest scripts)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
 
@@ -236,7 +236,7 @@ jobs:
 
       - name: Upload leg artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
         with:
           name: zakura-perf-bench-${{ github.run_id }}-${{ matrix.leg.leg }}
           path: leg-out/
@@ -261,7 +261,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout (for the digest script)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
 
@@ -307,7 +307,7 @@ jobs:
 
       - name: Upload compare artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
         with:
           name: zakura-perf-bench-${{ github.run_id }}-compare
           path: compare-out/

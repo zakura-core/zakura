@@ -41,7 +41,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
 
@@ -168,7 +168,7 @@ jobs:
       # Each run saves under a unique key and restores the most recent one by prefix.
       - name: Restore audit alert state
         if: env.ACTION == 'audit'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: .audit-alert-state
           key: continuous-sync-audit-state-${{ github.run_id }}
@@ -203,7 +203,7 @@ jobs:
         if: always() && env.ACTION == 'audit'
         # A lost state save only costs one duplicate reminder; never fail the job for it.
         continue-on-error: true
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: .audit-alert-state
           key: continuous-sync-audit-state-${{ github.run_id }}

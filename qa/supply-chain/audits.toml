@@ -1314,6 +1314,12 @@ criteria = "safe-to-deploy"
 version = "0.23.0"
 notes = "Reviewed all packaged source and manifest. This no_std crate contains only pairing-engine, curve-affine, Miller-loop, and final-exponentiation trait definitions over the separately policy-checked group crate. It has no unsafe code, build script, runtime I/O, or ambient capabilities. Library and documentation targets passed; the package defines no tests."
 
+[[audits.parity-scale-codec-derive]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "3.7.5"
+notes = "Reviewed all packaged source and manifest. The procedural macros validate compiler-supplied tokens and emit type-checked Encode, Decode, Compact, and MaxEncodedLen implementations; enum indices receive compile-time range and duplicate checks, and length sums saturate. The sole generated unsafe path is repr(transparent) decode_into: it restricts the optimization to structs with unmodified fields, asserts total size and non-ZST count, calls each field's Decode::decode_into, and returns the codec's DecodeFinished only after all fields succeed. No build script, network, process execution, or direct filesystem I/O; crate-path discovery delegates to separately policy-checked proc-macro-crate. The all-feature package compiled, and 128 exact codec tests plus 29 derive-focused functional tests passed. Four published doctests omit their runtime dev dependency, and compile-fail snapshots differed only in current rustc diagnostic wording."
+
 [[audits.paste]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1984,6 +1990,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.6.0"
 notes = "Reviewed all packaged bindgen output, manifest, and build script. The no_std crate contains only repr(C) SystemConfiguration types, constants, callback signatures, and unsafe extern declarations; its build script reads Cargo's TARGET solely to link the Apple framework. It performs no runtime I/O or process execution of its own. The library target compiled on Apple; the package defines no tests."
+
+[[audits.tagptr]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.0"
+notes = "Reviewed all packaged source, manifest, documentation, and tests. Safe operations manipulate tagged raw-pointer representations without dereferencing them; reference creation remains unsafe, non-null composition rejects values that become null after tag stripping, and potentially pointer-corrupting arithmetic is documented at the raw-pointer boundary. Atomic operations delegate ordering to AtomicUsize, while the repr(transparent) get_mut cast requires an exclusive reference. No dependencies, build script, I/O, or ambient capability. All 10 unit tests and 24 doctests passed in both debug and release modes."
 
 [[audits.tempfile]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

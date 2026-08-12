@@ -743,10 +743,6 @@ notes = "Audit hold: the Windows get_proc_address helper wraps GetProcAddress's 
 version = "3.7.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.parity-scale-codec-derive]]
-version = "3.7.5"
-criteria = "safe-to-deploy"
-
 [[exemptions.parking_lot]]
 version = "0.12.5"
 criteria = "safe-to-deploy"
@@ -1086,10 +1082,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.system-configuration]]
 version = "0.6.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.tagptr]]
-version = "0.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tar]]

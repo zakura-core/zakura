@@ -124,10 +124,6 @@ criteria = "safe-to-deploy"
 version = "0.8.9"
 criteria = "safe-to-deploy"
 
-[[exemptions.axum-core]]
-version = "0.5.6"
-criteria = "safe-to-deploy"
-
 [[exemptions.backtrace]]
 version = "0.3.76"
 criteria = "safe-to-deploy"
@@ -230,10 +226,6 @@ notes = "Sentry 0.47 upgrade"
 version = "0.16.4"
 criteria = "safe-to-deploy"
 
-[[exemptions.console-api]]
-version = "0.8.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.console-subscriber]]
 version = "0.4.1"
 criteria = "safe-to-deploy"
@@ -255,10 +247,6 @@ version = "0.10.1"
 criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade"
-
-[[exemptions.crc32fast]]
-version = "1.5.0"
-criteria = "safe-to-deploy"
 
 [[exemptions.criterion]]
 version = "0.5.1"
@@ -425,6 +413,7 @@ criteria = "safe-to-deploy"
 [[exemptions.hash32]]
 version = "0.2.1"
 criteria = "safe-to-deploy"
+notes = "Audit held: the safe default constructor for the public Murmur3 hasher creates its [u8; 4] buffer with deprecated mem::uninitialized, which is undefined behavior because integer bytes must be initialized even when the current index prevents an immediate read. Retain the exemption pending replacement with initialized storage or MaybeUninit with a proven initialization boundary."
 
 [[exemptions.hashbrown]]
 version = "0.14.5"
@@ -490,6 +479,7 @@ criteria = "safe-to-deploy"
 [[exemptions.icu_normalizer_data]]
 version = "2.2.0"
 criteria = "safe-to-deploy"
+notes = "Audit held: the generated data package embeds 18 unsafe unchecked zerovec and ICU trie/list constructors across 7 opaque .rs.data files. Compilation checks syntax and types but does not establish the byte-layout invariants required by those constructors; retain the exemption pending generator provenance or independent blob validation."
 
 [[exemptions.icu_properties]]
 version = "2.2.0"
@@ -498,6 +488,7 @@ criteria = "safe-to-deploy"
 [[exemptions.icu_properties_data]]
 version = "2.2.0"
 criteria = "safe-to-deploy"
+notes = "Audit held: the generated data package embeds 249 unsafe unchecked zerovec and ICU trie/list constructors across 137 opaque .rs.data files. Compilation checks syntax and types but does not establish the byte-layout invariants required by those constructors; retain the exemption pending generator provenance or independent blob validation."
 
 [[exemptions.icu_provider]]
 version = "2.2.0"
@@ -691,10 +682,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.netdev]]
 version = "0.37.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.netlink-packet-core]]
-version = "0.7.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.netlink-packet-route]]
@@ -1027,10 +1014,6 @@ notes = "Sentry 0.47 upgrade"
 version = "0.103.13"
 criteria = "safe-to-deploy"
 
-[[exemptions.rusty-fork]]
-version = "0.3.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.ryu]]
 version = "1.0.23"
 criteria = "safe-to-deploy"
@@ -1230,10 +1213,6 @@ criteria = "safe-to-deploy"
 version = "1.52.3"
 criteria = "safe-to-deploy"
 
-[[exemptions.tokio-rustls]]
-version = "0.26.4"
-criteria = "safe-to-deploy"
-
 [[exemptions.tokio-stream]]
 version = "0.1.18"
 criteria = "safe-to-deploy"
@@ -1268,10 +1247,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tracing]]
 version = "0.1.44"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-appender]]
-version = "0.2.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.tracing-core]]
@@ -1309,6 +1284,7 @@ criteria = "safe-to-deploy"
 [[exemptions.vergen-lib]]
 version = "9.1.0"
 criteria = "safe-to-deploy"
+notes = "Audit held: the optional emit_and_set feature exposes a safe method that calls unsafe process-environment mutation without requiring callers to guarantee that no other thread reads or writes the environment. Zakura does not enable that feature, but a version-wide safe-to-deploy certification is deferred pending an unsafe API boundary or internal synchronization."
 
 [[exemptions.wait-timeout]]
 version = "0.2.0"

@@ -66,6 +66,12 @@ criteria = "safe-to-deploy"
 delta = "0.6.20 -> 0.7.5"
 
 [[audits.axum-core]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.5.6"
+notes = "Reviewed all packaged source and manifest. The crate forbids unsafe code and implements request extraction, response conversion, body limits, and Tower service adapters over caller-supplied HTTP values without filesystem, process, environment, or direct network access. There is no build script, and the all-features library target compiled. Published unit and documentation tests require workspace-only axum, axum-extra, and axum-macros development dependencies that Cargo omits from this standalone package."
+
+[[audits.axum-core]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.4 -> 0.4.3"
@@ -274,6 +280,12 @@ version = "0.15.25"
 notes = "Reviewed all packaged source, manifest, and tests. The crate has no unsafe code; its filesystem, environment, HTTP, and asynchronous source capabilities are explicit builder inputs or feature-gated source types, and parsed values flow through checked path and type conversions. It has no build script or implicit process execution. All 13 unit tests and 7 doctests passed with all features."
 
 [[audits.console-api]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.8.1"
+notes = "Reviewed all packaged source, protobuf schemas, generated bindings, manifest, and bootstrap test. Runtime code consists of safe Prost messages and Tonic client/server types with no build script, filesystem access, process execution, or ambient network connection. The bootstrap test successfully regenerated every binding and produced no diff when run from an initialized temporary Git repository."
+
+[[audits.console-api]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.6.0 -> 0.7.0"
@@ -352,6 +364,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "2.5.0"
 notes = "Reviewed all packaged source, manifest, and tests. This dependency-free no_std crate forbids unsafe code and contains typed CRC algorithm parameters and aliases only, with no build script, runtime I/O, or ambient capabilities. All 112 standard check-vector tests passed."
+
+[[audits.crc32fast]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.5.0"
+notes = "Reviewed all packaged source, manifest, build script, baseline and accelerated implementations, and tests. Runtime CPU detection gates every target-feature call; x86 unaligned vector loads consume only complete 16-byte chunks after a 128-byte length check, and AArch64 operates on slices returned by align_to. The build script only invokes the configured rustc with --version. All 6 unit tests and 2 doctests passed with all features."
 
 [[audits.criterion-plot]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1103,6 +1121,12 @@ criteria = "safe-to-deploy"
 version = "0.2.3"
 notes = "Reviewed all packaged source and manifest. The attribute macros validate single-field enum variants and distinct field types before generating type-checked From and TryFrom implementations, or parse and clone caller-supplied named fields into enum variants. They contain no unsafe code, build script, runtime I/O, or ambient capability, and the library target passed."
 
+[[audits.netlink-packet-core]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.7.0"
+notes = "Reviewed all packaged source, manifest, packet framing, parsing, serialization, and tests. The safe parser validates the minimum header, advertised packet length, and backing slice before payload access; unchecked constructors document that malformed buffers may panic but contain no unsafe code. Runtime behavior is limited to caller-provided byte slices, with no build script or ambient I/O. All 10 library tests passed after omitting the Linux-only netlink-packet-route example dependency on macOS."
+
 [[audits.nix]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -1556,6 +1580,12 @@ criteria = "safe-to-deploy"
 version = "1.0.23"
 notes = "Reviewed all packaged source, manifest, build script, and tests. The build script invokes only Cargo's configured compiler or wrapper with --version and writes parsed version metadata to OUT_DIR; the proc macro then parses predicates and conditionally emits caller tokens. No unsafe code or network access. All 7 applicable tests passed; one nightly-only UI test was ignored as declared."
 
+[[audits.rusty-fork]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.1"
+notes = "Reviewed all packaged source, manifest, subprocess coordination, command-line filtering, and tests. This safe-code test helper only respawns the current test executable, bounds recursive nesting, captures output in an anonymous temporary file, and exposes command modification explicitly to its caller; it has no build script or network access. All 13 unit tests and 3 doctests passed with all features."
+
 [[audits.salsa20]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1892,6 +1922,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "2.3.0 -> 2.4.0"
 
+[[audits.tokio-rustls]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.26.4"
+notes = "Reviewed all packaged source, manifest, client/server handshake state machines, stream adapters, and local tests. The crate contains no unsafe code or build script and performs I/O only through caller-supplied async streams while delegating TLS cryptography and protocol validation to separately policy-checked rustls providers. All 20 local default-provider tests and all 23 ring-provider tests passed against Zakura's rustls 0.23.41; external badssl network tests were not run. Enabling both providers simultaneously requires explicit rustls provider selection by design, which Zakura supplies when building its TLS configuration."
+
 [[audits.tokio-stream]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -2069,6 +2105,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.4.0"
 notes = "Reviewed all packaged source, manifest, and tests. This test utility connects mock Tower services through Tokio channels, tracks capacity and wakers behind mutexes, and retains response ownership in one-shot senders; it contains no unsafe code, build script, filesystem or network access, or process execution. Both integration tests passed."
+
+[[audits.tracing-appender]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.5"
+notes = "Reviewed all packaged source, manifest, rolling-file retention, symlink handling, worker thread, and tests. The crate has no unsafe code or build script; filesystem creation and deletion are explicitly configured by the caller and retention filters candidates by file type and configured name boundaries. Non-blocking output uses a capacity-bounded channel, saturating drop counts, and bounded shutdown waits. All 17 enabled unit tests and 32 doctests passed with all features; 1 timing test remained ignored as published."
 
 [[audits.tracing-attributes]]
 who = "OpenAI Codex <noreply@openai.com>"

@@ -1,12 +1,19 @@
 ---
-description: Keep core Rust code semantically named, discoverable, cohesive, and understandable as a black box
-globs: crates/{zakura-chain,zakura-consensus,zakura-header-chain,zakura-network,zakura-rpc,zakura-script,zakura-state}/**/*.rs
-alwaysApply: false
+name: core-rust-readability
+description: >-
+  Keep core Rust code semantically named, discoverable, cohesive, and
+  understandable as a black box. Prefer facade modules with private children
+  over overloaded files. Use when modifying key Rust crates (zakura-chain,
+  zakura-consensus, zakura-header-chain, zakura-network, zakura-rpc,
+  zakura-script, zakura-state), or when the user asks for readability,
+  naming, module decomposition, or facade-package refactors in those crates.
 ---
 
 # Human-Readable Core Rust
 
-Write for a human reviewer who should understand the architecture and each API without asking an AI to reconstruct intent.
+Apply this skill when editing the key Rust crates listed in the description.
+Write for a human reviewer who should understand the architecture and each API
+without asking an AI to reconstruct intent.
 
 ## Semantic Naming
 

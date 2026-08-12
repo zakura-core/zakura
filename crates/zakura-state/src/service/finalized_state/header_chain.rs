@@ -1877,8 +1877,11 @@ impl HeaderChainRuntime {
             retention_references: lease_references.as_ref(),
         };
 
-        let first =
-            transition_engine.apply(first_request, &first_context, DurableTransitionFacts::None)?;
+        let first = transition_engine.plan_transition(
+            first_request,
+            &first_context,
+            DurableTransitionFacts::None,
+        )?;
         if first.cause() == TransitionCause::ResourceStalled {
             return Err(HeaderChainStoreError::Incoherent(
                 "checkpoint auxiliary authentication exhausted header resources",
@@ -1891,7 +1894,7 @@ impl HeaderChainRuntime {
         // The publisher continues to expose the durable snapshot.
         // The writer can stage the first transition without exposing it.
         // The runtime reloads the unchanged durable engine after an error before the atomic write.
-        if let Err(error) = transition_engine.apply_committed(first) {
+        if let Err(error) = transition_engine.install_committed_transition(first) {
             let error = restore_transition_engine_after_staging_error(
                 &self.store,
                 &mut transition_engine,
@@ -1901,7 +1904,7 @@ impl HeaderChainRuntime {
         }
 
         checkpoint_request.expected_version = transition_engine.snapshot().state_version;
-        let checkpoint = match transition_engine.apply(
+        let checkpoint = match transition_engine.plan_transition(
             checkpoint_request,
             &checkpoint_context,
             DurableTransitionFacts::HeaderInsertion {
@@ -1930,7 +1933,7 @@ impl HeaderChainRuntime {
             return Err(error);
         }
 
-        let current = checkpoint.change_set().metadata.snapshot();
+        let current = checkpoint.after();
         let batch = match self
             .store
             .batch_for_combined(checkpoint.change_set(), batch)
@@ -1953,7 +1956,7 @@ impl HeaderChainRuntime {
             );
             return Err(error);
         }
-        if let Err(error) = transition_engine.apply_committed(checkpoint) {
+        if let Err(error) = transition_engine.install_committed_transition(checkpoint) {
             let error = restore_transition_engine_after_staging_error(
                 &self.store,
                 &mut transition_engine,
@@ -2128,16 +2131,17 @@ impl HeaderChainRuntime {
             full_state_authority: Some(&state_authority),
             retention_references: base_context.retention_references,
         };
-        let transition = match transition_engine.apply(request, &transition_context, durable) {
-            Ok(plan) => plan,
-            Err(TransitionFailure::Stale { current }) => {
-                return Ok(ApplyResult::Stale(StaleReceipt {
-                    current_version: current,
-                    branch,
-                }));
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let transition =
+            match transition_engine.plan_transition(request, &transition_context, durable) {
+                Ok(plan) => plan,
+                Err(TransitionFailure::Stale { current }) => {
+                    return Ok(ApplyResult::Stale(StaleReceipt {
+                        current_version: current,
+                        branch,
+                    }));
+                }
+                Err(error) => return Err(error.into()),
+            };
         let transition_cause = transition.cause();
         let resource_stalled = transition_cause == TransitionCause::ResourceStalled;
         let stall_receipt = resource_stalled.then(|| CommittedStallReceipt {
@@ -2174,12 +2178,12 @@ impl HeaderChainRuntime {
             if transition.is_no_change() {
                 return Ok(ApplyResult::ResourceStalled(receipt));
             }
-            let current = transition.change_set().metadata.snapshot();
+            let current = transition.after();
             let batch = self.store.batch_for(transition.change_set())?;
             #[cfg(test)]
             fault(FaultPoint::BeforeCommit)?;
             self.store.db.write(batch)?;
-            transition_engine.apply_committed(transition)?;
+            transition_engine.install_committed_transition(transition)?;
             #[cfg(test)]
             fault(FaultPoint::AfterCommit)?;
             self.publisher.publish(current);
@@ -2241,7 +2245,7 @@ impl HeaderChainRuntime {
             }));
         }
 
-        let current = transition.change_set().metadata.snapshot();
+        let current = transition.after();
         let migrated_pin_refuted = transition.change_set().metadata.alarms.migrated_pin_refuted;
         let batch = self
             .store
@@ -2249,7 +2253,7 @@ impl HeaderChainRuntime {
         #[cfg(test)]
         fault(FaultPoint::BeforeCommit)?;
         self.store.db.write(batch)?;
-        transition_engine.apply_committed(transition)?;
+        transition_engine.install_committed_transition(transition)?;
         #[cfg(test)]
         fault(FaultPoint::AfterCommit)?;
         if let Some(pin) = migrated_pin_refuted {
@@ -2845,7 +2849,7 @@ impl HeaderChainStore {
             retention_references: &[],
         };
         let engine = load_transition_engine(self)?;
-        let transition = engine.apply(
+        let transition = engine.plan_transition(
             TransitionRequest {
                 expected_version: snapshot.state_version,
                 event,
@@ -2923,7 +2927,7 @@ impl HeaderChainStore {
             retention_references: &[],
         };
         let engine = load_transition_engine(self)?;
-        let transition = engine.apply(
+        let transition = engine.plan_transition(
             TransitionRequest {
                 expected_version: snapshot.state_version,
                 event,

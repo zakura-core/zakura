@@ -21,8 +21,11 @@ use crate::{
 };
 
 /// A complete write set and the private graph delta that the verifier checked.
+///
+/// Production callers consume [`crate::EngineTransition`]; this plan type stays
+/// crate-private so the planner representation is not part of the public API.
 #[derive(Clone, Debug)]
-pub struct TransitionPlan {
+pub(crate) struct TransitionPlan {
     pub(super) before: EngineSnapshot,
     pub(super) change_set: ChangeSet,
     pub(super) graph_delta: GraphDelta,
@@ -107,7 +110,7 @@ pub enum TransitionFailure {
 }
 
 /// Derive one atomic transition without mutating the coherent engine.
-pub(super) fn apply_transition_engine(
+pub(super) fn derive_transition_plan(
     engine: &HeaderChainEngine,
     durable: &DurableTransitionFacts,
     mut request: TransitionRequest,

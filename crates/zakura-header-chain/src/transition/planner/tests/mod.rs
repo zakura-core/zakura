@@ -296,7 +296,7 @@ fn apply_transition(
         _ => DurableTransitionFacts::None,
     };
     let plan = engine
-        .apply(request, context, durable)
+        .plan_transition(request, context, durable)
         .map(crate::EngineTransition::into_plan)?;
     if let Err(error) = crate::verify_plan_production(&engine, &plan) {
         panic!(

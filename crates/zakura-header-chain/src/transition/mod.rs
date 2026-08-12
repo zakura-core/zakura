@@ -17,7 +17,8 @@ pub(crate) use invariants::verify_plan;
 #[cfg(any(test, feature = "fuzz-impl"))]
 pub(crate) use invariants::verify_plan_production;
 pub use invariants::InvariantViolation;
-pub use planner::{TransitionFailure, TransitionPlan};
+pub use planner::TransitionFailure;
+pub(crate) use planner::TransitionPlan;
 pub use recovery::{
     audit_store, audit_store_at, audit_store_for_trust_anchor_update, AuditViolation,
     RecoveryFailure, RecoveryPlan, RecoveryRepair, StoreAuditRead, ValidationContextRecord,

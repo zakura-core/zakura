@@ -58,7 +58,7 @@ fn apply_with_header_rebase_facts(
     validation: ValidationLease,
 ) -> Result<TransitionPlan, TransitionFailure> {
     test_engine(store)
-        .apply(
+        .plan_transition(
             request,
             &context(config, clock, None),
             DurableTransitionFacts::HeaderInsertion {

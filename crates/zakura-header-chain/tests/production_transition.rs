@@ -172,7 +172,7 @@ fn production_incremental_verifier_accepts_exact_auxiliary_evidence() {
         })),
     };
     let transition = engine
-        .apply(
+        .plan_transition(
             insertion,
             &context,
             DurableTransitionFacts::HeaderInsertion {
@@ -182,7 +182,7 @@ fn production_incremental_verifier_accepts_exact_auxiliary_evidence() {
         )
         .expect("the fixture insertion verifies");
     engine
-        .apply_committed(transition)
+        .install_committed_transition(transition)
         .expect("the fixture insertion commits");
 
     let authentication = AuxAuthentication::Authenticated {
@@ -203,19 +203,19 @@ fn production_incremental_verifier_accepts_exact_auxiliary_evidence() {
     let mut altered = delivery;
     altered.source = SourceId::from_digest([7; 32]);
     assert!(matches!(
-        engine.apply(request(altered), &context, DurableTransitionFacts::None),
+        engine.plan_transition(request(altered), &context, DurableTransitionFacts::None),
         Err(TransitionFailure::InvalidEvidence(
             "auxiliary evidence changes delivery provenance"
         ))
     ));
 
     let transition = engine
-        .apply(request(delivery), &context, DurableTransitionFacts::None)
+        .plan_transition(request(delivery), &context, DurableTransitionFacts::None)
         .expect("the production incremental verifier accepts exact evidence");
     assert_eq!(transition.cause(), TransitionCause::AuxAuthentication);
     let mut projected = engine.clone();
     projected
-        .apply_committed(transition)
+        .install_committed_transition(transition)
         .expect("the verified transition applies to a cloned source engine");
     assert_eq!(
         projected.aux_deliveries(header_hash)[0].authentication,

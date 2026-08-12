@@ -439,7 +439,7 @@ fn apply_transition(
         _ => DurableTransitionFacts::None,
     };
     engine
-        .apply(request, context, durable)
+        .plan_transition(request, context, durable)
         .map(crate::EngineTransition::into_plan)
 }
 

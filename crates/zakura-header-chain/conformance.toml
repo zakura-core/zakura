@@ -23,7 +23,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-SCOPE-03"
 name = "Header-validity boundary"
 status = "implemented"
-owner = "zakura_header_chain::HeaderChainEngine::apply"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
 tests = ["DF-02::header_acceptance_cannot_construct_body_or_state_validity", "DF-02::body_verification_outcomes_preserve_distinct_transition_effects"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -111,7 +111,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-FRONTIER-02"
 name = "Independent frontier selection"
 status = "implemented"
-owner = "zakura_header_chain::HeaderChainEngine::apply"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
 tests = ["DG-02::body_availability_does_not_override_header_work_or_mark_other_bodies", "DG-02::invalidating_verified_path_preserves_independent_header_best", "DG-07::finalization_and_replacement_match_serial_histories"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -135,7 +135,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-GEN-01"
 name = "State-version advancement"
 status = "implemented"
-owner = "zakura_header_chain::HeaderChainEngine::apply"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
 tests = ["IN-05::structured_replay_is_bounded_and_deterministic", "IN-05::bounded_transition_examples_replay_deterministically", "IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -143,7 +143,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-GEN-02"
 name = "Frontier-generation advancement"
 status = "implemented"
-owner = "zakura_header_chain::HeaderChainEngine::apply"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
 tests = ["IN-05::structured_replay_is_bounded_and_deterministic", "IN-05::bounded_transition_examples_replay_deterministically", "DG-07::finalization_and_replacement_match_serial_histories"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -166,7 +166,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-GEN-04"
 name = "Stale-result rejection"
 status = "implemented"
-owner = "zakura_header_chain::HeaderChainEngine::apply"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
 tests = ["IN-02::all_owner_mismatches_have_zero_effects"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -193,7 +193,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-TXN-02"
 name = "Uniform transition path"
 status = "implemented"
-owner = "zakura_header_chain::HeaderChainEngine::apply"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
 tests = ["IN-02::apply_transition_is_the_only_public_dag_mutation_entry_point"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -449,7 +449,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-FINAL-02"
 name = "Full-state finality"
 status = "implemented"
-owner = "zakura_header_chain::HeaderChainEngine::apply"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
 tests = ["DG-07::integrated_finality_requires_authority_and_exact_verified_path"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -457,7 +457,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-FINAL-03"
 name = "Headers-only depth finality"
 status = "implemented"
-owner = "zakura_header_chain::HeaderChainEngine::apply"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
 tests = ["DG-07::headers_only_finalizes_exactly_tip_minus_one_thousand_before_publication"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -537,7 +537,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-INT-05"
 name = "Owner-qualified freshness"
 status = "implemented"
-owner = "zakura_header_chain::transition::planner::apply_transition_engine"
+owner = "zakura_header_chain::transition::planner::derive_transition_plan"
 tests = ["DF-02::typed_header_authority_ignores_global_version_but_rejects_stale_generation", "DF-02::typed_body_authority_ignores_global_version_but_rejects_stale_generation", "IN-01::all_owner_mismatches_have_zero_effects"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -561,7 +561,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-INT-08"
 name = "Distinct admission-pressure outcomes"
 status = "implemented"
-owner = "zakura_header_chain::transition::planner::apply_transition_engine"
+owner = "zakura_header_chain::transition::planner::derive_transition_plan"
 tests = ["DG-06::protected_paths_and_context_references_fail_closed_under_node_pressure", "DG-06::exact_v1_node_boundary_refuses_to_evict_the_selected_path", "IN-06::auxiliary_resource_limits_reject_equal_plus_one_without_effects"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -689,7 +689,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-AUX-02"
 name = "Unauthenticated metadata isolation"
 status = "implemented"
-owner = "zakura_header_chain::HeaderChainEngine::apply"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
 tests = ["IN-06::auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral", "IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header", "PW-06::oversized_body_hint_is_malformed_metadata_not_an_invalid_header", "IN-06::vct_boundary_failure_attribution_never_weakens_authenticated_evidence"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -897,7 +897,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-ACCEPT-02"
 name = "Durable deterministic frontiers"
 status = "implemented"
-owner = "zakura_header_chain::HeaderChainEngine::apply + zakura_state::HeaderChainRuntime::apply_combined"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition + zakura_state::HeaderChainRuntime::apply_combined"
 tests = ["AUD-15::every_changed_frontier_accepts_an_exact_parent_next_child", "DG-03::every_crash_boundary_reopens_to_complete_transition", "DG-01::same_height_forks_are_insertion_order_independent", "PW-03::complete_target_is_independent_of_page_partition", "DG-07::finalization_and_replacement_match_serial_histories", "DG-07::headers_only_finalizes_exactly_tip_minus_one_thousand_before_publication", "DG-07::migrated_headers_only_pin_refutation_is_durable_and_fail_closed"]
 networks = ["mainnet", "testnet", "custom"]
 

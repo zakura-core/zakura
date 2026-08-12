@@ -21,17 +21,17 @@ fn committed_transition_reports_a_stale_source_without_panicking() {
     };
     let mut engine = test_engine(&store);
     let first = engine
-        .apply(request.clone(), &context(&config, &clock, None), durable())
+        .plan_transition(request.clone(), &context(&config, &clock, None), durable())
         .expect("the first transition plans from the source snapshot");
     let stale = engine
-        .apply(request, &context(&config, &clock, None), durable())
+        .plan_transition(request, &context(&config, &clock, None), durable())
         .expect("the second transition plans from the same source snapshot");
 
     engine
-        .apply_committed(first)
+        .install_committed_transition(first)
         .expect("the first transition still has its exact source");
     assert_eq!(
-        engine.apply_committed(stale),
+        engine.install_committed_transition(stale),
         Err(crate::CommittedTransitionError::StaleSource)
     );
 }
@@ -216,7 +216,7 @@ fn committed_transition_applies_to_a_cloned_source_engine() {
     let request = insertion(&store, 3, EvidenceId::from_digest([0x92; 32]));
     let before = engine.snapshot();
     let transition = engine
-        .apply(
+        .plan_transition(
             request,
             &context(&config, &clock, None),
             crate::DurableTransitionFacts::HeaderInsertion {
@@ -227,10 +227,20 @@ fn committed_transition_applies_to_a_cloned_source_engine() {
         .expect("the stateful engine plans the insertion");
 
     assert_eq!(transition.before(), &before);
-    let expected = transition.change_set().metadata.snapshot();
+    assert_ne!(
+        transition.after().state_version,
+        before.state_version,
+        "a state-changing insertion advances the durable version"
+    );
+    assert_eq!(
+        engine.snapshot(),
+        before,
+        "planning must leave the source engine unchanged"
+    );
+    let expected = transition.after();
     let mut projected = engine.clone();
     projected
-        .apply_committed(transition)
+        .install_committed_transition(transition)
         .expect("the transition still has its exact source");
     assert_eq!(projected.snapshot(), expected);
     assert_eq!(

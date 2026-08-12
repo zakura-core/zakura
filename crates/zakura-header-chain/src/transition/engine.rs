@@ -11,7 +11,7 @@ use crate::{
     TransitionRequest, ValidationLease,
 };
 
-use super::planner::apply_transition_engine;
+use super::planner::derive_transition_plan;
 
 /// Incoherent state supplied while hydrating an audited engine.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -168,19 +168,29 @@ impl HeaderChainEngine {
         })
     }
 
-    /// Derive and verify one complete projected engine state without mutating this engine.
-    pub fn apply(
+    /// Plan one verified transition without mutating this engine.
+    ///
+    /// Returns a durable write set and the exact post-transition snapshot that
+    /// the runtime may commit and then install. This method never writes durable
+    /// state or publishes watches.
+    pub fn plan_transition(
         &self,
         request: TransitionRequest,
         context: &TransitionContext<'_>,
         durable: DurableTransitionFacts,
     ) -> Result<EngineTransition, TransitionFailure> {
-        let plan = apply_transition_engine(self, &durable, request, context)?;
+        let plan = derive_transition_plan(self, &durable, request, context)?;
         Ok(EngineTransition { plan })
     }
 
-    /// Apply a verified graph delta after its durable batch has committed.
-    pub fn apply_committed(
+    /// Install a verified transition after its durable batch has committed.
+    ///
+    /// The caller must have already persisted [`EngineTransition::change_set`].
+    /// Returns [`CommittedTransitionError::StaleSource`] when another transition
+    /// changed this engine after planning. On success, in-memory graph,
+    /// projections, metadata, and auxiliary deliveries match the committed
+    /// write set.
+    pub fn install_committed_transition(
         &mut self,
         transition: EngineTransition,
     ) -> Result<(), CommittedTransitionError> {
@@ -251,7 +261,7 @@ impl HeaderChainEngine {
     }
 }
 
-/// A verified durable write set ready for one post-commit in-memory application.
+/// A verified durable write set ready for one post-commit in-memory installation.
 #[derive(Clone, Debug)]
 pub struct EngineTransition {
     plan: TransitionPlan,
@@ -263,12 +273,20 @@ impl EngineTransition {
         self.plan.before()
     }
 
+    /// Return the coherent state that exists after this transition commits.
+    pub fn after(&self) -> EngineSnapshot {
+        self.plan.change_set().metadata.snapshot()
+    }
+
     /// Return the atomic durable write set.
     pub const fn change_set(&self) -> &ChangeSet {
         self.plan.change_set()
     }
 
-    /// Return true when the request is an idempotent replay.
+    /// Return true when admission produced no durable effects.
+    ///
+    /// This covers exact adjacent replay, already-applied work, immediately
+    /// evicted insertions, and other zero-effect admissions.
     pub fn is_no_change(&self) -> bool {
         self.plan.is_no_change()
     }

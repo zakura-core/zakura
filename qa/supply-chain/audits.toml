@@ -433,6 +433,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.4.21 -> 0.4.22"
 
+[[audits.md5]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.7.0"
+notes = "Reviewed all packaged source, manifest, tests, and benchmark. This dependency-free no_std-compatible crate implements the in-memory MD5 transform over caller-supplied bytes and explicitly warns that MD5 is cryptographically broken; this audit does not endorse new cryptographic use. It has no unsafe code, build script, runtime I/O, or ambient capabilities. Three unit tests, including published vectors and the 512 MiB counter-overflow case, plus 1 doctest and the no-default-features target passed; the separate 4 GiB allocation test was not run."
+
 [[audits.metrics]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -634,6 +640,12 @@ criteria = "safe-to-deploy"
 version = "0.3.1"
 notes = "Reviewed all packaged source, manifest, and tests. This dependency-free crate builds an in-memory NFA for matching caller-supplied routes and extracting parameters. It denies unsafe code and has no build script, runtime I/O, or ambient capabilities. All 21 unit tests and 1 doctest passed."
 
+[[audits.rustc-hash]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "2.1.3"
+notes = "Reviewed all packaged source, manifest, and tests. This no_std-compatible crate performs bounded non-cryptographic hashing over caller-supplied values; its optional rand feature obtains a seed only when the explicit random-state constructor is used. It has no unsafe code, build script, filesystem or network access, or process execution. All 10 stable-feature unit tests and 3 doctests passed, and the no-default-features target passed."
+
 [[audits.rustc-hex]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -665,6 +677,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.0.1"
 notes = "Reviewed all packaged source and manifest content, including the unsafe Sync implementation and raw-pointer dereference. They are sound because storage is per-thread, the borrow exists only for the synchronous closure scope, and an RAII guard restores prior state during unwinding. There is no build script, runtime I/O, or ambient authority; five unit tests and three documentation tests passed."
+
+[[audits.secrecy]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.8.0"
+notes = "Reviewed all packaged source and manifest. This no_std-compatible wrapper makes secret exposure explicit, redacts Debug output, restricts cloning and serialization with marker traits, and invokes separately policy-checked zeroization on drop. It forbids unsafe code and has no build script, runtime I/O, or ambient capabilities. All-feature library and the single doctest passed, and the no-default-features target passed; the package defines no unit tests."
 
 [[audits.serde]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

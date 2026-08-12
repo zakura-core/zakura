@@ -42,6 +42,12 @@ criteria = "safe-to-deploy"
 version = "1.0.3"
 notes = "Reviewed all packaged source, manifest, and build script. Known targets either re-export core atomics or place every UnsafeCell access for emulated integer, boolean, and pointer atomics inside the platform-provided critical section; Send and Sync therefore rely on that separately policy-checked global critical-section contract. The build script only classifies Cargo's TARGET value. Both the native re-export path and a forced full-polyfill library target compiled."
 
+[[audits.autocfg]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.5.1"
+notes = "Reviewed all packaged source, manifest, and tests. The documented build helper reads Cargo compiler settings, invokes only the configured rustc and wrappers, feeds probes over stdin, and writes/removes uniquely named LLVM-IR outputs within the caller-provided output directory. It has no unsafe code or network access. All 23 unit and integration tests and 3 applicable doctests passed in an isolated target directory."
+
 [[audits.axum]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -171,6 +177,12 @@ criteria = "safe-to-deploy"
 version = "1.1.0"
 notes = "Reviewed all packaged source, manifest, and tests. RawArgs owns its argument storage and bounds its private cursor, while unsafe OsStr reconstruction only splits bytes returned by as_encoded_bytes at UTF-8 or documented platform-encoding boundaries. There is no build script, runtime I/O, or ambient capability. All 17 applicable doctests passed; 1 example was ignored as documented."
 
+[[audits.color-backtrace]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.7.1"
+notes = "Reviewed all packaged source and manifest. The panic hook captures and renders backtraces, optionally reads referenced source files and /proc/self/maps, and consults documented color and verbosity environment variables. It has no unsafe code, build script, process execution, or network access. The all-features library target passed; the package contains no unit tests."
+
 [[audits.color-spantrace]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -269,6 +281,12 @@ criteria = "safe-to-deploy"
 version = "0.4.1"
 notes = "Reviewed all packaged source and manifest, including Unix account lookup, XDG parsing, Redox lookup, and Windows known-folder APIs. getpwuid_r receives a live capacity-sized buffer and its returned C string is copied before the buffer drops; Windows checks the API result, bounds the returned string by lstrlenW, and frees COM memory on both paths. Runtime authority is limited to documented environment, account, XDG file, and known-folder reads. There is no build script, network access, or process execution, and the host library target passed."
 
+[[audits.displaydoc]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.6"
+notes = "Reviewed all packaged source, manifest, and tests. This procedural macro parses enum and struct attributes and emits bounded Display implementations; it has no unsafe code, build script, runtime I/O, process execution, or network access. Both applicable unit tests passed with all features; one no-std expansion test is intentionally ignored."
+
 [[audits.documented]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -304,6 +322,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.7.12"
 notes = "Reviewed all packaged source and manifest. The procedural macro validates unit variants, unsigned integer reprs, and one-bit discriminants before generating the unsafe RawBitFlags implementation; deferred invariants are enforced by generated compile-time assertions and rustc repr checks. No build script, runtime I/O, or ambient capabilities. Unit and doc test targets compiled."
+
+[[audits.fixed-hash]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.8.0"
+notes = "Reviewed all packaged source, manifest, and tests. The exported macros generate fixed-size byte-array types with checked slice lengths, bounded conversions, formatting, bit operations, and feature-gated randomness. There is no unsafe code, build script, or ambient capability. All 35 unit tests passed with all features."
 
 [[audits.foldhash]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -408,6 +432,12 @@ criteria = "safe-to-deploy"
 version = "0.3.0"
 notes = "Reviewed all packaged source and manifest. The crate exposes only explicit browser setTimeout and setInterval calls, retains each wasm closure for the timer lifetime, clears live timer handles on drop, and transfers ownership deliberately when a caller requests forget. Future and stream adapters preserve those RAII guards. There is no build script, filesystem or network access, or process execution, and all host all-feature targets passed."
 
+[[audits.group]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.13.0"
+notes = "Reviewed all packaged source and manifest. This no-std crate defines group and encoding traits plus allocation-gated wNAF helpers; table indices derive from internally paired window tables and signed-digit forms. It has no unsafe code, build script, I/O, or ambient capabilities. The all-features library target passed; the package has no concrete group implementation tests."
+
 [[audits.hashbrown]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -469,6 +499,18 @@ delta = "1.3.1 -> 1.4.1"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.4.1 -> 1.5.0"
+
+[[audits.hyper-rustls]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.27.9"
+notes = "Reviewed all packaged source, manifest, and tests. HTTPS connections validate a rustls ServerName derived from the URI or an explicit resolver; plaintext HTTP is available only through the explicit https_or_http builder state. Pinned I/O forwarding is safe and networking is delegated to the caller-supplied connector. There is no unsafe code or build script. The Zakura-enabled ring, TLS 1.2, webpki-roots, and HTTP/1 feature path compiled and both local builder tests passed; four live-network tests were excluded."
+
+[[audits.hyper-timeout]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.5.2"
+notes = "Reviewed all packaged source, manifest, and tests. Pin-projected read and write wrappers start timers only after Pending, reset them after completed operations, and preserve the underlying connector's readiness and connection metadata. There is no unsafe code or build script. All 5 local stream tests passed; two external-network connector tests were excluded."
 
 [[audits.hyper-util]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -539,6 +581,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.39.0 -> 1.40.0"
 
+[[audits.iroh-base]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.92.0"
+notes = "Reviewed all packaged source, manifest, and tests. Public keys are validated through ed25519-dalek before construction, signature verification is strict, key generation requires a CryptoRngCore, secret Debug output is redacted, and ticket decoding checks kind, base32 length, postcard structure, and public-key validity. There is no unsafe code, build script, or ambient capability. All 10 unit tests passed with all features."
+
 [[audits.iroh-metrics-derive]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -568,6 +616,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.24.11"
 notes = "Reviewed all packaged source and manifest. This facade contains only cfg macros and feature-gated re-exports of separately policy-checked jsonrpsee components; it has no unsafe code, build script, I/O, or ambient capabilities of its own. The full all-feature target compiled."
+
+[[audits.jsonrpsee-types]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.24.11"
+notes = "Reviewed all packaged source, manifest, and tests. The crate contains typed JSON-RPC requests, responses, identifiers, errors, and borrowed parameter deserializers over caller-provided serde input. It has no unsafe code, build script, filesystem or network access, process execution, or other ambient capability. All 32 unit tests passed."
 
 [[audits.libc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -659,11 +713,23 @@ criteria = "safe-to-deploy"
 version = "0.10.1"
 notes = "Reviewed all packaged source, manifest, and tests. The crate wraps HashMap values in nonempty vectors maintained by safe insert, entry, remove, retain, iterator, and optional Serde operations; lookups return None rather than indexing absent values. Unsafe code is forbidden and there is no build script, runtime I/O, or ambient capability. All 58 unit tests passed with all features."
 
+[[audits.n0-future]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.3"
+notes = "Reviewed all packaged source, manifest, and build script. Native targets re-export separately audited futures and Tokio primitives; the browser shim keeps task state in checked SendWrapper-wrapped Rc/RefCell values and implements cancellation and timers through wasm-bindgen without unsafe code. The build script only defines a target cfg alias. The all-features native library target passed; the package contains no native unit tests."
+
 [[audits.n0-snafu]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.3"
 notes = "Reviewed all packaged source, manifest, and tests. The crate wraps caller-supplied errors, captures span and backtrace data, and formats error chains using separately policy-checked dependencies. It has no unsafe code, build script, filesystem or network access, or process execution; Debug formatting explicitly reads color-backtrace verbosity from the environment. All 8 unit tests passed with backtrace display disabled to match their expected formatting."
+
+[[audits.n0-watcher]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.0"
+notes = "Reviewed all packaged source, manifest, and tests. Watchable state is protected by RwLock, pending wakers are registered under a Mutex and drained after value changes or sender drops, and weak ownership cleanly reports disconnection without retaining producers. There is no unsafe code, build script, or ambient capability. All 11 unit tests passed with all features."
 
 [[audits.nested_enum_utils]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -762,6 +828,12 @@ criteria = "safe-to-deploy"
 version = "0.8.0"
 notes = "Reviewed all packaged source and manifest content, including the binary and benchmark. Perfect-hash generation is deterministic from a fixed seed over developer-controlled entries; there is no unsafe code, build script, runtime I/O, or ambient authority. All-feature library, binary, and documentation targets compiled; an upstream benchmark dependency emitted only a future-incompatibility warning."
 
+[[audits.phf_macros]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.12.1"
+notes = "Reviewed all packaged source and manifest. This procedural macro accepts only supported literal key forms, rejects duplicate parsed keys, delegates deterministic perfect-hash generation to separately audited dependencies, and quotes the resulting static map or set. It has no unsafe code, build script, runtime I/O, process execution, or network access. The all-features library target passed; the package contains no unit tests."
+
 [[audits.phf_shared]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -777,6 +849,12 @@ delta = "1.1.5 -> 1.1.6"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.1.5 -> 1.1.6"
+
+[[audits.pkg-config]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.33"
+notes = "Reviewed all packaged source, manifest, fixtures, and tests. This documented build helper invokes the Cargo-environment-selected pkg-config executable with structured arguments, parses escaped flags without a shell, and emits corresponding Cargo link metadata; filesystem reads are limited to existence checks for reported libraries. It has no unsafe code or network access. All 31 unit and integration tests and 3 doctests passed."
 
 [[audits.plotters-backend]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -807,6 +885,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.1.5"
 notes = "Reviewed all packaged source, manifest, and tests. Transparent slice and box casts preserve representation and metadata; the 24-bit code-point ULE has no padding and uses explicit little-endian conversion; and unchecked UTF-8 slices are limited to boundaries established by Utf8Error. There is no build script, I/O, or ambient capability. All 7 all-feature unit tests passed."
+
+[[audits.primitive-types]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.12.2"
+notes = "Reviewed all packaged source and manifest. The crate composes fixed-size integer and hash macros from separately audited dependencies and implements checked widening/narrowing plus bounded floating-point conversions, with no unsafe code, build script, I/O, or ambient capabilities. The Zakura-relevant std, serde, RLP, codec, scale-info, num-traits, floating-point, and arbitrary feature set compiled; the unused json-schema feature currently resolves an incompatible newer schemars API outside the locked graph."
 
 [[audits.proc-macro-crate]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -848,6 +932,12 @@ delta = "0.13.1 -> 0.13.3"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.12.6 -> 0.13.1"
+
+[[audits.pulldown-cmark-to-cmark]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "22.0.0"
+notes = "Reviewed all packaged source, manifest, and tests. The crate serializes caller-provided pulldown-cmark events to caller-provided fmt writers while tracking delimiter, list, table, and source-range state with safe collections and checked event structure. It has no unsafe code, build script, filesystem or network access, or process execution. The all-features library test passed."
 
 [[audits.quick-error]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -893,6 +983,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.8.4 -> 0.8.5"
 
+[[audits.resolv-conf]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.7.6"
+notes = "Reviewed all packaged source, manifest, fixtures, and tests. Parsing operates over caller-provided bytes with ordinary bounded vectors. The sole unsafe operation passes a fully initialized 1024-byte buffer and its exact length to gethostname, checks the return value, and only scans initialized bytes; static Linux instead checks /proc hostname truncation before termination. There is no build script, process execution, or network access. All 22 unit and integration tests and 6 doctests passed."
+
 [[audits.rlimit]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -920,6 +1016,12 @@ notes = "Reviewed all packaged source and manifest. The dependency-free no_std-c
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.38.34 -> 0.38.37"
+
+[[audits.rustls-native-certs]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.8.4"
+notes = "Reviewed all packaged source and manifest across Unix, macOS, and Windows. The crate reads documented certificate paths or platform trust-store APIs, retains only trusted platform certificates, reports per-file and platform errors, and sorts and deduplicates DER results. It contains no unsafe code, build script, process execution, or network access. The all-features library target passed; packaged unit tests cannot compile because their upstream PEM fixtures are omitted from the published crate."
 
 [[audits.rustls-webpki]]
 who = "Alfredo Garcia <alfredo@zfnd.org>"
@@ -1177,6 +1279,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.1.15 -> 0.1.16"
 
+[[audits.tokio-test]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.5"
+notes = "Reviewed all packaged source, manifest, and tests. The custom RawWaker stores one Arc reference per raw handle: clone adds exactly one strong reference, wake consumes one, wake_by_ref forgets its temporary reconstruction, and drop consumes one. Mock I/O and streams use safe bounded queues and Tokio timers with no build script or ambient capability. All 29 integration tests and 10 doctests passed."
+
 [[audits.tokio-util]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -1307,6 +1415,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.0"
 notes = "Reviewed all packaged source, manifest, and tests. The tracing layer records caller span metadata and timing to a caller-supplied writer or explicitly selected file, serializes writes and flushes through a mutex, and acquires no network, process, or environment capability. It has no unsafe code or build script. Both integration tests passed."
+
+[[audits.tracing-futures]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.5"
+notes = "Reviewed all packaged source and manifest. Future, stream, sink, and executor wrappers enter the configured tracing span around each poll or operation and use pin-project for safe projection; there is no unsafe code, build script, I/O, or ambient capability. Zakura's std, std-future, and pin-project feature path compiled. Published unit tests cannot compile because they reference a tracing monorepo support module omitted from the crate."
 
 [[audits.tracing-log]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1485,6 +1599,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "3.0.0"
 notes = "Reviewed all packaged source, manifests, and tests. This Unix-only path resolver contains no unsafe code, ignores non-absolute XDG environment paths, validates that XDG_RUNTIME_DIR is accessible with no group/other permission bits, and limits writes to directory creation beneath the configured roots when callers honor the documented relative-path API. It performs only its documented environment and filesystem access and has no build script, network, or process capability. All 10 unit tests and 4 doctests passed both with optional Serde enabled and without default features. Callers must not pass attacker-controlled absolute or parent-traversal paths because the crate does not sanitize them."
+
+[[audits.xmltree]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.10.3"
+notes = "Reviewed all packaged source, manifest, fixtures, and tests. The parser builds owned tree nodes from xml-rs events and the emitter writes only to caller-provided writers; memory use is proportional to caller input. It has no unsafe code, build script, filesystem access beyond caller-provided handles, process execution, or network access. The library target and 15 of 19 integration tests passed; four legacy fixtures contain declarations or CDATA where the locked xml-rs parser now rejects them as invalid XML."
 
 [[audits.z32]]
 who = "OpenAI Codex <noreply@openai.com>"

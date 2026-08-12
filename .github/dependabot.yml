@@ -57,7 +57,6 @@ updates:
     # https://astral.sh/blog/open-source-security-at-astral#dependency-security
     cooldown:
       default-days: 7
-      semver-major-days: 30
     open-pull-requests-limit: 4
     labels:
       - 'C-exclude-from-changelog'

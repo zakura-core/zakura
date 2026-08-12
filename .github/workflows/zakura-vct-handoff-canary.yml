@@ -60,7 +60,9 @@ jobs:
       droplet_size: c-8
       teardown_after_run: true
       p2p_stack: zakura
-    secrets: inherit
+    secrets:
+      DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
 
   alert:
     name: Alert #zakura-alerts

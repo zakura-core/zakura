@@ -65,6 +65,11 @@ on:
         value: ${{ jobs.node.outputs.end_height }}
       verdict:
         value: ${{ jobs.node.outputs.verdict }}
+    secrets:
+      DIGITALOCEAN_ACCESS_TOKEN:
+        required: true
+      DO_SSH_PRIVATE_KEY:
+        required: true
   workflow_dispatch:
     inputs:
       pr_number:

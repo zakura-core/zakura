@@ -332,9 +332,10 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
           SKIP_VERSION_CHECK: ${{ inputs.skip_version_check }}
+          RELEASE_BINARY: ${{ env.release_binary }}
         run: |
           set -euo pipefail
-          version_output="$(./out/usr/local/bin/${{ env.release_binary }} --version)"
+          version_output="$("./out/usr/local/bin/${RELEASE_BINARY}" --version)"
           echo "$version_output"
 
           if [ "$SKIP_VERSION_CHECK" = "true" ]; then
@@ -615,10 +616,11 @@ jobs:
         env:
           FEATURES: ${{ vars.RUST_PROD_FEATURES || 'default-release-binaries' }}
           IMAGE_TAG: zakuracore/zakura:release-ci-${{ matrix.name }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
         run: |
           set -euo pipefail
           short_sha="$(git rev-parse --short=12 HEAD)"
-          image_version="${{ needs.resolve-release.outputs.release_tag }}"
+          image_version="${RELEASE_TAG}"
           image_version="${image_version#v}"
           docker buildx build \
             --platform "${{ matrix.platform }}" \
@@ -766,10 +768,11 @@ jobs:
         env:
           FEATURES: ${{ vars.RUST_PROD_FEATURES || 'default-release-binaries' }}
           IMAGE_TAG: zakuracore/zakura:zcashd-compat-release-ci-${{ matrix.name }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
         run: |
           set -euo pipefail
           short_sha="$(git rev-parse --short=12 HEAD)"
-          image_version="${{ needs.resolve-release.outputs.release_tag }}"
+          image_version="${RELEASE_TAG}"
           image_version="${image_version#v}"
           docker buildx build \
             --platform "${{ matrix.platform }}" \

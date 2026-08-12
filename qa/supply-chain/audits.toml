@@ -1008,6 +1008,12 @@ criteria = "safe-to-deploy"
 delta = "0.1.3 -> 0.1.4"
 notes = "Reviewed the complete 0.1.3 -> 0.1.4 packaged-source delta. Runtime changes replace lazy_static with once_cell::Lazy, qualify generated Option paths, update dependency floors, and deprecate an adapter; no new unsafe code, I/O, build script, or ambient capability. The all-feature library compiled. The all-feature test target has an upstream test-only initializer arity error at Lazy::new(Mutex::new); deployed code is unaffected."
 
+[[audits.typeid]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.3"
+notes = "Reviewed all packaged source, manifests, build script, and tests. The dependency-free no_std implementation erases only the trait-object reference lifetime around zero-sized PhantomData to obtain the compiler's lifetime-erased TypeId; the transmuted reference cannot escape or expose data. Its build script invokes the configured rustc with only --version to select compatibility cfgs and emits no linker or source directives. The integration test and all 3 doctests passed."
+
 [[audits.ucd-trie]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1036,6 +1042,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.9.0"
 notes = "Reviewed all packaged source, manifest, tests, and maintenance scripts. This dependency-free no_std crate provides a non-allocating cursor over caller-supplied byte slices using checked indexing and slicing. It has no unsafe code, build script, runtime I/O, or ambient capabilities; packaged shell scripts are maintenance-only and Cargo does not execute them. All 13 integration tests passed."
+
+[[audits.utf8-zero]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.8.1"
+notes = "Reviewed all packaged source, manifests, and tests. The dependency-free no_std decoder validates every byte range with core::str::from_utf8 before its unchecked UTF-8 conversions, bounds the incomplete-sequence buffer to four bytes, and performs I/O only through a caller-supplied BufRead when std is enabled. All 5 integration tests and 5 doctests passed with std; the no-default library and 3 applicable doctests passed. The published no-default integration target does not compile because its std-only BufReadDecoder test lacks a cfg guard; deployed no_std code is unaffected."
 
 [[audits.vergen]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

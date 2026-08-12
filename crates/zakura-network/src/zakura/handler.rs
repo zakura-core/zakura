@@ -5730,6 +5730,30 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct OrderedStreamService {
+        stream: Stream,
+        sessions: mpsc::UnboundedSender<(FramedRecv, FramedSend)>,
+    }
+
+    impl Service for OrderedStreamService {
+        fn name(&self) -> &'static str {
+            "ordered-stream"
+        }
+
+        fn streams(&self) -> &[Stream] {
+            std::slice::from_ref(&self.stream)
+        }
+
+        fn add_peer(&self, mut peer: Peer) {
+            if let Some(session) = peer.take_stream(self.stream.kind) {
+                let _ = self.sessions.send(session);
+            }
+        }
+
+        fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
+    }
+
+    #[derive(Debug)]
     struct GenerationGuardedRecordingService {
         streams: Vec<Stream>,
         active: std::sync::Mutex<HashMap<ZakuraPeerId, (ZakuraConnId, CancellationToken)>>,
@@ -6747,6 +6771,109 @@ mod tests {
         endpoint.cancel_upgrade_native_dial(&peer_id);
         endpoint.shutdown().await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn custom_ordered_service_round_trips_over_zakura() -> Result<(), BoxError> {
+        const CUSTOM_STREAM: Stream = Stream {
+            kind: 64,
+            version: 1,
+            frame_cap: 64 * 1024,
+            capability: 1 << 16,
+            mode: StreamMode::Ordered,
+        };
+
+        let _guard = zakura_test::init();
+        let listen_addr = "127.0.0.1:0".parse().expect("valid loopback address");
+        let server_identity = tempfile::tempdir()?;
+        let client_identity = tempfile::tempdir()?;
+        let (server_sessions, mut server_session_rx) = mpsc::unbounded_channel();
+        let (client_sessions, mut client_session_rx) = mpsc::unbounded_channel();
+
+        let mut server_config = Config::for_test(P2pStack::Dual);
+        server_config.identity_dir = server_identity.path().to_owned();
+        server_config.zakura.listen_addr = Some(listen_addr);
+        server_config.zakura.bootstrap_peers.clear();
+        let server = spawn_zakura_endpoint_with_services(
+            &server_config,
+            |_supervisor, _trace| Arc::new(NoopService),
+            None,
+            vec![CustomService {
+                service: Arc::new(OrderedStreamService {
+                    stream: CUSTOM_STREAM,
+                    sessions: server_sessions,
+                }),
+                advertised_services: Vec::new(),
+            }],
+        )
+        .await?
+        .expect("test server uses Zakura");
+        let server_addr = server.node_addr().await;
+        let server_direct = server_addr
+            .direct_addresses()
+            .copied()
+            .find(|addr| addr.ip().is_loopback())
+            .ok_or("test server has no loopback address")?;
+
+        let mut client_config = Config::for_test(P2pStack::Dual);
+        client_config.identity_dir = client_identity.path().to_owned();
+        client_config.zakura.listen_addr = Some(listen_addr);
+        client_config.zakura.bootstrap_peers =
+            vec![format!("{}@{server_direct}", server_addr.node_id)];
+        let client = spawn_zakura_endpoint_with_services(
+            &client_config,
+            |_supervisor, _trace| Arc::new(NoopService),
+            None,
+            vec![CustomService {
+                service: Arc::new(OrderedStreamService {
+                    stream: CUSTOM_STREAM,
+                    sessions: client_sessions,
+                }),
+                advertised_services: Vec::new(),
+            }],
+        )
+        .await?
+        .expect("test client uses Zakura");
+
+        let round_trip = timeout(Duration::from_secs(10), async {
+            let (mut server_recv, server_send) = server_session_rx
+                .recv()
+                .await
+                .ok_or_else(|| -> BoxError { "server custom stream did not open".into() })?;
+            let (mut client_recv, client_send) = client_session_rx
+                .recv()
+                .await
+                .ok_or_else(|| -> BoxError { "client custom stream did not open".into() })?;
+            let outbound = Frame {
+                message_type: 1_001,
+                flags: 3,
+                payload: b"custom client frame".to_vec(),
+            };
+            client_send.send(outbound.clone()).await?;
+            let received = server_recv
+                .recv()
+                .await
+                .ok_or_else(|| -> BoxError { "server custom stream closed".into() })?;
+            assert_eq!(received, outbound);
+
+            let response = Frame {
+                message_type: 2_002,
+                flags: 5,
+                payload: b"custom server frame".to_vec(),
+            };
+            server_send.send(response.clone()).await?;
+            let received = client_recv
+                .recv()
+                .await
+                .ok_or_else(|| -> BoxError { "client custom stream closed".into() })?;
+            assert_eq!(received, response);
+            Ok::<_, BoxError>(())
+        })
+        .await
+        .map_err(|_| -> BoxError { "custom ordered stream round trip timed out".into() })?;
+        client.shutdown().await;
+        server.shutdown().await;
+        round_trip
     }
 
     #[tokio::test]

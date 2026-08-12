@@ -21,6 +21,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.5.1 -> 0.5.2"
 
+[[audits.bitflags-serde-legacy]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.1"
+notes = "Reviewed all packaged source and manifest. no_std helper only serializes and deserializes a single primitive bitflags field using separately policy-checked bitflags and Serde dependencies. No unsafe code, build script, allocation, I/O, or ambient capabilities. The compatibility unit test and doctest passed."
+
 [[audits.bridgetree]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -101,6 +107,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.0 -> 0.4.0"
 
+[[audits.const-crc32-nostd]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.3.1"
+notes = "Reviewed all packaged source and manifest. no_std CRC32 implementation uses fixed-size table generation and input-length-bounded deterministic arithmetic; the table index is masked to 8 bits. No normal dependencies, unsafe code, build script, allocation, I/O, or ambient capabilities. All 6 unit tests and 3 doctests passed, including randomized crc32fast comparison."
+
 [[audits.darling_macro]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -112,6 +124,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.23.0"
 notes = "Full packaged-source review: source is identical to 0.20.11 aside from package metadata; no unsafe code, build script, I/O, or ambient capabilities; derive entry points delegate generation to separately policy-checked darling_core."
+
+[[audits.documented]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.0"
+notes = "Reviewed all packaged source and manifest. This facade crate only defines documentation traits, performs bounded static-slice lookup and error-string allocation, and re-exports the separately policy-checked derive and PHF dependencies. No unsafe code, build script, I/O, or ambient capabilities. cargo test --all-features passed."
 
 [[audits.foldhash]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -178,6 +196,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.1.1"
 notes = "Full packaged-source review: no unsafe code, dependencies, build script, allocation, I/O, or ambient capabilities; validation is bounded linear byte and label processing."
+
+[[audits.human_bytes]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.3"
+notes = "Reviewed all packaged library, optional CLI source, tests, and manifest. Library code performs numeric formatting and fixed-array suffix lookup with no unsafe code or build script; the optional CLI only reads arguments or stdin and writes stdout. The public formatter can panic for f64 values beyond its suffix range, but Zakura calls it only with finite u64-derived database size values, whose maximum remains within that range. All-feature library and binary tests passed."
 
 [[audits.hyper]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -380,6 +404,12 @@ delta = "0.13.1 -> 0.13.3"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.12.6 -> 0.13.1"
+
+[[audits.quoted-string-parser]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.0"
+notes = "Reviewed all packaged source, Pest grammar, and manifest. The crate exposes only bounded input parsing and validation via separately policy-checked Pest dependencies. No unsafe code, build script, I/O, or ambient capabilities. Both unit tests and the doctest passed."
 
 [[audits.regex]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

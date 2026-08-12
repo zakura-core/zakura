@@ -161,13 +161,13 @@ mod tests {
             HeaderSyncMisbehavior, HeaderSyncOperationIdentity, HeaderSyncPeerSession,
             HeaderSyncRequestId, HeaderSyncStartup, HeaderSyncStatus,
             HeaderSyncWireRequestIdentity, LegacyGossipFrame, LegacyGossipSink, LegacyRequestFrame,
-            Peer, Service, ServicePeerLimits, Services, Stream, ZakuraBlockSyncConfig,
+            Peer, Service, ServicePeerLimits, Services, Stream, StreamMode, ZakuraBlockSyncConfig,
             ZakuraConnId, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
             ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId, ZakuraTrace,
-            MAX_BS_RESPONSE_BYTES, MSG_RESPONSE_TRANSACTION_IDS, ZAKURA_CAP_DISCOVERY,
-            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-            ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
-            ZAKURA_STREAM_LEGACY_REQUESTS,
+            FRAME_HEADER_BYTES, MAX_BS_RESPONSE_BYTES, MSG_RESPONSE_TRANSACTION_IDS,
+            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
+            ZAKURA_STREAM_HEADER_SYNC, ZAKURA_STREAM_LEGACY_REQUESTS,
         },
         BoxError, Config, Request, Response,
     };
@@ -199,6 +199,17 @@ mod tests {
 
     /// Stream generation used by every simulated e2e session (`from_parts` uses 0).
     const E2E_SESSION_ID: u64 = 0;
+
+    const CUSTOM_FRAME_CAP_STREAM_KIND: u16 = 42;
+    const CUSTOM_FRAME_CAP_CAPABILITY: u64 = 1 << 20;
+    const CUSTOM_FRAME_CAP_BYTES: u32 = 64;
+    const CUSTOM_FRAME_CAP_STREAMS: [Stream; 1] = [Stream {
+        kind: CUSTOM_FRAME_CAP_STREAM_KIND,
+        version: 1,
+        frame_cap: CUSTOM_FRAME_CAP_BYTES,
+        capability: CUSTOM_FRAME_CAP_CAPABILITY,
+        mode: StreamMode::Ordered,
+    }];
 
     fn headers_message(headers: Vec<Arc<block::Header>>) -> HeaderSyncMessage {
         let body_sizes = vec![0; headers.len()];
@@ -324,6 +335,101 @@ mod tests {
             tokio::spawn(async move {
                 senders.lock().await.remove(&peer);
             });
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CustomFrameCapProbeService {
+        senders: Arc<StdMutex<HashMap<ZakuraPeerId, FramedSend>>>,
+        received: Arc<StdMutex<Vec<(ZakuraPeerId, Vec<u8>)>>>,
+    }
+
+    impl CustomFrameCapProbeService {
+        fn contains_peer(&self, peer: &ZakuraPeerId) -> bool {
+            self.senders
+                .lock()
+                .expect("custom frame-cap sender map is never poisoned")
+                .contains_key(peer)
+        }
+
+        fn contains_payload(&self, peer: &ZakuraPeerId, payload: &[u8]) -> bool {
+            self.received
+                .lock()
+                .expect("custom frame-cap receive list is never poisoned")
+                .iter()
+                .any(|(sender, received)| sender == peer && received == payload)
+        }
+
+        async fn send_payload(
+            &self,
+            peer: &ZakuraPeerId,
+            payload: Vec<u8>,
+        ) -> Result<(), BoxError> {
+            let sender = self
+                .senders
+                .lock()
+                .map_err(|_| -> BoxError { "custom frame-cap sender map is poisoned".into() })?
+                .get(peer)
+                .cloned()
+                .ok_or_else(|| -> BoxError { "custom frame-cap sender is missing".into() })?;
+
+            sender
+                .send(Frame {
+                    message_type: 1,
+                    flags: 0,
+                    payload,
+                })
+                .await
+                .map_err(|_| "custom frame-cap sender closed".into())
+        }
+    }
+
+    impl Service for CustomFrameCapProbeService {
+        fn name(&self) -> &'static str {
+            "custom-frame-cap-probe"
+        }
+
+        fn streams(&self) -> &[Stream] {
+            &CUSTOM_FRAME_CAP_STREAMS
+        }
+
+        fn add_peer(&self, mut peer: Peer) {
+            let peer_id = peer.id.clone();
+            let Some((mut recv, send)) = peer.take_stream(CUSTOM_FRAME_CAP_STREAM_KIND) else {
+                return;
+            };
+            self.senders
+                .lock()
+                .expect("custom frame-cap sender map is never poisoned")
+                .insert(peer_id.clone(), send);
+
+            let cancel_token = peer.cancel_token();
+            let received = self.received.clone();
+            tokio::spawn(async move {
+                loop {
+                    let frame = tokio::select! {
+                        _ = cancel_token.cancelled() => return,
+                        frame = recv.recv() => {
+                            let Some(frame) = frame else {
+                                return;
+                            };
+                            frame
+                        }
+                    };
+
+                    received
+                        .lock()
+                        .expect("custom frame-cap receive list is never poisoned")
+                        .push((peer_id.clone(), frame.payload));
+                }
+            });
+        }
+
+        fn remove_peer(&self, peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {
+            self.senders
+                .lock()
+                .expect("custom frame-cap sender map is never poisoned")
+                .remove(peer);
         }
     }
 
@@ -2072,6 +2178,83 @@ mod tests {
 
         hostile.shutdown().await;
         cluster.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn custom_service_frame_cap_is_enforced_end_to_end() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let service_a = Arc::new(CustomFrameCapProbeService::default());
+        let service_b = Arc::new(CustomFrameCapProbeService::default());
+        let node_a = ZakuraTestNode::builder(54)
+            .service(service_a.clone())
+            .supported_capabilities(CUSTOM_FRAME_CAP_CAPABILITY)
+            .spawn()
+            .await?;
+        let node_b = ZakuraTestNode::builder(55)
+            .service(service_b.clone())
+            .supported_capabilities(CUSTOM_FRAME_CAP_CAPABILITY)
+            .spawn()
+            .await?;
+        let peer_a = ZakuraPeerId::new(node_a.node_addr().await.node_id.as_bytes().to_vec())?;
+        let peer_b = ZakuraPeerId::new(node_b.node_addr().await.node_id.as_bytes().to_vec())?;
+
+        node_a
+            .connect_native(&node_b, Duration::from_secs(5))
+            .await?;
+        await_until(
+            "custom frame-cap stream admitted",
+            Duration::from_secs(5),
+            || service_a.contains_peer(&peer_b) && service_b.contains_peer(&peer_a),
+        )
+        .await?;
+
+        let max_payload_bytes = usize::try_from(CUSTOM_FRAME_CAP_BYTES)?
+            .checked_sub(FRAME_HEADER_BYTES)
+            .expect("custom frame cap includes the frame header");
+        let at_cap_from_a = vec![0xa5; max_payload_bytes];
+        service_a
+            .send_payload(&peer_b, at_cap_from_a.clone())
+            .await?;
+        await_until(
+            "at-cap custom frame delivered from opener",
+            Duration::from_secs(5),
+            || service_b.contains_payload(&peer_a, &at_cap_from_a),
+        )
+        .await?;
+
+        let at_cap_from_b = vec![0x5a; max_payload_bytes];
+        service_b
+            .send_payload(&peer_a, at_cap_from_b.clone())
+            .await?;
+        await_until(
+            "at-cap custom frame delivered from accepting peer",
+            Duration::from_secs(5),
+            || service_a.contains_payload(&peer_b, &at_cap_from_b),
+        )
+        .await?;
+
+        let peers_a = node_a.supervisor().subscribe();
+        let peers_b = node_b.supervisor().subscribe();
+        let over_cap = vec![0xff; max_payload_bytes + 1];
+        service_b.send_payload(&peer_a, over_cap.clone()).await?;
+
+        await_until(
+            "over-cap custom frame disconnects the peer",
+            Duration::from_secs(5),
+            || {
+                !contains_peer(&peers_a.borrow(), peer_b.as_bytes())
+                    && !contains_peer(&peers_b.borrow(), peer_a.as_bytes())
+            },
+        )
+        .await?;
+        assert!(
+            !service_a.contains_payload(&peer_b, &over_cap),
+            "a custom frame over the declared cap must not reach the peer service"
+        );
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
         Ok(())
     }
 

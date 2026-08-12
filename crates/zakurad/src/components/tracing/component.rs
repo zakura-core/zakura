@@ -386,8 +386,9 @@ impl Tracing {
         // TODO: move this to its own module?
         #[cfg(feature = "progress-bar")]
         if let Some(progress_bar_config) = config.progress_bar.as_ref() {
-            use howudoin::consumers::TermLine;
             use std::time::Duration;
+
+            use super::progress::TermLine;
 
             // Stops flickering during the initial sync.
             const PROGRESS_BAR_DEBOUNCE: Duration = Duration::from_secs(2);

@@ -85,7 +85,7 @@ hyper = "1.6"
 hyper-util = "0.1.11"
 iroh = { version = "=0.92.0", default-features = false }
 indexmap = "2.8"
-indicatif = "0.17"
+indicatif = "0.18"
 inferno = { version = "0.12", default-features = false }
 insta = "1.42"
 itertools = "0.14"

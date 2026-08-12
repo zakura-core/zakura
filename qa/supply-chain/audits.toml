@@ -302,6 +302,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "2.5.0 -> 2.6.0"
 
+[[audits.indicatif]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.18.6"
+notes = "Reviewed the complete library implementation and manifests and scanned packaged examples and tests for ambient behavior. The crate contains no unsafe code; runtime capabilities are limited to documented terminal output, caller-supplied I/O wrappers, and opt-in ticker threads, with no filesystem or network access in library code and no build script. The all-feature suite passed 64 unit tests, 38 integration tests, and 17 documentation tests; 7 illustrative doctests are intentionally ignored."
+
 [[audits.inferno]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -820,6 +826,12 @@ notes = "Reviewed the complete 0.1.3 -> 0.1.4 packaged-source delta. Runtime cha
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.9.5 -> 0.10.0"
+
+[[audits.unit-prefix]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.5.2"
+notes = "Reviewed all packaged library source and manifests. The no_std formatting and parsing crate denies unsafe code, has no dependencies, build script, I/O, or ambient authority, and performs only bounded numeric scaling and string formatting/parsing. All 20 unit tests and 11 documentation tests passed with all features."
 
 [[audits.vergen]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

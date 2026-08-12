@@ -337,10 +337,6 @@ version = "0.15.25"
 criteria = "safe-to-deploy"
 
 [[exemptions.console]]
-version = "0.15.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.console]]
 version = "0.16.4"
 criteria = "safe-to-deploy"
 
@@ -888,10 +884,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.indexmap]]
 version = "2.14.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.indicatif]]
-version = "0.17.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.inferno]]

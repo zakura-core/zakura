@@ -21,12 +21,11 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 
 | Workflow | What it does | Triggers |
 | --- | --- | --- |
-| `lint.yml` | Clippy, rustfmt, `cargo deny`, feature checks. A nightly scheduled run adds the expensive non-gating lints (unused deps, docs build). | PR/push on Rust-relevant paths, merge queue, nightly, manual |
-| `tests-unit.yml` | Unit-test suite via `cargo nextest` on an OS matrix. Nightly run covers release mode. | PR/push on Rust-relevant paths, merge queue, nightly, manual |
-| `test-crates.yml` | Builds each workspace crate standalone under its feature combinations. | PR/push on Rust-relevant paths |
+| `lint.yml` | Clippy, rustfmt, `cargo deny`, feature checks. A nightly scheduled run adds the expensive non-gating lints (unused deps, docs build). | Every PR (self-gated by a `changes` job); push on Rust-relevant paths; merge queue; nightly; manual |
+| `tests-unit.yml` | Unit-test suite via `cargo nextest` on an OS matrix. Nightly run covers release mode. | Every PR (self-gated by a `changes` job); push on Rust-relevant paths; merge queue; nightly; manual |
+| `test-crates.yml` | Builds each workspace crate standalone under its feature combinations. | Every PR (self-gated by a `changes` job); push on Rust-relevant paths; merge queue; manual |
 | `test-docker.yml` | Builds the production runtime image once, then smoke-tests its packaged binaries, privilege drop, default startup, and combined config overrides. | PR/push on Cargo, Docker, `zakurad`, or runtime-config paths; weekly; manual |
 | `zakura-e2e.yml` | The heaviest PR-path job, isolated in its own workflow: regtest docker-compose end-to-end gate, multi-node testkit test, block-sync fuzz on every push to `main`, and long four-node modes nightly. PR runs are gated by a `changes` job or the `run-zakura-e2e` label. | PR/push (self-gated), merge queue, nightly, manual |
-| `status-checks.patch.yml` | Empty jobs with the same names as required checks, so branch protection passes when path filters skip `lint.yml` / `tests-unit.yml` / `test-crates.yml`. Its `paths-ignore` list **must stay the exact inverse** of those workflows' `paths`. | PR on non-Rust paths only |
 | `docs-check.yml` | markdownlint, codespell, and lychee link checking over all Markdown. | PR/push on Markdown paths |
 | `changelog.yml` | Requires one fragment for Rust/Cargo.toml PRs and tests release assembly. | Every PR/push/merge group |
 | `coverage.yml` | llvm-cov + nextest coverage uploaded to Codecov. A 120-minute instrumented build, kept off the PR path. | Push to `main`/`release/**`, nightly, manual |
@@ -82,8 +81,8 @@ Droplet lifecycle is shared, not copy-pasted, through the composite actions in `
 
 ## Conventions
 
-- **Merge queue, not Mergify.** PRs land through GitHub's native merge queue; `lint.yml`, `tests-unit.yml`, and `zakura-e2e.yml` re-run on every queued entry via `merge_group`.
-- **Patch workflows.** When a required check is skipped by path filters, GitHub leaves it "Expected" forever. The `.patch.yml` pattern provides an empty job with the same name on the inverse path set. If you change `paths` in a gating workflow, update `status-checks.patch.yml` to match.
+- **Merge queue, not Mergify.** PRs land through GitHub's native merge queue; `lint.yml`, `tests-unit.yml`, `test-crates.yml`, `semver-checks.yml`, and `zakura-e2e.yml` re-run on every queued entry via `merge_group`.
+- **Self-gating required checks.** A required check that never runs (because a path filter skipped its whole workflow) sits in "Expected" forever and blocks the PR. `lint.yml`, `tests-unit.yml`, and `test-crates.yml` therefore drop the `paths:` filter on `pull_request` and instead trigger on every PR: a lightweight `changes` job detects whether the workflow's own relevant paths changed, the heavy jobs gate on it (`needs.changes.outputs.<x> == 'true' || github.event_name != 'pull_request'`) so they still skip on irrelevant PRs, and the always-running `re-actors/alls-green` summary job (with the skippable jobs in `allowed-skips`) reports exactly once on every PR. `zakura-e2e.yml` uses the same shape. `semver-checks.yml` reaches the same always-report property differently: its `select-packages` job runs on every event and its custom summary job requires a downstream result only when a publishable crate is actually affected, so a PR that touches none still reports green. When you change a workflow's relevant paths, update the regex/`case` in its `changes` job (or, for semver, `affected_semver_packages.py`) — there is no separate patch workflow to keep in sync.
 - **Label-gated heavy jobs.** `C-benchmark` runs benchmarks on a PR; `run-zakura-e2e` forces the e2e suite on a PR that wouldn't otherwise trigger it.
 - **Fork PRs.** Repository secrets and variables are not available to workflows on PRs from forks, so fleet and PR-node workflows are dispatch-only from this repository.
 - **Checkpoints are updated manually.** The upstream automated checkpoint pipeline depended on the removed GCP integration tests. Until a replacement exists, follow the [`zakura-checkpoints` instructions](../../crates/zakura-utils/README.md#zakura-checkpoints); checkpoint PRs remain consensus-critical and need careful review.

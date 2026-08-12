@@ -24,15 +24,12 @@
 name: Semver checks
 
 on:
+  # No `paths:` filter on pull_request: the workflow triggers on every PR so the
+  # `semver-checks` required check always reports. The select-packages job below
+  # detects affected publishable crates from the diff and skips the heavy
+  # per-package checks when none are affected. Push keeps its own paths filter.
   pull_request:
     branches: [main, "feat/**", "release/**"]
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - .github/workflows/semver-checks.yml
-      - .github/workflows/scripts/affected_semver_packages.py
-      - .github/workflows/scripts/test_affected_semver_packages.py
   push:
     branches: [main]
     paths:
@@ -42,6 +39,12 @@ on:
       - .github/workflows/semver-checks.yml
       - .github/workflows/scripts/affected_semver_packages.py
       - .github/workflows/scripts/test_affected_semver_packages.py
+
+  # Run in the merge queue so the `semver-checks` required check reports on every
+  # queued entry. `merge_group` ignores path filters; select-packages checks all
+  # publishable crates and warm-baselines validates them against their baselines.
+  merge_group:
+
   workflow_dispatch:
 
 permissions:

@@ -1,14 +1,12 @@
 name: Test Crate Build
 
 on:
+  # No `paths:` filter on pull_request: the workflow triggers on every PR and the
+  # `changes` job below gates the heavy build so it still skips on PRs that touch
+  # no crate-relevant files. This keeps the `test crate build success` required
+  # check reporting on every PR instead of sitting in "Expected" forever.
   pull_request:
     branches: [main, "feat/**", "release/**"]
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - .cargo/config.toml
-      - .github/workflows/test-crates.yml
 
   push:
     branches: [main, "feat/**", "release/**"]
@@ -45,6 +43,42 @@ env:
   COLORBT_SHOW_HIDDEN: 1
 
 jobs:
+  # Detect whether a pull request touches crate-build-relevant paths. Only
+  # pull_request is path-gated here; push carries its own `paths:` filter and
+  # merge_group / workflow_dispatch always run the full build.
+  changes:
+    name: detect crate-relevant changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      crates: ${{ steps.filter.outputs.crates }}
+    steps:
+      - id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Non-PR events run the heavy job unconditionally (see its `if`), so the
+          # filter result is only consumed on pull_request.
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            echo "crates=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+            --jq '.[].filename')
+
+          if printf '%s\n' "$changed" | grep -qE '(\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^\.github/workflows/test-crates\.yml$)'; then
+            echo "crates=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "crates=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # Verify every crate builds, both with its default features and with no
   # default features.
   #
@@ -64,6 +98,10 @@ jobs:
   # that is a separate, deliberate effort, not part of this CI change.
   crate-checks:
     name: Build crates (default and no-default features)
+    needs: changes
+    # Run for pushes (own paths filter), the merge queue, and on demand; on a
+    # pull request only when a crate-relevant path changed.
+    if: needs.changes.outputs.crates == 'true' || github.event_name != 'pull_request'
     permissions:
       contents: read
       id-token: write
@@ -101,6 +139,7 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     needs:
+      - changes
       - crate-checks
     timeout-minutes: 30
     steps:
@@ -108,3 +147,6 @@ jobs:
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
+          # crate-checks is skipped on pull requests that touch no crate-relevant
+          # paths; a genuine build failure still fails this aggregate.
+          allowed-skips: crate-checks

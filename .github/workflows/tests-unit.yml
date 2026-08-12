@@ -1,18 +1,13 @@
 name: Unit Tests
 
 on:
+  # No `paths:` filter on pull_request: the workflow triggers on every PR and the
+  # `changes` job below gates the heavy build/test jobs so they still skip on PRs
+  # that touch no test-relevant files. This keeps the `test success` required
+  # check reporting on every PR instead of sitting in "Expected" forever.
   pull_request:
     branches: [main, "feat/**", "release/**"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
-      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
-      - .config/nextest.toml
-      - .github/workflows/tests-unit.yml
 
   push:
     branches: [main]
@@ -68,6 +63,7 @@ jobs:
       pull-requests: read
     outputs:
       config: ${{ steps.filter.outputs.config }}
+      rust: ${{ steps.filter.outputs.rust }}
     steps:
       - id: filter
         env:
@@ -105,10 +101,12 @@ jobs:
               ;;
             workflow_dispatch)
               echo "config=true" >> "$GITHUB_OUTPUT"
+              echo "rust=true" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
             schedule)
               echo "config=false" >> "$GITHUB_OUTPUT"
+              echo "rust=false" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
           esac
@@ -138,7 +136,17 @@ jobs:
             esac
           done <<< "$changed"
 
+          # Broad test-relevant filter (the paths that formerly gated the whole
+          # workflow on pull_request). Gates the build/test jobs; `config` above
+          # additionally gates the narrower config-compatibility job.
+          if printf '%s\n' "$changed" | grep -qE '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/zakura-chain/src/parameters/checkpoint/main-checkpoints\.txt$|^crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier\.(bin|json)$|^\.config/nextest\.toml$|^\.github/workflows/tests-unit\.yml$)'; then
+            rust=true
+          else
+            rust=false
+          fi
+
           echo "config=$config" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
 
   # Compile the whole workspace and every test binary ONCE, then hand the result
   # to the shard jobs as a nextest archive. Previously each of the 3 shards ran
@@ -149,6 +157,12 @@ jobs:
   # parallel test execution across the shard jobs.
   build-tests:
     name: build test binaries (${{ github.event_name == 'pull_request' && 'debug' || (github.event_name == 'schedule' && 'release' || 'ci-tests') }})
+    needs: changes
+    # Run for pushes (own paths filter), the merge queue, nightly, and on demand;
+    # on a pull request only when a test-relevant path changed. unit-tests and
+    # zakura-config `need` this job, so they cascade-skip with it on PRs that
+    # touch no test-relevant paths.
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     permissions:
       contents: read
       id-token: write
@@ -279,6 +293,10 @@ jobs:
 
   network-dependent:
     name: network-dependent acceptance tests
+    needs: changes
+    # Compiles independently of build-tests, so gate it directly on the same
+    # test-relevant filter; always runs on non-PR events.
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     permissions:
       contents: read
       id-token: write
@@ -378,9 +396,13 @@ jobs:
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          # These jobs are skipped outside their event or changed-path scope.
-          # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config
+          # These jobs are skipped outside their event or changed-path scope:
+          # build-tests / unit-tests / network-dependent skip on pull requests
+          # that touch no test-relevant paths (unit-tests and zakura-config
+          # cascade-skip with build-tests), pruned-storage is push-main only,
+          # check-no-git-dependencies is A-release-label only. Failed,
+          # non-skipped jobs still fail this aggregate status.
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent
 
   report-nightly-result:
     name: report nightly release test result

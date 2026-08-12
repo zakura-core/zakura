@@ -196,6 +196,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 version = "0.1.3"
 
+[[audits.funty]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "2.0.0"
+notes = "Reviewed all packaged source and manifest. This dependency-free no_std-compatible crate defines traits over primitive numeric types and uses macros to forward methods to their type-checked inherent implementations. It has no unsafe code, build script, runtime I/O, or ambient capabilities. All-feature targets with compile-time trait assertions and the no-default-features library target passed."
+
 [[audits.futures]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -215,6 +221,12 @@ delta = "0.3.30 -> 0.3.31"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.30 -> 0.3.31"
+
+[[audits.futures-io]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.32"
+notes = "Reviewed all packaged source and manifest. This dependency-free no_std-compatible crate defines async I/O traits and forwarding implementations over caller-supplied buffers and objects; it does not acquire filesystem, network, or process capabilities itself. It has no unsafe code or build script. All-feature and no-default-features library and documentation targets passed; the package defines no tests."
 
 [[audits.futures-io]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -328,6 +340,12 @@ delta = "0.5.1 -> 0.6.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.6.0 -> 0.7.0"
+
+[[audits.indenter]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.4"
+notes = "Reviewed all packaged source, manifest, tests, and example. This dependency-free no_std-compatible crate wraps caller-supplied fmt::Write values to indent and dedent formatted text. It has no unsafe code, build script, runtime I/O, or ambient capabilities. All 15 unit tests and 2 doctests passed with all features, and the no-default-features library target passed."
 
 [[audits.indexmap]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

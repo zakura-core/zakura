@@ -618,10 +618,6 @@ criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade"
 
-[[exemptions.funty]]
-version = "2.0.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.futures]]
 version = "0.3.32"
 criteria = "safe-to-deploy"
@@ -639,10 +635,6 @@ version = "0.3.32"
 criteria = "safe-to-deploy"
 
 [[exemptions.futures-executor]]
-version = "0.3.32"
-criteria = "safe-to-deploy"
-
-[[exemptions.futures-io]]
 version = "0.3.32"
 criteria = "safe-to-deploy"
 
@@ -844,10 +836,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.incrementalmerkletree]]
 version = "0.8.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.indenter]]
-version = "0.3.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.indexmap]]

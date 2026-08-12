@@ -93,6 +93,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.7.2 -> 1.8.0"
 
+[[audits.cargo-platform]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.3"
+notes = "Reviewed all packaged source, manifest, tests, and example. The library parses, validates, displays, and matches caller-supplied target names and cfg expressions using a separately policy-checked Serde dependency. It has no unsafe code, build script, runtime I/O, or ambient capabilities. The manually run example invokes rustc to obtain host metadata, but Cargo does not execute it during build. All 8 integration tests passed."
+
 [[audits.cfg_aliases]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -485,6 +491,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.8.11 -> 1.0.1"
 
+[[audits.n0-snafu]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.3"
+notes = "Reviewed all packaged source, manifest, and tests. The crate wraps caller-supplied errors, captures span and backtrace data, and formats error chains using separately policy-checked dependencies. It has no unsafe code, build script, filesystem or network access, or process execution; Debug formatting explicitly reads color-backtrace verbosity from the environment. All 8 unit tests passed with backtrace display disabled to match their expected formatting."
+
 [[audits.nix]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -767,6 +779,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.5.0 -> 0.4.0@git:ffe4234788fd22662b937ba7c6ea01535fcc1293"
 importable = false
+
+[[audits.sketches-ddsketch]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.1"
+notes = "Reviewed all packaged source, manifest, and tests. The crate maintains configuration-bounded in-memory DDSketch histogram stores over caller-supplied floating-point samples with optional separately policy-checked Serde support. It has no unsafe code, build script, runtime I/O, or ambient capabilities. All 9 unit tests, 10 integration tests, and 2 doctests passed with all features; 2 resource-intensive performance tests remained ignored."
 
 [[audits.sketches-ddsketch]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

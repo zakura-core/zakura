@@ -3,10 +3,10 @@ updates:
   # Rust section
   - package-ecosystem: cargo
     directory: "/"
-    # Routine version updates are disabled below. For security updates, preserve
-    # compatible requirements but allow Cargo.toml changes when a patched version
+    # Routine version updates are disabled below. Use the automatic strategy for
+    # security updates so Dependabot can change Cargo.toml when a patched version
     # falls outside the existing requirement.
-    versioning-strategy: increase-if-necessary
+    versioning-strategy: auto
     # Keep this entry to customize security updates, but do not open routine Cargo
     # version updates. Routine dependency upgrades need matching cargo-vet evidence
     # and otherwise fail the supply-chain gate, so maintainers curate them

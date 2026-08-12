@@ -821,7 +821,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
             | Err(TransitionFailure::InvalidEvidence(_))
             | Err(TransitionFailure::Mode)
             | Err(TransitionFailure::StalePreparation)
-            | Err(TransitionFailure::ResourceStalled) => {
+            | Err(TransitionFailure::AuxiliaryLimitExceeded) => {
                 assert_eq!(store.snapshot(), before);
                 refused = refused.saturating_add(1);
             }

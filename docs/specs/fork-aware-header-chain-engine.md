@@ -296,7 +296,18 @@ Eligibility reasons are a set, not a single overwritable flag. Permanent reasons
 
 ### 4.1 One transition interface
 
-All calls below submit evidence to one serialized durable transition. The transition reads an expected `state_version`; commit uses compare-and-swap semantics and retries from the new durable state on conflict. It computes both frontiers independently, commits all changes, and then emits one ordered observation containing the committed version and generations.
+All calls below submit evidence to one serialized durable transition. The planner computes both frontiers independently. The runtime commits all changes and then emits one ordered observation containing the committed version and generations.
+
+Freshness uses two complementary models:
+
+- Ordinary caller-serialized events carry an expected `state_version` and use compare-and-swap semantics. On conflict the caller MUST reload and retry from the new durable state.
+- Owner-qualified asynchronous completions—header-range insertion and auxiliary evidence that carry a header-sync or body work owner—MUST derive freshness from that owner's generation, branch anchor, and identity. Their supplied `state_version` MUST NOT authorize the work.
+
+Durable facts supplied with a transition MUST come from the same serialized durable snapshot the planner reads. Validation leases MUST be coherent and explicitly authorized. A finality rebase path MUST be proven by walking durable finality history for that snapshot; the planner MAY check only structural linkage and that the path ends at the current finalized frontier.
+
+Replay short-circuit and conflicting-payload detection compare only against the identity of the most recent state-changing transition. An exact adjacent replay MUST be recognized before ordinary version rejection. Older exact replays are not required to short-circuit; graph-level event idempotence MUST still keep them safe.
+
+Protected-path retention pressure that cannot admit work without evicting `header_best` or `verified_best` MUST raise the durable resource-stalled alarm and return a committed stall receipt. Exceeding auxiliary-delivery bounds MUST refuse the event with zero durable effects and MUST NOT raise that alarm.
 
 **LC-INT-01 [ZW] — Unified transition events.** The following events MUST use that transition interface: header-range insertion, full-block grow, full-block reset at any height, deterministic body-invalid feedback, operator invalidate, operator reconsider, finalization, configured-checkpoint advancement, VCT metadata repair, and restart reconstruction.
 
@@ -305,6 +316,14 @@ All calls below submit evidence to one serialized durable transition. The transi
 **LC-INT-03 [ZW] — Full-block integration.** A full-block commit MUST ensure its exact header node exists in the DAG with correct parent linkage, update body-validation state, update `verified_best` from full state, apply any body-derived eligibility evidence, and then independently reevaluate `header_best`.
 
 **LC-INT-04 [ZW] — Atomic invalidate and reconsider.** Invalidate or reconsider MUST complete its durable eligibility and both-frontier transition before returning externally complete or publishing watches. If full state has no non-finalized chain, `verified_best` MUST become `finalized`; the header DAG remains independently selected subject to its eligibility set.
+
+**LC-INT-05 [LS] — Owner-qualified freshness.** Header-range insertion and auxiliary-evidence events that carry a typed work owner MUST admit or reject based on that owner's generation, branch identity, and ownership checks. They MUST NOT treat a mismatched `state_version` alone as authorization failure when the owner remains current.
+
+**LC-INT-06 [LS] — Adjacent replay scope.** Durable metadata MUST retain at most the fingerprint of the most recent state-changing transition for replay short-circuit and conflicting-payload detection. Exact adjacent replay MUST return no durable effects. An intervening state-changing transition MUST clear that adjacent protection for earlier events.
+
+**LC-INT-07 [LS] — Durable-fact provenance.** Validation leases supplied with a transition MUST be authorized against the current serialized snapshot. Finality rebase paths and migrated-pin facts MUST be read from durable history for that same snapshot; planner structural checks alone MUST NOT be treated as proof of provenance.
+
+**LC-INT-08 [LS] — Distinct admission-pressure outcomes.** Retention pressure that would require evicting a protected path MUST commit or retain the resource-stalled alarm and return a committed stall receipt without applying the refused event. Auxiliary-delivery limit overflow MUST fail closed with zero durable effects and MUST NOT set that alarm.
 
 ### 4.2 Body evidence
 
@@ -664,7 +683,7 @@ Every normative rule is mapped here. A range such as `LC-SCOPE-01..03` includes 
 | LC-SELECT-01..04 | DG-01, HV-07, DF-01, AUD-01..03 |
 | LC-REORG-01, LC-FINAL-01..04 | DG-05, DG-07, AUD-13 |
 | LC-RETAIN-01..04 | DG-06, PW-05 |
-| LC-INT-01..04 | IN-01, IN-04, IN-06, AUD-04, AUD-10..15 |
+| LC-INT-01..08 | IN-01, IN-04, IN-06, AUD-04, AUD-10..15 |
 | LC-BODY-01..04 | IN-02, DF-02 |
 | LC-OP-01..02 | IN-04, AUD-10..12 |
 | LC-AVAIL-01..03 | IN-03 |

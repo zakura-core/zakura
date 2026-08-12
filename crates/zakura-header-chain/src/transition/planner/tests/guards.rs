@@ -87,6 +87,83 @@ fn typed_header_authority_ignores_global_version_but_rejects_stale_generation() 
 }
 
 #[test]
+fn typed_body_authority_ignores_global_version_but_rejects_stale_generation() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let mut insert = insertion(&store, 2, EvidenceId::from_digest([0xa0; 32]));
+    let TransitionEvent::InsertHeaders(insert_event) = &mut insert.event else {
+        panic!("the fixture constructs a header insertion");
+    };
+    let header_hash = insert_event.batch.headers()[0].hash;
+    let boundary_hash = insert_event.batch.headers()[1].hash;
+    let delivery = crate::AuxDelivery {
+        delivery_id: EvidenceId::from_digest([0xa1; 32]),
+        header_hash,
+        source: SourceId::from_digest([0xa2; 32]),
+        owner: insert_event.owner,
+        body_size: crate::BodySizeHint::Unknown,
+        tree_aux: Some(crate::TreeAuxRecordV1 {
+            height: block::Height(1),
+            sapling_root: zakura_chain::sapling::tree::Root::default(),
+            orchard_root: zakura_chain::orchard::tree::Root::default(),
+            ironwood_root: zakura_chain::ironwood::tree::Root::default(),
+            sapling_tx_count: 1,
+            orchard_tx_count: 1,
+            ironwood_tx_count: 1,
+            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0xa3; 32]),
+        }),
+        authentication: crate::AuxAuthentication::Unauthenticated,
+    };
+    insert_event.source = delivery.source;
+    insert_event.aux.push(delivery);
+    let inserted = apply_transition(&store, insert, &context(&config, &clock, None))
+        .expect("the header and unauthenticated delivery insert");
+    store.commit(&inserted);
+
+    let owner = crate::BodyWorkAuthority::for_snapshot(&store.snapshot()).bind(
+        1,
+        NonZeroU64::new(1).expect("fixture request IDs are nonzero"),
+    );
+    let authentication = crate::AuxAuthentication::Authenticated {
+        evidence: EvidenceId::from_digest([0xa4; 32]),
+        boundary_hash,
+    };
+    let mut request = TransitionRequest {
+        expected_version: StateVersion::new(9),
+        event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence {
+            owner,
+            deliveries: vec![delivery],
+            authentication,
+        })),
+    };
+    apply_transition(
+        &store,
+        request.clone(),
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .expect("global state versions do not authorize auxiliary evidence");
+
+    let TransitionEvent::AuxEvidence(event) = &mut request.event else {
+        panic!("the fixture constructs auxiliary evidence");
+    };
+    event.owner = crate::BodyWorkOwner {
+        authority: crate::BodyWorkAuthority {
+            verified_generation: VerifiedGeneration::new(9),
+            ..event.owner.authority
+        },
+        ..event.owner
+    };
+    assert!(matches!(
+        apply_transition(
+            &store,
+            request,
+            &context(&config, &clock, Some(&Authority)),
+        ),
+        Err(TransitionFailure::Stale { current }) if current == store.metadata.state_version
+    ));
+}
+
+#[test]
 fn peer_target_completion_must_match_the_validation_lease_ancestor() {
     let (store, config) = TestStore::new(EngineMode::HeadersOnly);
     let clock = ManualClock(Utc::now());

@@ -534,6 +534,38 @@ tests = ["IN-01::generated_nu5_graph_matches_full_state_before_finalization", "A
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
+id = "LC-INT-05"
+name = "Owner-qualified freshness"
+status = "implemented"
+owner = "zakura_header_chain::transition::planner::apply_transition_engine"
+tests = ["DF-02::typed_header_authority_ignores_global_version_but_rejects_stale_generation", "DF-02::typed_body_authority_ignores_global_version_but_rejects_stale_generation", "IN-01::all_owner_mismatches_have_zero_effects"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-INT-06"
+name = "Adjacent replay scope"
+status = "implemented"
+owner = "zakura_header_chain::EngineMetadata::last_transition"
+tests = ["IN-04::replay_identity_is_domain_payload_and_authority_bound", "IN-04::replay_protection_covers_only_the_adjacent_state_changing_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-INT-07"
+name = "Durable-fact provenance"
+status = "implemented"
+owner = "zakura_state::HeaderChainRuntime"
+tests = ["DG-05::finality_atomic_prune_rebase_projection_generation", "DG-01::complete_batch_is_sealed_to_lease_and_uses_internal_context", "IN-07::stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or_score"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-INT-08"
+name = "Distinct admission-pressure outcomes"
+status = "implemented"
+owner = "zakura_header_chain::transition::planner::apply_transition_engine"
+tests = ["DG-06::protected_paths_and_context_references_fail_closed_under_node_pressure", "DG-06::exact_v1_node_boundary_refuses_to_evict_the_selected_path", "IN-06::auxiliary_resource_limits_reject_equal_plus_one_without_effects"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
 id = "LC-BODY-01"
 name = "Body-payload mismatch"
 status = "implemented"

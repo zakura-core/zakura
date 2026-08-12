@@ -1510,13 +1510,18 @@ pub struct RetiredWork {
     pub owners: Vec<HeaderSyncWorkOwner>,
 }
 
-/// Successful idempotent replay with no durable effects.
+/// Successful admission that produced no durable effects.
+///
+/// This covers exact adjacent replay of the most recent state-changing
+/// transition, already-applied rebased header work, immediately evicted
+/// insertions, and other zero-effect admissions. It is not a general
+/// historical replay ledger.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct NoChangeReceipt {
     /// Unchanged durable version.
     pub state_version: StateVersion,
-    /// Previously committed event identity, if this event carries one.
-    pub event: Option<EvidenceId>,
+    /// Submitted event identity when the event carries an idempotency key.
+    pub idempotency_key: Option<EvidenceId>,
 }
 
 /// Stale version/branch/owner result with guaranteed zero effects.
@@ -1544,7 +1549,7 @@ pub struct CommittedStallReceipt {
 pub enum ApplyResult {
     /// State adapter durably committed.
     Committed,
-    /// Idempotent evidence made no change.
+    /// Admission produced no durable effects.
     NoChange(NoChangeReceipt),
     /// Ownership/version was stale before effects.
     Stale(StaleReceipt),

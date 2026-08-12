@@ -94,9 +94,13 @@ pub enum TransitionFailure {
     /// Event fields contradict canonical headers or durable ancestry.
     #[error("invalid transition evidence: {0}")]
     InvalidEvidence(&'static str),
-    /// Retention could not admit this event without evicting protected state.
-    #[error("header admission refused because protected paths fill the resource bound")]
-    ResourceStalled,
+    /// Auxiliary delivery bounds refused this event before any durable mutation.
+    ///
+    /// Unlike [`TransitionCause::ResourceStalled`], this is a zero-effect planner
+    /// failure: it does not raise the durable resource-stall alarm or produce a
+    /// [`crate::CommittedStallReceipt`].
+    #[error("header admission refused because auxiliary delivery limits are exceeded")]
+    AuxiliaryLimitExceeded,
     /// The projected write set violated a commit invariant.
     #[error(transparent)]
     Invariant(#[from] super::InvariantViolation),
@@ -397,7 +401,7 @@ fn validate_event_resource_bounds(
         ));
     }
     if insert.aux.len() > limits.max_aux_deliveries_total.get() {
-        return Err(TransitionFailure::ResourceStalled);
+        return Err(TransitionFailure::AuxiliaryLimitExceeded);
     }
     let mut additions = HashMap::<block::Hash, HashSet<EvidenceId>>::new();
     for delivery in &insert.aux {
@@ -414,12 +418,12 @@ fn validate_event_resource_bounds(
             .filter(|id| !existing.iter().any(|row| row.delivery_id == **id))
             .count();
         if existing.len().saturating_add(new_count) > limits.max_aux_deliveries_per_header.get() {
-            return Err(TransitionFailure::ResourceStalled);
+            return Err(TransitionFailure::AuxiliaryLimitExceeded);
         }
         new_total = new_total.saturating_add(new_count);
     }
     if new_total > limits.max_aux_deliveries_total.get() {
-        return Err(TransitionFailure::ResourceStalled);
+        return Err(TransitionFailure::AuxiliaryLimitExceeded);
     }
     Ok(())
 }

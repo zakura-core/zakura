@@ -2237,7 +2237,7 @@ impl HeaderChainRuntime {
             fault(FaultPoint::AfterMemorySwap)?;
             return Ok(ApplyResult::NoChange(NoChangeReceipt {
                 state_version: transition.before().state_version,
-                event,
+                idempotency_key: event,
             }));
         }
 
@@ -2522,7 +2522,9 @@ impl HeaderChainStore {
         let max_nodes = config.limits.max_non_finalized_nodes.get();
         if finalized_path.len().saturating_add(restored_path.len()) > max_nodes {
             if restored_path.len() > max_nodes {
-                return Err(TransitionFailure::ResourceStalled.into());
+                return Err(HeaderChainStoreError::Incoherent(
+                    "restored verified path exceeds the non-finalized node limit",
+                ));
             }
             for chunk in finalized_path.chunks(max_nodes) {
                 let chunk = chunk.to_vec();

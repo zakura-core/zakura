@@ -274,6 +274,74 @@ fn replay_identity_is_domain_payload_and_authority_bound() {
 }
 
 #[test]
+fn replay_protection_covers_only_the_adjacent_state_changing_transition() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = store
+        .graph
+        .header_node(anchor.hash)
+        .expect("the anchor exists")
+        .header
+        .difficulty_threshold;
+    let tip = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x80);
+    synchronize_fixture(&mut store, tip);
+    let target = tip.hash;
+    let id = crate::OperatorInvalidationId::new([0x81; 16]);
+    let invalidate = operator_invalidate(&store, target, id, 0x82);
+    let committed = apply_transition(
+        &store,
+        invalidate.clone(),
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .expect("the original authenticated action commits");
+    store.commit(&committed);
+
+    let adjacent = apply_transition(
+        &store,
+        invalidate.clone(),
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .expect("an exact adjacent replay is short-circuited");
+    assert!(adjacent.is_no_change());
+
+    let reconsider = operator_reconsider(&store, target, id, 0x83);
+    let intervening = apply_transition(
+        &store,
+        reconsider,
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .expect("an intervening state-changing transition commits");
+    store.commit(&intervening);
+    assert_eq!(
+        store
+            .metadata
+            .last_transition
+            .expect("the intervening transition is replay protected")
+            .evidence(),
+        EvidenceId::from_digest([0x83; 32]),
+    );
+
+    let mut older = invalidate;
+    older.expected_version = store.metadata.state_version;
+    let replayed = apply_transition(&store, older, &context(&config, &clock, Some(&Authority)))
+        .expect("an older event replans after an intervening transition");
+    assert!(
+        !replayed.is_no_change(),
+        "one-slot replay protection does not short-circuit older events"
+    );
+    store.commit(&replayed);
+    assert_eq!(
+        store
+            .metadata
+            .last_transition
+            .expect("the replanned older event becomes the adjacent slot")
+            .evidence(),
+        EvidenceId::from_digest([0x82; 32]),
+    );
+}
+
+#[test]
 fn full_state_authority_is_bound_to_the_complete_event_payload() {
     struct ExactAuthority(crate::TransitionFingerprint);
 

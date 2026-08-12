@@ -177,15 +177,15 @@ pub enum TreestateArtifactError {
         found_height: Height,
     },
 
-    /// A record claims to complete at or above the artifact's last checkpoint.
+    /// A record claims to complete above the artifact's last checkpoint.
     ///
-    /// The artifact covers only subtrees completed before that checkpoint; a height at or above it
-    /// escapes the tip bound that keeps unverified blocks from being served from published roots.
+    /// The artifact covers subtrees completed through that checkpoint; a height above it escapes
+    /// the tip bound that keeps unverified blocks from being served from published roots.
     #[error(
         "{pool} subtree index {index} ends at {end_height:?}, \
-         which is not strictly below last checkpoint {last_checkpoint:?}"
+         which is above last checkpoint {last_checkpoint:?}"
     )]
-    EndHeightAtOrAboveCheckpoint {
+    EndHeightAboveCheckpoint {
         /// The pool whose height failed.
         pool: &'static str,
         /// The record's index.
@@ -316,9 +316,8 @@ impl Default for SubtreeArtifact {
 
 /// Validates one pool's declared indexes and end heights against the artifact checkpoint.
 ///
-/// Indexes must be exactly `0..records.len()`. End heights must be strictly increasing and
-/// strictly below `last_checkpoint`, matching the export contract that only completed
-/// pre-checkpoint subtrees are published.
+/// Indexes must be exactly `0..records.len()`. End heights must be strictly increasing and at or
+/// below `last_checkpoint`, matching the final frontier that authenticates the artifact.
 fn validate_pool_metadata(
     pool: &'static str,
     last_checkpoint: Height,
@@ -341,8 +340,8 @@ fn validate_pool_metadata(
             });
         }
 
-        if record.end_height >= last_checkpoint {
-            return Err(TreestateArtifactError::EndHeightAtOrAboveCheckpoint {
+        if record.end_height > last_checkpoint {
+            return Err(TreestateArtifactError::EndHeightAboveCheckpoint {
                 pool,
                 index: record.index.0,
                 end_height: record.end_height,
@@ -1057,8 +1056,8 @@ mod tests {
         );
     }
 
-    /// End heights drive tip-bound serving. They must rise with indexes and stay strictly below
-    /// the artifact checkpoint, or a root can become eligible before its block is verified — or
+    /// End heights drive tip-bound serving. They must rise with indexes and stay at or below the
+    /// artifact checkpoint, or a root can become eligible before its block is verified — or
     /// remain hidden after it should be public.
     #[test]
     fn subtree_artifact_rejects_invalid_end_heights() {
@@ -1092,12 +1091,8 @@ mod tests {
         at_checkpoint.sapling[1].end_height = Height(31);
         assert_eq!(
             SubtreeArtifact::decode(&at_checkpoint.encode(&Network::Mainnet), &Network::Mainnet),
-            Err(TreestateArtifactError::EndHeightAtOrAboveCheckpoint {
-                pool: SAPLING_POOL,
-                index: 1,
-                end_height: Height(31),
-                last_checkpoint: Height(31),
-            })
+            Ok(at_checkpoint),
+            "a subtree completed by the checkpoint is part of its final frontier"
         );
 
         let mut above_checkpoint = sample_subtrees();
@@ -1107,7 +1102,7 @@ mod tests {
                 &above_checkpoint.encode(&Network::Mainnet),
                 &Network::Mainnet
             ),
-            Err(TreestateArtifactError::EndHeightAtOrAboveCheckpoint {
+            Err(TreestateArtifactError::EndHeightAboveCheckpoint {
                 pool: ORCHARD_POOL,
                 index: 0,
                 end_height: Height(40),
@@ -1136,14 +1131,14 @@ mod tests {
             })
         );
 
-        let mut at_checkpoint = sample_subtrees();
-        at_checkpoint.sapling[1].end_height = at_checkpoint.last_checkpoint;
+        let mut above_checkpoint = sample_subtrees();
+        above_checkpoint.sapling[1].end_height = Height(above_checkpoint.last_checkpoint.0 + 1);
         assert_eq!(
-            at_checkpoint.verify_against_frontiers(&empty, &empty_orchard, &empty_orchard),
-            Err(TreestateArtifactError::EndHeightAtOrAboveCheckpoint {
+            above_checkpoint.verify_against_frontiers(&empty, &empty_orchard, &empty_orchard),
+            Err(TreestateArtifactError::EndHeightAboveCheckpoint {
                 pool: SAPLING_POOL,
                 index: 1,
-                end_height: Height(31),
+                end_height: Height(32),
                 last_checkpoint: Height(31),
             })
         );

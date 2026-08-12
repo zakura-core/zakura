@@ -8,10 +8,11 @@
 //!
 //! # Direct export
 //!
-//! When Sapling, Orchard, and Ironwood frontiers are present at `H - 1`, each pool's leaf count
-//! floor-divides to the number of completed subtrees the artifact must contain. The stored
+//! When Sapling, Orchard, and Ironwood frontiers are present at `H - 1`, this is a legacy archive,
+//! so each pool's frontier at `H` floor-divides to the number of completed subtrees the artifact
+//! must contain. The stored
 //! `{pool}_note_commitment_subtree` rows are then required to be exactly the contiguous indexes
-//! `0..expected`, each with `end_height < H`. That proves completeness against the frontiers; the
+//! `0..expected`, each with `end_height <= H`. That proves completeness against the frontiers; the
 //! individual roots remain review-trusted, matching the artifact's published trust model.
 //!
 //! # Replay fallback
@@ -62,9 +63,9 @@ pub enum TreestateExportError {
     #[error("network last checkpoint is genesis; there is no historical subtree band to export")]
     InvalidLastCheckpoint,
 
-    /// The finalized tip has not reached the height immediately below the network checkpoint.
+    /// The finalized tip has not reached the network checkpoint.
     #[error(
-        "finalized tip {tip:?} has not reached pre-last-checkpoint height {required:?} \
+        "finalized tip {tip:?} has not reached last-checkpoint height {required:?} \
          for network checkpoint {last_checkpoint:?}"
     )]
     TipBelowLastCheckpoint {
@@ -105,7 +106,7 @@ pub enum TreestateExportError {
     IncompleteStoredSubtrees {
         /// Which pool failed validation.
         pool: &'static str,
-        /// The height bound records must complete strictly below.
+        /// The inclusive height bound records must complete at or below.
         bound: Height,
         /// How many completed subtrees the frontier required.
         expected: usize,
@@ -209,24 +210,31 @@ pub fn export(
         return Err(TreestateExportError::InvalidLastCheckpoint);
     }
 
-    let pre_last_checkpoint = Height(last_checkpoint.0 - 1);
     let tip = db.finalized_tip_height();
-    if tip.is_none_or(|tip| tip < pre_last_checkpoint) {
+    if tip.is_none_or(|tip| tip < last_checkpoint) {
         return Err(TreestateExportError::TipBelowLastCheckpoint {
             tip,
-            required: pre_last_checkpoint,
+            required: last_checkpoint,
             last_checkpoint,
         });
     }
 
     let start = Instant::now();
+    let pre_last_checkpoint = Height(last_checkpoint.0 - 1);
 
     match probe_pre_last_checkpoint_frontiers(db, pre_last_checkpoint)? {
-        FrontierProbe::Present(frontiers) => {
-            let subtrees = export_stored(db, last_checkpoint, pre_last_checkpoint, &frontiers)?;
-            let verified_roots =
-                verify_exported_subtrees(&subtrees, &frontiers, pre_last_checkpoint)?;
-            on_progress(pre_last_checkpoint, 0);
+        FrontierProbe::Present(_) => {
+            let frontiers = match probe_pre_last_checkpoint_frontiers(db, last_checkpoint)? {
+                FrontierProbe::Present(frontiers) => frontiers,
+                FrontierProbe::Absent => {
+                    return Err(TreestateExportError::IncompleteFrontiers {
+                        missing: vec!["sapling", "orchard", "ironwood"],
+                    });
+                }
+            };
+            let subtrees = export_stored(db, last_checkpoint, last_checkpoint, &frontiers)?;
+            let verified_roots = verify_exported_subtrees(&subtrees, &frontiers, last_checkpoint)?;
+            on_progress(last_checkpoint, 0);
             Ok(TreestateExport {
                 subtrees,
                 elapsed: start.elapsed(),
@@ -237,7 +245,7 @@ pub fn export(
         FrontierProbe::Absent => export_by_replay(
             db,
             last_checkpoint,
-            pre_last_checkpoint,
+            last_checkpoint,
             start,
             &mut on_progress,
         ),
@@ -328,11 +336,11 @@ fn export_stored(
     })
 }
 
-/// Validates and collects stored subtree rows completed strictly below `bound`.
+/// Validates and collects stored subtree rows completed at or below `bound`.
 ///
 /// `leaf_count` is the pool's note-commitment count at `bound`. The expected completed-subtree
 /// count is `leaf_count >> TRACKED_SUBTREE_HEIGHT`. Stored rows must supply exactly indexes
-/// `0..expected`, each with `end_height < bound`, and no additional below-bound rows.
+/// `0..expected`, each with `end_height <= bound`, and no additional in-bound rows.
 fn collect_stored_pool<Node>(
     pool: &'static str,
     bound: Height,
@@ -354,22 +362,22 @@ fn collect_stored_pool<Node>(
         }
     })?;
 
-    let below_bound: Vec<_> = stored
+    let at_or_below_bound: Vec<_> = stored
         .into_iter()
-        .filter(|(_, data)| data.end_height < bound)
+        .filter(|(_, data)| data.end_height <= bound)
         .collect();
 
-    if below_bound.len() != expected {
+    if at_or_below_bound.len() != expected {
         return Err(TreestateExportError::IncompleteStoredSubtrees {
             pool,
             bound,
             expected,
-            detail: format!("found {} below-bound rows", below_bound.len()),
+            detail: format!("found {} in-bound rows", at_or_below_bound.len()),
         });
     }
 
     let mut records = Vec::with_capacity(expected);
-    for (offset, (index, data)) in below_bound.into_iter().enumerate() {
+    for (offset, (index, data)) in at_or_below_bound.into_iter().enumerate() {
         let expected_index = NoteCommitmentSubtreeIndex(u16::try_from(offset).map_err(|_| {
             TreestateExportError::UnrepresentableSubtreeCount {
                 pool,
@@ -630,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_stored_pool_requires_contiguous_below_bound_rows() {
+    fn collect_stored_pool_requires_contiguous_inclusive_bound_rows() {
         let bound = Height(10);
         let root = sapling_crypto::Node::from_bytes([7; 32]).unwrap();
         let mut stored = BTreeMap::new();
@@ -642,7 +650,7 @@ mod tests {
             NoteCommitmentSubtreeIndex(1),
             NoteCommitmentSubtreeData::new(Height(8), root),
         );
-        // Completing at the bound itself must be ignored for the below-bound set.
+        // Completing at the bound itself must be included because the final frontier includes it.
         stored.insert(
             NoteCommitmentSubtreeIndex(2),
             NoteCommitmentSubtreeData::new(bound, root),
@@ -651,25 +659,26 @@ mod tests {
         let records = collect_stored_pool(
             "sapling",
             bound,
-            2 << TRACKED_SUBTREE_HEIGHT,
+            3 << TRACKED_SUBTREE_HEIGHT,
             stored.clone(),
             |root| root.to_bytes(),
         )
-        .expect("two below-bound rows match the frontier");
-        assert_eq!(records.len(), 2);
+        .expect("three in-bound rows match the frontier");
+        assert_eq!(records.len(), 3);
         assert_eq!(records[0].index.0, 0);
         assert_eq!(records[1].end_height, Height(8));
+        assert_eq!(records[2].end_height, bound);
 
         stored.remove(&NoteCommitmentSubtreeIndex(1));
         assert!(matches!(
             collect_stored_pool(
                 "sapling",
                 bound,
-                2 << TRACKED_SUBTREE_HEIGHT,
+                3 << TRACKED_SUBTREE_HEIGHT,
                 stored,
                 |root| root.to_bytes(),
             ),
-            Err(TreestateExportError::IncompleteStoredSubtrees { expected: 2, .. })
+            Err(TreestateExportError::IncompleteStoredSubtrees { expected: 3, .. })
         ));
 
         assert_eq!(
@@ -695,7 +704,7 @@ mod tests {
         let _init_guard = zakura_test::init();
         let network = export_test_network();
         let db = ephemeral_db(&network);
-        set_tip(&db, PRE_LAST_CHECKPOINT);
+        set_tip(&db, LAST_CHECKPOINT);
         store_empty_pre_last_checkpoint_frontiers(&db);
 
         let export = export(&db, |_, _| {}).expect("legacy direct export succeeds");
@@ -708,21 +717,25 @@ mod tests {
     }
 
     #[test]
-    fn legacy_archive_exports_completed_subtree_rows_and_excludes_last_checkpoint_completion() {
+    fn legacy_archive_exports_subtree_completed_at_last_checkpoint() {
         let _init_guard = zakura_test::init();
         let network = export_test_network();
         let db = ephemeral_db(&network);
-        set_tip(&db, PRE_LAST_CHECKPOINT);
+        set_tip(&db, LAST_CHECKPOINT);
 
-        let sapling_tree = sapling_tree_with_completed_subtrees(1);
+        let pre_checkpoint_tree = sapling_tree_with_completed_subtrees(1);
+        let checkpoint_tree = sapling_tree_with_completed_subtrees(2);
         // Export proves the roots it emits against this tree, so the seeded row has to carry the
         // root the tree actually completed, the way a real database does.
-        let (_, sapling_root) = sapling_tree
+        let (_, sapling_root) = pre_checkpoint_tree
             .completed_subtree_index_and_root()
             .expect("the fixture tree completes exactly one subtree");
-        let post_bound_root = sapling_crypto::Node::from_bytes([9; 32]).unwrap();
+        let (checkpoint_index, checkpoint_root) = checkpoint_tree
+            .completed_subtree_index_and_root()
+            .expect("the checkpoint fixture completes its second subtree");
         let mut batch = DiskWriteBatch::new();
-        batch.create_sapling_tree(&db, &PRE_LAST_CHECKPOINT, &sapling_tree);
+        batch.create_sapling_tree(&db, &PRE_LAST_CHECKPOINT, &pre_checkpoint_tree);
+        batch.create_sapling_tree(&db, &LAST_CHECKPOINT, &checkpoint_tree);
         batch.create_orchard_tree(
             &db,
             &PRE_LAST_CHECKPOINT,
@@ -737,19 +750,21 @@ mod tests {
             &db,
             &NoteCommitmentSubtree::new(0u16, Height(4), sapling_root),
         );
-        // A subtree that completes at the last checkpoint itself is post-bound and must not be exported.
         batch.insert_sapling_subtree(
             &db,
-            &NoteCommitmentSubtree::new(1u16, LAST_CHECKPOINT, post_bound_root),
+            &NoteCommitmentSubtree::new(checkpoint_index, LAST_CHECKPOINT, checkpoint_root),
         );
         db.write_batch(batch).expect("seeding stored rows succeeds");
 
         let export = export(&db, |_, _| {}).expect("legacy direct export succeeds");
         assert_eq!(export.replayed_blocks, 0);
-        assert_eq!(export.subtrees.sapling.len(), 1);
+        assert_eq!(export.subtrees.sapling.len(), 2);
         assert_eq!(export.subtrees.sapling[0].index.0, 0);
         assert_eq!(export.subtrees.sapling[0].end_height, Height(4));
         assert_eq!(export.subtrees.sapling[0].root, sapling_root.to_bytes());
+        assert_eq!(export.subtrees.sapling[1].index, checkpoint_index);
+        assert_eq!(export.subtrees.sapling[1].end_height, LAST_CHECKPOINT);
+        assert_eq!(export.subtrees.sapling[1].root, checkpoint_root.to_bytes());
         assert!(export.subtrees.orchard.is_empty());
         assert!(export.subtrees.ironwood.is_empty());
     }
@@ -765,7 +780,7 @@ mod tests {
             export(&db, |_, _| {}).expect_err("tip below last checkpoint fails"),
             TreestateExportError::TipBelowLastCheckpoint {
                 tip: Some(Height(8)),
-                required: PRE_LAST_CHECKPOINT,
+                required: LAST_CHECKPOINT,
                 last_checkpoint: LAST_CHECKPOINT,
             }
         );
@@ -776,7 +791,7 @@ mod tests {
         let _init_guard = zakura_test::init();
         let network = export_test_network();
         let db = ephemeral_db(&network);
-        set_tip(&db, PRE_LAST_CHECKPOINT);
+        set_tip(&db, LAST_CHECKPOINT);
 
         let sapling_tree = sapling_tree_with_completed_subtrees(2);
         let sapling_root = sapling_crypto::Node::from_bytes([3; 32]).unwrap();
@@ -818,7 +833,7 @@ mod tests {
         let _init_guard = zakura_test::init();
         let network = export_test_network();
         let db = ephemeral_db(&network);
-        set_tip(&db, PRE_LAST_CHECKPOINT);
+        set_tip(&db, LAST_CHECKPOINT);
 
         let mut batch = DiskWriteBatch::new();
         batch.update_vct_upgrade_marker(&db, Height(0));
@@ -839,7 +854,7 @@ mod tests {
         let _init_guard = zakura_test::init();
         let network = export_test_network();
         let db = ephemeral_db(&network);
-        set_tip(&db, PRE_LAST_CHECKPOINT);
+        set_tip(&db, LAST_CHECKPOINT);
 
         assert_eq!(
             export(&db, |_, _| {}).expect_err("no export source fails"),
@@ -854,7 +869,7 @@ mod tests {
         let _init_guard = zakura_test::init();
         let network = export_test_network();
         let db = ephemeral_db(&network);
-        set_tip(&db, PRE_LAST_CHECKPOINT);
+        set_tip(&db, LAST_CHECKPOINT);
 
         let mut batch = DiskWriteBatch::new();
         batch.update_vct_upgrade_marker(&db, Height(0));
@@ -866,7 +881,7 @@ mod tests {
         assert!(matches!(
             export(&db, |_, _| {}).expect_err("empty VCT replay fails closed"),
             TreestateExportError::Derivation {
-                height: PRE_LAST_CHECKPOINT,
+                height: LAST_CHECKPOINT,
                 source: HistoricalTreeDerivationError::MissingBlockBody { .. },
             }
         ));
@@ -877,7 +892,7 @@ mod tests {
         let _init_guard = zakura_test::init();
         let network = export_test_network();
         let db = ephemeral_db(&network);
-        set_tip(&db, PRE_LAST_CHECKPOINT);
+        set_tip(&db, LAST_CHECKPOINT);
 
         let mut batch = DiskWriteBatch::new();
         batch.update_vct_upgrade_marker(&db, Height(4));
@@ -897,7 +912,7 @@ mod tests {
         let _init_guard = zakura_test::init();
         let network = export_test_network();
         let db = ephemeral_db(&network);
-        set_tip(&db, PRE_LAST_CHECKPOINT);
+        set_tip(&db, LAST_CHECKPOINT);
 
         let upgrade = Height(4);
         let pre_upgrade = Height(3);
@@ -929,7 +944,7 @@ mod tests {
         assert!(matches!(
             export(&db, |_, _| {}).expect_err("anchored VCT replay fails without bodies"),
             TreestateExportError::Derivation {
-                height: PRE_LAST_CHECKPOINT,
+                height: LAST_CHECKPOINT,
                 source: HistoricalTreeDerivationError::MissingBlockBody {
                     missing: Height(4),
                     ..
@@ -943,7 +958,7 @@ mod tests {
         let _init_guard = zakura_test::init();
         let network = export_test_network();
         let db = ephemeral_db(&network);
-        set_tip(&db, PRE_LAST_CHECKPOINT);
+        set_tip(&db, LAST_CHECKPOINT);
 
         let mut batch = DiskWriteBatch::new();
         batch.create_sapling_tree(

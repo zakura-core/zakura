@@ -3,8 +3,8 @@ name: Unit Tests
 on:
   # No `paths:` filter on pull_request: the workflow triggers on every PR and the
   # `changes` job below gates the heavy build/test jobs so they still skip on PRs
-  # that touch no test-relevant files. This keeps the required aggregate checks
-  # reporting on every PR instead of sitting in "Expected" forever.
+  # that touch no test-relevant files. This keeps the `test success` required
+  # check reporting on every PR instead of sitting in "Expected" forever.
   pull_request:
     branches: [main, "feat/**", "release/**"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
@@ -428,25 +428,6 @@ jobs:
           # check-no-git-dependencies is A-release-label only. Failed,
           # non-skipped jobs still fail this aggregate status.
           allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent
-
-  # Use a stable required context that is distinct from the `test success`
-  # context previously emitted by the removed status-check patch workflow.
-  # Keep the compatibility aggregate above while existing PRs are migrated.
-  required-tests:
-    name: required tests
-    needs: test-success
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Check the test aggregate result
-        env:
-          TEST_SUCCESS_RESULT: ${{ needs.test-success.result }}
-        run: |
-          if [[ "$TEST_SUCCESS_RESULT" != "success" ]]; then
-            echo "test success did not pass: $TEST_SUCCESS_RESULT" >&2
-            exit 1
-          fi
 
   report-nightly-result:
     name: report nightly release test result

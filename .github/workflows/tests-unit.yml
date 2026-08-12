@@ -207,7 +207,7 @@ jobs:
           cache-shared-key: ${{ github.event_name == 'pull_request' && 'zakura-drb-debug' || (github.event_name == 'schedule' && 'unit-tests-release' || 'unit-tests-ci-tests') }}
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 #v2.85.8
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -263,7 +263,7 @@ jobs:
           toolchain: ${{ matrix.rust-version }}
           # Nothing is compiled in this job, so there is no build cache to keep.
           cache: false
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 #v2.85.8
         with:
           tool: cargo-nextest
       # RocksDB is dynamically linked, so the prebuilt test binaries still need
@@ -304,7 +304,7 @@ jobs:
           toolchain: stable
           # The test binaries come from build-tests, so this job does not compile.
           cache: false
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 #v2.85.8
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -338,7 +338,7 @@ jobs:
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 #v2.85.8
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -367,7 +367,7 @@ jobs:
           # If this job is removed or stops compiling, move cache ownership to
           # network-dependent or a dedicated main-branch debug build job.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 #v2.85.8
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -392,7 +392,7 @@ jobs:
           toolchain: stable
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 #v2.85.8
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build

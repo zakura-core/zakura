@@ -189,7 +189,7 @@ jobs:
 
       # Deliberately unpinned (like cargo-hack): cargo-semver-checks must
       # track new stable rustdoc formats; pin only if a regression forces it.
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 #v2.85.8
         with:
           tool: cargo-semver-checks
 
@@ -239,7 +239,7 @@ jobs:
           toolchain: stable
           cache: false
 
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 #v2.85.8
         with:
           tool: cargo-public-api
 
@@ -286,7 +286,7 @@ jobs:
             semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-
             semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
 
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 #v2.85.8
         with:
           tool: cargo-semver-checks
 

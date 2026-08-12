@@ -20,9 +20,11 @@ updates:
       semver-major-days: 30
     # Keep the repository's Dependabot security updates setting enabled;
     # security pull requests use a separate limit and are unaffected by this.
+    # Re-enabling routine updates also requires restoring lockfile-only and
+    # replacing C-security with C-exclude-from-changelog before raising the
+    # pull request limit.
     open-pull-requests-limit: 0
     labels:
-      - "C-exclude-from-changelog"
       - "C-security"
   # Devops section
   - package-ecosystem: github-actions

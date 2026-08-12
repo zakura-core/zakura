@@ -254,6 +254,7 @@ criteria = "safe-to-deploy"
 [[exemptions.canonical-path]]
 version = "2.0.2"
 criteria = "safe-to-deploy"
+notes = "Audit held: safe set_file_name and set_extension methods mutate the wrapped path without re-canonicalizing it, breaking the advertised canonical-path invariant; is_dir also delegates to is_file. A version-wide safe-to-deploy certification is deferred pending an upstream fix."
 
 [[exemptions.cargo-platform]]
 version = "0.3.3"
@@ -869,10 +870,6 @@ criteria = "safe-to-deploy"
 version = "2.2.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.idna_adapter]]
-version = "1.2.2"
-criteria = "safe-to-deploy"
-
 [[exemptions.igd-next]]
 version = "0.16.2"
 criteria = "safe-to-deploy"
@@ -1372,20 +1369,8 @@ criteria = "safe-to-deploy"
 version = "0.5.3"
 criteria = "safe-to-deploy"
 
-[[exemptions.phf]]
-version = "0.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.phf_generator]]
-version = "0.8.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.phf_macros]]
 version = "0.12.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.phf_shared]]
-version = "0.8.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.pin-project]]
@@ -1748,10 +1733,6 @@ criteria = "safe-to-deploy"
 version = "1.2.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.scoped-tls]]
-version = "1.0.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.scopeguard]]
 version = "1.2.0"
 criteria = "safe-to-deploy"
@@ -1952,10 +1933,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.spki]]
 version = "0.7.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.stable_deref_trait]]
-version = "1.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.str_stack]]
@@ -2496,24 +2473,12 @@ criteria = "safe-to-deploy"
 version = "0.4.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.zcash_spec]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.zerocopy]]
 version = "0.8.54"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerocopy-derive]]
 version = "0.8.54"
-criteria = "safe-to-deploy"
-
-[[exemptions.zerofrom]]
-version = "0.1.8"
-criteria = "safe-to-deploy"
-
-[[exemptions.zerofrom-derive]]
-version = "0.1.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.zeroize]]

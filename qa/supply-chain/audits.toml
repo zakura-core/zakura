@@ -265,6 +265,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.1.6 -> 0.1.9"
 
+[[audits.idna_adapter]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.2.2"
+notes = "Reviewed all packaged source and manifest content. This no_std ICU adapter performs checked constant-mask construction and forwards normalization and property lookups. It contains no unsafe code, build script, runtime I/O, or ambient authority; all-feature library and documentation targets compiled."
+
 [[audits.impl-codec]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -432,6 +438,24 @@ criteria = "safe-to-deploy"
 version = "0.2.3"
 notes = "Reviewed all packaged source and manifest. Both Path and optional Camino implementations perform input-length-bounded component iteration and relative PathBuf construction without filesystem access, unsafe code, or a build script. All 6 unit tests and 2 doctests passed with all features."
 
+[[audits.phf]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.8.0"
+notes = "Reviewed all packaged source and manifest content. Immutable generated map and set lookup and iterator code is safe; generated table invariants handle empty maps. There is no unsafe code, build script, runtime I/O, or ambient authority. All three documentation tests passed."
+
+[[audits.phf_generator]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.8.0"
+notes = "Reviewed all packaged source and manifest content, including the binary and benchmark. Perfect-hash generation is deterministic from a fixed seed over developer-controlled entries; there is no unsafe code, build script, runtime I/O, or ambient authority. All-feature library, binary, and documentation targets compiled; an upstream benchmark dependency emitted only a future-incompatibility warning."
+
+[[audits.phf_shared]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.8.0"
+notes = "Reviewed all packaged source and manifest content. The crate contains deterministic SipHash, displacement, and PHF trait helpers with no unsafe code, build script, runtime I/O, or ambient authority. The all-feature documentation target compiled."
+
 [[audits.pin-project]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -534,6 +558,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.2.0 -> 0.3.0"
 
+[[audits.scoped-tls]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.1"
+notes = "Reviewed all packaged source and manifest content, including the unsafe Sync implementation and raw-pointer dereference. They are sound because storage is per-thread, the borrow exists only for the synchronous closure scope, and an RAII guard restores prior state during unwinding. There is no build script, runtime I/O, or ambient authority; five unit tests and three documentation tests passed."
+
 [[audits.serde]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -610,6 +640,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.1.1"
 notes = "Reviewed all packaged source and manifest. This build-time proc macro only folds a syn AST and generates tracing span tokens; it has no unsafe code, build script, I/O, or ambient capabilities. Both unit tests passed and doctests compiled."
+
+[[audits.stable_deref_trait]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.2.1"
+notes = "Reviewed the unsafe marker-trait contracts and every standard-library and allocation implementation. Each implementation preserves the stable pointee-address invariant, and CloneStableDeref implementations preserve the same-address invariant. The crate has no dependencies, build script, runtime I/O, or ambient authority; all six documentation tests passed."
 
 [[audits.sync_wrapper]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -977,10 +1013,28 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.0 -> 0.4.0"
 
+[[audits.zcash_spec]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.1"
+notes = "Reviewed all packaged source and manifest content. This small no_std crate denies unsafe code and implements PRF expansion using fixed personalization and domain constants, typed inputs, and a separately policy-checked BLAKE2b dependency. It has no build script, runtime I/O, or ambient authority; library and documentation targets compiled with the exact locked dependencies."
+
 [[audits.zebra-grpc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.1.0-alpha.5 -> 0.1.0-alpha.6"
+
+[[audits.zerofrom]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.8"
+notes = "Reviewed all packaged source and manifest content. This no_std crate implements safe zero-copy borrowing traits and type, array, and tuple conversions whose lifetimes are enforced by the compiler. There is no unsafe code, build script, runtime I/O, or ambient authority. All-feature targets and the documentation test passed."
+
+[[audits.zerofrom-derive]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.7"
+notes = "Reviewed all packaged source and manifest content. The proc macro only parses and folds tokens and emits safe, type-checked ZeroFrom implementations; it contains no unsafe code, build script, runtime I/O, or ambient authority. Both library unit tests passed. The published example omits workspace-only development dependencies, but that packaging defect does not affect the deployed proc macro."
 
 [[audits.zip321]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

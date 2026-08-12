@@ -313,6 +313,28 @@ impl PreparedHeaderBatch {
         self.evidence
     }
 
+    /// Derive the stable context-free batch evidence identity.
+    ///
+    /// Preparation and finality rebasing must share this exact encoding so a
+    /// rebased suffix keeps the same evidence ID that fresh preparation would
+    /// produce for the same parent, trust anchor, and header path.
+    pub(crate) fn context_free_evidence(
+        parent: Frontier,
+        trust_anchor_digest: [u8; 32],
+        headers: &[PreparedHeader],
+    ) -> EvidenceId {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-header-chain-context-free-batch-v1");
+        hasher.update(parent.height.0.to_le_bytes());
+        hasher.update(parent.hash.0);
+        hasher.update(trust_anchor_digest);
+        for header in headers {
+            hasher.update(header.height.0.to_le_bytes());
+            hasher.update(header.hash.0);
+        }
+        EvidenceId::from_digest(hasher.finalize().into())
+    }
+
     /// Rebase this sealed batch after an exact prepared header that became finalized.
     ///
     /// The remaining headers retain their validated results and absolute heights.
@@ -332,16 +354,8 @@ impl PreparedHeaderBatch {
         let removed = index.saturating_add(1);
         self.headers.drain(..removed);
         self.receipt.parent = parent;
-        let mut hasher = Sha256::new();
-        hasher.update(b"zakura-header-chain-context-free-batch-v1");
-        hasher.update(parent.height.0.to_le_bytes());
-        hasher.update(parent.hash.0);
-        hasher.update(self.receipt.trust_anchor_digest);
-        for header in &self.headers {
-            hasher.update(header.height.0.to_le_bytes());
-            hasher.update(header.hash.0);
-        }
-        self.evidence = EvidenceId::from_digest(hasher.finalize().into());
+        self.evidence =
+            Self::context_free_evidence(parent, self.receipt.trust_anchor_digest, &self.headers);
         Ok(removed)
     }
 

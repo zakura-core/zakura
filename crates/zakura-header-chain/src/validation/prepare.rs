@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use chrono::{Duration, Timelike};
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zakura_chain::{block, parameters::Network};
 
@@ -14,7 +13,7 @@ use super::{
     AdjustedDifficulty, PowPolicy, PowPolicyError, POW_ADJUSTMENT_BLOCK_SPAN,
 };
 use crate::{
-    Clock, EngineConfig, EvidenceId, HeaderContextFact, HeaderValidationState, PreparedHeader,
+    Clock, EngineConfig, HeaderContextFact, HeaderValidationState, PreparedHeader,
     PreparedHeaderBatch, RuleId, ValidationLease,
 };
 
@@ -372,21 +371,17 @@ fn prepare_headers_inner(
         prepared.push(prepared_header);
     }
 
-    let mut hasher = Sha256::new();
-    hasher.update(b"zakura-header-chain-context-free-batch-v1");
-    hasher.update(parent_frontier.height.0.to_le_bytes());
-    hasher.update(parent_frontier.hash.0);
-    hasher.update(rules.trust_anchor_digest);
-    for header in &prepared {
-        hasher.update(header.height.0.to_le_bytes());
-        hasher.update(header.hash.0);
-    }
+    let evidence = PreparedHeaderBatch::context_free_evidence(
+        parent_frontier,
+        rules.trust_anchor_digest,
+        &prepared,
+    );
     PreparedHeaderBatch::new(
         prepared,
         parent_frontier,
         rules.network.clone(),
         rules.trust_anchor_digest,
-        EvidenceId::from_digest(hasher.finalize().into()),
+        evidence,
     )
     .map_err(|error| invalid(0, HeaderRule::ValidationLease, error))
 }
@@ -476,6 +471,42 @@ mod tests {
             batch.headers()[1].header.previous_block_hash,
             headers[0].hash()
         );
+    }
+
+    #[test]
+    fn rebased_suffix_evidence_matches_fresh_preparation() {
+        let (rules, lease, anchor) = fixture();
+        let first = child(lease.parent, &anchor, 1);
+        let first_frontier = Frontier::new(block::Height(1), first.hash());
+        let second = child(first_frontier, &first, 2);
+        let third = child(Frontier::new(block::Height(2), second.hash()), &second, 3);
+        let headers = [first.clone(), second.clone(), third.clone()];
+        let clock = FixedClock(anchor.time + Duration::hours(1));
+
+        let mut prepared = prepare_context_free_headers(
+            HeaderBatchInput::new(&headers),
+            lease.parent(),
+            &rules,
+            &clock,
+        )
+        .expect("the continuous context-free batch is valid");
+
+        prepared
+            .rebase_after(first_frontier)
+            .expect("the prepared path contains the finalized parent");
+
+        let fresh_suffix = prepare_context_free_headers(
+            HeaderBatchInput::new(&[second, third]),
+            first_frontier,
+            &rules,
+            &clock,
+        )
+        .expect("fresh preparation of the same suffix succeeds");
+
+        assert_eq!(prepared.receipt().parent(), first_frontier);
+        assert_eq!(prepared.headers().len(), 2);
+        assert_eq!(prepared.headers(), fresh_suffix.headers());
+        assert_eq!(prepared.evidence(), fresh_suffix.evidence());
     }
 
     #[test]

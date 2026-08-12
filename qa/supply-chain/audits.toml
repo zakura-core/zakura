@@ -94,6 +94,12 @@ criteria = "safe-to-deploy"
 version = "0.11.1"
 notes = "Reviewed all packaged source, manifest, and tests. This dependency-free crate implements bounded Bech32, Bech32m, and SegWit encoding, decoding, and checksums over caller-provided data and writers. No unsafe code, build script, filesystem or network access, process execution, or other ambient capabilities. All 152 unit and integration tests and 20 doctests passed with all features."
 
+[[audits.bincode]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.3.3"
+notes = "Reviewed all packaged source, manifest, and tests. Serialization and deserialization operate through Serde over caller-provided slices or I/O; fixed-width reads check source lengths before copying into initialized integer storage, and float conversions reinterpret equal-width initialized scalar bits. There is no build script, hidden I/O, or ambient authority. All 46 unit and integration tests and 4 applicable doctests passed; 3 explanatory doctests were ignored as declared."
+
 [[audits.bip32]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -413,6 +419,30 @@ criteria = "safe-to-deploy"
 version = "0.20.2"
 notes = "Reviewed all packaged source and manifest. This proc-macro entry point parses a DeriveInput and delegates token generation to separately policy-checked derive_builder_core. No unsafe code, build script, I/O, or ambient capabilities. All-feature unit and doc test targets compiled."
 
+[[audits.derive_more]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+notes = "Reviewed all packaged source, manifest, feature wiring, and tests. This no_std facade reexports opt-in derives from the separately audited implementation crate without runtime logic or ambient capability. All 510 non-UI all-feature integration tests passed. The published crate omits the expected .stderr files for its trybuild compile-fail suite, so that harness generated the expected compiler failures but could not compare their diagnostics."
+
+[[audits.derive_more]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "2.1.1"
+notes = "Reviewed all packaged source, manifest, feature wiring, and tests. This no_std facade reexports opt-in derives from the separately audited implementation crate without runtime logic or ambient capability. All 870 non-UI all-feature integration tests passed. The published crate omits the expected .stderr files for its trybuild compile-fail suite, so that harness generated the expected compiler failures but could not compare their diagnostics."
+
+[[audits.derive_more-impl]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+notes = "Reviewed all packaged source, manifest, and tests. The procedural macros parse derives and emit type-checked trait implementations without runtime I/O, build scripts, or ambient authority. All 8 implementation unit tests passed, and the exact implementation was exercised by 510 passing all-feature facade integration tests; standalone doctests require the facade crate and are not valid in the implementation package alone."
+
+[[audits.derive_more-impl]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "2.1.1"
+notes = "Reviewed all packaged source, manifest, and tests. The procedural macros parse derives and emit type-checked trait implementations without runtime I/O, build scripts, or ambient authority. The only emitted unsafe operation is an unreachable enum-match arm after an equal mem::discriminant check, which guarantees the variants match. All 17 implementation unit tests and 870 all-feature facade integration tests passed; standalone doctests require the facade crate."
+
 [[audits.digest]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -490,6 +520,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.7.12"
 notes = "Reviewed all packaged source and manifest. The procedural macro validates unit variants, unsigned integer reprs, and one-bit discriminants before generating the unsafe RawBitFlags implementation; deferred invariants are enforced by generated compile-time assertions and rustc repr checks. No build script, runtime I/O, or ambient capabilities. Unit and doc test targets compiled."
+
+[[audits.f4jumble]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.1"
+notes = "Reviewed all packaged source, manifest, and tests. The no_std ZIP 316 F4Jumble implementation validates the full 48..=4194368-byte domain before splitting, bounds every BLAKE2b round and output slice, uses distinct fixed personalizations, and reverses the four Feistel rounds in inverse order. No unsafe code, build script, I/O, or ambient authority. All 6 vector and property tests and 4 doctests passed with all features."
 
 [[audits.fastrand]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -845,6 +881,18 @@ criteria = "safe-to-deploy"
 version = "1.70.2"
 notes = "Reviewed all packaged source and manifest. The sealed trait implementation only delegates terminal detection to std::io::IsTerminal for standard handles and File; no unsafe code, build script, allocation, or additional ambient capabilities. All-feature unit and doc test targets compiled."
 
+[[audits.itertools]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.10.5"
+notes = "Reviewed all packaged source, manifest, iterator adapters, macros, and tests. The crate contains no unsafe code, build script, runtime I/O, or ambient authority; adapters preserve ownership and iterator length contracts through ordinary type-checked state machines. All 414 applicable unit, integration, property, and documentation tests passed with all features; 3 doctests were ignored as declared."
+
+[[audits.itertools]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.13.0"
+notes = "Reviewed all packaged source, manifest, iterator adapters, macros, and tests. Unsafe code is confined to EitherOrBoth in-place variant changes: values are read and immediately written into the same valid pointer with no intervening user code, and subsequent unreachable arms follow assignments to the matched variant. No build script, runtime I/O, or ambient authority. All 587 unit, integration, property, and documentation tests passed with all features."
+
 [[audits.itoa]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1092,6 +1140,12 @@ delta = "0.8.0 -> 0.9.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.9.0 -> 0.10.0"
+
+[[audits.owo-colors]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "4.3.0"
+notes = "Reviewed all packaged source, manifest, build script, examples, and tests. Formatting emits fixed ANSI control sequences and caller-supplied style values without unsafe code or runtime ambient access. The build script only executes Cargo's configured RUSTC with --version to select a stabilized const feature and fails closed to the older path. All 35 unit tests and 65 doctests passed with all features."
 
 [[audits.owo-colors]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1384,6 +1438,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.10.1 -> 0.10.2"
 
+[[audits.ron]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.12.2"
+notes = "Reviewed all packaged source, manifest, parsers, serializers, and tests. Parsing is bounded over caller-provided strings or readers. RawValue casts preserve its repr(transparent) str layout, and boxed trimming drains only parser-derived UTF-8 boundaries before restoring that type. There is no build script or hidden ambient authority. All 445 unit and integration tests and 25 applicable doctests passed with all features; 11 doctests were ignored as declared."
+
 [[audits.route-recognizer]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1445,6 +1505,12 @@ delta = "0.1.3 -> 0.2.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.2.0 -> 0.3.0"
+
+[[audits.schemars]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.2.1"
+notes = "Reviewed all packaged source, manifest, schema implementations, transforms, and tests. Schema generation and recursive transforms use safe Rust over caller-provided types and values; std networking types are described structurally and no network operation is performed. No build script, unsafe code, I/O, or ambient authority. All 174 all-feature tests and doctests passed after regenerating the expected snapshots omitted from the crates.io package in an isolated copy."
 
 [[audits.schemars_derive]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1613,6 +1679,18 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.2.2 -> 0.3.0"
 
+[[audits.snafu]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.8.9"
+notes = "Reviewed all packaged source, manifest, feature gates, and tests. Error context, backtrace delegation, futures adapters, and report termination are implemented in safe Rust and acquire no capability beyond caller-provided errors; environment access is confined to tests. No build script or hidden I/O. All 248 applicable stable default-feature tests and doctests passed; 16 documentation cases were ignored, while explicitly unstable nightly-only features were not enabled on stable."
+
+[[audits.snafu-derive]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.8.9"
+notes = "Reviewed all packaged source, manifest, and tests. The procedural macro parses error attributes and emits type-checked context selectors and trait implementations without unsafe code, build scripts, runtime I/O, or ambient authority. All 6 unit tests passed; generated behavior was additionally exercised through the snafu package's 248 passing tests and doctests."
+
 [[audits.spandoc]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1753,6 +1831,12 @@ criteria = "safe-to-deploy"
 delta = "0.7.11 -> 0.7.12"
 
 [[audits.toml]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.5.11"
+notes = "Reviewed all packaged source, manifest, parser, serializer, and tests. The crate forbids unsafe code and parses and serializes TOML through Serde over caller-provided strings and I/O with checked token and table state. It has no build script or ambient authority. All 20 unit and integration tests and 9 applicable doctests passed with all features; 3 declared tests were ignored."
+
+[[audits.toml]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.8.14 -> 0.8.15"
@@ -1766,6 +1850,12 @@ delta = "0.8.15 -> 0.8.16"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.8.16 -> 0.8.19"
+
+[[audits.toml_datetime]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.1+spec-1.1.0"
+notes = "Reviewed all packaged source and manifest content. This small no_std crate forbids unsafe code and provides structural TOML date-time values, formatting, and optional Serde conversions with explicit component fields and no parsing ambiguity or ambient capability. There is no build script or runtime I/O. All-feature library and documentation targets compiled; the package defines no tests."
 
 [[audits.toml_datetime]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1979,6 +2069,18 @@ criteria = "safe-to-deploy"
 version = "0.9.0"
 notes = "Reviewed all packaged source, manifest, tests, and maintenance scripts. This dependency-free no_std crate provides a non-allocating cursor over caller-supplied byte slices using checked indexing and slicing. It has no unsafe code, build script, runtime I/O, or ambient capabilities; packaged shell scripts are maintenance-only and Cargo does not execute them. All 13 integration tests passed."
 
+[[audits.ureq-proto]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.6.0"
+notes = "Reviewed all packaged source, manifest, protocol state machines, and tests. The crate forbids unsafe code and explicitly performs no socket or TLS operations; HTTP/1.1 request, response, chunking, framing, and 100-continue logic consume and produce caller-supplied buffers with checked state transitions and lengths. No build script or ambient authority. All 185 tests and 2 doctests passed with all features."
+
+[[audits.url]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "2.5.8"
+notes = "Reviewed all packaged source, manifest, parser, serializer, and tests. URL parsing uses bounded indices and separately policy-checked IDNA and percent-encoding dependencies; its only unchecked UTF-8 conversion consumes decimal digits written into a fixed five-byte buffer. The sole ambient operation, socket_addrs, is explicit caller-invoked hostname resolution. All 66 default-feature tests and 67 doctests passed. The optional debugger_visualizer feature cannot compile from the published package because its natvis asset is omitted; this is a packaging defect, not deployed runtime behavior."
+
 [[audits.utf8-zero]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -2065,6 +2167,12 @@ notes = "Reviewed all packaged source, manifest, and tests. Lookup searches only
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.52.0 -> 0.59.0"
+
+[[audits.windows-targets]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.52.5"
+notes = "Reviewed all packaged source and manifest content. This no_std facade contains only cfg-selected link macro definitions for Windows raw-dylib or separately policy-checked target import-library packages; it has no build script, executable logic, I/O, or ambient authority of its own. Library and documentation targets compiled; the package defines no tests."
 
 [[audits.windows-targets]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

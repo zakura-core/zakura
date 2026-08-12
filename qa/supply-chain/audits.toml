@@ -1065,6 +1065,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.9.4 -> 0.9.5"
 
+[[audits.web-time]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.0"
+notes = "Reviewed all packaged source and manifests, including the native and WebAssembly implementations and optional Serde support. Native targets directly re-export std::time; the unsafe-free browser path reads only Performance.now and Date.now through separately policy-checked wasm-bindgen dependencies, converts timestamps with checked Duration arithmetic, and validates deserialized overflow. It has no build script, filesystem, network, or process capability. Native all-feature and no-default library targets plus the packaged doctest passed, and the all-feature library cross-compiled for wasm32-unknown-unknown. The published manifest references excluded upstream test and benchmark files, so an unfiltered packaged cargo test cannot run them."
+
 [[audits.windows-sys]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -1125,6 +1131,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.6.3"
 notes = "Reviewed all packaged source, manifests, tests, example, and benchmark. The crate formats caller-supplied values into caller-supplied fmt sinks using checked and saturating length hints; its unsafe UTF-8 conversions consume only an ASCII digit buffer or a prefix incrementally proven equal to valid str chunks. It has no build script, runtime I/O, or ambient capabilities, and the optional either dependency remains separately policy-checked. All 15 unit tests, 1 integration test, and 20 doctests passed with all features, and the no-allocation library target compiled. The published example omits its workspace-only instrumentation dependency and therefore prevents an unfiltered cargo test from compiling that example."
+
+[[audits.xdg]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "3.0.0"
+notes = "Reviewed all packaged source, manifests, and tests. This Unix-only path resolver contains no unsafe code, ignores non-absolute XDG environment paths, validates that XDG_RUNTIME_DIR is accessible with no group/other permission bits, and limits writes to directory creation beneath the configured roots when callers honor the documented relative-path API. It performs only its documented environment and filesystem access and has no build script, network, or process capability. All 10 unit tests and 4 doctests passed both with optional Serde enabled and without default features. Callers must not pass attacker-controlled absolute or parent-traversal paths because the crate does not sanitize them."
 
 [[audits.z32]]
 who = "OpenAI Codex <noreply@openai.com>"

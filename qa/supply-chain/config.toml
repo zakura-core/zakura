@@ -2094,10 +2094,6 @@ criteria = "safe-to-deploy"
 version = "0.3.103"
 criteria = "safe-to-deploy"
 
-[[exemptions.web-time]]
-version = "1.1.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.webpki-root-certs]]
 version = "1.0.8"
 criteria = "safe-to-deploy"
@@ -2272,10 +2268,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.x25519-dalek]]
 version = "2.0.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.xdg]]
-version = "3.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.xml-rs]]

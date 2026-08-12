@@ -7,6 +7,12 @@ criteria = "safe-to-deploy"
 version = "0.7.0"
 notes = "Reviewed all packaged source and manifest. The three procedural derives parse source tokens and generate Command, Component, and Runnable implementations; generated code only uses compile-time package metadata and separately policy-checked dependencies. No unsafe code, build script, runtime I/O, or ambient capabilities. All 4 unit tests passed."
 
+[[audits.aead]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.5.2"
+notes = "Reviewed all packaged source and manifest content. This no_std crate defines authenticated-encryption traits, bounded buffer adapters, and stream constructions; stream nonces reserve the final bytes for a checked counter and reject overflow before reuse. No unsafe code, build script, runtime I/O, or ambient authority. All-feature library targets compiled; the package contains no active tests."
+
 [[audits.anstyle]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -171,10 +177,22 @@ criteria = "safe-to-deploy"
 version = "0.23.1"
 notes = "Reviewed all packaged source, manifest, and tests. The crate contains no unsafe code; its documented ambient capability is limited to executing the configured Cargo binary with explicit metadata arguments and parsing its captured JSON output. All command, environment, and option arguments remain separately encoded rather than shell-interpreted. Twenty tests passed with all features; four sample-workspace tests could not run because crates.io omitted their fixture manifests."
 
+[[audits.cbc]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.2"
+notes = "Reviewed all packaged source, manifest, and tests. The no_std implementation performs CBC chaining over fixed-size cipher blocks and delegates primitive operations to separately policy-checked cipher traits; padding and buffer lengths are validated before access. No unsafe code, build script, I/O, or ambient authority. All 18 tests and 2 doctests passed."
+
 [[audits.cfg_aliases]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 version = "0.1.1"
+
+[[audits.chacha20poly1305]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.10.1"
+notes = "Reviewed all packaged source, manifest, and tests. The no_std AEAD implementation authenticates AAD and ciphertext with Poly1305 and verifies the tag before decrypting; key, nonce, tag, and block sizes are enforced by typed arrays and checked length arithmetic. No unsafe code, build script, I/O, or ambient authority. All 9 integration and Wycheproof tests and 3 doctests passed with all features."
 
 [[audits.clap]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -317,6 +335,12 @@ criteria = "safe-to-deploy"
 version = "0.1.7"
 notes = "Reviewed all packaged source and manifest. This no_std trait crate defines type-level cryptographic block, output, key, and IV sizes plus checked slice adapters and caller-supplied RNG helpers. It forbids unsafe code and has no build script, runtime I/O, or hidden ambient capabilities; dependencies remain separately policy-checked. All-feature library and documentation targets passed; the package defines no tests."
 
+[[audits.crypto_secretbox]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.1"
+notes = "Reviewed all packaged source, manifest, and tests. XSalsa20 and XChaCha20 secret-box operations authenticate ciphertext before decryption, use typed key, nonce, and tag lengths, and delegate primitives and secret clearing to separately policy-checked dependencies. No unsafe code, build script, I/O, or ambient authority. All 6 integration tests and 3 doctests passed with all features."
+
 [[audits.curve25519-dalek-derive]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -389,6 +413,18 @@ criteria = "safe-to-deploy"
 version = "0.20.2"
 notes = "Reviewed all packaged source and manifest. This proc-macro entry point parses a DeriveInput and delegates token generation to separately policy-checked derive_builder_core. No unsafe code, build script, I/O, or ambient capabilities. All-feature unit and doc test targets compiled."
 
+[[audits.digest]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.10.7"
+notes = "Reviewed all packaged source and manifest content. This no_std facade defines digest traits and checked adapters over caller-supplied buffers; algorithm implementations and block buffering remain in separately policy-checked dependencies. No unsafe code, build script, runtime I/O, or ambient authority. All-feature targets compiled; the package contains no active tests."
+
+[[audits.digest]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.11.0-pre.9"
+notes = "Reviewed all packaged source and manifest content. This no_std facade defines digest traits and checked adapters over caller-supplied buffers; algorithm implementations and block buffering remain in separately policy-checked dependencies. No unsafe code, build script, runtime I/O, or ambient authority. All-feature targets compiled against the exact locked block-buffer release-candidate dependency."
+
 [[audits.dirs]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -425,6 +461,18 @@ criteria = "safe-to-deploy"
 version = "1.0.19"
 notes = "Reviewed all packaged source, manifest, examples, and tests. The sealed DynClone implementations return an allocation of the same concrete type; clone_box replaces only the data pointer while retaining valid trait-object, string, or slice metadata, and the string and slice clones preserve their lengths. Arc and Rc mutable access follows a uniqueness check or replacement with a fresh allocation. There are no dependencies, build script, I/O, or ambient capabilities, and the library target passed."
 
+[[audits.ed25519]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "2.2.3"
+notes = "Reviewed all packaged source, manifest, and tests. This no_std facade validates fixed Ed25519 key and signature encodings and defines signing and verification traits; it does not implement curve arithmetic itself. Serialization, PKCS#8, and OID paths preserve exact lengths and delegate parsing to separately policy-checked dependencies. No unsafe code, build script, I/O, or ambient authority. All 21 applicable tests passed; one declared test was ignored."
+
+[[audits.ed25519-zebra]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "4.2.0"
+notes = "Reviewed all packaged source, manifest, and tests. Signing uses the standard nonce and challenge transcript construction, while verification strictly decodes keys and signatures, rejects invalid encodings, and checks the cofactored verification equation through separately policy-checked curve primitives. Secret material is redacted and delegated to zeroizing types. No unsafe code, build script, I/O, or ambient authority. All 22 applicable tests and 3 doctests passed."
+
 [[audits.encode_unicode]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -449,6 +497,12 @@ criteria = "safe-to-deploy"
 version = "2.4.1"
 notes = "Reviewed all packaged source, manifest, examples, and tests. This explicitly non-cryptographic RNG forbids unsafe code, bounds integer and character ranges before sampling, and obtains optional initial entropy through the separately policy-checked getrandom crate. It has no build script, filesystem, network, or process access. All 32 integration tests and 9 doctests passed with all features."
 
+[[audits.ff]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.13.1"
+notes = "Reviewed all packaged source, manifest, and tests. This no_std crate defines finite-field traits and helpers; batch inversion replaces zero values with one before inversion and restores zeros afterward, avoiding invalid inversions while preserving results. No unsafe code, build script, runtime I/O, or ambient authority. All 5 ordinary tests and the long-running batch test passed."
+
 [[audits.fixed-hash]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -459,6 +513,18 @@ notes = "Reviewed all packaged source, manifest, and tests. The exported macros 
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 version = "0.1.3"
+
+[[audits.fpe]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.6.1"
+notes = "Reviewed all packaged source, manifest, and tests. The no_std FF1 format-preserving encryption implementation validates radix and message-length constraints, uses checked numeral conversions and buffer sizing, and delegates AES operations to separately policy-checked cipher traits. No unsafe code, build script, I/O, or ambient authority. All 11 vector and property tests and 1 doctest passed."
+
+[[audits.frost-rerandomized]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "3.0.0"
+notes = "Reviewed all packaged source and manifest content. Rerandomization binds the seed to encoded signing commitments, regenerates and verifies randomized parameters, and applies the same derived scalar to signing shares, verifying shares, and the aggregate key using separately policy-checked FROST group operations. No unsafe code, build script, runtime I/O, or ambient authority. All-feature targets compiled; reusable generic tests require a concrete ciphersuite and are not activated by the package alone."
 
 [[audits.fs-err]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -587,6 +653,12 @@ criteria = "safe-to-deploy"
 version = "0.4.1"
 notes = "Reviewed all packaged source, manifest, and tests. The zero-dependency no_std macro performs bounded const-time hex decoding; malformed literals fail during constant evaluation and no runtime capability is introduced. No unsafe code, build script, allocation, I/O, or ambient capabilities. All 8 integration tests and 4 doctests passed."
 
+[[audits.hmac]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.13.0-pre.4"
+notes = "Reviewed all packaged source, manifest, and tests. The no_std implementation performs standard HMAC key normalization and inner/outer pad separation over fixed block sizes, with constant-time verification supplied by separately policy-checked dependencies. No unsafe code, build script, I/O, or ambient authority. All 23 tests and 2 doctests passed against the exact locked block-buffer release candidate."
+
 [[audits.hmac-sha1]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -684,6 +756,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.3"
 notes = "Reviewed all packaged source, manifest, and tests. The attribute macro preserves trait unsafety, generics, where clauses, and method signatures while expanding bounded tuple implementations; it has no build script, runtime I/O, ambient capability, or runtime unsafe code. All 23 code-generation tests, 14 compile-fail/UI cases, and 3 doctests passed."
+
+[[audits.incrementalmerkletree]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.8.2"
+notes = "Reviewed all packaged source and manifest content. This safe no_std crate implements typed tree positions, frontiers, paths, and witnesses with checked construction and explicit depth and completeness invariants over caller-provided hashes. No unsafe code, build script, runtime I/O, or ambient authority. Default and no-default-feature library targets compiled; the published optional test-dependencies feature currently selects incompatible latest proptest and rand releases, so that auxiliary test configuration could not compile."
 
 [[audits.incrementalmerkletree]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1233,6 +1311,18 @@ criteria = "safe-to-deploy"
 version = "0.7.0"
 notes = "Reviewed all packaged source, manifest, tests, and build script. The safe no_std trait implementations delegate to core atomics where supported and otherwise to non-Sync Cell operations; the build script only classifies Cargo target environment variables and emits cfg flags. It performs no filesystem, network, or process access. All 5 unit tests and 21 doctests passed."
 
+[[audits.rand_core]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.10.1"
+notes = "Reviewed all packaged source, manifest, and tests. This no_std facade defines RNG and seed traits plus checked byte-filling adapters; operating-system entropy is explicitly delegated to the separately policy-checked getrandom dependency rather than implemented here. No unsafe code, build script, runtime I/O beyond that opt-in delegation, or hidden ambient authority. All 15 applicable tests passed."
+
+[[audits.rand_pcg]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.10.2"
+notes = "Reviewed all packaged source, manifest, and tests. The no_std PCG implementations use fixed-width wrapping state transitions and explicit little-endian seed encodings; documentation clearly states these generators are not cryptographically secure. No unsafe code, build script, I/O, or ambient authority. All 23 applicable vector and behavior tests passed; one declared test was ignored."
+
 [[audits.ref-cast]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1276,6 +1366,18 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.7.6"
 notes = "Reviewed all packaged source, manifest, fixtures, and tests. Parsing operates over caller-provided bytes with ordinary bounded vectors. The sole unsafe operation passes a fully initialized 1024-byte buffer and its exact length to gethostname, checks the return value, and only scans initialized bytes; static Linux instead checks /proc hostname truncation before termination. There is no build script, process execution, or network access. All 22 unit and integration tests and 6 doctests passed."
+
+[[audits.ripemd]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.3"
+notes = "Reviewed all packaged source, manifest, and tests. The no_std implementation uses fixed RIPEMD round schedules, constants, and wrapping word operations over exact-size blocks and delegates buffering to separately policy-checked digest traits. No unsafe code, build script, I/O, or ambient authority. All 12 known-answer tests and 1 doctest passed."
+
+[[audits.ripemd]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.0-pre.4"
+notes = "Reviewed all packaged source, manifest, and tests. The no_std implementation uses fixed RIPEMD round schedules, constants, and wrapping word operations over exact-size blocks and delegates buffering to separately policy-checked digest traits. No unsafe code, build script, I/O, or ambient authority. All 16 known-answer tests and 1 doctest passed against the exact locked block-buffer release candidate."
 
 [[audits.rlimit]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1327,6 +1429,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.0.23"
 notes = "Reviewed all packaged source, manifest, build script, and tests. The build script invokes only Cargo's configured compiler or wrapper with --version and writes parsed version metadata to OUT_DIR; the proc macro then parses predicates and conditionally emits caller tokens. No unsafe code or network access. All 7 applicable tests passed; one nightly-only UI test was ignored as declared."
+
+[[audits.salsa20]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.10.2"
+notes = "Reviewed all packaged source, manifest, and tests. Salsa20 and XSalsa20 enforce fixed key and nonce lengths through typed arrays and operate on exact 64-byte states and blocks using wrapping arithmetic; seek calculations are checked by the stream-cipher facade. No unsafe code, build script, I/O, or ambient authority. All 8 applicable vector and seek tests and 1 doctest passed; one intentionally long test was ignored."
 
 [[audits.sapling-crypto]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1459,6 +1567,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.0"
 notes = "Reviewed all packaged source, manifest, and tests. This no_std Serde adapter performs bounded binary or Base16 serialization using the separately audited base16ct dependency, with optional zeroization. Unsafe code is forbidden and there is no build script, runtime I/O, or ambient capability. All 40 integration tests and 2 doctests passed with all features."
+
+[[audits.sha1]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.10.7"
+notes = "Reviewed all packaged source, manifest, tests, SIMD paths, and LoongArch assembly. Slice casts preserve the exact 64-byte block layout; x86 SIMD is feature-gated and uses in-bounds unaligned loads, while assembly handles empty input, restores stack state, and bounds its loop to the supplied slice. No build script, I/O, or ambient authority. All 2 tests and 2 doctests passed. This audit covers implementation safety only: SHA-1 remains collision-broken and suitable only for legacy compatibility, as the crate documents."
 
 [[audits.shardtree]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -2014,6 +2128,12 @@ criteria = "safe-to-deploy"
 version = "0.6.3"
 notes = "Reviewed all packaged source, manifests, tests, example, and benchmark. The crate formats caller-supplied values into caller-supplied fmt sinks using checked and saturating length hints; its unsafe UTF-8 conversions consume only an ASCII digit buffer or a prefix incrementally proven equal to valid str chunks. It has no build script, runtime I/O, or ambient capabilities, and the optional either dependency remains separately policy-checked. All 15 unit tests, 1 integration test, and 20 doctests passed with all features, and the no-allocation library target compiled. The published example omits its workspace-only instrumentation dependency and therefore prevents an unfiltered cargo test from compiling that example."
 
+[[audits.x25519-dalek]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "2.0.1"
+notes = "Reviewed all packaged source, manifest, and tests. The safe no_std wrapper clamps secret scalars, delegates Montgomery arithmetic to separately policy-checked curve25519-dalek, supports secret zeroization, and exposes was_contributory so higher-level protocols can reject low-order peer keys. No unsafe code, build script, I/O, or ambient authority. All 13 applicable tests and 4 doctests passed; the declared long ladder test and 2 doctests were ignored."
+
 [[audits.xdg]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -2119,10 +2239,22 @@ criteria = "safe-to-deploy"
 delta = "0.14.0 -> 0.13.0@git:1410f1449100a417bfbc4f6c7167aa9808e38792"
 importable = false
 
+[[audits.zcash_encoding]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.0"
+notes = "Reviewed all packaged source, manifest, and tests. This no_std crate denies unsafe code and implements canonical CompactSize integers capped at the Zcash allocation limit plus fixed, optional, vector, and amount codecs with checked lengths and caller-supplied I/O. No build script or ambient authority. All 4 unit tests passed."
+
 [[audits.zcash_keys]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.0 -> 0.4.0"
+
+[[audits.zcash_note_encryption]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.2"
+notes = "Reviewed all packaged source and manifest content. The crate denies unsafe code, enforces fixed plaintext and ciphertext sizes, derives one-time keys through its Domain contract, and uses ChaCha20Poly1305 with the protocol-defined zero nonce under those unique keys; current constructors require fresh or deterministic ephemeral secrets and the legacy path is feature-gated. No build script, runtime I/O, or ambient authority. All-feature targets compiled; the package contains no active tests."
 
 [[audits.zcash_primitives]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -2187,6 +2319,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.5.0"
 notes = "Reviewed all packaged source, manifest, and tests. The safe procedural macros generate field-wise Zeroize and Drop matches, honor explicit skip and bound attributes, reject unsupported unions and misplaced attributes, and introduce no behavior beyond calls to separately policy-checked zeroize traits. No build script, I/O, or ambient capability. All 27 unit tests passed."
+
+[[audits.zip32]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.1"
+notes = "Reviewed all packaged source, manifest, and tests. This crate denies unsafe code and represents account, child, and diversifier indices with checked constructors; hardened derivation, fingerprints, and registered paths use explicit domain separation and separately policy-checked cryptographic primitives. No build script, runtime I/O, or ambient authority. All 11 unit tests passed."
 
 [[audits.zip321]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

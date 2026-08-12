@@ -75,10 +75,6 @@ criteria = "safe-to-deploy"
 version = "0.21.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.aead]]
-version = "0.5.2"
-criteria = "safe-to-deploy"
-
 [[exemptions.aes]]
 version = "0.8.4"
 criteria = "safe-to-deploy"
@@ -198,10 +194,6 @@ version = "2.0.2"
 criteria = "safe-to-deploy"
 notes = "Audit held: safe set_file_name and set_extension methods mutate the wrapped path without re-canonicalizing it, breaking the advertised canonical-path invariant; is_dir also delegates to is_file. A version-wide safe-to-deploy certification is deferred pending an upstream fix."
 
-[[exemptions.cbc]]
-version = "0.1.2"
-criteria = "safe-to-deploy"
-
 [[exemptions.cc]]
 version = "1.2.66"
 criteria = "safe-to-deploy"
@@ -211,10 +203,6 @@ version = "0.9.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.chacha20]]
-version = "0.10.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.chacha20poly1305]]
 version = "0.10.1"
 criteria = "safe-to-deploy"
 
@@ -325,10 +313,7 @@ notes = "Audit deferred: hazmat::SerializableState uses an 8-byte element width 
 [[exemptions.crypto_box]]
 version = "0.9.1"
 criteria = "safe-to-deploy"
-
-[[exemptions.crypto_secretbox]]
-version = "0.1.1"
-criteria = "safe-to-deploy"
+notes = "Audit held: the high-level CryptoBox constructor accepts any 32-byte peer public key and derives a key without rejecting a non-contributory X25519 result. A low-order peer key can therefore produce a predictable all-zero shared secret; retain the exemption until the API enforces contributory behavior or clearly delegates that validation to callers."
 
 [[exemptions.curve25519-dalek]]
 version = "4.1.3"
@@ -359,14 +344,6 @@ criteria = "safe-to-deploy"
 version = "0.2.3"
 criteria = "safe-to-deploy"
 
-[[exemptions.digest]]
-version = "0.10.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.digest]]
-version = "0.11.0-pre.9"
-criteria = "safe-to-deploy"
-
 [[exemptions.dispatch2]]
 version = "0.3.1"
 criteria = "safe-to-deploy"
@@ -375,16 +352,8 @@ criteria = "safe-to-deploy"
 version = "0.5.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.ed25519]]
-version = "2.2.3"
-criteria = "safe-to-deploy"
-
 [[exemptions.ed25519-dalek]]
 version = "2.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.ed25519-zebra]]
-version = "4.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.enumflags2]]
@@ -401,10 +370,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.f4jumble]]
 version = "0.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.ff]]
-version = "0.13.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.filetime]]
@@ -427,15 +392,7 @@ criteria = "safe-to-deploy"
 version = "0.10.14"
 criteria = "safe-to-deploy"
 
-[[exemptions.fpe]]
-version = "0.6.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.frost-core]]
-version = "3.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.frost-rerandomized]]
 version = "3.0.0"
 criteria = "safe-to-deploy"
 
@@ -537,10 +494,6 @@ criteria = "safe-to-deploy"
 version = "0.25.2"
 criteria = "safe-to-deploy"
 
-[[exemptions.hmac]]
-version = "0.13.0-pre.4"
-criteria = "safe-to-deploy"
-
 [[exemptions.hmac-sha256]]
 version = "1.1.14"
 criteria = "safe-to-deploy"
@@ -606,10 +559,6 @@ criteria = "safe-to-deploy"
 version = "0.16.2"
 criteria = "safe-to-deploy"
 
-[[exemptions.incrementalmerkletree]]
-version = "0.8.2"
-criteria = "safe-to-deploy"
-
 [[exemptions.indexmap]]
 version = "1.9.3"
 criteria = "safe-to-deploy"
@@ -637,6 +586,7 @@ criteria = "safe-to-deploy"
 [[exemptions.iroh-metrics]]
 version = "0.35.0"
 criteria = "safe-to-deploy"
+notes = "Audit held: start_metrics_exporter unwraps reading the body of any non-success response from the remote exporter endpoint. A network/body read failure can therefore panic the exporter task; retain the exemption pending fallible error propagation."
 
 [[exemptions.iroh-quinn]]
 version = "0.14.0"
@@ -1064,14 +1014,6 @@ criteria = "safe-to-deploy"
 version = "0.10.2"
 criteria = "safe-to-deploy"
 
-[[exemptions.rand_core]]
-version = "0.10.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_pcg]]
-version = "0.10.2"
-criteria = "safe-to-deploy"
-
 [[exemptions.rand_xoshiro]]
 version = "0.7.0"
 criteria = "safe-to-deploy"
@@ -1128,14 +1070,6 @@ criteria = "safe-to-deploy"
 version = "0.17.14"
 criteria = "safe-to-deploy"
 
-[[exemptions.ripemd]]
-version = "0.1.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.ripemd]]
-version = "0.2.0-pre.4"
-criteria = "safe-to-deploy"
-
 [[exemptions.rlimit]]
 version = "0.10.1"
 criteria = "safe-to-deploy"
@@ -1182,10 +1116,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.ryu]]
 version = "1.0.23"
-criteria = "safe-to-deploy"
-
-[[exemptions.salsa20]]
-version = "0.10.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.same-file]]
@@ -1284,10 +1214,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.serde_with]]
 version = "3.21.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.sha1]]
-version = "0.10.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.sha2]]
@@ -1687,24 +1613,12 @@ criteria = "safe-to-deploy"
 version = "0.5.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.x25519-dalek]]
-version = "2.0.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.yoke]]
 version = "0.8.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.yoke-derive]]
 version = "0.8.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.zcash_encoding]]
-version = "0.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zcash_note_encryption]]
-version = "0.4.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_script]]
@@ -1733,10 +1647,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.zerovec-derive]]
 version = "0.11.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.zip32]]
-version = "0.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.zmij]]

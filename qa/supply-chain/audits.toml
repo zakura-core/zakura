@@ -1025,6 +1025,12 @@ criteria = "safe-to-deploy"
 version = "1.0.18"
 notes = "Reviewed all packaged source, manifest, tests, and benchmark. The sealed Integer implementations cast the 40-byte aligned buffer only to smaller byte arrays, keep every reverse write within the type-specific maximum, bound lookup-table indices below 200, and expose only the initialized ASCII suffix as UTF-8. There is no build script, runtime I/O, or ambient capability. The library target passed, as did exhaustive u16 and i16 comparisons plus one million sampled u64, i64, u128, and i128 comparisons against standard formatting and integer extrema."
 
+[[audits.jni-sys-macros]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.1"
+notes = "Reviewed all packaged source and manifest content. The procedural macro parses JNI version attributes, preserves field order and visibility, and emits repr(C) per-version structs plus a union with explicit pointer-sized padding for later fields. Invalid inputs become compiler errors. It contains no unsafe code, build script, I/O, or ambient capability. The proc-macro target compiled; the package defines no tests."
+
 [[audits.jsonrpsee]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1676,6 +1682,12 @@ criteria = "safe-to-deploy"
 version = "0.3.1"
 notes = "Reviewed all packaged source, manifest, subprocess coordination, command-line filtering, and tests. This safe-code test helper only respawns the current test executable, bounds recursive nesting, captures output in an anonymous temporary file, and exposes command modification explicitly to its caller; it has no build script or network access. All 13 unit tests and 3 doctests passed with all features."
 
+[[audits.ryu]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.23"
+notes = "Reviewed all packaged source, manifest, and tests. The sealed f32 and f64 API writes at most 24 initialized ASCII bytes into its fixed buffer; full and compact power tables are indexed only from bounded IEEE exponent fields, and raw pointer writes remain behind a documented unsafe API. No build script, allocation, I/O, or ambient authority. Default and small-feature suites passed 46 and 37 active algorithm and table tests respectively, plus 4 doctests in each mode; the explicitly gated exhaustive 2^32-float test was not run."
+
 [[audits.salsa20]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1848,6 +1860,12 @@ criteria = "safe-to-deploy"
 version = "2.0.1"
 notes = "Reviewed all packaged source, manifests, tests, and quoting guidance. The string facade accepts valid UTF-8, the byte parser preserves multibyte sequences, and unchecked facade conversion APIs explicitly require that invariant before using unchecked UTF-8 conversions. Quoting is bounded by caller input, rejects NUL by default, and documents that control characters must not be sent to interactive shells or terminal input. The dependency-free library has no build script, runtime I/O, process execution, or ambient capabilities. All 7 unit tests and 1 doctest passed with both default and no-default features."
 
+[[audits.simd-adler32]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.9"
+notes = "Reviewed all packaged source, manifest, and architecture backends. Scalar and SIMD accumulators reduce at the Adler NMAX bound; every unsafe vector load consumes an exact 32- or 64-byte slice, and CPU-specific functions are selected only after target or runtime feature checks. No build script or ambient authority. Default and no-default-feature suites each passed all 32 unit tests; 8 default-feature and 4 scalar-only doctests also passed."
+
 [[audits.simple-dns]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1930,6 +1948,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.1.2"
 notes = "Reviewed all packaged source and manifest. The unsafe Sync implementation exposes no shared access to the wrapped value; owned movement still requires the wrapped type to be Send. Pin projections map only to structurally retained fields and never move the inner future or stream. No build script, I/O, or ambient capabilities. All 7 doctests passed."
+
+[[audits.system-configuration-sys]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.6.0"
+notes = "Reviewed all packaged bindgen output, manifest, and build script. The no_std crate contains only repr(C) SystemConfiguration types, constants, callback signatures, and unsafe extern declarations; its build script reads Cargo's TARGET solely to link the Apple framework. It performs no runtime I/O or process execution of its own. The library target compiled on Apple; the package defines no tests."
 
 [[audits.tempfile]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

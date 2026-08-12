@@ -516,12 +516,6 @@ criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade"
 
-[[exemptions.jni-sys-macros]]
-version = "0.4.1"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
 [[exemptions.jobserver]]
 version = "0.1.35"
 criteria = "safe-to-deploy"
@@ -565,6 +559,7 @@ criteria = "safe-to-deploy"
 [[exemptions.libredox]]
 version = "0.1.18"
 criteria = "safe-to-deploy"
+notes = "Audit hold: Fd::new is a safe public ownership constructor for an arbitrary raw descriptor, while Drop always closes it. Safe code can construct duplicate owners for one descriptor and, after descriptor reuse, close an unrelated resource. Retain the exemption until raw ownership construction is unsafe or uses a borrowing or duplication model."
 
 [[exemptions.librocksdb-sys]]
 version = "0.17.3+10.4.2"
@@ -959,10 +954,6 @@ notes = "Sentry 0.47 upgrade"
 version = "0.103.13"
 criteria = "safe-to-deploy"
 
-[[exemptions.ryu]]
-version = "1.0.23"
-criteria = "safe-to-deploy"
-
 [[exemptions.same-file]]
 version = "1.0.6"
 criteria = "safe-to-deploy"
@@ -1066,10 +1057,6 @@ criteria = "safe-to-deploy"
 version = "1.4.8"
 criteria = "safe-to-deploy"
 
-[[exemptions.simd-adler32]]
-version = "0.3.9"
-criteria = "safe-to-deploy"
-
 [[exemptions.simd_cesu8]]
 version = "1.1.1"
 criteria = "safe-to-deploy"
@@ -1116,10 +1103,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.system-configuration]]
 version = "0.6.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.system-configuration-sys]]
-version = "0.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tagptr]]
@@ -1227,7 +1210,7 @@ notes = "Audit held: the optional emit_and_set feature exposes a safe method tha
 [[exemptions.wait-timeout]]
 version = "0.2.0"
 criteria = "safe-to-deploy"
-notes = "Audit held: the Unix SIGCHLD chaining path checks only a null previous handler; an inherited SIG_IGN disposition is typically the non-null sentinel 1 and can be transmuted and called as a function pointer. Current wait-timeout 0.2.1 retains this design, but its imported delta audit depends on this legacy baseline, so direct replacement review or upstream remediation is required before removing the exemption."
+notes = "Audit hold: the Unix initializer installs the SIGCHLD handler before publishing the global STATE pointer, so a signal in that window dereferences null. The handler also treats any nonzero previous sa_sigaction as callable, including the SIG_IGN sentinel. Current wait-timeout 0.2.1 retains this design, but its imported delta audit depends on this legacy baseline, so direct replacement review or upstream remediation is required before removing the exemption."
 
 [[exemptions.wasi]]
 version = "0.11.0+wasi-snapshot-preview1"

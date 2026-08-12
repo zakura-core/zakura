@@ -128,10 +128,6 @@ criteria = "safe-to-deploy"
 version = "0.5.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.backon]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.backtrace]]
 version = "0.3.76"
 criteria = "safe-to-deploy"
@@ -224,19 +220,11 @@ criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade"
 
-[[exemptions.color-eyre]]
-version = "0.6.5"
-criteria = "safe-to-deploy"
-
 [[exemptions.combine]]
 version = "4.6.7"
 criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade"
-
-[[exemptions.config]]
-version = "0.15.25"
-criteria = "safe-to-deploy"
 
 [[exemptions.console]]
 version = "0.16.4"
@@ -442,10 +430,6 @@ criteria = "safe-to-deploy"
 version = "0.14.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.hdrhistogram]]
-version = "7.5.4"
-criteria = "safe-to-deploy"
-
 [[exemptions.heapless]]
 version = "0.7.17"
 criteria = "safe-to-deploy"
@@ -469,10 +453,6 @@ notes = "Audit held: HKDF::expand documents a maximum of 8160 output bytes, but 
 
 [[exemptions.http]]
 version = "1.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.http-body-util]]
-version = "0.1.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.httparse]]
@@ -1171,10 +1151,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.sinsemilla]]
 version = "0.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.slab]]
-version = "0.4.12"
 criteria = "safe-to-deploy"
 
 [[exemptions.socket2]]

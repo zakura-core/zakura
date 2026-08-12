@@ -70,6 +70,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.4 -> 0.4.3"
 
+[[audits.backon]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.6.0"
+notes = "Reviewed all packaged source, manifest, and tests. Retry state is caller-supplied and bounded only by the selected backoff policy; manual pin projections preserve the pinned retry future and sleeper fields and never move them after pinning. There is no build script, filesystem or network access, process execution, or other ambient capability. All 18 applicable tests and doctests passed; 4 illustrative doctests remained ignored as published."
+
 [[audits.base16ct]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -243,6 +249,12 @@ criteria = "safe-to-deploy"
 version = "0.7.1"
 notes = "Reviewed all packaged source and manifest. The panic hook captures and renders backtraces, optionally reads referenced source files and /proc/self/maps, and consults documented color and verbosity environment variables. It has no unsafe code, build script, process execution, or network access. The all-features library target passed; the package contains no unit tests."
 
+[[audits.color-eyre]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.6.5"
+notes = "Reviewed all packaged source, manifest, and tests. The safe error and panic-reporting layer installs explicit global hooks, reads documented backtrace and spantrace environment variables, and can read source paths carried by captured frames for display; it does not write files, execute processes, or access the network. Four applicable integration tests and all 19 doctests passed with all features. Two theme compatibility tests compare stored ANSI escape snapshots and fail under the current toolchain because the rendered sequences drifted; this does not exercise a safety boundary."
+
 [[audits.color-spantrace]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -254,6 +266,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.0.5"
 notes = "Reviewed all packaged source and manifest. The no_std implementation stores a four-value enum as a SeqCst AtomicUsize with total checked conversion; no dependencies, unsafe code, build script, allocation, I/O, or ambient capabilities. Its unit test passed."
+
+[[audits.config]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.15.25"
+notes = "Reviewed all packaged source, manifest, and tests. The crate has no unsafe code; its filesystem, environment, HTTP, and asynchronous source capabilities are explicit builder inputs or feature-gated source types, and parsed values flow through checked path and type conversions. It has no build script or implicit process execution. All 13 unit tests and 7 doctests passed with all features."
 
 [[audits.console-api]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -695,6 +713,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.14.5 -> 0.15.0"
 
+[[audits.hdrhistogram]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "7.5.4"
+notes = "Reviewed all packaged source, manifest, and tests. Serialization reserves the documented maximum output before setting vector length and truncates to initialized bytes; unchecked count indexing is bounded by validated histogram geometry. Runtime operations are in-memory or use caller-provided readers and writers, with no build script or ambient capability. All 271 library and applicable integration tests passed. The Unix-only quantile oracle test was omitted because its rug development dependency requires a GNU m4 unavailable in this environment; the all-features bench_private target separately requires nightly Rust."
+
 [[audits.hex-literal]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -736,6 +760,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.1.2"
 notes = "Reviewed all packaged source, manifest, and tests. Progress reporting uses safe atomics, a flume channel, and one explicitly initialized consumer thread; the global singleton owns its state and callback serialization. It has no build script, filesystem or network access, process execution, or unsafe code. All 5 unit tests and 18 doctests passed when serialized as required by the shared global test state."
+
+[[audits.http-body-util]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.3"
+notes = "Reviewed all packaged source, manifest, and tests. The only unsafe code is a pin projection over an internal Either enum whose active variant is never replaced while pinned; body combinators otherwise operate on caller-supplied frames, streams, and channels. There is no build script, filesystem or network access, process execution, or other ambient capability. All 33 unit tests and 4 doctests passed after updating the package's stale development lockfile to Zakura's tokio 1.52.3."
 
 [[audits.human_bytes]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1720,6 +1750,12 @@ notes = "Reviewed all packaged source, manifest, and tests. The crate maintains 
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.2.2 -> 0.3.0"
+
+[[audits.slab]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.12"
+notes = "Reviewed all packaged source, manifest, and tests. Safe disjoint mutable access checks bounds, occupancy, and key distinctness before raw pointer writes; unchecked accessors clearly require the same invariants from callers, and compaction maintains the free-list links. This in-memory allocator has no build script, runtime I/O, or ambient capability. All 47 unit tests and 38 doctests passed with all features."
 
 [[audits.snafu]]
 who = "OpenAI Codex <noreply@openai.com>"

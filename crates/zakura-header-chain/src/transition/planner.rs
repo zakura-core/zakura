@@ -1736,17 +1736,27 @@ fn invariant_pins(context: &TransitionContext<'_>) -> Arc<[Frontier]> {
 }
 
 fn path<G: HeaderGraphView>(graph: &G, tip: Frontier) -> Result<Vec<Frontier>, TransitionFailure> {
+    let finalized = graph.view_finalized_frontier();
     let mut path = Vec::new();
     let mut current = tip;
     loop {
         path.push(current);
-        if current == graph.view_finalized_frontier() {
+        if current == finalized {
             break;
         }
         let node = graph
             .view_header_node(current.hash)
             .ok_or(GraphError::UnknownHeaderNode(current.hash))?;
-        current = Frontier::new(block::Height(current.height.0 - 1), node.parent_hash);
+        current = Frontier::new(
+            current
+                .height
+                .previous()
+                .map_err(|_| GraphError::FinalizedNotDescendant {
+                    current: finalized.hash,
+                    candidate: tip.hash,
+                })?,
+            node.parent_hash,
+        );
     }
     path.reverse();
     Ok(path)

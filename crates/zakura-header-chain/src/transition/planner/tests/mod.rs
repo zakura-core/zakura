@@ -544,3 +544,22 @@ fn apply_projection(projection: &mut Vec<Frontier>, delta: &ProjectionDelta) {
     }
     projection.extend(delta.put.iter().copied());
 }
+
+#[test]
+fn path_rejects_zero_height_tip_that_is_not_finalized() {
+    let (mut store, _) = TestStore::new(EngineMode::HeadersOnly);
+    let anchor = store.metadata.frontiers.finalized;
+    let difficulty = regtest_genesis_block().header.difficulty_threshold;
+    let child = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0xa1);
+    let malformed = Frontier::new(block::Height::MIN, child.hash);
+
+    assert_eq!(
+        path(&store.graph, malformed),
+        Err(TransitionFailure::Graph(
+            GraphError::FinalizedNotDescendant {
+                current: anchor.hash,
+                candidate: child.hash,
+            }
+        ))
+    );
+}

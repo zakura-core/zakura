@@ -318,10 +318,39 @@ jobs:
       # A separate required `zizmor` context would strand pull requests opened
       # before that context existed, because GitHub does not backfill checks on
       # their current head commits.
+      - name: Detect workflow-audit changes
+        id: workflow-audit-changes
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TOTAL_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          # The PR files endpoint returns at most 3,000 files. Run the audit
+          # when the count is missing or reaches that limit so a truncated
+          # response cannot hide a relevant path.
+          if ! [[ "$TOTAL_CHANGED_FILES" =~ ^[0-9]+$ ]] || \
+             (( TOTAL_CHANGED_FILES >= 3000 )); then
+            echo "audit=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            --jq '.[] | .filename, (.previous_filename // empty)')
+
+          if grep -qE '\.(ya?ml|py)$' <<< "$changed"; then
+            echo "audit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "audit=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        if: github.event_name != 'pull_request' || steps.workflow-audit-changes.outputs.audit == 'true'
         with:
           persist-credentials: false
       - name: Run zizmor workflow audit
+        if: github.event_name != 'pull_request' || steps.workflow-audit-changes.outputs.audit == 'true'
         uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 #v0.6.2
         with:
           advanced-security: false

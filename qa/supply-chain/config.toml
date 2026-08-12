@@ -127,10 +127,6 @@ criteria = "safe-to-deploy"
 version = "0.2.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.async-compression]]
-version = "0.4.42"
-criteria = "safe-to-deploy"
-
 [[exemptions.async-trait]]
 version = "0.1.88"
 criteria = "safe-to-deploy"
@@ -351,14 +347,6 @@ criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade"
 
-[[exemptions.compression-codecs]]
-version = "0.4.38"
-criteria = "safe-to-deploy"
-
-[[exemptions.compression-core]]
-version = "0.4.32"
-criteria = "safe-to-deploy"
-
 [[exemptions.config]]
 version = "0.15.25"
 criteria = "safe-to-deploy"
@@ -387,14 +375,6 @@ criteria = "safe-to-deploy"
 version = "0.9.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.const-random]]
-version = "0.1.18"
-criteria = "safe-to-deploy"
-
-[[exemptions.const-random-macro]]
-version = "0.1.16"
-criteria = "safe-to-deploy"
-
 [[exemptions.const_format]]
 version = "0.2.36"
 criteria = "safe-to-deploy"
@@ -405,10 +385,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.constant_time_eq]]
 version = "0.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.convert_case]]
-version = "0.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.convert_case]]
@@ -591,10 +567,6 @@ criteria = "safe-to-deploy"
 version = "0.5.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.dlv-list]]
-version = "0.5.2"
-criteria = "safe-to-deploy"
-
 [[exemptions.documented]]
 version = "0.3.0"
 criteria = "safe-to-deploy"
@@ -635,16 +607,8 @@ criteria = "safe-to-deploy"
 version = "0.7.12"
 criteria = "safe-to-deploy"
 
-[[exemptions.env_logger]]
-version = "0.7.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.equihash]]
 version = "0.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.erased-serde]]
-version = "0.4.10"
 criteria = "safe-to-deploy"
 
 [[exemptions.eyre]]
@@ -766,10 +730,6 @@ version = "0.14.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.getrandom]]
-version = "0.1.16"
-criteria = "safe-to-deploy"
-
-[[exemptions.getrandom]]
 version = "0.2.15"
 criteria = "safe-to-deploy"
 
@@ -827,10 +787,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.hashbrown]]
 version = "0.14.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.hashlink]]
-version = "0.11.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.hdrhistogram]]
@@ -1079,10 +1035,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.js-sys]]
 version = "0.3.103"
-criteria = "safe-to-deploy"
-
-[[exemptions.json5]]
-version = "0.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.jsonrpsee]]
@@ -1419,14 +1371,6 @@ criteria = "safe-to-deploy"
 version = "0.15.4"
 criteria = "safe-to-deploy"
 
-[[exemptions.ordered-map]]
-version = "0.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.ordered-multimap]]
-version = "0.7.3"
-criteria = "safe-to-deploy"
-
 [[exemptions.os_info]]
 version = "3.15.0"
 criteria = "safe-to-deploy"
@@ -1651,14 +1595,6 @@ criteria = "safe-to-deploy"
 version = "0.41.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.quickcheck]]
-version = "0.9.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.quickcheck_macros]]
-version = "0.9.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.quinn]]
 version = "0.11.11"
 criteria = "safe-to-deploy"
@@ -1692,27 +1628,11 @@ version = "0.7.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rand]]
-version = "0.7.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand]]
 version = "0.10.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_chacha]]
-version = "0.2.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_core]]
-version = "0.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.rand_core]]
 version = "0.10.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_hc]]
-version = "0.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rand_pcg]]
@@ -1815,10 +1735,6 @@ criteria = "safe-to-deploy"
 version = "0.3.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.rust-ini]]
-version = "0.21.3"
-criteria = "safe-to-deploy"
-
 [[exemptions.rustc-demangle]]
 version = "0.1.28"
 criteria = "safe-to-deploy"
@@ -1841,10 +1757,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.rustls-native-certs]]
 version = "0.8.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustls-pemfile]]
-version = "2.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls-pki-types]]
@@ -1995,10 +1907,6 @@ notes = "Sentry 0.47 upgrade"
 
 [[exemptions.serde-big-array]]
 version = "0.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde-untagged]]
-version = "0.1.9"
 criteria = "safe-to-deploy"
 
 [[exemptions.serde_bytes]]
@@ -2199,10 +2107,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.time-macros]]
 version = "0.2.31"
-criteria = "safe-to-deploy"
-
-[[exemptions.tiny-keccak]]
-version = "2.0.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.tinystr]]
@@ -2436,10 +2340,6 @@ suggest = false
 notes = "Sentry 0.47 upgrade"
 
 [[exemptions.wasi]]
-version = "0.9.0+wasi-snapshot-preview1"
-criteria = "safe-to-deploy"
-
-[[exemptions.wasi]]
 version = "0.11.0+wasi-snapshot-preview1"
 criteria = "safe-to-deploy"
 
@@ -2665,10 +2565,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.xmltree]]
 version = "0.10.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.yaml-rust2]]
-version = "0.11.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.yoke]]

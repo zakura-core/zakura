@@ -7,9 +7,21 @@
 //! See the full list of
 //! [Differences between JSON-RPC 1.0 and 2.0.](https://www.simple-is-better.org/rpc/#differences-between-1-0-and-2-0)
 
-use std::{fmt, fs::File, io::Read, panic, sync::Arc};
+use std::{
+    fmt,
+    fs::File,
+    io::Read,
+    panic,
+    path::Path,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use cookie::Cookie;
+use der::{
+    asn1::{GeneralizedTime, UtcTime},
+    Decode, Header, Reader, SliceReader, Tag,
+};
 use jsonrpsee::server::{
     middleware::rpc::RpcServiceBuilder, serve_with_graceful_shutdown, stop_channel, Server,
     ServerHandle,
@@ -319,6 +331,8 @@ fn load_tls_config(
         .into());
     }
 
+    warn_if_certificates_are_not_current(&cert_chain, &tls.cert_file);
+
     let private_key = parse_tls_private_key(key_file)?.ok_or_else(|| {
         format!(
             "RPC TLS private key file {} did not contain a usable private key",
@@ -349,6 +363,139 @@ fn parse_tls_private_key(
     PrivateKeyDer::pem_reader_iter(key_reader)
         .next()
         .transpose()
+}
+
+/// Whether a certificate is inside its validity window.
+#[derive(Debug, Eq, PartialEq)]
+enum CertificateDates {
+    /// The certificate can be used now.
+    Current,
+
+    /// The certificate's `notBefore` field is in the future.
+    NotYetValid {
+        /// The `notBefore` field, as a duration since the Unix epoch.
+        not_before: Duration,
+    },
+
+    /// The certificate's `notAfter` field is in the past.
+    Expired {
+        /// The `notAfter` field, as a duration since the Unix epoch.
+        not_after: Duration,
+    },
+}
+
+/// Logs a warning for every certificate in `cert_chain` that clients will reject because it is
+/// outside its validity window.
+///
+/// This warns and keeps running, rather than refusing to start:
+/// - an RPC certificate that expired while the node was down must not stop the node from
+///   verifying blocks when it comes back up, and
+/// - a `notBefore` in the future is usually an unsynchronised clock, which resolves itself
+///   without a restart.
+///
+/// Certificates whose dates can't be read are ignored, because rustls doesn't require the
+/// certificate to be well-formed either: only the peer validates it.
+fn warn_if_certificates_are_not_current(cert_chain: &[CertificateDer<'static>], cert_file: &Path) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+
+    for (position, certificate) in cert_chain.iter().enumerate() {
+        match certificate_dates(certificate, now) {
+            Ok(CertificateDates::Current) => {}
+            Ok(CertificateDates::NotYetValid { not_before }) => warn!(
+                cert_file = %cert_file.display(),
+                position,
+                not_before = not_before.as_secs(),
+                now = now.as_secs(),
+                "RPC TLS certificate is not valid yet, \
+                 clients will reject the TLS handshake until its notBefore date",
+            ),
+            Ok(CertificateDates::Expired { not_after }) => warn!(
+                cert_file = %cert_file.display(),
+                position,
+                not_after = not_after.as_secs(),
+                now = now.as_secs(),
+                "RPC TLS certificate has expired, clients will reject the TLS handshake",
+            ),
+            Err(error) => debug!(
+                ?error,
+                cert_file = %cert_file.display(),
+                position,
+                "could not read the validity dates of an RPC TLS certificate",
+            ),
+        }
+    }
+}
+
+/// Returns whether `certificate` is inside its validity window at `now`.
+///
+/// Walks the DER encoding as far as the `validity` field of the `TBSCertificate`
+/// ([RFC 5280 section 4.1](https://www.rfc-editor.org/rfc/rfc5280#section-4.1)):
+/// ```text
+/// Certificate  ::= SEQUENCE { tbsCertificate TBSCertificate, ... }
+/// TBSCertificate ::= SEQUENCE {
+///     version         [0] EXPLICIT Version DEFAULT v1,
+///     serialNumber        CertificateSerialNumber,
+///     signature           AlgorithmIdentifier,
+///     issuer              Name,
+///     validity            Validity,
+///     ... }
+/// Validity ::= SEQUENCE { notBefore Time, notAfter Time }
+/// ```
+fn certificate_dates(
+    certificate: &CertificateDer<'_>,
+    now: Duration,
+) -> Result<CertificateDates, der::Error> {
+    let mut reader = SliceReader::new(certificate.as_ref())?;
+    let (tag, certificate) = read_der_value(&mut reader)?;
+    tag.assert_eq(Tag::Sequence)?;
+
+    let mut reader = SliceReader::new(certificate)?;
+    let (tag, tbs_certificate) = read_der_value(&mut reader)?;
+    tag.assert_eq(Tag::Sequence)?;
+
+    let mut reader = SliceReader::new(tbs_certificate)?;
+    if reader.peek_header()?.tag.is_context_specific() {
+        // `version` is only encoded when it isn't the default.
+        read_der_value(&mut reader)?;
+    }
+    read_der_value(&mut reader)?; // serialNumber
+    read_der_value(&mut reader)?; // signature
+    read_der_value(&mut reader)?; // issuer
+
+    let (tag, validity) = read_der_value(&mut reader)?;
+    tag.assert_eq(Tag::Sequence)?;
+
+    let mut reader = SliceReader::new(validity)?;
+    let not_before = read_der_time(&mut reader)?;
+    let not_after = read_der_time(&mut reader)?;
+
+    Ok(if now < not_before {
+        CertificateDates::NotYetValid { not_before }
+    } else if now > not_after {
+        CertificateDates::Expired { not_after }
+    } else {
+        CertificateDates::Current
+    })
+}
+
+/// Reads the next DER tag-length-value item, returning its tag and the bytes of its value.
+fn read_der_value<'a>(reader: &mut SliceReader<'a>) -> Result<(Tag, &'a [u8]), der::Error> {
+    let header = Header::decode(reader)?;
+    let value = reader.read_slice(header.length)?;
+
+    Ok((header.tag, value))
+}
+
+/// Reads an X.509 `Time`, which RFC 5280 section 4.1.2.5 encodes as a `UTCTime` through 2049,
+/// and as a `GeneralizedTime` from 2050.
+fn read_der_time(reader: &mut SliceReader<'_>) -> Result<Duration, der::Error> {
+    match reader.peek_header()?.tag {
+        Tag::UtcTime => Ok(UtcTime::decode(reader)?.to_unix_duration()),
+        Tag::GeneralizedTime => Ok(GeneralizedTime::decode(reader)?.to_unix_duration()),
+        tag => Err(tag.value_error()),
+    }
 }
 
 impl Drop for RpcServer {

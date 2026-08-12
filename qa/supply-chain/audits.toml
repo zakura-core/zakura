@@ -87,6 +87,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-run"
 delta = "4.5.5 -> 4.5.8"
 
+[[audits.colorchoice]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.5"
+notes = "Reviewed all packaged source and manifest. The no_std implementation stores a four-value enum as a SeqCst AtomicUsize with total checked conversion; no dependencies, unsafe code, build script, allocation, I/O, or ambient capabilities. Its unit test passed."
+
 [[audits.console-api]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -124,6 +130,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.23.0"
 notes = "Full packaged-source review: source is identical to 0.20.11 aside from package metadata; no unsafe code, build script, I/O, or ambient capabilities; derive entry points delegate generation to separately policy-checked darling_core."
+
+[[audits.derive_builder_macro]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.20.2"
+notes = "Reviewed all packaged source and manifest. This proc-macro entry point parses a DeriveInput and delegates token generation to separately policy-checked derive_builder_core. No unsafe code, build script, I/O, or ambient capabilities. All-feature unit and doc test targets compiled."
 
 [[audits.documented]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -275,6 +287,18 @@ criteria = "safe-to-deploy"
 version = "0.2.0"
 notes = "Full packaged-source review: no unsafe code, build script, I/O, or ambient capabilities; generated code is limited to metric trait implementations, static metadata, field references, and Arc clones."
 
+[[audits.is_terminal_polyfill]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.70.2"
+notes = "Reviewed all packaged source and manifest. The sealed trait implementation only delegates terminal detection to std::io::IsTerminal for standard handles and File; no unsafe code, build script, allocation, or additional ambient capabilities. All-feature unit and doc test targets compiled."
+
+[[audits.jsonrpsee]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.24.11"
+notes = "Reviewed all packaged source and manifest. This facade contains only cfg macros and feature-gated re-exports of separately policy-checked jsonrpsee components; it has no unsafe code, build script, I/O, or ambient capabilities of its own. The full all-feature target compiled."
+
 [[audits.libc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -345,6 +369,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.19.0 -> 1.20.2"
 
+[[audits.once_cell_polyfill]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.70.2"
+notes = "Reviewed all packaged source and manifest. This dependency-free wrapper safely delegates its small API to std::sync::OnceLock; no unsafe code, build script, I/O, allocation beyond the wrapped value, or ambient capabilities. All-feature unit and doc test targets compiled."
+
 [[audits.orchard]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -359,6 +389,12 @@ delta = "0.9.0 -> 0.10.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "4.0.0 -> 4.1.0"
+
+[[audits.pathdiff]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.3"
+notes = "Reviewed all packaged source and manifest. Both Path and optional Camino implementations perform input-length-bounded component iteration and relative PathBuf construction without filesystem access, unsafe code, or a build script. All 6 unit tests and 2 doctests passed with all features."
 
 [[audits.pin-project]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -435,6 +471,12 @@ delta = "0.8.4 -> 0.8.5"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.10.1 -> 0.10.2"
+
+[[audits.rustc-hex]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "2.1.0"
+notes = "Reviewed all packaged source and manifest. The dependency-free no_std-capable encoder and decoder use input-bounded safe iterators and masked table indices, with no unsafe code, build script, I/O, or ambient capabilities. All 7 unit tests and 4 doctests passed with all features."
 
 [[audits.rustix]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -526,6 +568,12 @@ importable = false
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.2.2 -> 0.3.0"
+
+[[audits.spandoc-attribute]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.1"
+notes = "Reviewed all packaged source and manifest. This build-time proc macro only folds a syn AST and generates tracing span tokens; it has no unsafe code, build script, I/O, or ambient capabilities. Both unit tests passed and doctests compiled."
 
 [[audits.tempfile]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -668,9 +716,21 @@ criteria = "safe-to-deploy"
 delta = "0.3.2 -> 0.3.3"
 
 [[audits.tower-service]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = "Reviewed all packaged source and manifest. The dependency-free crate defines the Service trait and forwarding implementations for mutable references and Box; unsafe code is forbidden and there is no build script, I/O, allocation, or ambient capability. Four doctests passed, one example-only doctest was ignored."
+
+[[audits.tower-service]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.2 -> 0.3.3"
+
+[[audits.tracing-log]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.1.3 -> 0.1.4"
+notes = "Reviewed the complete 0.1.3 -> 0.1.4 packaged-source delta. Runtime changes replace lazy_static with once_cell::Lazy, qualify generated Option paths, update dependency floors, and deprecate an adapter; no new unsafe code, I/O, build script, or ambient capability. The all-feature library compiled. The all-feature test target has an upstream test-only initializer arity error at Lazy::new(Mutex::new); deployed code is unaffected."
 
 [[audits.uint]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

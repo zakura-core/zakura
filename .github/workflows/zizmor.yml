@@ -34,13 +34,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d #v0.5.6
+      - uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 #v0.6.2
         with:
           advanced-security: false
           annotations: true
           # Pin the auditor itself: the action defaults to `version: latest`,
           # so a new zizmor release that adds an audit could turn this check
           # red repo-wide with no repo change. Bump deliberately instead.
+          # (The version must be known to the action release pinned above --
+          # its support/versions manifest maps each version to an image digest.)
           version: "1.29.0"
           # Catch every finding, including informational. Known-safe patterns
           # must be silenced with a line-level `# zizmor: ignore[<rule>]`

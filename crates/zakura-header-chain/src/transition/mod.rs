@@ -15,7 +15,7 @@ pub use engine::{
 };
 pub(crate) use invariants::verify_candidate;
 pub use invariants::InvariantViolation;
-#[cfg(any(test, feature = "fuzz-impl"))]
+#[cfg(test)]
 pub(crate) use invariants::{verify_plan, verify_plan_production};
 pub use planner::TransitionFailure;
 pub(crate) use planner::{PlanCandidate, TransitionPlan};

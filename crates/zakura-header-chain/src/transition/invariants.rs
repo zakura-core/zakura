@@ -7,7 +7,7 @@ use zakura_chain::block;
 
 use crate::graph::GraphOverlay;
 use crate::graph::HeaderGraphView;
-#[cfg(any(test, feature = "fuzz-impl"))]
+#[cfg(test)]
 use crate::TransitionPlan;
 use crate::{
     AuxDelta, BodyValidationState, EligibilityReason, EngineMode, FinalitySource, Frontier,
@@ -68,6 +68,7 @@ enum VerificationMode {
     #[cfg(any(test, feature = "fuzz-impl"))]
     Exhaustive,
     /// Delta overlay and changed-boundary nodes (shipped production path).
+    #[cfg(any(test, not(feature = "fuzz-impl")))]
     Production,
 }
 
@@ -91,7 +92,7 @@ pub(crate) fn verify_candidate(
 }
 
 /// Re-run verification against an already verified plan in tests and fuzzing.
-#[cfg(any(test, feature = "fuzz-impl"))]
+#[cfg(test)]
 pub(crate) fn verify_plan(
     before: &HeaderChainEngine,
     plan: &TransitionPlan,
@@ -100,7 +101,7 @@ pub(crate) fn verify_plan(
 }
 
 /// Verify `plan` using the exact production overlay and boundary-node path.
-#[cfg(any(test, feature = "fuzz-impl"))]
+#[cfg(test)]
 pub(crate) fn verify_plan_production(
     before: &HeaderChainEngine,
     plan: &TransitionPlan,
@@ -900,6 +901,7 @@ fn verify_aux<G: HeaderGraphView>(
     let nodes: Vec<&HeaderNode> = match mode {
         #[cfg(any(test, feature = "fuzz-impl"))]
         VerificationMode::Exhaustive => graph.view_header_nodes(),
+        #[cfg(any(test, not(feature = "fuzz-impl")))]
         VerificationMode::Production => plan
             .change_set
             .put_nodes
@@ -939,15 +941,16 @@ fn verify_aux<G: HeaderGraphView>(
 }
 
 fn verification_nodes<'a, G: HeaderGraphView>(
-    before: &HeaderChainEngine,
+    _before: &HeaderChainEngine,
     graph: &'a G,
-    plan: &PlanCandidate,
+    _plan: &PlanCandidate,
     mode: VerificationMode,
 ) -> Vec<&'a HeaderNode> {
     match mode {
         #[cfg(any(test, feature = "fuzz-impl"))]
         VerificationMode::Exhaustive => graph.view_header_nodes(),
-        VerificationMode::Production => changed_boundary_nodes(before, graph, plan),
+        #[cfg(any(test, not(feature = "fuzz-impl")))]
+        VerificationMode::Production => changed_boundary_nodes(_before, graph, _plan),
     }
 }
 
@@ -963,6 +966,7 @@ fn materialize_projected_graph(
     Ok(graph)
 }
 
+#[cfg(any(test, not(feature = "fuzz-impl")))]
 fn changed_boundary_nodes<'a, G: HeaderGraphView>(
     before: &HeaderChainEngine,
     graph: &'a G,

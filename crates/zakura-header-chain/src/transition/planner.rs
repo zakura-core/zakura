@@ -69,7 +69,7 @@ impl TransitionPlan {
         Self { candidate }
     }
 
-    #[cfg(any(test, feature = "fuzz-impl"))]
+    #[cfg(test)]
     pub(super) const fn candidate(&self) -> &PlanCandidate {
         &self.candidate
     }

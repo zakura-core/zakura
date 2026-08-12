@@ -222,6 +222,7 @@ impl<'a> ProjectedTransitionState<'a> {
         }
         Ok(SettledProjectedState {
             graph: self.graph,
+            graph_delta,
             verified: self.verified,
             aux_changes: self.aux_changes,
         })
@@ -236,6 +237,7 @@ impl<'a> ProjectedTransitionState<'a> {
 /// Fully settled projected state ready for write-set assembly.
 pub(super) struct SettledProjectedState<'a> {
     graph: GraphOverlay<'a>,
+    graph_delta: GraphDelta,
     verified: Cow<'a, [Frontier]>,
     aux_changes: Vec<AuxDelta>,
 }
@@ -250,8 +252,12 @@ impl<'a> SettledProjectedState<'a> {
         Cow<'a, [Frontier]>,
         Vec<AuxDelta>,
     ) {
-        let graph_delta = self.graph.delta();
-        (self.graph, graph_delta, self.verified, self.aux_changes)
+        (
+            self.graph,
+            self.graph_delta,
+            self.verified,
+            self.aux_changes,
+        )
     }
 }
 

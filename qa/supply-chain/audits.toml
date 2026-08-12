@@ -197,6 +197,12 @@ criteria = "safe-to-deploy"
 version = "0.3.0"
 notes = "Reviewed all packaged source and manifest. This facade crate only defines documentation traits, performs bounded static-slice lookup and error-string allocation, and re-exports the separately policy-checked derive and PHF dependencies. No unsafe code, build script, I/O, or ambient capabilities. cargo test --all-features passed."
 
+[[audits.encode_unicode]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.6"
+notes = "Reviewed all packaged source, manifests, tests, and benchmark. Safe UTF-8 and UTF-16 constructors validate lengths, continuation bytes, overlong forms, surrogate ranges, and scalar bounds before reaching unchecked constructors; transmute and pointer operations preserve their documented invariants, and public unchecked constructors require the caller to uphold them. There is no build script or runtime ambient capability; the benchmark alone embeds a host dictionary at compile time when explicitly built. With two obsolete test-only calls that violate their unchecked APIs' slice-length contracts removed from the temporary harness, 26 integration tests, 54 doctests, the ASCII feature, the no_std library target, and an exhaustive sweep over every valid Unicode scalar passed. The obsolete optional Clippy compiler-plugin feature no longer builds on modern Rust."
+
 [[audits.enumflags2_derive]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -444,6 +450,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.7.0"
 notes = "Reviewed all packaged source, manifest, tests, and benchmark. This dependency-free no_std-compatible crate implements the in-memory MD5 transform over caller-supplied bytes and explicitly warns that MD5 is cryptographically broken; this audit does not endorse new cryptographic use. It has no unsafe code, build script, runtime I/O, or ambient capabilities. Three unit tests, including published vectors and the 512 MiB counter-overflow case, plus 1 doctest and the no-default-features target passed; the separate 4 GiB allocation test was not run."
+
+[[audits.memuse]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.1"
+notes = "Reviewed all packaged source, manifest, and tests. The crate estimates dynamic memory usage by traversing caller-supplied standard collections and optionally the separately policy-checked nonempty type using safe APIs. Unsafe code is forbidden, and there is no build script, runtime I/O, process execution, or ambient capability. All 10 unit tests and 4 doctests passed with all features."
 
 [[audits.metrics]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -949,6 +961,12 @@ delta = "0.2.41-beta.14 -> 0.2.41-beta.15"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.2.41-beta.14 -> 0.2.41-beta.15"
+
+[[audits.tower-layer]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = "Reviewed all packaged source and manifests. The dependency-free library defines the Layer trait and type-checked identity, function, stack, reference, and tuple composition implementations. Unsafe code is forbidden, and there is no build script, allocation, I/O, or ambient capability. Its unit test passed; both doctests passed after enabling Tower's util feature, which the published development dependency omits."
 
 [[audits.tower-layer]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

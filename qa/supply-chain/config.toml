@@ -533,10 +533,6 @@ criteria = "safe-to-deploy"
 version = "4.2.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.encode_unicode]]
-version = "0.3.6"
-criteria = "safe-to-deploy"
-
 [[exemptions.enum-as-inner]]
 version = "0.6.1"
 criteria = "safe-to-deploy"
@@ -1025,10 +1021,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.memchr]]
 version = "2.8.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.memuse]]
-version = "0.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.metrics]]
@@ -1978,10 +1970,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tower-http]]
 version = "0.6.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.tower-layer]]
-version = "0.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.tower-test]]

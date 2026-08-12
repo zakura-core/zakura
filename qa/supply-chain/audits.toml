@@ -826,6 +826,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "8.3.1 -> 8.3.2"
 
+[[audits.vergen-gitcl]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "9.1.0"
+notes = "Reviewed all packaged source, manifests, build script, and tests. The crate contains no unsafe code and invokes only documented Git CLI commands at build time; Zakura supplies a fixed tag pattern and does not accept untrusted build input. The actual Zakura build script compiled and executed successfully in an isolated probe. Six applicable doctests passed; the two remaining doctests and unit tests cannot compile from the published package because its workspace-only test_util development dependency is omitted, which does not affect deployed code."
+
 [[audits.version_check]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"

@@ -710,10 +710,6 @@ criteria = "safe-to-deploy"
 version = "0.1.7"
 criteria = "safe-to-deploy"
 
-[[exemptions.git2]]
-version = "0.20.4"
-criteria = "safe-to-deploy"
-
 [[exemptions.gloo-timers]]
 version = "0.3.0"
 criteria = "safe-to-deploy"
@@ -1020,10 +1016,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.libc]]
 version = "0.2.186"
-criteria = "safe-to-deploy"
-
-[[exemptions.libgit2-sys]]
-version = "0.18.5+1.9.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.libloading]]
@@ -2204,10 +2196,6 @@ version = "1.23.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.vergen]]
-version = "9.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.vergen-git2]]
 version = "9.1.0"
 criteria = "safe-to-deploy"
 

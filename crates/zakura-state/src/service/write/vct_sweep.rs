@@ -9,7 +9,7 @@
 //! fails — arming metadata repair immediately instead of at commit.
 //!
 //! The cryptographic kernel is [`verify_supplied_roots_from_parts`], written by Roman Akhtariev
-//! for `main`'s ahead-of-body header-root authentication lane (zakura#346, #352, #455). It is
+//! for `main`'s ahead-of-body header-root authentication lane (zakura#346, #351, #352, #455). It is
 //! reused unchanged; this module only supplies the fork-aware inputs `main` did not have and
 //! records the verdict as header-chain auxiliary evidence instead of a height-keyed disk row.
 

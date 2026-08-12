@@ -1,6 +1,7 @@
 # Header-sync VCT root authentication
 
-Status: removed (specified by PRs #346, #351, #352; removed on the fork-aware header chain)
+Status: removed (specified by Roman Akhtariev in PRs #346, #351, #352; removed on the fork-aware
+header chain)
 
 > **Removed — historical reference only.** This document specifies the height-keyed
 > ascending-frontier lane (`AuthenticateHeaderRoots`), which authenticated peer roots against a

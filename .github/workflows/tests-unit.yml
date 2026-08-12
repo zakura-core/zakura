@@ -74,11 +74,22 @@ jobs:
           MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           MERGE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          TOTAL_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
         run: |
           case "$EVENT_NAME" in
             pull_request)
+              # The PR files endpoint returns at most 3,000 files. Run the full
+              # build and config suite when the count is missing or reaches that
+              # limit so a truncated response cannot hide a relevant path.
+              if ! [[ "$TOTAL_CHANGED_FILES" =~ ^[0-9]+$ ]] || \
+                 (( TOTAL_CHANGED_FILES >= 3000 )); then
+                echo "config=true" >> "$GITHUB_OUTPUT"
+                echo "rust=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+
               changed=$(gh api --paginate \
-                "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+                "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
                 --jq '.[].filename')
               ;;
             push)
@@ -137,9 +148,11 @@ jobs:
           done <<< "$changed"
 
           # Broad test-relevant filter (the paths that formerly gated the whole
-          # workflow on pull_request). Gates the build/test jobs; `config` above
-          # additionally gates the narrower config-compatibility job.
-          if printf '%s\n' "$changed" | grep -qE '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/zakura-chain/src/parameters/checkpoint/main-checkpoints\.txt$|^crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier\.(bin|json)$|^\.config/nextest\.toml$|^\.github/workflows/tests-unit\.yml$)'; then
+          # workflow on pull_request). Every config-relevant change also needs
+          # the build archive consumed by zakura-config, so `config` implies
+          # `rust` even for paths outside the old workflow-level filter.
+          if [[ "$config" == "true" ]] || \
+             grep -qE '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/zakura-chain/src/parameters/checkpoint/main-checkpoints\.txt$|^crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier\.(bin|json)$|^\.config/nextest\.toml$|^\.github/workflows/tests-unit\.yml$)' <<< "$changed"; then
             rust=true
           else
             rust=false

@@ -431,7 +431,7 @@ fn warn_if_certificates_are_not_current(cert_chain: &[CertificateDer<'static>], 
 /// Returns whether `certificate` is inside its validity window at `now`.
 ///
 /// Walks the DER encoding as far as the `validity` field of the `TBSCertificate`
-/// ([RFC 5280 section 4.1](https://www.rfc-editor.org/rfc/rfc5280#section-4.1)):
+/// (RFC 5280 section 4.1):
 /// ```text
 /// Certificate  ::= SEQUENCE { tbsCertificate TBSCertificate, ... }
 /// TBSCertificate ::= SEQUENCE {

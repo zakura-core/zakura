@@ -556,7 +556,7 @@ fn path_rejects_zero_height_tip_that_is_not_finalized() {
     assert_eq!(
         path(&store.graph, malformed),
         Err(TransitionFailure::Graph(
-            GraphError::FinalizedNotDescendant {
+            GraphError::FinalizedFrontierNotDescendant {
                 current: anchor.hash,
                 candidate: child.hash,
             }

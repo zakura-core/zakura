@@ -131,12 +131,13 @@ fn verify_plan_exhaustive(
     let delta_finalized = delta_graph.view_finalized_frontier();
     #[cfg(any(test, feature = "fuzz-impl"))]
     if mode == VerificationMode::Exhaustive {
+        let projected_graph = materialize_projected_graph(before, plan)?;
         return verify_plan_against_graph(
             before,
             plan,
             &source,
             source_metadata,
-            plan.projected_graph(),
+            &projected_graph,
             delta_finalized,
             mode,
         );
@@ -392,11 +393,12 @@ fn verify_incremental_checkpoint_finality(
     let delta_finalized = delta_graph.view_finalized_frontier();
     #[cfg(any(test, feature = "fuzz-impl"))]
     if mode == VerificationMode::Exhaustive {
+        let projected_graph = materialize_projected_graph(before, plan)?;
         return verify_incremental_checkpoint_against_graph(
             before,
             plan,
             &source,
-            plan.projected_graph(),
+            &projected_graph,
             delta_finalized,
             mode,
         );
@@ -936,6 +938,18 @@ fn verification_nodes<'a, G: HeaderGraphView>(
         VerificationMode::Exhaustive => graph.view_header_nodes(),
         VerificationMode::Production => changed_boundary_nodes(before, graph, plan),
     }
+}
+
+#[cfg(any(test, feature = "fuzz-impl"))]
+fn materialize_projected_graph(
+    before: &HeaderChainEngine,
+    plan: &TransitionPlan,
+) -> Result<crate::graph::MemHeaderStore, InvariantViolation> {
+    let mut graph = before.graph().clone();
+    graph
+        .apply_delta(plan.graph_delta())
+        .map_err(|_| InvariantViolation::Index(block::Hash([0; 32])))?;
+    Ok(graph)
 }
 
 fn changed_boundary_nodes<'a, G: HeaderGraphView>(

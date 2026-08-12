@@ -1760,7 +1760,7 @@ fn path<G: HeaderGraphView>(graph: &G, tip: Frontier) -> Result<Vec<Frontier>, T
             current
                 .height
                 .previous()
-                .map_err(|_| GraphError::FinalizedNotDescendant {
+                .map_err(|_| GraphError::FinalizedFrontierNotDescendant {
                     current: finalized.hash,
                     candidate: tip.hash,
                 })?,

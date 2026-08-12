@@ -4,7 +4,7 @@ use super::*;
 fn operator_invalidation_rejects_the_finalized_anchor() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
-    let anchor = store.graph.finalized();
+    let anchor = store.graph.finalized_frontier();
 
     let err = apply_transition(
         &store,

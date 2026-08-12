@@ -109,10 +109,10 @@ fn auxiliary_deletes_for_evicted_headers_are_sorted_by_hash_and_delivery_id() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
-    let old_finalized = store.graph.finalized();
+    let old_finalized = store.graph.finalized_frontier();
     let easy = store
         .graph
-        .node(old_finalized.hash)
+        .header_node(old_finalized.hash)
         .expect("the anchor exists")
         .header
         .difficulty_threshold;
@@ -179,7 +179,7 @@ fn auxiliary_deletes_for_evicted_headers_are_sorted_by_hash_and_delivery_id() {
     for delivery in &deliveries {
         store
             .graph
-            .record_aux_delivery(delivery.header_hash, delivery.delivery_id)
+            .record_auxiliary_evidence_delivery(delivery.header_hash, delivery.delivery_id)
             .expect("the competing header remains retained");
         store.aux.push(*delivery);
     }

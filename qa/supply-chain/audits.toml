@@ -36,6 +36,12 @@ criteria = "safe-to-deploy"
 version = "0.2.5"
 notes = "Reviewed all packaged source and manifest. Generated pin projections retain the optional inner future or I/O object in place across every forwarding implementation, while pinned drop enters a Tokio context before destroying it. The on-demand fallback runtime creates one named driver thread and otherwise acquires no hidden capability. There is no build script or unsafe code, and the library target passed."
 
+[[audits.async-trait]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.88"
+notes = "Reviewed all packaged source, manifest, examples, and tests. The proc macro parses trait and impl syntax and emits type-checked boxed-future transformations without introducing unsafe code, filesystem access, process execution, or network access. All 9 applicable stable tests passed; the one UI harness that requires nightly was ignored as declared."
+
 [[audits.atomic-polyfill]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -147,11 +153,23 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.7.2 -> 1.8.0"
 
+[[audits.camino]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.2.4"
+notes = "Reviewed all packaged source, manifest, build script, features, and tests. Every safe constructor validates or starts from str, and every mutator accepts UTF-8 input or preserves existing bytes. Unsafe Path, Box, Arc, and Rc casts preserve repr(transparent) layouts and the established UTF-8 invariant. The build script only queries the configured Rust compiler version. All 92 tests passed with all features."
+
 [[audits.cargo-platform]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.3.3"
 notes = "Reviewed all packaged source, manifest, tests, and example. The library parses, validates, displays, and matches caller-supplied target names and cfg expressions using a separately policy-checked Serde dependency. It has no unsafe code, build script, runtime I/O, or ambient capabilities. The manually run example invokes rustc to obtain host metadata, but Cargo does not execute it during build. All 8 integration tests passed."
+
+[[audits.cargo_metadata]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.23.1"
+notes = "Reviewed all packaged source, manifest, and tests. The crate contains no unsafe code; its documented ambient capability is limited to executing the configured Cargo binary with explicit metadata arguments and parsing its captured JSON output. All command, environment, and option arguments remain separately encoded rather than shell-interpreted. Twenty tests passed with all features; four sample-workspace tests could not run because crates.io omitted their fixture manifests."
 
 [[audits.cfg_aliases]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -239,6 +257,12 @@ criteria = "safe-to-deploy"
 version = "0.9.6"
 notes = "Reviewed all packaged source, manifest, generated OID database, and tests. The no_std implementation performs checked fixed-buffer OID parsing and BER/DER encoding; the database feature adds only generated static constants and lookup tables, and the optional arbitrary dependency is separately policy-checked. Unsafe code is forbidden and there is no build script, runtime I/O, or ambient capability. All 18 unit and integration tests and 2 doctests passed with all features."
 
+[[audits.const_format_proc_macros]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.34"
+notes = "Reviewed all packaged source, manifest, parser, expansion logic, and tests. The procedural macros only parse tokens and emit calls into the separately policy-checked const_format API, with no unsafe code, build script, I/O, or ambient capability. All 11 unit tests passed."
+
 [[audits.convert_case]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -287,6 +311,30 @@ criteria = "safe-to-deploy"
 version = "0.1.1"
 notes = "Reviewed all packaged source, manifest, tests, and documentation. The procedural macros validate supported items and generate target_feature inner functions without altering argument ownership, generics, or return types. As its unsafe_target_feature name and documentation specify, callers must establish the CPU-feature precondition at their API boundary; the current curve25519-dalek consumer dispatches through cpufeatures checks. The proc-macro has no build script, I/O, or ambient capability, and its host library test target passed."
 
+[[audits.darling]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.20.11"
+notes = "Reviewed all packaged source, manifests, maintenance script, examples, and tests. The crate provides safe attribute-parsing traits and delegates derive expansion to separately policy-checked Darling components; it has no build script, runtime I/O, process execution, or network access. The complete stable default-feature test suite passed. The optional diagnostics feature is explicitly nightly-only."
+
+[[audits.darling]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.23.0"
+notes = "Reviewed all packaged source, manifests, maintenance script, examples, and tests. The crate provides safe attribute-parsing traits and delegates derive expansion to separately policy-checked Darling components; it has no build script, runtime I/O, process execution, or network access. The stable default and optional Serde test suite passed. The optional diagnostics feature is explicitly nightly-only."
+
+[[audits.darling_core]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.20.11"
+notes = "Reviewed all packaged source, manifest, token parsers, error accumulation, code generation, and tests. The safe Rust implementation transforms syn syntax and proc_macro2 tokens without I/O or ambient capabilities. All 81 unit tests and 10 applicable documentation tests passed; 9 nightly diagnostics doctests were ignored as declared."
+
+[[audits.darling_core]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.23.0"
+notes = "Reviewed all packaged source, manifest, token parsers, error accumulation, code generation, optional suggestion support, and tests. The safe Rust implementation transforms syn syntax and proc_macro2 tokens without I/O or ambient capabilities. All 86 unit tests and 10 applicable documentation tests passed; 10 nightly diagnostics doctests were ignored as declared."
+
 [[audits.darling_macro]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -299,11 +347,29 @@ criteria = "safe-to-deploy"
 version = "0.23.0"
 notes = "Full packaged-source review: source is identical to 0.20.11 aside from package metadata; no unsafe code, build script, I/O, or ambient capabilities; derive entry points delegate generation to separately policy-checked darling_core."
 
+[[audits.der_derive]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.7.3"
+notes = "Reviewed all packaged source, manifest, and tests. Unsafe code is forbidden, and the derive macros validate supported struct shapes before emitting type-checked Encode, Decode, Sequence, Choice, and ValueOrd implementations over the separately policy-checked der traits. No build script, I/O, or ambient capability. All 13 unit tests passed; 3 documentation targets were ignored as packaged."
+
 [[audits.derive-getters]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.5.0"
 notes = "Reviewed all packaged source, manifest, and tests. The procedural derives validate named-struct and field attributes and generate type-checked borrowed, mutable, copy, and dissolve accessors without unsafe code, a build script, runtime I/O, or ambient capabilities. The full all-feature suite passed, including all 11 trybuild cases."
+
+[[audits.derive_builder]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.20.2"
+notes = "Reviewed all packaged source, manifest, examples, and tests. This safe facade re-exports the separately policy-checked builder derive and contains no unsafe production code, build script, I/O, or ambient capability. All 79 all-feature unit, integration, and documentation tests passed in a non-incremental isolated target."
+
+[[audits.derive_builder_core]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.20.2"
+notes = "Reviewed all packaged source, manifest, embedded documentation templates, expansion logic, and tests. The safe Rust generator validates attributes and emits typed builder fields, setters, defaults, and errors without I/O or ambient capabilities. All 42 unit tests passed with all features; 6 compile-test doctests were ignored as declared."
 
 [[audits.derive_builder_macro]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -924,6 +990,12 @@ criteria = "safe-to-deploy"
 version = "0.23.0"
 notes = "Reviewed all packaged source and manifest. This no_std crate contains only pairing-engine, curve-affine, Miller-loop, and final-exponentiation trait definitions over the separately policy-checked group crate. It has no unsafe code, build script, runtime I/O, or ambient capabilities. Library and documentation targets passed; the package defines no tests."
 
+[[audits.paste]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.10"
+notes = "Reviewed all packaged source, manifest, build script, macro expansion, and tests. The proc macro concatenates caller tokens and reads an environment variable only when the caller explicitly requests the env modifier; it emits no unsafe code. The build script only queries the configured Rust compiler version, and the library target passed. The published package omits its real path-based paste-test-suite crate and instead resolves an intentionally invalid registry placeholder, preventing the packaged integration suite from compiling."
+
 [[audits.pathdiff]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1246,6 +1318,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.210 -> 1.0.211"
 
+[[audits.serde_derive_internals]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.29.1"
+notes = "Reviewed all packaged source, manifest, AST construction, attribute parsing, case conversion, and tests. The safe Rust library analyzes syn input for derive implementations without generating executable code itself and has no build script, I/O, or ambient capability. Both unit tests passed."
+
 [[audits.serde_spanned]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1402,6 +1480,12 @@ version = "1.4.1"
 notes = "Reviewed all packaged source, manifest, and tests. Color decisions read only documented terminal environment state; output is emitted to explicit standard streams or caller-supplied writers, and Windows console operations delegate to separately policy-checked winapi-util. No unsafe code, build script, filesystem or network access, or process execution. All 16 applicable tests passed; one stream-sensitive test was ignored as declared."
 
 [[audits.thiserror]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "2.0.17"
+notes = "Reviewed all packaged source, manifests, build probe, examples, and tests. The safe facade delegates expansion to the separately policy-checked implementation crate. Its build script writes only generated module glue and compiler-probe artifacts beneath Cargo's OUT_DIR and invokes only Cargo-configured Rust compiler wrappers with fixed probe arguments. All 60 applicable all-feature tests passed; 3 nightly-only cases were ignored as declared."
+
+[[audits.thiserror]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.61 -> 1.0.62"
@@ -1410,6 +1494,12 @@ delta = "1.0.61 -> 1.0.62"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.63 -> 1.0.64"
+
+[[audits.thiserror-impl]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "2.0.17"
+notes = "Reviewed all packaged source and manifest, including format-expression scanning, attribute validation, generic-bound inference, and generated Error, Display, From, and provide implementations. The proc macro uses safe Rust and has no build script, filesystem, process, network, or environment access. Its library target passed directly and its expansions passed the separately audited thiserror test suite."
 
 [[audits.thiserror-impl]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1589,6 +1679,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.4.0"
 notes = "Reviewed all packaged source, manifest, and tests. This test utility connects mock Tower services through Tokio channels, tracks capacity and wakers behind mutexes, and retains response ownership in one-shot senders; it contains no unsafe code, build script, filesystem or network access, or process execution. Both integration tests passed."
+
+[[audits.tracing-attributes]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.31"
+notes = "Reviewed all packaged source, manifest, macro parsing and expansion, and tests. The safe procedural macro preserves function unsafety rather than introducing it and emits only typed tracing span and event operations, with no build script, I/O, or ambient capability. The all-feature library and packaged dead-code test passed; the UI suite's only mismatch was changed Rust diagnostic text. Most runtime integration tests cannot compile from the published package because its workspace-only tracing-mock development dependency was omitted."
 
 [[audits.tracing-flame]]
 who = "OpenAI Codex <noreply@openai.com>"

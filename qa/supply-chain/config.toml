@@ -107,10 +107,6 @@ criteria = "safe-to-deploy"
 version = "0.7.8"
 criteria = "safe-to-deploy"
 
-[[exemptions.async-trait]]
-version = "0.1.88"
-criteria = "safe-to-deploy"
-
 [[exemptions.async_io_stream]]
 version = "0.3.3"
 criteria = "safe-to-deploy"
@@ -196,18 +192,10 @@ criteria = "safe-to-deploy"
 version = "0.1.13+1.0.8"
 criteria = "safe-to-deploy"
 
-[[exemptions.camino]]
-version = "1.2.4"
-criteria = "safe-to-deploy"
-
 [[exemptions.canonical-path]]
 version = "2.0.2"
 criteria = "safe-to-deploy"
 notes = "Audit held: safe set_file_name and set_extension methods mutate the wrapped path without re-canonicalizing it, breaking the advertised canonical-path invariant; is_dir also delegates to is_file. A version-wide safe-to-deploy certification is deferred pending an upstream fix."
-
-[[exemptions.cargo_metadata]]
-version = "0.23.1"
-criteria = "safe-to-deploy"
 
 [[exemptions.cbc]]
 version = "0.1.2"
@@ -285,10 +273,6 @@ criteria = "safe-to-deploy"
 version = "0.2.36"
 criteria = "safe-to-deploy"
 
-[[exemptions.const_format_proc_macros]]
-version = "0.2.34"
-criteria = "safe-to-deploy"
-
 [[exemptions.constant_time_eq]]
 version = "0.4.2"
 criteria = "safe-to-deploy"
@@ -358,38 +342,10 @@ criteria = "safe-to-deploy"
 version = "4.1.3"
 criteria = "safe-to-deploy"
 
-[[exemptions.darling]]
-version = "0.20.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.darling]]
-version = "0.23.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.darling_core]]
-version = "0.20.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.darling_core]]
-version = "0.23.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.data-encoding]]
 version = "2.11.0"
 criteria = "safe-to-deploy"
 notes = "Audit hold: the doc-hidden Encoding tuple field and Encoding::internal_new are safe public APIs that accept arbitrary implementation bytes. A caller can safely supply non-ASCII symbols with an otherwise valid table shape, after which encode_mut_str and encode use unchecked UTF-8 construction. Retain the exemption pending upstream validation or an unsafe constructor boundary."
-
-[[exemptions.der_derive]]
-version = "0.7.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.derive_builder]]
-version = "0.20.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.derive_builder_core]]
-version = "0.20.2"
-criteria = "safe-to-deploy"
 
 [[exemptions.derive_more]]
 version = "1.0.0"
@@ -1007,25 +963,25 @@ criteria = "safe-to-deploy"
 version = "0.5.2"
 criteria = "safe-to-deploy"
 
-[[exemptions.paste]]
-version = "1.0.10"
-criteria = "safe-to-deploy"
-
 [[exemptions.pest]]
 version = "2.8.7"
 criteria = "safe-to-deploy"
+notes = "Audit hold: an empty-stack PEEK_ALL succeeds without consuming input, while ParserState::repeat checks its call limit only before entering the loop. A grammar such as PEEK_ALL* can therefore hang indefinitely. Retain the exemption pending a runtime progress guard or complete grammar validation."
 
 [[exemptions.pest_derive]]
 version = "2.8.7"
 criteria = "safe-to-deploy"
+notes = "Audit hold: the derive stack accepts repetitions around empty-stack PEEK_ALL and emits a runtime parser loop that never consumes input or reaches the call limit. Retain the exemption pending a fix in pest and pest_meta."
 
 [[exemptions.pest_generator]]
 version = "2.8.7"
 criteria = "safe-to-deploy"
+notes = "Audit hold: code generation can emit ParserState::repeat around PEEK_ALL after pest_meta misclassifies that empty-stack operation as progressing, producing an unbounded runtime loop. Retain the exemption pending upstream validation or a runtime progress guard."
 
 [[exemptions.pest_meta]]
 version = "2.8.7"
 criteria = "safe-to-deploy"
+notes = "Audit hold: validator.rs explicitly notes that empty-stack PEEK_ALL is non-progressing but classifies it as progressing. Repetitions such as PEEK_ALL* can pass validation and generate a parser that hangs indefinitely. Retain the exemption pending complete progress analysis."
 
 [[exemptions.petgraph]]
 version = "0.8.3"
@@ -1369,10 +1325,6 @@ criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade"
 
-[[exemptions.serde_derive_internals]]
-version = "0.29.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.serde_json]]
 version = "1.0.150"
 criteria = "safe-to-deploy"
@@ -1481,14 +1433,6 @@ criteria = "safe-to-deploy"
 version = "3.27.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.thiserror]]
-version = "2.0.17"
-criteria = "safe-to-deploy"
-
-[[exemptions.thiserror-impl]]
-version = "2.0.17"
-criteria = "safe-to-deploy"
-
 [[exemptions.thread-priority]]
 version = "1.2.0"
 criteria = "safe-to-deploy"
@@ -1583,10 +1527,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tracing-appender]]
 version = "0.2.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-attributes]]
-version = "0.1.31"
 criteria = "safe-to-deploy"
 
 [[exemptions.tracing-core]]

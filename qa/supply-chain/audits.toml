@@ -1089,6 +1089,12 @@ version = "1.0.0"
 notes = "Reviewed all packaged source, manifest, and tests. The library parses Rust literal token text into borrowed, type-checked representations and optionally validates suffix identifiers, with no unsafe code, build script, runtime I/O, or ambient capability. All 80 applicable unit tests and 4 applicable doctests passed with all features."
 
 [[audits.log]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.33"
+notes = "Reviewed all packaged source, manifest, benchmarks, and tests. Global logger publication uses a private three-state atomic protocol with Acquire/Release ordering; the level-filter transmute consumes only private enum-derived discriminants, and non-atomic initialization APIs carry explicit unsafe synchronization contracts. Key-value capture delegates to separately policy-checked value adapters. No build script, filesystem, network, process execution, or hidden initialization. Default and full runtime-feature suites passed 32 and 84 active unit, integration, and macro tests plus 26 and 39 doctests respectively; one static release-level test was intentionally ignored in each mode."
+
+[[audits.log]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.4.21 -> 0.4.22"
@@ -1630,6 +1636,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.0-pre.4"
 notes = "Reviewed all packaged source, manifest, and tests. The no_std implementation uses fixed RIPEMD round schedules, constants, and wrapping word operations over exact-size blocks and delegates buffering to separately policy-checked digest traits. No unsafe code, build script, I/O, or ambient authority. All 16 known-answer tests and 1 doctest passed against the exact locked block-buffer release candidate."
+
+[[audits.rlimit]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.10.1"
+notes = "Reviewed all packaged source, generated platform bindings and resource table, manifest, build script, examples, and tests. Resource constants are closed safe values; Unix wrappers reject unsupported resources, initialize ABI structs, clamp limits, and expose outputs only after successful syscalls. The build script only maps Cargo target variables to cfg flags, and procfs reads and resource mutations are explicit API behavior. No network or hidden process execution. On Apple, all 4 active unit and integration tests and 5 doctests passed; the limit-raising tool test was intentionally ignored."
 
 [[audits.rlimit]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

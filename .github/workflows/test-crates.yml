@@ -14,6 +14,8 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      # Include non-Rust inputs compiled or exercised by workspace crates.
+      - crates/**
       - .cargo/config.toml
       - .github/actions/setup-zakura-build/**
       - .github/workflows/test-crates.yml
@@ -84,7 +86,7 @@ jobs:
             "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
             --jq '.[] | .filename, (.previous_filename // empty)')
 
-          if grep -qE '(\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^\.github/actions/setup-zakura-build/|^\.github/workflows/test-crates\.yml$)' <<< "$changed"; then
+          if grep -qE '(^crates/|\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^\.github/actions/setup-zakura-build/|^\.github/workflows/test-crates\.yml$)' <<< "$changed"; then
             echo "crates=true" >> "$GITHUB_OUTPUT"
           else
             echo "crates=false" >> "$GITHUB_OUTPUT"

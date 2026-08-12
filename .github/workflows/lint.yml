@@ -14,8 +14,12 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      # Crates contain compiled assets, protobufs, snapshots, and test vectors
+      # whose changes must run the Rust checks even though they are not `.rs`.
+      - crates/**
       - .cargo/config.toml
       - deny.toml
+      - rust-toolchain.toml
       - .github/workflows/lint.yml
       - qa/supply-chain/**
       - "scripts/**.sh"
@@ -92,7 +96,7 @@ jobs:
             "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
             --jq '.[] | .filename, (.previous_filename // empty)')
 
-          if grep -qE '(\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^deny\.toml$|^\.github/workflows/lint\.yml$|^qa/supply-chain/|^scripts/.*\.sh$|^\.github/workflows/scripts/|^\.github/actions/|^deploy/|^\.github/scripts/)' <<< "$changed"; then
+          if grep -qE '(^crates/|\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^deny\.toml$|^rust-toolchain\.toml$|^\.github/workflows/lint\.yml$|^qa/supply-chain/|^scripts/.*\.sh$|^\.github/workflows/scripts/|^\.github/actions/|^deploy/|^\.github/scripts/)' <<< "$changed"; then
             echo "lint=true" >> "$GITHUB_OUTPUT"
           else
             echo "lint=false" >> "$GITHUB_OUTPUT"

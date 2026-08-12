@@ -540,10 +540,6 @@ criteria = "safe-to-deploy"
 version = "0.2.20"
 criteria = "safe-to-deploy"
 
-[[exemptions.konst_macro_rules]]
-version = "0.2.19"
-criteria = "safe-to-deploy"
-
 [[exemptions.libc]]
 version = "0.2.186"
 criteria = "safe-to-deploy"
@@ -857,10 +853,7 @@ criteria = "safe-to-deploy"
 [[exemptions.r-efi]]
 version = "5.2.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.r-efi]]
-version = "6.0.0"
-criteria = "safe-to-deploy"
+notes = "Audit hold: the UEFI protocol tables expose firmware operations that accept and dereference raw pointers as safe extern function pointers. Safe Rust can therefore invoke them with invalid pointers; version 6.0.0 corrected this by making every firmware callback unsafe. Retain the 5.2.0 exemption until its dependents upgrade."
 
 [[exemptions.rand]]
 version = "0.10.2"
@@ -913,6 +906,7 @@ criteria = "safe-to-deploy"
 [[exemptions.rgb]]
 version = "0.8.53"
 criteria = "safe-to-deploy"
+notes = "Audit hold: the default as-bytes feature explicitly provides unsound Pod implementations for mixed-component RGBA, BGRA, ARGB, ABGR, and GrayAlpha types. repr(C) may insert padding between independently chosen Pod component types, but the Pod contract permits that padding to be read as bytes. Retain the exemption until those implementations are removed or constrained to padding-free layouts."
 
 [[exemptions.ring]]
 version = "0.17.14"
@@ -994,10 +988,6 @@ notes = "Sentry 0.47 upgrade"
 version = "1.2.2"
 criteria = "safe-to-deploy"
 notes = "Audit hold: the optional old_rust feature deliberately uses a pre-1.51 field-pointer projection that the crate documents as technically undefined behavior. Zakura's MSRV does not execute that branch, but retain the version-wide exemption until the legacy UB path is removed or excluded by feature-scoped policy."
-
-[[exemptions.semver]]
-version = "1.0.28"
-criteria = "safe-to-deploy"
 
 [[exemptions.sentry]]
 version = "0.47.0"
@@ -1211,10 +1201,6 @@ notes = "Audit held: the optional emit_and_set feature exposes a safe method tha
 version = "0.2.0"
 criteria = "safe-to-deploy"
 notes = "Audit hold: the Unix initializer installs the SIGCHLD handler before publishing the global STATE pointer, so a signal in that window dereferences null. The handler also treats any nonzero previous sa_sigaction as callable, including the SIG_IGN sentinel. Current wait-timeout 0.2.1 retains this design, but its imported delta audit depends on this legacy baseline, so direct replacement review or upstream remediation is required before removing the exemption."
-
-[[exemptions.wasi]]
-version = "0.11.0+wasi-snapshot-preview1"
-criteria = "safe-to-deploy"
 
 [[exemptions.wasm-bindgen]]
 version = "0.2.126"

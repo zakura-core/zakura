@@ -1055,6 +1055,12 @@ criteria = "safe-to-deploy"
 version = "1.4.2"
 notes = "Reviewed all packaged source, manifest, example, and Windows FFI. The wrapper frees every SHGetKnownFolderPath allocation with CoTaskMemFree, checks the UTF-16 byte-length multiplication, and copies the bounded NUL-terminated result into an owned OsString. No build script, network access, or process execution. The applicable non-Windows documentation test passed."
 
+[[audits.konst_macro_rules]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.19"
+notes = "Reviewed all packaged source and manifest content. The no_std dependency-free macro support validates UTF-8 before unchecked conversion, checks slice lengths before reference casts, initializes every array element before assume-init, and keeps its type-equality proof unforgeable through safe APIs. It has no build script, I/O, or ambient capability. Default and combined stable-feature library targets compiled; the package defines no tests."
+
 [[audits.libc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -1539,6 +1545,12 @@ criteria = "safe-to-deploy"
 version = "0.1.0"
 notes = "Reviewed all packaged source, Pest grammar, and manifest. The crate exposes only bounded input parsing and validation via separately policy-checked Pest dependencies. No unsafe code, build script, I/O, or ambient capabilities. Both unit tests and the doctest passed."
 
+[[audits.r-efi]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "6.0.0"
+notes = "Reviewed all packaged source, manifest, examples, and tests. The no_std crate is a transparent set of repr(C) UEFI types, constants, protocol tables, and raw pointers; every firmware function prototype is unsafe, while safe executable logic is limited to checked Boolean, Status, and GUID conversions. No build script or hidden ambient initialization. All 4 unit tests and 2 active doctests passed, with 2 documentation examples intentionally ignored; the native-feature library target also compiled."
+
 [[audits.radium]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1733,6 +1745,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.8.0"
 notes = "Reviewed all packaged source and manifest. This no_std-compatible wrapper makes secret exposure explicit, redacts Debug output, restricts cloning and serialization with marker traits, and invokes separately policy-checked zeroization on drop. It forbids unsafe code and has no build script, runtime I/O, or ambient capabilities. All-feature library and the single doctest passed, and the no-default-features target passed; the package defines no unit tests."
+
+[[audits.semver]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.28"
+notes = "Reviewed all packaged source, manifest, tests, and benchmark. Identifier input is validated ASCII before compact inline or heap representation; heap layouts track the exact varint header and string length, and requirement parsing reserves vector capacity before raw writes and sets length only after full success. No build script, I/O, or ambient capability. All-feature and no-default-feature suites each passed 34 integration tests and 4 doctests."
 
 [[audits.send_wrapper]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -2372,6 +2390,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "2.5.0"
 notes = "Reviewed all packaged source, manifest, and tests. Traversal is limited to caller-provided roots, caps simultaneously open directory handles, preserves per-entry errors, and detects followed-symlink loops through separately policy-checked file identities. It has no unsafe code, build script, network access, or process execution. All 47 unit and integration tests and 20 doctests passed."
+
+[[audits.wasi]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.11.0+wasi-snapshot-preview1"
+notes = "Reviewed all packaged generated bindings, manifest, and documentation. Closed discriminant wrappers expose only valid constants to safe construction; raw-pointer convenience wrappers are unsafe, and the low-level integer WASI import surface is explicit. The no_std crate has no build script, hidden initialization, or capabilities beyond its declared WASI API. Default and no-default-feature library targets compiled; the package defines no tests."
 
 [[audits.wasm-bindgen-futures]]
 who = "OpenAI Codex <noreply@openai.com>"

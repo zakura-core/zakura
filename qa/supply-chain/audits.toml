@@ -1,6 +1,12 @@
 
 # cargo-vet audits file
 
+[[audits.abscissa_derive]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.7.0"
+notes = "Reviewed all packaged source and manifest. The three procedural derives parse source tokens and generate Command, Component, and Runnable implementations; generated code only uses compile-time package metadata and separately policy-checked dependencies. No unsafe code, build script, runtime I/O, or ambient capabilities. All 4 unit tests passed."
+
 [[audits.anstyle]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -36,6 +42,12 @@ delta = "0.4.0 -> 0.5.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.5.0 -> 0.6.0"
+
+[[audits.btparse]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.0"
+notes = "Reviewed all packaged source, manifest, and tests. The crate has no runtime dependencies or unsafe code and only formats a supplied std Backtrace then parses its documented Debug structure into owned strings and integers. It has no build script, filesystem or network access, process execution, or other ambient capabilities. All 8 unit tests and 1 doctest passed."
 
 [[audits.bytemuck]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -143,6 +155,12 @@ criteria = "safe-to-deploy"
 version = "0.3.0"
 notes = "Reviewed all packaged source and manifest. This facade crate only defines documentation traits, performs bounded static-slice lookup and error-string allocation, and re-exports the separately policy-checked derive and PHF dependencies. No unsafe code, build script, I/O, or ambient capabilities. cargo test --all-features passed."
 
+[[audits.enumflags2_derive]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.7.12"
+notes = "Reviewed all packaged source and manifest. The procedural macro validates unit variants, unsigned integer reprs, and one-bit discriminants before generating the unsafe RawBitFlags implementation; deferred invariants are enforced by generated compile-time assertions and rustc repr checks. No build script, runtime I/O, or ambient capabilities. Unit and doc test targets compiled."
+
 [[audits.foldhash]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -179,6 +197,12 @@ criteria = "safe-to-deploy"
 delta = "0.3.30 -> 0.3.31"
 
 [[audits.futures-sink]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.32"
+notes = "Reviewed all packaged source and manifest. This no_std, dependency-free crate defines Sink and forwarding implementations. Its two unsafe mutable accesses operate on pinned Vec and VecDeque containers without exposing pinned elements or moving a structurally pinned field. No build script, I/O, or ambient capabilities. Unit and doc test targets compiled."
+
+[[audits.futures-sink]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.30 -> 0.3.31"
@@ -202,6 +226,12 @@ delta = "0.18.3 -> 0.19.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.14.5 -> 0.15.0"
+
+[[audits.hex-literal]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.1"
+notes = "Reviewed all packaged source, manifest, and tests. The zero-dependency no_std macro performs bounded const-time hex decoding; malformed literals fail during constant evaluation and no runtime capability is introduced. No unsafe code, build script, allocation, I/O, or ambient capabilities. All 8 integration tests and 4 doctests passed."
 
 [[audits.hostname-validator]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -363,6 +393,12 @@ delta = "0.8.11 -> 1.0.1"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 version = "0.15.0"
+
+[[audits.num-conv]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.2"
+notes = "Reviewed all packaged source and manifest. The zero-dependency no_std crate seals its integer conversion traits, uses compile-time size assertions for every generated conversion, and implements wrapping, saturating, and checked behavior with safe integer operations. No unsafe code, build script, allocation, I/O, or ambient capabilities. All 11 doctests passed."
 
 [[audits.once_cell]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -575,6 +611,12 @@ criteria = "safe-to-deploy"
 version = "0.1.1"
 notes = "Reviewed all packaged source and manifest. This build-time proc macro only folds a syn AST and generates tracing span tokens; it has no unsafe code, build script, I/O, or ambient capabilities. Both unit tests passed and doctests compiled."
 
+[[audits.sync_wrapper]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.2"
+notes = "Reviewed all packaged source and manifest. The unsafe Sync implementation exposes no shared access to the wrapped value; owned movement still requires the wrapped type to be Send. Pin projections map only to structurally retained fields and never move the inner future or stream. No build script, I/O, or ambient capabilities. All 7 doctests passed."
+
 [[audits.tempfile]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -684,6 +726,12 @@ delta = "0.12.1 -> 0.12.3"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.12.1 -> 0.12.3"
+
+[[audits.tonic-prost]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.14.6"
+notes = "Reviewed all packaged source and manifest. This thin codec delegates protobuf encoding and decoding to separately policy-checked prost and tonic dependencies, maps decode failures to gRPC status, and has no unsafe code, build script, direct I/O, or ambient capabilities. Four codec tests passed; the upstream 4 GiB allocation regression test was intentionally skipped to avoid resource exhaustion."
 
 [[audits.tonic-reflection]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -801,6 +849,12 @@ delta = "0.52.5 -> 0.52.6"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.6.13 -> 0.6.18"
+
+[[audits.z32]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.3.0"
+notes = "Reviewed all packaged source and manifest. The zero-dependency z-base-32 encoder and decoder use input-bounded loops. The sole unsafe String::from_utf8_unchecked is sound because every output byte is selected from a fixed ASCII alphabet. No build script, I/O, or ambient capabilities. All 6 unit tests and 2 doctests passed."
 
 [[audits.zakura-chain]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

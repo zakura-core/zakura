@@ -1630,10 +1630,6 @@ criteria = "safe-to-deploy"
 version = "1.2.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.scopeguard]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.secp256k1]]
 version = "0.29.1"
 criteria = "safe-to-deploy"
@@ -1738,10 +1734,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.sha2]]
 version = "0.11.0-pre.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.shlex]]
-version = "2.0.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.signal-hook-registry]]
@@ -2288,10 +2280,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.wmi]]
 version = "0.17.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.writeable]]
-version = "0.6.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.ws_stream_wasm]]

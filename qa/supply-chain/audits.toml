@@ -702,6 +702,12 @@ criteria = "safe-to-deploy"
 version = "1.0.1"
 notes = "Reviewed all packaged source and manifest content, including the unsafe Sync implementation and raw-pointer dereference. They are sound because storage is per-thread, the borrow exists only for the synchronous closure scope, and an RAII guard restores prior state during unwinding. There is no build script, runtime I/O, or ambient authority; five unit tests and three documentation tests passed."
 
+[[audits.scopeguard]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.2.0"
+notes = "Reviewed all packaged source, manifests, tests, and example. ManuallyDrop and ptr::read operations transfer the guarded value and closure exactly once across normal drop, conditional strategies, and into_inner; the unsafe Sync implementation exposes only a shared reference to T and leaves Send enforcement to auto traits. The library has no dependencies, build script, runtime I/O, or ambient capability beyond explicitly querying whether the current thread is panicking for its standard-library strategies. All 8 unit tests and 6 doctests passed with standard support; all 3 applicable unit tests and 5 doctests passed without default features."
+
 [[audits.secrecy]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -791,6 +797,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.5.0 -> 0.4.0@git:ffe4234788fd22662b937ba7c6ea01535fcc1293"
 importable = false
+
+[[audits.shlex]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "2.0.1"
+notes = "Reviewed all packaged source, manifests, tests, and quoting guidance. The string facade accepts valid UTF-8, the byte parser preserves multibyte sequences, and unchecked facade conversion APIs explicitly require that invariant before using unchecked UTF-8 conversions. Quoting is bounded by caller input, rejects NUL by default, and documents that control characters must not be sent to interactive shells or terminal input. The dependency-free library has no build script, runtime I/O, process execution, or ambient capabilities. All 7 unit tests and 1 doctest passed with both default and no-default features."
 
 [[audits.sketches-ddsketch]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1077,6 +1089,12 @@ delta = "0.52.5 -> 0.52.6"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.6.13 -> 0.6.18"
+
+[[audits.writeable]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.6.3"
+notes = "Reviewed all packaged source, manifests, tests, example, and benchmark. The crate formats caller-supplied values into caller-supplied fmt sinks using checked and saturating length hints; its unsafe UTF-8 conversions consume only an ASCII digit buffer or a prefix incrementally proven equal to valid str chunks. It has no build script, runtime I/O, or ambient capabilities, and the optional either dependency remains separately policy-checked. All 15 unit tests, 1 integration test, and 20 doctests passed with all features, and the no-allocation library target compiled. The published example omits its workspace-only instrumentation dependency and therefore prevents an unfiltered cargo test from compiling that example."
 
 [[audits.z32]]
 who = "OpenAI Codex <noreply@openai.com>"

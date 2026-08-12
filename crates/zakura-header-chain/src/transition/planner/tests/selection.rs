@@ -16,16 +16,13 @@ fn committed_transition_reports_a_stale_source_without_panicking() {
     let (store, config) = TestStore::new(EngineMode::HeadersOnly);
     let clock = ManualClock(Utc::now());
     let request = insertion(&store, 1, EvidenceId::from_digest([0xe0; 32]));
-    let durable = || DurableTransitionFacts::HeaderInsertion {
-        validation_contexts: vec![store.lease.clone()],
-        finality_path: Vec::new(),
-    };
+    let input = || fixture_transition_input(&store, request.clone());
     let mut engine = test_engine(&store);
     let first = engine
-        .plan_transition(request.clone(), &context(&config, &clock, None), durable())
+        .plan_transition(input(), &context(&config, &clock, None))
         .expect("the first transition plans from the source snapshot");
     let stale = engine
-        .plan_transition(request, &context(&config, &clock, None), durable())
+        .plan_transition(input(), &context(&config, &clock, None))
         .expect("the second transition plans from the same source snapshot");
 
     engine
@@ -218,12 +215,8 @@ fn committed_transition_applies_to_a_cloned_source_engine() {
     let before = engine.snapshot();
     let transition = engine
         .plan_transition(
-            request,
+            fixture_transition_input(&store, request),
             &context(&config, &clock, None),
-            crate::DurableTransitionFacts::HeaderInsertion {
-                validation_contexts: vec![store.lease.clone()],
-                finality_path: Vec::new(),
-            },
         )
         .expect("the stateful engine plans the insertion");
 

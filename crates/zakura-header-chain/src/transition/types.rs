@@ -804,7 +804,20 @@ pub enum VctRootRepairState {
     },
 }
 
-/// Every chain-changing input accepted by the sole transition planner.
+/// Authenticated evidence that one state-service transition may apply.
+///
+/// The state write path builds a [`TransitionRequest`] around this value. Peers
+/// and consensus never submit it directly: they produce higher-level work that
+/// the adapter authenticates and classifies into one of these variants.
+///
+/// An event records only what happened (header admission, body evidence,
+/// operator action, and so on). It does not carry durable store facts; the
+/// adapter binds those separately into [`crate::TransitionInput`] before the
+/// engine plans. Callers also never submit desired consequences—the planner
+/// derives effects from the event and coherent state.
+///
+/// Domains that are replay-protected hash this payload into
+/// [`TransitionFingerprint`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransitionEvent {
     /// Prepared header admission.
@@ -833,7 +846,12 @@ pub enum TransitionEvent {
     ReevaluateDeferred,
 }
 
-/// Stable domain of one replay-protected transition event.
+/// Stable domain of one submitted transition input.
+///
+/// Replay-protected domains keep their version-one disk discriminants.
+/// [`Self::ReevaluateDeferred`] is submitted without a durable fingerprint and
+/// therefore uses an appended code that is never persisted in
+/// [`TransitionFingerprint`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TransitionDomain {
     /// Prepared header admission.
@@ -864,6 +882,8 @@ pub enum TransitionDomain {
     MigratedPinRefutation,
     /// Auxiliary authentication evidence.
     AuxEvidence,
+    /// Local reevaluation of due future-time deferrals.
+    ReevaluateDeferred,
 }
 
 impl TransitionDomain {
@@ -884,6 +904,8 @@ impl TransitionDomain {
             Self::FullStateFinalized => 11,
             Self::MigratedPinRefutation => 12,
             Self::AuxEvidence => 13,
+            // Appended after the replay-protected set; never persisted in fingerprints.
+            Self::ReevaluateDeferred => 14,
         }
     }
 
@@ -904,6 +926,7 @@ impl TransitionDomain {
             11 => Self::FullStateFinalized,
             12 => Self::MigratedPinRefutation,
             13 => Self::AuxEvidence,
+            14 => Self::ReevaluateDeferred,
             _ => return None,
         })
     }
@@ -1068,6 +1091,33 @@ impl TransitionEvent {
         match self {
             Self::AuxEvidence(event) => Some(event.owner),
             _ => None,
+        }
+    }
+
+    /// Return the submitted event's domain, including non-replayed inputs.
+    pub fn domain(&self) -> TransitionDomain {
+        match self {
+            Self::InsertHeaders(_) => TransitionDomain::InsertHeaders,
+            Self::VerifiedChainChanged(_) => TransitionDomain::VerifiedChainChanged,
+            Self::VerifiedBlockAccepted(_) => TransitionDomain::VerifiedBlockAccepted,
+            Self::BodyEvidence(BodyEvidence::PayloadMismatch(_)) => {
+                TransitionDomain::BodyPayloadMismatch
+            }
+            Self::BodyEvidence(BodyEvidence::ConsensusInvalid(_)) => {
+                TransitionDomain::ConsensusBodyInvalid
+            }
+            Self::BodyEvidence(BodyEvidence::Transient(_)) => {
+                TransitionDomain::TransientBodyFailure
+            }
+            Self::BodyEvidence(BodyEvidence::Verified(_)) => TransitionDomain::VerifiedBody,
+            Self::BodySupplierDiscovered(_) => TransitionDomain::BodySupplierDiscovered,
+            Self::OperatorBodyRetry(_) => TransitionDomain::OperatorBodyRetry,
+            Self::OperatorInvalidate(_) => TransitionDomain::OperatorInvalidate,
+            Self::OperatorReconsider(_) => TransitionDomain::OperatorReconsider,
+            Self::FullStateFinalized(_) => TransitionDomain::FullStateFinalized,
+            Self::MigratedPinRefutation(_) => TransitionDomain::MigratedPinRefutation,
+            Self::AuxEvidence(_) => TransitionDomain::AuxEvidence,
+            Self::ReevaluateDeferred => TransitionDomain::ReevaluateDeferred,
         }
     }
 }
@@ -1363,12 +1413,17 @@ fn hash_aux_authentication(hasher: &mut Sha256, authentication: AuxAuthenticatio
     }
 }
 
-/// Version-qualified request to the sole serialized transition planner.
+/// Version-qualified request assembled by the state write path.
+///
+/// [`Self::event`] is the authenticated evidence; [`Self::expected_version`] is
+/// the caller's observed durable version. The adapter then binds event-specific
+/// store facts into [`crate::TransitionInput`] for the engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransitionRequest {
     /// Exact durable version observed by the caller.
     pub expected_version: StateVersion,
-    /// Typed evidence.
+    /// Authenticated evidence of what happened.
+    ///
     /// Callers never submit desired consequences.
     pub event: TransitionEvent,
 }
@@ -1475,26 +1530,117 @@ pub struct ChangeSet {
     pub metadata: EngineMetadata,
 }
 
-/// High-level cause preserved in a committed receipt.
+/// How ordinary header work related to newer monotone finality.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum TransitionCause {
-    /// One of the externally typed evidence categories.
-    Event,
-    /// Checkpoint body growth advanced integrated finality on the retained selected path.
-    CheckpointFinality,
-    /// Full state authenticated or rejected auxiliary metadata without changing the DAG.
-    AuxAuthentication,
+pub enum HeaderWorkEffect {
     /// The planner admitted ordinary header work after a durable monotone-finality rebase.
-    HeaderWorkRebased,
+    Rebased,
     /// Monotone finality already consumed the complete prepared range.
-    HeaderWorkAlreadyApplied,
-    /// The planner refused admission because protected state filled a limit.
-    /// The planner did not apply the event.
-    ResourceStalled,
+    AlreadyApplied,
+}
+
+/// Finality effects produced while settling one transition.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum FinalityEffect {
+    /// Checkpoint body growth advanced integrated finality on the retained selected path.
+    Checkpoint,
     /// Headers-only depth finality occurred in the same insertion/reselection.
-    HeadersOnlyFinality,
-    /// Startup recovery reconstructed state.
-    Recovery,
+    HeadersOnlyDepth,
+    /// Integrated full-state finality advanced from an explicit finality event.
+    FullState,
+}
+
+/// Auxiliary-delivery effects produced while settling one transition.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AuxiliaryEffect {
+    /// Full state authenticated or rejected auxiliary metadata without changing the DAG.
+    Authentication,
+}
+
+/// Orthogonal effects produced by one planned transition.
+///
+/// The submitted [`TransitionDomain`] identifies the input. This record describes
+/// the resulting admission transformations and side effects, which may coexist.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct TransitionEffect {
+    /// Ordinary header-work rebase or already-applied classification.
+    pub header_work: Option<HeaderWorkEffect>,
+    /// Optional finality advancement produced while settling.
+    pub finality: Option<FinalityEffect>,
+    /// Optional auxiliary authentication/rejection effect.
+    pub auxiliary: Option<AuxiliaryEffect>,
+    /// True when retention limits refused the event and only an alarm may change.
+    pub resource_stalled: bool,
+}
+
+impl TransitionEffect {
+    /// Construct an empty effect record for an ordinary event admission.
+    pub const fn none() -> Self {
+        Self {
+            header_work: None,
+            finality: None,
+            auxiliary: None,
+            resource_stalled: false,
+        }
+    }
+
+    /// Construct an exact adjacent-replay or zero-effect ordinary admission.
+    pub const fn event() -> Self {
+        Self::none()
+    }
+
+    /// Construct an already-applied header-work effect.
+    pub const fn header_work_already_applied() -> Self {
+        Self {
+            header_work: Some(HeaderWorkEffect::AlreadyApplied),
+            finality: None,
+            auxiliary: None,
+            resource_stalled: false,
+        }
+    }
+
+    /// Construct a committed resource-stall refusal.
+    pub const fn resource_stalled() -> Self {
+        Self {
+            header_work: None,
+            finality: None,
+            auxiliary: None,
+            resource_stalled: true,
+        }
+    }
+
+    /// True when retention refused admission.
+    pub const fn is_resource_stalled(self) -> bool {
+        self.resource_stalled
+    }
+
+    /// True when checkpoint finality advanced on the retained selected path.
+    pub const fn is_checkpoint_finality(self) -> bool {
+        matches!(self.finality, Some(FinalityEffect::Checkpoint))
+    }
+
+    /// True when the plan only authenticated or rejected auxiliary deliveries.
+    pub const fn is_aux_authentication(self) -> bool {
+        matches!(self.auxiliary, Some(AuxiliaryEffect::Authentication))
+            && self.header_work.is_none()
+            && self.finality.is_none()
+            && !self.resource_stalled
+    }
+
+    /// True when ordinary header work was rebased onto newer finality.
+    pub const fn is_header_work_rebased(self) -> bool {
+        matches!(self.header_work, Some(HeaderWorkEffect::Rebased))
+    }
+
+    /// True when monotone finality already consumed the prepared range.
+    pub const fn is_header_work_already_applied(self) -> bool {
+        matches!(self.header_work, Some(HeaderWorkEffect::AlreadyApplied))
+    }
+
+    /// True when headers-only depth finality appended in this transition.
+    pub const fn is_headers_only_finality(self) -> bool {
+        matches!(self.finality, Some(FinalityEffect::HeadersOnlyDepth))
+    }
 }
 
 /// Work that the coordinator must retire before scheduling new forward work.

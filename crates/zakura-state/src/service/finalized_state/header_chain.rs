@@ -16,12 +16,12 @@ use zakura_chain::{block, parallel::commitment_aux::BlockCommitmentRoots, parame
 use zakura_header_chain::{
     audit_store, audit_store_for_trust_anchor_update, ApplyResult, AuxDelivery, AuxDelta,
     BodyWorkAuthority, BodyWorkOwner, ChangeSet, CommittedStallReceipt, CounterExhausted,
-    DurableTransitionFacts, EligibilityReason, EngineConfig, EngineMetadata, EngineMode,
-    EngineSnapshot, EvidenceId, FinalityRecord, FinalitySource, Frontier,
-    FullStateEvidenceAuthority, FullStateFinalized, HeaderChainEngine, HeaderLocator, HeaderNode,
-    HeaderSyncWorkOwner, HeaderWorkAuthority, MemHeaderStore, NoChangeReceipt, RecoveryFailure,
+    EligibilityReason, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, EvidenceId,
+    FinalityRecord, FinalitySource, Frontier, FullStateEvidenceAuthority, FullStateFinalized,
+    HeaderChainEngine, HeaderInsertionFacts, HeaderLocator, HeaderNode, HeaderSyncWorkOwner,
+    HeaderValidationFacts, HeaderWorkAuthority, MemHeaderStore, NoChangeReceipt, RecoveryFailure,
     RecoveryPlan, RecoveryRepair, SourceId, StaleReceipt, StateVersion, StoreAuditRead, StoreError,
-    SystemClock, TransitionCause, TransitionContext, TransitionEvent, TransitionFailure,
+    SystemClock, TransitionContext, TransitionEvent, TransitionFailure, TransitionInput,
     TransitionRequest, ValidationContextRecord, ValidationLease, VerifiedChainChanged,
     VerifiedChangeCause, VerifiedHeaderRef,
 };
@@ -1805,7 +1805,7 @@ impl HeaderChainRuntime {
         &self,
         first_request: TransitionRequest,
         first_context: &TransitionContext<'_>,
-        mut checkpoint_request: TransitionRequest,
+        checkpoint_request: TransitionRequest,
         checkpoint_context: &TransitionContext<'_>,
         full_state_batch: DiskWriteBatch,
         memory_swap: M,
@@ -1877,12 +1877,16 @@ impl HeaderChainRuntime {
             retention_references: lease_references.as_ref(),
         };
 
+        let TransitionEvent::AuxEvidence(first_event) = first_request.event else {
+            return Err(HeaderChainStoreError::Incoherent(
+                "combined auxiliary transition has the wrong event kind",
+            ));
+        };
         let first = transition_engine.plan_transition(
-            first_request,
+            TransitionInput::AuxEvidence { event: first_event },
             &first_context,
-            DurableTransitionFacts::None,
         )?;
-        if first.cause() == TransitionCause::ResourceStalled {
+        if first.effect().is_resource_stalled() {
             return Err(HeaderChainStoreError::Incoherent(
                 "checkpoint auxiliary authentication exhausted header resources",
             ));
@@ -1903,14 +1907,22 @@ impl HeaderChainRuntime {
             return Err(error);
         }
 
-        checkpoint_request.expected_version = transition_engine.snapshot().state_version;
+        let expected_version = transition_engine.snapshot().state_version;
+        let TransitionEvent::VerifiedChainChanged(checkpoint_event) = checkpoint_request.event
+        else {
+            return Err(HeaderChainStoreError::Incoherent(
+                "combined checkpoint transition has the wrong event kind",
+            ));
+        };
         let checkpoint = match transition_engine.plan_transition(
-            checkpoint_request,
-            &checkpoint_context,
-            DurableTransitionFacts::HeaderInsertion {
-                validation_contexts: validation_leases.to_vec(),
-                finality_path: Vec::new(),
+            TransitionInput::VerifiedChainChanged {
+                expected_version,
+                event: checkpoint_event,
+                facts: HeaderValidationFacts {
+                    validation_leases: validation_leases.to_vec(),
+                },
             },
+            &checkpoint_context,
         ) {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
@@ -1922,7 +1934,7 @@ impl HeaderChainRuntime {
                 return Err(error);
             }
         };
-        if checkpoint.cause() == TransitionCause::ResourceStalled {
+        if checkpoint.effect().is_resource_stalled() {
             let error = restore_transition_engine_after_staging_error(
                 &self.store,
                 &mut transition_engine,
@@ -1992,6 +2004,118 @@ impl HeaderChainRuntime {
         )
     }
 
+    /// Bind a state-service request to the exact durable facts its event may consume.
+    fn build_transition_input(
+        &self,
+        request: TransitionRequest,
+        before: &EngineSnapshot,
+        network: &Network,
+    ) -> Result<TransitionInput, HeaderChainStoreError> {
+        let expected_version = request.expected_version;
+        Ok(match request.event {
+            TransitionEvent::InsertHeaders(event) => {
+                let anchor_changed = event.owner.header_authority().branch.anchor_hash
+                    != before.frontiers.finalized.hash;
+                let mut validation_leases = Vec::new();
+                if self.store.header_node(event.parent_hash)?.is_some() {
+                    validation_leases
+                        .push(self.store.validation_context(event.parent_hash, network)?);
+                }
+                if anchor_changed && event.parent_hash != before.frontiers.finalized.hash {
+                    validation_leases.push(
+                        self.store
+                            .validation_context(before.frontiers.finalized.hash, network)?,
+                    );
+                }
+                validation_leases.dedup_by_key(|lease| lease.parent());
+                let finality_rebase_history = self.store.finality_rebase_history(
+                    event.owner.header_authority().branch.anchor_hash,
+                    before.frontiers.finalized,
+                    before
+                        .header_generation
+                        .get()
+                        .saturating_sub(event.owner.header_authority().header_generation.get()),
+                )?;
+                TransitionInput::InsertHeaders {
+                    event,
+                    facts: HeaderInsertionFacts {
+                        validation: HeaderValidationFacts { validation_leases },
+                        finality_rebase_history,
+                    },
+                }
+            }
+            TransitionEvent::VerifiedChainChanged(event) => {
+                let parent = match event.cause {
+                    VerifiedChangeCause::Grow | VerifiedChangeCause::CheckpointFinalizedGrow => {
+                        event.old_tip
+                    }
+                    VerifiedChangeCause::Reset => before.frontiers.finalized,
+                };
+                TransitionInput::VerifiedChainChanged {
+                    expected_version,
+                    event,
+                    facts: HeaderValidationFacts {
+                        validation_leases: vec![self
+                            .store
+                            .validation_context(parent.hash, network)?],
+                    },
+                }
+            }
+            TransitionEvent::VerifiedBlockAccepted(event) => {
+                TransitionInput::VerifiedBlockAccepted {
+                    expected_version,
+                    event,
+                    facts: HeaderValidationFacts {
+                        validation_leases: vec![self
+                            .store
+                            .validation_context(before.frontiers.finalized.hash, network)?],
+                    },
+                }
+            }
+            TransitionEvent::BodyEvidence(event) => TransitionInput::BodyEvidence {
+                expected_version,
+                event,
+            },
+            TransitionEvent::BodySupplierDiscovered(event) => {
+                TransitionInput::BodySupplierDiscovered {
+                    expected_version,
+                    event,
+                }
+            }
+            TransitionEvent::OperatorBodyRetry(event) => TransitionInput::OperatorBodyRetry {
+                expected_version,
+                event,
+            },
+            TransitionEvent::OperatorInvalidate(event) => TransitionInput::OperatorInvalidate {
+                expected_version,
+                event,
+            },
+            TransitionEvent::OperatorReconsider(event) => TransitionInput::OperatorReconsider {
+                expected_version,
+                event,
+            },
+            TransitionEvent::FullStateFinalized(event) => TransitionInput::FullStateFinalized {
+                expected_version,
+                event,
+            },
+            TransitionEvent::MigratedPinRefutation(event) => {
+                let preserved_pin = self
+                    .store
+                    .is_migrated_finality_pin(event.pin)?
+                    .then_some(event.pin);
+                TransitionInput::MigratedPinRefutation {
+                    expected_version,
+                    event,
+                    preserved_pin,
+                }
+            }
+            TransitionEvent::AuxEvidence(event) => TransitionInput::AuxEvidence { event },
+            TransitionEvent::ReevaluateDeferred => {
+                TransitionInput::ReevaluateDeferred { expected_version }
+            }
+        })
+    }
+
     fn apply_combined_inner<M>(
         &self,
         request: TransitionRequest,
@@ -2052,75 +2176,11 @@ impl HeaderChainRuntime {
             .map(HeaderSyncWorkOwner::header_authority)
             .map(|authority| authority.branch)
             .or_else(|| request.event.body_owner().map(|owner| owner.branch));
-        let durable = match &request.event {
-            TransitionEvent::InsertHeaders(event) => {
-                let anchor_changed = event.owner.header_authority().branch.anchor_hash
-                    != before.frontiers.finalized.hash;
-                let mut validation_contexts = Vec::new();
-                if self.store.header_node(event.parent_hash)?.is_some() {
-                    validation_contexts.push(
-                        self.store
-                            .validation_context(event.parent_hash, &base_context.config.network)?,
-                    );
-                }
-                if anchor_changed && event.parent_hash != before.frontiers.finalized.hash {
-                    validation_contexts.push(self.store.validation_context(
-                        before.frontiers.finalized.hash,
-                        &base_context.config.network,
-                    )?);
-                }
-                validation_contexts.dedup_by_key(|lease| lease.parent());
-                DurableTransitionFacts::HeaderInsertion {
-                    validation_contexts,
-                    finality_path: self.store.finality_rebase_path(
-                        event.owner.header_authority().branch.anchor_hash,
-                        before.frontiers.finalized,
-                        before
-                            .header_generation
-                            .get()
-                            .saturating_sub(event.owner.header_authority().header_generation.get()),
-                    )?,
-                }
-            }
-            TransitionEvent::VerifiedChainChanged(event) => {
-                let parent = match event.cause {
-                    VerifiedChangeCause::Grow | VerifiedChangeCause::CheckpointFinalizedGrow => {
-                        event.old_tip
-                    }
-                    VerifiedChangeCause::Reset => before.frontiers.finalized,
-                };
-                DurableTransitionFacts::HeaderInsertion {
-                    validation_contexts: vec![self
-                        .store
-                        .validation_context(parent.hash, &base_context.config.network)?],
-                    finality_path: Vec::new(),
-                }
-            }
-            TransitionEvent::VerifiedBlockAccepted(_) => DurableTransitionFacts::HeaderInsertion {
-                validation_contexts: vec![self.store.validation_context(
-                    before.frontiers.finalized.hash,
-                    &base_context.config.network,
-                )?],
-                finality_path: Vec::new(),
-            },
-            TransitionEvent::MigratedPinRefutation(event) => {
-                DurableTransitionFacts::MigratedFinalityPin(
-                    self.store
-                        .is_migrated_finality_pin(event.pin)?
-                        .then_some(event.pin),
-                )
-            }
-            _ => DurableTransitionFacts::None,
-        };
-        let validation_leases = match &durable {
-            DurableTransitionFacts::HeaderInsertion {
-                validation_contexts,
-                ..
-            } => validation_contexts.clone(),
-            DurableTransitionFacts::None | DurableTransitionFacts::MigratedFinalityPin(_) => {
-                Vec::new()
-            }
-        };
+        let input = self.build_transition_input(request, &before, &base_context.config.network)?;
+        let validation_leases = input
+            .header_validation_facts()
+            .map(|facts| facts.validation_leases.clone())
+            .unwrap_or_default();
         let state_authority = StateIssuedAuthority {
             inner: base_context.full_state_authority,
             validation_leases: &validation_leases,
@@ -2131,47 +2191,35 @@ impl HeaderChainRuntime {
             full_state_authority: Some(&state_authority),
             retention_references: base_context.retention_references,
         };
-        let transition =
-            match transition_engine.plan_transition(request, &transition_context, durable) {
-                Ok(plan) => plan,
-                Err(TransitionFailure::Stale { current }) => {
-                    return Ok(ApplyResult::Stale(StaleReceipt {
-                        current_version: current,
-                        branch,
-                    }));
-                }
-                Err(error) => return Err(error.into()),
-            };
-        let transition_cause = transition.cause();
-        let resource_stalled = transition_cause == TransitionCause::ResourceStalled;
+        let transition = match transition_engine.plan_transition(input, &transition_context) {
+            Ok(plan) => plan,
+            Err(TransitionFailure::Stale { current }) => {
+                return Ok(ApplyResult::Stale(StaleReceipt {
+                    current_version: current,
+                    branch,
+                }));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let transition_effect = transition.effect();
+        let resource_stalled = transition_effect.is_resource_stalled();
         let stall_receipt = resource_stalled.then(|| CommittedStallReceipt {
             state_version: transition.change_set().metadata.state_version,
             alarm_changed: transition.before().alarms.resource_stalled
                 != transition.change_set().metadata.alarms.resource_stalled,
             attempted_branch: branch,
         });
-        match transition_cause {
-            TransitionCause::HeaderWorkRebased => {
-                metrics::counter!("state.header.work.rebase.total", "outcome" => "rebased")
-                    .increment(1);
-                metrics::counter!(
-                    "state.header.work.rebase.headers.total",
-                    "outcome" => "rebased"
-                )
-                .increment(
-                    u64::try_from(transition.change_set().put_nodes.len()).unwrap_or(u64::MAX),
-                );
-            }
-            TransitionCause::HeaderWorkAlreadyApplied => {
-                metrics::counter!("state.header.work.rebase.total", "outcome" => "already_applied")
-                    .increment(1);
-            }
-            TransitionCause::Event
-            | TransitionCause::CheckpointFinality
-            | TransitionCause::AuxAuthentication
-            | TransitionCause::ResourceStalled
-            | TransitionCause::HeadersOnlyFinality
-            | TransitionCause::Recovery => {}
+        if transition_effect.is_header_work_rebased() {
+            metrics::counter!("state.header.work.rebase.total", "outcome" => "rebased")
+                .increment(1);
+            metrics::counter!(
+                "state.header.work.rebase.headers.total",
+                "outcome" => "rebased"
+            )
+            .increment(u64::try_from(transition.change_set().put_nodes.len()).unwrap_or(u64::MAX));
+        } else if transition_effect.is_header_work_already_applied() {
+            metrics::counter!("state.header.work.rebase.total", "outcome" => "already_applied")
+                .increment(1);
         }
         if resource_stalled {
             let receipt = stall_receipt.expect("resource-stalled transitions construct a receipt");
@@ -2849,16 +2897,18 @@ impl HeaderChainStore {
             retention_references: &[],
         };
         let engine = load_transition_engine(self)?;
+        let TransitionEvent::VerifiedChainChanged(event) = event else {
+            unreachable!("startup reconciliation constructs VerifiedChainChanged");
+        };
         let transition = engine.plan_transition(
-            TransitionRequest {
+            TransitionInput::VerifiedChainChanged {
                 expected_version: snapshot.state_version,
                 event,
+                facts: HeaderValidationFacts {
+                    validation_leases: vec![validation_context],
+                },
             },
             &context,
-            DurableTransitionFacts::HeaderInsertion {
-                validation_contexts: vec![validation_context],
-                finality_path: Vec::new(),
-            },
         )?;
         if !transition.is_no_change() {
             self.db.write(self.batch_for(transition.change_set())?)?;
@@ -2927,13 +2977,15 @@ impl HeaderChainStore {
             retention_references: &[],
         };
         let engine = load_transition_engine(self)?;
+        let TransitionEvent::FullStateFinalized(event) = event else {
+            unreachable!("startup finalization constructs FullStateFinalized");
+        };
         let transition = engine.plan_transition(
-            TransitionRequest {
+            TransitionInput::FullStateFinalized {
                 expected_version: snapshot.state_version,
                 event,
             },
             &context,
-            DurableTransitionFacts::None,
         )?;
         if !transition.is_no_change() {
             let mut batch = DiskWriteBatch::new();
@@ -3734,7 +3786,7 @@ impl HeaderChainStore {
         Ok(records)
     }
 
-    fn finality_rebase_path(
+    fn finality_rebase_history(
         &self,
         original_anchor: block::Hash,
         current_finalized: Frontier,

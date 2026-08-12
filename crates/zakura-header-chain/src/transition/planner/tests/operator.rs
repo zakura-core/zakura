@@ -20,9 +20,9 @@ fn operator_invalidation_rejects_the_finalized_anchor() {
     .expect_err("invalidating the finalized anchor must fail before any graph edit");
     assert_eq!(
         err,
-        TransitionFailure::InvalidEvidence(
-            "operator invalidation cannot target the finalized anchor"
-        )
+        TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::Operator(
+            OperatorViolation::FinalizedAnchorTarget
+        ))
     );
 }
 
@@ -635,7 +635,7 @@ fn operator_body_retry_rejects_stale_or_malformed_requests() {
     assert!(matches!(
         apply(block::Hash([0x42; 32]), fresh),
         Err(TransitionFailure::InvalidEvidence(
-            "operator body retry has an invalid fresh episode"
+            InvalidTransitionEvidence::Body(BodyViolation::InvalidOperatorRetryEpisode)
         ))
     ));
     assert!(matches!(
@@ -647,7 +647,7 @@ fn operator_body_retry_rejects_stale_or_malformed_requests() {
             }
         ),
         Err(TransitionFailure::InvalidEvidence(
-            "operator body retry has an invalid fresh episode"
+            InvalidTransitionEvidence::Body(BodyViolation::InvalidOperatorRetryEpisode)
         ))
     ));
     store
@@ -669,7 +669,7 @@ fn operator_body_retry_rejects_stale_or_malformed_requests() {
     assert!(matches!(
         non_alarmed,
         Err(TransitionFailure::InvalidEvidence(
-            "operator body retry requires the selected persistent alarm"
+            InvalidTransitionEvidence::Body(BodyViolation::OperatorRetryRequiresPersistentAlarm)
         ))
     ));
 }

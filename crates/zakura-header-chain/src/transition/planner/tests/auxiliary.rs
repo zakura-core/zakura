@@ -49,7 +49,7 @@ fn auxiliary_delivery_ids_are_globally_unique_across_headers() {
     assert!(matches!(
         apply_transition(&store, second, &context(&config, &clock, None)),
         Err(TransitionFailure::InvalidEvidence(
-            "auxiliary delivery replay changes provenance or indexing"
+            InvalidTransitionEvidence::Auxiliary(AuxiliaryViolation::ReplayConflict)
         ))
     ));
 }
@@ -313,7 +313,7 @@ fn selected_auxiliary_repair_adds_only_one_exact_provenance_record() {
             &context(&config, &clock, None)
         ),
         Err(TransitionFailure::InvalidEvidence(
-            "selected auxiliary repair does not have body authority"
+            InvalidTransitionEvidence::Header(HeaderViolation::RepairOwnerRoleMismatch)
         ))
     ));
     let repaired = apply_transition(&store, repair, &context(&config, &clock, None))
@@ -460,7 +460,9 @@ fn auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral() {
             matches!(
                 apply_transition(&store, request, &context(&config, &clock, None)),
                 Err(TransitionFailure::InvalidEvidence(
-                    "auxiliary delivery does not match the admitted target"
+                    InvalidTransitionEvidence::Auxiliary(
+                        AuxiliaryViolation::AdmittedTargetMismatch
+                    )
                 ))
             ),
             "{label}"
@@ -540,7 +542,7 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
             &context(&config, &clock, Some(&Authority)),
         ),
         Err(TransitionFailure::InvalidEvidence(
-            "auxiliary evidence changes delivery provenance"
+            InvalidTransitionEvidence::Auxiliary(AuxiliaryViolation::ProvenanceMismatch)
         ))
     ));
     let wrong_boundary = crate::AuxAuthentication::Authenticated {
@@ -554,7 +556,7 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
             &context(&config, &clock, Some(&Authority)),
         ),
         Err(TransitionFailure::InvalidEvidence(
-            "auxiliary authentication is not the owned one-header-later boundary"
+            InvalidTransitionEvidence::Auxiliary(AuxiliaryViolation::InvalidBoundary)
         ))
     ));
 
@@ -579,7 +581,8 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
         authenticated.change_set.metadata.verified_generation,
         before.verified_generation
     );
-    assert_eq!(authenticated.cause(), TransitionCause::AuxAuthentication);
+    assert!(authenticated.effect().is_aux_authentication());
+    assert_eq!(authenticated.domain(), TransitionDomain::AuxEvidence);
     assert!(
         super::super::super::invariants::is_incremental_aux_authentication(
             &test_engine(&store),
@@ -622,7 +625,8 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
         &context(&config, &clock, Some(&Authority)),
     )
     .expect("two exact metadata deliveries reject in one atomic transition");
-    assert_eq!(rejected.cause(), TransitionCause::AuxAuthentication);
+    assert!(rejected.effect().is_aux_authentication());
+    assert_eq!(rejected.domain(), TransitionDomain::AuxEvidence);
     assert_eq!(
         rejected.change_set.aux_changes,
         vec![

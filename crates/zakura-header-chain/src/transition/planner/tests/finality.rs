@@ -60,14 +60,21 @@ fn apply_with_header_rebase_facts(
     clock: &ManualClock,
     validation: ValidationLease,
 ) -> Result<TransitionPlan, TransitionFailure> {
+    let TransitionEvent::InsertHeaders(event) = request.event else {
+        panic!("rebase fixtures insert headers");
+    };
     test_engine(store)
         .plan_transition(
-            request,
-            &context(config, clock, None),
-            DurableTransitionFacts::HeaderInsertion {
-                validation_contexts: vec![validation],
-                finality_path: store.finality.clone(),
+            TransitionInput::InsertHeaders {
+                event,
+                facts: HeaderInsertionFacts {
+                    validation: HeaderValidationFacts {
+                        validation_leases: vec![validation],
+                    },
+                    finality_rebase_history: store.finality.clone(),
+                },
             },
+            &context(config, clock, None),
         )
         .map(crate::EngineTransition::into_plan)
 }
@@ -197,11 +204,11 @@ fn header_insert_rebases_and_trims_across_each_monotone_finality_position() {
         assert_eq!(plan.change_set.put_nodes.len(), remaining);
         assert_eq!(plan.is_no_change(), remaining == 0);
         assert_eq!(
-            plan.cause(),
+            plan.effect().header_work,
             if remaining == 0 {
-                TransitionCause::HeaderWorkAlreadyApplied
+                Some(HeaderWorkEffect::AlreadyApplied)
             } else {
-                TransitionCause::HeaderWorkRebased
+                Some(HeaderWorkEffect::Rebased)
             }
         );
         assert_eq!(plan.change_set.metadata.frontiers.finalized, verified_tip);
@@ -306,7 +313,7 @@ fn header_insert_rebase_preserves_a_retained_parent_after_new_finality() {
 
     let plan = apply_with_header_rebase_facts(&store, held, &config, &clock, validation)
         .expect("the retained parent preserves all prepared child work");
-    assert_eq!(plan.cause(), TransitionCause::HeaderWorkRebased);
+    assert!(plan.effect().is_header_work_rebased());
     assert_eq!(plan.change_set.put_nodes.len(), 1);
     assert_eq!(plan.change_set.put_nodes[0].parent_hash, parent.hash);
 }
@@ -664,7 +671,8 @@ fn headers_only_finalizes_exactly_tip_minus_one_thousand_before_publication() {
         plan.change_set.finality_append.expect("depth finality is recorded").source,
         FinalitySource::HeadersOnlyDepth { selected_tip } if selected_tip.height == block::Height(1_001)
     ));
-    assert_eq!(plan.cause(), TransitionCause::HeadersOnlyFinality);
+    assert!(plan.effect().is_headers_only_finality());
+    assert_eq!(plan.domain(), TransitionDomain::InsertHeaders);
 }
 
 #[test]
@@ -772,7 +780,8 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
         .expect("checkpoint authority advances verification and finality together");
     assert_eq!(plan.change_set.metadata.frontiers.verified_best, checkpoint);
     assert_eq!(plan.change_set.metadata.frontiers.finalized, checkpoint);
-    assert_eq!(plan.cause(), TransitionCause::CheckpointFinality);
+    assert!(plan.effect().is_checkpoint_finality());
+    assert_eq!(plan.domain(), TransitionDomain::VerifiedChainChanged);
     assert!(
         super::super::super::invariants::is_incremental_checkpoint_finality(
             &test_engine(&store),

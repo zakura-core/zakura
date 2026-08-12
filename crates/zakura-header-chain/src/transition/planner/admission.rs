@@ -4,11 +4,11 @@ use std::collections::{HashMap, HashSet};
 
 use zakura_chain::block;
 
-use super::TransitionFailure;
+use super::{InvalidTransitionEvidence, LimitViolation, TransitionFailure};
 use crate::{
-    BodyWorkOwner, DurableTransitionFacts, EngineLimits, EngineMetadata, EngineMode,
-    EngineSnapshot, EventAdmission, EvidenceId, FinalityRecord, Frontier, HeaderChainEngine,
-    HeaderSyncWorkOwner, MemHeaderStore, TargetCompletion, TransitionContext, TransitionEvent,
+    BodyWorkOwner, EngineLimits, EngineMetadata, EngineMode, EngineSnapshot, EventAdmission,
+    EvidenceId, FinalityRecord, Frontier, HeaderChainEngine, HeaderSyncWorkOwner, MemHeaderStore,
+    TargetCompletion, TransitionContext, TransitionEvent, TransitionInput,
 };
 
 /// Request admitted against its original authority and resource bounds.
@@ -19,8 +19,8 @@ use crate::{
 pub(super) struct AdmittedRequest {
     /// Admitted event ready for canonical rebasing and freshness binding.
     pub(super) event: TransitionEvent,
-    /// Caller-observed durable version.
-    pub(super) expected_version: crate::StateVersion,
+    /// Caller-observed durable version when the input is version-qualified.
+    pub(super) expected_version: Option<crate::StateVersion>,
 }
 
 /// How a pure header insertion related to newer monotone finality.
@@ -37,25 +37,26 @@ pub(super) enum HeaderInsertionRebase {
 /// Authenticate the caller and admit the event before any projection work.
 pub(super) fn authenticate_and_admit(
     engine: &HeaderChainEngine,
-    request: crate::TransitionRequest,
+    input: &TransitionInput,
     context: &TransitionContext<'_>,
 ) -> Result<(EngineSnapshot, EngineMetadata, AdmittedRequest), TransitionFailure> {
     let before = engine.snapshot();
     let metadata = engine.metadata().clone();
     validate_snapshot(&before, &metadata, context)?;
     if context.retention_references.len() > context.config.limits.max_retention_references.get() {
-        return Err(TransitionFailure::InvalidEvidence(
-            "retained-path references exceed the per-transition limit",
-        ));
+        return Err(
+            InvalidTransitionEvidence::Limit(LimitViolation::RetentionReferencesExceeded).into(),
+        );
     }
-    validate_event_resource_bounds(engine, &request.event, context.config.limits)?;
-    validate_authority(&request.event, context)?;
+    let event = input.event();
+    validate_event_resource_bounds(engine, &event, context.config.limits)?;
+    validate_authority(&event, context)?;
     Ok((
         before,
         metadata,
         AdmittedRequest {
-            event: request.event,
-            expected_version: request.expected_version,
+            event,
+            expected_version: input.expected_version(),
         },
     ))
 }
@@ -87,9 +88,9 @@ fn validate_event_resource_bounds(
         return Ok(());
     };
     if insert.batch.headers().len() > limits.max_headers_per_transition.get() {
-        return Err(TransitionFailure::InvalidEvidence(
-            "prepared header batch exceeds the per-transition limit",
-        ));
+        return Err(
+            InvalidTransitionEvidence::Limit(LimitViolation::PreparedHeadersExceeded).into(),
+        );
     }
     if insert.aux.len() > limits.max_aux_deliveries_total.get() {
         return Err(TransitionFailure::AuxiliaryLimitExceeded);
@@ -205,7 +206,7 @@ pub(super) fn rebase_header_insertion(
     event: &mut TransitionEvent,
     current: &EngineSnapshot,
     graph: &MemHeaderStore,
-    durable: &DurableTransitionFacts,
+    input: &TransitionInput,
 ) -> Result<HeaderInsertionRebase, TransitionFailure> {
     let TransitionEvent::InsertHeaders(insert) = event else {
         return Ok(HeaderInsertionRebase::Current);
@@ -240,12 +241,12 @@ pub(super) fn rebase_header_insertion(
             current: current.state_version,
         });
     }
-    let DurableTransitionFacts::HeaderInsertion { finality_path, .. } = durable else {
+    let Some(finality_rebase_history) = input.finality_rebase_history() else {
         return Err(TransitionFailure::Stale {
             current: current.state_version,
         });
     };
-    if finality_path.is_empty() {
+    if finality_rebase_history.is_empty() {
         return Err(TransitionFailure::Stale {
             current: current.state_version,
         });
@@ -253,7 +254,7 @@ pub(super) fn rebase_header_insertion(
     validate_finality_rebase_path(
         original.branch.anchor_hash,
         current.frontiers.finalized,
-        finality_path,
+        finality_rebase_history,
     )?;
 
     let finalized = current.frontiers.finalized;
@@ -287,7 +288,7 @@ pub(super) fn rebase_header_insertion(
                 .last()
                 .map(|header| Frontier::new(header.height, header.hash))
                 .ok_or(TransitionFailure::StalePreparation)?;
-            let prepared_tip_was_finalized = finality_path
+            let prepared_tip_was_finalized = finality_rebase_history
                 .iter()
                 .any(|record| record.previous == prepared_tip || record.current == prepared_tip);
             if prepared_tip_was_finalized && prepared_tip.height <= finalized.height {

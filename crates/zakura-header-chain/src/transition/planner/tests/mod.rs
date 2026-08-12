@@ -19,12 +19,15 @@ use zakura_chain::{
 
 use super::{projected_state::path, TransitionFailure, TransitionPlan};
 use crate::{
-    verify_plan, AlarmSet, BodyEvidence, BodyValidationState, BranchId, CheckpointSet,
-    DurableTransitionFacts, EligibilityReason, EngineConfig, EngineMetadata, EngineMode,
+    verify_plan, AlarmSet, AuxiliaryViolation, BodyEvidence, BodyValidationState, BodyViolation,
+    BranchId, CheckpointSet, EligibilityReason, EngineConfig, EngineMetadata, EngineMode,
     EngineSnapshot, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
     FrontierSet, GraphError, HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration,
-    HeaderValidationState, MemHeaderStore, PreparedHeader, PreparedHeaderBatch, ProjectionDelta,
-    SourceId, StateVersion, TargetCompletion, TransitionCause, TransitionContext, TransitionEvent,
+    HeaderInsertionFacts, HeaderPathKind, HeaderPathProblem, HeaderValidationCheck,
+    HeaderValidationFacts, HeaderValidationState, HeaderViolation, HeaderWorkEffect,
+    InvalidTransitionEvidence, LimitViolation, MemHeaderStore, OperatorViolation, PreparedHeader,
+    PreparedHeaderBatch, ProjectionDelta, SourceId, StateVersion, TargetCompletion,
+    TransitionContext, TransitionDomain, TransitionEffect, TransitionEvent, TransitionInput,
     TransitionRequest, TrustedAnchor, ValidationLease, VerifiedGeneration,
 };
 
@@ -268,6 +271,79 @@ fn test_engine(store: &TestStore) -> crate::HeaderChainEngine {
     .expect("the planner fixture is coherent before transition")
 }
 
+fn fixture_transition_input(store: &TestStore, request: TransitionRequest) -> TransitionInput {
+    let expected_version = request.expected_version;
+    match request.event {
+        TransitionEvent::InsertHeaders(event) => TransitionInput::InsertHeaders {
+            event,
+            facts: HeaderInsertionFacts {
+                validation: HeaderValidationFacts {
+                    validation_leases: vec![store.lease.clone()],
+                },
+                finality_rebase_history: Vec::new(),
+            },
+        },
+        TransitionEvent::VerifiedChainChanged(event) => TransitionInput::VerifiedChainChanged {
+            expected_version,
+            event,
+            facts: HeaderValidationFacts {
+                validation_leases: vec![store.lease.clone()],
+            },
+        },
+        TransitionEvent::VerifiedBlockAccepted(event) => TransitionInput::VerifiedBlockAccepted {
+            expected_version,
+            event,
+            facts: HeaderValidationFacts {
+                validation_leases: vec![store.lease.clone()],
+            },
+        },
+        TransitionEvent::BodyEvidence(event) => TransitionInput::BodyEvidence {
+            expected_version,
+            event,
+        },
+        TransitionEvent::BodySupplierDiscovered(event) => TransitionInput::BodySupplierDiscovered {
+            expected_version,
+            event,
+        },
+        TransitionEvent::OperatorBodyRetry(event) => TransitionInput::OperatorBodyRetry {
+            expected_version,
+            event,
+        },
+        TransitionEvent::OperatorInvalidate(event) => TransitionInput::OperatorInvalidate {
+            expected_version,
+            event,
+        },
+        TransitionEvent::OperatorReconsider(event) => TransitionInput::OperatorReconsider {
+            expected_version,
+            event,
+        },
+        TransitionEvent::FullStateFinalized(event) => TransitionInput::FullStateFinalized {
+            expected_version,
+            event,
+        },
+        TransitionEvent::MigratedPinRefutation(event) => {
+            let preserved_pin = store
+                .finality
+                .iter()
+                .any(|record| {
+                    record.current == event.pin
+                        && matches!(record.source, FinalitySource::MigratedHeadersOnly)
+                })
+                .then_some(event.pin);
+            TransitionInput::MigratedPinRefutation {
+                expected_version,
+                event,
+                preserved_pin,
+            }
+        }
+        TransitionEvent::AuxEvidence(event) => TransitionInput::AuxEvidence { event },
+        TransitionEvent::ReevaluateDeferred => {
+            TransitionInput::ReevaluateDeferred { expected_version }
+        }
+    }
+}
+
+#[allow(clippy::unwrap_in_result)]
 fn apply_transition(
     store: &TestStore,
     request: TransitionRequest,
@@ -280,28 +356,10 @@ fn apply_transition(
         store.verified.clone(),
         store.aux.clone(),
     )
-    .map_err(|_| TransitionFailure::InvalidEvidence("planner fixture engine is incoherent"))?;
-    let durable = match &request.event {
-        TransitionEvent::InsertHeaders(_) => DurableTransitionFacts::HeaderInsertion {
-            validation_contexts: vec![store.lease.clone()],
-            finality_path: Vec::new(),
-        },
-        TransitionEvent::MigratedPinRefutation(event) => {
-            DurableTransitionFacts::MigratedFinalityPin(
-                store
-                    .finality
-                    .iter()
-                    .any(|record| {
-                        record.current == event.pin
-                            && matches!(record.source, FinalitySource::MigratedHeadersOnly)
-                    })
-                    .then_some(event.pin),
-            )
-        }
-        _ => DurableTransitionFacts::None,
-    };
+    .expect("the planner fixture is coherent before transition");
+    let input = fixture_transition_input(store, request);
     let plan = engine
-        .plan_transition(request, context, durable)
+        .plan_transition(input, context)
         .map(crate::EngineTransition::into_plan)?;
     if let Err(error) = crate::verify_plan_production(&engine, &plan) {
         panic!(

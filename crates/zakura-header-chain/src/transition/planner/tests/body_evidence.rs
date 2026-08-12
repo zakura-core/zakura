@@ -108,7 +108,7 @@ fn transient_body_evidence_cannot_regress_a_verified_body() {
         matches!(
             result,
             Err(TransitionFailure::InvalidEvidence(
-                "body retry evidence cannot regress an already verified body"
+                InvalidTransitionEvidence::Body(BodyViolation::RetryConflictsWithVerified)
             ))
         ),
         "unexpected transition result: {result:?}"
@@ -239,7 +239,7 @@ fn body_supplier_discovery_rejects_reset_or_nonexpanding_evidence() {
             next_probe_at: now,
         }),
         Err(TransitionFailure::InvalidEvidence(
-            "body supplier discovery does not add an eligible supplier"
+            InvalidTransitionEvidence::Body(BodyViolation::NoNewSupplier)
         ))
     ));
     assert!(matches!(
@@ -252,7 +252,7 @@ fn body_supplier_discovery_rejects_reset_or_nonexpanding_evidence() {
             next_probe_at: now,
         }),
         Err(TransitionFailure::InvalidEvidence(
-            "body supplier discovery must preserve the persistent retry episode"
+            InvalidTransitionEvidence::Body(BodyViolation::SupplierEpisodeChanged)
         ))
     ));
     assert!(matches!(
@@ -265,7 +265,7 @@ fn body_supplier_discovery_rejects_reset_or_nonexpanding_evidence() {
             next_probe_at: now + chrono::Duration::minutes(1),
         }),
         Err(TransitionFailure::InvalidEvidence(
-            "body supplier discovery must preserve the persistent retry episode"
+            InvalidTransitionEvidence::Body(BodyViolation::SupplierEpisodeChanged)
         ))
     ));
     assert!(matches!(
@@ -278,7 +278,7 @@ fn body_supplier_discovery_rejects_reset_or_nonexpanding_evidence() {
             next_probe_at: now,
         }),
         Err(TransitionFailure::InvalidEvidence(
-            "body supplier discovery does not add an eligible supplier"
+            InvalidTransitionEvidence::Body(BodyViolation::NoNewSupplier)
         ))
     ));
 }

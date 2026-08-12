@@ -1,7 +1,8 @@
 //! Transient body availability and supplier-discovery evidence.
 
+use super::super::{BodyViolation, InvalidTransitionEvidence, TransitionFailure};
 use crate::graph::HeaderGraphView;
-use crate::{BodyValidationState, TransitionFailure};
+use crate::BodyValidationState;
 
 use super::super::projected_state::ProjectedTransitionState;
 use super::ApplyEventContext;
@@ -22,9 +23,7 @@ pub(super) fn apply_transient(
         || event.availability.suppliers == 0
         || event.availability.started_at > event.availability.next_probe_at
     {
-        return Err(TransitionFailure::InvalidEvidence(
-            "body retry evidence has an invalid episode summary",
-        ));
+        return Err(InvalidTransitionEvidence::Body(BodyViolation::InvalidTransientEpisode).into());
     }
     if matches!(
         projected
@@ -33,9 +32,9 @@ pub(super) fn apply_transient(
             .map(|node| &node.body_validation_state),
         Some(BodyValidationState::Verified { .. })
     ) {
-        return Err(TransitionFailure::InvalidEvidence(
-            "body retry evidence cannot regress an already verified body",
-        ));
+        return Err(
+            InvalidTransitionEvidence::Body(BodyViolation::RetryConflictsWithVerified).into(),
+        );
     }
     projected.set_body_validation_state(
         event.hash,
@@ -63,9 +62,10 @@ pub(super) fn apply_supplier_discovery(
             *summary
         }
         _ => {
-            return Err(TransitionFailure::InvalidEvidence(
-                "body supplier discovery requires the selected persistent alarm",
-            ));
+            return Err(InvalidTransitionEvidence::Body(
+                BodyViolation::SupplierRequiresPersistentAlarm,
+            )
+            .into());
         }
     };
     if event.availability.started_at != old.started_at
@@ -75,17 +75,13 @@ pub(super) fn apply_supplier_discovery(
         || event.availability.next_probe_at < event.availability.started_at
         || event.availability.next_probe_at > context.clock.now()
     {
-        return Err(TransitionFailure::InvalidEvidence(
-            "body supplier discovery must preserve the persistent retry episode",
-        ));
+        return Err(InvalidTransitionEvidence::Body(BodyViolation::SupplierEpisodeChanged).into());
     }
     let has_new_supplier = event.availability.suppliers > old.suppliers
         || (event.availability.suppliers == old.suppliers
             && event.availability.supplier_set_digest != old.supplier_set_digest);
     if !has_new_supplier {
-        return Err(TransitionFailure::InvalidEvidence(
-            "body supplier discovery does not add an eligible supplier",
-        ));
+        return Err(InvalidTransitionEvidence::Body(BodyViolation::NoNewSupplier).into());
     }
     projected.set_body_validation_state(
         event.hash,

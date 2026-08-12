@@ -1,7 +1,10 @@
 //! Operator-driven eligibility and body-retry policy.
 
+use super::super::{
+    BodyViolation, InvalidTransitionEvidence, OperatorViolation, TransitionFailure,
+};
 use crate::graph::HeaderGraphView;
-use crate::{BodyValidationState, EligibilityReason, TransitionFailure};
+use crate::{BodyValidationState, EligibilityReason};
 
 use super::super::projected_state::ProjectedTransitionState;
 
@@ -16,17 +19,18 @@ pub(super) fn apply_body_retry(
         || event.availability.alarmed
         || event.availability.started_at != event.availability.next_probe_at
     {
-        return Err(TransitionFailure::InvalidEvidence(
-            "operator body retry has an invalid fresh episode",
-        ));
+        return Err(
+            InvalidTransitionEvidence::Body(BodyViolation::InvalidOperatorRetryEpisode).into(),
+        );
     }
     if !matches!(
         projected.graph().view_header_node(event.hash).map(|node| &node.body_validation_state),
         Some(BodyValidationState::Unavailable(summary)) if summary.alarmed
     ) {
-        return Err(TransitionFailure::InvalidEvidence(
-            "operator body retry requires the selected persistent alarm",
-        ));
+        return Err(InvalidTransitionEvidence::Body(
+            BodyViolation::OperatorRetryRequiresPersistentAlarm,
+        )
+        .into());
     }
     projected.set_body_validation_state(
         event.hash,
@@ -47,14 +51,12 @@ pub(super) fn apply_invalidate(
     hasher.update(event.id.bytes());
     let expected_digest: [u8; 32] = hasher.finalize().into();
     if event.operator_reason_digest != expected_digest {
-        return Err(TransitionFailure::InvalidEvidence(
-            "operator invalidation identity is not bound to its target",
-        ));
+        return Err(InvalidTransitionEvidence::Operator(OperatorViolation::BindingMismatch).into());
     }
     if event.target == projected.graph().view_finalized_frontier().hash {
-        return Err(TransitionFailure::InvalidEvidence(
-            "operator invalidation cannot target the finalized anchor",
-        ));
+        return Err(
+            InvalidTransitionEvidence::Operator(OperatorViolation::FinalizedAnchorTarget).into(),
+        );
     }
     projected.add_operator_invalidation(
         event.target,

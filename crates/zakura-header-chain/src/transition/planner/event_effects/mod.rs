@@ -9,8 +9,8 @@ pub(super) mod header_validation;
 mod operator_policy;
 
 use crate::{
-    BodyEvidence, DurableTransitionFacts, EngineSnapshot, Frontier, HeaderChainEngine,
-    TransitionContext, TransitionEvent, TransitionFailure,
+    BodyEvidence, EngineSnapshot, Frontier, HeaderChainEngine, TransitionContext, TransitionEvent,
+    TransitionFailure, TransitionInput,
 };
 
 use super::projected_state::ProjectedTransitionState;
@@ -18,7 +18,7 @@ use super::projected_state::ProjectedTransitionState;
 /// Read-only inputs shared by every domain event handler.
 pub(in crate::transition::planner) struct ApplyEventContext<'a> {
     pub(super) engine: &'a HeaderChainEngine,
-    pub(super) durable: &'a DurableTransitionFacts,
+    pub(super) input: &'a TransitionInput,
     pub(super) transition: &'a TransitionContext<'a>,
     pub(super) before: &'a EngineSnapshot,
     pub(super) old_selected: &'a [Frontier],
@@ -80,16 +80,16 @@ pub(super) fn apply_event_evidence(
 
 /// Resolve whether durable facts authenticate a migrated-pin refutation.
 pub(super) fn migrated_pin_refuted(
-    durable: &DurableTransitionFacts,
+    input: &TransitionInput,
     event: &TransitionEvent,
 ) -> Result<Option<Frontier>, TransitionFailure> {
     let TransitionEvent::MigratedPinRefutation(event) = event else {
         return Ok(None);
     };
-    match durable {
-        DurableTransitionFacts::MigratedFinalityPin(preserved) => {
-            Ok((*preserved == Some(event.pin)).then_some(event.pin))
-        }
-        _ => Err(crate::StoreError::Unavailable("migrated finality fact was not supplied").into()),
-    }
+    let Some(preserved) = input.preserved_migrated_pin() else {
+        return Err(
+            crate::StoreError::Unavailable("migrated finality fact was not supplied").into(),
+        );
+    };
+    Ok((preserved == Some(event.pin)).then_some(event.pin))
 }

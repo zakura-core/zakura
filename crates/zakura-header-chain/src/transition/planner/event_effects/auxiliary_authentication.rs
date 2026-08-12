@@ -1,7 +1,8 @@
 //! Auxiliary delivery authentication and rejection.
 
+use super::super::{AuxiliaryViolation, InvalidTransitionEvidence, TransitionFailure};
 use crate::graph::HeaderGraphView;
-use crate::{Frontier, TransitionFailure};
+use crate::Frontier;
 
 use super::super::projected_state::ProjectedTransitionState;
 use super::ApplyEventContext;
@@ -14,9 +15,7 @@ pub(super) fn apply(
 ) -> Result<(), TransitionFailure> {
     let engine = event_context.engine;
     if event.deliveries.is_empty() || event.deliveries.len() > 2 {
-        return Err(TransitionFailure::InvalidEvidence(
-            "auxiliary evidence must name one or two exact deliveries",
-        ));
+        return Err(InvalidTransitionEvidence::Auxiliary(AuxiliaryViolation::DeliveryCount).into());
     }
 
     for (index, event_delivery) in event.deliveries.iter().enumerate() {
@@ -24,15 +23,16 @@ pub(super) fn apply(
             prior.header_hash == event_delivery.header_hash
                 && prior.delivery_id == event_delivery.delivery_id
         }) {
-            return Err(TransitionFailure::InvalidEvidence(
-                "auxiliary evidence names the same delivery more than once",
-            ));
+            return Err(InvalidTransitionEvidence::Auxiliary(
+                AuxiliaryViolation::DuplicateDelivery,
+            )
+            .into());
         }
         let header = projected
             .graph()
             .view_header_node(event_delivery.header_hash)
             .ok_or(TransitionFailure::InvalidEvidence(
-                "auxiliary evidence references an unknown header",
+                InvalidTransitionEvidence::Auxiliary(AuxiliaryViolation::UnknownHeader),
             ))?;
         let header_frontier = Frontier::new(header.height, header.hash);
         if projected
@@ -40,9 +40,10 @@ pub(super) fn apply(
             .view_header_ancestor(event.owner.branch.target_tip_hash, header.height)?
             != Some(header_frontier)
         {
-            return Err(TransitionFailure::InvalidEvidence(
-                "auxiliary evidence is outside its owned branch",
-            ));
+            return Err(InvalidTransitionEvidence::Auxiliary(
+                AuxiliaryViolation::OutsideOwnedBranch,
+            )
+            .into());
         }
         let existing = engine
             .aux_deliveries(event_delivery.header_hash)
@@ -50,30 +51,32 @@ pub(super) fn apply(
             .copied()
             .find(|delivery| delivery.delivery_id == event_delivery.delivery_id)
             .ok_or(TransitionFailure::InvalidEvidence(
-                "auxiliary evidence references an unknown delivery",
+                InvalidTransitionEvidence::Auxiliary(AuxiliaryViolation::UnknownDelivery),
             ))?;
         if existing != *event_delivery || !header.aux_delivery_ids.contains(&existing.delivery_id) {
-            return Err(TransitionFailure::InvalidEvidence(
-                "auxiliary evidence changes delivery provenance",
-            ));
+            return Err(InvalidTransitionEvidence::Auxiliary(
+                AuxiliaryViolation::ProvenanceMismatch,
+            )
+            .into());
         }
         if existing.authentication == event.authentication {
             continue;
         }
         if existing.authentication != crate::AuxAuthentication::Unauthenticated {
-            return Err(TransitionFailure::InvalidEvidence(
-                "an authenticated or rejected auxiliary delivery is immutable",
-            ));
+            return Err(InvalidTransitionEvidence::Auxiliary(
+                AuxiliaryViolation::ImmutableAuthentication,
+            )
+            .into());
         }
         if let crate::AuxAuthentication::Authenticated { boundary_hash, .. } = event.authentication
         {
             let boundary = projected.graph().view_header_node(boundary_hash).ok_or(
-                TransitionFailure::InvalidEvidence("auxiliary authentication boundary is unknown"),
+                TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::Auxiliary(
+                    AuxiliaryViolation::UnknownBoundary,
+                )),
             )?;
             let expected_height = header.height.next().map_err(|_| {
-                TransitionFailure::InvalidEvidence(
-                    "auxiliary authentication boundary height overflowed",
-                )
+                InvalidTransitionEvidence::Auxiliary(AuxiliaryViolation::BoundaryHeightOverflow)
             })?;
             let boundary_frontier = Frontier::new(boundary.height, boundary.hash);
             if boundary.height != expected_height
@@ -83,23 +86,26 @@ pub(super) fn apply(
                     .view_header_ancestor(event.owner.branch.target_tip_hash, boundary.height)?
                     != Some(boundary_frontier)
             {
-                return Err(TransitionFailure::InvalidEvidence(
-                    "auxiliary authentication is not the owned one-header-later boundary",
-                ));
+                return Err(InvalidTransitionEvidence::Auxiliary(
+                    AuxiliaryViolation::InvalidBoundary,
+                )
+                .into());
             }
         } else if event.authentication == crate::AuxAuthentication::Unauthenticated {
-            return Err(TransitionFailure::InvalidEvidence(
-                "auxiliary evidence cannot remove authentication",
-            ));
+            return Err(InvalidTransitionEvidence::Auxiliary(
+                AuxiliaryViolation::AuthenticationRemoval,
+            )
+            .into());
         }
         let mut delivery = existing;
         delivery.authentication = event.authentication;
         projected.update_aux_delivery(delivery);
     }
     if event.authentication == crate::AuxAuthentication::Unauthenticated {
-        return Err(TransitionFailure::InvalidEvidence(
-            "auxiliary evidence cannot remove authentication",
-        ));
+        return Err(InvalidTransitionEvidence::Auxiliary(
+            AuxiliaryViolation::AuthenticationRemoval,
+        )
+        .into());
     }
     Ok(())
 }

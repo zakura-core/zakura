@@ -19,17 +19,18 @@ use zakura_chain::{
 use crate::{
     AlarmSet, AuxDelivery, AuxDelta, BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch,
     BodyRuleId, BodyUnavailableSummary, BodyValidationState, BranchId, ChainScore, CheckpointSet,
-    Clock, ConsensusBodyInvalid, DurableTransitionFacts, EngineConfig, EngineMetadata, EngineMode,
-    EngineSnapshot, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
-    FrontierSet, FullStateEvidenceAuthority, FullStateFinalized, GraphError, HeaderBatchInput,
+    Clock, ConsensusBodyInvalid, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot,
+    EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
+    FullStateEvidenceAuthority, FullStateFinalized, GraphError, HeaderBatchInput,
     HeaderChainDiskVersion, HeaderChainEngine, HeaderContextFact, HeaderFailure, HeaderGeneration,
-    HeaderRule, HeaderRules, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner,
-    InsertHeaders, MemHeaderStore, OperatorInvalidate, OperatorInvalidationId, OperatorReconsider,
-    PreparedHeader, PreparedHeaderBatch, ProjectionDelta, SourceId, StateVersion, SuffixWork,
-    TargetCompletion, TransientBodyFailure, TransientBodyFailureKind, TransitionContext,
-    TransitionFailure, TransitionPlan, TransitionRequest, TrustedAnchor, ValidationLease,
-    VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration,
-    VerifiedHeaderRef, MAX_CANDIDATE_TIPS_V1,
+    HeaderInsertionFacts, HeaderRule, HeaderRules, HeaderValidationFacts, HeaderValidationState,
+    HeaderWorkAuthority, HeaderWorkOwner, InsertHeaders, MemHeaderStore, OperatorInvalidate,
+    OperatorInvalidationId, OperatorReconsider, PreparedHeader, PreparedHeaderBatch,
+    ProjectionDelta, SourceId, StateVersion, SuffixWork, TargetCompletion, TransientBodyFailure,
+    TransientBodyFailureKind, TransitionContext, TransitionFailure, TransitionInput,
+    TransitionPlan, TransitionRequest, TrustedAnchor, ValidationLease, VerifiedBodyEvidence,
+    VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef,
+    MAX_CANDIDATE_TIPS_V1,
 };
 
 /// Deterministic summary of one bounded structured-operation replay.
@@ -400,6 +401,93 @@ impl FuzzStore {
     }
 }
 
+fn fuzz_transition_input(store: &FuzzStore, request: TransitionRequest) -> TransitionInput {
+    let expected_version = request.expected_version;
+    match request.event {
+        crate::TransitionEvent::InsertHeaders(event) => {
+            let parent = store
+                .graph
+                .header_node(event.parent_hash)
+                .expect("an insertion fixture names a retained parent");
+            TransitionInput::InsertHeaders {
+                event,
+                facts: HeaderInsertionFacts {
+                    validation: HeaderValidationFacts {
+                        validation_leases: vec![
+                            store.lease(Frontier::new(parent.height, parent.hash))
+                        ],
+                    },
+                    finality_rebase_history: Vec::new(),
+                },
+            }
+        }
+        crate::TransitionEvent::VerifiedChainChanged(event) => {
+            TransitionInput::VerifiedChainChanged {
+                expected_version,
+                event,
+                facts: HeaderValidationFacts {
+                    validation_leases: Vec::new(),
+                },
+            }
+        }
+        crate::TransitionEvent::VerifiedBlockAccepted(event) => {
+            TransitionInput::VerifiedBlockAccepted {
+                expected_version,
+                event,
+                facts: HeaderValidationFacts {
+                    validation_leases: Vec::new(),
+                },
+            }
+        }
+        crate::TransitionEvent::BodyEvidence(event) => TransitionInput::BodyEvidence {
+            expected_version,
+            event,
+        },
+        crate::TransitionEvent::BodySupplierDiscovered(event) => {
+            TransitionInput::BodySupplierDiscovered {
+                expected_version,
+                event,
+            }
+        }
+        crate::TransitionEvent::OperatorBodyRetry(event) => TransitionInput::OperatorBodyRetry {
+            expected_version,
+            event,
+        },
+        crate::TransitionEvent::OperatorInvalidate(event) => TransitionInput::OperatorInvalidate {
+            expected_version,
+            event,
+        },
+        crate::TransitionEvent::OperatorReconsider(event) => TransitionInput::OperatorReconsider {
+            expected_version,
+            event,
+        },
+        crate::TransitionEvent::FullStateFinalized(event) => TransitionInput::FullStateFinalized {
+            expected_version,
+            event,
+        },
+        crate::TransitionEvent::MigratedPinRefutation(event) => {
+            let preserved_pin = store
+                .finality
+                .iter()
+                .any(|record| {
+                    record.current == event.pin
+                        && matches!(record.source, FinalitySource::MigratedHeadersOnly)
+                })
+                .then_some(event.pin);
+            TransitionInput::MigratedPinRefutation {
+                expected_version,
+                event,
+                preserved_pin,
+            }
+        }
+        crate::TransitionEvent::AuxEvidence(event) => TransitionInput::AuxEvidence { event },
+        crate::TransitionEvent::ReevaluateDeferred => {
+            TransitionInput::ReevaluateDeferred { expected_version }
+        }
+    }
+}
+
+#[allow(clippy::unwrap_in_result)]
 fn apply_transition(
     store: &FuzzStore,
     request: TransitionRequest,
@@ -412,34 +500,9 @@ fn apply_transition(
         store.verified.clone(),
         store.aux.clone(),
     )
-    .map_err(|_| TransitionFailure::InvalidEvidence("fuzz fixture engine is incoherent"))?;
-    let durable = match &request.event {
-        crate::TransitionEvent::InsertHeaders(event) => {
-            let parent = store
-                .graph
-                .header_node(event.parent_hash)
-                .expect("an insertion fixture names a retained parent");
-            DurableTransitionFacts::HeaderInsertion {
-                validation_contexts: vec![store.lease(Frontier::new(parent.height, parent.hash))],
-                finality_path: Vec::new(),
-            }
-        }
-        crate::TransitionEvent::MigratedPinRefutation(event) => {
-            DurableTransitionFacts::MigratedFinalityPin(
-                store
-                    .finality
-                    .iter()
-                    .any(|record| {
-                        record.current == event.pin
-                            && matches!(record.source, FinalitySource::MigratedHeadersOnly)
-                    })
-                    .then_some(event.pin),
-            )
-        }
-        _ => DurableTransitionFacts::None,
-    };
+    .expect("the fuzz fixture engine is coherent");
     engine
-        .plan_transition(request, context, durable)
+        .plan_transition(fuzz_transition_input(store, request), context)
         .map(crate::EngineTransition::into_plan)
 }
 

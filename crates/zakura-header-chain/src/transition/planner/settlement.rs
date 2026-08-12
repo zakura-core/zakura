@@ -2,11 +2,15 @@
 
 use std::borrow::Cow;
 
+use super::{
+    FinalityViolation, InvalidTransitionEvidence, PlannerCoherenceViolation, TransitionFailure,
+};
 use crate::graph::HeaderGraphView;
 use crate::retention::RetentionPlan;
 use crate::{
-    EngineMetadata, EngineMode, EngineSnapshot, FinalityRecord, FinalitySource, Frontier,
-    HeaderChainEngine, TransitionCause, TransitionContext, TransitionEvent, TransitionFailure,
+    AuxiliaryEffect, EngineMetadata, EngineMode, EngineSnapshot, FinalityEffect, FinalityRecord,
+    FinalitySource, Frontier, HeaderChainEngine, HeaderWorkEffect, TransitionContext,
+    TransitionEffect, TransitionEvent,
 };
 
 use super::admission::HeaderInsertionRebase;
@@ -34,8 +38,8 @@ pub(super) struct SettledTransition<'a> {
     pub(super) finality_append: Option<FinalityRecord>,
     /// Retention outcome.
     pub(super) retention: RetentionPlan,
-    /// Classified transition cause.
-    pub(super) cause: TransitionCause,
+    /// Orthogonal transition effects.
+    pub(super) effect: TransitionEffect,
     /// Updated metadata carrying work-origin and alarm side effects.
     pub(super) metadata: EngineMetadata,
 }
@@ -89,12 +93,13 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     let mut finality = None;
     if let Some((new_finalized, evidence)) = full_state_finalized {
         if new_finalized.height < before.frontiers.finalized.height {
-            return Err(TransitionFailure::InvalidEvidence("finality retreated"));
+            return Err(InvalidTransitionEvidence::Finality(FinalityViolation::Retreated).into());
         }
         if !projected.verified().contains(&new_finalized) {
-            return Err(TransitionFailure::InvalidEvidence(
-                "integrated finality is not on the verified projection",
-            ));
+            return Err(InvalidTransitionEvidence::Finality(
+                FinalityViolation::OutsideVerifiedProjection,
+            )
+            .into());
         }
         finality = Some((new_finalized, FinalitySource::FullState { evidence }));
     } else if context.config.mode == EngineMode::HeadersOnly {
@@ -110,7 +115,9 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
                 .graph()
                 .view_header_ancestor(header_best.hash, height)?
                 .ok_or(TransitionFailure::InvalidEvidence(
-                    "selected ancestry is incomplete",
+                    InvalidTransitionEvidence::Planner(
+                        PlannerCoherenceViolation::IncompleteSelectedAncestry,
+                    ),
                 ))?;
             finality = Some((
                 new_finalized,
@@ -121,19 +128,21 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         }
     }
 
-    let mut cause = if work_rebased || header_rebase == HeaderInsertionRebase::Rebased {
-        TransitionCause::HeaderWorkRebased
-    } else if matches!(
+    let mut effect = TransitionEffect::none();
+    if work_rebased || header_rebase == HeaderInsertionRebase::Rebased {
+        effect.header_work = Some(HeaderWorkEffect::Rebased);
+    }
+    if matches!(
         event,
         TransitionEvent::VerifiedChainChanged(ref event)
             if event.cause == crate::VerifiedChangeCause::CheckpointFinalizedGrow
     ) {
-        TransitionCause::CheckpointFinality
+        effect.finality = Some(FinalityEffect::Checkpoint);
     } else if matches!(event, TransitionEvent::AuxEvidence(_)) {
-        TransitionCause::AuxAuthentication
-    } else {
-        TransitionCause::Event
-    };
+        effect.auxiliary = Some(AuxiliaryEffect::Authentication);
+    } else if matches!(event, TransitionEvent::FullStateFinalized(_)) {
+        // Finality effect is set when a record is actually appended below.
+    }
 
     let mut finality_append = None;
     if let Some((new_finalized, source)) = finality {
@@ -148,8 +157,16 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
                 epoch,
             });
             header_best = projected.graph().view_select_best_header_chain()?.0;
-            if matches!(source, FinalitySource::HeadersOnlyDepth { .. }) {
-                cause = TransitionCause::HeadersOnlyFinality;
+            match source {
+                FinalitySource::HeadersOnlyDepth { .. } => {
+                    effect.finality = Some(FinalityEffect::HeadersOnlyDepth);
+                }
+                FinalitySource::FullState { .. } => {
+                    if effect.finality.is_none() {
+                        effect.finality = Some(FinalityEffect::FullState);
+                    }
+                }
+                FinalitySource::MigratedHeadersOnly => {}
             }
         }
     }
@@ -168,7 +185,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     }
 
     header_best = projected.graph().view_select_best_header_chain()?.0;
-    let selected = if cause == TransitionCause::CheckpointFinality
+    let selected = if effect.is_checkpoint_finality()
         && header_best == before.frontiers.header_best
         && finality_append.is_some_and(|record| {
             old_selected
@@ -177,15 +194,16 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
                 .is_some_and(|index| old_selected[index] == record.current)
         }) {
         let Some(record) = finality_append else {
-            return Err(TransitionFailure::InvalidEvidence(
-                "checkpoint finality has no finality record",
-            ));
+            return Err(InvalidTransitionEvidence::Planner(
+                PlannerCoherenceViolation::MissingCheckpointRecord,
+            )
+            .into());
         };
         let index = old_selected
             .binary_search_by_key(&record.current.height, |frontier| frontier.height)
             .map_err(|_| {
-                TransitionFailure::InvalidEvidence(
-                    "checkpoint finality left the selected projection",
+                InvalidTransitionEvidence::Planner(
+                    PlannerCoherenceViolation::CheckpointOutsideSelection,
                 )
             })?;
         Cow::Borrowed(&old_selected[index..])
@@ -200,7 +218,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
             selected,
             finality_append,
             retention,
-            cause,
+            effect,
             metadata,
         },
     )))

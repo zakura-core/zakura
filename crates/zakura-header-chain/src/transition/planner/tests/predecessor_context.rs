@@ -2,7 +2,7 @@
 
 use super::super::event_effects::header_validation::retained_header_context;
 use super::*;
-use crate::{DurableTransitionFacts, FullStateEvidenceAuthority, StoreError};
+use crate::{FullStateEvidenceAuthority, HeaderValidationFacts, StoreError};
 
 struct NoLeaseAuthority;
 impl FullStateEvidenceAuthority for NoLeaseAuthority {
@@ -90,9 +90,8 @@ fn retained_header_context_uses_exact_span_and_newest_to_oldest_order() {
             .expect("fixture height fits")
             .saturating_add(1)
             .min(crate::POW_ADJUSTMENT_BLOCK_SPAN);
-        let reconstructed =
-            retained_header_context(&store.graph, parent, &DurableTransitionFacts::None, &ctx)
-                .expect("fully retained context succeeds without durable facts");
+        let reconstructed = retained_header_context(&store.graph, parent, None, &ctx)
+            .expect("fully retained context succeeds without durable facts");
         assert_eq!(reconstructed.len(), expected_len, "height {height}");
 
         let expected: Vec<_> = header_path(&store, parent)
@@ -154,31 +153,29 @@ fn retained_header_context_splices_authorized_leases_and_rejects_bad_facts() {
     let cases = [
         (
             "authorized coherent lease",
-            DurableTransitionFacts::HeaderInsertion {
-                validation_contexts: vec![matching_lease.clone()],
-                finality_path: Vec::new(),
-            },
+            Some(HeaderValidationFacts {
+                validation_leases: vec![matching_lease.clone()],
+            }),
             Ok(expected.clone()),
         ),
         (
             "unrelated lease then matching lease",
-            DurableTransitionFacts::HeaderInsertion {
-                validation_contexts: vec![genesis_lease, matching_lease.clone()],
-                finality_path: Vec::new(),
-            },
+            Some(HeaderValidationFacts {
+                validation_leases: vec![genesis_lease, matching_lease.clone()],
+            }),
             Ok(expected.clone()),
         ),
         (
             "missing durable facts",
-            DurableTransitionFacts::None,
+            None,
             Err(TransitionFailure::Store(StoreError::Unavailable(
                 "retained predecessor context is incomplete",
             ))),
         ),
         (
             "no matching lease",
-            DurableTransitionFacts::HeaderInsertion {
-                validation_contexts: vec![lease_for_path(
+            Some(HeaderValidationFacts {
+                validation_leases: vec![lease_for_path(
                     &store,
                     frontiers[20],
                     &[(
@@ -191,47 +188,43 @@ fn retained_header_context_splices_authorized_leases_and_rejects_bad_facts() {
                             .clone(),
                     )],
                 )],
-                finality_path: Vec::new(),
-            },
+            }),
             Err(TransitionFailure::Store(StoreError::Unavailable(
                 "durable predecessor context is incoherent",
             ))),
         ),
         (
             "wrong trust digest",
-            DurableTransitionFacts::HeaderInsertion {
-                validation_contexts: vec![wrong_digest],
-                finality_path: Vec::new(),
-            },
+            Some(HeaderValidationFacts {
+                validation_leases: vec![wrong_digest],
+            }),
             Err(TransitionFailure::Store(StoreError::Unavailable(
                 "durable predecessor context is incoherent",
             ))),
         ),
         (
             "insufficient lease span",
-            DurableTransitionFacts::HeaderInsertion {
-                validation_contexts: vec![short_lease],
-                finality_path: Vec::new(),
-            },
+            Some(HeaderValidationFacts {
+                validation_leases: vec![short_lease],
+            }),
             Err(TransitionFailure::Store(StoreError::Unavailable(
                 "durable predecessor context is incoherent",
             ))),
         ),
         (
             "empty header-insertion leases",
-            DurableTransitionFacts::HeaderInsertion {
-                validation_contexts: Vec::new(),
-                finality_path: Vec::new(),
-            },
+            Some(HeaderValidationFacts {
+                validation_leases: Vec::new(),
+            }),
             Err(TransitionFailure::Store(StoreError::Unavailable(
                 "durable predecessor context is incoherent",
             ))),
         ),
     ];
 
-    for (label, durable, expected_result) in cases {
+    for (label, facts, expected_result) in cases {
         assert_eq!(
-            retained_header_context(&store.graph, parent, &durable, &ctx),
+            retained_header_context(&store.graph, parent, facts.as_ref(), &ctx),
             expected_result,
             "{label}"
         );
@@ -248,10 +241,9 @@ fn retained_header_context_splices_authorized_leases_and_rejects_bad_facts() {
         retained_header_context(
             &store.graph,
             parent,
-            &DurableTransitionFacts::HeaderInsertion {
-                validation_contexts: vec![matching_lease],
-                finality_path: Vec::new(),
-            },
+            Some(&HeaderValidationFacts {
+                validation_leases: vec![matching_lease],
+            }),
             &unauthorized_ctx,
         ),
         Err(TransitionFailure::Store(StoreError::Unavailable(

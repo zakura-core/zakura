@@ -73,18 +73,18 @@ fn finality_rebase_reads_only_the_generation_bounded_recent_suffix() {
 
     assert_eq!(
         store
-            .finality_rebase_path(third.hash, fourth, 1)
+            .finality_rebase_history(third.hash, fourth, 1)
             .expect("one recent epoch is sufficient"),
         vec![record_four]
     );
     assert_eq!(
         store
-            .finality_rebase_path(second.hash, fourth, 2)
+            .finality_rebase_history(second.hash, fourth, 2)
             .expect("two recent epochs are sufficient"),
         vec![record_three, record_four]
     );
     assert!(store
-        .finality_rebase_path(anchor_frontier.hash, fourth, 2)
+        .finality_rebase_history(anchor_frontier.hash, fourth, 2)
         .expect("an insufficient generation bound is a stale path")
         .is_empty());
 }

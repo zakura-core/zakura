@@ -2,6 +2,7 @@
 
 mod admission;
 mod event_effects;
+mod evidence;
 mod projected_state;
 mod settlement;
 mod write_set;
@@ -15,9 +16,15 @@ use thiserror::Error;
 
 use crate::graph::GraphDelta;
 use crate::{
-    ChangeSet, CounterExhausted, DurableTransitionFacts, EngineLimits, EngineSnapshot, Frontier,
-    GraphError, HeaderChainEngine, StoreError, TransitionCause, TransitionContext,
-    TransitionRequest,
+    ChangeSet, CounterExhausted, EngineLimits, EngineSnapshot, Frontier, GraphError,
+    HeaderChainEngine, StoreError, TransitionContext, TransitionDomain, TransitionEffect,
+    TransitionInput,
+};
+
+pub use evidence::{
+    AuxiliaryViolation, BodyViolation, FinalityViolation, HeaderPathKind, HeaderPathProblem,
+    HeaderValidationCheck, HeaderValidationSource, HeaderViolation, InvalidTransitionEvidence,
+    LimitViolation, OperatorViolation, PlannerCoherenceViolation, ProjectionKind,
 };
 
 use admission::{
@@ -38,7 +45,8 @@ pub(crate) struct PlanCandidate {
     pub(super) before: EngineSnapshot,
     pub(super) change_set: ChangeSet,
     pub(super) graph_delta: GraphDelta,
-    pub(super) cause: TransitionCause,
+    pub(super) domain: TransitionDomain,
+    pub(super) effect: TransitionEffect,
     pub(super) trust_pins: Arc<[Frontier]>,
     pub(super) limits: EngineLimits,
 }
@@ -49,9 +57,9 @@ impl PlanCandidate {
         &self.graph_delta
     }
 
-    /// Return the candidate's classified transition cause.
-    pub(super) const fn cause(&self) -> TransitionCause {
-        self.cause
+    /// Return the orthogonal transition effects.
+    pub(super) const fn effect(&self) -> TransitionEffect {
+        self.effect
     }
 }
 
@@ -84,9 +92,14 @@ impl TransitionPlan {
         &self.candidate.before
     }
 
-    /// Return the classified transition cause.
-    pub const fn cause(&self) -> TransitionCause {
-        self.candidate.cause
+    /// Return the submitted transition domain.
+    pub const fn domain(&self) -> TransitionDomain {
+        self.candidate.domain
+    }
+
+    /// Return the orthogonal transition effects.
+    pub const fn effect(&self) -> TransitionEffect {
+        self.candidate.effect
     }
 
     /// Return true when the evidence was valid but changed no durable fact.
@@ -150,12 +163,12 @@ pub enum TransitionFailure {
     #[error("transition replay key conflicts with the previously committed payload")]
     ConflictingReplay,
     /// Event fields contradict canonical headers or durable ancestry.
-    #[error("invalid transition evidence: {0}")]
-    InvalidEvidence(&'static str),
+    #[error(transparent)]
+    InvalidEvidence(#[from] InvalidTransitionEvidence),
     /// Auxiliary delivery bounds refused this event before any durable mutation.
     ///
-    /// Unlike [`TransitionCause::ResourceStalled`], this is a zero-effect planner
-    /// failure: it does not raise the durable resource-stall alarm or produce a
+    /// Unlike a [`TransitionEffect`] with `resource_stalled`, this is a zero-effect
+    /// planner failure: it does not raise the durable resource-stall alarm or produce a
     /// [`crate::CommittedStallReceipt`].
     #[error("header admission refused because auxiliary delivery limits are exceeded")]
     AuxiliaryLimitExceeded,
@@ -167,11 +180,10 @@ pub enum TransitionFailure {
 /// Derive one atomic transition without mutating the coherent engine.
 pub(super) fn derive_transition_plan(
     engine: &HeaderChainEngine,
-    durable: &DurableTransitionFacts,
-    request: TransitionRequest,
+    input: TransitionInput,
     context: &TransitionContext<'_>,
 ) -> Result<TransitionPlan, TransitionFailure> {
-    let candidate = derive_plan_candidate(engine, durable, request, context)?;
+    let candidate = derive_plan_candidate(engine, input, context)?;
     // Phase 6: verify invariants
     verify_invariants(engine, &candidate)?;
     Ok(TransitionPlan::from_verified(candidate))
@@ -179,29 +191,37 @@ pub(super) fn derive_transition_plan(
 
 fn derive_plan_candidate(
     engine: &HeaderChainEngine,
-    durable: &DurableTransitionFacts,
-    request: TransitionRequest,
+    input: TransitionInput,
     context: &TransitionContext<'_>,
 ) -> Result<PlanCandidate, TransitionFailure> {
     // Phase 1: authenticate / admit
-    let (before, mut metadata, admitted) = authenticate_and_admit(engine, request, context)?;
+    let (before, mut metadata, admitted) = authenticate_and_admit(engine, &input, context)?;
 
     // Phase 2: bind replay and freshness
-    let bound = bind_replay_and_freshness(engine, durable, &before, &metadata, admitted)?;
-    if let Some(cause) = bound.no_change_cause {
-        return no_change(engine, before, metadata, bound.event, context, cause);
+    let bound = bind_replay_and_freshness(engine, &input, &before, &metadata, admitted)?;
+    if let Some(effect) = bound.no_change_effect {
+        return no_change(
+            engine,
+            before,
+            metadata,
+            bound.event,
+            context,
+            bound.domain,
+            effect,
+        );
     }
     let event = bound.event;
+    let domain = bound.domain;
 
     // Phase 3: apply event evidence
     let old_selected = engine.selected_projection();
     let old_verified = engine.verified_projection();
     let mut projected = ProjectedTransitionState::new(engine);
-    let migrated_pin = migrated_pin_refuted(durable, &event)?;
+    let migrated_pin = migrated_pin_refuted(&input, &event)?;
     apply_migrated_pin_alarm(&mut metadata, migrated_pin);
     let event_context = ApplyEventContext {
         engine,
-        durable,
+        input: &input,
         transition: context,
         before: &before,
         old_selected,
@@ -222,7 +242,7 @@ fn derive_plan_candidate(
     })?;
     let settled = match settlement {
         FinalityRetentionOutcome::ResourceStalled => {
-            return resource_stalled(engine, before, context);
+            return resource_stalled(engine, before, domain, context);
         }
         FinalityRetentionOutcome::Settled(settled) => *settled,
     };
@@ -241,13 +261,14 @@ fn derive_plan_candidate(
 
 struct BoundRequest {
     event: crate::TransitionEvent,
+    domain: TransitionDomain,
     header_rebase: HeaderInsertionRebase,
-    no_change_cause: Option<TransitionCause>,
+    no_change_effect: Option<TransitionEffect>,
 }
 
 fn bind_replay_and_freshness(
     engine: &HeaderChainEngine,
-    durable: &DurableTransitionFacts,
+    input: &TransitionInput,
     before: &EngineSnapshot,
     metadata: &crate::EngineMetadata,
     request: AdmittedRequest,
@@ -256,7 +277,8 @@ fn bind_replay_and_freshness(
         mut event,
         expected_version,
     } = request;
-    let header_rebase = rebase_header_insertion(&mut event, before, engine.graph(), durable)?;
+    let domain = event.domain();
+    let header_rebase = rebase_header_insertion(&mut event, before, engine.graph(), input)?;
     if let Some(owner) = event.header_sync_owner() {
         validate_header_sync_owner(owner, before)?;
     }
@@ -268,8 +290,9 @@ fn bind_replay_and_freshness(
     if fingerprint.is_some() && metadata.last_transition == fingerprint {
         return Ok(BoundRequest {
             event,
+            domain,
             header_rebase,
-            no_change_cause: Some(TransitionCause::Event),
+            no_change_effect: Some(TransitionEffect::event()),
         });
     }
     if metadata
@@ -280,16 +303,24 @@ fn bind_replay_and_freshness(
         return Err(TransitionFailure::ConflictingReplay);
     }
     let has_async_authority = event.header_sync_owner().is_some() || event.body_owner().is_some();
-    if !has_async_authority && expected_version != before.state_version {
-        return Err(TransitionFailure::Stale {
-            current: before.state_version,
-        });
+    if !has_async_authority {
+        let Some(expected_version) = expected_version else {
+            return Err(TransitionFailure::Stale {
+                current: before.state_version,
+            });
+        };
+        if expected_version != before.state_version {
+            return Err(TransitionFailure::Stale {
+                current: before.state_version,
+            });
+        }
     }
     Ok(BoundRequest {
         event,
+        domain,
         header_rebase,
-        no_change_cause: (header_rebase == HeaderInsertionRebase::AlreadyApplied)
-            .then_some(TransitionCause::HeaderWorkAlreadyApplied),
+        no_change_effect: (header_rebase == HeaderInsertionRebase::AlreadyApplied)
+            .then_some(TransitionEffect::header_work_already_applied()),
     })
 }
 
@@ -307,7 +338,7 @@ fn assemble_writes<'a>(
         selected,
         finality_append,
         retention,
-        cause,
+        effect,
         metadata,
     } = settled;
     derive_plan(DerivePlanInputs {
@@ -321,7 +352,8 @@ fn assemble_writes<'a>(
         finality_append,
         retention,
         fingerprint: event.fingerprint(),
-        cause,
+        domain: event.domain(),
+        effect,
         trust_pins: invariant_pins(context),
         limits: context.config.limits,
     })

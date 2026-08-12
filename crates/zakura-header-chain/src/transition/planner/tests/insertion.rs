@@ -26,7 +26,7 @@ fn ordinary_header_insertion_rejects_body_repair_authority() {
     assert!(matches!(
         apply_transition(&store, request, &context(&config, &clock, None)),
         Err(TransitionFailure::InvalidEvidence(
-            "ordinary header insertion does not have pure header authority"
+            InvalidTransitionEvidence::Header(HeaderViolation::OrdinaryOwnerRoleMismatch)
         ))
     ));
 }
@@ -43,7 +43,8 @@ fn resource_bound_refusal_commits_only_the_alarm_and_recovers() {
         &context(&config, &clock, None),
     )
     .expect("resource refusal produces an alarm-only plan");
-    assert_eq!(refused.cause(), TransitionCause::ResourceStalled);
+    assert!(refused.effect().is_resource_stalled());
+    assert_eq!(refused.domain(), TransitionDomain::InsertHeaders);
     assert!(refused.change_set.metadata.alarms.resource_stalled);
     assert!(refused.graph_delta.is_empty());
     assert_eq!(
@@ -68,7 +69,8 @@ fn resource_bound_refusal_commits_only_the_alarm_and_recovers() {
         &context(&config, &clock, None),
     )
     .expect("an insertion within the bound clears the resource alarm");
-    assert_eq!(recovered.cause(), TransitionCause::Event);
+    assert_eq!(recovered.effect(), TransitionEffect::none());
+    assert_eq!(recovered.domain(), TransitionDomain::InsertHeaders);
     assert!(!recovered.change_set.metadata.alarms.resource_stalled);
     assert_eq!(
         recovered.change_set.metadata.state_version,
@@ -133,7 +135,10 @@ fn engine_rejects_context_free_batch_with_invalid_retained_time() {
     assert!(matches!(
         apply_transition(&store, request, &context(&config, &clock, None)),
         Err(TransitionFailure::InvalidEvidence(
-            "prepared header failed retained contextual validation"
+            InvalidTransitionEvidence::Header(crate::HeaderViolation::Validation {
+                source: crate::HeaderValidationSource::Prepared,
+                check: HeaderValidationCheck::ContextualValidation
+            })
         ))
     ));
 }

@@ -1,5 +1,8 @@
 //! Cohesive mutable projection of graph, verified path, and auxiliary deltas.
 
+use super::{
+    InvalidTransitionEvidence, PlannerCoherenceViolation, ProjectionKind, TransitionFailure,
+};
 use std::{borrow::Cow, collections::HashSet, sync::Arc};
 
 use zakura_chain::block;
@@ -9,7 +12,6 @@ use crate::retention::RetentionPlan;
 use crate::{
     AuxDelta, BodyValidationState, EligibilityReason, EngineLimits, EvidenceId, Frontier,
     GraphError, HeaderChainEngine, HeaderValidationState, InsertResult, OperatorInvalidationId,
-    TransitionFailure,
 };
 
 /// Mutable projected state accumulated while applying one transition event.
@@ -360,9 +362,10 @@ pub(super) fn trim_projection<'a, G: HeaderGraphView>(
                 .view_header_node(pair[1].hash)
                 .is_none_or(|node| node.parent_hash != pair[0].hash)
         {
-            return Err(TransitionFailure::InvalidEvidence(
-                "verified projection is not continuous",
-            ));
+            return Err(InvalidTransitionEvidence::Planner(
+                PlannerCoherenceViolation::DiscontinuousProjection(ProjectionKind::Verified),
+            )
+            .into());
         }
     }
     Ok(Cow::Owned(result))

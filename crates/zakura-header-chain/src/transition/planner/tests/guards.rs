@@ -50,7 +50,7 @@ fn retention_references_are_bounded_before_ancestry_walks() {
     assert!(matches!(
         result,
         Err(TransitionFailure::InvalidEvidence(
-            "retained-path references exceed the per-transition limit"
+            InvalidTransitionEvidence::Limit(LimitViolation::RetentionReferencesExceeded)
         ))
     ));
 }
@@ -178,7 +178,10 @@ fn peer_target_completion_must_match_the_validation_lease_ancestor() {
     assert!(matches!(
         apply_transition(&store, request, &context(&config, &clock, None)),
         Err(TransitionFailure::InvalidEvidence(
-            "target completion ancestor does not match the retained parent"
+            InvalidTransitionEvidence::Header(crate::HeaderViolation::Path {
+                kind: HeaderPathKind::Completion,
+                problem: HeaderPathProblem::AncestorMismatch
+            })
         ))
     ));
 }

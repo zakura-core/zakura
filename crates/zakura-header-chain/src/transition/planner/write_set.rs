@@ -7,12 +7,16 @@ use crate::retention::RetentionPlan;
 use crate::{
     BodyValidationState, ChangeSet, EligibilityDelta, EngineLimits, EngineMetadata, EngineSnapshot,
     Frontier, FrontierSet, GraphError, HeaderChainEngine, IndexChanges, MemHeaderStore,
-    ProjectionDelta, TransitionCause, TransitionContext, TransitionEvent, TransitionFingerprint,
+    ProjectionDelta, TransitionContext, TransitionDomain, TransitionEffect, TransitionEvent,
+    TransitionFingerprint,
 };
 
 use super::admission::validate_authority;
 use super::projected_state::SettledProjectedState;
-use super::{PlanCandidate, TransitionFailure};
+use super::{
+    InvalidTransitionEvidence, PlanCandidate, PlannerCoherenceViolation, ProjectionKind,
+    TransitionFailure,
+};
 
 /// Inputs required to derive the atomic write set from settled projections.
 pub(super) struct DerivePlanInputs<'a> {
@@ -26,7 +30,8 @@ pub(super) struct DerivePlanInputs<'a> {
     pub(super) finality_append: Option<crate::FinalityRecord>,
     pub(super) retention: RetentionPlan,
     pub(super) fingerprint: Option<TransitionFingerprint>,
-    pub(super) cause: TransitionCause,
+    pub(super) domain: TransitionDomain,
+    pub(super) effect: TransitionEffect,
     pub(super) trust_pins: Arc<[Frontier]>,
     pub(super) limits: EngineLimits,
 }
@@ -46,7 +51,8 @@ pub(super) fn derive_plan(
         finality_append,
         retention,
         fingerprint,
-        cause,
+        domain,
+        effect,
         trust_pins,
         limits,
     } = inputs;
@@ -84,7 +90,9 @@ pub(super) fn derive_plan(
             .is_some_and(|old| old.is_eligible() != node.is_eligible())
     });
     let header_best = *selected.last().ok_or(TransitionFailure::InvalidEvidence(
-        "selected projection is empty",
+        InvalidTransitionEvidence::Planner(PlannerCoherenceViolation::EmptyProjection(
+            ProjectionKind::Selected,
+        )),
     ))?;
     metadata.alarms.resource_stalled = retention.resource_stalled;
     let header_best_node = graph
@@ -124,7 +132,9 @@ pub(super) fn derive_plan(
         }
     }
     let verified_best = *verified.last().ok_or(TransitionFailure::InvalidEvidence(
-        "verified projection is empty",
+        InvalidTransitionEvidence::Planner(PlannerCoherenceViolation::EmptyProjection(
+            ProjectionKind::Verified,
+        )),
     ))?;
     metadata.frontiers = FrontierSet {
         finalized: graph.view_finalized_frontier(),
@@ -172,7 +182,8 @@ pub(super) fn derive_plan(
         before,
         change_set,
         graph_delta,
-        cause,
+        domain,
+        effect,
         trust_pins,
         limits,
     })
@@ -185,7 +196,8 @@ pub(super) fn no_change(
     metadata: EngineMetadata,
     event: TransitionEvent,
     context: &TransitionContext<'_>,
-    cause: TransitionCause,
+    domain: TransitionDomain,
+    effect: TransitionEffect,
 ) -> Result<PlanCandidate, TransitionFailure> {
     validate_authority(&event, context)?;
     Ok(PlanCandidate {
@@ -203,7 +215,8 @@ pub(super) fn no_change(
             metadata,
         },
         graph_delta: GraphDelta::empty(engine.graph()),
-        cause,
+        domain,
+        effect,
         trust_pins: invariant_pins(context),
         limits: context.config.limits,
     })
@@ -213,6 +226,7 @@ pub(super) fn no_change(
 pub(super) fn resource_stalled(
     engine: &HeaderChainEngine,
     before: EngineSnapshot,
+    domain: TransitionDomain,
     context: &TransitionContext<'_>,
 ) -> Result<PlanCandidate, TransitionFailure> {
     let mut metadata = engine.metadata().clone();
@@ -235,7 +249,8 @@ pub(super) fn resource_stalled(
             metadata,
         },
         graph_delta: GraphDelta::empty(engine.graph()),
-        cause: TransitionCause::ResourceStalled,
+        domain,
+        effect: TransitionEffect::resource_stalled(),
         trust_pins: invariant_pins(context),
         limits: context.config.limits,
     })

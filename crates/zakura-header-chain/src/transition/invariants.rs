@@ -11,7 +11,7 @@ use crate::graph::HeaderGraphView;
 use crate::TransitionPlan;
 use crate::{
     AuxDelta, BodyValidationState, EligibilityReason, EngineMode, FinalitySource, Frontier,
-    HeaderChainEngine, HeaderNode, PlanCandidate, ProjectionDelta, TransitionCause,
+    HeaderChainEngine, HeaderNode, PlanCandidate, ProjectionDelta,
 };
 
 /// Stable, category-specific projected-state invariant failures.
@@ -274,7 +274,7 @@ pub(super) fn is_incremental_aux_authentication(
     let metadata = &plan.change_set.metadata;
     let source_metadata = before.metadata();
 
-    plan.cause() == TransitionCause::AuxAuthentication
+    plan.effect().is_aux_authentication()
         && !plan.change_set.aux_changes.is_empty()
         && plan.change_set.aux_changes.len() <= 2
         && plan
@@ -350,7 +350,7 @@ pub(super) fn is_incremental_checkpoint_finality(
     };
     let finalized = record.current;
 
-    plan.cause() == TransitionCause::CheckpointFinality
+    plan.effect().is_checkpoint_finality()
         && source.mode == EngineMode::Integrated
         && matches!(record.source, FinalitySource::FullState { .. })
         && record.previous == source.frontiers.finalized

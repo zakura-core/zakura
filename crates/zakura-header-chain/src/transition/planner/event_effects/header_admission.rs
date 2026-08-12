@@ -1,12 +1,13 @@
 //! Prepared header insertion and atomic auxiliary delivery admission.
 
+use super::super::{
+    AuxiliaryViolation, HeaderPathKind, HeaderPathProblem, HeaderValidationCheck, HeaderViolation,
+    InvalidTransitionEvidence, TransitionFailure,
+};
 use std::collections::{HashMap, HashSet};
 
 use crate::graph::HeaderGraphView;
-use crate::{
-    BodyValidationState, Frontier, GraphError, HeaderValidationState, TargetCompletion,
-    TransitionFailure,
-};
+use crate::{BodyValidationState, Frontier, GraphError, HeaderValidationState, TargetCompletion};
 
 use super::super::projected_state::ProjectedTransitionState;
 use super::header_validation::{anchor_reasons, retained_header_context};
@@ -19,7 +20,7 @@ pub(super) fn apply(
     event_context: &ApplyEventContext<'_>,
 ) -> Result<(), TransitionFailure> {
     let engine = event_context.engine;
-    let durable = event_context.durable;
+    let facts = event_context.input.header_validation_facts();
     let context = event_context.transition;
     let receipt = event.batch.receipt();
     if receipt.parent().hash != event.parent_hash
@@ -49,12 +50,16 @@ pub(super) fn apply(
         } => common_ancestor,
     };
     if common_ancestor != parent_frontier {
-        return Err(TransitionFailure::InvalidEvidence(
-            "target completion ancestor does not match the retained parent",
-        ));
+        return Err(
+            InvalidTransitionEvidence::Header(crate::HeaderViolation::Path {
+                kind: HeaderPathKind::Completion,
+                problem: HeaderPathProblem::AncestorMismatch,
+            })
+            .into(),
+        );
     }
     let mut contextual =
-        retained_header_context(projected.graph(), parent_frontier, durable, context)?;
+        retained_header_context(projected.graph(), parent_frontier, facts, context)?;
     let mut parent = parent_frontier;
     for prepared in event.batch.headers() {
         if prepared.header.previous_block_hash != parent.hash
@@ -68,12 +73,17 @@ pub(super) fn apply(
                     })?
             || prepared.block_work
                 != prepared.header.difficulty_threshold.to_work().ok_or(
-                    TransitionFailure::InvalidEvidence("invalid prepared target"),
+                    TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::header_path(
+                        HeaderPathKind::Completion,
+                        HeaderPathProblem::InvalidPreparedTarget,
+                    )),
                 )?
         {
-            return Err(TransitionFailure::InvalidEvidence(
-                "prepared header batch is inconsistent",
-            ));
+            return Err(InvalidTransitionEvidence::header_path(
+                HeaderPathKind::Completion,
+                HeaderPathProblem::BatchInconsistent,
+            )
+            .into());
         }
         let adjustment = crate::AdjustedDifficulty::new_from_header_time(
             prepared.header.time,
@@ -82,18 +92,20 @@ pub(super) fn apply(
             contextual.iter().copied(),
         )
         .map_err(|_| {
-            TransitionFailure::InvalidEvidence(
-                "prepared header has incomplete retained difficulty context",
-            )
+            InvalidTransitionEvidence::Header(crate::HeaderViolation::Validation {
+                source: crate::HeaderValidationSource::Prepared,
+                check: HeaderValidationCheck::IncompleteDifficultyContext,
+            })
         })?;
         crate::validate_contextual_difficulty_and_time(
             prepared.header.difficulty_threshold,
             adjustment,
         )
         .map_err(|_| {
-            TransitionFailure::InvalidEvidence(
-                "prepared header failed retained contextual validation",
-            )
+            InvalidTransitionEvidence::Header(crate::HeaderViolation::Validation {
+                source: crate::HeaderValidationSource::Prepared,
+                check: HeaderValidationCheck::ContextualValidation,
+            })
         })?;
         let validation = match prepared.validation {
             HeaderValidationState::DeferredUntil(until) if until <= context.clock.now() => {
@@ -118,18 +130,23 @@ pub(super) fn apply(
         contextual.truncate(crate::POW_ADJUSTMENT_BLOCK_SPAN);
     }
     if parent.hash != event.target_tip_hash {
-        return Err(TransitionFailure::InvalidEvidence(
-            "target completion does not end at the pursued hash",
-        ));
+        return Err(
+            InvalidTransitionEvidence::Header(crate::HeaderViolation::Path {
+                kind: HeaderPathKind::Completion,
+                problem: HeaderPathProblem::TipMismatch,
+            })
+            .into(),
+        );
     }
     match event.completion {
         TargetCompletion::SelectedAuxiliaryRepair {
             selected_target, ..
         } => {
             if event.owner.body_owner().is_none() {
-                return Err(TransitionFailure::InvalidEvidence(
-                    "selected auxiliary repair does not have body authority",
-                ));
+                return Err(InvalidTransitionEvidence::Header(
+                    HeaderViolation::RepairOwnerRoleMismatch,
+                )
+                .into());
             }
             if event.batch.headers().len() != 1
                 || event.aux.len() != 1
@@ -148,21 +165,27 @@ pub(super) fn apply(
                     selected_target.height,
                 )? != Some(selected_target)
             {
-                return Err(TransitionFailure::InvalidEvidence(
-                    "auxiliary repair is not one exact selected header",
-                ));
+                return Err(InvalidTransitionEvidence::Header(
+                    HeaderViolation::AuxiliaryRepairShape,
+                )
+                .into());
             }
         }
         TargetCompletion::TargetComplete { .. } | TargetCompletion::TargetPrefix { .. } => {
             if event.owner.header_owner().is_none() {
-                return Err(TransitionFailure::InvalidEvidence(
-                    "ordinary header insertion does not have pure header authority",
-                ));
+                return Err(InvalidTransitionEvidence::Header(
+                    HeaderViolation::OrdinaryOwnerRoleMismatch,
+                )
+                .into());
             }
             if event.owner.header_authority().branch.target_tip_hash != event.target_tip_hash {
-                return Err(TransitionFailure::InvalidEvidence(
-                    "target completion does not end at the pursued hash",
-                ));
+                return Err(
+                    InvalidTransitionEvidence::Header(crate::HeaderViolation::Path {
+                        kind: HeaderPathKind::Completion,
+                        problem: HeaderPathProblem::TipMismatch,
+                    })
+                    .into(),
+                );
             }
         }
     }
@@ -184,9 +207,10 @@ pub(super) fn apply(
                 .tree_aux
                 .is_some_and(|aux| Some(aux.height) != expected_height)
         {
-            return Err(TransitionFailure::InvalidEvidence(
-                "auxiliary delivery does not match the admitted target",
-            ));
+            return Err(InvalidTransitionEvidence::Auxiliary(
+                AuxiliaryViolation::AdmittedTargetMismatch,
+            )
+            .into());
         }
         let indexed_count = projected
             .graph()
@@ -201,9 +225,10 @@ pub(super) fn apply(
             (Some(stored), 1) if stored == *delivery => continue,
             (None, 0) => {}
             _ => {
-                return Err(TransitionFailure::InvalidEvidence(
-                    "auxiliary delivery replay changes provenance or indexing",
-                ));
+                return Err(InvalidTransitionEvidence::Auxiliary(
+                    AuxiliaryViolation::ReplayConflict,
+                )
+                .into());
             }
         }
         projected.record_aux_delivery(*delivery)?;

@@ -8,14 +8,14 @@ use zakura_chain::{
     parameters::{testnet::RegtestParameters, Network},
 };
 use zakura_header_chain::{
-    prepare_headers, AlarmSet, AuxAuthentication, AuxDelivery, AuxEvidence, BodySizeHint,
-    BodyWorkAuthority, BranchId, CheckpointSet, Clock, DurableTransitionFacts, EngineConfig,
-    EngineMetadata, EngineMode, EvidenceId, FinalityEpoch, Frontier, FrontierSet,
-    FullStateEvidenceAuthority, HeaderBatchInput, HeaderChainDiskVersion, HeaderChainEngine,
-    HeaderContextFact, HeaderGeneration, HeaderRules, HeaderWorkAuthority, MemHeaderStore,
-    SourceId, StateVersion, TargetCompletion, TransitionCause, TransitionContext, TransitionEvent,
-    TransitionFailure, TransitionRequest, TreeAuxRecordV1, TrustedAnchor, ValidationLease,
-    VerifiedGeneration,
+    prepare_headers, AlarmSet, AuxAuthentication, AuxDelivery, AuxEvidence, AuxiliaryViolation,
+    BodySizeHint, BodyWorkAuthority, BranchId, CheckpointSet, Clock, EngineConfig, EngineMetadata,
+    EngineMode, EvidenceId, FinalityEpoch, Frontier, FrontierSet, FullStateEvidenceAuthority,
+    HeaderBatchInput, HeaderChainDiskVersion, HeaderChainEngine, HeaderContextFact,
+    HeaderGeneration, HeaderInsertionFacts, HeaderRules, HeaderValidationFacts,
+    HeaderWorkAuthority, InvalidTransitionEvidence, MemHeaderStore, SourceId, StateVersion,
+    TargetCompletion, TransitionContext, TransitionEvent, TransitionFailure, TransitionInput,
+    TransitionRequest, TreeAuxRecordV1, TrustedAnchor, ValidationLease, VerifiedGeneration,
 };
 
 struct FixedClock(DateTime<Utc>);
@@ -171,14 +171,21 @@ fn production_incremental_verifier_accepts_exact_auxiliary_evidence() {
             aux: vec![delivery],
         })),
     };
+    let TransitionEvent::InsertHeaders(event) = insertion.event else {
+        panic!("fixture constructs InsertHeaders");
+    };
     let transition = engine
         .plan_transition(
-            insertion,
-            &context,
-            DurableTransitionFacts::HeaderInsertion {
-                validation_contexts: vec![lease],
-                finality_path: Vec::new(),
+            TransitionInput::InsertHeaders {
+                event,
+                facts: HeaderInsertionFacts {
+                    validation: HeaderValidationFacts {
+                        validation_leases: vec![lease],
+                    },
+                    finality_rebase_history: Vec::new(),
+                },
             },
+            &context,
         )
         .expect("the fixture insertion verifies");
     engine
@@ -203,16 +210,33 @@ fn production_incremental_verifier_accepts_exact_auxiliary_evidence() {
     let mut altered = delivery;
     altered.source = SourceId::from_digest([7; 32]);
     assert!(matches!(
-        engine.plan_transition(request(altered), &context, DurableTransitionFacts::None),
+        engine.plan_transition(
+            TransitionInput::AuxEvidence {
+                event: {
+                    let TransitionEvent::AuxEvidence(event) = request(altered).event else {
+                        panic!("fixture constructs AuxEvidence");
+                    };
+                    event
+                },
+            },
+            &context,
+        ),
         Err(TransitionFailure::InvalidEvidence(
-            "auxiliary evidence changes delivery provenance"
+            InvalidTransitionEvidence::Auxiliary(AuxiliaryViolation::ProvenanceMismatch)
         ))
     ));
 
+    let TransitionEvent::AuxEvidence(event) = request(delivery).event else {
+        panic!("fixture constructs AuxEvidence");
+    };
     let transition = engine
-        .plan_transition(request(delivery), &context, DurableTransitionFacts::None)
+        .plan_transition(TransitionInput::AuxEvidence { event }, &context)
         .expect("the production incremental verifier accepts exact evidence");
-    assert_eq!(transition.cause(), TransitionCause::AuxAuthentication);
+    assert!(transition.effect().is_aux_authentication());
+    assert_eq!(
+        transition.domain(),
+        zakura_header_chain::TransitionDomain::AuxEvidence
+    );
     let mut projected = engine.clone();
     projected
         .install_committed_transition(transition)

@@ -128,9 +128,9 @@ fn production_body_unavailability_writer_authenticates_exact_evidence() {
     assert!(matches!(
         result,
         Err(HeaderChainStoreError::Transition(
-            TransitionFailure::InvalidEvidence(
-                "body retry evidence cannot regress an already verified body"
-            )
+            TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::Body(
+                BodyViolation::RetryConflictsWithVerified
+            ))
         ))
     ));
 }

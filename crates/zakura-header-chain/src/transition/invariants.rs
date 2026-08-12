@@ -7,9 +7,11 @@ use zakura_chain::block;
 
 use crate::graph::GraphOverlay;
 use crate::graph::HeaderGraphView;
+#[cfg(any(test, feature = "fuzz-impl"))]
+use crate::TransitionPlan;
 use crate::{
     AuxDelta, BodyValidationState, EligibilityReason, EngineMode, FinalitySource, Frontier,
-    HeaderChainEngine, HeaderNode, ProjectionDelta, TransitionCause, TransitionPlan,
+    HeaderChainEngine, HeaderNode, PlanCandidate, ProjectionDelta, TransitionCause,
 };
 
 /// Stable, category-specific projected-state invariant failures.
@@ -80,12 +82,21 @@ fn default_verification_mode() -> VerificationMode {
     }
 }
 
-/// Verify the complete projected state before an adapter may commit `plan`.
+/// Verify a complete projected candidate before it becomes commit-capable.
+pub(crate) fn verify_candidate(
+    before: &HeaderChainEngine,
+    plan: &PlanCandidate,
+) -> Result<(), InvariantViolation> {
+    verify_plan_with_mode(before, plan, default_verification_mode())
+}
+
+/// Re-run verification against an already verified plan in tests and fuzzing.
+#[cfg(any(test, feature = "fuzz-impl"))]
 pub(crate) fn verify_plan(
     before: &HeaderChainEngine,
     plan: &TransitionPlan,
 ) -> Result<(), InvariantViolation> {
-    verify_plan_with_mode(before, plan, default_verification_mode())
+    verify_plan_with_mode(before, plan.candidate(), default_verification_mode())
 }
 
 /// Verify `plan` using the exact production overlay and boundary-node path.
@@ -94,12 +105,12 @@ pub(crate) fn verify_plan_production(
     before: &HeaderChainEngine,
     plan: &TransitionPlan,
 ) -> Result<(), InvariantViolation> {
-    verify_plan_with_mode(before, plan, VerificationMode::Production)
+    verify_plan_with_mode(before, plan.candidate(), VerificationMode::Production)
 }
 
 fn verify_plan_with_mode(
     before: &HeaderChainEngine,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
     mode: VerificationMode,
 ) -> Result<(), InvariantViolation> {
     if is_incremental_aux_authentication(before, plan) {
@@ -114,7 +125,7 @@ fn verify_plan_with_mode(
 
 fn verify_plan_exhaustive(
     before: &HeaderChainEngine,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
     mode: VerificationMode,
 ) -> Result<(), InvariantViolation> {
     let source = before.snapshot();
@@ -155,7 +166,7 @@ fn verify_plan_exhaustive(
 
 fn verify_plan_against_graph<G: HeaderGraphView>(
     before: &HeaderChainEngine,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
     source: &crate::EngineSnapshot,
     source_metadata: &crate::EngineMetadata,
     graph: &G,
@@ -257,7 +268,7 @@ fn verify_plan_against_graph<G: HeaderGraphView>(
 
 pub(super) fn is_incremental_aux_authentication(
     before: &HeaderChainEngine,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
 ) -> bool {
     let metadata = &plan.change_set.metadata;
     let source_metadata = before.metadata();
@@ -293,7 +304,7 @@ pub(super) fn is_incremental_aux_authentication(
 
 fn verify_incremental_aux_authentication(
     before: &HeaderChainEngine,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
     mode: VerificationMode,
 ) -> Result<(), InvariantViolation> {
     if before.snapshot() != plan.before {
@@ -329,7 +340,7 @@ fn verify_incremental_aux_authentication(
 
 pub(super) fn is_incremental_checkpoint_finality(
     before: &HeaderChainEngine,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
 ) -> bool {
     let source = before.snapshot();
     let metadata = &plan.change_set.metadata;
@@ -377,7 +388,7 @@ pub(super) fn is_incremental_checkpoint_finality(
 
 fn verify_incremental_checkpoint_finality(
     before: &HeaderChainEngine,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
     mode: VerificationMode,
 ) -> Result<(), InvariantViolation> {
     let source = before.snapshot();
@@ -415,7 +426,7 @@ fn verify_incremental_checkpoint_finality(
 
 fn verify_incremental_checkpoint_against_graph<G: HeaderGraphView>(
     before: &HeaderChainEngine,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
     source: &crate::EngineSnapshot,
     graph: &G,
     delta_finalized: Frontier,
@@ -571,7 +582,7 @@ fn verify_node<G: HeaderGraphView>(
 
 fn verify_indexes(
     before: &HeaderChainEngine,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
 ) -> Result<(), InvariantViolation> {
     if plan.change_set.put_nodes != plan.graph_delta().updated_header_nodes()
         || plan.change_set.delete_nodes != plan.graph_delta().deleted_header_hashes()
@@ -742,7 +753,7 @@ fn verify_pins(
 
 fn verify_protected<G: HeaderGraphView>(
     graph: &G,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
 ) -> Result<(), InvariantViolation> {
     for frontier in [
         plan.change_set.metadata.frontiers.finalized,
@@ -760,7 +771,7 @@ fn verify_protected<G: HeaderGraphView>(
 
 fn verify_generations(
     before: &HeaderChainEngine,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
     selected: &[Frontier],
     verified: &[Frontier],
 ) -> Result<(), InvariantViolation> {
@@ -836,7 +847,7 @@ fn verify_generations(
 fn verify_aux<G: HeaderGraphView>(
     before: &HeaderChainEngine,
     graph: &G,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
     mode: VerificationMode,
 ) -> Result<(), InvariantViolation> {
     let mut put_ids = HashSet::new();
@@ -930,7 +941,7 @@ fn verify_aux<G: HeaderGraphView>(
 fn verification_nodes<'a, G: HeaderGraphView>(
     before: &HeaderChainEngine,
     graph: &'a G,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
     mode: VerificationMode,
 ) -> Vec<&'a HeaderNode> {
     match mode {
@@ -943,7 +954,7 @@ fn verification_nodes<'a, G: HeaderGraphView>(
 #[cfg(any(test, feature = "fuzz-impl"))]
 fn materialize_projected_graph(
     before: &HeaderChainEngine,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
 ) -> Result<crate::graph::MemHeaderStore, InvariantViolation> {
     let mut graph = before.graph().clone();
     graph
@@ -955,7 +966,7 @@ fn materialize_projected_graph(
 fn changed_boundary_nodes<'a, G: HeaderGraphView>(
     before: &HeaderChainEngine,
     graph: &'a G,
-    plan: &TransitionPlan,
+    plan: &PlanCandidate,
 ) -> Vec<&'a HeaderNode> {
     let mut hashes = HashSet::from([
         plan.change_set.metadata.frontiers.finalized.hash,

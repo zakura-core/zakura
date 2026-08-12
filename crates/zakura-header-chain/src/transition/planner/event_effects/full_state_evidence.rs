@@ -1,0 +1,194 @@
+//! Authoritative full-state conclusions and finality evidence.
+
+use crate::graph::HeaderGraphView;
+use crate::{BodyValidationState, Frontier, GraphError, HeaderValidationState, TransitionFailure};
+
+use super::super::projected_state::ProjectedTransitionState;
+use super::header_validation::{anchor_reasons, validate_full_state_header};
+use super::ApplyEventContext;
+
+/// Apply a verified winning-path change.
+pub(super) fn apply_chain_change(
+    projected: &mut ProjectedTransitionState<'_>,
+    event: &crate::VerifiedChainChanged,
+    event_context: &ApplyEventContext<'_>,
+) -> Result<(), TransitionFailure> {
+    let durable = event_context.durable;
+    let context = event_context.transition;
+    if projected.verified().last().copied() != Some(event.old_tip) {
+        return Err(TransitionFailure::StalePreparation);
+    }
+    let mut parent = match event.cause {
+        crate::VerifiedChangeCause::Grow | crate::VerifiedChangeCause::CheckpointFinalizedGrow => {
+            event.old_tip
+        }
+        crate::VerifiedChangeCause::Reset => projected.graph().view_finalized_frontier(),
+    };
+    if matches!(event.cause, crate::VerifiedChangeCause::Reset) {
+        projected.reset_verified(parent);
+    }
+    for header in &event.new_path {
+        if header.header.hash() != header.hash
+            || header.header.previous_block_hash != parent.hash
+            || header.height
+                != parent
+                    .height
+                    .next()
+                    .map_err(|_| GraphError::HeightOverflow {
+                        parent: parent.hash,
+                    })?
+        {
+            return Err(TransitionFailure::InvalidEvidence(
+                "verified path is not continuous",
+            ));
+        }
+        if projected.graph().view_header_node(header.hash).is_none() {
+            validate_full_state_header(projected.graph(), parent, header, durable, context)?;
+            projected.insert_header(
+                header.header.clone(),
+                HeaderValidationState::Valid,
+                anchor_reasons(context, header.height, header.hash),
+                BodyValidationState::Verified {
+                    evidence: event.full_state_transition_id,
+                },
+            )?;
+        } else {
+            projected.set_body_validation_state(
+                header.hash,
+                BodyValidationState::Verified {
+                    evidence: event.full_state_transition_id,
+                },
+            )?;
+        }
+        parent = Frontier::new(header.height, header.hash);
+        projected.push_verified(parent);
+    }
+    Ok(())
+}
+
+/// Accept a finalized-rooted side path without replacing the verified winner.
+pub(super) fn apply_block_acceptance(
+    projected: &mut ProjectedTransitionState<'_>,
+    event: &crate::VerifiedBlockAccepted,
+    event_context: &ApplyEventContext<'_>,
+) -> Result<(), TransitionFailure> {
+    let durable = event_context.durable;
+    let context = event_context.transition;
+    if event.path.is_empty() {
+        return Err(TransitionFailure::InvalidEvidence(
+            "accepted full-state side path is empty",
+        ));
+    }
+    let mut parent = projected.graph().view_finalized_frontier();
+    let last_index = event.path.len().saturating_sub(1);
+    for (index, header) in event.path.iter().enumerate() {
+        if header.header.hash() != header.hash
+            || header.header.previous_block_hash != parent.hash
+            || header.height
+                != parent
+                    .height
+                    .next()
+                    .map_err(|_| GraphError::HeightOverflow {
+                        parent: parent.hash,
+                    })?
+        {
+            return Err(TransitionFailure::InvalidEvidence(
+                "accepted full-state side path is not continuous",
+            ));
+        }
+        if projected.graph().view_header_node(header.hash).is_none() {
+            validate_full_state_header(projected.graph(), parent, header, durable, context)?;
+            projected.insert_header(
+                header.header.clone(),
+                HeaderValidationState::Valid,
+                anchor_reasons(context, header.height, header.hash),
+                BodyValidationState::Verified {
+                    evidence: event.full_state_transition_id,
+                },
+            )?;
+        } else if index == last_index {
+            projected.set_body_validation_state(
+                header.hash,
+                BodyValidationState::Verified {
+                    evidence: event.full_state_transition_id,
+                },
+            )?;
+        }
+        parent = Frontier::new(header.height, header.hash);
+    }
+    Ok(())
+}
+
+/// Install permanent consensus-invalid body evidence.
+pub(super) fn apply_consensus_invalid(
+    projected: &mut ProjectedTransitionState<'_>,
+    event: &crate::ConsensusBodyInvalid,
+) -> Result<(), TransitionFailure> {
+    if matches!(
+        projected
+            .graph()
+            .view_header_node(event.hash)
+            .map(|node| &node.body_validation_state),
+        Some(BodyValidationState::Verified { .. })
+    ) {
+        return Err(TransitionFailure::InvalidEvidence(
+            "body invalid evidence cannot contradict an already verified body",
+        ));
+    }
+    projected.set_body_validation_state(
+        event.hash,
+        BodyValidationState::ConsensusInvalid {
+            evidence: event.evidence,
+            rule: event.rule.clone(),
+        },
+    )?;
+    Ok(())
+}
+
+/// Install exact full-state body acceptance.
+pub(super) fn apply_verified_body(
+    projected: &mut ProjectedTransitionState<'_>,
+    event: &crate::VerifiedBodyEvidence,
+) -> Result<(), TransitionFailure> {
+    projected.set_body_validation_state(
+        event.hash,
+        BodyValidationState::Verified {
+            evidence: event.evidence,
+        },
+    )?;
+    Ok(())
+}
+
+/// Validate that a full-state finality proof matches the exact verified prefix.
+pub(super) fn apply_finality_proof(
+    projected: &ProjectedTransitionState<'_>,
+    event: &crate::FullStateFinalized,
+) -> Result<(), TransitionFailure> {
+    let expected: Vec<_> = projected
+        .verified()
+        .iter()
+        .take_while(|frontier| frontier.height <= event.new_finalized.height)
+        .map(|frontier| frontier.hash)
+        .collect();
+    if event.verified_path_proof != expected {
+        return Err(TransitionFailure::InvalidEvidence(
+            "finality proof is not the exact verified ancestry",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate migrated-pin refutation evidence against durable authentication.
+pub(super) fn apply_migrated_pin_refutation(
+    event: &crate::MigratedPinRefutation,
+    event_context: &ApplyEventContext<'_>,
+) -> Result<(), TransitionFailure> {
+    if event.invalid_header.height > event.pin.height
+        || event_context.migrated_pin_refuted != Some(event.pin)
+    {
+        return Err(TransitionFailure::InvalidEvidence(
+            "full-state refutation does not name an imported pin ancestor",
+        ));
+    }
+    Ok(())
+}

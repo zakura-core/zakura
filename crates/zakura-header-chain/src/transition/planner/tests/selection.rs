@@ -1,3 +1,4 @@
+use super::super::projected_state::trim_projection;
 use super::*;
 
 #[test]

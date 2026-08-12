@@ -1,3 +1,6 @@
+use super::super::{
+    admission::validate_finality_rebase_path, projected_state::path, write_set::projection_delta,
+};
 use super::*;
 use crate::InvariantViolation;
 
@@ -822,5 +825,264 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
     assert_eq!(
         verify_plan(&test_engine(&store), &pin_conflict),
         Err(InvariantViolation::TrustPin(checkpoint.height))
+    );
+}
+
+#[test]
+fn validate_finality_rebase_path_table() {
+    let a0 = Frontier::new(block::Height(0), block::Hash([0x10; 32]));
+    let a1 = Frontier::new(block::Height(1), block::Hash([0x11; 32]));
+    let a2 = Frontier::new(block::Height(2), block::Hash([0x12; 32]));
+    let a3 = Frontier::new(block::Height(3), block::Hash([0x13; 32]));
+    let competing = Frontier::new(block::Height(1), block::Hash([0x91; 32]));
+    let evidence = EvidenceId::from_digest([0x44; 32]);
+    let source = FinalitySource::FullState { evidence };
+
+    struct Case {
+        label: &'static str,
+        original_anchor: block::Hash,
+        current_finalized: Frontier,
+        path: Vec<FinalityRecord>,
+        expected: Result<(), TransitionFailure>,
+    }
+
+    let cases = [
+        Case {
+            label: "unchanged anchor with empty path",
+            original_anchor: a1.hash,
+            current_finalized: a1,
+            path: Vec::new(),
+            expected: Ok(()),
+        },
+        Case {
+            label: "unchanged anchor with nonempty path",
+            original_anchor: a1.hash,
+            current_finalized: a1,
+            path: vec![FinalityRecord {
+                previous: a0,
+                current: a1,
+                source,
+                epoch: FinalityEpoch::new(1),
+            }],
+            expected: Err(TransitionFailure::StalePreparation),
+        },
+        Case {
+            label: "one valid advancement",
+            original_anchor: a0.hash,
+            current_finalized: a1,
+            path: vec![FinalityRecord {
+                previous: a0,
+                current: a1,
+                source,
+                epoch: FinalityEpoch::new(1),
+            }],
+            expected: Ok(()),
+        },
+        Case {
+            label: "multiple contiguous advancements",
+            original_anchor: a0.hash,
+            current_finalized: a3,
+            path: vec![
+                FinalityRecord {
+                    previous: a0,
+                    current: a1,
+                    source,
+                    epoch: FinalityEpoch::new(1),
+                },
+                FinalityRecord {
+                    previous: a1,
+                    current: a2,
+                    source,
+                    epoch: FinalityEpoch::new(2),
+                },
+                FinalityRecord {
+                    previous: a2,
+                    current: a3,
+                    source,
+                    epoch: FinalityEpoch::new(3),
+                },
+            ],
+            expected: Ok(()),
+        },
+        Case {
+            label: "first record may begin at any epoch",
+            original_anchor: a0.hash,
+            current_finalized: a1,
+            path: vec![FinalityRecord {
+                previous: a0,
+                current: a1,
+                source,
+                epoch: FinalityEpoch::new(9),
+            }],
+            expected: Ok(()),
+        },
+        Case {
+            label: "changed anchor with empty path",
+            original_anchor: a0.hash,
+            current_finalized: a1,
+            path: Vec::new(),
+            expected: Err(TransitionFailure::StalePreparation),
+        },
+        Case {
+            label: "first predecessor hash mismatch",
+            original_anchor: a0.hash,
+            current_finalized: a1,
+            path: vec![FinalityRecord {
+                previous: competing,
+                current: a1,
+                source,
+                epoch: FinalityEpoch::new(1),
+            }],
+            expected: Err(TransitionFailure::StalePreparation),
+        },
+        Case {
+            label: "gap between current and next previous",
+            original_anchor: a0.hash,
+            current_finalized: a3,
+            path: vec![
+                FinalityRecord {
+                    previous: a0,
+                    current: a1,
+                    source,
+                    epoch: FinalityEpoch::new(1),
+                },
+                FinalityRecord {
+                    previous: a2,
+                    current: a3,
+                    source,
+                    epoch: FinalityEpoch::new(2),
+                },
+            ],
+            expected: Err(TransitionFailure::StalePreparation),
+        },
+        Case {
+            label: "duplicate epoch",
+            original_anchor: a0.hash,
+            current_finalized: a2,
+            path: vec![
+                FinalityRecord {
+                    previous: a0,
+                    current: a1,
+                    source,
+                    epoch: FinalityEpoch::new(1),
+                },
+                FinalityRecord {
+                    previous: a1,
+                    current: a2,
+                    source,
+                    epoch: FinalityEpoch::new(1),
+                },
+            ],
+            expected: Err(TransitionFailure::StalePreparation),
+        },
+        Case {
+            label: "skipped epoch",
+            original_anchor: a0.hash,
+            current_finalized: a2,
+            path: vec![
+                FinalityRecord {
+                    previous: a0,
+                    current: a1,
+                    source,
+                    epoch: FinalityEpoch::new(1),
+                },
+                FinalityRecord {
+                    previous: a1,
+                    current: a2,
+                    source,
+                    epoch: FinalityEpoch::new(3),
+                },
+            ],
+            expected: Err(TransitionFailure::StalePreparation),
+        },
+        Case {
+            label: "reversed epoch",
+            original_anchor: a0.hash,
+            current_finalized: a2,
+            path: vec![
+                FinalityRecord {
+                    previous: a0,
+                    current: a1,
+                    source,
+                    epoch: FinalityEpoch::new(2),
+                },
+                FinalityRecord {
+                    previous: a1,
+                    current: a2,
+                    source,
+                    epoch: FinalityEpoch::new(1),
+                },
+            ],
+            expected: Err(TransitionFailure::StalePreparation),
+        },
+        Case {
+            label: "height retreat",
+            original_anchor: a0.hash,
+            current_finalized: Frontier::new(block::Height(4), block::Hash([0x14; 32])),
+            path: vec![FinalityRecord {
+                previous: Frontier::new(block::Height(5), a0.hash),
+                current: Frontier::new(block::Height(4), block::Hash([0x14; 32])),
+                source,
+                epoch: FinalityEpoch::new(1),
+            }],
+            expected: Err(TransitionFailure::StalePreparation),
+        },
+        Case {
+            label: "wrong terminal frontier",
+            original_anchor: a0.hash,
+            current_finalized: a2,
+            path: vec![FinalityRecord {
+                previous: a0,
+                current: a1,
+                source,
+                epoch: FinalityEpoch::new(1),
+            }],
+            expected: Err(TransitionFailure::StalePreparation),
+        },
+    ];
+
+    for case in cases {
+        assert_eq!(
+            validate_finality_rebase_path(case.original_anchor, case.current_finalized, &case.path),
+            case.expected,
+            "{}",
+            case.label
+        );
+    }
+
+    assert_eq!(
+        validate_finality_rebase_path(
+            a0.hash,
+            a1,
+            &[FinalityRecord {
+                previous: a0,
+                current: a1,
+                source,
+                epoch: FinalityEpoch::new(u64::MAX),
+            }],
+        ),
+        Err(TransitionFailure::Counter(
+            FinalityEpoch::new(u64::MAX)
+                .checked_next()
+                .expect_err("u64::MAX has no next finality epoch"),
+        )),
+        "epoch exhaustion at u64::MAX"
+    );
+
+    // First predecessor compares only its hash because BranchId retains only the anchor hash.
+    // Equal heights are allowed; only a height retreat is rejected.
+    assert_eq!(
+        validate_finality_rebase_path(
+            a0.hash,
+            a1,
+            &[FinalityRecord {
+                previous: Frontier::new(block::Height(1), a0.hash),
+                current: a1,
+                source,
+                epoch: FinalityEpoch::new(1),
+            }],
+        ),
+        Ok(()),
+        "first-record predecessor height is intentionally ignored when it does not retreat"
     );
 }

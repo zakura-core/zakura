@@ -1,3 +1,4 @@
+use super::super::projected_state::path;
 use super::*;
 
 #[test]

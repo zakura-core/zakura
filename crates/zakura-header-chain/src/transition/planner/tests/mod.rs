@@ -1,26 +1,31 @@
 mod auxiliary;
 mod body_evidence;
+mod coherence;
 mod finality;
 mod guards;
 mod insertion;
 mod operator;
+mod predecessor_context;
 mod selection;
 
-use std::{collections::HashMap, num::NonZeroU64, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, num::NonZeroU64, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use zakura_chain::{
-    block::{genesis::regtest_genesis_block, Block},
+    block::{self, genesis::regtest_genesis_block, Block},
     parameters::{testnet::RegtestParameters, Network},
     serialization::ZcashDeserialize,
 };
 
-use super::*;
+use super::{projected_state::path, TransitionFailure, TransitionPlan};
 use crate::{
-    verify_plan, AlarmSet, BranchId, CheckpointSet, EngineConfig, FinalityEpoch,
-    HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, PreparedHeader,
-    PreparedHeaderBatch, SourceId, TargetCompletion, TrustedAnchor, ValidationLease,
-    VerifiedGeneration,
+    verify_plan, AlarmSet, BodyEvidence, BodyValidationState, BranchId, CheckpointSet,
+    DurableTransitionFacts, EligibilityReason, EngineConfig, EngineMetadata, EngineMode,
+    EngineSnapshot, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
+    FrontierSet, GraphError, HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration,
+    HeaderValidationState, MemHeaderStore, PreparedHeader, PreparedHeaderBatch, ProjectionDelta,
+    SourceId, StateVersion, TargetCompletion, TransitionCause, TransitionContext, TransitionEvent,
+    TransitionRequest, TrustedAnchor, ValidationLease, VerifiedGeneration,
 };
 
 #[derive(Clone)]

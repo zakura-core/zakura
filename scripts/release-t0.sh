@@ -196,7 +196,7 @@ check_globals() {
   gh auth status >/dev/null 2>&1 \
     || die "tools" "gh auth status" "not authenticated" "authenticated" \
         "run: gh auth login"
-  gh pr merge --help 2>/dev/null | grep -q -- '--match-head-commit' \
+  gh pr merge --help 2>/dev/null | grep -- '--match-head-commit' >/dev/null \
     || die "tools" "gh pr merge --help" "no --match-head-commit flag" \
         "gh with --match-head-commit support" "upgrade gh (>= 2.30)"
 

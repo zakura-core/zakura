@@ -1,7 +1,7 @@
 name: Release PR readiness
 
 on:
-  pull_request_target:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] -- no checkout of untrusted PR code; PR body read via env into a quoted heredoc; sole side effect is `gh pr ready --undo`, which returns an incomplete release PR to draft
     types: [opened, edited, synchronize, reopened, ready_for_review]
 
 permissions:

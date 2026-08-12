@@ -36,7 +36,7 @@ on:
 # already in process, will get cancelled. Only the latest commit will be allowed
 # to run, cancelling any workflows in between
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -81,7 +81,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI crate-check job; feature-matrix build check only, nothing published/released
         with:
           toolchain: stable
           cache-key: crate-checks

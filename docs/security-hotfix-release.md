@@ -159,6 +159,12 @@ the right to withhold reproduction details for counterfeiting-class bugs.
 | `hotfix/vX.Y.Z` cut from the last release tag | Default for solo, and whenever `main` has unreleased work operators shouldn't absorb mid-emergency | Minimal auditable diff; **mechanically simplest solo**: direct maintainer push, no PR review rule, no Mergify interaction. The branch must be named for the exact tag it releases — the `Create release` validate job enforces this. Fix must be forward-merged to `main` right after release. |
 | `main` | `main` is essentially the last release plus safe changes | Direct pushes to `main` are blocked for everyone: at T-0, open a public PR **from `hotfix/vX.Y.Z`** and **squash-merge** it — the only method the `main` ruleset allows, and safe in this order because `Create release` tags the squash commit _after_ the merge. Freeze the Mergify `batched` queue first. |
 
+Choose and record the mode when creating the hotfix branch, before opening the
+public PR, and do not rebase the branch onto a different base. Use `main` mode
+for a branch cut from `main`, or branch mode for a minimal branch cut from the
+previous release. Review this choice before T-0 to avoid publishing unreleased
+`main` changes directly from the hotfix branch.
+
 Record the choice and reasoning in the advisory.
 
 **Branch namespace rule.** Whatever the base, the hotfix process creates

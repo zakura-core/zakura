@@ -8,33 +8,44 @@ assignees: ""
 
 A hotfix release should only be created when a bug or critical issue is
 discovered in an existing release, and waiting for the next scheduled release
-is impractical or unacceptable. It ships the fix on top of the release
-operators are already running, instead of everything unreleased on `main`.
+is impractical or unacceptable. Prefer shipping the fix on top of the release
+operators are already running; use `main` only when its unreleased changes are
+safe to include.
 
 For an **embargoed security fix**, follow
 [`docs/security-hotfix-release.md`](https://github.com/zakura-core/zakura/blob/main/docs/security-hotfix-release.md):
-all preparation below happens in the private staging repo, this PR is opened
-at forward-merge time, and the extra steps there (advisory, dress rehearsal,
-canary soak, announcement) apply on top of this checklist.
+all preparation below happens in the private staging repo. Open this PR at T-0
+for a main-base hotfix, or at forward-merge time for a previous-release-base
+hotfix. The extra steps there (advisory, dress rehearsal, canary soak,
+announcement) apply on top of this checklist.
 
 ## Create the Hotfix Branch
 
-- [ ] Cut `hotfix/v<version>` from the tag of the release being fixed (not
-      from `main`). The branch **must** be named for the exact tag it will
-      release — the `Create release` workflow refuses to tag `v<version>`
-      from any other branch. The `hotfix/v*` ruleset blocks deletion and
-      force-pushes.
-- [ ] Embargoed main-base hotfix: the T-0 public PR branch is **also** named
-      `hotfix/v<version>` (based on `main`, pushed at T-0). Whatever the
-      base, the hotfix process never pushes `release/v*` or `bump-v*` —
+- [ ] Choose and review the release mode before creating the hotfix branch:
+      use `--mode main` when the unreleased changes on `main` are safe to
+      include, or `--mode branch` to release only the fix on top of the
+      previous release. Record the choice and do not rebase the branch onto a
+      different base.
+- [ ] Create `hotfix/v<version>` from `main` for `--mode main`, or from the
+      previous release tag for `--mode branch`. The branch **must** be named
+      for the exact tag it will release — the `Create release` workflow
+      refuses to tag `v<version>` from any other branch. The `hotfix/v*`
+      ruleset blocks deletion and force-pushes.
+- [ ] For an embargoed main-base hotfix, push the `hotfix/v<version>` branch
+      to the public repository at T-0. Whatever the base, the hotfix process
+      never pushes `release/v*` or `bump-v*` —
       those names belong to the regular release process, and disjoint
       namespaces are what prevent an embargo-blind collision with it (see
       the process doc's branch namespace rule).
 - [ ] Make the required changes, minimal and with tests.
-- [ ] For a public (non-embargoed) hotfix: open this PR from the branch with
+- [ ] For a public (non-embargoed) previous-release-base hotfix
+      (`--mode branch`): open this PR from the branch with
       `&template=hotfix-release-checklist.md` in the compare URL, and add the
-      `do-not-merge` label — the release is dispatched from the branch itself,
-      and the PR is merged (as a merge commit) only after the release.
+      `do-not-merge` label. Release from the branch, then forward-merge this PR
+      after the release.
+- [ ] For a main-base hotfix (`--mode main`): do not add `do-not-merge`.
+      The T-0 orchestrator squash-merges this PR before dispatching the release
+      from `main`.
 - [ ] Add the `A-release` and `C-exclude-from-changelog` labels **when
       opening the PR**: the changelog fragment check only accepts a
       fragment-consuming release branch in release-PR mode, and relabeling
@@ -91,14 +102,20 @@ allows `hotfix/v*`).
       and verifies each step's target state (resumable — re-runs skip
       completed steps):
 
-      ```sh
-      ./scripts/release-t0.sh publish --hotfix --tag v<version> \
-          --mode branch --head-sha <final-commit>
-      ```
+  ```sh
+  # Main base: squash-merge the public PR, then release from main.
+  ./scripts/release-t0.sh publish --hotfix --tag v<version> \
+      --mode main --pr <N> --head-sha <final-commit>
 
-      Manual fallback: push `hotfix/v<version>`, dispatch `Create release`
-      **from the branch** with the exact tag, and verify each step landed
-      before the next.
+  # Previous-release base: push and release from the hotfix branch.
+  ./scripts/release-t0.sh publish --hotfix --tag v<version> \
+      --mode branch --head-sha <final-commit>
+  ```
+
+  Manual fallback: for a main-base hotfix, squash-merge the public PR and
+  dispatch `Create release` from `main`; for a previous-release-base hotfix,
+  push `hotfix/v<version>` and dispatch from that branch. Use the exact tag
+  and verify each step landed before the next.
 - [ ] Approve the `release` environment deployment when the script announces
       it (right commit? right tag?). The workflow publishes a complete
       pre-release and creates the protected tag; the tag push starts Docker

@@ -41,14 +41,27 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
 
       - name: Resolve operation
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ACTION: ${{ inputs.action }}
+          INPUT_NODE: ${{ inputs.node }}
+          INPUT_NO_START: ${{ inputs.no_start }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "schedule" ]; then
+          # Reject a node name outside the fleet naming scheme before it reaches
+          # $GITHUB_ENV and the later ssh steps. The charset excludes newlines,
+          # so a multiline value cannot inject extra environment variables
+          # (e.g. overriding ACTION to bypass the audit-only schedule path).
+          if [ -n "${INPUT_NODE}" ] && ! [[ "${INPUT_NODE}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "invalid node: allowed chars [A-Za-z0-9._-]" >&2
+            exit 1
+          fi
+          if [ "${EVENT_NAME}" = "schedule" ]; then
             {
               echo "ACTION=audit"
               echo "NODE="
@@ -56,9 +69,9 @@ jobs:
             } >> "$GITHUB_ENV"
           else
             {
-              echo "ACTION=${{ inputs.action }}"
-              echo "NODE=${{ inputs.node }}"
-              echo "NO_START=${{ inputs.no_start }}"
+              echo "ACTION=${INPUT_ACTION}"
+              echo "NODE=${INPUT_NODE}"
+              echo "NO_START=${INPUT_NO_START}"
             } >> "$GITHUB_ENV"
           fi
 
@@ -155,7 +168,7 @@ jobs:
       # Each run saves under a unique key and restores the most recent one by prefix.
       - name: Restore audit alert state
         if: env.ACTION == 'audit'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: .audit-alert-state
           key: continuous-sync-audit-state-${{ github.run_id }}
@@ -190,7 +203,7 @@ jobs:
         if: always() && env.ACTION == 'audit'
         # A lost state save only costs one duplicate reminder; never fail the job for it.
         continue-on-error: true
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: .audit-alert-state
           key: continuous-sync-audit-state-${{ github.run_id }}

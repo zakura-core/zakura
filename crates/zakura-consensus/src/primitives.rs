@@ -142,15 +142,15 @@ fn flush_block_verifier_batches() {
     }
 
     if let Some(verifier) = Lazy::get(&halo2::VERIFIER_PRE_NU6_2) {
-        queue_batch_flush("halo2_pre_nu6_2", verifier.primary().clone().try_flush());
+        queue_batch_flush("halo2_pre_nu6_2", halo2::try_flush(verifier));
     }
 
     if let Some(verifier) = Lazy::get(&halo2::VERIFIER_NU6_2) {
-        queue_batch_flush("halo2_nu6_2", verifier.primary().clone().try_flush());
+        queue_batch_flush("halo2_nu6_2", halo2::try_flush(verifier));
     }
 
     if let Some(verifier) = Lazy::get(&halo2::VERIFIER_NU6_3_ONWARD) {
-        queue_batch_flush("halo2_nu6_3_onward", verifier.primary().clone().try_flush());
+        queue_batch_flush("halo2_nu6_3_onward", halo2::try_flush(verifier));
     }
 }
 

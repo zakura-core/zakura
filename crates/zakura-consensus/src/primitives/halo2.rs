@@ -12,11 +12,13 @@ use std::{
 use futures::{future::BoxFuture, FutureExt};
 use once_cell::sync::Lazy;
 use orchard::{
-    bundle::{BatchError, BatchValidator},
+    bundle::{BatchError, BatchValidator, BundleVersion},
     circuit::{OrchardCircuitVersion, VerifyingKey},
+    ProtocolVersion, ValuePool,
 };
 use rand::thread_rng;
 use zakura_chain::{parameters::NetworkUpgrade, transaction::SigHash};
+use zcash_primitives::transaction::components::orchard::write_v5_bundle;
 use zcash_protocol::value::ZatBalance;
 
 use crate::{error::TransactionError, BoxError};
@@ -28,8 +30,12 @@ use tower_fallback::Fallback;
 
 use super::spawn_fifo;
 
+mod cache;
+
 #[cfg(test)]
 mod tests;
+
+use cache::Cached;
 
 /// Adjusted batch size for halo2 batches.
 ///
@@ -41,6 +47,18 @@ mod tests;
 /// [`HALO2_MAX_BATCH_SIZE`] total actions among pending items in the queue.
 const HALO2_MAX_BATCH_SIZE: usize = super::MAX_BATCH_SIZE;
 
+/// The number of verified-proof keys retained per Orchard circuit era.
+///
+/// Sized to hold several blocks of history plus a full mempool, so that a transaction gossiped
+/// well before the block that mines it is still remembered. At 32-byte keys this is on the order
+/// of a megabyte per era.
+const CACHE_CAPACITY: usize = 20_000;
+
+/// A key that determines every input to one [`Item`]'s proof verification.
+///
+/// See [`Item::cache_key`] for the construction and for why completeness matters.
+type CacheKey = [u8; 32];
+
 /// The type of verification results.
 type VerifyResult = bool;
 
@@ -50,6 +68,12 @@ type Sender = watch::Sender<Option<VerifyResult>>;
 /// The type of a prepared verifying key.
 /// This is the key used to verify individual items.
 pub type ItemVerifyingKey = VerifyingKey;
+
+/// The BLAKE2b personalization for [`Item`] cache keys.
+///
+/// Domain-separates these keys from every other BLAKE2b-256 hash in the protocol, so that a
+/// cache key can never be confused with a txid, an auth digest, or a sighash.
+const HALO2_CACHE_PERSONALIZATION: &[u8; 16] = b"ZakuraHalo2Cache";
 
 // The Orchard Action circuit, and therefore its verifying key, changes across protocol eras.
 // A proof produced under one circuit version does not verify under the other keys. So we keep
@@ -150,6 +174,71 @@ impl Item {
         }
         batch.validate(thread_rng())
     }
+
+    /// Returns a key that determines every input to this item's proof verification.
+    ///
+    /// [`Cached`] reuses a previous `Ok` result whenever this key matches, so the key must commit
+    /// to everything [`BatchValidator::add_bundle`] reads. The bundle's consensus encoding is
+    /// injective, so hashing it commits to the whole bundle. The verifying key is absent on
+    /// purpose: each Orchard circuit era has its own cache, so an entry is only read back under
+    /// the key it was written against (see [`verifier_for`]).
+    ///
+    /// Do not derive this key by hand. The txid does not commit to authorizing data under ZIP 244
+    /// (CVE-2026-34377), and `(auth digest, sighash)` is also incomplete: the Orchard and Ironwood
+    /// bundles of one v6 transaction share both.
+    fn cache_key(&self) -> CacheKey {
+        // Destructured exhaustively on purpose: adding a field to `Item` is a compile error here
+        // until someone decides whether it belongs in the key.
+        let Item { bundle, sighash } = self;
+
+        let mut hasher = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(HALO2_CACHE_PERSONALIZATION)
+            .to_state();
+
+        hasher.update(&[bundle_version_discriminant(bundle.bundle_version())]);
+        hasher.update(&sighash.0);
+
+        // A total encoder is required, because `cache_key` cannot fail. `write_v5_bundle` and
+        // `write_v6_bundle` both delegate to one private `write_bundle`, differing only in v6's
+        // precondition on the bundle version, so v5 encodes every version — including Ironwood's,
+        // outside its documented v5 contract — and the choice cannot change the bytes.
+        let mut encoded = Vec::new();
+        write_v5_bundle(Some(bundle.as_ref()), &mut encoded)
+            .expect("encoding a bundle into a Vec cannot fail: the encoder only reports IO errors");
+        hasher.update(&encoded);
+
+        hasher
+            .finalize()
+            .as_bytes()
+            .try_into()
+            .expect("hash_length(32) produces exactly 32 bytes")
+    }
+}
+
+/// Returns a stable one-byte discriminant for `version`.
+///
+/// A bundle's consensus encoding contains its flag byte but not its [`BundleVersion`], and two
+/// bundles in different value pools can share a flag byte, so [`Item::cache_key`] commits to the
+/// value pool and protocol version separately. Today the pool affects verification only through
+/// the flags, but the bundle version already selects other version-dependent behaviour in the
+/// `orchard` crate, and one byte removes the need to re-check that on every dependency bump.
+///
+/// Both matches are exhaustive: a new value pool or protocol version is a compile error here
+/// until it is given a discriminant on purpose.
+fn bundle_version_discriminant(version: BundleVersion) -> u8 {
+    let pool = match version.value_pool() {
+        ValuePool::Orchard => 0x00,
+        ValuePool::Ironwood => 0x10,
+    };
+
+    let protocol = match version.protocol_version() {
+        ProtocolVersion::InsecureV1 => 0x00,
+        ProtocolVersion::V2 => 0x01,
+        ProtocolVersion::V3 => 0x02,
+    };
+
+    pool | protocol
 }
 
 trait QueueBatchVerify {
@@ -217,12 +306,15 @@ impl Service<Item> for OrchardFallback {
     }
 }
 
+/// The batching-and-fallback stack for one Orchard circuit era, before caching.
+type BatchFallbackService = Fallback<Batch<Verifier, Item>, OrchardFallback>;
+
 /// The concrete type of a global Halo2 verification service.
 ///
 /// Each Orchard circuit era gets its own instance — see [`VERIFIER_PRE_NU6_2`], [`VERIFIER_NU6_2`],
-/// or [`VERIFIER_NU6_3_ONWARD`] — so that batches, fallbacks, and verifying keys are fully
+/// or [`VERIFIER_NU6_3_ONWARD`] — so that batches, fallbacks, verifying keys, and caches are fully
 /// separated per era.
-type VerifierService = Fallback<Batch<Verifier, Item>, OrchardFallback>;
+type VerifierService = Cached<BatchFallbackService>;
 
 /// Builds a global Halo2 verifier that validates every item against `vk`.
 ///
@@ -231,7 +323,17 @@ type VerifierService = Fallback<Batch<Verifier, Item>, OrchardFallback>;
 /// passed here, so an item built by this verifier is always checked against exactly one era's key.
 /// Callers select the correct era's key by which `VERIFYING_KEY_*` they pass; there is no runtime
 /// key resolution.
+///
+/// The stack is wrapped in a [`Cached`] so that a proof gossiped into the mempool does not have
+/// to be verified again when the block that mines it arrives. Because each era builds its own
+/// verifier here, each era also gets its own cache, which is what binds a remembered result to the
+/// `vk` it was produced under.
 fn batch_verifier(vk: &'static ItemVerifyingKey) -> VerifierService {
+    Cached::new(batch_fallback_verifier(vk), CACHE_CAPACITY)
+}
+
+/// Builds the uncached batching-and-fallback stack for `vk`.
+fn batch_fallback_verifier(vk: &'static ItemVerifyingKey) -> BatchFallbackService {
     Fallback::new(
         Batch::new(
             Verifier::new(vk),
@@ -336,6 +438,17 @@ fn lazy_verifier_for(network_upgrade: NetworkUpgrade) -> &'static Lazy<VerifierS
 /// is a compile error here until it is bound to a key on purpose.
 pub fn verifier_for(network_upgrade: NetworkUpgrade) -> &'static VerifierService {
     lazy_verifier_for(network_upgrade)
+}
+
+/// Returns how many times `item` has reached its era's inner Halo2 verifier.
+#[cfg(test)]
+pub(crate) fn inner_calls_for(network_upgrade: NetworkUpgrade, item: &Item) -> usize {
+    verifier_for(network_upgrade).inner_calls_for(item)
+}
+
+/// Attempts to flush the batching service wrapped by `verifier`.
+pub(super) fn try_flush(verifier: &VerifierService) -> Result<bool, BoxError> {
+    verifier.inner().primary().clone().try_flush()
 }
 
 /// Halo2 proof verifier implementation

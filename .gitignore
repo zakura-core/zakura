@@ -160,6 +160,7 @@ __pycache__/
 # .claude is a symlink to .agents; keep agent-local state out of git
 .agents/*
 !.agents/skills
+!.agents/rules
 local_data/**
 
 # fuzzing artifacts

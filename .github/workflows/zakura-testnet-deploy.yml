@@ -49,8 +49,23 @@ jobs:
       ZAKURA_DEPLOYER_BUILD_CACHE_DIR: /mnt/data/zakura-deployer/binaries
 
     steps:
+      - name: Validate deploy inputs
+        env:
+          REF: ${{ inputs.ref }}
+          NODE: ${{ inputs.node }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "invalid ref: allowed chars [A-Za-z0-9._/-]" >&2
+            exit 1
+          fi
+          if [ -n "${NODE}" ] && ! [[ "${NODE}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "invalid node: allowed chars [A-Za-z0-9._-]" >&2
+            exit 1
+          fi
+
       - name: Checkout deploy ref
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
           ref: ${{ inputs.ref }}
@@ -108,6 +123,8 @@ jobs:
 
       - name: Generate deployer fleet config
         working-directory: deploy/deployer
+        env:
+          REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
 
@@ -138,7 +155,7 @@ jobs:
           [[nodes]]
           name       = "zakura-testnet-1"
           ssh_string = "root@167.99.103.111"
-          commit     = "${{ inputs.ref }}"
+          commit     = "${REF}"
           network_cache_dir = "/mnt/data/zakura-cache"
           state_cache_dir = "/mnt/data/zakura-cache"
           log_file = "/mnt/data/logs/zakura.log"
@@ -146,7 +163,7 @@ jobs:
           [[nodes]]
           name       = "zakura-testnet-eu"
           ssh_string = "root@164.92.209.78"
-          commit     = "${{ inputs.ref }}"
+          commit     = "${REF}"
           network_cache_dir = "/mnt/data/zakura-cache"
           state_cache_dir = "/mnt/data/zakura-cache"
           log_file = "/mnt/data/logs/zakura.log"
@@ -154,7 +171,7 @@ jobs:
           [[nodes]]
           name       = "zakura-testnet-as"
           ssh_string = "root@206.189.148.0"
-          commit     = "${{ inputs.ref }}"
+          commit     = "${REF}"
           network_cache_dir = "/mnt/data/zakura-cache"
           state_cache_dir = "/mnt/data/zakura-cache"
           log_file = "/mnt/data/logs/zakura.log"
@@ -162,33 +179,40 @@ jobs:
 
       - name: Build deployer binary
         working-directory: deploy/deployer
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
           args=(--config nodes.ci.toml)
-          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+          if [ "${FORCE_REBUILD}" = "true" ]; then
             args+=(--force)
           fi
-          if [ -n "${{ inputs.node }}" ]; then
-            args+=(--node "${{ inputs.node }}")
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
           fi
 
           python3 deploy.py build "${args[@]}"
 
       - name: Deploy fleet
         working-directory: deploy/deployer
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
           args=(--config nodes.ci.toml)
-          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+          if [ "${FORCE_REBUILD}" = "true" ]; then
             args+=(--force)
           fi
-          if [ "${{ inputs.no_restart }}" = "true" ]; then
+          if [ "${NO_RESTART}" = "true" ]; then
             args+=(--no-restart)
           fi
-          if [ -n "${{ inputs.node }}" ]; then
-            args+=(--node "${{ inputs.node }}")
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
           fi
 
           python3 deploy.py deploy "${args[@]}"
@@ -196,12 +220,14 @@ jobs:
       - name: Show fleet status
         if: always()
         working-directory: deploy/deployer
+        env:
+          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
           args=(--config nodes.ci.toml)
-          if [ -n "${{ inputs.node }}" ]; then
-            args+=(--node "${{ inputs.node }}")
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
           fi
 
           python3 deploy.py status "${args[@]}"
@@ -305,19 +331,21 @@ jobs:
       - name: Fetch recent logs on failure
         if: failure()
         working-directory: deploy/deployer
+        env:
+          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
           args=(--config nodes.ci.toml --lines 300)
-          if [ -n "${{ inputs.node }}" ]; then
-            args+=(--node "${{ inputs.node }}")
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
           fi
 
           python3 deploy.py logs fetch "${args[@]}" || true
 
       - name: Upload failure logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
         with:
           name: zakura-testnet-deploy-logs-${{ github.run_id }}
           path: deploy/deployer/logs/

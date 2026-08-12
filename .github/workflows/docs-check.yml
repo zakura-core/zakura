@@ -103,7 +103,7 @@ jobs:
           node-version: "22"
 
       - name: Install markdownlint-cli
-        run: npm install -g markdownlint-cli
+        run: npm install -g markdownlint-cli # zizmor: ignore[adhoc-packages] -- markdown linter only; repo has no npm lockfile to install from, and the job is read-only with no credentials persisted
 
       - name: Run markdownlint
         run: |

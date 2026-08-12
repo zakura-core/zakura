@@ -103,10 +103,6 @@ criteria = "safe-to-deploy"
 version = "1.0.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.anstyle-query]]
-version = "1.1.5"
-criteria = "safe-to-deploy"
-
 [[exemptions.anstyle-wincon]]
 version = "3.0.11"
 criteria = "safe-to-deploy"
@@ -215,10 +211,6 @@ criteria = "safe-to-deploy"
 version = "0.5.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.byte-slice-cast]]
-version = "1.2.3"
-criteria = "safe-to-deploy"
-
 [[exemptions.bytemuck]]
 version = "1.25.0"
 criteria = "safe-to-deploy"
@@ -282,10 +274,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.clap_derive]]
 version = "4.6.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.clap_lex]]
-version = "1.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.cmake]]
@@ -619,10 +607,6 @@ criteria = "safe-to-deploy"
 version = "0.3.32"
 criteria = "safe-to-deploy"
 
-[[exemptions.futures-core]]
-version = "0.3.32"
-criteria = "safe-to-deploy"
-
 [[exemptions.futures-executor]]
 version = "0.3.32"
 criteria = "safe-to-deploy"
@@ -632,10 +616,6 @@ version = "2.6.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.futures-macro]]
-version = "0.3.32"
-criteria = "safe-to-deploy"
-
-[[exemptions.futures-task]]
 version = "0.3.32"
 criteria = "safe-to-deploy"
 
@@ -1005,10 +985,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.lru]]
 version = "0.13.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.lru-slab]]
-version = "0.1.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.lz4-sys]]
@@ -1704,10 +1680,6 @@ criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade"
 
-[[exemptions.serde-big-array]]
-version = "0.5.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.serde_bytes]]
 version = "0.11.19"
 criteria = "safe-to-deploy"
@@ -1798,10 +1770,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.spki]]
 version = "0.7.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.str_stack]]
-version = "0.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.stun-rs]]

@@ -12,6 +12,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.7 -> 1.0.8"
 
+[[audits.anstyle-query]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.5"
+notes = "Reviewed all packaged source, manifest, and example. Runtime behavior is limited to terminal-related environment reads and, on Windows, enabling virtual-terminal mode on borrowed stdout and stderr handles; the FFI validates the handle and checks both Win32 return values. No build script, filesystem or network access, or process execution. All 3 unit tests passed."
+
 [[audits.axum]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -73,6 +79,12 @@ criteria = "safe-to-deploy"
 version = "0.2.0"
 notes = "Reviewed all packaged source, manifest, and tests. The crate has no runtime dependencies or unsafe code and only formats a supplied std Backtrace then parses its documented Debug structure into owned strings and integers. It has no build script, filesystem or network access, process execution, or other ambient capabilities. All 8 unit tests and 1 doctest passed."
 
+[[audits.byte-slice-cast]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.2.3"
+notes = "Reviewed all packaged source, manifest, and tests. Raw slice construction checks byte length and alignment before conversion, and unsafe marker implementations are limited to numeric primitives, floats, unit, and homogeneous arrays whose layouts support the declared byte views. The no_std crate has no build script, I/O, or ambient capabilities. All 18 all-feature unit tests and 6 doctests passed; 13 unit tests and the same doctests also passed without default features."
+
 [[audits.bytemuck]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -128,6 +140,12 @@ delta = "4.5.5 -> 4.5.8"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-run"
 delta = "4.5.5 -> 4.5.8"
+
+[[audits.clap_lex]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.0"
+notes = "Reviewed all packaged source, manifest, and tests. RawArgs owns its argument storage and bounds its private cursor, while unsafe OsStr reconstruction only splits bytes returned by as_encoded_bytes at UTF-8 or documented platform-encoding boundaries. There is no build script, runtime I/O, or ambient capability. All 17 applicable doctests passed; 1 example was ignored as documented."
 
 [[audits.colorchoice]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -231,6 +249,12 @@ criteria = "safe-to-deploy"
 delta = "0.3.30 -> 0.3.31"
 
 [[audits.futures-core]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.32"
+notes = "Reviewed all packaged source and manifest. AtomicWaker serializes every UnsafeCell access with its atomic state bits, transfers the stored Waker once, and restores the idle state before invoking user wake code; its stream pin projection keeps the wrapped field in place. The no_std crate has no build script, I/O, or ambient capabilities, and separately policy-checked dependencies are feature-gated. All-feature library tests and the no-default-features target passed; the package has no unit tests, and its doctests reference an umbrella futures dev dependency omitted from the published manifest."
+
+[[audits.futures-core]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.30 -> 0.3.31"
@@ -266,6 +290,12 @@ notes = "Reviewed all packaged source and manifest. This no_std, dependency-free
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.30 -> 0.3.31"
+
+[[audits.futures-task]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.32"
+notes = "Reviewed all packaged source and manifest. Lifetime-erased future pointers remain tied to their source lifetime and allocation-specific drop function, FutureObj only accepts Send representations, and RawWaker operations balance Arc ownership across clone, wake, and drop. Borrowed WakerRef values cannot outlive their Arc. The no_std crate has no build script, I/O, or ambient capabilities. Its all-feature unit test and no-default-features target passed; doctests reference an umbrella futures dev dependency omitted from the published manifest."
 
 [[audits.futures-task]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -444,6 +474,12 @@ version = "0.0.5"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.4.21 -> 0.4.22"
+
+[[audits.lru-slab]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.2"
+notes = "Reviewed all packaged source, manifest, and tests. This no_std allocation-only LRU slab maintains bounded vector indices and linked-list invariants; its unsafe mutable iterator holds an exclusive slice and advances a shared remaining count so forward and reverse iteration yield each occupied slot at most once. Invalid or vacant caller keys can panic but do not bypass memory safety. There is no build script, I/O, or ambient capability. All 5 unit tests passed."
 
 [[audits.md5]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -719,6 +755,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.210 -> 1.0.211"
 
+[[audits.serde-big-array]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.5.1"
+notes = "Reviewed all packaged source, manifest, and tests. Array deserialization and Default write elements into aligned MaybeUninit storage, increment the initialized count only after each successful write, drop exactly that prefix on errors or unwinding, and assume initialization only after all N elements are present. The no_std crate has no build script, I/O, or ambient capability. All 9 integration tests and 2 doctests passed."
+
 [[audits.serde_derive]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -832,6 +874,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.2.1"
 notes = "Reviewed the unsafe marker-trait contracts and every standard-library and allocation implementation. Each implementation preserves the stable pointee-address invariant, and CloneStableDeref implementations preserve the same-address invariant. The crate has no dependencies, build script, runtime I/O, or ambient authority; all six documentation tests passed."
+
+[[audits.str_stack]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.0"
+notes = "Reviewed all packaged source, manifest, and tests. Unsafe string slicing uses monotonic offsets captured from String lengths after valid UTF-8 appends, and Writer records its final boundary on drop; an interrupted caller-supplied Read can leave an ungrouped valid prefix but cannot invalidate the slicing boundaries. There are no dependencies, build script, or independently acquired ambient capabilities. All 4 unit tests and 3 doctests passed."
 
 [[audits.sync_wrapper]]
 who = "OpenAI Codex <noreply@openai.com>"

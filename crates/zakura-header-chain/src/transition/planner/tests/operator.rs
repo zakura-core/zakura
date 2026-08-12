@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn operator_invalidation_rejects_the_finalized_anchor() {
+    let (store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let anchor = store.graph.finalized();
+
+    let err = apply_transition(
+        &store,
+        operator_invalidate(
+            &store,
+            anchor.hash,
+            crate::OperatorInvalidationId::new([0xa1; 16]),
+            0xa2,
+        ),
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .expect_err("invalidating the finalized anchor must fail before any graph edit");
+    assert_eq!(
+        err,
+        TransitionFailure::InvalidEvidence(
+            "operator invalidation cannot target the finalized anchor"
+        )
+    );
+}
+
+#[test]
 // AUD-10/AUD-12: invalidation must reselect eligible work without erasing
 // independent exclusion reasons. This fixture exercises both rules in one graph.
 fn operator_invalidation_promotes_alternate_and_preserves_nested_reasons() {

@@ -1330,6 +1330,11 @@ fn apply_event<G: HeaderGraphEdit>(
                     "operator invalidation identity is not bound to its target",
                 ));
             }
+            if event.target == graph.view_finalized_frontier().hash {
+                return Err(TransitionFailure::InvalidEvidence(
+                    "operator invalidation cannot target the finalized anchor",
+                ));
+            }
             *operator_reason_changed = graph.edit_add_header_eligibility_reason(
                 event.target,
                 EligibilityReason::operator_invalid(event.target, event.id, event.evidence),

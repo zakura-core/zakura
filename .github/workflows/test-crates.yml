@@ -7,6 +7,9 @@ on:
   # check reporting on every PR instead of sitting in "Expected" forever.
   pull_request:
     branches: [main, "feat/**", "release/**"]
+    # Allows maintainers to trigger checks on an unchanged PR head when
+    # backfilling newly required status contexts.
+    types: [opened, synchronize, reopened, labeled]
 
   push:
     branches: [main, "feat/**", "release/**"]

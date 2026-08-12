@@ -30,6 +30,9 @@ on:
   # per-package checks when none are affected. Push keeps its own paths filter.
   pull_request:
     branches: [main, "feat/**", "release/**"]
+    # Allows maintainers to trigger checks on an unchanged PR head when
+    # backfilling newly required status contexts.
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main]
     paths:

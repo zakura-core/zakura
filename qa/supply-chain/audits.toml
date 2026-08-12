@@ -42,6 +42,12 @@ criteria = "safe-to-deploy"
 version = "3.0.11"
 notes = "Reviewed all packaged source, manifest, examples, and tests. Windows console handling borrows caller-owned handles, rejects invalid handles, initializes FFI output storage, and checks API results; the non-Windows path only formats ANSI to a caller-provided writer. No build script or ambient authority. Host all-feature targets compiled; the package's only active test is Windows-specific."
 
+[[audits.arrayvec]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.7.8"
+notes = "Reviewed all packaged source, manifest, and tests. Fixed-capacity storage limits lengths to its encoded length type, initializes elements through MaybeUninit, checks capacity at safe mutation boundaries, preserves initialized-element and UTF-8 invariants through drain, retain, panic, and zero-sized-type paths, and validates optional Serde and Borsh inputs. It has no build script or ambient authority. All 64 all-feature unit and integration tests and 45 doctests passed."
+
 [[audits.async-compat]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1973,6 +1979,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.63 -> 1.0.64"
 
+[[audits.thread_local]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.10"
+notes = "Reviewed all packaged source, manifest, and tests. Bucket allocation and destruction are paired, each live thread exclusively initializes its assigned slot, Release and Acquire publication protects initialized values, thread IDs are recycled only after thread exit, and mutable iteration requires exclusive access. There is no build script, I/O, or ambient authority. All 9 unit tests and 2 doctests passed; the nightly TLS branch was source-reviewed but is not enabled on the stable test host."
+
 [[audits.time-core]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -2397,6 +2409,24 @@ criteria = "safe-to-deploy"
 version = "0.59.3"
 notes = "Reviewed all packaged proc-macro source and manifest content. Generated COM wrappers are repr-transparent, preserve vtable ABI and QueryInterface ancestry, keep call methods unsafe, and bind scoped borrowed implementations to their owner. GUID and method forms are validated. No build script, I/O, or ambient authority. The library target compiled; one published-package doctest requires an omitted workspace-only windows-core development dependency."
 
+[[audits.windows-numerics]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.0"
+notes = "Reviewed all packaged source and manifest content. The crate defines repr(C) f32 vector and matrix values with bounded arithmetic; its only unsafe operations call fixed Windows Direct2D helpers with initialized outputs and valid pointers. It has no build script, filesystem, network, or process capability. Library and documentation targets compiled; the package defines no tests."
+
+[[audits.windows-numerics]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.2.0 -> 0.3.1"
+notes = "Reviewed the complete packaged source and manifest delta. Changes are mechanical Self substitutions, lint and MSRV updates, dependency updates, Rust 2024 FFI syntax, and standard-feature forwarding; the reviewed value layouts, arithmetic, and Direct2D pointer invariants are unchanged. Library and documentation targets compiled; the package defines no tests."
+
+[[audits.windows-registry]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.6.1"
+notes = "Reviewed all packaged source and manifest content. Owned registry key and transaction handles close exactly once, Windows heap allocations are paired with the same heap, string buffers are NUL-terminated, output lengths are checked before decoding, and all Win32 return statuses are translated. Registry reads and writes occur only through explicit caller operations; there is no build script, network, or process capability. The host library target compiled; Windows-only doctests cannot resolve cfg-gated exports on macOS."
+
 [[audits.windows-result]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -2408,6 +2438,18 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.4 -> 0.4.1"
 notes = "Reviewed the complete source and manifest delta. Changes are limited to linting and helper naming around thread-local Windows error retrieval, plus an HRESULT helper; the audited FFI ownership and buffer invariants are unchanged. The all-feature library target compiled. Its error-message doctest is Windows-specific and fails on the non-Windows host because only the hexadecimal fallback is available."
+
+[[audits.windows-strings]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.2"
+notes = "Reviewed all packaged source and manifest content. BSTR and HSTRING allocation, cloning, reference counting, static-string flags, and destruction are paired; builder buffers reserve terminator storage; raw pointer string reads remain unsafe APIs with stated caller preconditions; and literal macros emit matching repr(C), NUL-terminated static layouts. No build script or ambient authority. The host library target compiled; its Windows-only doctest cannot resolve cfg-gated exports on macOS."
+
+[[audits.windows-strings]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.4.2 -> 0.5.1"
+notes = "Reviewed the complete packaged source and manifest delta. Changes are Rust 2024 unsafe-extern syntax, Self and formatter cleanup, a safe builder Debug implementation, dependency updates, and relocation of the literal HSTRING header within the macro with the same repr(C) layout; reviewed ownership and pointer invariants are unchanged. The host library target compiled; its Windows-only doctest cannot resolve cfg-gated exports on macOS."
 
 [[audits.windows-sys]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

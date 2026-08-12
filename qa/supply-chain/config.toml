@@ -95,10 +95,6 @@ criteria = "safe-to-deploy"
 version = "1.9.2"
 criteria = "safe-to-deploy"
 
-[[exemptions.arrayvec]]
-version = "0.7.8"
-criteria = "safe-to-deploy"
-
 [[exemptions.async_io_stream]]
 version = "0.3.3"
 criteria = "safe-to-deploy"
@@ -305,6 +301,7 @@ criteria = "safe-to-deploy"
 [[exemptions.fixedbitset]]
 version = "0.5.7"
 criteria = "safe-to-deploy"
+notes = "Audit hold: the safe grow_and_insert(usize::MAX) path adds one without checked arithmetic. In release builds the length wraps to zero, grow does not allocate, and the method then performs an unchecked out-of-bounds write through get_unchecked_mut. Retain the exemption pending checked overflow handling before the raw write."
 
 [[exemptions.flate2]]
 version = "1.1.9"
@@ -662,6 +659,7 @@ notes = "Audit held: the public Nla trait permits value_len values above u16::MA
 [[exemptions.netlink-proto]]
 version = "0.11.5"
 criteria = "safe-to-deploy"
+notes = "Audit hold: Connection::forward_responses calls unimplemented! for a NetlinkPayload::Overrun response. The kernel can legitimately report an overrun when messages are lost, so valid external input can panic the connection future. Retain the exemption pending fallible handling or forwarding of overrun messages."
 
 [[exemptions.netlink-sys]]
 version = "0.8.8"
@@ -1004,6 +1002,7 @@ notes = "Sentry 0.47 upgrade"
 [[exemptions.self_cell]]
 version = "1.2.2"
 criteria = "safe-to-deploy"
+notes = "Audit hold: the optional old_rust feature deliberately uses a pre-1.51 field-pointer projection that the crate documents as technically undefined behavior. Zakura's MSRV does not execute that branch, but retain the version-wide exemption until the legacy UB path is removed or excluded by feature-scoped policy."
 
 [[exemptions.semver]]
 version = "1.0.28"
@@ -1137,10 +1136,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.thread-priority]]
 version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.thread_local]]
-version = "1.1.10"
 criteria = "safe-to-deploy"
 
 [[exemptions.time]]
@@ -1306,26 +1301,7 @@ criteria = "safe-to-deploy"
 [[exemptions.windows-implement]]
 version = "0.60.2"
 criteria = "safe-to-deploy"
-
-[[exemptions.windows-numerics]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-numerics]]
-version = "0.3.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-registry]]
-version = "0.6.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-strings]]
-version = "0.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-strings]]
-version = "0.5.1"
-criteria = "safe-to-deploy"
+notes = "Audit hold: #[implement] generates a safe into_outer method in the caller's module even though the crate states safe code must never own the generated COM outer type. Same-module code can create a stack outer, obtain an owned interface through ComObjectInterface::as_interface_ref(...).to_owned(), then drop or move the outer and leave the interface pointing at dead storage. Retain the exemption until outer construction is inaccessible or pinned behind a lifetime-safe wrapper."
 
 [[exemptions.windows-sys]]
 version = "0.52.0"

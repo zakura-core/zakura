@@ -8,9 +8,21 @@ version = "0.7.0"
 notes = "Reviewed all packaged source and manifest. The three procedural derives parse source tokens and generate Command, Component, and Runnable implementations; generated code only uses compile-time package metadata and separately policy-checked dependencies. No unsafe code, build script, runtime I/O, or ambient capabilities. All 4 unit tests passed."
 
 [[audits.anstyle]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.14"
+notes = "Reviewed all packaged source, manifest, examples, and tests. ANSI escape rendering is bounded over typed effects and u8 color channels; the only unchecked UTF-8 conversion consumes a private fixed buffer filled exclusively with static ASCII fragments and decimal digits, with sufficient capacity for the longest RGB sequence. There is no build script or hidden ambient capability; output occurs only through caller-supplied writers. All 8 unit tests passed with all features."
+
+[[audits.anstyle]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.7 -> 1.0.8"
+
+[[audits.anstyle-parse]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+notes = "Reviewed all packaged source, manifest, and tests. The ANSI parser bounds parameter and raw-string buffers before indexing, converts only the initialized prefix of its temporary slice array, and masks packed state transitions into the complete 16-variant repr(u8) enums before transmuting. It has no build script, runtime I/O, or ambient capability. The library target and 2 functional unit tests passed; the generated-table snapshot differed only in the repository-relative source path embedded in its first comment."
 
 [[audits.anstyle-query]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -23,6 +35,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.5"
 notes = "Reviewed all packaged source and manifest. Generated pin projections retain the optional inner future or I/O object in place across every forwarding implementation, while pinned drop enters a Tokio context before destroying it. The on-demand fallback runtime creates one named driver thread and otherwise acquires no hidden capability. There is no build script or unsafe code, and the library target passed."
+
+[[audits.atomic-polyfill]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.3"
+notes = "Reviewed all packaged source, manifest, and build script. Known targets either re-export core atomics or place every UnsafeCell access for emulated integer, boolean, and pointer atomics inside the platform-provided critical section; Send and Sync therefore rely on that separately policy-checked global critical-section contract. The build script only classifies Cargo's TARGET value. Both the native re-export path and a forced full-polyfill library target compiled."
 
 [[audits.axum]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -197,6 +215,18 @@ criteria = "safe-to-deploy"
 version = "0.9.6"
 notes = "Reviewed all packaged source, manifest, generated OID database, and tests. The no_std implementation performs checked fixed-buffer OID parsing and BER/DER encoding; the database feature adds only generated static constants and lookup tables, and the optional arbitrary dependency is separately policy-checked. Unsafe code is forbidden and there is no build script, runtime I/O, or ambient capability. All 18 unit and integration tests and 2 doctests passed with all features."
 
+[[audits.cpufeatures]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.17"
+notes = "Reviewed all packaged source, manifest, and tests. Runtime detection uses CPUID only on supported x86 targets, checks OSXSAVE before xgetbv, queries documented HWCAP or read-only Apple sysctl values on Arm and LoongArch, and caches only the resulting boolean. Version 0.2.17 also corrects prior XSAVE classification and freestanding cfg behavior. There is no build script, allocation, filesystem or network access, or process execution. The library target and both applicable AArch64 tests passed."
+
+[[audits.cpufeatures]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.0"
+notes = "Reviewed all packaged source, manifest, and tests, including the 0.3 LoongArch CPUCFG assembly and new x86 SHA-512, SM3, and SM4 checks. Assembly uses register-only pure reads with no memory or stack effects; CPUID and xgetbv retain their feature preconditions, and Apple sysctl buffers remain aligned and size-checked. The crate acquires no capability beyond read-only CPU and OS feature queries. The library target and both applicable AArch64 tests passed."
+
 [[audits.crypto-common]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -245,6 +275,12 @@ criteria = "safe-to-deploy"
 version = "0.3.0"
 notes = "Reviewed all packaged source and manifest. This facade crate only defines documentation traits, performs bounded static-slice lookup and error-string allocation, and re-exports the separately policy-checked derive and PHF dependencies. No unsafe code, build script, I/O, or ambient capabilities. cargo test --all-features passed."
 
+[[audits.documented-macros]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.9.2"
+notes = "Reviewed all packaged source and manifest. The procedural macros parse documentation and customization attributes and generate constants or safe, type-checked documentation trait implementations; the 0.9.2 source changes only adapt case-conversion types and dependency versions. There is no unsafe code, build script, runtime I/O, or ambient capability, and the all-feature library target passed."
+
 [[audits.dyn-clone]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -256,6 +292,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.3.6"
 notes = "Reviewed all packaged source, manifests, tests, and benchmark. Safe UTF-8 and UTF-16 constructors validate lengths, continuation bytes, overlong forms, surrogate ranges, and scalar bounds before reaching unchecked constructors; transmute and pointer operations preserve their documented invariants, and public unchecked constructors require the caller to uphold them. There is no build script or runtime ambient capability; the benchmark alone embeds a host dictionary at compile time when explicitly built. With two obsolete test-only calls that violate their unchecked APIs' slice-length contracts removed from the temporary harness, 26 integration tests, 54 doctests, the ASCII feature, the no_std library target, and an exhaustive sweep over every valid Unicode scalar passed. The obsolete optional Clippy compiler-plugin feature no longer builds on modern Rust."
+
+[[audits.enum-as-inner]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.6.1"
+notes = "Reviewed all packaged source and manifest. The procedural derive accepts only enums and generates type-checked matches that return booleans, references, mutable references, or owned fields without unsafe code. It has no build script, runtime I/O, or ambient capability, and the library target passed."
 
 [[audits.enumflags2_derive]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -348,6 +390,12 @@ delta = "0.3.30 -> 0.3.31"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.30 -> 0.3.31"
+
+[[audits.getset]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.7"
+notes = "Reviewed all packaged source and manifest. The procedural derives parse visibility and prefix options and generate direct type-checked field borrows, clones, copies, and assignments; unsupported inputs become compile errors. There is no unsafe code, build script, runtime I/O, or ambient capability, and the all-feature library target passed."
 
 [[audits.git2]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -605,11 +653,23 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.8.11 -> 1.0.1"
 
+[[audits.multimap]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.10.1"
+notes = "Reviewed all packaged source, manifest, and tests. The crate wraps HashMap values in nonempty vectors maintained by safe insert, entry, remove, retain, iterator, and optional Serde operations; lookups return None rather than indexing absent values. Unsafe code is forbidden and there is no build script, runtime I/O, or ambient capability. All 58 unit tests passed with all features."
+
 [[audits.n0-snafu]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.3"
 notes = "Reviewed all packaged source, manifest, and tests. The crate wraps caller-supplied errors, captures span and backtrace data, and formats error chains using separately policy-checked dependencies. It has no unsafe code, build script, filesystem or network access, or process execution; Debug formatting explicitly reads color-backtrace verbosity from the environment. All 8 unit tests passed with backtrace display disabled to match their expected formatting."
+
+[[audits.nested_enum_utils]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.3"
+notes = "Reviewed all packaged source and manifest. The attribute macros validate single-field enum variants and distinct field types before generating type-checked From and TryFrom implementations, or parse and clone caller-supplied named fields into enum variants. They contain no unsafe code, build script, runtime I/O, or ambient capability, and the library target passed."
 
 [[audits.nix]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -621,6 +681,18 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.2"
 notes = "Reviewed all packaged source and manifest. The zero-dependency no_std crate seals its integer conversion traits, uses compile-time size assertions for every generated conversion, and implements wrapping, saturating, and checked behavior with safe integer operations. No unsafe code, build script, allocation, I/O, or ambient capabilities. All 11 doctests passed."
+
+[[audits.num_enum]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.7.6"
+notes = "Reviewed all packaged source and manifest. This no_std facade defines primitive-conversion traits and a typed conversion error and re-exports the separately audited derives; its only unsafe API explicitly requires a valid enum discriminant from the caller. It has no build script, runtime I/O, or ambient capability, and the all-feature library target passed."
+
+[[audits.num_enum_derive]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.7.6"
+notes = "Reviewed all packaged source, manifest, and tests. The derives require an integer repr, validate variant shapes and catch-all payloads, reject literal discriminant collisions, and generate checked match conversions. The optional transmute implementation is emitted only behind the explicitly unsafe UnsafeFromPrimitive trait and documents the valid-discriminant precondition; catch-all IntoPrimitive handles its payload before reading unit-variant repr bytes. No build script, runtime I/O, or ambient capability. All 8 unit tests passed."
 
 [[audits.num_threads]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -638,6 +710,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.70.2"
 notes = "Reviewed all packaged source and manifest. This dependency-free wrapper safely delegates its small API to std::sync::OnceLock; no unsafe code, build script, I/O, allocation beyond the wrapped value, or ambient capabilities. All-feature unit and doc test targets compiled."
+
+[[audits.openrpsee]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.1"
+notes = "Reviewed all packaged source and manifest. The library parses an explicitly supplied Rust source file, generates OpenRPC descriptors from requested traits, and writes one generated file beneath the caller-supplied output directory; runtime schema generation is in-memory. It contains no unsafe code, build script, network access, process execution, or hidden ambient capability, and the all-feature library target passed."
 
 [[audits.opentelemetry-http]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -711,6 +789,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.3.7"
 notes = "Reviewed all packaged source and manifest. The backend escapes text and attribute values before emitting SVG, writes only to a caller-supplied string or explicitly selected path during present, and optionally encodes caller-supplied image bytes. It has no unsafe code, build script, network access, or process execution. Default and image-feature library targets passed; the published all-feature debug test target retains workspace-only references and is not independently buildable."
+
+[[audits.pnet_base]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.34.0"
+notes = "Reviewed all packaged source, manifest, and tests. This no_std-capable crate provides a six-byte MAC-address value with bounded parsing, formatting, classification, and optional Serde conversion. It has no unsafe code, build script, runtime I/O, or ambient capability. All 7 unit tests passed with all features."
 
 [[audits.postcard-derive]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -887,6 +971,12 @@ criteria = "safe-to-deploy"
 version = "0.5.1"
 notes = "Reviewed all packaged source, manifest, and tests. Array deserialization and Default write elements into aligned MaybeUninit storage, increment the initialized count only after each successful write, drop exactly that prefix on errors or unwinding, and assume initialization only after all N elements are present. The no_std crate has no build script, I/O, or ambient capability. All 9 integration tests and 2 doctests passed."
 
+[[audits.serde_bytes]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.11.19"
+notes = "Reviewed all packaged source and manifest. Bytes and ByteArray are repr(transparent) wrappers over byte slices and arrays, so their reference and boxed-pointer casts preserve layout, metadata, allocation, and lifetimes; deserialization checks fixed lengths and caps only initial allocation hints while remaining type-checked. There is no build script, runtime I/O, or ambient capability, and the all-feature library target passed."
+
 [[audits.serde_derive]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -989,6 +1079,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.2.2 -> 0.3.0"
 
+[[audits.spandoc]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.2"
+notes = "Reviewed all packaged source and manifest. FancyGuard enters and exits a caller-created tracing span, exits before awaiting an instrumented future, re-enters after it resumes, and conditionally exits on drop; the separately audited attribute macro supplies local guards. There is no unsafe code, build script, filesystem or network access, or process execution, and the all-feature library target passed with only obsolete-lint warnings."
+
 [[audits.spandoc-attribute]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1064,6 +1160,12 @@ delta = "1.38.0 -> 1.38.1"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.38.1 -> 1.39.0"
+
+[[audits.tokio-macros]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "2.7.0"
+notes = "Reviewed all packaged source and manifest. The procedural attributes validate literal runtime options and async function shapes before generating type-checked Tokio runtime builders, while select helpers only declare bounded output enums and normalize Rust patterns. There is no unsafe code, build script, runtime I/O, or ambient capability, and the all-feature library target passed."
 
 [[audits.tokio-macros]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1320,6 +1422,12 @@ delta = "0.52.0 -> 0.59.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.52.5 -> 0.52.6"
+
+[[audits.windows-threading]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.1"
+notes = "Reviewed all packaged source and manifest. Submitted closures are boxed once and reclaimed by the one-shot Windows thread-pool callback; public unscoped submission requires 'static, while Scope uses invariant lifetimes and an unwind-safe drop guard that waits for all submitted callbacks before borrowed data can expire. Pool drop waits before closing the cleanup group and pool. The Windows library target cross-compiled for x86_64-pc-windows-msvc."
 
 [[audits.windows_aarch64_gnullvm]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

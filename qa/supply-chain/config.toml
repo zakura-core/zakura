@@ -95,14 +95,6 @@ criteria = "safe-to-deploy"
 version = "1.0.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.anstyle]]
-version = "1.0.14"
-criteria = "safe-to-deploy"
-
-[[exemptions.anstyle-parse]]
-version = "1.0.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.anstyle-wincon]]
 version = "3.0.11"
 criteria = "safe-to-deploy"
@@ -121,10 +113,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.async_io_stream]]
 version = "0.3.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.atomic-polyfill]]
-version = "1.0.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.attohttpc]]
@@ -343,10 +331,6 @@ version = "0.1.1"
 criteria = "safe-to-deploy"
 notes = "Replacement for the yanked core2 crate; pulled in transitively by librustzcash 2026-04 release wave."
 
-[[exemptions.cpufeatures]]
-version = "0.2.12"
-criteria = "safe-to-deploy"
-
 [[exemptions.crc]]
 version = "3.4.0"
 criteria = "safe-to-deploy"
@@ -481,10 +465,6 @@ criteria = "safe-to-deploy"
 version = "0.5.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.documented-macros]]
-version = "0.9.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.ed25519]]
 version = "2.2.3"
 criteria = "safe-to-deploy"
@@ -495,10 +475,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.ed25519-zebra]]
 version = "4.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.enum-as-inner]]
-version = "0.6.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.enumflags2]]
@@ -613,10 +589,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.getrandom]]
 version = "0.4.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.getset]]
-version = "0.1.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.group]]
@@ -983,10 +955,6 @@ criteria = "safe-to-deploy"
 version = "0.1.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.multimap]]
-version = "0.10.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.n0-future]]
 version = "0.1.3"
 criteria = "safe-to-deploy"
@@ -997,10 +965,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.nanorand]]
 version = "0.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.nested_enum_utils]]
-version = "0.2.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.netdev]]
@@ -1064,14 +1028,6 @@ criteria = "safe-to-deploy"
 version = "1.16.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.num_enum]]
-version = "0.7.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.num_enum_derive]]
-version = "0.7.6"
-criteria = "safe-to-deploy"
-
 [[exemptions.objc2]]
 version = "0.6.4"
 criteria = "safe-to-deploy"
@@ -1110,10 +1066,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.once_cell]]
 version = "1.19.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.openrpsee]]
-version = "0.1.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.openssl-probe]]
@@ -1233,10 +1185,6 @@ criteria = "safe-to-deploy"
 [[exemptions.plotters]]
 version = "0.3.7"
 criteria = "safe-to-run"
-
-[[exemptions.pnet_base]]
-version = "0.34.0"
-criteria = "safe-to-deploy"
 
 [[exemptions.pnet_macros]]
 version = "0.34.0"
@@ -1596,10 +1544,6 @@ criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade"
 
-[[exemptions.serde_bytes]]
-version = "0.11.19"
-criteria = "safe-to-deploy"
-
 [[exemptions.serde_derive_internals]]
 version = "0.29.1"
 criteria = "safe-to-deploy"
@@ -1670,10 +1614,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.soketto]]
 version = "0.8.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.spandoc]]
-version = "0.2.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.spin]]
@@ -1758,10 +1698,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tokio]]
 version = "1.52.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.tokio-macros]]
-version = "2.7.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio-rustls]]
@@ -2053,10 +1989,7 @@ criteria = "safe-to-deploy"
 [[exemptions.windows-threading]]
 version = "0.1.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.windows-threading]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
+notes = "Audit held: Pool::submit binds a non-'static closure to a freely inferred temporary borrow of &self, then submits it asynchronously. Safe code can therefore let captured borrowed data expire while the pool and callback remain live. Version 0.2.1 replaces this API with 'static submission plus an invariant scoped API that joins before borrowed data can expire."
 
 [[exemptions.windows_aarch64_gnullvm]]
 version = "0.52.5"

@@ -154,6 +154,17 @@ pub enum StateInitError {
         source: rocksdb::Error,
     },
 
+    /// A migration failure prevents the state database from opening.
+    #[error(
+        "cannot upgrade state database format at {path:?}. The database version remains unchanged, so Zakura can retry the migration: {source}"
+    )]
+    DatabaseFormatUpgrade {
+        /// The path identifies the database that failed migration.
+        path: PathBuf,
+        /// The source describes the migration failure.
+        source: BoxError,
+    },
+
     /// A read-only state was requested, but the configured cache directory is
     /// missing or unreadable.
     ///

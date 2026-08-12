@@ -15,7 +15,7 @@ use zakura_chain::block::Height;
 
 use crate::service::finalized_state::ZakuraDb;
 
-use super::{CancelFormatChange, DiskFormatUpgrade};
+use super::{CancelFormatChange, DiskFormatUpgrade, FormatChangeError};
 
 /// First format that no longer maintains a header-root authentication frontier.
 pub(crate) const UPGRADE_VERSION: Version = Version::new(28, 1, 4);
@@ -34,14 +34,13 @@ impl DiskFormatUpgrade for Upgrade {
 
     fn run(
         &self,
-        _initial_tip_height: Height,
+        _initial_tip_height: Option<Height>,
         db: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<(), CancelFormatChange> {
+    ) -> Result<(), FormatChangeError> {
         check_cancelled(cancel_receiver)?;
-        if let Err(error) = db.clear_retired_header_root_auth_frontier() {
-            panic!("retired header-root frontier removal failed: {error}");
-        }
+        db.clear_retired_header_root_auth_frontier()
+            .map_err(|error| FormatChangeError::Storage(error.to_string()))?;
         check_cancelled(cancel_receiver)?;
         Ok(())
     }
@@ -50,7 +49,7 @@ impl DiskFormatUpgrade for Upgrade {
         &self,
         db: &ZakuraDb,
         _cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<Result<(), String>, CancelFormatChange> {
+    ) -> Result<Result<(), String>, FormatChangeError> {
         Ok(if db.has_retired_header_root_auth_frontier_row() {
             Err("the retired header-root authentication frontier still has a row".to_string())
         } else {
@@ -117,16 +116,16 @@ mod tests {
         assert!(db.has_retired_header_root_auth_frontier_row());
 
         let (_cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
-        DiskFormatUpgrade::run(&Upgrade, Height::MIN, &db, &cancel_rx)
+        DiskFormatUpgrade::run(&Upgrade, Some(Height::MIN), &db, &cancel_rx)
             .expect("clearing the frontier is not cancelled");
-        DiskFormatUpgrade::run(&Upgrade, Height::MIN, &db, &cancel_rx)
+        DiskFormatUpgrade::run(&Upgrade, Some(Height::MIN), &db, &cancel_rx)
             .expect("re-running the clear is idempotent");
 
         assert!(!db.has_retired_header_root_auth_frontier_row());
-        assert_eq!(
+        assert!(matches!(
             DiskFormatUpgrade::validate(&Upgrade, &db, &cancel_rx),
             Ok(Ok(()))
-        );
+        ));
     }
 
     #[test]
@@ -151,11 +150,11 @@ mod tests {
         );
 
         let (_cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
-        DiskFormatUpgrade::run(&Upgrade, Height::MIN, &db, &cancel_rx)
+        DiskFormatUpgrade::run(&Upgrade, Some(Height::MIN), &db, &cancel_rx)
             .expect("a missing column family is not an error");
-        assert_eq!(
+        assert!(matches!(
             DiskFormatUpgrade::validate(&Upgrade, &db, &cancel_rx),
             Ok(Ok(()))
-        );
+        ));
     }
 }

@@ -15,6 +15,7 @@ use std::{
 
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use semver::Version;
+use thiserror::Error;
 use tracing::Span;
 
 use zakura_chain::{
@@ -57,10 +58,10 @@ pub trait DiskFormatUpgrade {
     /// Runs disk format upgrade.
     fn run(
         &self,
-        initial_tip_height: Height,
+        initial_tip_height: Option<Height>,
         db: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<(), CancelFormatChange>;
+    ) -> Result<(), FormatChangeError>;
 
     /// Check that state has been upgraded to this format correctly.
     ///
@@ -70,18 +71,18 @@ pub trait DiskFormatUpgrade {
         &self,
         _db: &ZakuraDb,
         _cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<Result<(), String>, CancelFormatChange> {
+    ) -> Result<Result<(), String>, FormatChangeError> {
         Ok(Ok(()))
     }
 
     /// Prepare for disk format upgrade.
     fn prepare(
         &self,
-        _initial_tip_height: Height,
+        _initial_tip_height: Option<Height>,
         _upgrade_db: &ZakuraDb,
         _cancel_receiver: &Receiver<CancelFormatChange>,
         _older_disk_version: &Version,
-    ) -> Result<(), CancelFormatChange> {
+    ) -> Result<(), FormatChangeError> {
         Ok(())
     }
 
@@ -131,13 +132,19 @@ fn format_upgrades(
             "repair VCT Sprout history",
             Version::new(28, 0, 1),
         )),
-        Box::new(unauthenticated_commitment_roots::Upgrade),
+        // Version 28.0.2 previously removed the header-root authentication frontier.
+        // The registry keeps this version reserved to preserve append-only history.
+        Box::new(no_migration::NoMigration::new(
+            "reserve historical header-root authentication migration version",
+            Version::new(28, 0, 2),
+        )),
         Box::new(no_migration::NoMigration::new(
             "add fork-aware header-chain column families and codecs",
             Version::new(28, 1, 3),
         )),
         Box::new(drop_header_root_auth_frontier::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 13])
+        Box::new(unauthenticated_commitment_roots::Upgrade),
+    ] as [Box<dyn DiskFormatUpgrade>; 14])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -219,7 +226,7 @@ pub struct DbFormatChangeThreadHandle {
     ///
     /// Panics from this thread are propagated into Zebra's state service.
     /// The task returns an error if the upgrade was cancelled by a shutdown.
-    update_task: Option<Arc<JoinHandle<Result<(), CancelFormatChange>>>>,
+    update_task: Option<Arc<JoinHandle<Result<(), FormatChangeError>>>>,
 
     /// A channel that tells the running format thread to finish early.
     cancel_handle: Sender<CancelFormatChange>,
@@ -228,6 +235,26 @@ pub struct DbFormatChangeThreadHandle {
 /// Marker type that is sent to cancel a format upgrade, and returned as an error on cancellation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct CancelFormatChange;
+
+/// A format change error prevents a version update.
+#[derive(Debug, Error)]
+pub enum FormatChangeError {
+    /// Shutdown cancels the format change.
+    #[error("database format change was cancelled")]
+    Cancelled,
+    /// RocksDB rejected a migration write.
+    #[error("database format migration storage write failed: {0}")]
+    Storage(String),
+    /// A migration or final format check reports an invalid postcondition.
+    #[error("database format migration postcondition failed: {0}")]
+    Invalid(String),
+}
+
+impl From<CancelFormatChange> for FormatChangeError {
+    fn from(_: CancelFormatChange) -> Self {
+        Self::Cancelled
+    }
+}
 
 #[cfg(test)]
 type StartupUpgradeHook = Arc<dyn Fn() + Send + Sync>;
@@ -437,7 +464,7 @@ impl DbFormatChange {
         db: ZakuraDb,
         initial_tip_height: Option<Height>,
         cancel_receiver: Receiver<CancelFormatChange>,
-    ) -> Result<(), CancelFormatChange> {
+    ) -> Result<(), FormatChangeError> {
         let Some(debug_validity_check_interval) = db.config().debug_validity_check_interval else {
             return Ok(());
         };
@@ -449,7 +476,7 @@ impl DbFormatChange {
                 cancel_receiver.recv_timeout(debug_validity_check_interval),
                 Err(RecvTimeoutError::Timeout)
             ) {
-                return Err(CancelFormatChange);
+                return Err(FormatChangeError::Cancelled);
             }
 
             Self::check_new_blocks(&db).run_format_change_or_check(
@@ -467,7 +494,7 @@ impl DbFormatChange {
         db: &ZakuraDb,
         initial_tip_height: Option<Height>,
         cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<(), CancelFormatChange> {
+    ) -> Result<(), FormatChangeError> {
         // Mark the database as having finished applying any format upgrades if there are no
         // format upgrades that need to be applied.
         if !self.is_upgrade() {
@@ -586,12 +613,16 @@ impl DbFormatChange {
         //   (unless a future upgrade breaks these format checks)
         // - re-opening the current version should be valid, regardless of whether the upgrade
         //   or new block code created the format (or any combination).
-        Self::format_validity_checks_detailed(db, cancel_receiver)?.unwrap_or_else(|_| {
+        if let Err(message) = Self::format_validity_checks_detailed(db, cancel_receiver)? {
+            if self.is_upgrade() {
+                return Err(FormatChangeError::Invalid(message));
+            }
+
             panic!(
-                "unexpected invalid database format: delete and re-sync the database at '{:?}'",
+                "unexpected invalid database format: delete and re-sync the database at '{:?}': {message}",
                 db.path()
-            )
-        });
+            );
+        }
 
         let initial_disk_version = self
             .initial_disk_version()
@@ -623,9 +654,9 @@ impl DbFormatChange {
         db: &ZakuraDb,
         initial_tip_height: Option<Height>,
         cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<(), CancelFormatChange> {
+    ) -> Result<(), FormatChangeError> {
         let Upgrade {
-            newer_running_version,
+            newer_running_version: _,
             older_disk_version,
         } = self
         else {
@@ -634,28 +665,6 @@ impl DbFormatChange {
 
         #[cfg(test)]
         run_startup_upgrade_hook(db.path());
-
-        // # New Upgrades Sometimes Go Here
-        //
-        // If the format change is outside RocksDb, put new code above this comment!
-        let Some(initial_tip_height) = initial_tip_height else {
-            // If the database is empty, then the RocksDb format doesn't need any changes.
-            info!(
-                %newer_running_version,
-                %older_disk_version,
-                "marking empty database as upgraded"
-            );
-
-            Self::mark_as_upgraded_to(db, newer_running_version);
-
-            info!(
-                %newer_running_version,
-                %older_disk_version,
-                "empty database is fully upgraded"
-            );
-
-            return Ok(());
-        };
 
         // Apply or validate format upgrades
         for upgrade in format_upgrades(Some(older_disk_version.clone())) {
@@ -668,7 +677,7 @@ impl DbFormatChange {
                 // Before marking the state as upgraded, check that the upgrade completed successfully.
                 upgrade
                     .validate(db, cancel_receiver)?
-                    .expect("db should be valid after upgrade");
+                    .map_err(FormatChangeError::Invalid)?;
 
                 timer.finish_desc(upgrade.description());
             }
@@ -719,7 +728,7 @@ impl DbFormatChange {
     pub fn format_validity_checks_detailed(
         db: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<Result<(), String>, CancelFormatChange> {
+    ) -> Result<Result<(), String>, FormatChangeError> {
         let timer = CodeTimer::start();
         let mut results = Vec::new();
 
@@ -1076,12 +1085,13 @@ fn vct_format_changes_include_root_auth_metadata_updates() {
 
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0))).collect();
 
-    assert_eq!(upgrades.len(), 5);
+    assert_eq!(upgrades.len(), 6);
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
     assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
     assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
     assert_eq!(upgrades[3].version(), Version::new(28, 1, 3));
     assert_eq!(upgrades[4].version(), Version::new(28, 1, 4));
+    assert_eq!(upgrades[5].version(), Version::new(28, 1, 5));
     assert!(
         !upgrades[3].needs_migration(),
         "the header-chain column families are created on open without rebasing authenticated roots"

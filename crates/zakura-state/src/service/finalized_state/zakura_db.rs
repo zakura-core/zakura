@@ -235,16 +235,20 @@ impl ZakuraDb {
             )
         }
 
-        db.run_startup_format_change(format_change);
+        db.run_startup_format_change(format_change)?;
 
         Ok(db)
     }
 
-    /// Complete the startup format change before exposing the database, then launch only
-    /// configured periodic current-format checks in the background.
-    pub(crate) fn run_startup_format_change(&mut self, format_change: DbFormatChange) {
+    /// The method completes the startup format change before exposing the database.
+    ///
+    /// The method then launches configured periodic current-format checks.
+    pub(crate) fn run_startup_format_change(
+        &mut self,
+        format_change: DbFormatChange,
+    ) -> Result<(), StateInitError> {
         if self.debug_skip_format_upgrades {
-            return;
+            return Ok(());
         }
 
         // No state service can commit while this synchronous startup operation is running.
@@ -252,12 +256,17 @@ impl ZakuraDb {
         let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
         format_change
             .run_format_change_or_check(self, initial_tip_height, &never_cancel_receiver)
-            .expect("startup format change cannot be cancelled");
+            .map_err(|source| StateInitError::DatabaseFormatUpgrade {
+                path: self.path().to_owned(),
+                source: Box::new(source),
+            })?;
 
         let format_change_handle =
             DbFormatChange::spawn_periodic_format_checks(self.clone(), initial_tip_height);
 
         self.format_change_handle = Some(format_change_handle);
+
+        Ok(())
     }
 
     /// Sets `finished_format_upgrades` to true on the inner [`DiskDb`] to indicate that Zebra has

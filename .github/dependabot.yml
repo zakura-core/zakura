@@ -3,13 +3,14 @@ updates:
   # Rust section
   - package-ecosystem: cargo
     directory: "/"
-    # Update only the lockfile. We shouldn't update Cargo.toml unless it's for
-    # a security issue, or if we need a new feature of the dependency.
-    versioning-strategy: lockfile-only
-    # Keep this entry so Dependabot can open security updates, but do not open
-    # routine Cargo version updates. Lockfile-only version batches need matching
-    # cargo-vet evidence and otherwise fail the supply-chain gate, so maintainers
-    # curate those updates explicitly.
+    # Routine version updates are disabled below. For security updates, preserve
+    # compatible requirements but allow Cargo.toml changes when a patched version
+    # falls outside the existing requirement.
+    versioning-strategy: increase-if-necessary
+    # Keep this entry to customize security updates, but do not open routine Cargo
+    # version updates. Routine dependency upgrades need matching cargo-vet evidence
+    # and otherwise fail the supply-chain gate, so maintainers curate them
+    # explicitly.
     schedule:
       interval: monthly
       timezone: America/New_York

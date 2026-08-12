@@ -155,10 +155,6 @@ criteria = "safe-to-deploy"
 version = "0.6.0-pre.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.bitflags]]
-version = "2.13.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.bitvec]]
 version = "1.1.1"
 criteria = "safe-to-deploy"
@@ -186,10 +182,7 @@ criteria = "safe-to-deploy"
 [[exemptions.bounded-integer]]
 version = "0.5.8"
 criteria = "safe-to-deploy"
-
-[[exemptions.bs58]]
-version = "0.5.1"
-criteria = "safe-to-deploy"
+notes = "Audit hold: the optional bytemuck1 feature implements unsafe Contiguous for every const MIN and MAX without enforcing MIN <= MAX. Bounded<5, 4> therefore violates Bytemuck's explicit inhabited-range contract. Zakura enables only the types feature, so this path is not currently deployed; retain the exemption pending an upstream bound or feature-scoped audit policy."
 
 [[exemptions.bytemuck]]
 version = "1.25.0"
@@ -300,14 +293,6 @@ criteria = "safe-to-deploy"
 version = "0.4.2"
 criteria = "safe-to-deploy"
 
-[[exemptions.convert_case]]
-version = "0.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.convert_case]]
-version = "0.10.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.cordyceps]]
 version = "0.3.4"
 criteria = "safe-to-deploy"
@@ -322,14 +307,6 @@ notes = "Sentry 0.47 upgrade"
 version = "0.1.1"
 criteria = "safe-to-deploy"
 notes = "Replacement for the yanked core2 crate; pulled in transitively by librustzcash 2026-04 release wave."
-
-[[exemptions.crc]]
-version = "3.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.crc-catalog]]
-version = "2.5.0"
-criteria = "safe-to-deploy"
 
 [[exemptions.crc32fast]]
 version = "1.5.0"
@@ -400,6 +377,7 @@ criteria = "safe-to-deploy"
 [[exemptions.data-encoding]]
 version = "2.11.0"
 criteria = "safe-to-deploy"
+notes = "Audit hold: the doc-hidden Encoding tuple field and Encoding::internal_new are safe public APIs that accept arbitrary implementation bytes. A caller can safely supply non-ASCII symbols with an otherwise valid table shape, after which encode_mut_str and encode use unchecked UTF-8 construction. Retain the exemption pending upstream validation or an unsafe constructor boundary."
 
 [[exemptions.der_derive]]
 version = "0.7.3"
@@ -475,10 +453,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.f4jumble]]
 version = "0.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.fastrand]]
-version = "2.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.ff]]
@@ -720,10 +694,6 @@ criteria = "safe-to-deploy"
 version = "0.3.4"
 criteria = "safe-to-deploy"
 
-[[exemptions.ipnet]]
-version = "2.12.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.iroh]]
 version = "0.92.0"
 criteria = "safe-to-deploy"
@@ -840,10 +810,6 @@ criteria = "safe-to-deploy"
 version = "0.12.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.litrs]]
-version = "1.0.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.lock_api]]
 version = "0.4.14"
 criteria = "safe-to-deploy"
@@ -936,10 +902,6 @@ criteria = "safe-to-deploy"
 version = "0.31.3"
 criteria = "safe-to-deploy"
 
-[[exemptions.no-std-net]]
-version = "0.6.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.ntimestamp]]
 version = "1.0.0"
 criteria = "safe-to-deploy"
@@ -1011,10 +973,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry_sdk]]
 version = "0.32.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.optfield]]
-version = "0.4.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.orchard]]
@@ -1189,10 +1147,6 @@ criteria = "safe-to-deploy"
 version = "6.0.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.radium]]
-version = "0.7.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.rand]]
 version = "0.10.2"
 criteria = "safe-to-deploy"
@@ -1239,10 +1193,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.regex-automata]]
 version = "0.4.15"
-criteria = "safe-to-deploy"
-
-[[exemptions.regex-lite]]
-version = "0.1.9"
 criteria = "safe-to-deploy"
 
 [[exemptions.regex-syntax]]
@@ -1555,10 +1505,6 @@ criteria = "safe-to-deploy"
 version = "0.2.31"
 criteria = "safe-to-deploy"
 
-[[exemptions.tinystr]]
-version = "0.8.3"
-criteria = "safe-to-deploy"
-
 [[exemptions.tinyvec]]
 version = "1.12.0"
 criteria = "safe-to-deploy"
@@ -1663,16 +1609,8 @@ criteria = "safe-to-deploy"
 version = "0.3.23"
 criteria = "safe-to-deploy"
 
-[[exemptions.typenum]]
-version = "1.20.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.uint]]
 version = "0.9.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.unicase]]
-version = "2.9.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.ureq]]
@@ -1878,10 +1816,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.x25519-dalek]]
 version = "2.0.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.xml-rs]]
-version = "0.8.28"
 criteria = "safe-to-deploy"
 
 [[exemptions.yoke]]

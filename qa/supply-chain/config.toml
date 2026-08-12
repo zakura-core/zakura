@@ -782,10 +782,6 @@ criteria = "safe-to-deploy"
 version = "1.10.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.humantime]]
-version = "2.4.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.hybrid-array]]
 version = "0.2.3"
 criteria = "safe-to-deploy"
@@ -1072,10 +1068,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.metrics-util]]
 version = "0.19.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.mime]]
-version = "0.3.17"
 criteria = "safe-to-deploy"
 
 [[exemptions.minimal-lexical]]
@@ -1469,10 +1461,6 @@ criteria = "safe-to-deploy"
 version = "0.12.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.quick-error]]
-version = "1.2.3"
-criteria = "safe-to-deploy"
-
 [[exemptions.quick-xml]]
 version = "0.41.0"
 criteria = "safe-to-deploy"
@@ -1607,10 +1595,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.ron]]
 version = "0.12.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.route-recognizer]]
-version = "0.3.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustc-demangle]]
@@ -2125,10 +2109,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.unicode-ident]]
 version = "1.0.24"
-criteria = "safe-to-deploy"
-
-[[exemptions.untrusted]]
-version = "0.9.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.ureq]]

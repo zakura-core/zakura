@@ -275,6 +275,12 @@ criteria = "safe-to-deploy"
 version = "0.4.3"
 notes = "Reviewed all packaged library, optional CLI source, tests, and manifest. Library code performs numeric formatting and fixed-array suffix lookup with no unsafe code or build script; the optional CLI only reads arguments or stdin and writes stdout. The public formatter can panic for f64 values beyond its suffix range, but Zakura calls it only with finite u64-derived database size values, whose maximum remains within that range. All-feature library and binary tests passed."
 
+[[audits.humantime]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "2.4.0"
+notes = "Reviewed all packaged source, manifest, and tests. This dependency-free crate parses and formats caller-supplied Duration and SystemTime values using checked arithmetic and bounded fixed-format parsing. It forbids unsafe code and has no build script, runtime I/O, or ambient capabilities. All 38 unit tests and 5 doctests passed with all features."
+
 [[audits.humantime-serde]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -432,6 +438,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.17.0 -> 0.18.0"
 
+[[audits.mime]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.17"
+notes = "Reviewed all packaged source, manifest, tests, and benchmark. This dependency-free crate parses and formats caller-supplied MIME strings with no build script, runtime I/O, or ambient capabilities. Library code is safe Rust; benchmark-only unsafe code resets a String length to zero. With modern compiler lints capped, 16 unit tests and all 6 doctests passed; one packaged MimeIter expectation remains inconsistent with the implementation and fails independently of deployment code."
+
 [[audits.mio]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -543,6 +555,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.12.6 -> 0.13.1"
 
+[[audits.quick-error]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.2.3"
+notes = "Reviewed all packaged source, manifest, tests, and examples. This dependency-free macro crate generates error enums plus Display, Error, From, and context conversion implementations. It has no unsafe code, build script, runtime I/O, or ambient capabilities; file access appears only in consumer-side documentation and example code. All 18 unit tests and 12 doctests passed."
+
 [[audits.quoted-string-parser]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -573,6 +591,12 @@ delta = "0.8.4 -> 0.8.5"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.10.1 -> 0.10.2"
+
+[[audits.route-recognizer]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.1"
+notes = "Reviewed all packaged source, manifest, and tests. This dependency-free crate builds an in-memory NFA for matching caller-supplied routes and extracting parameters. It denies unsafe code and has no build script, runtime I/O, or ambient capabilities. All 21 unit tests and 1 doctest passed."
 
 [[audits.rustc-hex]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -886,6 +910,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.5.2"
 notes = "Reviewed all packaged library source and manifests. The no_std formatting and parsing crate denies unsafe code, has no dependencies, build script, I/O, or ambient authority, and performs only bounded numeric scaling and string formatting/parsing. All 20 unit tests and 11 documentation tests passed with all features."
+
+[[audits.untrusted]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.9.0"
+notes = "Reviewed all packaged source, manifest, tests, and maintenance scripts. This dependency-free no_std crate provides a non-allocating cursor over caller-supplied byte slices using checked indexing and slicing. It has no unsafe code, build script, runtime I/O, or ambient capabilities; packaged shell scripts are maintenance-only and Cargo does not execute them. All 13 integration tests passed."
 
 [[audits.vergen]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

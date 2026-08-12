@@ -31,9 +31,9 @@ Write for a human reviewer who should understand the architecture and each API w
 
 ## Module Packages
 
-Do not grow overloaded multi-responsibility files. When a module mixes a high-level API with lower-level helpers or phases, keep a thin façade and move cohesive clusters into private children.
+Do not grow overloaded multi-responsibility files. When a module mixes a high-level API with lower-level helpers or phases, keep a thin facade and move cohesive clusters into private children.
 
-- Façade shows entry points and phase order; children hide mechanism (`pub(super)` / package-private).
+- Facade shows entry points and phase order; children hide mechanism (`pub(super)` / package-private).
 - Split by responsibility or phase (admit → apply → settle; load → audit → derive → classify), not by arbitrary line count.
 - Keep one-way dependencies: leaves and DTOs below planners/recovery/engine; do not park shared durable types under a single consumer.
 - Prefer behavior-grouped tests with shared fixtures over source-layout guards that break when files move.

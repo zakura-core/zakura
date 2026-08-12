@@ -1412,23 +1412,23 @@ suggest = false
 notes = "Sentry 0.47 upgrade"
 
 [[exemptions.opentelemetry]]
-version = "0.31.0"
+version = "0.32.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry-http]]
-version = "0.31.0"
+version = "0.32.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry-otlp]]
-version = "0.31.1"
+version = "0.32.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry-proto]]
-version = "0.31.0"
+version = "0.32.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry_sdk]]
-version = "0.31.0"
+version = "0.32.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.optfield]]
@@ -2366,7 +2366,7 @@ version = "0.1.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.tracing-opentelemetry]]
-version = "0.32.1"
+version = "0.33.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tracing-subscriber]]

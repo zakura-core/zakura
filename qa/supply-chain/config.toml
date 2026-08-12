@@ -519,14 +519,6 @@ criteria = "safe-to-deploy"
 version = "0.23.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.darling_macro]]
-version = "0.20.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.darling_macro]]
-version = "0.23.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.data-encoding]]
 version = "2.11.0"
 criteria = "safe-to-deploy"
@@ -885,10 +877,6 @@ criteria = "safe-to-deploy"
 version = "0.4.2"
 criteria = "safe-to-deploy"
 
-[[exemptions.hostname-validator]]
-version = "1.1.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.howudoin]]
 version = "0.1.2"
 criteria = "safe-to-deploy"
@@ -977,10 +965,6 @@ criteria = "safe-to-deploy"
 version = "0.16.2"
 criteria = "safe-to-deploy"
 
-[[exemptions.impl-codec]]
-version = "0.6.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.impl-trait-for-tuples]]
 version = "0.2.3"
 criteria = "safe-to-deploy"
@@ -1031,10 +1015,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.iroh-metrics]]
 version = "0.35.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.iroh-metrics-derive]]
-version = "0.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.iroh-quinn]]

@@ -101,6 +101,18 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.0 -> 0.4.0"
 
+[[audits.darling_macro]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.20.11"
+notes = "Full packaged-source review: no unsafe code, build script, I/O, or ambient capabilities; derive entry points only parse tokens and delegate generation to separately policy-checked darling_core."
+
+[[audits.darling_macro]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.23.0"
+notes = "Full packaged-source review: source is identical to 0.20.11 aside from package metadata; no unsafe code, build script, I/O, or ambient capabilities; derive entry points delegate generation to separately policy-checked darling_core."
+
 [[audits.foldhash]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -161,6 +173,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.14.5 -> 0.15.0"
 
+[[audits.hostname-validator]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.1"
+notes = "Full packaged-source review: no unsafe code, dependencies, build script, allocation, I/O, or ambient capabilities; validation is bounded linear byte and label processing."
+
 [[audits.hyper]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -180,6 +198,12 @@ delta = "1.4.1 -> 1.5.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.1.6 -> 0.1.9"
+
+[[audits.impl-codec]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.6.0"
+notes = "Full packaged-source review: no unsafe code, build script, I/O, or ambient capabilities; macros implement fixed-size SCALE encoding and decoding through separately policy-checked dependencies."
 
 [[audits.incrementalmerkletree]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -220,6 +244,12 @@ delta = "0.11.20 -> 0.11.21"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.39.0 -> 1.40.0"
+
+[[audits.iroh-metrics-derive]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.0"
+notes = "Full packaged-source review: no unsafe code, build script, I/O, or ambient capabilities; generated code is limited to metric trait implementations, static metadata, field references, and Arc clones."
 
 [[audits.libc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

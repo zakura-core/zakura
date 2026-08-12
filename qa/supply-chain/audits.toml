@@ -153,6 +153,12 @@ criteria = "safe-to-deploy"
 version = "1.1.0"
 notes = "Reviewed all packaged source, manifest, and tests. RawArgs owns its argument storage and bounds its private cursor, while unsafe OsStr reconstruction only splits bytes returned by as_encoded_bytes at UTF-8 or documented platform-encoding boundaries. There is no build script, runtime I/O, or ambient capability. All 17 applicable doctests passed; 1 example was ignored as documented."
 
+[[audits.color-spantrace]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.0"
+notes = "Reviewed all packaged source, manifest, and build script. Formatting reads only documented backtrace environment variables and, at full verbosity, the source paths carried by tracing metadata; failures to open source are ignored. The build script invokes the configured rustc only for its version and emits cfg values. There is no unsafe code or network access, and the library test target passed."
+
 [[audits.colorchoice]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -220,6 +226,18 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.20.2"
 notes = "Reviewed all packaged source and manifest. This proc-macro entry point parses a DeriveInput and delegates token generation to separately policy-checked derive_builder_core. No unsafe code, build script, I/O, or ambient capabilities. All-feature unit and doc test targets compiled."
+
+[[audits.dirs]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "5.0.1"
+notes = "Reviewed all packaged source and manifest. This safe facade derives documented platform directory paths from process environment values and the separately policy-checked dirs-sys API; it performs no writes, network access, or process execution and has no build script. Its documentation test passed."
+
+[[audits.dirs-sys]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.1"
+notes = "Reviewed all packaged source and manifest, including Unix account lookup, XDG parsing, Redox lookup, and Windows known-folder APIs. getpwuid_r receives a live capacity-sized buffer and its returned C string is copied before the buffer drops; Windows checks the API result, bounds the returned string by lstrlenW, and frees COM memory on both paths. Runtime authority is limited to documented environment, account, XDG file, and known-folder reads. There is no build script, network access, or process execution, and the host library target passed."
 
 [[audits.documented]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -294,6 +312,12 @@ criteria = "safe-to-deploy"
 delta = "0.3.30 -> 0.3.31"
 
 [[audits.futures-macro]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.32"
+notes = "Reviewed all packaged source and manifest. Generated join futures are shadowed after stack pinning, while select either asserts caller paths are Unpin or keeps newly bound futures immovable for the generated polling scope; generated stream state remains in retained option fields. The proc macro contains no build script, I/O, process execution, or ambient capabilities, and its library test target passed."
+
+[[audits.futures-macro]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.30 -> 0.3.31"
@@ -330,6 +354,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.18.3 -> 0.19.0"
 
+[[audits.gloo-timers]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.0"
+notes = "Reviewed all packaged source and manifest. The crate exposes only explicit browser setTimeout and setInterval calls, retains each wasm closure for the timer lifetime, clears live timer handles on drop, and transfers ownership deliberately when a caller requests forget. Future and stream adapters preserve those RAII guards. There is no build script, filesystem or network access, or process execution, and all host all-feature targets passed."
+
 [[audits.hashbrown]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -346,6 +376,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.2"
 notes = "Reviewed all packaged source, manifest, and tests. This small adapter passes caller-supplied keys and messages to separately policy-checked RustCrypto HMAC and SHA-1 implementations and returns the fixed 20-byte tag. It has no unsafe code, build script, runtime I/O, or ambient capabilities. All 7 published HMAC-SHA1 test vectors passed."
+
+[[audits.home]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.5.12"
+notes = "Reviewed all packaged source, manifest, and tests. Cargo and rustup paths are derived from documented environment and current-directory inputs. The Windows fallback checks SHGetKnownFolderPath, scans only its returned NUL-terminated allocation, and frees that allocation on success and failure. There is no build script, filesystem write, network access, or process execution, and the library target passed."
 
 [[audits.hostname-validator]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -586,6 +622,12 @@ criteria = "safe-to-deploy"
 version = "0.2.2"
 notes = "Reviewed all packaged source and manifest. The zero-dependency no_std crate seals its integer conversion traits, uses compile-time size assertions for every generated conversion, and implements wrapping, saturating, and checked behavior with safe integer operations. No unsafe code, build script, allocation, I/O, or ambient capabilities. All 11 doctests passed."
 
+[[audits.num_threads]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.7"
+notes = "Reviewed all packaged source and manifest across Linux, AIX, Apple, and FreeBSD implementations. Proc-file parsing is bounded; FreeBSD validates the returned struct length, embedded length, and PID; and the Apple path releases each acquired port plus the kernel thread-list allocation. There is no build script, network access, or process execution. The all-feature library target passed; the published archive omits its declared tests.rs target."
+
 [[audits.once_cell]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -658,11 +700,35 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.1.5 -> 1.1.6"
 
+[[audits.plotters-backend]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.7"
+notes = "Reviewed all packaged source and manifest. The dependency-free crate defines drawing traits plus safe CPU rasterizers over caller-supplied coordinates and backend methods; it acquires no filesystem, network, process, or environment capability and has no build script or unsafe code. Both unit tests passed."
+
+[[audits.plotters-svg]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.7"
+notes = "Reviewed all packaged source and manifest. The backend escapes text and attribute values before emitting SVG, writes only to a caller-supplied string or explicitly selected path during present, and optionally encodes caller-supplied image bytes. It has no unsafe code, build script, network access, or process execution. Default and image-feature library targets passed; the published all-feature debug test target retains workspace-only references and is not independently buildable."
+
 [[audits.postcard-derive]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.2"
 notes = "Reviewed all packaged source and manifest. The procedural macros parse structs and enums and generate bounded constant MaxSize expressions and static Schema descriptions through separately policy-checked token libraries. They reject unions and acquire no runtime authority. No unsafe code, build script, I/O, or ambient capabilities; the library target passed."
+
+[[audits.potential_utf]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.5"
+notes = "Reviewed all packaged source, manifest, and tests. Transparent slice and box casts preserve representation and metadata; the 24-bit code-point ULE has no padding and uses explicit little-endian conversion; and unchecked UTF-8 slices are limited to boundaries established by Utf8Error. There is no build script, I/O, or ambient capability. All 7 all-feature unit tests passed."
+
+[[audits.proc-macro-crate]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "3.5.0"
+notes = "Reviewed all packaged source, manifest, and tests. The helper reads the active and workspace Cargo manifests, invokes only the configured Cargo executable with locate-project, caches results against manifest timestamps, and sanitizes dependency names before returning them to proc macros. It has no unsafe code, build script, or network access. All 13 unit tests passed; the published integration target references a workspace fixture omitted from the archive."
 
 [[audits.proptest-derive]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -804,6 +870,12 @@ criteria = "safe-to-deploy"
 version = "0.8.0"
 notes = "Reviewed all packaged source and manifest. This no_std-compatible wrapper makes secret exposure explicit, redacts Debug output, restricts cloning and serialization with marker traits, and invokes separately policy-checked zeroization on drop. It forbids unsafe code and has no build script, runtime I/O, or ambient capabilities. All-feature library and the single doctest passed, and the no-default-features target passed; the package defines no unit tests."
 
+[[audits.send_wrapper]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.6.0"
+notes = "Reviewed all packaged source, manifest, and tests. Every dereference, clone, poll, take, and nontrivial drop checks the creating thread before touching the wrapped value; wrong-thread unwinding leaks rather than drops thread-bound state. Pin projections retain the inner future or stream in the pinned wrapper, and take prevents the wrapper drop before moving its ManuallyDrop field. There is no build script or ambient capability. All 15 all-feature unit tests passed."
+
 [[audits.serde]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -935,6 +1007,12 @@ criteria = "safe-to-deploy"
 version = "0.1.0"
 notes = "Reviewed all packaged source, manifest, and tests. Unsafe string slicing uses monotonic offsets captured from String lengths after valid UTF-8 appends, and Writer records its final boundary on drop; an interrupted caller-supplied Read can leave an ungrouped valid prefix but cannot invalidate the slicing boundaries. There are no dependencies, build script, or independently acquired ambient capabilities. All 4 unit tests and 3 doctests passed."
 
+[[audits.symlink]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.0"
+notes = "Reviewed all packaged source, manifest, and tests. Unix functions delegate explicit caller paths to standard symlink operations. Windows rejects interior NULs, checks every handle and API result, uses a fully initialized fixed-size reparse buffer, classifies only recognized tags and attributes, and closes the opened handle on every post-open path. It has no build script, network access, or process execution. All 4 host integration tests passed."
+
 [[audits.sync_wrapper]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1063,6 +1141,12 @@ criteria = "safe-to-deploy"
 version = "0.14.6"
 notes = "Reviewed all packaged source and manifest. This thin codec delegates protobuf encoding and decoding to separately policy-checked prost and tonic dependencies, maps decode failures to gRPC status, and has no unsafe code, build script, direct I/O, or ambient capabilities. Four codec tests passed; the upstream 4 GiB allocation regression test was intentionally skipped to avoid resource exhaustion."
 
+[[audits.tonic-prost-build]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.14.6"
+notes = "Reviewed all packaged source, manifest, and tests. The safe builder converts caller-supplied protobuf descriptors and options into type-checked tonic token streams and delegates explicitly requested protoc execution and output writes to separately policy-checked prost-build. Environment access is limited to Cargo and OUT_DIR configuration; there is no build script, network access, or unsafe code. All 11 unit tests passed."
+
 [[audits.tonic-reflection]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -1109,6 +1193,18 @@ notes = "Reviewed all packaged source and manifest. The dependency-free crate de
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.2 -> 0.3.3"
+
+[[audits.tower-test]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.0"
+notes = "Reviewed all packaged source, manifest, and tests. This test utility connects mock Tower services through Tokio channels, tracks capacity and wakers behind mutexes, and retains response ownership in one-shot senders; it contains no unsafe code, build script, filesystem or network access, or process execution. Both integration tests passed."
+
+[[audits.tracing-flame]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.0"
+notes = "Reviewed all packaged source, manifest, and tests. The tracing layer records caller span metadata and timing to a caller-supplied writer or explicitly selected file, serializes writes and flushes through a mutex, and acquires no network, process, or environment capability. It has no unsafe code or build script. Both integration tests passed."
 
 [[audits.tracing-log]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1197,11 +1293,23 @@ criteria = "safe-to-deploy"
 version = "0.2.126"
 notes = "Reviewed all packaged source, manifest, and packaged doctest fixture. The procedural macro entry points delegate token expansion to the separately policy-checked wasm-bindgen-macro-support crate and only print generated tokens when an explicit debug cfg is set. No unsafe code, build script, filesystem or network access, or process execution. The all-feature library target passed."
 
+[[audits.wasm-bindgen-shared]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.126"
+notes = "Reviewed all packaged source, manifest, build script, and schema test. The no_std library defines shared schema data, identifier validation, escaping, and deterministic symbol construction without unsafe code or runtime I/O. Its build script reads its own schema source and makes a best-effort git rev-parse call solely to label the build version. The schema-hash test passed."
+
 [[audits.web-time]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.1.0"
 notes = "Reviewed all packaged source and manifests, including the native and WebAssembly implementations and optional Serde support. Native targets directly re-export std::time; the unsafe-free browser path reads only Performance.now and Date.now through separately policy-checked wasm-bindgen dependencies, converts timestamps with checked Duration arithmetic, and validates deserialized overflow. It has no build script, filesystem, network, or process capability. Native all-feature and no-default library targets plus the packaged doctest passed, and the all-feature library cross-compiled for wasm32-unknown-unknown. The published manifest references excluded upstream test and benchmark files, so an unfiltered packaged cargo test cannot run them."
+
+[[audits.webpki-roots]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.26.11"
+notes = "Reviewed all packaged source and manifest. This no_std semver-bridge crate only re-exports TLS_SERVER_ROOTS from the separately policy-checked version-1 package. It forbids unsafe and unstable code and has no build script, runtime I/O, or ambient capability of its own. The library target passed."
 
 [[audits.windows-sys]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

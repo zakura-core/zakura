@@ -286,10 +286,6 @@ criteria = "safe-to-deploy"
 version = "0.6.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.color-spantrace]]
-version = "0.3.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.combine]]
 version = "4.6.7"
 criteria = "safe-to-deploy"
@@ -473,14 +469,6 @@ criteria = "safe-to-deploy"
 version = "0.11.0-pre.9"
 criteria = "safe-to-deploy"
 
-[[exemptions.dirs]]
-version = "5.0.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.dirs-sys]]
-version = "0.4.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.dispatch2]]
 version = "0.3.1"
 criteria = "safe-to-deploy"
@@ -603,10 +591,6 @@ criteria = "safe-to-deploy"
 version = "2.6.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.futures-macro]]
-version = "0.3.32"
-criteria = "safe-to-deploy"
-
 [[exemptions.futures-util]]
 version = "0.3.32"
 criteria = "safe-to-deploy"
@@ -633,10 +617,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.getset]]
 version = "0.1.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.gloo-timers]]
-version = "0.3.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.group]]
@@ -701,10 +681,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.hmac-sha256]]
 version = "1.1.14"
-criteria = "safe-to-deploy"
-
-[[exemptions.home]]
-version = "0.5.12"
 criteria = "safe-to-deploy"
 
 [[exemptions.hostname]]
@@ -1096,10 +1072,6 @@ criteria = "safe-to-deploy"
 version = "0.7.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.num_threads]]
-version = "0.1.7"
-criteria = "safe-to-deploy"
-
 [[exemptions.objc2]]
 version = "0.6.4"
 criteria = "safe-to-deploy"
@@ -1262,14 +1234,6 @@ criteria = "safe-to-deploy"
 version = "0.3.7"
 criteria = "safe-to-run"
 
-[[exemptions.plotters-backend]]
-version = "0.3.7"
-criteria = "safe-to-run"
-
-[[exemptions.plotters-svg]]
-version = "0.3.7"
-criteria = "safe-to-run"
-
 [[exemptions.pnet_base]]
 version = "0.34.0"
 criteria = "safe-to-deploy"
@@ -1298,10 +1262,6 @@ criteria = "safe-to-deploy"
 version = "0.9.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.potential_utf]]
-version = "0.1.5"
-criteria = "safe-to-deploy"
-
 [[exemptions.ppv-lite86]]
 version = "0.2.21"
 criteria = "safe-to-deploy"
@@ -1324,10 +1284,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.primitive-types]]
 version = "0.12.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.proc-macro-crate]]
-version = "3.5.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.proptest]]
@@ -1598,10 +1554,6 @@ criteria = "safe-to-deploy"
 version = "1.0.28"
 criteria = "safe-to-deploy"
 
-[[exemptions.send_wrapper]]
-version = "0.6.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.sentry]]
 version = "0.47.0"
 criteria = "safe-to-deploy"
@@ -1744,10 +1696,6 @@ criteria = "safe-to-deploy"
 version = "0.8.4"
 criteria = "safe-to-deploy"
 
-[[exemptions.symlink]]
-version = "0.1.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.syn]]
 version = "2.0.118"
 criteria = "safe-to-deploy"
@@ -1868,10 +1816,6 @@ criteria = "safe-to-deploy"
 version = "0.14.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.tonic-prost-build]]
-version = "0.14.6"
-criteria = "safe-to-deploy"
-
 [[exemptions.tonic-reflection]]
 version = "0.14.6"
 criteria = "safe-to-deploy"
@@ -1887,10 +1831,6 @@ criteria = "safe-to-deploy"
 [[exemptions.tower-http]]
 version = "0.6.11"
 criteria = "safe-to-deploy"
-
-[[exemptions.tower-test]]
-version = "0.4.0"
-criteria = "safe-to-run"
 
 [[exemptions.tracing]]
 version = "0.1.44"
@@ -1910,10 +1850,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tracing-error]]
 version = "0.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-flame]]
-version = "0.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tracing-futures]]
@@ -1994,10 +1930,6 @@ criteria = "safe-to-deploy"
 version = "0.2.126"
 criteria = "safe-to-deploy"
 
-[[exemptions.wasm-bindgen-shared]]
-version = "0.2.126"
-criteria = "safe-to-deploy"
-
 [[exemptions.wasm-streams]]
 version = "0.4.2"
 criteria = "safe-to-deploy"
@@ -2008,10 +1940,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.webpki-root-certs]]
 version = "1.0.8"
-criteria = "safe-to-deploy"
-
-[[exemptions.webpki-roots]]
-version = "0.26.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.webpki-roots]]

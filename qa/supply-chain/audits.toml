@@ -176,6 +176,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 version = "0.1.1"
 
+[[audits.clap]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "4.6.1"
+notes = "Reviewed all packaged source, manifest, examples, and tests. This facade is documentation, feature wiring, macros, and re-exports over separately policy-checked clap_builder and clap_derive implementations; it has no unsafe code, build script, or hidden ambient capability. All 3 facade tests passed with Zakura's derive, env, unicode, string, wrap_help, and cargo features."
+
 [[audits.clap_derive]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -274,6 +280,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.10.0"
 notes = "Reviewed all packaged source, manifest, and tests. Case conversion splits caller-provided strings at explicit Unicode-aware boundaries and rejoins transformed words; custom boundary and pattern callbacks remain caller-supplied safe functions. There is no unsafe code, build script, runtime I/O, or ambient capability. All 62 unit and integration tests and 84 doctests passed."
+
+[[audits.corez]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.1"
+notes = "Reviewed all packaged source, manifest, and tests. This replacement for core2 forbids unsafe code and either re-exports std I/O or implements no_std Read, Write, Seek, BufRead, Cursor, and error traits with bounded slice and position handling. It has no build script or ambient capability. All 36 all-feature tests passed, and the no-default-features targets compiled both with and without alloc."
 
 [[audits.cpufeatures]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -448,11 +460,23 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 version = "0.1.3"
 
+[[audits.fs-err]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "2.11.0"
+notes = "Reviewed all packaged source, manifest, build script, and tests. The crate safely delegates caller-requested sync and Tokio filesystem operations to standard APIs while attaching the affected path to errors; it performs no implicit filesystem access. Its build script only probes compiler capabilities through autocfg, and it contains no unsafe code or network/process authority. All 3 tests passed."
+
 [[audits.funty]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "2.0.0"
 notes = "Reviewed all packaged source and manifest. This dependency-free no_std-compatible crate defines traits over primitive numeric types and uses macros to forward methods to their type-checked inherent implementations. It has no unsafe code, build script, runtime I/O, or ambient capabilities. All-feature targets with compile-time trait assertions and the no-default-features library target passed."
+
+[[audits.futures]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.32"
+notes = "Reviewed all packaged source and manifest. This safe umbrella crate contains feature wiring and re-exports over separately policy-checked futures components, with no build script, direct I/O, or ambient capability. The all-feature library target compiled. The published integration suite references the workspace-only futures-test development dependency omitted from the normalized package, so those tests were not runnable from the archive."
 
 [[audits.futures]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -586,6 +610,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.1.1"
 notes = "Full packaged-source review: no unsafe code, dependencies, build script, allocation, I/O, or ambient capabilities; validation is bounded linear byte and label processing."
+
+[[audits.howudoin]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.2"
+notes = "Reviewed all packaged source, manifest, and tests. Progress reporting uses safe atomics, a flume channel, and one explicitly initialized consumer thread; the global singleton owns its state and callback serialization. It has no build script, filesystem or network access, process execution, or unsafe code. All 5 unit tests and 18 doctests passed when serialized as required by the shared global test state."
 
 [[audits.human_bytes]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -748,6 +778,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.24.11"
 notes = "Reviewed all packaged source and manifest. This facade contains only cfg macros and feature-gated re-exports of separately policy-checked jsonrpsee components; it has no unsafe code, build script, I/O, or ambient capabilities of its own. The full all-feature target compiled."
+
+[[audits.jsonrpsee-proc-macros]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.24.11"
+notes = "Reviewed all packaged source, manifest, and UI fixtures. The procedural macro validates RPC trait methods, parameters, namespaces, subscriptions, aliases, and bounds before generating type-checked client and server adapters through separately policy-checked jsonrpsee APIs. It contains no unsafe code, build script, filesystem or network access, or process execution. All 4 unit tests passed."
 
 [[audits.jsonrpsee-types]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1002,6 +1038,12 @@ criteria = "safe-to-deploy"
 version = "0.2.3"
 notes = "Reviewed all packaged source and manifest. Both Path and optional Camino implementations perform input-length-bounded component iteration and relative PathBuf construction without filesystem access, unsafe code, or a build script. All 6 unit tests and 2 doctests passed with all features."
 
+[[audits.pharos]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.5.3"
+notes = "Reviewed all packaged source, manifest, and build script. The safe observer implementation assigns listener IDs, applies caller-provided filters, and fans out events through futures channels while removing closed observers. It has no filesystem, network, or process capability; the build script only detects the Rust compiler version. The library target passed; packaged tests depend on an obsolete wasm-bindgen development version rejected by the current compiler."
+
 [[audits.phf]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1090,6 +1132,24 @@ criteria = "safe-to-deploy"
 version = "0.1.5"
 notes = "Reviewed all packaged source, manifest, and tests. Transparent slice and box casts preserve representation and metadata; the 24-bit code-point ULE has no padding and uses explicit little-endian conversion; and unchecked UTF-8 slices are limited to boundaries established by Utf8Error. There is no build script, I/O, or ambient capability. All 7 all-feature unit tests passed."
 
+[[audits.precis-core]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.11"
+notes = "Reviewed all packaged source, manifest, build script, Unicode resources, and tests. The safe build script parses packaged UCD data and emits fixed numeric lookup tables into OUT_DIR; runtime code applies bounded PRECIS derived-property and contextual rules over caller strings. It performs no network or process access. All 18 unit tests, the exhaustive derived-property test, and 2 doctests passed with the locked package dependencies."
+
+[[audits.precis-profiles]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.13"
+notes = "Reviewed all packaged source, manifest, build script, Unicode resources, and tests. The safe crate implements RFC PRECIS username, nickname, password, normalization, width-mapping, and bidirectional rules; its build script generates fixed tables in OUT_DIR from packaged Unicode data and does not use the network or execute processes. All 28 unit and integration tests and 5 doctests passed with locked dependencies."
+
+[[audits.precis-tools]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.9"
+notes = "Reviewed all packaged source, manifest, generators, parsers, and tests. Default behavior parses explicit caller-selected Unicode/IANA data files and writes generated tables only to caller-selected paths. The optional networking feature exposes explicit HTTPS download helpers and is not enabled in Zakura; there is no unsafe code or process execution. All 4 unit tests and 2 doctests passed with locked dependencies."
+
 [[audits.primitive-types]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1121,6 +1181,12 @@ delta = "0.13.1 -> 0.13.3"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.12.6 -> 0.13.1"
+
+[[audits.prost-derive]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.14.4"
+notes = "Reviewed all packaged source, manifest, and tests. The procedural derives validate protobuf tags, field shapes, scalar defaults, maps, groups, oneofs, and enum discriminants before emitting safe type-checked Message, Enumeration, and Oneof implementations. There is no unsafe code, build script, I/O, or ambient capability. All 4 unit tests passed with all features."
 
 [[audits.prost-derive]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1272,6 +1338,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.2.0 -> 0.3.0"
 
+[[audits.schemars_derive]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.2.1"
+notes = "Reviewed all packaged source, manifest, derivation documentation, and tests. The proc macro forbids unsafe code, validates serde and schemars attributes, and emits type-checked JsonSchema implementations and schema expressions through separately policy-checked dependencies. It has no build script, I/O, or ambient capability. Both unit tests passed with all features."
+
 [[audits.scoped-tls]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1355,6 +1427,12 @@ delta = "3.8.3 -> 3.9.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "3.9.0 -> 3.11.0"
+
+[[audits.serde_with_macros]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "3.21.0"
+notes = "Reviewed all packaged source, manifest, and tests. The procedural macros forbid unsafe code, parse container and field attributes, validate conversions and duplicate options, and emit type-checked serde_as and display/string conversion adapters. They have no build script, runtime I/O, or ambient capability. The all-feature library target compiled; the test harness's expect-test development dependency was unavailable in the local offline cache."
 
 [[audits.serde_with_macros]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1600,6 +1678,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.22.17 -> 0.22.20"
 
+[[audits.toml_writer]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.1+spec-1.1.0"
+notes = "Reviewed all packaged source, manifest, and documentation tests. This dependency-free crate forbids unsafe code and writes TOML keys and strings only to caller-provided fmt writers. Escaping scans bytes but slices input solely at ASCII control, quote, backslash, or end boundaries, preserving UTF-8. It has no build script, I/O, or ambient capability. All 4 documentation tests passed with all features."
+
 [[audits.tonic]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -1609,6 +1693,12 @@ delta = "0.11.0 -> 0.12.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.12.1 -> 0.12.3"
+
+[[audits.tonic-build]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.14.6"
+notes = "Reviewed all packaged source, manifest, examples, and tests. The safe code generator converts caller-provided service and method descriptors into type-checked tonic client and server tokens and writes only the explicitly selected output file, defaulting to Cargo's OUT_DIR. It has no build script, network access, or process execution. Both unit tests and 6 applicable doctests passed with all features."
 
 [[audits.tonic-build]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1626,6 +1716,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.14.6"
 notes = "Reviewed all packaged source, manifest, and tests. The safe builder converts caller-supplied protobuf descriptors and options into type-checked tonic token streams and delegates explicitly requested protoc execution and output writes to separately policy-checked prost-build. Environment access is limited to Cargo and OUT_DIR configuration; there is no build script, network access, or unsafe code. All 11 unit tests passed."
+
+[[audits.tonic-reflection]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.14.6"
+notes = "Reviewed all packaged source, generated descriptors, manifest, and tests. The safe server decodes caller-registered descriptor sets, validates required names and dependency relationships, indexes symbols in owned maps, and serves bounded responses through separately policy-checked tonic APIs. It has no build script or hidden ambient capability, and the all-feature library target compiled. The normalized package's integration tests omit tonic's router feature and therefore do not compile their add_service calls."
 
 [[audits.tonic-reflection]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1814,6 +1910,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.126"
 notes = "Reviewed all packaged source, manifest, build script, and schema test. The no_std library defines shared schema data, identifier validation, escaping, and deterministic symbol construction without unsafe code or runtime I/O. Its build script reads its own schema source and makes a best-effort git rev-parse call solely to label the build version. The schema-hash test passed."
+
+[[audits.wasm-streams]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.2"
+notes = "Reviewed all packaged source, JavaScript bindings, manifest, examples, and tests. The safe wrappers preserve stream-reader and writer lock lifetimes, release locks on drop, copy BYOB reads through separate JavaScript buffers to avoid transferring or invalidating WebAssembly memory, and map rejected promises into errors. There is no build script or hidden ambient capability. The all-feature library target compiled with its locked wasm-bindgen dependencies."
 
 [[audits.web-time]]
 who = "OpenAI Codex <noreply@openai.com>"

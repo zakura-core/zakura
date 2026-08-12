@@ -22,6 +22,30 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.4 -> 0.4.3"
 
+[[audits.base16ct]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.0"
+notes = "Reviewed all packaged source, manifest, and tests. This dependency-free no_std crate performs bounded Base16 encoding and decoding. Its four unsafe UTF-8 conversions only consume bytes produced by the ASCII-only hex encoders. No build script, runtime I/O, or ambient capabilities. All 11 integration tests and 1 doctest passed with all features."
+
+[[audits.base32]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.5.1"
+notes = "Reviewed all packaged source, manifest, and tests. This dependency-free no_std library performs bounded table-based Base32 encoding and decoding with no unsafe code, build script, runtime I/O, or ambient capabilities. All 19 unit tests, including QuickCheck round trips, and 1 doctest passed."
+
+[[audits.base64ct]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.8.3"
+notes = "Reviewed all packaged source, manifest, and tests. This dependency-free no_std library implements bounded Base64 transforms and caller-supplied streaming I/O. Unsafe pointer operations in in-place decoding are bounds-checked and non-overlapping writes use a temporary block; UTF-8 conversions only consume encoder-produced ASCII. No build script or ambient capabilities. All 60 unit and integration tests and 2 doctests passed with all features."
+
+[[audits.bech32]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.11.1"
+notes = "Reviewed all packaged source, manifest, and tests. This dependency-free crate implements bounded Bech32, Bech32m, and SegWit encoding, decoding, and checksums over caller-provided data and writers. No unsafe code, build script, filesystem or network access, process execution, or other ambient capabilities. All 152 unit and integration tests and 20 doctests passed with all features."
+
 [[audits.bip32]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -130,6 +154,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.3.1"
 notes = "Reviewed all packaged source and manifest. no_std CRC32 implementation uses fixed-size table generation and input-length-bounded deterministic arithmetic; the table index is masked to 8 bits. No normal dependencies, unsafe code, build script, allocation, I/O, or ambient capabilities. All 6 unit tests and 3 doctests passed, including randomized crc32fast comparison."
+
+[[audits.const-oid]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.9.6"
+notes = "Reviewed all packaged source, manifest, generated OID database, and tests. The no_std implementation performs checked fixed-buffer OID parsing and BER/DER encoding; the database feature adds only generated static constants and lookup tables, and the optional arbitrary dependency is separately policy-checked. Unsafe code is forbidden and there is no build script, runtime I/O, or ambient capability. All 18 unit and integration tests and 2 doctests passed with all features."
 
 [[audits.darling_macro]]
 who = "OpenAI Codex <noreply@openai.com>"

@@ -12,8 +12,9 @@ header chain)
 >
 > The request, the durable ascending frontier, and the `header_root_auth_frontier` column
 > family no longer exist. What survives is the verification kernel
-> (`verify_supplied_roots_from_parts`), reused unchanged by `service/write/vct_sweep.rs`, and
-> the invariants below — which the replacement upholds identically. See
+> (`verify_supplied_roots_from_parts`). The replacement reuses that kernel in
+> `service/write/vct_authentication_sweep.rs`. The replacement also preserves the invariants
+> below. See
 > [verified-commitment-trees.md §6.0](verified-commitment-trees.md) for the current design.
 > Read this document for the rationale behind those invariants, never for the live call graph.
 

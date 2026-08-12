@@ -23,18 +23,18 @@ fn auxiliary_authentication_transitions_only_refine_evidence() {
         evidence: other_evidence,
     };
 
-    for next in [disputed, authenticated, rejected] {
-        assert!(AuxAuthentication::Unauthenticated.permits_transition_to(next));
+    for next_state in [disputed, authenticated, rejected] {
+        assert!(AuxAuthentication::Unauthenticated.can_refine_to(next_state));
     }
-    for next in [authenticated, rejected] {
-        assert!(disputed.permits_transition_to(next));
+    for next_state in [authenticated, rejected] {
+        assert!(disputed.can_refine_to(next_state));
     }
-    for current in [disputed, authenticated, rejected] {
-        assert!(!current.permits_transition_to(AuxAuthentication::Unauthenticated));
-        assert!(!current.permits_transition_to(disputed));
+    for current_state in [disputed, authenticated, rejected] {
+        assert!(!current_state.can_refine_to(AuxAuthentication::Unauthenticated));
+        assert!(!current_state.can_refine_to(disputed));
     }
-    assert!(!authenticated.permits_transition_to(rejected));
-    assert!(!rejected.permits_transition_to(authenticated));
+    assert!(!authenticated.can_refine_to(rejected));
+    assert!(!rejected.can_refine_to(authenticated));
 }
 
 #[test]

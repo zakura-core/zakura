@@ -252,17 +252,19 @@ impl ZakuraDb {
         }
 
         // No state service can commit while this synchronous startup operation is running.
-        let initial_tip_height = self.finalized_tip_height();
+        let initial_finalized_tip_height = self.finalized_tip_height();
         let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
         format_change
-            .run_format_change_or_check(self, initial_tip_height, &never_cancel_receiver)
+            .run_format_change_or_check(self, initial_finalized_tip_height, &never_cancel_receiver)
             .map_err(|source| StateInitError::DatabaseFormatUpgrade {
                 path: self.path().to_owned(),
                 source: Box::new(source),
             })?;
 
-        let format_change_handle =
-            DbFormatChange::spawn_periodic_format_checks(self.clone(), initial_tip_height);
+        let format_change_handle = DbFormatChange::spawn_periodic_format_checks(
+            self.clone(),
+            initial_finalized_tip_height,
+        );
 
         self.format_change_handle = Some(format_change_handle);
 

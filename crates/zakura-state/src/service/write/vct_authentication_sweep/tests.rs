@@ -36,7 +36,7 @@ use crate::{
             verify_commitment_roots, CommitmentRootVerification,
         },
         non_finalized_state::NonFinalizedState,
-        write::{HeaderChainWriter, VctAuxWindowRead},
+        write::{HeaderChainWriter, VctAuxiliaryWindowRead},
     },
     CheckpointVerifiedBlock, Config,
 };
@@ -278,7 +278,7 @@ struct Fixture {
     chain: Vec<Arc<Block>>,
     finalized_state: FinalizedState,
     writer: HeaderChainWriter,
-    repair: VctWriteManager,
+    repair: VctWriteRetryManager,
     repair_receiver: watch::Receiver<VctRootRepairStatus>,
     /// Height whose delivery was omitted from the admitted headers, if any.
     skipped_aux: Option<Height>,
@@ -332,7 +332,7 @@ impl Fixture {
             chain,
             finalized_state,
             writer,
-            repair: VctWriteManager::new(repair_sender),
+            repair: VctWriteRetryManager::new(repair_sender),
             repair_receiver,
             skipped_aux: None,
             corruption: None,
@@ -547,17 +547,18 @@ impl Fixture {
         let window = self
             .writer
             .runtime
-            .selected_aux_window(height, hash)
+            .selected_auxiliary_window(height, hash)
             .expect("the selected auxiliary window is coherent")
             .expect("the selected auxiliary header exists");
         window
-            .current_deliveries
+            .delivery_header
+            .auxiliary_deliveries
             .into_iter()
             .map(|delivery| delivery.authentication)
             .collect()
     }
 
-    fn sweep(&mut self, sweeper: &mut VctAuthSweeper) {
+    fn sweep(&mut self, sweeper: &mut VctAuthenticationSweeper) {
         for _ in 0..=TOP - BODY_TIP {
             sweeper.sweep(
                 &self.finalized_state,
@@ -567,7 +568,7 @@ impl Fixture {
             );
             if self.repair_state() != VctRootRepairState::Idle
                 || sweeper
-                    .verified
+                    .verified_selected_prefix
                     .as_ref()
                     .is_some_and(|run| run.frontier.height >= Height(LAST_PROVABLE))
             {
@@ -579,10 +580,10 @@ impl Fixture {
     /// The authentication state currently recorded for the selected delivery at `height`.
     fn authentication(&self, height: Height) -> Option<AuxAuthentication> {
         let hash = self.chain[height.0 as usize].hash();
-        match self.writer.vct_aux_window(height, hash) {
-            Ok(VctAuxWindowRead::Ready(window)) => Some(window.current.authentication),
+        match self.writer.vct_auxiliary_window(height, hash) {
+            Ok(VctAuxiliaryWindowRead::Ready(window)) => Some(window.delivery.authentication),
             // Every delivery at this height is rejected, or none was ever supplied.
-            Ok(VctAuxWindowRead::Missing { .. }) => None,
+            Ok(VctAuxiliaryWindowRead::Missing { .. }) => None,
             Err(error) => panic!("the fixture auxiliary read is coherent: {error}"),
         }
     }
@@ -616,7 +617,7 @@ impl Fixture {
         tree
     }
 
-    /// Run the committer's own body-based verifier over the delivery admitted for `height`.
+    /// Runs the committer's body-based verifier over the delivery at `height`.
     ///
     /// This is the trust boundary the sweep runs ahead of, reached through a different code
     /// path: [`commitment_aux_verify::verify_commitment_roots`] folds from a block body, while
@@ -663,7 +664,7 @@ fn authenticates_every_supplied_delivery_ahead_of_its_body() {
     let _init_guard = zakura_test::init();
     let mut fixture = Fixture::new();
     fixture.insert_headers(None, None);
-    let mut sweeper = VctAuthSweeper::default();
+    let mut sweeper = VctAuthenticationSweeper::default();
 
     fixture.sweep(&mut sweeper);
 
@@ -699,7 +700,7 @@ fn queued_commit_work_yields_before_authentication() {
     let mut fixture = Fixture::new();
     fixture.insert_headers(None, None);
     let before = fixture.writer.runtime.publisher().snapshot();
-    let mut sweeper = VctAuthSweeper::default();
+    let mut sweeper = VctAuthenticationSweeper::default();
 
     sweeper.sweep(
         &fixture.finalized_state,
@@ -721,7 +722,7 @@ fn stops_below_a_height_with_no_supplied_metadata() {
     let hole = Height(BODY_TIP + 4);
     let mut fixture = Fixture::new();
     fixture.insert_headers(Some(hole), None);
-    let mut sweeper = VctAuthSweeper::default();
+    let mut sweeper = VctAuthenticationSweeper::default();
 
     fixture.sweep(&mut sweeper);
 
@@ -761,7 +762,7 @@ fn disputes_an_ambiguous_note_commitment_boundary_and_arms_repair() {
     let bad = Height(BODY_TIP + 3);
     let mut fixture = Fixture::new();
     fixture.insert_headers(None, Some((bad, Corruption::SaplingRoot)));
-    let mut sweeper = VctAuthSweeper::default();
+    let mut sweeper = VctAuthenticationSweeper::default();
 
     fixture.sweep(&mut sweeper);
 
@@ -798,7 +799,7 @@ fn an_ambiguous_boundary_disputes_both_deliveries_without_rejecting_them() {
     let predecessor = Height(bad.0 - 1);
     let mut fixture = Fixture::new();
     fixture.insert_headers(None, Some((bad, Corruption::AuthDataRoot)));
-    let mut sweeper = VctAuthSweeper::default();
+    let mut sweeper = VctAuthenticationSweeper::default();
 
     fixture.sweep(&mut sweeper);
 
@@ -834,7 +835,7 @@ fn a_replacement_successor_preserves_and_authenticates_the_honest_predecessor() 
     let predecessor = Height(bad.0 - 1);
     let mut fixture = Fixture::new();
     fixture.insert_headers(None, Some((bad, Corruption::AuthDataRoot)));
-    let mut sweeper = VctAuthSweeper::default();
+    let mut sweeper = VctAuthenticationSweeper::default();
     fixture.sweep(&mut sweeper);
 
     fixture.redeliver(bad, None, 0x71);
@@ -862,7 +863,7 @@ fn a_replacement_predecessor_preserves_the_honest_successor() {
     let successor = Height(bad.0 + 1);
     let mut fixture = Fixture::new();
     fixture.insert_headers(None, Some((bad, Corruption::SaplingRoot)));
-    let mut sweeper = VctAuthSweeper::default();
+    let mut sweeper = VctAuthenticationSweeper::default();
     fixture.sweep(&mut sweeper);
 
     fixture.redeliver(bad, None, 0x73);
@@ -889,13 +890,13 @@ fn a_fresh_manager_recreates_repair_from_a_durable_dispute() {
     let repair_height = Height(bad.0 - 1);
     let mut fixture = Fixture::new();
     fixture.insert_headers(None, Some((bad, Corruption::AuthDataRoot)));
-    let mut sweeper = VctAuthSweeper::default();
+    let mut sweeper = VctAuthenticationSweeper::default();
     fixture.sweep(&mut sweeper);
 
     let (repair_sender, repair_receiver) = watch::channel(VctRootRepairStatus::default());
-    fixture.repair = VctWriteManager::new(repair_sender);
+    fixture.repair = VctWriteRetryManager::new(repair_sender);
     fixture.repair_receiver = repair_receiver;
-    let mut restarted = VctAuthSweeper::default();
+    let mut restarted = VctAuthenticationSweeper::default();
     fixture.sweep(&mut restarted);
 
     assert_eq!(
@@ -916,7 +917,7 @@ fn a_transient_anchor_gate_preserves_an_existing_repair() {
     fixture
         .finalized_state
         .enable_vct_exact_root_source_for_test(Height(BODY_TIP));
-    let mut sweeper = VctAuthSweeper::default();
+    let mut sweeper = VctAuthenticationSweeper::default();
 
     fixture.sweep(&mut sweeper);
 
@@ -934,21 +935,21 @@ fn a_sweep_repair_need_survives_a_successful_commit() {
     let bad = Height(BODY_TIP + 3);
     let mut fixture = Fixture::new();
     fixture.insert_headers(None, Some((bad, Corruption::SaplingRoot)));
-    let mut sweeper = VctAuthSweeper::default();
+    let mut sweeper = VctAuthenticationSweeper::default();
     fixture.sweep(&mut sweeper);
     assert_eq!(
         fixture.repair_state(),
         VctRootRepairState::Unavailable { height: bad }
     );
 
-    // The committer is far below the sweep and keeps committing; withdrawing its own idle
-    // signal must not withdraw the repair the sweep is still waiting on.
+    // The committer remains below the sweep. A successful block commit must not clear the
+    // sweep repair request.
     fixture.repair.on_commit_success();
 
     assert_eq!(
         fixture.repair_state(),
         VctRootRepairState::Unavailable { height: bad },
-        "the committer owns only its own repair need"
+        "the committer clears only its repair request"
     );
 }
 
@@ -958,7 +959,7 @@ fn a_committer_stall_below_the_sweep_takes_priority() {
     let bad = Height(BODY_TIP + 6);
     let mut fixture = Fixture::new();
     fixture.insert_headers(None, Some((bad, Corruption::SaplingRoot)));
-    let mut sweeper = VctAuthSweeper::default();
+    let mut sweeper = VctAuthenticationSweeper::default();
     fixture.sweep(&mut sweeper);
 
     let stalled = Height(BODY_TIP + 1);
@@ -974,7 +975,7 @@ fn a_committer_stall_below_the_sweep_takes_priority() {
     assert_eq!(
         fixture.repair_state(),
         VctRootRepairState::Unavailable { height: bad },
-        "clearing the committer need falls back to the sweep's"
+        "clearing the committer request exposes the sweep request"
     );
 }
 
@@ -983,12 +984,12 @@ fn a_fresh_sweeper_resumes_from_the_durable_authentication_marks() {
     let _init_guard = zakura_test::init();
     let mut fixture = Fixture::new();
     fixture.insert_headers(None, None);
-    let mut sweeper = VctAuthSweeper::default();
+    let mut sweeper = VctAuthenticationSweeper::default();
     fixture.sweep(&mut sweeper);
     let after_first = fixture.writer.runtime.publisher().snapshot();
 
     // A restart drops the in-memory run but not the marks it wrote.
-    let mut restarted = VctAuthSweeper::default();
+    let mut restarted = VctAuthenticationSweeper::default();
     fixture.sweep(&mut restarted);
 
     assert_eq!(
@@ -1015,7 +1016,7 @@ fn does_nothing_outside_the_fast_path() {
         .finalized_state
         .enable_vct_exact_root_source_for_test(Height(BODY_TIP));
     let before = fixture.writer.runtime.publisher().snapshot();
-    let mut sweeper = VctAuthSweeper::default();
+    let mut sweeper = VctAuthenticationSweeper::default();
 
     fixture.sweep(&mut sweeper);
 
@@ -1034,15 +1035,15 @@ fn fold_placement_is_checked_before_every_history_tree_push() {
     let mut tree = HistoryTree::default();
 
     assert!(
-        fold_is_safe(&network, Height(1), &tree),
+        history_tree_accepts_height(&network, Height(1), &tree),
         "an empty tree is the only correct placement below Heartwood"
     );
     assert!(
-        fold_is_safe(&network, Height(HEARTWOOD), &tree),
+        history_tree_accepts_height(&network, Height(HEARTWOOD), &tree),
         "the activation height creates the tree from any placement"
     );
     assert!(
-        !fold_is_safe(&network, Height(HEARTWOOD + 1), &tree),
+        !history_tree_accepts_height(&network, Height(HEARTWOOD + 1), &tree),
         "an empty tree cannot be extended above Heartwood"
     );
 
@@ -1055,13 +1056,17 @@ fn fold_placement_is_checked_before_every_history_tree_push() {
     )
     .expect("the activation block creates the tree");
 
-    assert!(fold_is_safe(&network, Height(HEARTWOOD + 1), &tree));
+    assert!(history_tree_accepts_height(
+        &network,
+        Height(HEARTWOOD + 1),
+        &tree
+    ));
     assert!(
-        !fold_is_safe(&network, Height(HEARTWOOD + 2), &tree),
+        !history_tree_accepts_height(&network, Height(HEARTWOOD + 2), &tree),
         "a tree one height behind would panic the fold"
     );
     assert!(
-        !fold_is_safe(&network, Height(HEARTWOOD - 1), &tree),
+        !history_tree_accepts_height(&network, Height(HEARTWOOD - 1), &tree),
         "a tree that exists below Heartwood would panic the fold"
     );
 }
@@ -1099,7 +1104,10 @@ fn only_supplied_auxiliary_fields_are_blamed_on_a_delivery() {
             actual: [1; 32],
         },
     ] {
-        assert!(blames_delivery(&error), "{error} is a supplied-field pin");
+        assert!(
+            commitment_error_implicates_delivery(&error),
+            "{error} is a supplied-field pin"
+        );
     }
 
     for error in [
@@ -1117,7 +1125,7 @@ fn only_supplied_auxiliary_fields_are_blamed_on_a_delivery() {
         CommitmentError::InvalidSapingRootBytes,
     ] {
         assert!(
-            !blames_delivery(&error),
+            !commitment_error_implicates_delivery(&error),
             "{error} must never reject metadata"
         );
     }
@@ -1145,7 +1153,7 @@ proptest! {
         let bad = Height(BODY_TIP + offset);
         let mut fixture = Fixture::new();
         fixture.insert_headers(None, Some((bad, corruption)));
-        let mut sweeper = VctAuthSweeper::default();
+        let mut sweeper = VctAuthenticationSweeper::default();
 
         fixture.sweep(&mut sweeper);
 
@@ -1169,9 +1177,8 @@ proptest! {
                 "{height:?} is below the corruption and must stay usable"
             );
         }
-        // The sweep folds a ZIP-221 leaf from schema-1 parts; the committer folds the same
-        // leaf from a block body. Authenticating anything the committer would reject would
-        // let the fast path commit a wrong root.
+        // The sweep folds a ZIP-221 leaf from schema-1 parts. The committer folds the same leaf
+        // from a block body. The sweep must not authenticate a delivery that the committer rejects.
         for height in (BODY_TIP + 1..=LAST_PROVABLE).map(Height) {
             if matches!(
                 fixture.authentication(height),

@@ -28,16 +28,16 @@ impl DiskFormatUpgrade for FixTreeKeyTypeAndCacheGenesisRoots {
     #[allow(clippy::unwrap_in_result)]
     fn run(
         &self,
-        initial_tip_height: Option<Height>,
+        initial_finalized_tip_height: Option<Height>,
         db: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<(), FormatChangeError> {
-        let Some(initial_tip_height) = initial_tip_height else {
+        let Some(initial_finalized_tip_height) = initial_finalized_tip_height else {
             return Ok(());
         };
         // It shouldn't matter what order these are run in.
-        cache_genesis_roots::run(initial_tip_height, db, cancel_receiver)?;
-        fix_tree_key_type::run(initial_tip_height, db, cancel_receiver)?;
+        cache_genesis_roots::run(initial_finalized_tip_height, db, cancel_receiver)?;
+        fix_tree_key_type::run(initial_finalized_tip_height, db, cancel_receiver)?;
         Ok(())
     }
 

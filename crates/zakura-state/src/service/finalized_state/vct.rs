@@ -24,14 +24,14 @@ use zakura_header_chain::{AuxAuthentication, AuxDelivery};
 /// Positive result proving which exact successor boundary authenticated supplied roots.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum VctAuthenticationProof {
-    /// The successful commit did not authenticate the current auxiliary delivery.
+    /// The successful commit did not authenticate an auxiliary delivery.
     NotAuthenticated,
-    /// One exact history-root commitment accepted the current roots one header later.
+    /// One exact successor history-root commitment accepted the delivery roots.
     Successor {
-        /// Current delivery whose roots verification folded into the verified history tree.
-        current_delivery_id: zakura_header_chain::EvidenceId,
-        /// Current header owning those roots.
-        current_header_hash: block::Hash,
+        /// Delivery whose roots verification folded into the verified history tree.
+        delivery_id: zakura_header_chain::EvidenceId,
+        /// Header that owns the delivery roots.
+        delivery_header_hash: block::Hash,
         /// Exact successor header whose commitment verification checked.
         boundary_hash: block::Hash,
         /// Exact successor authorizing-data root checked with that header.
@@ -42,10 +42,9 @@ pub(crate) enum VctAuthenticationProof {
 use super::commitment_aux::{CommitmentRootSource, EmbeddedFrontierSource, FinalFrontiers};
 use crate::error::VctCommitFailure;
 
-/// A VCT successor header used to authenticate the current block's supplied
-/// note-commitment roots.
+/// A selected successor header and auxiliary delivery that authenticate VCT roots.
 #[derive(Clone, Debug)]
-pub struct NextVctBlock {
+pub struct VctSuccessorWitness {
     /// The successor header that commits to the current block's VCT roots.
     pub(crate) header: Arc<Header>,
     /// The successor header's height.
@@ -58,8 +57,8 @@ pub struct NextVctBlock {
     pub(crate) delivery: Option<AuxDelivery>,
 }
 
-impl NextVctBlock {
-    /// Build a successor witness from a header and its precomputed auth-data root.
+impl VctSuccessorWitness {
+    /// Builds a successor witness from a header and its precomputed authorizing-data root.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_header(
         header: Arc<Header>,
@@ -77,7 +76,9 @@ impl NextVctBlock {
         }
     }
 
-    /// Build a successor witness while retaining its exact auxiliary delivery.
+    /// Builds a successor witness from an exact auxiliary delivery.
+    ///
+    /// The method returns `None` when the delivery identifies another header or height.
     pub(crate) fn from_delivery(
         header: Arc<Header>,
         height: block::Height,
@@ -99,70 +100,70 @@ impl NextVctBlock {
     }
 }
 
-/// One atomically selected current delivery and its optional direct-successor witness.
+/// One selected VCT auxiliary delivery and its optional successor authentication boundary.
 #[derive(Clone, Debug)]
-pub(crate) struct VctAuxWindow {
-    /// Exact committed snapshot under which state selected both deliveries.
-    pub(crate) snapshot: zakura_header_chain::EngineSnapshot,
-    /// Retained header owning the current delivery.
+pub(crate) struct VctAuxiliaryWindow {
+    /// Committed engine snapshot under which state selected both deliveries.
+    pub(crate) engine_snapshot: zakura_header_chain::EngineSnapshot,
+    /// Retained header that owns the delivery under verification.
     ///
-    /// The committer already holds this header in the block it is about to commit, but the
-    /// header-time sweep verifies ahead of bodies and has no block, so the window carries it.
-    pub(crate) current_header: Arc<Header>,
-    /// Exact auxiliary delivery whose roots verification folds for the current block.
-    pub(crate) current: AuxDelivery,
+    /// The committer already holds this header in the block it will commit. The sweep
+    /// verifies ahead of block bodies, so the window carries the header for the sweep.
+    pub(crate) delivery_header: Arc<Header>,
+    /// Auxiliary delivery whose roots verification folds for the current block.
+    pub(crate) delivery: AuxDelivery,
     /// Height of the retained direct successor, even when state lacks its auxiliary delivery.
     pub(crate) successor_height: Option<block::Height>,
     /// Exact direct-successor witness used for one-header-later authentication.
-    pub(crate) successor: Option<NextVctBlock>,
+    pub(crate) successor: Option<VctSuccessorWitness>,
 }
 
-/// Exact metadata deliveries that a failed VCT verification implicates.
+/// Attribution result for a failed VCT auxiliary verification.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum VctAuxRejection {
+pub(crate) enum VctAuxiliaryFailureAttribution {
     /// Verification proved only the current roots invalid.
-    Current,
+    CurrentDelivery,
     /// Verification proved only the successor auth-data root invalid.
-    Successor,
+    SuccessorDelivery,
     /// Either of two unauthenticated deliveries may have caused the boundary mismatch.
-    Ambiguous,
+    AmbiguousDeliveries,
     /// Verification cannot safely attribute failure to a mutable metadata delivery.
-    None,
+    NoDelivery,
 }
 
-impl VctAuxRejection {
-    /// The rejection provides a stable metrics label.
+impl VctAuxiliaryFailureAttribution {
+    /// Returns a stable metrics label for this attribution result.
     pub(crate) fn attribution_label(self) -> &'static str {
         match self {
-            Self::Current => "current",
-            Self::Successor => "successor",
-            Self::Ambiguous => "ambiguous",
-            Self::None => "none",
+            Self::CurrentDelivery => "current",
+            Self::SuccessorDelivery => "successor",
+            Self::AmbiguousDeliveries => "ambiguous",
+            Self::NoDelivery => "none",
         }
     }
 
-    /// The rejection indicates whether the writer stores a dispute.
-    pub(crate) fn is_ambiguous(self) -> bool {
-        self == Self::Ambiguous
+    /// Returns whether the writer must dispute both deliveries.
+    pub(crate) fn requires_dispute(self) -> bool {
+        self == Self::AmbiguousDeliveries
     }
 
-    /// The rejection identifies the lowest delivery that repair must replace.
+    /// Returns the lowest delivery height that repair must replace.
     pub(crate) fn repair_height(
         self,
-        current: block::Height,
-        successor: Option<block::Height>,
+        current_delivery_height: block::Height,
+        successor_delivery_height: Option<block::Height>,
     ) -> Option<block::Height> {
         match self {
-            Self::Current | Self::Ambiguous => Some(current),
-            Self::Successor => successor,
-            Self::None => None,
+            Self::CurrentDelivery | Self::AmbiguousDeliveries => Some(current_delivery_height),
+            Self::SuccessorDelivery => successor_delivery_height,
+            Self::NoDelivery => None,
         }
     }
 }
 
-impl VctAuxWindow {
-    /// Return the exact current roots when the delivery still agrees with the block.
-    pub(crate) fn current_roots(
+impl VctAuxiliaryWindow {
+    /// Returns the delivery roots when the delivery identifies the requested block.
+    pub(crate) fn delivery_roots(
         &self,
         height: block::Height,
         hash: block::Hash,
@@ -171,18 +172,21 @@ impl VctAuxWindow {
         orchard::tree::Root,
         ironwood::tree::Root,
     )> {
-        let aux = self.current.tree_aux?;
-        (self.current.header_hash == hash && aux.height == height).then_some((
-            aux.sapling_root,
-            aux.orchard_root,
-            aux.ironwood_root,
+        let auxiliary_data = self.delivery.tree_aux?;
+        (self.delivery.header_hash == hash && auxiliary_data.height == height).then_some((
+            auxiliary_data.sapling_root,
+            auxiliary_data.orchard_root,
+            auxiliary_data.ironwood_root,
         ))
     }
 
-    /// Attribute a verifier failure without weakening already authenticated evidence.
-    pub(crate) fn classify_failure(&self, failure: VctCommitFailure) -> VctAuxRejection {
-        classify_vct_aux_failure(
-            self.current,
+    /// Attributes a verification failure without weakening authenticated evidence.
+    pub(crate) fn attribute_failure(
+        &self,
+        failure: VctCommitFailure,
+    ) -> VctAuxiliaryFailureAttribution {
+        attribute_vct_auxiliary_failure(
+            self.delivery,
             self.successor
                 .as_ref()
                 .and_then(|successor| successor.delivery),
@@ -191,40 +195,40 @@ impl VctAuxWindow {
     }
 }
 
-fn classify_vct_aux_failure(
-    current: AuxDelivery,
-    successor: Option<AuxDelivery>,
+fn attribute_vct_auxiliary_failure(
+    current_delivery: AuxDelivery,
+    successor_delivery: Option<AuxDelivery>,
     failure: VctCommitFailure,
-) -> VctAuxRejection {
+) -> VctAuxiliaryFailureAttribution {
     let current_untrusted = matches!(
-        current.authentication,
+        current_delivery.authentication,
         AuxAuthentication::Unauthenticated | AuxAuthentication::Disputed { .. }
     );
     if failure == VctCommitFailure::CurrentRoots {
         return if current_untrusted {
-            VctAuxRejection::Current
+            VctAuxiliaryFailureAttribution::CurrentDelivery
         } else {
-            VctAuxRejection::None
+            VctAuxiliaryFailureAttribution::NoDelivery
         };
     }
 
-    let Some(successor) = successor else {
+    let Some(successor_delivery) = successor_delivery else {
         return if current_untrusted {
-            VctAuxRejection::Current
+            VctAuxiliaryFailureAttribution::CurrentDelivery
         } else {
-            VctAuxRejection::None
+            VctAuxiliaryFailureAttribution::NoDelivery
         };
     };
     let successor_untrusted = matches!(
-        successor.authentication,
+        successor_delivery.authentication,
         AuxAuthentication::Unauthenticated | AuxAuthentication::Disputed { .. }
     );
 
     match (current_untrusted, successor_untrusted) {
-        (true, true) => VctAuxRejection::Ambiguous,
-        (true, false) => VctAuxRejection::Current,
-        (false, true) => VctAuxRejection::Successor,
-        (false, false) => VctAuxRejection::None,
+        (true, true) => VctAuxiliaryFailureAttribution::AmbiguousDeliveries,
+        (true, false) => VctAuxiliaryFailureAttribution::CurrentDelivery,
+        (false, true) => VctAuxiliaryFailureAttribution::SuccessorDelivery,
+        (false, false) => VctAuxiliaryFailureAttribution::NoDelivery,
     }
 }
 
@@ -274,11 +278,11 @@ pub(crate) struct VctState {
     prevalidated_count: AtomicU64,
 }
 
-/// Which commitment-root source the committer uses, resolved from the (already read)
+/// Commitment-root source that the committer uses, resolved from the
 /// configuration signals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceMode {
-    /// Legacy recompute committer (no VCT state).
+    /// Legacy committer that recomputes every tree without VCT state.
     Legacy,
     /// Consume exact hash-scoped header auxiliary data.
     HeaderAuxiliary,
@@ -303,7 +307,7 @@ fn select_source_mode(
 }
 
 impl VctState {
-    /// Build committer state from `checkpoint_sync` and `vct_fast_sync`.
+    /// Builds committer state from `checkpoint_sync` and `vct_fast_sync`.
     /// `checkpoint_sync` mirrors `consensus.checkpoint_sync`.
     /// Mainnet checkpoint sync defaults to the peer `tree_aux` source.
     /// Disabled checkpoint sync returns `None` for legacy per-block recomputation.
@@ -602,7 +606,7 @@ impl VctCommitState {
 }
 
 /// Fast-path (vct) outputs for the block being committed, passed as one
-/// parameter from the committer down through
+/// parameter from the committer through
 /// `super::ZakuraDb::write_block` to `super::ZakuraDb::prepare_trees_batch`.
 ///
 /// The fields are independent: a checkpoint-handoff block sets `sync_below`
@@ -773,44 +777,44 @@ mod tests {
         );
 
         assert_eq!(
-            classify_vct_aux_failure(
+            attribute_vct_auxiliary_failure(
                 unauthenticated,
                 Some(authenticated),
                 VctCommitFailure::SuccessorBoundary,
             ),
-            VctAuxRejection::Current,
+            VctAuxiliaryFailureAttribution::CurrentDelivery,
         );
         assert_eq!(
-            classify_vct_aux_failure(
+            attribute_vct_auxiliary_failure(
                 authenticated,
                 Some(unauthenticated),
                 VctCommitFailure::SuccessorBoundary,
             ),
-            VctAuxRejection::Successor,
+            VctAuxiliaryFailureAttribution::SuccessorDelivery,
         );
         assert_eq!(
-            classify_vct_aux_failure(
+            attribute_vct_auxiliary_failure(
                 unauthenticated,
                 Some(unauthenticated),
                 VctCommitFailure::SuccessorBoundary,
             ),
-            VctAuxRejection::Ambiguous,
+            VctAuxiliaryFailureAttribution::AmbiguousDeliveries,
         );
         assert_eq!(
-            classify_vct_aux_failure(
+            attribute_vct_auxiliary_failure(
                 authenticated,
                 Some(authenticated),
                 VctCommitFailure::SuccessorBoundary,
             ),
-            VctAuxRejection::None,
+            VctAuxiliaryFailureAttribution::NoDelivery,
         );
         assert_eq!(
-            classify_vct_aux_failure(
+            attribute_vct_auxiliary_failure(
                 unauthenticated,
                 Some(authenticated),
                 VctCommitFailure::CurrentRoots,
             ),
-            VctAuxRejection::Current,
+            VctAuxiliaryFailureAttribution::CurrentDelivery,
         );
     }
 

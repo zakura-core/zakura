@@ -1,11 +1,10 @@
 //! Clears the retired header-root authentication frontier.
 //!
 //! Header-time root authentication now records its verdicts as header-chain auxiliary
-//! evidence, so the single-row `header_root_auth_frontier` column family has no reader and no
-//! writer. The column family is no longer in [`STATE_COLUMN_FAMILIES_IN_CODE`], so new
-//! databases never create it; this upgrade clears the row a database written by an earlier
-//! version still carries. RocksDB keeps the empty column family itself, because a database is
-//! always opened with every column family already on disk.
+//! evidence. No code reads or writes the single-row `header_root_auth_frontier` column family.
+//! New databases do not create this column family. This upgrade clears the row from older
+//! databases. RocksDB retains the empty column family because startup opens every column family
+//! that exists on disk.
 //!
 //! [`STATE_COLUMN_FAMILIES_IN_CODE`]: crate::service::finalized_state::STATE_COLUMN_FAMILIES_IN_CODE
 
@@ -34,27 +33,30 @@ impl DiskFormatUpgrade for Upgrade {
 
     fn run(
         &self,
-        _initial_tip_height: Option<Height>,
-        db: &ZakuraDb,
+        _initial_finalized_tip_height: Option<Height>,
+        state_database: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<(), FormatChangeError> {
         check_cancelled(cancel_receiver)?;
-        db.clear_retired_header_root_auth_frontier()
-            .map_err(|error| FormatChangeError::Storage(error.to_string()))?;
+        state_database
+            .clear_retired_header_root_auth_frontier()
+            .map_err(|error| FormatChangeError::MigrationStorage(error.to_string()))?;
         check_cancelled(cancel_receiver)?;
         Ok(())
     }
 
     fn validate(
         &self,
-        db: &ZakuraDb,
+        state_database: &ZakuraDb,
         _cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<Result<(), String>, FormatChangeError> {
-        Ok(if db.has_retired_header_root_auth_frontier_row() {
-            Err("the retired header-root authentication frontier still has a row".to_string())
-        } else {
-            Ok(())
-        })
+        Ok(
+            if state_database.has_retired_header_root_auth_frontier_row() {
+                Err("the retired header-root authentication frontier still has a row".to_string())
+            } else {
+                Ok(())
+            },
+        )
     }
 }
 

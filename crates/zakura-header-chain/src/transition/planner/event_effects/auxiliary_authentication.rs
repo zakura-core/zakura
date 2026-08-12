@@ -62,12 +62,9 @@ pub(super) fn apply(
         if existing.authentication == event.authentication {
             continue;
         }
-        if !existing
-            .authentication
-            .permits_transition_to(event.authentication)
-        {
+        if !existing.authentication.can_refine_to(event.authentication) {
             return Err(InvalidTransitionEvidence::Auxiliary(
-                AuxiliaryViolation::ImmutableAuthentication,
+                AuxiliaryViolation::NonRefiningAuthentication,
             )
             .into());
         }

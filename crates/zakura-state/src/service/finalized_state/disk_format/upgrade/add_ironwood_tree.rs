@@ -32,7 +32,7 @@ impl DiskFormatUpgrade for Upgrade {
     #[allow(clippy::unwrap_in_result)]
     fn run(
         &self,
-        _initial_tip_height: Option<Height>,
+        _initial_finalized_tip_height: Option<Height>,
         db: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<(), FormatChangeError> {

@@ -53,20 +53,26 @@ pub enum AuxAuthentication {
         /// Stable rejection evidence.
         evidence: EvidenceId,
     },
-    /// A boundary failure does not identify which of two deliveries is wrong.
+    /// Verification failed at a boundary that combines two untrusted deliveries.
+    ///
+    /// The evidence does not identify which delivery is invalid. Later evidence can refine this
+    /// state to [`AuxAuthentication::Authenticated`] or [`AuxAuthentication::Rejected`].
     Disputed {
-        /// Stable evidence binds both deliveries to one failed boundary.
+        /// Stable evidence that binds both deliveries to the failed boundary.
         evidence: EvidenceId,
     },
 }
 
 impl AuxAuthentication {
-    pub(crate) fn permits_transition_to(self, next: Self) -> bool {
+    /// Return whether new evidence can refine this authentication state to `next_state`.
+    ///
+    /// Evidence cannot restore an unauthenticated state or replace a terminal state.
+    pub(crate) fn can_refine_to(self, next_state: Self) -> bool {
         matches!(
-            (self, next),
-            (Self::Unauthenticated, next) if next != Self::Unauthenticated
+            (self, next_state),
+            (Self::Unauthenticated, next_state) if next_state != Self::Unauthenticated
         ) || matches!(
-            (self, next),
+            (self, next_state),
             (
                 Self::Disputed { .. },
                 Self::Authenticated { .. } | Self::Rejected { .. }

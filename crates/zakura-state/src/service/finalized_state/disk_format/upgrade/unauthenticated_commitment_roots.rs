@@ -1,8 +1,8 @@
 //! Removes commitment-root rows that no committed body or trusted header proves.
 //!
-//! Before this format, the fast path persisted peer-supplied roots as they arrived, so a
-//! database could hold rows above its finalized tip that nothing had verified. Those rows are
-//! served to peers and read by the committer, so they are truncated back to the body tip.
+//! An earlier fast path persisted peer-supplied roots before authentication. The database could
+//! therefore contain unverified rows above its finalized body tip. This upgrade removes those
+//! rows before the committer or peer-serving code can read them.
 
 use crossbeam_channel::{Receiver, TryRecvError};
 use semver::Version;
@@ -28,7 +28,7 @@ static WRITE_HOOKS: std::sync::LazyLock<
 
 #[cfg(test)]
 struct WriteHookGuard {
-    db_path: std::path::PathBuf,
+    database_path: std::path::PathBuf,
 }
 
 #[cfg(test)]
@@ -37,42 +37,45 @@ impl Drop for WriteHookGuard {
         WRITE_HOOKS
             .lock()
             .expect("migration write-hook mutex is not poisoned")
-            .remove(&self.db_path);
+            .remove(&self.database_path);
     }
 }
 
 #[cfg(test)]
-fn register_write_hook(db_path: impl Into<std::path::PathBuf>, hook: WriteHook) -> WriteHookGuard {
-    let db_path = db_path.into();
+fn register_write_hook(
+    database_path: impl Into<std::path::PathBuf>,
+    hook: WriteHook,
+) -> WriteHookGuard {
+    let database_path = database_path.into();
     let replaced = WRITE_HOOKS
         .lock()
         .expect("migration write-hook mutex is not poisoned")
-        .insert(db_path.clone(), hook);
+        .insert(database_path.clone(), hook);
     assert!(
         replaced.is_none(),
         "database already has a migration write hook"
     );
-    WriteHookGuard { db_path }
+    WriteHookGuard { database_path }
 }
 
 #[cfg(test)]
-fn run_write_hook(db_path: &std::path::Path) -> Result<(), String> {
+fn run_write_hook(database_path: &std::path::Path) -> Result<(), String> {
     let hook = WRITE_HOOKS
         .lock()
         .map_err(|_| "migration write-hook mutex is poisoned".to_string())?
-        .get(db_path)
+        .get(database_path)
         .cloned();
     hook.map_or(Ok(()), |hook| hook())
 }
 
 /// Drops every commitment-root row above the finalized body tip.
-pub(super) fn truncate_to_body_tip(db: &ZakuraDb) -> Result<(), rocksdb::Error> {
+pub(super) fn truncate_to_body_tip(state_database: &ZakuraDb) -> Result<(), rocksdb::Error> {
     let mut batch = DiskWriteBatch::new();
-    match db.finalized_tip_height() {
-        Some(body_tip) => batch.truncate_commitment_roots_after(db, body_tip),
-        None => batch.truncate_all_commitment_roots(db),
+    match state_database.finalized_tip_height() {
+        Some(body_tip) => batch.truncate_commitment_roots_after(state_database, body_tip),
+        None => batch.truncate_all_commitment_roots(state_database),
     }
-    db.write_batch(batch)
+    state_database.write_batch(batch)
 }
 
 impl DiskFormatUpgrade for Upgrade {
@@ -86,31 +89,35 @@ impl DiskFormatUpgrade for Upgrade {
 
     fn run(
         &self,
-        _initial_tip_height: Option<Height>,
-        db: &ZakuraDb,
+        _initial_finalized_tip_height: Option<Height>,
+        state_database: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<(), FormatChangeError> {
         check_cancelled(cancel_receiver)?;
         #[cfg(test)]
-        run_write_hook(db.path()).map_err(FormatChangeError::Storage)?;
-        truncate_to_body_tip(db).map_err(|error| FormatChangeError::Storage(error.to_string()))?;
+        run_write_hook(state_database.path()).map_err(FormatChangeError::MigrationStorage)?;
+        truncate_to_body_tip(state_database)
+            .map_err(|error| FormatChangeError::MigrationStorage(error.to_string()))?;
         check_cancelled(cancel_receiver)?;
         Ok(())
     }
 
     fn validate(
         &self,
-        db: &ZakuraDb,
+        state_database: &ZakuraDb,
         _cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<Result<(), String>, FormatChangeError> {
-        let body_tip = db.finalized_tip_height();
+        let body_tip = state_database.finalized_tip_height();
         let first_unproven = match body_tip {
             Some(body_tip) => body_tip.next().ok().and_then(|above| {
-                db.commitment_roots_by_height_range(above..=Height::MAX)
+                state_database
+                    .commitment_roots_by_height_range(above..=Height::MAX)
                     .first()
                     .map(|roots| roots.height)
             }),
-            None => db.has_commitment_root_rows().then_some(Height::MIN),
+            None => state_database
+                .has_commitment_root_rows()
+                .then_some(Height::MIN),
         };
 
         Ok(match first_unproven {
@@ -299,7 +306,7 @@ mod tests {
         };
         assert!(matches!(
             source.downcast_ref::<FormatChangeError>(),
-            Some(FormatChangeError::Storage(message))
+            Some(FormatChangeError::MigrationStorage(message))
                 if message == "injected migration write failure"
         ));
         assert_eq!(

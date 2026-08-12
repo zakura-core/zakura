@@ -15,7 +15,7 @@ use super::{super::super::DiskWriteBatch, CancelFormatChange};
 #[allow(clippy::unwrap_in_result)]
 #[instrument(skip(zakura_db, cancel_receiver))]
 pub fn run(
-    initial_tip_height: Height,
+    initial_finalized_tip_height: Height,
     zakura_db: &ZakuraDb,
     cancel_receiver: &Receiver<CancelFormatChange>,
 ) -> Result<(), CancelFormatChange> {
@@ -36,7 +36,7 @@ pub fn run(
         return Err(CancelFormatChange);
     }
 
-    (0..=initial_tip_height.0)
+    (0..=initial_finalized_tip_height.0)
         .into_par_iter()
         .try_for_each(|height| {
             let height = Height(height);

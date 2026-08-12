@@ -24,11 +24,11 @@ impl DiskFormatUpgrade for PruneTrees {
     #[allow(clippy::unwrap_in_result)]
     fn run(
         &self,
-        initial_tip_height: Option<Height>,
+        initial_finalized_tip_height: Option<Height>,
         db: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<(), FormatChangeError> {
-        let Some(initial_tip_height) = initial_tip_height else {
+        let Some(initial_finalized_tip_height) = initial_finalized_tip_height else {
             return Ok(());
         };
         // Prune duplicate Sapling note commitment trees.
@@ -40,7 +40,9 @@ impl DiskFormatUpgrade for PruneTrees {
 
         // Run through all the possible duplicate trees in the finalized chain.
         // The block after genesis is the first possible duplicate.
-        for (height, tree) in db.sapling_tree_by_height_range(Height(1)..=initial_tip_height) {
+        for (height, tree) in
+            db.sapling_tree_by_height_range(Height(1)..=initial_finalized_tip_height)
+        {
             // Return early if there is a cancel signal.
             if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
                 return Err(CancelFormatChange.into());
@@ -67,7 +69,9 @@ impl DiskFormatUpgrade for PruneTrees {
 
         // Run through all the possible duplicate trees in the finalized chain.
         // The block after genesis is the first possible duplicate.
-        for (height, tree) in db.orchard_tree_by_height_range(Height(1)..=initial_tip_height) {
+        for (height, tree) in
+            db.orchard_tree_by_height_range(Height(1)..=initial_finalized_tip_height)
+        {
             // Return early if there is a cancel signal.
             if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
                 return Err(CancelFormatChange.into());

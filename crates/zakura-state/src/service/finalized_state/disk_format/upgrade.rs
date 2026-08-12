@@ -47,51 +47,59 @@ pub(crate) mod drop_tx_locs_by_spends;
 #[cfg(feature = "indexer")]
 pub(crate) mod track_tx_locs_by_spends;
 
-/// Defines method signature for running disk format upgrades.
+/// Defines one ordered state database format upgrade.
+///
+/// The upgrade coordinator calls [`DiskFormatUpgrade::prepare`],
+/// [`DiskFormatUpgrade::run`], and [`DiskFormatUpgrade::validate`] before it writes the new format
+/// version. Implementations must support a retry after cancellation or failure.
 pub trait DiskFormatUpgrade {
-    /// Returns the version at which this upgrade is applied.
+    /// Returns the database format version that this upgrade establishes.
     fn version(&self) -> Version;
 
-    /// Returns the description of this upgrade.
+    /// Returns a short operation description for logs and timing metrics.
     fn description(&self) -> &'static str;
 
-    /// Runs disk format upgrade.
+    /// Applies the format upgrade to `state_database`.
+    ///
+    /// `initial_finalized_tip_height` reports the tip that startup observed before any upgrade.
+    /// An empty database supplies `None`. The coordinator does not update the format version when
+    /// this method returns an error.
     fn run(
         &self,
-        initial_tip_height: Option<Height>,
-        db: &ZakuraDb,
+        initial_finalized_tip_height: Option<Height>,
+        state_database: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<(), FormatChangeError>;
 
-    /// Check that state has been upgraded to this format correctly.
+    /// Validates the postconditions that this upgrade establishes.
     ///
-    /// The outer `Result` indicates whether the validation was cancelled (due to e.g. node shutdown).
-    /// The inner `Result` indicates whether the validation itself failed or not.
+    /// The outer result reports cancellation or an operational error. The inner result reports an
+    /// invalid postcondition without discarding its diagnostic message.
     fn validate(
         &self,
-        _db: &ZakuraDb,
+        _state_database: &ZakuraDb,
         _cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<Result<(), String>, FormatChangeError> {
         Ok(Ok(()))
     }
 
-    /// Prepare for disk format upgrade.
+    /// Prepares temporary or derived data that [`DiskFormatUpgrade::run`] consumes.
     fn prepare(
         &self,
-        _initial_tip_height: Option<Height>,
-        _upgrade_db: &ZakuraDb,
+        _initial_finalized_tip_height: Option<Height>,
+        _state_database: &ZakuraDb,
         _cancel_receiver: &Receiver<CancelFormatChange>,
         _older_disk_version: &Version,
     ) -> Result<(), FormatChangeError> {
         Ok(())
     }
 
-    /// Returns true if the [`DiskFormatUpgrade`] needs to run a migration on existing data in the db.
+    /// Returns whether this upgrade mutates existing database rows.
     fn needs_migration(&self) -> bool {
         true
     }
 
-    /// Returns true if the upgrade is a major upgrade that can reuse the cache in the previous major db format version.
+    /// Returns whether a major upgrade can reuse the previous major version's cache.
     fn is_reusable_major_upgrade(&self) -> bool {
         let version = self.version();
         version.minor == 0 && version.patch == 0
@@ -236,7 +244,7 @@ pub struct DbFormatChangeThreadHandle {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct CancelFormatChange;
 
-/// A format change error prevents a version update.
+/// An error that prevents the coordinator from updating the database format version.
 #[derive(Debug, Error)]
 pub enum FormatChangeError {
     /// Shutdown cancels the format change.
@@ -244,10 +252,10 @@ pub enum FormatChangeError {
     Cancelled,
     /// RocksDB rejected a migration write.
     #[error("database format migration storage write failed: {0}")]
-    Storage(String),
-    /// A migration or final format check reports an invalid postcondition.
+    MigrationStorage(String),
+    /// A migration or final format check found an invalid postcondition.
     #[error("database format migration postcondition failed: {0}")]
-    Invalid(String),
+    InvalidPostcondition(String),
 }
 
 impl From<CancelFormatChange> for FormatChangeError {
@@ -430,11 +438,11 @@ impl DbFormatChange {
     ///
     /// The startup format change must already have completed synchronously.
     ///
-    /// `initial_tip_height` is the database height when it was opened, and `db` is the
+    /// `initial_finalized_tip_height` is the database height when it was opened. `db` is the
     /// database instance to upgrade or check.
     pub fn spawn_periodic_format_checks(
         db: ZakuraDb,
-        initial_tip_height: Option<Height>,
+        initial_finalized_tip_height: Option<Height>,
     ) -> DbFormatChangeThreadHandle {
         // # Correctness
         //
@@ -445,7 +453,7 @@ impl DbFormatChange {
         let span = Span::current();
         let update_task = thread::spawn(move || {
             span.in_scope(move || {
-                Self::periodic_format_check_loop(db, initial_tip_height, cancel_receiver)
+                Self::periodic_format_check_loop(db, initial_finalized_tip_height, cancel_receiver)
             })
         });
 
@@ -462,7 +470,7 @@ impl DbFormatChange {
     /// Periodically check that newly added blocks match the current format.
     fn periodic_format_check_loop(
         db: ZakuraDb,
-        initial_tip_height: Option<Height>,
+        initial_finalized_tip_height: Option<Height>,
         cancel_receiver: Receiver<CancelFormatChange>,
     ) -> Result<(), FormatChangeError> {
         let Some(debug_validity_check_interval) = db.config().debug_validity_check_interval else {
@@ -481,7 +489,7 @@ impl DbFormatChange {
 
             Self::check_new_blocks(&db).run_format_change_or_check(
                 &db,
-                initial_tip_height,
+                initial_finalized_tip_height,
                 &cancel_receiver,
             )?;
         }
@@ -492,7 +500,7 @@ impl DbFormatChange {
     pub(crate) fn run_format_change_or_check(
         &self,
         db: &ZakuraDb,
-        initial_tip_height: Option<Height>,
+        initial_finalized_tip_height: Option<Height>,
         cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<(), FormatChangeError> {
         // Mark the database as having finished applying any format upgrades if there are no
@@ -504,7 +512,7 @@ impl DbFormatChange {
         match self {
             // Perform any required upgrades, then mark the state as upgraded.
             Upgrade { .. } => {
-                self.apply_format_upgrade(db, initial_tip_height, cancel_receiver)?;
+                self.apply_format_upgrade(db, initial_finalized_tip_height, cancel_receiver)?;
                 db.mark_finished_format_upgrades();
             }
 
@@ -554,8 +562,8 @@ impl DbFormatChange {
         #[cfg(feature = "indexer")]
         if let (
             Upgrade { .. } | CheckOpenCurrent { .. } | Downgrade { .. },
-            Some(initial_tip_height),
-        ) = (self, initial_tip_height)
+            Some(initial_finalized_tip_height),
+        ) = (self, initial_finalized_tip_height)
         {
             // Indexing transaction locations by their spent outpoints and revealed nullifiers.
             let timer = CodeTimer::start();
@@ -571,7 +579,7 @@ impl DbFormatChange {
                 .expect("unable to write database format version file to disk");
 
             info!("started checking/adding indexes for spending tx ids");
-            track_tx_locs_by_spends::run(initial_tip_height, db, cancel_receiver)?;
+            track_tx_locs_by_spends::run(initial_finalized_tip_height, db, cancel_receiver)?;
             info!("finished checking/adding indexes for spending tx ids");
 
             timer.finish_desc("indexing spending transaction ids");
@@ -580,8 +588,8 @@ impl DbFormatChange {
         #[cfg(not(feature = "indexer"))]
         if let (
             Upgrade { .. } | CheckOpenCurrent { .. } | Downgrade { .. },
-            Some(initial_tip_height),
-        ) = (self, initial_tip_height)
+            Some(initial_finalized_tip_height),
+        ) = (self, initial_finalized_tip_height)
         {
             let mut version = db
                 .format_version_on_disk()
@@ -593,7 +601,7 @@ impl DbFormatChange {
                 let timer = CodeTimer::start();
 
                 info!("started removing indexes for spending tx ids");
-                drop_tx_locs_by_spends::run(initial_tip_height, db, cancel_receiver)?;
+                drop_tx_locs_by_spends::run(initial_finalized_tip_height, db, cancel_receiver)?;
                 info!("finished removing indexes for spending tx ids");
 
                 // Remove build metadata to on-disk version file after indexes have been dropped.
@@ -615,7 +623,7 @@ impl DbFormatChange {
         //   or new block code created the format (or any combination).
         if let Err(message) = Self::format_validity_checks_detailed(db, cancel_receiver)? {
             if self.is_upgrade() {
-                return Err(FormatChangeError::Invalid(message));
+                return Err(FormatChangeError::InvalidPostcondition(message));
             }
 
             panic!(
@@ -652,7 +660,7 @@ impl DbFormatChange {
     fn apply_format_upgrade(
         &self,
         db: &ZakuraDb,
-        initial_tip_height: Option<Height>,
+        initial_finalized_tip_height: Option<Height>,
         cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<(), FormatChangeError> {
         let Upgrade {
@@ -671,13 +679,18 @@ impl DbFormatChange {
             if upgrade.needs_migration() {
                 let timer = CodeTimer::start();
 
-                upgrade.prepare(initial_tip_height, db, cancel_receiver, older_disk_version)?;
-                upgrade.run(initial_tip_height, db, cancel_receiver)?;
+                upgrade.prepare(
+                    initial_finalized_tip_height,
+                    db,
+                    cancel_receiver,
+                    older_disk_version,
+                )?;
+                upgrade.run(initial_finalized_tip_height, db, cancel_receiver)?;
 
                 // Before marking the state as upgraded, check that the upgrade completed successfully.
                 upgrade
                     .validate(db, cancel_receiver)?
-                    .map_err(FormatChangeError::Invalid)?;
+                    .map_err(FormatChangeError::InvalidPostcondition)?;
 
                 timer.finish_desc(upgrade.description());
             }

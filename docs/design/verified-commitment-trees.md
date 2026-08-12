@@ -398,34 +398,33 @@ offending height; over `[start..=end]` it confirms `[start..=end-1]`, and `end+1
 
 ### 6.0 Header-time authentication (the early check)
 
-The committer is the trust boundary, but it only reaches a height when that height's body
-commits. During fast sync the header chain runs far ahead of the bodies, so a wrong root can
-sit in the DAG for a long time before anything notices, and the repair that replaces it only
-starts once the committer stalls on it.
+The committer is the trust boundary. It reaches a height only when it commits that
+height's block body. During fast sync, the header chain runs far ahead of the block bodies. An
+invalid root can therefore remain in the DAG until the committer reaches it.
 
-`service/write/vct_sweep.rs` closes that gap. As header batches arrive, the state writer walks
-the selected path above the committed body tip, keeps its own running ZIP-221 MMR anchored at
-that tip, and for each height `H` verifies the selected delivery against the delivery at `H+1`
-— the same one-header-later boundary the committer uses, reached through the header-only
-kernel `verify_supplied_roots_from_parts` rather than a block body. A delivery that verifies is
-promoted to `Authenticated` through the same auxiliary-evidence transition the committer emits;
-a delivery that fails is marked `Rejected` and arms metadata repair immediately.
+`service/write/vct_authentication_sweep.rs` detects invalid roots earlier. The sweep walks the
+selected projection above the committed body tip. It maintains a ZIP-221 MMR anchored at that tip.
+At each height `H`, the sweep verifies the selected delivery against the delivery at `H+1`. This
+check uses the same successor boundary as the committer. The sweep calls
+`verify_supplied_roots_from_parts` because it has headers instead of block bodies. The sweep records
+a successful delivery as `Authenticated`. The sweep rejects an attributable delivery. The sweep
+disputes both deliveries when the boundary cannot identify which delivery is invalid. Either
+failure starts metadata repair immediately.
 
-Three properties keep this additive rather than load-bearing:
+Three properties keep the committer authoritative:
 
-- **The committer still verifies everything it commits.** The sweep is an extra check, never a
-  substitute, so the trust boundary does not move and a sweep that never runs is only slower.
-- **Rejection attribution matches the committer's.** A failure that the boundary cannot
-  separate from its predecessor's roots evicts both, exactly as `classify_failure` already
-  resolves it at commit time. A failure on a delivery's own pre-activation fields evicts only
-  that delivery.
-- **Promotion pins selection.** `select_vct_aux_delivery` prefers an authenticated delivery,
-  and an authenticated delivery is immutable, so a later delivery cannot silently displace
-  roots the running MMR already folded.
+- **The committer still verifies every committed delivery.** The sweep adds an early check.
+  It does not move the trust boundary.
+- **Failure attribution matches the committer.** The header-chain writer disputes both deliveries
+  when the boundary cannot identify the invalid delivery. A replacement can later authenticate the
+  honest delivery and reject the invalid delivery. A failure on a delivery's pre-activation fields
+  rejects only that delivery.
+- **Authentication pins selection.** `select_vct_auxiliary_delivery` prefers an authenticated
+  delivery. Authentication state cannot return to `Unauthenticated`. A later delivery cannot
+  displace roots that the running MMR already folded.
 
-Repair need is published on the existing single-slot watch channel: the sweep and the committer
-track their needs independently and the lower height is published, so an early eviction is not
-withdrawn by the committer's next successful commit.
+The sweep and committer track repair requests independently. The repair channel publishes the
+lower height. A successful block commit clears only the committer repair request.
 
 ### 6.1 Direct header checks below Heartwood, NU5, and Nu6_3
 
@@ -785,11 +784,11 @@ asserts to prove roots actually came over the wire rather than a silent legacy s
   exercise serving and committing finalized ranges with roots end-to-end, including the
   all-or-nothing serving helper (roots attached only on complete coverage, otherwise rootless
   headers) and routing received roots into `CommitHeaderRange`.
-- **State persistence:** `InsertHeaders` shape-checks roots and stores them as auxiliary
-  deliveries but writes no root row; `service/write/vct_sweep.rs` authenticates each delivery
-  against its successor's commitment and records the verdict as header-chain evidence, evicting
-  an invalid delivery and arming repair for it. Only a committed body writes a
-  `commitment_roots_by_height` row, and rollback truncates rows above its target height.
+- **State persistence:** `InsertHeaders` validates root shapes and stores the roots as auxiliary
+  deliveries. It does not write a root row. `service/write/vct_authentication_sweep.rs`
+  authenticates each delivery against its successor commitment. The sweep records the result as
+  header-chain evidence. The sweep starts repair after a rejection or dispute. Only a committed
+  body writes a `commitment_roots_by_height` row. Rollback truncates rows above its target height.
 - **Real-data manual runs (`#[ignore]`, env-gated):** `verifies_real_nu5_range_over_synced_forks`
   verifies the real NU5/V2 range against synced archive forks (corrupted root rejected at H+1).
 - **Headline end-to-end (manual, follow-up):** a fresh node fast-syncing

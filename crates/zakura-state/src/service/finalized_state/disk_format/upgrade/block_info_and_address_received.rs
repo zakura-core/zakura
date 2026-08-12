@@ -54,11 +54,11 @@ impl DiskFormatUpgrade for Upgrade {
     #[allow(clippy::unwrap_in_result)]
     fn run(
         &self,
-        initial_tip_height: Option<zakura_chain::block::Height>,
+        initial_finalized_tip_height: Option<zakura_chain::block::Height>,
         db: &crate::ZakuraDb,
         cancel_receiver: &crossbeam_channel::Receiver<super::CancelFormatChange>,
     ) -> Result<(), super::FormatChangeError> {
-        let Some(initial_tip_height) = initial_tip_height else {
+        let Some(initial_finalized_tip_height) = initial_finalized_tip_height else {
             return Ok(());
         };
         let network = db.network();
@@ -66,7 +66,7 @@ impl DiskFormatUpgrade for Upgrade {
         let chunk_size = rayon::current_num_threads();
         tracing::info!(chunk_size = ?chunk_size, "adding block info data");
 
-        let chunks = (0..=initial_tip_height.0).chunks(chunk_size);
+        let chunks = (0..=initial_finalized_tip_height.0).chunks(chunk_size);
         // Since transaction parsing is slow, we want to parallelize it.
         // Get chunks of block heights and load them in parallel.
         let seq_iter = chunks.into_iter().flat_map(|height_span| {

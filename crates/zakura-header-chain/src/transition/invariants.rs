@@ -325,7 +325,7 @@ fn verify_incremental_aux_authentication(
         if expected != **delivery
             || !existing
                 .authentication
-                .permits_transition_to(delivery.authentication)
+                .can_refine_to(delivery.authentication)
         {
             return Err(InvariantViolation::Auxiliary(delivery.header_hash));
         }

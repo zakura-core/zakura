@@ -804,6 +804,12 @@ criteria = "safe-to-deploy"
 version = "2.0.1"
 notes = "Reviewed all packaged source, manifests, tests, and quoting guidance. The string facade accepts valid UTF-8, the byte parser preserves multibyte sequences, and unchecked facade conversion APIs explicitly require that invariant before using unchecked UTF-8 conversions. Quoting is bounded by caller input, rejects NUL by default, and documents that control characters must not be sent to interactive shells or terminal input. The dependency-free library has no build script, runtime I/O, process execution, or ambient capabilities. All 7 unit tests and 1 doctest passed with both default and no-default features."
 
+[[audits.siphasher]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.3"
+notes = "Reviewed all packaged source, manifests, and tests. This dependency-free no_std implementation performs in-memory SipHash-1-3, SipHash-2-4, and 128-bit variants. Every unsafe unaligned byte load is bounded by a complete-block loop or a tail length below 8 bytes; the remaining volatile read is from a valid local reference. It has no build script, runtime I/O, or ambient capabilities. All 15 unit tests and 2 doctests passed with all features; all 13 unit tests and 2 doctests passed without default features. This audit does not override the crate's warning against cryptographic use."
+
 [[audits.sketches-ddsketch]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1002,10 +1008,22 @@ criteria = "safe-to-deploy"
 delta = "0.1.3 -> 0.1.4"
 notes = "Reviewed the complete 0.1.3 -> 0.1.4 packaged-source delta. Runtime changes replace lazy_static with once_cell::Lazy, qualify generated Option paths, update dependency floors, and deprecate an adapter; no new unsafe code, I/O, build script, or ambient capability. The all-feature library compiled. The all-feature test target has an upstream test-only initializer arity error at Lazy::new(Mutex::new); deployed code is unaffected."
 
+[[audits.ucd-trie]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.7"
+notes = "Reviewed all packaged source, manifests, generated Unicode 16 general-category data, tests, and benchmark. The no_std lookup path uses safe Rust over immutable caller-supplied or generated trie slices; the std builder validates codepoint bounds and rejects compression indices that exceed u8. It contains no unsafe code, build script, runtime I/O, or ambient capabilities. All 40 unit tests passed with std, including exhaustive membership checks across every codepoint for 38 general categories; the no-default library and test targets compiled successfully."
+
 [[audits.uint]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.9.5 -> 0.10.0"
+
+[[audits.unicode-ident]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.24"
+notes = "Reviewed all packaged source, manifests, generated Unicode 17 tables, tests, and benchmark. The dependency-free no_std implementation performs fixed-table XID lookups; the largest generated chunk index makes both unchecked leaf accesses land at or before the final table element. Exhaustive comparison of every Unicode scalar against the bundled independent ucd-trie and FST representations passed, together with 5 size/layout tests and 2 doctests. It has no build script, allocation, runtime I/O, or ambient capabilities. The published unicode-xid 0.2.6 comparison oracle is older and first disagrees at U+088F because Cargo strips the source manifest's Unicode 17 patch; rerunning without only that stale oracle passed."
 
 [[audits.unit-prefix]]
 who = "OpenAI Codex <noreply@openai.com>"

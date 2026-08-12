@@ -1760,10 +1760,6 @@ criteria = "safe-to-deploy"
 version = "0.1.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.siphasher]]
-version = "1.0.3"
-criteria = "safe-to-deploy"
-
 [[exemptions.slab]]
 version = "0.4.12"
 criteria = "safe-to-deploy"
@@ -2028,20 +2024,12 @@ criteria = "safe-to-deploy"
 version = "0.1.13"
 criteria = "safe-to-deploy"
 
-[[exemptions.ucd-trie]]
-version = "0.1.7"
-criteria = "safe-to-deploy"
-
 [[exemptions.uint]]
 version = "0.9.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.unicase]]
 version = "2.9.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.unicode-ident]]
-version = "1.0.24"
 criteria = "safe-to-deploy"
 
 [[exemptions.ureq]]

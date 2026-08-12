@@ -179,10 +179,8 @@ fn auxiliary_deletes_for_evicted_headers_are_sorted_by_hash_and_delivery_id() {
     for delivery in &deliveries {
         store
             .graph
-            .node_mut(delivery.header_hash)
-            .expect("the competing header remains retained")
-            .aux_delivery_ids
-            .push(delivery.delivery_id);
+            .record_aux_delivery(delivery.header_hash, delivery.delivery_id)
+            .expect("the competing header remains retained");
         store.aux.push(*delivery);
     }
 

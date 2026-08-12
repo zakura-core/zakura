@@ -335,6 +335,12 @@ criteria = "safe-to-deploy"
 version = "2.5.0"
 notes = "Reviewed all packaged source, manifest, and tests. This dependency-free no_std crate forbids unsafe code and contains typed CRC algorithm parameters and aliases only, with no build script, runtime I/O, or ambient capabilities. All 112 standard check-vector tests passed."
 
+[[audits.criterion-plot]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-run"
+version = "0.5.0"
+notes = "Reviewed all packaged source, manifest, and tests. Plot builders serialize caller-provided values into a gnuplot script; the explicit draw, save, and version APIs respectively spawn the literal gnuplot executable, write a caller-selected file, or query its version, with no shell interpolation or hidden capability use. No unsafe code or build script. All 4 unit tests and 5 doctests passed after capping an obsolete unexpected-cfg lint that is already capped for dependencies."
+
 [[audits.crypto-common]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -677,6 +683,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.13.0"
 notes = "Reviewed all packaged source and manifest. This no-std crate defines group and encoding traits plus allocation-gated wNAF helpers; table indices derive from internally paired window tables and signed-digit forms. It has no unsafe code, build script, I/O, or ambient capabilities. The all-features library target passed; the package has no concrete group implementation tests."
+
+[[audits.halo2_poseidon]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.0"
+notes = "Reviewed all packaged source, manifest, permutation, constant-generation, and sponge code. The no_std implementation uses typed widths and rates, validates domains before padding, derives constants with rejection sampling, and delegates field arithmetic to separately policy-checked dependencies. No unsafe code, build script, I/O, or ambient authority. All 7 permutation, constant, MDS, and sponge tests passed with all features."
 
 [[audits.hashbrown]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1295,9 +1307,21 @@ version = "3.5.0"
 notes = "Reviewed all packaged source, manifest, and tests. The helper reads the active and workspace Cargo manifests, invokes only the configured Cargo executable with locate-project, caches results against manifest timestamps, and sanitizes dependency names before returning them to proc macros. It has no unsafe code, build script, or network access. All 13 unit tests passed; the published integration target references a workspace fixture omitted from the archive."
 
 [[audits.proptest-derive]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.5.1"
+notes = "Reviewed all packaged source, manifest, generated strategy logic, and tests. The procedural macro parses type and field attributes and emits safe, type-checked Arbitrary strategies with bounded recursion and no build script, runtime I/O, or ambient authority. All 74 non-UI tests passed; two never-type suites required enabling the compiler's declared unstable feature, while the diagnostic compiletest expectations have drifted on the current compiler."
+
+[[audits.proptest-derive]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.4.0 -> 0.5.0"
+
+[[audits.prost]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.14.4"
+notes = "Reviewed all packaged source, manifest, encoders, decoders, and tests. Unrolled varint reads are entered only when the available slice proves every accessed continuation byte exists, integer overflow is rejected, and string decoding uses a drop guard that clears invalid UTF-8 on errors and unwinding. There is no build script, hidden I/O, or ambient authority. All 413 all-feature tests and 1 applicable doctest passed; 13 illustrative doctests were ignored as declared."
 
 [[audits.prost]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1329,6 +1353,12 @@ delta = "0.12.6 -> 0.13.1"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.13.1 -> 0.13.3"
+
+[[audits.prost-types]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.14.4"
+notes = "Reviewed all packaged source, manifest, generated Protocol Buffer types, and conversion helpers. Duration, timestamp, datetime, and type-URL conversions normalize and range-check components before constructing standard types; no unsafe code, build script, runtime I/O, or ambient authority is present. All 23 all-feature unit tests passed."
 
 [[audits.prost-types]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1376,6 +1406,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.10.2"
 notes = "Reviewed all packaged source, manifest, and tests. The no_std PCG implementations use fixed-width wrapping state transitions and explicit little-endian seed encodings; documentation clearly states these generators are not cryptographically secure. No unsafe code, build script, I/O, or ambient authority. All 23 applicable vector and behavior tests passed; one declared test was ignored."
+
+[[audits.rand_xoshiro]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.7.0"
+notes = "Reviewed all packaged source, manifest, generators, jump functions, and tests. The no_std implementations use fixed-width wrapping transitions, rotations, and explicit seed encodings and are clearly documented as non-cryptographic generators. No unsafe code, build script, I/O, or ambient authority. All 35 vector and behavior tests and 13 doctests passed with all features."
 
 [[audits.ref-cast]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1662,6 +1698,12 @@ criteria = "safe-to-deploy"
 version = "2.0.1"
 notes = "Reviewed all packaged source, manifests, tests, and quoting guidance. The string facade accepts valid UTF-8, the byte parser preserves multibyte sequences, and unchecked facade conversion APIs explicitly require that invariant before using unchecked UTF-8 conversions. Quoting is bounded by caller input, rejects NUL by default, and documents that control characters must not be sent to interactive shells or terminal input. The dependency-free library has no build script, runtime I/O, process execution, or ambient capabilities. All 7 unit tests and 1 doctest passed with both default and no-default features."
 
+[[audits.simple-dns]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.9.3"
+notes = "Reviewed all packaged source, manifest, DNS packet and zone parsers, writers, and tests. The safe parser checks every wire slice, caps labels and names, bounds record counts to header u16 values, and requires compression pointers to move strictly backward, preventing pointer cycles. Runtime operations are limited to caller-provided bytes and I/O; filesystem reads occur only in tests. All 117 unit tests and 6 doctests passed with all features."
+
 [[audits.siphasher]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1942,6 +1984,18 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.12.1 -> 0.12.3"
 
+[[audits.tower]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.13"
+notes = "Reviewed all packaged source, manifest, service middleware, state machines, and tests. Buffering, readiness, concurrency and rate limits, retries, timeouts, balancing, discovery, and load shedding use safe Rust with typed futures and separately policy-checked synchronization dependencies; no build script or hidden ambient capability is present. All 74 all-feature unit and integration tests and 44 doctests passed."
+
+[[audits.tower]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.5.3"
+notes = "Reviewed all packaged source, manifest, service middleware, state machines, and tests. Buffering, readiness, limits, retries, timeouts, balancing, discovery, and load shedding use safe Rust with typed futures and separately policy-checked synchronization dependencies; no build script or hidden ambient capability is present. All 82 all-feature unit and integration tests and 48 doctests passed after updating the package's bundled development lock from tracing 0.1.9 to the Zakura-locked tracing API."
+
 [[audits.tower-batch-control]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -1985,6 +2039,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.1.31"
 notes = "Reviewed all packaged source, manifest, macro parsing and expansion, and tests. The safe procedural macro preserves function unsafety rather than introducing it and emits only typed tracing span and event operations, with no build script, I/O, or ambient capability. The all-feature library and packaged dead-code test passed; the UI suite's only mismatch was changed Rust diagnostic text. Most runtime integration tests cannot compile from the published package because its workspace-only tracing-mock development dependency was omitted."
+
+[[audits.tracing-error]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.1"
+notes = "Reviewed all packaged source, manifest, error erasure, span layer, and tests. The erased error pointer is always paired with a vtable instantiated for its original concrete type, and raw layer downcasts return pointers only for matching TypeIds. The crate has no build script or ambient authority. All 3 unit tests and 9 applicable doctests passed; one doctest requires tracing's attributes feature, which the standalone package's dev-dependency does not enable."
 
 [[audits.tracing-flame]]
 who = "OpenAI Codex <noreply@openai.com>"

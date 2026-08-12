@@ -276,10 +276,6 @@ criteria = "safe-to-deploy"
 version = "0.5.1"
 criteria = "safe-to-run"
 
-[[exemptions.criterion-plot]]
-version = "0.5.0"
-criteria = "safe-to-run"
-
 [[exemptions.critical-section]]
 version = "1.2.0"
 criteria = "safe-to-deploy"
@@ -431,10 +427,6 @@ version = "0.5.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.halo2_legacy_pdqsort]]
-version = "0.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.halo2_poseidon]]
 version = "0.1.0"
 criteria = "safe-to-deploy"
 
@@ -711,6 +703,7 @@ criteria = "safe-to-deploy"
 [[exemptions.nanorand]]
 version = "0.7.0"
 criteria = "safe-to-deploy"
+notes = "Audit held: without the optional getrandom dependency, constructors ignore the success result from direct system-entropy calls; Linux also treats a short getrandom read as success, and Windows reports RtlGenRandom success as false. The public rdseed helper additionally writes full eight-byte chunks into arbitrary output lengths and can panic on a non-multiple-of-eight slice. Zakura currently enables the getrandom feature, but retain the version-wide exemption pending upstream fixes."
 
 [[exemptions.netdev]]
 version = "0.36.0"
@@ -926,19 +919,7 @@ criteria = "safe-to-deploy"
 version = "1.11.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.proptest-derive]]
-version = "0.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.prost]]
-version = "0.14.4"
-criteria = "safe-to-deploy"
-
 [[exemptions.prost-build]]
-version = "0.14.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.prost-types]]
 version = "0.14.4"
 criteria = "safe-to-deploy"
 
@@ -976,10 +957,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.rand]]
 version = "0.10.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_xoshiro]]
-version = "0.7.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rapidhash]]
@@ -1192,10 +1169,6 @@ criteria = "safe-to-deploy"
 version = "0.1.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.simple-dns]]
-version = "0.9.3"
-criteria = "safe-to-deploy"
-
 [[exemptions.sinsemilla]]
 version = "0.1.0"
 criteria = "safe-to-deploy"
@@ -1271,6 +1244,7 @@ criteria = "safe-to-deploy"
 [[exemptions.time-macros]]
 version = "0.2.31"
 criteria = "safe-to-deploy"
+notes = "Audit held: timestamp parsing rounds arbitrary fractional precision to nanoseconds before calling Timestamp::__new_unchecked. timestamp!(0.9999999999) reproducibly produces 1_000_000_000 nanoseconds and fails the ranged-integer invariant during compilation instead of yielding a valid value or a normal macro diagnostic. Retain the exemption pending explicit carry or truncation handling."
 
 [[exemptions.tinyvec]]
 version = "1.12.0"
@@ -1312,14 +1286,6 @@ criteria = "safe-to-deploy"
 version = "0.14.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.tower]]
-version = "0.4.13"
-criteria = "safe-to-deploy"
-
-[[exemptions.tower]]
-version = "0.5.3"
-criteria = "safe-to-deploy"
-
 [[exemptions.tower-http]]
 version = "0.6.11"
 criteria = "safe-to-deploy"
@@ -1334,10 +1300,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tracing-core]]
 version = "0.1.36"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-error]]
-version = "0.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.tracing-journald]]
@@ -1375,6 +1337,7 @@ criteria = "safe-to-deploy"
 [[exemptions.wait-timeout]]
 version = "0.2.0"
 criteria = "safe-to-deploy"
+notes = "Audit held: the Unix SIGCHLD chaining path checks only a null previous handler; an inherited SIG_IGN disposition is typically the non-null sentinel 1 and can be transmuted and called as a function pointer. Current wait-timeout 0.2.1 retains this design, but its imported delta audit depends on this legacy baseline, so direct replacement review or upstream remediation is required before removing the exemption."
 
 [[exemptions.wasi]]
 version = "0.11.0+wasi-snapshot-preview1"

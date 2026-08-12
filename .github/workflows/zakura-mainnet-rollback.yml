@@ -51,12 +51,12 @@ jobs:
           BIN_PATH: ${{ inputs.bin_path }}
         run: |
           set -euo pipefail
-          if ! [[ "${SSH_TARGET}" =~ ^[a-zA-Z0-9._@-]+$ ]]; then
-            echo "invalid ssh_target: expected root@<host>, allowed chars [a-zA-Z0-9._@-]" >&2
+          if ! [[ "${SSH_TARGET}" =~ ^root@[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+            echo "invalid ssh_target: expected root@<host> with an alphanumeric host boundary" >&2
             exit 1
           fi
-          if ! [[ "${SERVICE}" =~ ^[a-zA-Z0-9._@-]+$ ]]; then
-            echo "invalid service: allowed chars [a-zA-Z0-9._@-]" >&2
+          if ! [[ "${SERVICE}" =~ ^[a-zA-Z0-9][a-zA-Z0-9._@-]*$ ]]; then
+            echo "invalid service: must start alphanumeric, allowed chars [a-zA-Z0-9._@-]" >&2
             exit 1
           fi
           if ! [[ "${BIN_PATH}" =~ ^/[a-zA-Z0-9._/-]+$ ]]; then
@@ -83,9 +83,9 @@ jobs:
           SSH_TARGET: ${{ inputs.ssh_target }}
         run: |
           set -euo pipefail
-          host="$(echo "${SSH_TARGET}" | sed 's/.*@//')"
+          host="${SSH_TARGET#*@}"
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -T 30 -H -- "$host" >> ~/.ssh/known_hosts 2>/dev/null || true
           chmod 600 ~/.ssh/known_hosts
 
       - name: Capture diagnostics
@@ -95,11 +95,11 @@ jobs:
           BIN_PATH: ${{ inputs.bin_path }}
         run: |
           set -euo pipefail
-          ssh -o BatchMode=yes -o ConnectTimeout=20 "${SSH_TARGET}" \
+          ssh -o BatchMode=yes -o ConnectTimeout=20 -- "${SSH_TARGET}" \
             "SERVICE='${SERVICE}' BIN='${BIN_PATH}' bash -s" <<'EOF'
           set -uo pipefail
           echo "=== uptime / load ==="; uptime
-          echo "=== service ==="; systemctl show -p ActiveState -p SubState -p MainPID -p ActiveEnterTimestamp --value "$SERVICE"
+          echo "=== service ==="; systemctl show -p ActiveState -p SubState -p MainPID -p ActiveEnterTimestamp --value -- "$SERVICE"
           echo "=== binaries ==="; ls -l "$BIN" "${BIN}.bak" 2>&1
           echo "=== version ==="; "$BIN" --version 2>&1 | head -1
           echo "=== recent journal ==="; journalctl -u "$SERVICE" -n 40 --no-pager 2>/dev/null | tail -40
@@ -114,15 +114,15 @@ jobs:
           BIN_PATH: ${{ inputs.bin_path }}
         run: |
           set -euo pipefail
-          ssh -o BatchMode=yes -o ConnectTimeout=20 "${SSH_TARGET}" \
+          ssh -o BatchMode=yes -o ConnectTimeout=20 -- "${SSH_TARGET}" \
             "SERVICE='${SERVICE}' BIN='${BIN_PATH}' bash -s" <<'EOF'
           set -euo pipefail
           if [ ! -x "${BIN}.bak" ]; then echo "no ${BIN}.bak to restore" >&2; exit 1; fi
-          systemctl stop "$SERVICE" || true
-          for _ in 1 2 3 4 5 6 7 8 9 10; do systemctl is-active --quiet "$SERVICE" || break; sleep 1; done
+          systemctl stop -- "$SERVICE" || true
+          for _ in 1 2 3 4 5 6 7 8 9 10; do systemctl is-active --quiet -- "$SERVICE" || break; sleep 1; done
           install -m 755 "${BIN}.bak" "$BIN"
-          systemctl start "$SERVICE"
+          systemctl start -- "$SERVICE"
           sleep 3
-          systemctl is-active "$SERVICE"
+          systemctl is-active -- "$SERVICE"
           echo "restored ${BIN}.bak; running:"; "$BIN" --version 2>&1 | head -1
           EOF

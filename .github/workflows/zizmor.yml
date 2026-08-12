@@ -38,6 +38,10 @@ jobs:
         with:
           advanced-security: false
           annotations: true
+          # Pin the auditor itself: the action defaults to `version: latest`,
+          # so a new zizmor release that adds an audit could turn this check
+          # red repo-wide with no repo change. Bump deliberately instead.
+          version: "1.29.0"
           # Catch every finding, including informational. Known-safe patterns
           # must be silenced with a line-level `# zizmor: ignore[<rule>]`
           # comment at the site, with a justification — not by raising this

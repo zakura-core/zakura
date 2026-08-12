@@ -5,7 +5,6 @@ mod engine;
 mod invariants;
 mod planner;
 mod recovery;
-mod store;
 mod types;
 
 pub use authority::{Clock, FullStateEvidenceAuthority, SystemClock, TransitionContext};
@@ -28,5 +27,4 @@ pub use recovery::{
     audit_store, audit_store_at, audit_store_for_trust_anchor_update, AuditViolation,
     RecoveryFailure, RecoveryPlan, RecoveryRepair, StoreAuditRead, ValidationContextRecord,
 };
-pub use store::StoreError;
 pub use types::*;

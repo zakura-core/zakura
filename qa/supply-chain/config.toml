@@ -405,10 +405,6 @@ criteria = "safe-to-deploy"
 version = "0.7.3"
 criteria = "safe-to-deploy"
 
-[[exemptions.derive-getters]]
-version = "0.5.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.derive_builder]]
 version = "0.20.2"
 criteria = "safe-to-deploy"
@@ -634,10 +630,7 @@ criteria = "safe-to-deploy"
 [[exemptions.hmac-sha256]]
 version = "1.1.14"
 criteria = "safe-to-deploy"
-
-[[exemptions.hostname]]
-version = "0.4.2"
-criteria = "safe-to-deploy"
+notes = "Audit held: HKDF::expand documents a maximum of 8160 output bytes, but rejects exactly 8160 and increments a u8 counter after the final block, which panics with overflow checks for supported lengths 8129 through 8159. A version-wide safe-to-deploy certification is deferred pending an upstream fix."
 
 [[exemptions.howudoin]]
 version = "0.1.2"
@@ -701,10 +694,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.igd-next]]
 version = "0.16.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.impl-trait-for-tuples]]
-version = "0.2.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.incrementalmerkletree]]
@@ -811,10 +800,6 @@ criteria = "safe-to-deploy"
 version = "0.10.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.known-folders]]
-version = "1.4.2"
-criteria = "safe-to-deploy"
-
 [[exemptions.konst]]
 version = "0.2.20"
 criteria = "safe-to-deploy"
@@ -855,10 +840,6 @@ criteria = "safe-to-deploy"
 version = "0.12.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.litemap]]
-version = "0.8.2"
-criteria = "safe-to-deploy"
-
 [[exemptions.litrs]]
 version = "1.0.0"
 criteria = "safe-to-deploy"
@@ -881,10 +862,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.lz4-sys]]
 version = "1.11.1+lz4-1.10.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.matchit]]
-version = "0.8.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.memchr]]
@@ -913,10 +890,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.moka]]
 version = "0.12.15"
-criteria = "safe-to-deploy"
-
-[[exemptions.mset]]
-version = "0.1.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.nanorand]]
@@ -1024,12 +997,6 @@ criteria = "safe-to-deploy"
 version = "1.19.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.openssl-probe]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
 [[exemptions.opentelemetry]]
 version = "0.32.0"
 criteria = "safe-to-deploy"
@@ -1118,10 +1085,6 @@ criteria = "safe-to-deploy"
 version = "1.1.13"
 criteria = "safe-to-deploy"
 
-[[exemptions.pin-project-lite]]
-version = "0.2.17"
-criteria = "safe-to-deploy"
-
 [[exemptions.pkarr]]
 version = "3.10.0"
 criteria = "safe-to-deploy"
@@ -1133,14 +1096,6 @@ criteria = "safe-to-deploy"
 [[exemptions.plotters]]
 version = "0.3.7"
 criteria = "safe-to-run"
-
-[[exemptions.pnet_macros]]
-version = "0.34.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.pnet_macros_support]]
-version = "0.34.0"
-criteria = "safe-to-deploy"
 
 [[exemptions.pnet_packet]]
 version = "0.34.0"
@@ -1224,10 +1179,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.quinn-udp]]
 version = "0.5.15"
-criteria = "safe-to-deploy"
-
-[[exemptions.quote]]
-version = "1.0.46"
 criteria = "safe-to-deploy"
 
 [[exemptions.r-efi]]
@@ -1334,10 +1285,6 @@ criteria = "safe-to-deploy"
 version = "0.12.2"
 criteria = "safe-to-deploy"
 
-[[exemptions.rustc-demangle]]
-version = "0.1.28"
-criteria = "safe-to-deploy"
-
 [[exemptions.rustix]]
 version = "1.1.4"
 criteria = "safe-to-deploy"
@@ -1366,10 +1313,6 @@ notes = "Sentry 0.47 upgrade"
 version = "0.103.13"
 criteria = "safe-to-deploy"
 
-[[exemptions.rustversion]]
-version = "1.0.23"
-criteria = "safe-to-deploy"
-
 [[exemptions.rusty-fork]]
 version = "0.3.1"
 criteria = "safe-to-deploy"
@@ -1386,7 +1329,7 @@ criteria = "safe-to-deploy"
 version = "1.0.6"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Sentry 0.47 upgrade"
+notes = "Sentry 0.47 upgrade. Audit held: on Unix, IntoRawFd for a standard-stream Handle removes the File and then Drop unconditionally unwraps the now-empty Option, so the safe consuming conversion panics. A version-wide safe-to-deploy certification is deferred pending an upstream fix."
 
 [[exemptions.sapling-crypto]]
 version = "0.7.0"
@@ -1556,10 +1499,6 @@ criteria = "safe-to-deploy"
 version = "0.10.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.spki]]
-version = "0.7.3"
-criteria = "safe-to-deploy"
-
 [[exemptions.stun-rs]]
 version = "0.1.11"
 criteria = "safe-to-deploy"
@@ -1590,10 +1529,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tempfile]]
 version = "3.27.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.termcolor]]
-version = "1.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.thiserror]]
@@ -1732,10 +1667,6 @@ criteria = "safe-to-deploy"
 version = "1.20.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.ucd-parse]]
-version = "0.1.13"
-criteria = "safe-to-deploy"
-
 [[exemptions.uint]]
 version = "0.9.5"
 criteria = "safe-to-deploy"
@@ -1772,12 +1703,6 @@ criteria = "safe-to-deploy"
 version = "0.2.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.walkdir]]
-version = "2.5.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
 [[exemptions.wasi]]
 version = "0.11.0+wasi-snapshot-preview1"
 criteria = "safe-to-deploy"
@@ -1796,18 +1721,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.web-sys]]
 version = "0.3.103"
-criteria = "safe-to-deploy"
-
-[[exemptions.webpki-root-certs]]
-version = "1.0.8"
-criteria = "safe-to-deploy"
-
-[[exemptions.webpki-roots]]
-version = "1.0.8"
-criteria = "safe-to-deploy"
-
-[[exemptions.which]]
-version = "8.0.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.widestring]]

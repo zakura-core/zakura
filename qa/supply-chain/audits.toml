@@ -161,6 +161,12 @@ criteria = "safe-to-deploy"
 version = "0.9.6"
 notes = "Reviewed all packaged source, manifest, generated OID database, and tests. The no_std implementation performs checked fixed-buffer OID parsing and BER/DER encoding; the database feature adds only generated static constants and lookup tables, and the optional arbitrary dependency is separately policy-checked. Unsafe code is forbidden and there is no build script, runtime I/O, or ambient capability. All 18 unit and integration tests and 2 doctests passed with all features."
 
+[[audits.crypto-common]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.7"
+notes = "Reviewed all packaged source and manifest. This no_std trait crate defines type-level cryptographic block, output, key, and IV sizes plus checked slice adapters and caller-supplied RNG helpers. It forbids unsafe code and has no build script, runtime I/O, or hidden ambient capabilities; dependencies remain separately policy-checked. All-feature library and documentation targets passed; the package defines no tests."
+
 [[audits.darling_macro]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -274,6 +280,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.4.1"
 notes = "Reviewed all packaged source, manifest, and tests. The zero-dependency no_std macro performs bounded const-time hex decoding; malformed literals fail during constant evaluation and no runtime capability is introduced. No unsafe code, build script, allocation, I/O, or ambient capabilities. All 8 integration tests and 4 doctests passed."
+
+[[audits.hmac-sha1]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.2"
+notes = "Reviewed all packaged source, manifest, and tests. This small adapter passes caller-supplied keys and messages to separately policy-checked RustCrypto HMAC and SHA-1 implementations and returns the fixed 20-byte tag. It has no unsafe code, build script, runtime I/O, or ambient capabilities. All 7 published HMAC-SHA1 test vectors passed."
 
 [[audits.hostname-validator]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -503,6 +515,12 @@ delta = "0.9.0 -> 0.10.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "4.0.0 -> 4.1.0"
+
+[[audits.pairing]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.23.0"
+notes = "Reviewed all packaged source and manifest. This no_std crate contains only pairing-engine, curve-affine, Miller-loop, and final-exponentiation trait definitions over the separately policy-checked group crate. It has no unsafe code, build script, runtime I/O, or ambient capabilities. Library and documentation targets passed; the package defines no tests."
 
 [[audits.pathdiff]]
 who = "OpenAI Codex <noreply@openai.com>"

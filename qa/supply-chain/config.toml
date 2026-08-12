@@ -413,12 +413,9 @@ version = "0.8.22"
 criteria = "safe-to-deploy"
 
 [[exemptions.crypto-common]]
-version = "0.1.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.crypto-common]]
 version = "0.2.0-rc.1"
 criteria = "safe-to-deploy"
+notes = "Audit deferred: hazmat::SerializableState uses an 8-byte element width for [u128; N], causing serialize() to panic; reproduced with [u128; 1]."
 
 [[exemptions.crypto_box]]
 version = "0.9.1"
@@ -740,10 +737,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.hmac]]
 version = "0.13.0-pre.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.hmac-sha1]]
-version = "0.2.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.hmac-sha256]]
@@ -1255,10 +1248,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.owo-colors]]
 version = "4.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.pairing]]
-version = "0.23.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.parity-scale-codec]]

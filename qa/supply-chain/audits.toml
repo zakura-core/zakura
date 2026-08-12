@@ -36,6 +36,12 @@ criteria = "safe-to-deploy"
 version = "1.1.5"
 notes = "Reviewed all packaged source, manifest, and example. Runtime behavior is limited to terminal-related environment reads and, on Windows, enabling virtual-terminal mode on borrowed stdout and stderr handles; the FFI validates the handle and checks both Win32 return values. No build script, filesystem or network access, or process execution. All 3 unit tests passed."
 
+[[audits.anstyle-wincon]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "3.0.11"
+notes = "Reviewed all packaged source, manifest, examples, and tests. Windows console handling borrows caller-owned handles, rejects invalid handles, initializes FFI output storage, and checks API results; the non-Windows path only formats ANSI to a caller-provided writer. No build script or ambient authority. Host all-feature targets compiled; the package's only active test is Windows-specific."
+
 [[audits.async-compat]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -212,6 +218,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 version = "0.1.1"
 
+[[audits.chacha20]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.9.1"
+notes = "Reviewed all packaged source, manifest, backends, and tests. Fixed-size scalar, SSE2, AVX2, and NEON implementations keep unaligned loads and stores within complete 64-byte blocks, gate target instructions, and expose counter exhaustion through the cipher wrapper. No build script, I/O, or ambient authority. Forced-NEON release testing passed the HChaCha20 vector, 9 stream, seek, and RFC vectors, and the doctest."
+
 [[audits.chacha20poly1305]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -328,6 +340,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.34"
 notes = "Reviewed all packaged source, manifest, parser, expansion logic, and tests. The procedural macros only parse tokens and emit calls into the separately policy-checked const_format API, with no unsafe code, build script, I/O, or ambient capability. All 11 unit tests passed."
+
+[[audits.constant_time_eq]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.2"
+notes = "Reviewed all packaged source, manifest, architecture backends, and tests. Length-checked unaligned reads remain inside slices, SIMD accesses use fixed lanes, target features gate instructions, and the AArch64 DIT guard restores the prior register state. Exhaustive functional, SIMD, generic, DIT, and documentation tests passed; instruction-tracing tests are unsupported on the macOS host."
 
 [[audits.convert_case]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1315,9 +1333,21 @@ version = "0.8.0"
 notes = "Reviewed all packaged source and manifest content. The crate contains deterministic SipHash, displacement, and PHF trait helpers with no unsafe code, build script, runtime I/O, or ambient authority. The all-feature documentation target compiled."
 
 [[audits.pin-project]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.13"
+notes = "Reviewed all packaged source and manifest content, plus the prior audited-version delta. The projection generator rejects packed structs, exposes pinned fields only through Pin, determines Unpin from pinned fields, prevents ordinary Drop implementations, and guards project_replace during unwinding. PinnedFieldsOf preserves those rules around Rust's unstable negative_impls behavior. All 37 runnable integration tests and 3 root doctests passed."
+
+[[audits.pin-project]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.1.5 -> 1.1.6"
+
+[[audits.pin-project-internal]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.13"
+notes = "Reviewed all packaged proc-macro source and manifest content, plus the prior audited-version delta. The crate forbids unsafe code and emits compiler-checked projection, Unpin, pinned-drop, and replacement machinery; validation rejects packed structs and conflicting Drop implementations. Seven dependency-free doctests passed; twelve other published-package doctests require the workspace-only pin-project development dependency omitted from the package."
 
 [[audits.pin-project-internal]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1329,6 +1359,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.17"
 notes = "Reviewed all packaged source, manifest, expansion fixtures, and tests. Generated projections preserve pinning by exposing pinned fields only as Pin references, require &mut access for unpinned mutation, prevent conflicting Drop implementations, and use drop/overwrite guards to remain valid during unwinding. No build script, I/O, or ambient capability. All 12 doctests passed; the published compile and expansion test targets omit their workspace-only dev dependencies."
+
+[[audits.pkcs8]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.10.2"
+notes = "Reviewed all packaged source, manifest, and tests. The crate forbids unsafe code and implements bounded DER and PEM parsing and encoding; optional encryption uses fresh salt and IV values, scrypt defaults, AES-256-CBC, and zeroizing secret documents. Filesystem access is limited to caller-provided paths. All 29 all-feature tests passed. Optional DES and 3DES support is explicitly legacy decryption only."
 
 [[audits.pkg-config]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -2184,6 +2220,12 @@ criteria = "safe-to-deploy"
 version = "0.2.5"
 notes = "Reviewed all packaged source and manifest. Future, stream, sink, and executor wrappers enter the configured tracing span around each poll or operation and use pin-project for safe projection; there is no unsafe code, build script, I/O, or ambient capability. Zakura's std, std-future, and pin-project feature path compiled. Published unit tests cannot compile because they reference a tracing monorepo support module omitted from the crate."
 
+[[audits.tracing-journald]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = "Reviewed all packaged source, manifest, and tests, including the Linux-only unsafe transport. It sends encoded fields only to the fixed journald socket; checked memfd, sealing, sockaddr_un, control-buffer, SCM_RIGHTS, and sendmsg operations preserve ownership and bounds. No build script or network access. Both doctests passed; Linux-only runtime tests were excluded on the macOS host."
+
 [[audits.tracing-log]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -2348,6 +2390,24 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "8.0.4"
 notes = "Reviewed all packaged source, manifest, and tests. Lookup searches only explicit paths or documented PATH, PATHEXT, HOME, and current-directory inputs. Unix executable checks pass a NUL-checked CString to access; Windows passes a NUL-terminated UTF-16 buffer to GetBinaryTypeW and checks the return value. No build script, process execution, or network access. All 34 all-feature tests and doctests passed."
+
+[[audits.windows-interface]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.59.3"
+notes = "Reviewed all packaged proc-macro source and manifest content. Generated COM wrappers are repr-transparent, preserve vtable ABI and QueryInterface ancestry, keep call methods unsafe, and bind scoped borrowed implementations to their owner. GUID and method forms are validated. No build script, I/O, or ambient authority. The library target compiled; one published-package doctest requires an omitted workspace-only windows-core development dependency."
+
+[[audits.windows-result]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.4"
+notes = "Reviewed all packaged source, manifest, and FFI bindings. BSTR, FormatMessage buffer, and COM interface wrappers consistently acquire, clone, move, and release ownership; nullable output pointers and initialized buffers match the called Windows APIs, and errors are checked. No build script or network access. All-feature library targets compiled; behavior is Windows-specific."
+
+[[audits.windows-result]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.3.4 -> 0.4.1"
+notes = "Reviewed the complete source and manifest delta. Changes are limited to linting and helper naming around thread-local Windows error retrieval, plus an HRESULT helper; the audited FFI ownership and buffer invariants are unchanged. The all-feature library target compiled. Its error-message doctest is Windows-specific and fails on the non-Windows host because only the hexadecimal fallback is available."
 
 [[audits.windows-sys]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -2614,6 +2674,12 @@ criteria = "safe-to-deploy"
 version = "0.1.7"
 notes = "Reviewed all packaged source and manifest content. The proc macro only parses and folds tokens and emits safe, type-checked ZeroFrom implementations; it contains no unsafe code, build script, runtime I/O, or ambient authority. Both library unit tests passed. The published example omits workspace-only development dependencies, but that packaging defect does not affect the deployed proc macro."
 
+[[audits.zeroize]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.9.0"
+notes = "Reviewed all packaged source, manifest, and tests. Volatile writes plus optimization barriers cover scalar, slice, allocation, option, and MaybeUninit implementations; architecture SIMD values use valid zero bit patterns, and the unsafe flat-type helper states its caller contract. No build script, I/O, or ambient authority. All 45 active all-feature tests and doctests passed; one test is intentionally ignored."
+
 [[audits.zeroize_derive]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -2641,6 +2707,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.2.0 -> 0.1.0@git:1410f1449100a417bfbc4f6c7167aa9808e38792"
 importable = false
+
+[[audits.zmij]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.21"
+notes = "Reviewed all packaged source, manifest, build script, and tests. The sealed f32 and f64 formatter writes bounded ASCII components into an internal fixed-size buffer, with table indices derived from bounded float fields; its build script only queries Cargo's configured rustc version. All default-feature unit, comparison, integration, and documentation tests passed. The optional no-panic feature's link-time doctest rejects panic symbols on this rustc, but the production formatting tests pass."
 
 [[trusted.clap]]
 criteria = "safe-to-deploy"

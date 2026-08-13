@@ -3693,6 +3693,7 @@ async fn spawn_zakura_endpoint_inner(
         block_sync_actions,
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
     };
+    let startup_shutdown = endpoint.background_shutdown_token().drop_guard();
 
     if let Some(mut service_demand) = service_demand {
         let capability_handler = endpoint.handler.clone();
@@ -3771,6 +3772,7 @@ async fn spawn_zakura_endpoint_inner(
     let discovery_dialer =
         super::discovery::spawn_native_discovery_dialer(endpoint.clone(), discovery, limits);
     endpoint.push_header_sync_task(discovery_dialer).await;
+    startup_shutdown.disarm();
     Ok(Some(endpoint))
 }
 

@@ -80,7 +80,7 @@ mod tests {
         fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn embedded_node_registers_custom_service_and_shuts_down_on_drop() {
         let _guard = zakura_test::init();
         let native_socket = UdpSocket::bind("127.0.0.1:0").expect("test UDP port is available");

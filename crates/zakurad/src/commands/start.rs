@@ -307,8 +307,6 @@ impl StartCmd {
         shutdown: CancellationToken,
         shutdown_cleanup_required: CancellationToken,
     ) -> Result<(), Report> {
-        let _shutdown_on_drop = shutdown.clone().drop_guard();
-        let mut node_tasks = NodeTasks::default();
         check_tcp_slow_start_after_idle();
 
         let is_regtest = config.network.network.is_regtest();
@@ -473,6 +471,10 @@ impl StartCmd {
         } else {
             None
         };
+
+        let mut node_tasks = NodeTasks::default();
+        // Cancel detached tasks before dropping the state services, whose teardown blocks.
+        let _shutdown_on_drop = shutdown.clone().drop_guard();
 
         info!("initializing network");
         // The service that our node uses to respond to requests by peers. The

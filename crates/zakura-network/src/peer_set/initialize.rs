@@ -29,12 +29,16 @@ use tokio::{
     time::{sleep, Instant},
 };
 use tokio_stream::wrappers::IntervalStream;
+use tokio_util::task::AbortOnDropHandle;
 use tower::{
     buffer::Buffer, discover::Change, layer::Layer, util::BoxService, Service, ServiceExt,
 };
 use tracing_futures::Instrument;
 
-use zakura_chain::{chain_tip::ChainTip, diagnostic::task::WaitForPanics};
+use zakura_chain::{
+    chain_tip::ChainTip,
+    diagnostic::task::{CheckForPanics, WaitForPanics},
+};
 
 use crate::{
     address_book_updater::{AddressBookUpdater, MIN_CHANNEL_SIZE},
@@ -258,6 +262,9 @@ where
         peer_registry.clone(),
     )
     .await?;
+    let zakura_startup_shutdown = zakura_endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.background_shutdown_token().drop_guard());
 
     let (address_book, bans, address_book_updater, address_metrics, address_book_updater_guard) =
         AddressBookUpdater::spawn_with_peer_registry(
@@ -387,7 +394,11 @@ where
     let peer_cache_updater_fut = peer_cache_updater(config.clone(), address_book.clone());
     let peer_cache_updater_guard = tokio::spawn(peer_cache_updater_fut.in_current_span());
 
-    let mut task_handles = vec![address_book_updater_guard, peer_cache_updater_guard];
+    // Abort startup tasks if this initialization future is dropped before handoff.
+    let mut task_handles = vec![
+        AbortOnDropHandle::new(address_book_updater_guard),
+        AbortOnDropHandle::new(peer_cache_updater_guard),
+    ];
 
     if let Some(tcp_listener) = tcp_listener {
         // Connect peerset_tx to the 3 peer sources:
@@ -402,7 +413,9 @@ where
             bans,
             block_gossip_peer_ips,
         );
-        task_handles.push(tokio::spawn(listen_fut.in_current_span()));
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(
+            listen_fut.in_current_span(),
+        )));
 
         // 2. Initial peers, specified in the config and cached on disk.
         let initial_peers_fut = add_initial_peers(
@@ -411,15 +424,17 @@ where
             peerset_tx.clone(),
             address_book_updater.clone(),
         );
-        let initial_peers_join = tokio::spawn(initial_peers_fut.in_current_span());
+        let initial_peers_join =
+            AbortOnDropHandle::new(tokio::spawn(initial_peers_fut.in_current_span()));
 
         // 3. Outgoing peers we connect to in response to load.
         let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
 
         // Wait for the initial seed peer count
         let mut active_outbound_connections = initial_peers_join
-            .wait_for_panics()
             .await
+            .panic_if_task_has_panicked()
+            .expect("initial peer task is not cancelled")
             .expect("unexpected error connecting to initial peers");
         let active_initial_peer_count = active_outbound_connections.update_count();
 
@@ -457,9 +472,11 @@ where
             address_book_updater,
             Arc::new(AtomicBool::new(false)),
         );
-        task_handles.push(tokio::spawn(crawl_fut.in_current_span()));
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(
+            crawl_fut.in_current_span(),
+        )));
     } else {
-        task_handles.push(tokio::spawn(
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(
             async move {
                 let _peerset_tx = peerset_tx;
                 let mut demand_rx = demand_rx;
@@ -471,7 +488,7 @@ where
                 future::pending::<Result<(), BoxError>>().await
             }
             .in_current_span(),
-        ));
+        )));
     }
 
     // Capture the supervisor before the endpoint is moved into the keep-alive
@@ -482,13 +499,20 @@ where
 
     let returned_zakura_endpoint = zakura_endpoint.clone();
     if let Some(zakura_endpoint) = zakura_endpoint {
-        task_handles.push(tokio::spawn(async move {
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(async move {
             let _zakura_endpoint = zakura_endpoint;
             future::pending::<Result<(), BoxError>>().await
-        }));
+        })));
     }
 
-    handle_tx.send(task_handles).unwrap();
+    handle_tx
+        .send(
+            task_handles
+                .into_iter()
+                .map(AbortOnDropHandle::detach)
+                .collect(),
+        )
+        .unwrap();
 
     // When the Zakura endpoint is active, wrap the legacy peer set so locally
     // originated gossip and inventory fetches also flow over Zakura. The internal
@@ -507,6 +531,10 @@ where
         }
         None => peer_set,
     };
+
+    if let Some(shutdown) = zakura_startup_shutdown {
+        shutdown.disarm();
+    }
 
     Ok((
         peer_set,

@@ -177,7 +177,12 @@ pub enum TransitionFailure {
     Invariant(#[from] super::InvariantViolation),
 }
 
-/// Derive one atomic transition without mutating the coherent engine.
+/// Derive one atomic transition without mutating the engine.
+///
+/// Pure: freezes `engine` as the before-state, projects `input` under
+/// `context`, and returns a [`TransitionPlan`] only after independent
+/// commit-time invariant verification. Failure is [`TransitionFailure`] with
+/// zero durable effects—distinct from a verified no-change plan.
 pub(super) fn derive_transition_plan(
     engine: &HeaderChainEngine,
     input: TransitionInput,
@@ -185,7 +190,7 @@ pub(super) fn derive_transition_plan(
 ) -> Result<TransitionPlan, TransitionFailure> {
     let candidate = derive_plan_candidate(engine, input, context)?;
     // Phase 6: verify invariants
-    verify_invariants(engine, &candidate)?;
+    super::verify_candidate(engine, &candidate)?;
     Ok(TransitionPlan::from_verified(candidate))
 }
 
@@ -357,11 +362,4 @@ fn assemble_writes<'a>(
         trust_pins: invariant_pins(context),
         limits: context.config.limits,
     })
-}
-
-fn verify_invariants(
-    engine: &HeaderChainEngine,
-    candidate: &PlanCandidate,
-) -> Result<(), TransitionFailure> {
-    Ok(super::verify_candidate(engine, candidate)?)
 }

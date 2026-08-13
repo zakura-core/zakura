@@ -377,9 +377,27 @@ impl HeaderChainEngine {
 
     /// Plan one verified transition without mutating this engine.
     ///
-    /// Returns a durable write set and the exact post-transition snapshot that
-    /// the runtime may commit and then install. This method never writes durable
-    /// state or publishes watches.
+    /// Callers own everything after this returns: persist
+    /// [`EngineTransition::change_set`], then
+    /// [`Self::install_committed_transition`], then publish
+    /// [`EngineTransition::after`]. This method never writes durable state or
+    /// publishes watches.
+    ///
+    /// # Returns
+    ///
+    /// - [`Ok`] — an invariant-verified [`EngineTransition`]. Inspect
+    ///   [`EngineTransition::is_no_change`] and [`EngineTransition::effect`]
+    ///   before assuming a mutation: valid evidence may produce no durable
+    ///   change, or only a resource-stall alarm.
+    /// - [`Err`] — [`TransitionFailure`]: reject with zero durable effects
+    ///   (stale version/owner, invalid evidence, mode/authority refusal, etc.).
+    ///   Do not confuse this with a verified no-change plan.
+    ///
+    /// # Install contract
+    ///
+    /// Install succeeds only if this engine's snapshot is still
+    /// [`EngineTransition::before`]. Concurrent commits make the plan stale;
+    /// re-plan against the current engine rather than forcing install.
     pub fn plan_transition(
         &self,
         input: TransitionInput,
@@ -391,11 +409,19 @@ impl HeaderChainEngine {
 
     /// Install a verified transition after its durable batch has committed.
     ///
-    /// The caller must have already persisted [`EngineTransition::change_set`].
-    /// Returns [`CommittedTransitionError::StaleSource`] when another transition
-    /// changed this engine after planning. On success, in-memory graph,
-    /// projections, metadata, and auxiliary deliveries match the committed
-    /// write set.
+    /// Callers must already have persisted [`EngineTransition::change_set`].
+    /// This advances the in-memory engine only; it does not write durable state
+    /// or publish watches—publish [`EngineTransition::after`] after success.
+    ///
+    /// # Returns
+    ///
+    /// - [`Ok`] — graph, projections, metadata, and auxiliary deliveries match
+    ///   the committed write set and this engine is ready to publish.
+    /// - [`Err`] — [`CommittedTransitionError::StaleSource`] if another
+    ///   transition changed this engine after planning, or
+    ///   [`CommittedTransitionError::Graph`] if the verified delta cannot apply.
+    ///   On either error the engine is unchanged; re-plan against the current
+    ///   snapshot rather than forcing install.
     pub fn install_committed_transition(
         &mut self,
         transition: EngineTransition,
@@ -407,6 +433,10 @@ impl HeaderChainEngine {
         Ok(())
     }
 
+    /// Apply a verified plan's write set to this engine's in-memory state.
+    ///
+    /// Caller must have already checked the source snapshot; graph apply is the
+    /// only fallible step and leaves the engine unchanged on error.
     fn apply_verified_plan(&mut self, plan: &TransitionPlan) -> Result<(), GraphError> {
         self.graph.apply_delta(plan.graph_delta())?;
         self.metadata = plan.change_set().metadata.clone();

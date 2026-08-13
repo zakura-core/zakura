@@ -444,12 +444,14 @@ impl Harness {
             result,
             Err(HeaderChainStoreError::Transition(
                 TransitionFailure::ConflictingReplay
+            )) | Err(HeaderChainStoreError::Transition(
+                TransitionFailure::InvalidEvidence(_)
             ))
         ) {
             assert_eq!(
                 self.logical_dump(),
                 before,
-                "a conflicting replay must not mutate any header family"
+                "a rejected insertion must not mutate any header family"
             );
             self.rejections += 1;
             return;

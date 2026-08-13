@@ -976,31 +976,7 @@ criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade"
 
-[[exemptions.sentry-backtrace]]
-version = "0.47.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.sentry-contexts]]
-version = "0.47.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
 [[exemptions.sentry-core]]
-version = "0.47.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.sentry-log]]
-version = "0.47.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.sentry-tracing]]
 version = "0.47.0"
 criteria = "safe-to-deploy"
 suggest = false

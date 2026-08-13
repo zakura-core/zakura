@@ -1794,6 +1794,30 @@ criteria = "safe-to-deploy"
 version = "0.6.0"
 notes = "Reviewed all packaged source, manifest, and tests. Every dereference, clone, poll, take, and nontrivial drop checks the creating thread before touching the wrapped value; wrong-thread unwinding leaks rather than drops thread-bound state. Pin projections retain the inner future or stream in the pinned wrapper, and take prevents the wrapper drop before moving its ManuallyDrop field. There is no build script or ambient capability. All 15 all-feature unit tests passed."
 
+[[audits.sentry-backtrace]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.47.0"
+notes = "Reviewed all packaged source, manifest, backtrace conversion, parsing, classification, and tests. Frame processing only reads the caller-supplied or current backtrace; the sole unsafe operation converts the opaque, same-sized ThreadId value into a valid u64 without pointer access or constructing an invalid value. No build script, filesystem or network I/O, or hidden ambient capability beyond the documented current-thread backtrace capture. All 11 unit tests passed."
+
+[[audits.sentry-contexts]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.47.0"
+notes = "Reviewed all packaged source, manifest, build script, platform context collection, and tests. The build script writes compiler and target constants only to Cargo's OUT_DIR. Runtime host access is limited to documented hostname, uname, Windows version, and macOS sysctl metadata; the macOS FFI first queries the required size, passes that allocation length back to the kernel, checks both return codes, and bounds all subsequent Rust reads. Both macOS unit tests and both doctests passed on macOS."
+
+[[audits.sentry-log]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.47.0"
+notes = "Reviewed all packaged source, manifest, log conversion, filtering, dispatch, and documentation tests. The crate uses safe Rust to map caller-provided log records into explicitly configured Sentry breadcrumbs, events, or logs and forwards each record to the wrapped logger; it has no build script or capability beyond that documented dispatch. All 4 doctests passed with all features after restoring the workspace-only sentry dev-dependency omitted from the package manifest."
+
+[[audits.sentry-tracing]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.47.0"
+notes = "Reviewed all packaged source, manifest, event and span conversion, thread-local hub-guard bookkeeping, and tests. The crate contains no unsafe code; span guards are keyed and stacked per thread, balanced enter/exit restores the prior hub by RAII, and cross-thread async entry forks hub state rather than mutating the originating thread. Its only external effect is documented Sentry capture. All 9 active unit and integration tests and 10 doctests passed with all features."
+
 [[audits.serde]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"

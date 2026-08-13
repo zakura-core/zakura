@@ -13,7 +13,7 @@ use crate::{
 use super::contracts::{AuditViolation, StoreAuditRead, ValidationContextRecord};
 
 /// Exhaustive durable rows loaded before any authoritative audit.
-pub(super) struct StoreImage {
+pub(super) struct PreAuditStoreRows {
     pub(super) snapshot_before_repair: EngineSnapshot,
     pub(super) metadata: EngineMetadata,
     pub(super) source_nodes: Vec<HeaderNode>,
@@ -32,8 +32,8 @@ pub(super) struct AuditedSource {
     pub(super) trust_anchor_changed: bool,
 }
 
-/// Deterministic reconstructed state derived only from an audited source.
-pub(super) struct DerivedState {
+/// Deterministic derived views reconstructed only from an audited source.
+pub(super) struct ReconstructedDerivedViews {
     /// Source rows after elapsed-deferral promotion and before eligibility recompute.
     ///
     /// Repair classification compares this image to [`Self::header_nodes`] so promotion
@@ -51,12 +51,12 @@ pub(super) struct DerivedState {
     pub(super) body_unavailable_alarm: Option<crate::BodyUnavailableSummary>,
 }
 
-/// Load the complete durable image used by startup audit.
-pub(super) fn load_store_image<S: StoreAuditRead>(
+/// Load the complete durable rows used by startup audit.
+pub(super) fn load_pre_audit_store_rows<S: StoreAuditRead>(
     store: &S,
     config: &EngineConfig,
     allow_trust_anchor_update: bool,
-) -> Result<StoreImage, StoreError> {
+) -> Result<PreAuditStoreRows, StoreError> {
     let snapshot_before_repair = store.snapshot()?;
     let metadata = store.metadata()?;
     let mut early_violations = Vec::new();
@@ -108,7 +108,7 @@ pub(super) fn load_store_image<S: StoreAuditRead>(
         }
     }
     let validation_contexts = store.validation_context_records()?;
-    Ok(StoreImage {
+    Ok(PreAuditStoreRows {
         snapshot_before_repair,
         metadata,
         source_nodes,

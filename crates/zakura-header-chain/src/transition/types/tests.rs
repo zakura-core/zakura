@@ -119,7 +119,7 @@ fn all_named_inputs_use_their_single_serialized_transition_path() {
         include_str!("event/body.rs"),
         include_str!("event/operator.rs"),
         include_str!("event/finality.rs"),
-        include_str!("event/aux.rs"),
+        include_str!("event/auxiliary_evidence.rs"),
         include_str!("event/replay.rs"),
     ]
     .concat();

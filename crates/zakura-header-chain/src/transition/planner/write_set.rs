@@ -89,16 +89,16 @@ pub(super) fn derive_plan(
             .header_node(node.hash)
             .is_some_and(|old| old.is_eligible() != node.is_eligible())
     });
-    let header_best = *selected.last().ok_or(TransitionFailure::InvalidEvidence(
+    let selected_tip = *selected.last().ok_or(TransitionFailure::InvalidEvidence(
         InvalidTransitionEvidence::Planner(PlannerCoherenceViolation::EmptyProjection(
             ProjectionKind::Selected,
         )),
     ))?;
     metadata.alarms.resource_stalled = retention.resource_stalled;
-    let header_best_node = graph
-        .view_header_node(header_best.hash)
-        .ok_or(GraphError::UnknownHeaderNode(header_best.hash))?;
-    metadata.alarms.header_best_body_unavailable = match &header_best_node.body_validation_state {
+    let selected_tip_node = graph
+        .view_header_node(selected_tip.hash)
+        .ok_or(GraphError::UnknownHeaderNode(selected_tip.hash))?;
+    metadata.alarms.header_best_body_unavailable = match &selected_tip_node.body_validation_state {
         BodyValidationState::Unavailable(summary) if summary.alarmed => Some(*summary),
         _ => None,
     };
@@ -131,17 +131,17 @@ pub(super) fn derive_plan(
             metadata.last_transition = Some(fingerprint);
         }
     }
-    let verified_best = *verified.last().ok_or(TransitionFailure::InvalidEvidence(
+    let verified_tip = *verified.last().ok_or(TransitionFailure::InvalidEvidence(
         InvalidTransitionEvidence::Planner(PlannerCoherenceViolation::EmptyProjection(
             ProjectionKind::Verified,
         )),
     ))?;
     metadata.frontiers = FrontierSet {
         finalized: graph.view_finalized_frontier(),
-        header_best,
-        verified_best,
+        header_best: selected_tip,
+        verified_best: verified_tip,
     };
-    metadata.header_best_score = graph.view_header_chain_score(header_best.hash)?;
+    metadata.header_best_score = graph.view_header_chain_score(selected_tip.hash)?;
     metadata.oldest_retained_height = if delete_nodes.is_empty() {
         put_nodes
             .iter()

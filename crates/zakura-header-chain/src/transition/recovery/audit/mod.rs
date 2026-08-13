@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use crate::{BodyValidationState, EngineConfig};
 
 use super::contracts::{violation_key, AuditViolation, RecoveryFailure, StoreAuditRead};
-use super::phases::{AuditedSource, StoreImage};
+use super::phases::{AuditedSource, PreAuditStoreRows};
 
 use authoritative_rows::check_authoritative_rows;
 use connectivity::check_finalized_connectivity;
@@ -22,11 +22,11 @@ use trust_pins::check_trust_pins;
 /// Audit every authoritative row and reject before any reconstruction.
 pub(super) fn audit_authoritative<S: StoreAuditRead>(
     store: &S,
-    image: StoreImage,
+    rows: PreAuditStoreRows,
     config: &EngineConfig,
     now: DateTime<Utc>,
 ) -> Result<AuditedSource, RecoveryFailure> {
-    let StoreImage {
+    let PreAuditStoreRows {
         snapshot_before_repair,
         metadata,
         source_nodes,
@@ -34,7 +34,7 @@ pub(super) fn audit_authoritative<S: StoreAuditRead>(
         validation_contexts,
         trust_anchor_changed,
         early_violations,
-    } = image;
+    } = rows;
     let mut violations = early_violations;
     let by_hash: HashMap<_, _> = source_nodes.iter().map(|node| (node.hash, node)).collect();
     let archived_contexts: HashMap<_, _> = validation_contexts

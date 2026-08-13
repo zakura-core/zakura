@@ -11,13 +11,13 @@ use crate::{BodyValidationState, Frontier, GraphError, HeaderValidationState, Ta
 
 use super::super::projected_state::ProjectedTransitionState;
 use super::header_validation::{anchor_reasons, retained_header_context};
-use super::ApplyEventContext;
+use super::EventProjectionContext;
 
 /// Admit a prepared header batch and any accompanying unauthenticated auxiliary deliveries.
-pub(super) fn apply(
+pub(super) fn admit_prepared_headers(
     projected: &mut ProjectedTransitionState<'_>,
     event: &crate::InsertHeaders,
-    event_context: &ApplyEventContext<'_>,
+    event_context: &EventProjectionContext<'_>,
 ) -> Result<(), TransitionFailure> {
     let engine = event_context.engine;
     let facts = event_context.input.header_validation_facts();
@@ -153,7 +153,11 @@ pub(super) fn apply(
                 || event.aux[0].tree_aux.is_none()
                 || selected_target != parent
                 || event.owner.header_authority().branch.target_tip_hash
-                    != event_context.snapshot_before_commit.frontiers.header_best.hash
+                    != event_context
+                        .snapshot_before_commit
+                        .frontiers
+                        .header_best
+                        .hash
                 || event_context
                     .old_selected
                     .iter()

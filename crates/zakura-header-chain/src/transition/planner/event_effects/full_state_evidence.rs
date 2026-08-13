@@ -9,13 +9,13 @@ use super::super::{
     TransitionFailure,
 };
 use super::header_validation::{anchor_reasons, validate_full_state_header};
-use super::ApplyEventContext;
+use super::EventProjectionContext;
 
-/// Apply a verified winning-path change.
-pub(super) fn apply_chain_change(
+/// Project a verified winning-path change.
+pub(super) fn project_verified_chain_change(
     projected: &mut ProjectedTransitionState<'_>,
     event: &crate::VerifiedChainChanged,
-    event_context: &ApplyEventContext<'_>,
+    event_context: &EventProjectionContext<'_>,
 ) -> Result<(), TransitionFailure> {
     let facts = event_context.input.header_validation_facts();
     let context = event_context.transition;
@@ -75,10 +75,10 @@ pub(super) fn apply_chain_change(
 }
 
 /// Accept a finalized-rooted side path without replacing the verified winner.
-pub(super) fn apply_block_acceptance(
+pub(super) fn project_verified_block_acceptance(
     projected: &mut ProjectedTransitionState<'_>,
     event: &crate::VerifiedBlockAccepted,
-    event_context: &ApplyEventContext<'_>,
+    event_context: &EventProjectionContext<'_>,
 ) -> Result<(), TransitionFailure> {
     let facts = event_context.input.header_validation_facts();
     let context = event_context.transition;
@@ -135,8 +135,8 @@ pub(super) fn apply_block_acceptance(
     Ok(())
 }
 
-/// Install permanent consensus-invalid body evidence.
-pub(super) fn apply_consensus_invalid(
+/// Project permanent consensus-invalid body evidence.
+pub(super) fn project_consensus_invalid_body(
     projected: &mut ProjectedTransitionState<'_>,
     event: &crate::ConsensusBodyInvalid,
 ) -> Result<(), TransitionFailure> {
@@ -162,8 +162,8 @@ pub(super) fn apply_consensus_invalid(
     Ok(())
 }
 
-/// Install exact full-state body acceptance.
-pub(super) fn apply_verified_body(
+/// Project exact full-state body acceptance.
+pub(super) fn project_verified_body_evidence(
     projected: &mut ProjectedTransitionState<'_>,
     event: &crate::VerifiedBodyEvidence,
 ) -> Result<(), TransitionFailure> {
@@ -177,7 +177,7 @@ pub(super) fn apply_verified_body(
 }
 
 /// Validate that a full-state finality proof matches the exact verified prefix.
-pub(super) fn apply_finality_proof(
+pub(super) fn project_full_state_finality(
     projected: &ProjectedTransitionState<'_>,
     event: &crate::FullStateFinalized,
 ) -> Result<(), TransitionFailure> {
@@ -194,9 +194,9 @@ pub(super) fn apply_finality_proof(
 }
 
 /// Validate migrated-pin refutation evidence against durable authentication.
-pub(super) fn apply_migrated_pin_refutation(
+pub(super) fn project_migrated_pin_refutation(
     event: &crate::MigratedPinRefutation,
-    event_context: &ApplyEventContext<'_>,
+    event_context: &EventProjectionContext<'_>,
 ) -> Result<(), TransitionFailure> {
     if event.invalid_header.height > event.pin.height
         || event_context.migrated_pin_refuted != Some(event.pin)

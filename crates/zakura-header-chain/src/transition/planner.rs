@@ -28,7 +28,7 @@ pub use violations::{
 pub(crate) use plan::{PlanCandidate, TransitionPlan};
 
 use admission::authenticate_and_admit;
-use event_effects::{apply_event_evidence, migrated_pin_refuted, ApplyEventContext};
+use event_effects::{migrated_pin_refuted, project_event_evidence, EventProjectionContext};
 use projected_state::ProjectedTransitionState;
 use replay::bind_replay_and_freshness;
 use settlement::{
@@ -116,34 +116,29 @@ fn derive_plan_candidate(
         authenticate_and_admit(engine, &input, context)?;
 
     // Phase 2: bind replay and freshness
-    let bound = bind_replay_and_freshness(
-        engine,
-        &input,
-        &snapshot_before_commit,
-        &metadata,
-        admitted,
-    )?;
-    if let Some(effect) = bound.no_change_effect {
+    let bound_request =
+        bind_replay_and_freshness(engine, &input, &snapshot_before_commit, &metadata, admitted)?;
+    if let Some(effect) = bound_request.no_change_effect {
         return no_change(
             engine,
             snapshot_before_commit,
             metadata,
-            bound.event,
+            bound_request.event,
             context,
-            bound.domain,
+            bound_request.domain,
             effect,
         );
     }
-    let event = bound.event;
-    let domain = bound.domain;
+    let event = bound_request.event;
+    let domain = bound_request.domain;
 
-    // Phase 3: apply event evidence
+    // Phase 3: project event evidence
     let old_selected = engine.selected_projection();
     let old_verified = engine.verified_projection();
     let mut projected = ProjectedTransitionState::new(engine);
     let migrated_pin = migrated_pin_refuted(&input, &event)?;
     apply_migrated_pin_alarm(&mut metadata, migrated_pin);
-    let event_context = ApplyEventContext {
+    let event_context = EventProjectionContext {
         engine,
         input: &input,
         transition: context,
@@ -151,7 +146,7 @@ fn derive_plan_candidate(
         old_selected,
         migrated_pin_refuted: migrated_pin,
     };
-    apply_event_evidence(&mut projected, &event, &event_context)?;
+    project_event_evidence(&mut projected, &event, &event_context)?;
 
     // Phase 4: derive finality and retention
     let settlement = derive_finality_and_retention(SettlementInputs {
@@ -160,7 +155,7 @@ fn derive_plan_candidate(
         metadata,
         snapshot_before_commit: &snapshot_before_commit,
         event: &event,
-        header_rebase: bound.header_rebase,
+        header_rebase: bound_request.header_rebase,
         context,
         old_selected,
     })?;

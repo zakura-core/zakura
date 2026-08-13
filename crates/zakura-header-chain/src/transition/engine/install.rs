@@ -1,4 +1,4 @@
-//! In-memory install helpers for verified projections and auxiliary deltas.
+//! In-memory install helpers for verified projections and auxiliary deliveries.
 
 use std::collections::HashMap;
 
@@ -65,14 +65,14 @@ pub(super) fn verify_projection(
     Ok(())
 }
 
-/// Applies a verified replacement to a height-ordered frontier projection.
+/// Merges a verified replacement into a height-ordered frontier projection.
 ///
 /// Retires entries below `remove_before`, removes the old suffix beginning at
 /// `remove_from`, then appends the replacement suffix from `put`.
 ///
 /// Assumes transition planning has validated that `put` preserves ascending,
 /// contiguous projection order.
-pub(super) fn apply_delta_to_projection(projection: &mut Vec<Frontier>, delta: &ProjectionDelta) {
+pub(super) fn merge_projection_delta(projection: &mut Vec<Frontier>, delta: &ProjectionDelta) {
     if let Some(height) = delta.remove_before {
         projection.retain(|frontier| frontier.height >= height);
     }
@@ -82,15 +82,15 @@ pub(super) fn apply_delta_to_projection(projection: &mut Vec<Frontier>, delta: &
     projection.extend(delta.put.iter().copied());
 }
 
-/// Applies verified auxiliary-delivery changes to the in-memory index.
+/// Merges verified auxiliary-delivery changes into the in-memory index.
 ///
-/// Changes are applied in order. A `Put` upserts by delivery ID within its
+/// Changes are merged in order. A `Put` upserts by delivery ID within its
 /// header bucket and keeps that bucket sorted. A `Delete` is a no-op when the
 /// delivery is absent and removes the bucket when it becomes empty.
 ///
 /// Assumes transition planning has validated retained headers and global
 /// delivery-ID uniqueness.
-pub(super) fn apply_aux_delta(
+pub(super) fn merge_auxiliary_delivery_changes(
     aux: &mut HashMap<block::Hash, Vec<AuxDelivery>>,
     changes: &[AuxDelta],
 ) {
@@ -229,7 +229,7 @@ mod tests {
             Frontier::new(block::Height(2), hashes[1]),
             Frontier::new(block::Height(3), hashes[2]),
         ];
-        apply_delta_to_projection(
+        merge_projection_delta(
             &mut projection,
             &ProjectionDelta {
                 remove_before: Some(block::Height(2)),
@@ -256,7 +256,7 @@ mod tests {
         let second = delivery(second_id, hash, SourceId::from_digest([5; 32]));
         let mut aux = HashMap::from([(hash, vec![original])]);
 
-        apply_aux_delta(
+        merge_auxiliary_delivery_changes(
             &mut aux,
             &[
                 AuxDelta::Put(Box::new(second)),
@@ -265,7 +265,7 @@ mod tests {
         );
         assert_eq!(aux[&hash], vec![replacement, second]);
 
-        apply_aux_delta(
+        merge_auxiliary_delivery_changes(
             &mut aux,
             &[
                 AuxDelta::Delete {

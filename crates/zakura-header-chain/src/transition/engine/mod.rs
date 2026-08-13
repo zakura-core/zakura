@@ -14,7 +14,7 @@ use crate::{
 };
 
 use super::planner::derive_transition_plan;
-use install::{apply_aux_delta, apply_delta_to_projection, verify_projection};
+use install::{merge_auxiliary_delivery_changes, merge_projection_delta, verify_projection};
 
 pub use input::{HeaderInsertionFacts, HeaderValidationFacts, TransitionInput};
 
@@ -210,26 +210,26 @@ impl HeaderChainEngine {
         if self.snapshot() != *transition.snapshot_before_commit() {
             return Err(CommittedTransitionError::StaleSource);
         }
-        self.apply_verified_plan(&transition.plan)?;
+        self.install_verified_plan(&transition.plan)?;
         Ok(())
     }
 
-    /// Apply a verified plan's write set to this engine's in-memory state.
+    /// Install a verified plan's write set into this engine's in-memory state.
     ///
     /// Caller must have already checked the snapshot before commit; graph apply is the
     /// only fallible step and leaves the engine unchanged on error.
-    fn apply_verified_plan(&mut self, plan: &TransitionPlan) -> Result<(), GraphError> {
+    fn install_verified_plan(&mut self, plan: &TransitionPlan) -> Result<(), GraphError> {
         self.graph.apply_delta(plan.graph_delta())?;
         self.metadata = plan.change_set().metadata.clone();
-        apply_delta_to_projection(
+        merge_projection_delta(
             &mut self.selected_projection,
             &plan.change_set().selected_projection,
         );
-        apply_delta_to_projection(
+        merge_projection_delta(
             &mut self.verified_projection,
             &plan.change_set().verified_projection,
         );
-        apply_aux_delta(&mut self.aux_deliveries, &plan.change_set().aux_changes);
+        merge_auxiliary_delivery_changes(&mut self.aux_deliveries, &plan.change_set().aux_changes);
         Ok(())
     }
 

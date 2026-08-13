@@ -4,12 +4,12 @@ use crate::graph::HeaderGraphView;
 use crate::{HeaderValidationState, TransitionFailure};
 
 use super::super::projected_state::ProjectedTransitionState;
-use super::ApplyEventContext;
+use super::EventProjectionContext;
 
 /// Promote every due deferred header to valid using the authoritative clock.
-pub(super) fn apply(
+pub(super) fn reevaluate_elapsed_deferrals(
     projected: &mut ProjectedTransitionState<'_>,
-    event_context: &ApplyEventContext<'_>,
+    event_context: &EventProjectionContext<'_>,
 ) -> Result<(), TransitionFailure> {
     let due: Vec<_> = projected
         .graph()

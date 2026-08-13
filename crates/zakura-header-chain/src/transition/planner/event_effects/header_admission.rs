@@ -1,9 +1,10 @@
 //! Prepared header insertion and atomic auxiliary delivery admission.
 
 use super::super::{
-    AuxiliaryViolation, HeaderPathKind, HeaderPathProblem, HeaderViolation,
+    AuxiliaryViolation, HeaderPathKind, HeaderPathProblem, HeaderValidationCheck, HeaderViolation,
     InvalidTransitionEvidence, TransitionFailure,
 };
+use chrono::Duration;
 use std::collections::{HashMap, HashSet};
 
 use crate::graph::HeaderGraphView;
@@ -63,6 +64,13 @@ pub(super) fn admit_prepared_headers(
     let mut contextual =
         retained_header_context(projected.graph(), parent_frontier, facts, context)?;
     let mut parent = parent_frontier;
+    let admission_now = context.clock.now();
+    let future_limit = admission_now.checked_add_signed(Duration::hours(2)).ok_or(
+        InvalidTransitionEvidence::Header(HeaderViolation::Validation {
+            source: crate::HeaderValidationSource::Prepared,
+            check: HeaderValidationCheck::IdentityOrLocalTime,
+        }),
+    )?;
     for prepared in event.batch.headers() {
         if prepared.header.previous_block_hash != parent.hash
             || prepared.hash != prepared.header.hash()
@@ -96,7 +104,21 @@ pub(super) fn admit_prepared_headers(
             crate::HeaderValidationSource::Prepared,
         )?;
         let validation = match prepared.validation {
-            HeaderValidationState::DeferredUntil(until) if until <= context.clock.now() => {
+            HeaderValidationState::Valid if prepared.header.time > future_limit => {
+                HeaderValidationState::DeferredUntil(
+                    prepared
+                        .header
+                        .time
+                        .checked_sub_signed(Duration::hours(2))
+                        .ok_or(InvalidTransitionEvidence::Header(
+                            HeaderViolation::Validation {
+                                source: crate::HeaderValidationSource::Prepared,
+                                check: HeaderValidationCheck::IdentityOrLocalTime,
+                            },
+                        ))?,
+                )
+            }
+            HeaderValidationState::DeferredUntil(until) if until <= admission_now => {
                 HeaderValidationState::Valid
             }
             state => state,

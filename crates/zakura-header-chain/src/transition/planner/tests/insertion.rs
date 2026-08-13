@@ -83,6 +83,41 @@ fn resource_bound_refusal_commits_only_the_alarm_and_recovers() {
 }
 
 #[test]
+fn admission_defers_a_prepared_valid_header_after_clock_rollback() {
+    let (store, config) = TestStore::new(EngineMode::Integrated);
+    let request = insertion(&store, 1, EvidenceId::from_digest([0x32; 32]));
+    let TransitionEvent::InsertHeaders(insert) = &request.event else {
+        panic!("the fixture request inserts headers");
+    };
+    let prepared = &insert.batch.headers()[0];
+    assert_eq!(prepared.validation, HeaderValidationState::Valid);
+    let prepared_hash = prepared.hash;
+    let prepared_time = prepared.header.time;
+
+    let admission_now = prepared_time - chrono::Duration::hours(3);
+    let plan = apply_transition(
+        &store,
+        request,
+        &context(&config, &ManualClock(admission_now), None),
+    )
+    .expect("admission retains a newly future header as deferred");
+    let graph = projected_graph(&store.graph, &plan);
+    let admitted = graph
+        .header_node(prepared_hash)
+        .expect("the deferred header is retained");
+
+    assert_eq!(
+        admitted.validation,
+        HeaderValidationState::DeferredUntil(prepared_time - chrono::Duration::hours(2))
+    );
+    assert!(!admitted.is_eligible());
+    assert_eq!(
+        plan.change_set.metadata.frontiers.header_best,
+        store.metadata.frontiers.header_best
+    );
+}
+
+#[test]
 fn engine_rejects_context_free_batch_with_invalid_retained_time() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(regtest_genesis_block().header.time + chrono::Duration::hours(1));

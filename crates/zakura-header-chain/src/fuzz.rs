@@ -508,7 +508,9 @@ struct ManualClock(AtomicI64);
 
 impl ManualClock {
     fn new() -> Self {
-        Self(AtomicI64::new(0))
+        Self(AtomicI64::new(
+            regtest_genesis_block().header.time.timestamp(),
+        ))
     }
 
     fn advance(&self, seconds: u32) {
@@ -1323,10 +1325,6 @@ fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
     let rules = HeaderRules::from_engine_config(&store.config)
         .expect("the authenticated fuzz network defines header rules");
     let clock = ManualClock::new();
-    clock.advance(
-        u32::try_from(anchor_header.time.timestamp())
-            .expect("the regtest genesis timestamp fits in u32"),
-    );
 
     let child = |seconds: i64| {
         let mut header = *anchor_header;

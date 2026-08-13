@@ -7,7 +7,7 @@ use zakura_chain::{
         testnet::{Parameters, RegtestParameters},
         Network, NetworkUpgrade,
     },
-    work::difficulty::{CompactDifficulty, ParameterDifficulty as _, U256},
+    work::difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty as _, U256},
 };
 
 use super::super::*;
@@ -378,6 +378,45 @@ fn validate_contextual_sequence(
         context.truncate(POW_ADJUSTMENT_BLOCK_SPAN);
     }
     Ok(())
+}
+
+#[test]
+fn disabled_pow_low_target_window_does_not_calculate_expected_difficulty() {
+    let network = Network::new_regtest(RegtestParameters::default());
+    let base = DateTime::from_timestamp(1_700_000_000, 0).expect("test timestamp is in range");
+    let limit = network.target_difficulty_limit().to_compact();
+    let low_target = ExpandedDifficulty::from(U256::one()).to_compact();
+    let candidates = (1..=18)
+        .map(|offset| (low_target, base + Duration::seconds(offset)))
+        .collect::<Vec<_>>();
+
+    validate_contextual_sequence(&network, block::Height(0), &[(limit, base)], &candidates)
+        .expect("disabled PoW accepts valid targets without calculating an unenforced threshold");
+
+    let poisoned_context = candidates[..17]
+        .iter()
+        .rev()
+        .copied()
+        .chain([(limit, base)])
+        .collect::<Vec<_>>();
+    let invalid_target = CompactDifficulty::from_le_bytes([0; 4]);
+    let result = validate_contextual_difficulty_and_time(
+        invalid_target,
+        AdjustedDifficulty::new_from_header_time(
+            base + Duration::seconds(18),
+            block::Height(17),
+            &network,
+            poisoned_context,
+        )
+        .expect("height 18 has complete predecessor context"),
+    );
+    assert!(matches!(
+        result,
+        Err(ContextualValidationError::InvalidDifficultyThreshold {
+            difficulty_threshold,
+            expected_difficulty,
+        }) if difficulty_threshold == invalid_target && expected_difficulty == limit
+    ));
 }
 
 /// Run with:

@@ -1,6 +1,9 @@
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
-use zakura_chain::{parameters::NetworkUpgrade, work::difficulty::CompactDifficulty};
+use zakura_chain::{
+    parameters::NetworkUpgrade,
+    work::difficulty::{CompactDifficulty, ParameterDifficulty as _},
+};
 
 use super::{AdjustedDifficulty, BLOCK_MAX_TIME_SINCE_MEDIAN};
 
@@ -68,19 +71,21 @@ pub fn validate_contextual_difficulty_and_time(
         });
     }
 
-    let expected_difficulty = difficulty_adjustment.expected_difficulty_threshold();
     if network.disable_pow() {
         if difficulty_threshold.to_work().is_none() {
+            return Err(ContextualValidationError::InvalidDifficultyThreshold {
+                difficulty_threshold,
+                expected_difficulty: network.target_difficulty_limit().to_compact(),
+            });
+        }
+    } else {
+        let expected_difficulty = difficulty_adjustment.expected_difficulty_threshold();
+        if difficulty_threshold != expected_difficulty {
             return Err(ContextualValidationError::InvalidDifficultyThreshold {
                 difficulty_threshold,
                 expected_difficulty,
             });
         }
-    } else if difficulty_threshold != expected_difficulty {
-        return Err(ContextualValidationError::InvalidDifficultyThreshold {
-            difficulty_threshold,
-            expected_difficulty,
-        });
     }
 
     Ok(())

@@ -68,27 +68,25 @@ fn mining_template_solver_action(
     template_receiver: &mut WatchReceiver<Option<Arc<Block>>>,
     old_header: block::Header,
 ) -> SolverAction {
-    match template_receiver.has_changed() {
-        // Guard against `get_block_template()` providing an identical header.
-        // This could happen if something irrelevant to the block data changes,
-        // the time was within 1 second, or there is a spurious channel change.
-        Ok(has_changed) => {
-            template_receiver.mark_as_seen();
+    loop {
+        let current_header = template_receiver
+            .cloned_watch_data_and_update()
+            .map(|block| *block.header);
 
-            // We only need to check header equality, because the block data is
-            // bound to the header. An unavailable template has no header, so it
-            // also cancels current work.
-            if has_changed
-                && Some(old_header) != template_receiver.cloned_watch_data().map(|b| *b.header)
-            {
-                SolverAction::StopNow
-            } else {
-                SolverAction::Continue
-            }
+        // We only need to check header equality, because the block data is bound
+        // to the header. An unavailable template has no header, so it also
+        // cancels current work.
+        if current_header != Some(old_header) {
+            return SolverAction::StopNow;
         }
-        // If the sender was dropped, we're likely shutting down, so cancel the
-        // solver.
-        Err(_sender_dropped) => SolverAction::StopNow,
+
+        match template_receiver.has_changed() {
+            // Re-read an update that raced with the acknowledged snapshot.
+            Ok(true) => continue,
+            Ok(false) => return SolverAction::Continue,
+            // If the sender was dropped, we're likely shutting down.
+            Err(_sender_dropped) => return SolverAction::StopNow,
+        }
     }
 }
 

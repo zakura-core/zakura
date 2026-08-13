@@ -114,6 +114,14 @@ where
         self.receiver.borrow().clone()
     }
 
+    /// Returns a clone of the latest watch data and marks that version as seen.
+    ///
+    /// The clone and version update happen while holding the same read lock, so
+    /// callers cannot acknowledge a newer value than the one they receive.
+    pub fn cloned_watch_data_and_update(&mut self) -> T {
+        self.receiver.borrow_and_update().clone()
+    }
+
     /// Calls [`watch::Receiver::changed()`] and returns the result.
     /// Returns when the inner value has been updated, even if the old and new values are equal.
     ///
@@ -139,5 +147,29 @@ where
     /// Calls [`watch::Receiver::mark_changed()`].
     pub fn mark_changed(&mut self) {
         self.receiver.mark_changed();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::watch;
+
+    use super::WatchReceiver;
+
+    #[test]
+    fn cloned_watch_data_and_update_acknowledges_the_returned_version() {
+        let (sender, receiver) = watch::channel(1);
+        let mut receiver = WatchReceiver::new(receiver);
+
+        sender.send(2).expect("receiver remains open");
+
+        assert_eq!(receiver.cloned_watch_data_and_update(), 2);
+        assert!(!receiver.has_changed().expect("sender remains open"));
+
+        sender.send(3).expect("receiver remains open");
+
+        assert!(receiver.has_changed().expect("sender remains open"));
+        assert_eq!(receiver.cloned_watch_data_and_update(), 3);
+        assert!(!receiver.has_changed().expect("sender remains open"));
     }
 }

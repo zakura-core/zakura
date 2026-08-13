@@ -6,7 +6,6 @@ use crate::{
     AuxDelta, BodyValidationState, EngineMode, FinalitySource, Frontier, HeaderChainEngine,
     PlanCandidate, ProjectionDelta,
 };
-use zakura_chain::block;
 
 use super::checks::{verify_aux, verify_generations, verify_indexes, verify_protected};
 #[cfg(any(test, feature = "fuzz-impl"))]
@@ -73,9 +72,9 @@ pub(crate) fn verify_incremental_checkpoint_finality(
     engine_before_commit
         .graph()
         .validate_delta(plan.graph_delta())
-        .map_err(|_| InvariantViolation::Index(block::Hash([0; 32])))?;
+        .map_err(|error| super::graph_error_violation(error, plan))?;
     let delta_graph = GraphOverlay::from_delta(engine_before_commit.graph(), plan.graph_delta())
-        .map_err(|_| InvariantViolation::Index(block::Hash([0; 32])))?;
+        .map_err(|error| super::graph_error_violation(error, plan))?;
     let delta_finalized = delta_graph.view_finalized_frontier();
     #[cfg(any(test, feature = "fuzz-impl"))]
     if mode == VerificationMode::Exhaustive {

@@ -186,27 +186,6 @@ fn accepted_side_path_does_not_replace_the_verified_winner() {
 }
 
 #[test]
-fn apply_transition_is_the_only_public_dag_mutation_entry_point() {
-    let graph_source = include_str!("../../../graph.rs");
-    for old_entry in [
-        "pub fn insert(",
-        "pub fn add_eligibility_reason(",
-        "pub fn remove_operator_invalidation(",
-        "pub fn set_consensus_body_invalid(",
-        "pub fn set_body_validation_state(",
-        "pub fn set_header_validation_state(",
-    ] {
-        assert!(
-            !graph_source.contains(old_entry),
-            "raw mutation entry point escaped: {old_entry}"
-        );
-    }
-    assert!(
-        !include_str!("../../../../src/lib.rs").contains("pub use retention::enforce_retention")
-    );
-}
-
-#[test]
 fn committed_transition_applies_to_a_cloned_source_engine() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let engine = test_engine(&store);

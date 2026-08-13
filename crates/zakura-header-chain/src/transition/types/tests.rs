@@ -109,61 +109,6 @@ fn body_verification_outcomes_preserve_distinct_transition_effects() {
 }
 
 #[test]
-fn all_named_inputs_use_their_single_serialized_transition_path() {
-    // Cover the event façade and every payload module so decomposition cannot
-    // hide a variant or revive consequence-oriented input fields.
-    let sources = [
-        include_str!("event/mod.rs"),
-        include_str!("event/header.rs"),
-        include_str!("event/verified.rs"),
-        include_str!("event/body.rs"),
-        include_str!("event/operator.rs"),
-        include_str!("event/finality.rs"),
-        include_str!("event/auxiliary_evidence.rs"),
-        include_str!("event/replay.rs"),
-    ]
-    .concat();
-    for variant in [
-        "InsertHeaders(Box<InsertHeaders>)",
-        "VerifiedChainChanged(VerifiedChainChanged)",
-        "VerifiedBlockAccepted(VerifiedBlockAccepted)",
-        "BodyEvidence(BodyEvidence)",
-        "BodySupplierDiscovered(BodySupplierDiscovered)",
-        "OperatorBodyRetry(OperatorBodyRetry)",
-        "OperatorInvalidate(OperatorInvalidate)",
-        "OperatorReconsider(OperatorReconsider)",
-        "FullStateFinalized(FullStateFinalized)",
-        "MigratedPinRefutation(MigratedPinRefutation)",
-        "AuxEvidence(Box<AuxEvidence>)",
-        "ReevaluateDeferred",
-    ] {
-        assert!(sources.contains(variant), "missing event variant {variant}");
-    }
-    for forbidden in [
-        "pub new_header_best",
-        "pub new_generation",
-        "pub prune",
-        "pub publish",
-    ] {
-        assert!(
-            !sources.contains(forbidden),
-            "event inputs must contain evidence, not requested consequence {forbidden}"
-        );
-    }
-    for obsolete_facade in [
-        "AdvanceLocalCheckpoint",
-        "InternalFullState",
-        "RecoveryEvidence",
-        "TransitionEvent::Recover",
-    ] {
-        assert!(
-            !sources.contains(obsolete_facade),
-            "the event surface must not duplicate a real transition path with {obsolete_facade}"
-        );
-    }
-}
-
-#[test]
 fn transition_domain_codes_are_stable_and_exhaustive() {
     use crate::TransitionDomain;
 

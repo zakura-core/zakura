@@ -291,11 +291,19 @@ fn graph_boundary_and_transition_invariants_reject_corruption() {
     ));
 
     let mut corrupt = plan.clone();
+    let missing_index = corrupt
+        .change_set
+        .index_changes
+        .inserted
+        .iter()
+        .min_by_key(|frontier| frontier.hash.0)
+        .expect("the insertion plan adds indexed headers")
+        .hash;
     corrupt.change_set.index_changes.inserted.clear();
-    assert!(matches!(
+    assert_eq!(
         verify_plan(&test_engine(&store), &corrupt),
-        Err(InvariantViolation::Index(_))
-    ));
+        Err(InvariantViolation::Index(missing_index))
+    );
 
     let mut corrupt = plan.clone();
     crate::graph::test_support::mutate_updated_header(

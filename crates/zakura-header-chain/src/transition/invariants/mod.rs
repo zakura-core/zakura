@@ -9,8 +9,7 @@ use std::collections::HashSet;
 use thiserror::Error;
 use zakura_chain::block;
 
-use crate::graph::GraphOverlay;
-use crate::graph::HeaderGraphView;
+use crate::graph::{GraphError, GraphOverlay, HeaderGraphView};
 #[cfg(test)]
 use crate::TransitionPlan;
 use crate::{EngineMode, FinalitySource, Frontier, HeaderChainEngine, HeaderNode, PlanCandidate};
@@ -97,6 +96,41 @@ fn default_verification_mode() -> VerificationMode {
     }
 }
 
+fn graph_error_violation(error: GraphError, plan: &PlanCandidate) -> InvariantViolation {
+    let fallback = plan
+        .graph_delta()
+        .updated_header_nodes()
+        .first()
+        .map(|node| node.hash)
+        .or_else(|| plan.graph_delta().deleted_header_hashes().first().copied())
+        .or_else(|| {
+            plan.graph_delta()
+                .new_consensus_invalid_body_tombstones()
+                .first()
+                .map(|tombstone| tombstone.hash)
+        })
+        .unwrap_or(plan.change_set.metadata.frontiers.finalized.hash);
+    let hash = match error {
+        GraphError::StaleDelta { .. } => return InvariantViolation::SnapshotBeforeCommit,
+        GraphError::AnchorHashMismatch { expected, .. } => expected,
+        GraphError::UnknownParent { header, .. } | GraphError::InvalidHeaderNode { header, .. } => {
+            header
+        }
+        GraphError::HeightOverflow { parent } => parent,
+        GraphError::ConflictingDuplicate(hash)
+        | GraphError::DuplicateHeaderNode(hash)
+        | GraphError::UnknownHeaderNode(hash)
+        | GraphError::IneligibleFinalizedFrontier(hash)
+        | GraphError::HeaderNodeHasChildren(hash)
+        | GraphError::PermanentBodyInvalidity(hash) => hash,
+        GraphError::FinalizedFrontierNotDescendant { candidate, .. } => candidate,
+        GraphError::RevisionExhausted
+        | GraphError::InvalidAncestorHeight { .. }
+        | GraphError::Work(_) => fallback,
+    };
+    InvariantViolation::Index(hash)
+}
+
 /// Independently check that `plan`'s projection obeys every transition invariant under `engine_before_commit`.
 ///
 /// Pure gate between [`PlanCandidate`] and [`TransitionPlan`]: no mutation; success is required
@@ -135,10 +169,10 @@ fn verify_plan_exhaustive(
     engine_before_commit
         .graph()
         .validate_delta(plan.graph_delta())
-        .map_err(|_| InvariantViolation::Index(block::Hash([0; 32])))?;
+        .map_err(|error| graph_error_violation(error, plan))?;
     let source_metadata = engine_before_commit.metadata();
     let delta_graph = GraphOverlay::from_delta(engine_before_commit.graph(), plan.graph_delta())
-        .map_err(|_| InvariantViolation::Index(block::Hash([0; 32])))?;
+        .map_err(|error| graph_error_violation(error, plan))?;
     let delta_finalized = delta_graph.view_finalized_frontier();
     #[cfg(any(test, feature = "fuzz-impl"))]
     if mode == VerificationMode::Exhaustive {
@@ -298,7 +332,7 @@ pub(crate) fn materialize_projected_graph(
     let mut graph = engine_before_commit.graph().clone();
     graph
         .apply_delta(plan.graph_delta())
-        .map_err(|_| InvariantViolation::Index(block::Hash([0; 32])))?;
+        .map_err(|error| graph_error_violation(error, plan))?;
     Ok(graph)
 }
 

@@ -810,7 +810,7 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
         |header_node| header_node.body_validation_state = BodyValidationState::Unknown,
     );
     assert_eq!(
-        verify_plan(&test_engine(&store), &unverified),
+        crate::verify_plan_production(&test_engine(&store), &unverified),
         Err(InvariantViolation::VerifiedProjection(checkpoint.hash))
     );
 

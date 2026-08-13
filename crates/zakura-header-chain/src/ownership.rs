@@ -371,13 +371,11 @@ mod tests {
         let mut pending: PendingOwners<HeaderSyncWorkOwner> = PendingOwners::default();
         pending.insert(source, old.into());
         pending.insert(source, exact.into());
+        let before = current.clone();
         current.state_version = StateVersion::new(8);
         current.header_generation = HeaderGeneration::new(9);
-        let retired = crate::RetiredWork {
-            header_generation_changed: true,
-            verified_generation_changed: false,
-            owners: vec![exact.into()],
-        };
+        let retired =
+            crate::RetiredWork::from_snapshots(&before, &current).with_owners(vec![exact.into()]);
         let removed = pending.apply_retirement(&retired, &current);
         assert_eq!(removed.len(), 2);
         assert!(pending.is_empty());

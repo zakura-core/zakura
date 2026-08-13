@@ -2,7 +2,7 @@
 
 use super::super::event_effects::header_validation::retained_header_context;
 use super::*;
-use crate::{FullStateEvidenceAuthority, HeaderValidationFacts, StoreError};
+use crate::{FullStateEvidenceAuthority, HeaderValidationFacts};
 
 struct NoLeaseAuthority;
 impl FullStateEvidenceAuthority for NoLeaseAuthority {
@@ -168,9 +168,9 @@ fn retained_header_context_splices_authorized_leases_and_rejects_bad_facts() {
         (
             "missing durable facts",
             None,
-            Err(TransitionFailure::Store(StoreError::Unavailable(
+            Err(TransitionFailure::MissingDurableFacts(
                 "retained predecessor context is incomplete",
-            ))),
+            )),
         ),
         (
             "no matching lease",
@@ -189,36 +189,36 @@ fn retained_header_context_splices_authorized_leases_and_rejects_bad_facts() {
                     )],
                 )],
             }),
-            Err(TransitionFailure::Store(StoreError::Unavailable(
+            Err(TransitionFailure::MissingDurableFacts(
                 "durable predecessor context is incoherent",
-            ))),
+            )),
         ),
         (
             "wrong trust digest",
             Some(HeaderValidationFacts {
                 validation_leases: vec![wrong_digest],
             }),
-            Err(TransitionFailure::Store(StoreError::Unavailable(
+            Err(TransitionFailure::MissingDurableFacts(
                 "durable predecessor context is incoherent",
-            ))),
+            )),
         ),
         (
             "insufficient lease span",
             Some(HeaderValidationFacts {
                 validation_leases: vec![short_lease],
             }),
-            Err(TransitionFailure::Store(StoreError::Unavailable(
+            Err(TransitionFailure::MissingDurableFacts(
                 "durable predecessor context is incoherent",
-            ))),
+            )),
         ),
         (
             "empty header-insertion leases",
             Some(HeaderValidationFacts {
                 validation_leases: Vec::new(),
             }),
-            Err(TransitionFailure::Store(StoreError::Unavailable(
+            Err(TransitionFailure::MissingDurableFacts(
                 "durable predecessor context is incoherent",
-            ))),
+            )),
         ),
     ];
 
@@ -246,9 +246,9 @@ fn retained_header_context_splices_authorized_leases_and_rejects_bad_facts() {
             }),
             &unauthorized_ctx,
         ),
-        Err(TransitionFailure::Store(StoreError::Unavailable(
+        Err(TransitionFailure::MissingDurableFacts(
             "durable predecessor context is incoherent",
-        ))),
+        )),
         "coherent lease without lease authority is incoherent"
     );
 }

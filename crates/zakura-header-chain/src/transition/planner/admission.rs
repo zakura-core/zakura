@@ -24,6 +24,9 @@ pub(super) struct AdmittedRequest {
 }
 
 /// How a pure header insertion related to newer monotone finality.
+///
+/// Maps to published [`crate::HeaderWorkEffect`] via [`Self::header_work_effect`].
+/// Settlement and replay must use that conversion rather than open-coding the match.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum HeaderInsertionRebase {
     /// The insertion already targeted the current finality anchor.
@@ -32,6 +35,24 @@ pub(super) enum HeaderInsertionRebase {
     Rebased,
     /// Newer finality fully consumed the prepared batch.
     AlreadyApplied,
+}
+
+impl HeaderInsertionRebase {
+    /// Authoritative conversion into the published header-work effect.
+    ///
+    /// - [`Self::Current`] contributes no header-work effect by itself (finality
+    ///   settlement may still set [`crate::HeaderWorkEffect::Rebased`] when work
+    ///   coordinates rebase independently).
+    /// - [`Self::Rebased`] → [`crate::HeaderWorkEffect::Rebased`]
+    /// - [`Self::AlreadyApplied`] → [`crate::HeaderWorkEffect::AlreadyApplied`]
+    ///   (normally surfaced as a verified no-change before settlement).
+    pub(super) const fn header_work_effect(self) -> Option<crate::HeaderWorkEffect> {
+        match self {
+            Self::Current => None,
+            Self::Rebased => Some(crate::HeaderWorkEffect::Rebased),
+            Self::AlreadyApplied => Some(crate::HeaderWorkEffect::AlreadyApplied),
+        }
+    }
 }
 
 /// Authenticate the caller and admit the event before any projection work.
@@ -87,6 +108,10 @@ fn validate_event_resource_bounds(
     let TransitionEvent::InsertHeaders(insert) = event else {
         return Ok(());
     };
+    // Authoritative runtime batch-size gate against the active engine limits.
+    // `PreparedHeaderBatch::new` also rejects batches above the frozen
+    // `MAX_HEADERS_PER_TRANSITION_V1` constant at construction; unifying those
+    // checks is deferred—treat this limits-aware check as planning authority.
     if insert.batch.headers().len() > limits.max_headers_per_transition.get() {
         return Err(
             InvalidTransitionEvidence::Limit(LimitViolation::PreparedHeadersExceeded).into(),
@@ -175,11 +200,9 @@ pub(super) fn validate_header_sync_owner(
 ) -> Result<(), TransitionFailure> {
     let header = owner.header_authority();
     if header.header_generation != snapshot_before_commit.header_generation
-        || owner
-            .body_authority()
-            .is_some_and(|authority| {
-                authority.verified_generation != snapshot_before_commit.verified_generation
-            })
+        || owner.body_authority().is_some_and(|authority| {
+            authority.verified_generation != snapshot_before_commit.verified_generation
+        })
         || header.branch.anchor_hash != snapshot_before_commit.frontiers.finalized.hash
     {
         return Err(TransitionFailure::Stale {

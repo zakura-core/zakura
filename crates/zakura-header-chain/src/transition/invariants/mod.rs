@@ -59,6 +59,9 @@ pub enum InvariantViolation {
     #[error("protected-path invariant failed at {0:?}")]
     Protected(block::Hash),
     /// 11. The projected DAG exceeds a frozen resource limit.
+    ///
+    /// Distinct from a verified resource stall and from
+    /// [`crate::TransitionFailure::AuxiliaryLimitExceeded`]. See [`crate::ApplyResult`].
     #[error("resource-limit invariant failed")]
     Limits,
     /// 12. The verifier found generation increments that disagree with actual changes.

@@ -121,16 +121,18 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
                 ))?;
             finality = Some((
                 new_finalized,
-                FinalitySource::HeadersOnlyDepth {
-                    selected_tip: selected_tip,
-                },
+                FinalitySource::HeadersOnlyDepth { selected_tip },
             ));
         }
     }
 
     let mut effect = TransitionEffect::none();
-    if work_rebased || header_rebase == HeaderInsertionRebase::Rebased {
+    // HeaderInsertionRebase::header_work_effect is the sole rebase→effect map;
+    // work-coordinate rebase from finality settlement may still force Rebased.
+    if work_rebased {
         effect.header_work = Some(HeaderWorkEffect::Rebased);
+    } else {
+        effect.header_work = header_rebase.header_work_effect();
     }
     if matches!(
         event,

@@ -32,9 +32,9 @@ pub(in crate::transition::planner) fn retained_header_context<G: HeaderGraphView
     while context.len() < required {
         let Some(node) = graph.view_header_node(hash) else {
             let Some(facts) = facts else {
-                return Err(
-                    StoreError::Unavailable("retained predecessor context is incomplete").into(),
-                );
+                return Err(TransitionFailure::MissingDurableFacts(
+                    "retained predecessor context is incomplete",
+                ));
             };
             let authorized_lease = facts.validation_leases.iter().find_map(|lease| {
                 if !lease.is_coherent(
@@ -64,9 +64,9 @@ pub(in crate::transition::planner) fn retained_header_context<G: HeaderGraphView
                     .then_some((lease, overlap))
             });
             let Some((lease, overlap)) = authorized_lease else {
-                return Err(
-                    StoreError::Unavailable("durable predecessor context is incoherent").into(),
-                );
+                return Err(TransitionFailure::MissingDurableFacts(
+                    "durable predecessor context is incoherent",
+                ));
             };
             context.truncate(overlap);
             context.extend(
@@ -83,9 +83,9 @@ pub(in crate::transition::planner) fn retained_header_context<G: HeaderGraphView
                     }),
             );
             if context.len() != required {
-                return Err(
-                    StoreError::Unavailable("durable predecessor context is incomplete").into(),
-                );
+                return Err(TransitionFailure::MissingDurableFacts(
+                    "durable predecessor context is incomplete",
+                ));
             }
             return Ok(context
                 .into_iter()

@@ -147,6 +147,9 @@ impl TransitionFingerprint {
 }
 
 /// Authority/mode gate checked before any transition effect.
+///
+/// See [`crate::FullStateEvidenceAuthority`] for the capability matrix that
+/// [`crate::TransitionContext`] enforces for each variant.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum EventAdmission {
     /// Valid in integrated and headers-only modes.

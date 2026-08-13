@@ -77,7 +77,10 @@ pub(super) fn bind_replay_and_freshness(
         event,
         domain,
         header_rebase,
-        no_change_effect: (header_rebase == HeaderInsertionRebase::AlreadyApplied)
-            .then_some(TransitionEffect::header_work_already_applied()),
+        no_change_effect: matches!(
+            header_rebase.header_work_effect(),
+            Some(crate::HeaderWorkEffect::AlreadyApplied)
+        )
+        .then_some(TransitionEffect::header_work_already_applied()),
     })
 }

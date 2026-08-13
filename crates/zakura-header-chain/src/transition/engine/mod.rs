@@ -318,6 +318,17 @@ impl EngineTransition {
         self.plan.effect()
     }
 
+    /// Derive ownership retirement from the before/after commit snapshots.
+    ///
+    /// Delegates to [`crate::RetiredWork::from_snapshots`]. Coordinators that
+    /// also retire exact owners should call [`crate::RetiredWork::with_owners`].
+    pub fn retired_work(&self) -> crate::RetiredWork {
+        crate::RetiredWork::from_snapshots(
+            self.snapshot_before_commit(),
+            &self.snapshot_after_commit(),
+        )
+    }
+
     #[cfg(any(test, feature = "fuzz-impl"))]
     pub(crate) fn into_plan(self) -> TransitionPlan {
         self.plan

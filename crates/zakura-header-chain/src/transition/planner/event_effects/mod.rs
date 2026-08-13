@@ -93,9 +93,9 @@ pub(super) fn migrated_pin_refuted(
         return Ok(None);
     };
     let Some(preserved) = input.preserved_migrated_pin() else {
-        return Err(
-            crate::StoreError::Unavailable("migrated finality fact was not supplied").into(),
-        );
+        return Err(TransitionFailure::MissingDurableFacts(
+            "migrated finality fact was not supplied",
+        ));
     };
     Ok((preserved == Some(event.pin)).then_some(event.pin))
 }

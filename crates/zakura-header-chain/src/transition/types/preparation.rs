@@ -193,6 +193,9 @@ impl PreparedHeaderBatch {
             return Err(TransitionTypeError::EmptyHeaderBatch);
         }
         if headers.len() > crate::MAX_HEADERS_PER_TRANSITION_V1 {
+            // Type-boundary constant check. Planning also enforces
+            // `limits.max_headers_per_transition` in admission (authoritative for
+            // the active engine). Unifying these gates is deferred.
             return Err(TransitionTypeError::OversizedHeaderBatch);
         }
         Ok(Self {

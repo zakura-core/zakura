@@ -85,26 +85,52 @@ pub struct FinalityRecord {
 }
 
 /// Complete pure write plan applied atomically by the state adapter.
+///
+/// # Authoritative vs reconstructible
+///
+/// **Authoritative** fields are durable source of truth; recovery fails closed
+/// when they contradict configuration or each other:
+/// - [`Self::put_nodes`] / [`Self::delete_nodes`]
+/// - [`Self::put_consensus_invalid_body_tombstones`]
+/// - direct reasons inside [`Self::eligibility_changes`]
+/// - [`Self::aux_changes`]
+/// - [`Self::finality_append`]
+/// - mode, network, anchors, counters, frontiers, and alarms in [`Self::metadata`]
+///
+/// **Reconstructible** fields may be rebuilt from authoritative rows after
+/// audit (see [`crate::RecoveryRepair`]):
+/// - [`Self::index_changes`] (hash/parent/height adjacency and deferred indexes)
+/// - [`Self::selected_projection`] / [`Self::verified_projection`]
+/// - inherited eligibility caches carried on nodes / eligibility deltas
+/// - retention and body-unavailability alarm fields derived from the selected tip
+///
+/// # Atomic apply
+///
+/// The adapter must persist the entire set in one durable transaction (metadata
+/// last), then install the same delta into the in-memory engine. Partial apply
+/// is undefined: either every field lands together or none do. Empty mutations
+/// still require a coherent metadata row when the plan is not a verified
+/// no-change.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChangeSet {
-    /// New or replaced nodes.
+    /// New or replaced nodes (authoritative).
     pub put_nodes: Vec<HeaderNode>,
-    /// Evicted or finalized-away nodes.
+    /// Evicted or finalized-away nodes (authoritative).
     pub delete_nodes: Vec<block::Hash>,
-    /// New append-only consensus-invalid tombstones.
+    /// New append-only consensus-invalid tombstones (authoritative).
     pub put_consensus_invalid_body_tombstones: Vec<crate::ConsensusInvalidBodyTombstone>,
     /// Reconstructible indexes changed with the nodes.
     pub index_changes: IndexChanges,
-    /// Selected-header height projection change.
+    /// Selected-header height projection change (reconstructible cache).
     pub selected_projection: ProjectionDelta,
-    /// Full-state verified height projection change.
+    /// Full-state verified height projection change (reconstructible cache).
     pub verified_projection: ProjectionDelta,
-    /// Direct or inherited eligibility changes.
+    /// Direct (authoritative) or inherited (reconstructible cache) eligibility changes.
     pub eligibility_changes: Vec<EligibilityDelta>,
-    /// Hash-keyed auxiliary changes.
+    /// Hash-keyed auxiliary changes (authoritative).
     pub aux_changes: Vec<AuxDelta>,
-    /// Optional append-only finality record.
+    /// Optional append-only finality record (authoritative).
     pub finality_append: Option<FinalityRecord>,
-    /// New singleton metadata written last in the atomic batch.
+    /// New singleton metadata written last in the atomic batch (authoritative root).
     pub metadata: EngineMetadata,
 }

@@ -8,6 +8,16 @@ use crate::{
 };
 
 /// Durable predecessor leases used for contextual header validation.
+///
+/// # Adapter loading obligation
+///
+/// Before planning, the state adapter must load every [`ValidationLease`] needed
+/// to reconstruct difficulty/time context for parents that are no longer retained
+/// in the header graph. Leases must be coherent with the active network and trust
+/// anchor and authorized via
+/// [`crate::FullStateEvidenceAuthority::authorizes_validation_lease`]. Omitting
+/// required leases fails planning as [`crate::TransitionFailure::MissingDurableFacts`],
+/// not as store I/O.
 #[derive(Clone, Debug, Default)]
 pub struct HeaderValidationFacts {
     /// Exact predecessor leases available for missing retained parents.
@@ -15,6 +25,15 @@ pub struct HeaderValidationFacts {
 }
 
 /// Durable facts consumed by prepared header insertion, including finality rebase history.
+///
+/// # Adapter loading obligation
+///
+/// In addition to [`HeaderValidationFacts`], the adapter must supply the contiguous
+/// append-only [`FinalityRecord`] chain from the work's stable finality anchor to
+/// current finality whenever monotone finality may rebase the insertion. Missing
+/// or non-contiguous rebase history fails as
+/// [`crate::TransitionFailure::MissingDurableFacts`] or stale preparation—never as
+/// a successful partial admit.
 #[derive(Clone, Debug, Default)]
 pub struct HeaderInsertionFacts {
     /// Predecessor leases for the original and rebased parents.

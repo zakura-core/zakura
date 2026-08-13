@@ -47,8 +47,18 @@ pub enum TransitionFailure {
         current: crate::StateVersion,
     },
     /// The store could not read durable rows coherently.
+    ///
+    /// Reserved for genuine store I/O / coherence failures. Missing adapter-supplied
+    /// [`crate::TransitionInput`] facts use [`Self::MissingDurableFacts`] instead.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// Required durable facts were absent from [`crate::TransitionInput`].
+    ///
+    /// Distinct from [`Self::Store`]: the planner never reads the durable store, so
+    /// omitted validation leases, finality rebase history, or migrated-pin facts are
+    /// adapter contract failures—not storage unavailability.
+    #[error("transition input is missing required durable facts: {0}")]
+    MissingDurableFacts(&'static str),
     /// The projected graph would be incoherent.
     #[error(transparent)]
     Graph(#[from] GraphError),
@@ -75,9 +85,11 @@ pub enum TransitionFailure {
     InvalidEvidence(#[from] InvalidTransitionEvidence),
     /// Auxiliary delivery bounds refused this event before any durable mutation.
     ///
-    /// Unlike a [`TransitionEffect`] with `resource_stalled`, this is a zero-effect
-    /// planner failure: it does not raise the durable resource-stall alarm or produce a
-    /// [`crate::CommittedStallReceipt`].
+    /// Unlike a [`crate::TransitionEffect`] with `resource_stalled`, this is a
+    /// zero-effect planner failure: it does not raise the durable resource-stall
+    /// alarm or produce a [`crate::CommittedStallReceipt`]. Distinct from
+    /// [`crate::InvariantViolation::Limits`], which fails commit-time verification
+    /// after projection. See [`crate::ApplyResult`] for the three-way mapping.
     #[error("header admission refused because auxiliary delivery limits are exceeded")]
     AuxiliaryLimitExceeded,
     /// The projected write set violated a commit invariant.

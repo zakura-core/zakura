@@ -208,8 +208,8 @@ impl HeaderChainEngine {
     /// - [`Err`] — [`CommittedTransitionError::StaleSource`] if another
     ///   transition changed this engine after planning, or
     ///   [`CommittedTransitionError::Graph`] if the verified delta cannot apply.
-    ///   On either error the engine is unchanged; re-plan against the current
-    ///   snapshot rather than forcing install.
+    ///   On either error the engine is unchanged, but durable state may already
+    ///   be ahead of memory; fail closed and recover from durable state.
     pub fn install_committed_transition(
         &mut self,
         transition: EngineTransition,

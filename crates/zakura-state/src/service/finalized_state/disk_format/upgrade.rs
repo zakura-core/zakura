@@ -664,7 +664,7 @@ impl DbFormatChange {
         cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<(), FormatChangeError> {
         let Upgrade {
-            newer_running_version: _,
+            newer_running_version,
             older_disk_version,
         } = self
         else {
@@ -702,6 +702,13 @@ impl DbFormatChange {
                 "Zakura automatically upgraded the database format"
             );
             Self::mark_as_upgraded_to(db, &upgrade.version());
+        }
+
+        if initial_finalized_tip_height.is_none() {
+            // An empty database has no spending indexes to build. The coordinator records the
+            // running build metadata because the empty index is complete.
+            db.update_format_version_on_disk(newer_running_version)
+                .map_err(|error| FormatChangeError::MigrationStorage(error.to_string()))?;
         }
 
         Ok(())
@@ -1109,11 +1116,13 @@ fn vct_format_changes_include_root_auth_metadata_updates() {
         !upgrades[3].needs_migration(),
         "the header-chain column families are created on open without rebasing authenticated roots"
     );
+    let mut current_schema_version = state_database_format_version_in_code();
+    current_schema_version.build = semver::BuildMetadata::EMPTY;
     assert_eq!(
         upgrades
             .last()
             .expect("latest format upgrade is registered")
             .version(),
-        state_database_format_version_in_code()
+        current_schema_version
     );
 }

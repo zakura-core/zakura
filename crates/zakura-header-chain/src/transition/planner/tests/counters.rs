@@ -1,7 +1,7 @@
 use super::*;
 
 fn assert_counter_exhausted(
-    result: Result<TransitionPlan, TransitionFailure>,
+    result: Result<EngineTransition, TransitionFailure>,
     expected_counter: &str,
 ) {
     let TransitionFailure::Counter(error) =

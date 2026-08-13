@@ -369,7 +369,19 @@ where
         MinimumPeerVersion::new(latest_chain_tip, &config.network),
         None,
     );
-    let peer_set = Buffer::new(BoxService::new(peer_set), constants::PEERSET_BUFFER_SIZE);
+    let shutdown = zakura_endpoint
+        .as_ref()
+        .map(ZakuraEndpoint::background_shutdown_token)
+        .unwrap_or_default();
+    // Using Buffer::pair returns the background service, letting us inject our cancellation
+    let (peer_set, worker) =
+        Buffer::pair(BoxService::new(peer_set), constants::PEERSET_BUFFER_SIZE);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            _ = worker => {}
+        }
+    });
 
     // Start the peer disk cache updater
     let peer_cache_updater_fut = peer_cache_updater(config.clone(), address_book.clone());

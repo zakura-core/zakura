@@ -87,6 +87,7 @@ use futures::FutureExt;
 use tokio::{
     pin, select,
     sync::{oneshot, watch},
+    task::{AbortHandle, JoinHandle},
 };
 use tokio_util::sync::CancellationToken;
 use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
@@ -172,6 +173,22 @@ fn check_tcp_slow_start_after_idle() {
 
 fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
     config.v2_p2p()
+}
+
+#[derive(Default)]
+// Keeps track of `JoinHandle`s, and when `Drop`ped, `aborts` all of them.
+struct NodeTasks(Vec<AbortHandle>);
+
+impl NodeTasks {
+    fn track<T>(&mut self, task: &JoinHandle<T>) {
+        self.0.push(task.abort_handle());
+    }
+}
+
+impl Drop for NodeTasks {
+    fn drop(&mut self) {
+        self.0.iter().for_each(AbortHandle::abort);
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -288,8 +305,10 @@ impl StartCmd {
         config: Arc<ZakuradConfig>,
         custom_services: Vec<zakura_network::zakura::CustomService>,
         shutdown: CancellationToken,
-        cleanup_ready: CancellationToken,
+        shutdown_cleanup_required: CancellationToken,
     ) -> Result<(), Report> {
+        let _shutdown_on_drop = shutdown.clone().drop_guard();
+        let mut node_tasks = NodeTasks::default();
         check_tcp_slow_start_after_idle();
 
         let is_regtest = config.network.network.is_regtest();
@@ -501,6 +520,20 @@ impl StartCmd {
             .await
             .map_err(|error| eyre!(error))?;
 
+        // Not added to node_tasks, because it must outlive start() being dropped to shutdown the
+        // endpoint
+        let zakura_endpoint_shutdown_task = if let Some(endpoint) = zakura_endpoint.clone() {
+            shutdown_cleanup_required.cancel();
+
+            let shutdown = shutdown.clone();
+            Some(tokio::spawn(async move {
+                shutdown.cancelled().await;
+                endpoint.shutdown().await;
+            }))
+        } else {
+            None
+        };
+
         // Start health server if configured (after sync_status is available)
 
         info!("initializing verifiers");
@@ -513,6 +546,7 @@ impl StartCmd {
                 tx_verifier_setup_rx,
             )
             .await;
+        node_tasks.track(&consensus_task_handles.state_checkpoint_verify_handle);
 
         if let Some(endpoint) = zakura_endpoint.clone() {
             let trace = endpoint.trace();
@@ -617,6 +651,7 @@ impl StartCmd {
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),
         );
+        node_tasks.track(&rpc_tx_queue_handle);
         let rpc_impl = rpc_impl.with_end_of_support_height(
             sync::end_of_support::end_of_support_height(&config.network.network),
         );
@@ -628,6 +663,7 @@ impl StartCmd {
         } else {
             tokio::spawn(std::future::pending().in_current_span())
         };
+        node_tasks.track(&rpc_task_handle);
 
         let zcashd_compat_shutdown_timeout =
             Self::zcashd_compat_supervisor_shutdown_timeout(&config);
@@ -681,6 +717,7 @@ impl StartCmd {
                 tokio::spawn(std::future::pending().in_current_span())
             }
         };
+        node_tasks.track(&indexer_rpc_task_handle);
 
         // Start concurrent tasks which don't add load to other tasks
         info!("spawning block gossip task");
@@ -693,9 +730,11 @@ impl StartCmd {
             )
             .in_current_span(),
         );
+        node_tasks.track(&block_gossip_task_handle);
 
         info!("spawning mempool queue checker task");
         let mempool_queue_checker_task_handle = mempool::QueueChecker::spawn(mempool.clone());
+        node_tasks.track(&mempool_queue_checker_task_handle);
 
         info!("spawning mempool transaction gossip task");
         let tx_gossip_task_handle = tokio::spawn(
@@ -706,12 +745,14 @@ impl StartCmd {
             )
             .in_current_span(),
         );
+        node_tasks.track(&tx_gossip_task_handle);
 
         info!("spawning delete old databases task");
         let mut old_databases_task_handle = zakura_state::check_and_delete_old_state_databases(
             &config.state,
             &config.network.network,
         );
+        node_tasks.track(&old_databases_task_handle);
 
         info!("spawning progress logging task");
         let (chain_tip_metrics_sender, chain_tip_metrics_receiver) =
@@ -725,6 +766,7 @@ impl StartCmd {
             )
             .in_current_span(),
         );
+        node_tasks.track(&progress_task_handle);
 
         // Start health server if configured
         info!("initializing health endpoints");
@@ -736,6 +778,7 @@ impl StartCmd {
             address_book.clone(),
         )
         .await;
+        node_tasks.track(&health_task_handle);
 
         // Spawn never ending end of support task.
         info!("spawning end of support checking task");
@@ -743,6 +786,7 @@ impl StartCmd {
             sync::end_of_support::start(config.network.network.clone(), latest_chain_tip.clone())
                 .in_current_span(),
         );
+        node_tasks.track(&end_of_support_task_handle);
 
         // Give the inbound service more time to clear its queue,
         // then start concurrent tasks that can add load to the inbound service
@@ -758,6 +802,7 @@ impl StartCmd {
             sync_status.clone(),
             chain_tip_change.clone(),
         );
+        node_tasks.track(&mempool_crawler_task_handle);
 
         info!("spawning syncer task");
         // In regtest, commit the genesis block directly (bypassing the syncer's genesis
@@ -813,6 +858,7 @@ impl StartCmd {
         } else {
             tokio::spawn(syncer.sync().in_current_span())
         };
+        node_tasks.track(&syncer_task_handle);
 
         // And finally, spawn the internal Zcash miner, if it is enabled.
         //
@@ -829,6 +875,7 @@ impl StartCmd {
         // Spawn a dummy miner task which doesn't do anything and never finishes.
         let miner_task_handle: tokio::task::JoinHandle<Result<(), Report>> =
             tokio::spawn(std::future::pending().in_current_span());
+        node_tasks.track(&miner_task_handle);
 
         info!("spawned initial Zakura tasks");
 
@@ -844,7 +891,7 @@ impl StartCmd {
             };
         // The supervisor may own a child after this point, so shutdown must
         // await cleanup. Do not add a yield between the spawn and this marker.
-        cleanup_ready.cancel();
+        shutdown_cleanup_required.cancel();
 
         // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
 
@@ -997,6 +1044,7 @@ impl StartCmd {
         };
 
         info!("exiting Zakura: asking other tasks to stop");
+        shutdown.cancel();
         zakura_chain::shutdown::set_shutting_down();
 
         // ongoing tasks
@@ -1011,8 +1059,10 @@ impl StartCmd {
         progress_task_handle.abort();
         end_of_support_task_handle.abort();
         miner_task_handle.abort();
-        if let Some(zakura_endpoint) = zakura_endpoint {
-            zakura_endpoint.shutdown().await;
+        if let Some(zakura_endpoint_shutdown_task) = zakura_endpoint_shutdown_task {
+            zakura_endpoint_shutdown_task
+                .await
+                .expect("unexpected panic in the Zakura endpoint shutdown task");
         }
         if zcashd_compat_task_finished {
             debug!("zcashd-compat supervisor task already exited before shutdown");
@@ -1118,8 +1168,13 @@ impl Runnable for StartCmd {
             .take();
 
         rt.expect("runtime should not already be taken")
-            .run_with_graceful_shutdown(|shutdown, cleanup_ready| {
-                self.start(APPLICATION.config(), Vec::new(), shutdown, cleanup_ready)
+            .run_with_graceful_shutdown(|shutdown, shutdown_cleanup_required| {
+                self.start(
+                    APPLICATION.config(),
+                    Vec::new(),
+                    shutdown,
+                    shutdown_cleanup_required,
+                )
             });
 
         info!("stopping zakurad");

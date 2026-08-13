@@ -29,68 +29,80 @@ pub async fn run_with_services(
     let command = StartCmd::default();
     let config = command.override_config(config)?;
     let node_shutdown = CancellationToken::new();
-    let cleanup_ready = CancellationToken::new();
+    // One-way latch: cancelled means shutdown must await the root future's cleanup.
+    let shutdown_cleanup_required = CancellationToken::new();
     let node = command.start(
         config.into(),
         custom_services,
         node_shutdown.clone(),
-        cleanup_ready.clone(),
+        shutdown_cleanup_required.clone(),
     );
 
     run_until_shutdown(
         node,
         shutdown.cancelled_owned(),
         node_shutdown,
-        cleanup_ready,
+        shutdown_cleanup_required,
     )
     .await
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, time::Duration};
+    use std::{net::UdpSocket, time::Duration};
 
     use super::*;
-    use tokio::{net::TcpStream, time::timeout};
+    use tokio::time::timeout;
 
     #[tokio::test]
-    async fn node_starts_and_stops_on_cancellation() {
+    async fn dropping_node_future_shuts_down_zakura_endpoint() {
         let _guard = zakura_test::init();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("test port is available");
-        let health_addr = listener.local_addr().expect("test listener has an address");
-        drop(listener);
+        let native_socket = UdpSocket::bind("127.0.0.1:0").expect("test UDP port is available");
+        let native_addr = native_socket
+            .local_addr()
+            .expect("test UDP socket has an address");
+        drop(native_socket);
+        let identity_dir = tempfile::tempdir().expect("temporary identity directory is created");
 
         let mut config = ZakuradConfig::default();
         config.network.listen_addr = "127.0.0.1:0".parse().expect("valid test address");
-        config.network.p2p_stack = zakura_network::P2pStack::Legacy;
+        config.network.p2p_stack = zakura_network::P2pStack::Dual;
         config.network.initial_mainnet_peers.clear();
+        config.network.cache_dir = zakura_network::CacheDir::disabled();
+        config.network.identity_dir = identity_dir.path().to_owned();
+        config.network.zakura.listen_addr = Some(native_addr);
+        config.network.zakura.bootstrap_peers.clear();
         config.state = zakura_state::Config::ephemeral();
-        config.health.listen_addr = Some(health_addr);
-        let shutdown = CancellationToken::new();
-        let node = run_with_services(config, Vec::new(), shutdown.clone());
-
-        tokio::pin!(node);
+        let mut node = Box::pin(run_with_services(
+            config,
+            Vec::new(),
+            CancellationToken::new(),
+        ));
         timeout(Duration::from_secs(30), async {
-            tokio::select! {
-                result = &mut node => panic!("node exited before starting: {result:?}"),
-                _ = async {
-                    while TcpStream::connect(health_addr).await.is_err() {
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                    }
-                } => {}
+            loop {
+                tokio::select! {
+                    result = &mut node => panic!("node exited before starting: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                }
+                if UdpSocket::bind(native_addr).is_err() {
+                    break;
+                }
             }
         })
         .await
-        .expect("node starts its health endpoint");
+        .expect("node starts its Zakura endpoint");
+        drop(node);
 
-        tokio::select! {
-            result = &mut node => panic!("node exited after starting: {result:?}"),
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-        }
-        shutdown.cancel();
-        timeout(Duration::from_secs(30), &mut node)
-            .await
-            .expect("node shuts down after cancellation")
-            .expect("node shuts down cleanly");
+        let socket = timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(socket) = UdpSocket::bind(native_addr) {
+                    break socket;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("dropping the node future releases its Zakura endpoint");
+        drop(socket);
     }
 }

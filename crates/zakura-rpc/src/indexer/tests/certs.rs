@@ -50,3 +50,25 @@ AwEHoUQDQgAE0IiUsDpz0zII1yw0uYjf4m+LJpLTzDdQcZ/tZsCtN9dUjc9cJxkv
 FTfPb0T+GR98zf+kbOZw7XXakAVIiC4vDQ==
 -----END EC PRIVATE KEY-----
 "#;
+
+/// A client certificate signed by a second CA that the server does not trust,
+/// `CN=Zakura-Test-Untrusted-CA`. Otherwise identical in shape to
+/// [`CLIENT_CERT`]: P-256, ecdsa-with-SHA256, serial 2, same validity window.
+pub(super) const UNTRUSTED_CLIENT_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBejCCASGgAwIBAgIBAjAKBggqhkjOPQQDAjAjMSEwHwYDVQQDDBhaYWt1cmEt
+VGVzdC1VbnRydXN0ZWQtQ0EwHhcNMjYwODA1MTI1NjIxWhcNMzYwODAyMTI1NjIx
+WjAnMSUwIwYDVQQDDBxaYWt1cmEtVGVzdC1VbnRydXN0ZWQtQ2xpZW50MFkwEwYH
+KoZIzj0CAQYIKoZIzj0DAQcDQgAEZryAGuC1THWnd59RQiTwDSLzqSknT8nvOFgb
+itGEkTugY8wbpPDhtGqHEFlHLyc9pqLToF1dZcuydKKfhOZL+qNCMEAwHQYDVR0O
+BBYEFKXHrQvSGa9GvmdX2vSh1c1gYOrmMB8GA1UdIwQYMBaAFB0upmQpvEkhxChh
+e4j0YJJokeaPMAoGCCqGSM49BAMCA0cAMEQCIEe+Aop1mVwghhxIfuvMpotexJSL
+cn9ij3bghmh081AYAiBeOK3Sj3z4V7yipqDlSRUeH41rns8Mz7mVUD0UWYzgSQ==
+-----END CERTIFICATE-----
+"#;
+
+pub(super) const UNTRUSTED_CLIENT_KEY: &str = r#"-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIOfYiR9PgYMG8//jYaabLGknn1T+djREn5CzGoB0gIq6oAoGCCqGSM49
+AwEHoUQDQgAEZryAGuC1THWnd59RQiTwDSLzqSknT8nvOFgbitGEkTugY8wbpPDh
+tGqHEFlHLyc9pqLToF1dZcuydKKfhOZL+g==
+-----END EC PRIVATE KEY-----
+"#;

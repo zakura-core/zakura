@@ -24,7 +24,10 @@ use zakura_chain::serialization::ZcashSerialize;
 use crate::indexer::{self, indexer_client::IndexerClient, BlockRangeRequest, BlockRequest, Empty};
 use crate::{
     config::rpc::IndexerTlsConfig,
-    indexer::tests::certs::{CA_CERT, CLIENT_CERT, CLIENT_KEY, SERVER_CERT, SERVER_KEY},
+    indexer::tests::certs::{
+        CA_CERT, CLIENT_CERT, CLIENT_KEY, SERVER_CERT, SERVER_KEY, UNTRUSTED_CLIENT_CERT,
+        UNTRUSTED_CLIENT_KEY,
+    },
     sync::{IndexerClientConfig, IndexerClientTlsConfig},
 };
 
@@ -98,15 +101,49 @@ async fn indexer_server_requires_a_trusted_client_certificate() -> Result<()> {
     let unauthenticated_endpoint =
         tonic::transport::Endpoint::new(format!("https://{listen_addr}"))?
             .tls_config(unauthenticated_tls)?;
+    // Every client below sends the same request, which request validation
+    // rejects with `InvalidArgument`. Only a client the server accepted can
+    // reach request validation, so `InvalidArgument` is the signature of an
+    // accepted client and any other status means the connection was refused.
     let mut unauthenticated_client = IndexerClient::connect(unauthenticated_endpoint).await?;
-    assert!(
-        unauthenticated_client
-            .get_block(BlockRequest {
-                hash_or_height: Vec::new(),
-            })
-            .await
-            .is_err(),
-        "the indexer server must reject clients without a certificate"
+    let status = unauthenticated_client
+        .get_block(BlockRequest {
+            hash_or_height: Vec::new(),
+        })
+        .await
+        .expect_err("the indexer server must reject clients without a certificate");
+    assert_ne!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "a client without a certificate reached request validation: {status:?}"
+    );
+
+    let untrusted_cert_file = temp_dir.path().join("untrusted-client.pem");
+    let untrusted_key_file = temp_dir.path().join("untrusted-client-key.pem");
+    fs::write(&untrusted_cert_file, UNTRUSTED_CLIENT_CERT)?;
+    fs::write(&untrusted_key_file, UNTRUSTED_CLIENT_KEY)?;
+    let untrusted_endpoint = IndexerClientConfig::mtls(
+        listen_addr,
+        IndexerClientTlsConfig::new(
+            temp_dir.path().join("ca.pem"),
+            untrusted_cert_file,
+            untrusted_key_file,
+            "localhost".to_string(),
+        ),
+    )
+    .endpoint()
+    .map_err(|error| eyre!(error))?;
+    let mut untrusted_client = IndexerClient::connect(untrusted_endpoint).await?;
+    let status = untrusted_client
+        .get_block(BlockRequest {
+            hash_or_height: Vec::new(),
+        })
+        .await
+        .expect_err("the indexer server must reject certificates from an untrusted CA");
+    assert_ne!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "a certificate signed by an untrusted CA reached request validation: {status:?}"
     );
 
     let authenticated_endpoint = IndexerClientConfig::mtls(

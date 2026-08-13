@@ -37,7 +37,7 @@ type ServerTask = JoinHandle<Result<(), BoxError>>;
 const MAX_CONNECTIONS: usize = 64;
 
 /// Maximum number of concurrent HTTP/2 streams on each connection.
-const MAX_CONCURRENT_STREAMS_PER_CONNECTION: u32 = 16;
+const MAX_CONCURRENT_STREAMS_PER_CONNECTION: u32 = 64;
 
 /// Maximum time an unauthenticated connection may spend negotiating TLS.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);

@@ -71,7 +71,7 @@ equihash = "0.3"
 # feature for interruptible CPU Equihash solving. Consensus verification
 # continues to use registry `equihash`. Replace this dependency with a
 # published upstream release before merging.
-cpu-equihash-solver = { version = "0.3", git = "https://github.com/valargroup/librustzcash", rev = "f4a671b0e838a63977bac400d426b135e7e342e2" }
+cpu-equihash-solver = { version = "0.3", git = "https://github.com/valargroup/librustzcash", rev = "da4cdf609a131c91552ccee88905b6c6dffd4cd8" }
 ff = "0.13"
 futures = "0.3.31"
 futures-core = "0.3.31"

@@ -1781,9 +1781,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "equihash"
+name = "cpu-equihash-solver"
 version = "0.3.0"
-source = "git+https://github.com/valargroup/librustzcash?rev=f02666ca85119be817a336313cd28d3c3a9bc9c4#f02666ca85119be817a336313cd28d3c3a9bc9c4"
+source = "git+https://github.com/valargroup/librustzcash?rev=f4a671b0e838a63977bac400d426b135e7e342e2#f4a671b0e838a63977bac400d426b135e7e342e2"
 dependencies = [
  "blake2b_simd",
  "cc",
@@ -8385,7 +8385,7 @@ dependencies = [
  "dirs",
  "ed25519-zebra",
  "equihash 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "equihash 0.3.0 (git+https://github.com/valargroup/librustzcash?rev=f02666ca85119be817a336313cd28d3c3a9bc9c4)",
+ "cpu-equihash-solver",
  "futures",
  "group",
  "halo2_proofs",

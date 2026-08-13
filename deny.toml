@@ -203,7 +203,10 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-allow-git = []
+allow-git = [
+    # Temporary internal-miner dependency, pinned to a reviewed commit.
+    "https://github.com/valargroup/librustzcash",
+]
 
 [sources.allow-org]
 github = [

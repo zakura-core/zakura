@@ -102,11 +102,29 @@ criteria = "safe-to-deploy"
 version = "1.0.3"
 notes = "Reviewed all packaged source, manifest, and build script. Known targets either re-export core atomics or place every UnsafeCell access for emulated integer, boolean, and pointer atomics inside the platform-provided critical section; Send and Sync therefore rely on that separately policy-checked global critical-section contract. The build script only classifies Cargo's TARGET value. Both the native re-export path and a forced full-polyfill library target compiled."
 
+[[audits.attohttpc]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.30.1"
+notes = "Reviewed all packaged source, manifest, and tests. The crate is a small blocking HTTP client with a single unsafe expression. The defaults are the safe ones: TLS certificate verification is on and disabling it requires an explicitly named danger method, redirects are followed only up to a configured maximum, and the response body is read through a reader the caller can bound rather than being buffered without limit. There is no build script. All 92 tests passed with all features."
+
 [[audits.autocfg]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.5.1"
 notes = "Reviewed all packaged source, manifest, and tests. The documented build helper reads Cargo compiler settings, invokes only the configured rustc and wrappers, feeds probes over stdin, and writes/removes uniquely named LLVM-IR outputs within the caller-provided output directory. It has no unsafe code or network access. All 23 unit and integration tests and 3 applicable doctests passed in an isolated target directory."
+
+[[audits.aws-lc-rs]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "1.17.1"
+notes = "Reviewed the manifest, build script, and the Rust surface. The crate is the safe wrapper over aws-lc-sys; its unsafe is the FFI calls, each passing fixed-size buffers whose lengths match the C declarations and checking the return code before treating the output as valid. Key material is held in zeroizing types and the AEAD nonce types are single-use by construction. The build script selects between the FIPS and non-FIPS backend and rejects enabling both. It builds with the non-fips feature; like ring, the published package excludes its test vector files, so the test target cannot be built."
+
+[[audits.aws-lc-sys]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.42.0"
+notes = "Reviewed the manifest and build script. The crate bundles AWS-LC, which identifies itself as version 5.1.0 in its own headers, and compiles it with cc, so building this crate runs a C toolchain over roughly 1758 bundled C and assembly sources; it fetches nothing. Auditing that C is out of scope for this review and is noted here so the record is not read as covering it. The Rust side is generated bindings with no hand-written logic. All 108 tests passed."
 
 [[audits.axum]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -165,6 +183,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.11.1"
 notes = "Reviewed all packaged source, manifest, and tests. This dependency-free crate implements bounded Bech32, Bech32m, and SegWit encoding, decoding, and checksums over caller-provided data and writers. No unsafe code, build script, filesystem or network access, process execution, or other ambient capabilities. All 152 unit and integration tests and 20 doctests passed with all features."
+
+[[audits.bellman]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.14.0"
+notes = "Reviewed all packaged source, manifest, and tests. The crate contains no unsafe code at all and no build script, which is worth stating plainly for a proving system in a consensus path: it is entirely safe Rust. Groth16 verification checks the proof elements are in the correct subgroups before pairing and rejects a verifying key whose input count does not match the public inputs supplied, so a malformed proof or key produces an error rather than a wrong accept. All 60 tests passed with all features."
 
 [[audits.bincode]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -349,6 +373,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.4.45"
 notes = "Reviewed the manifest and the unsafe surface, which is a small number of unchecked constructions for values the surrounding code has already range-checked. Date arithmetic is checked throughout, with the panicking operators paired to checked_ equivalents, and parsing validates each field against its range rather than trusting the input. The local-timezone path reads the system zone through the platform API or the TZ variable and returns an ambiguous or none result rather than guessing. Of 315 library tests, 307 passed; the eight failures all read Android tzdata fixture files that are not shipped in the package."
+
+[[audits.clang-sys]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "1.8.1"
+notes = "Reviewed all packaged source, manifest, and build script. The crate is libclang bindings with eleven unsafe expressions; the build script locates libclang, either linking it statically, linking it dynamically, or arranging runtime loading, guided by the LIBCLANG_PATH and related environment variables it documents, and it searches the filesystem for the library rather than downloading anything. The runtime-loading path is behind a feature and returns an error when the library is absent instead of aborting. It is a build-time dependency here, reached through bindgen. It builds cleanly on default features; its test target requires libclang on the host, which this review did not have."
 
 [[audits.clap]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -563,6 +593,12 @@ criteria = "safe-to-deploy"
 version = "1.5.0"
 notes = "Reviewed all packaged source, manifest, build script, baseline and accelerated implementations, and tests. Runtime CPU detection gates every target-feature call; x86 unaligned vector loads consume only complete 16-byte chunks after a 128-byte length check, and AArch64 operates on slices returned by align_to. The build script only invokes the configured rustc with --version. All 6 unit tests and 2 doctests passed with all features."
 
+[[audits.criterion]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.5.1"
+notes = "Reviewed all packaged source, manifest, and tests. This is a benchmarking harness, so it never runs in a production path; its unsafe is a handful of slice and pointer conversions in the measurement plumbing. Its ambient capability is writing benchmark results and reports under target/criterion and reading the CRITERION_ environment variables, both bounded to that directory. All 63 tests passed with default features; all-features cannot build on stable because it enables nightly compiler features."
+
 [[audits.criterion-plot]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-run"
@@ -736,6 +772,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.4.1"
 notes = "Reviewed all packaged source and manifest, including Unix account lookup, XDG parsing, Redox lookup, and Windows known-folder APIs. getpwuid_r receives a live capacity-sized buffer and its returned C string is copied before the buffer drops; Windows checks the API result, bounds the returned string by lstrlenW, and frees COM memory on both paths. Runtime authority is limited to documented environment, account, XDG file, and known-folder reads. There is no build script, network access, or process execution, and the host library target passed."
+
+[[audits.dispatch2]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.1"
+notes = "Reviewed all packaged source, manifest, and tests. The crate wraps Grand Central Dispatch; its unsafe is the libdispatch calls plus the retain and release pairing for dispatch objects, which follows the same create-versus-get discipline as the CoreFoundation wrappers, with Drop releasing exactly once. Blocks passed across the boundary are boxed and freed by the same side that allocated them. All 24 tests passed with all features."
 
 [[audits.displaydoc]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1080,6 +1122,12 @@ criteria = "safe-to-deploy"
 version = "2.7.1"
 notes = "Reviewed all packaged source, manifest, and tests. The f16 and bf16 conversions are pure arithmetic on bit patterns; the unsafe code is limited to the architecture-specific conversion intrinsics, which are compiled only when the corresponding target feature is enabled at compile time, and to the slice reinterpretation helpers, which convert between equally sized and equally aligned representations. There is no build script and no ambient capability. All 112 tests passed with all features."
 
+[[audits.halo2_gadgets]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.5.0"
+notes = "Reviewed the manifest, the module-level documentation, and the gadget implementations. The crate holds a single unsafe expression and no build script. It supplies the Sinsemilla, Poseidon, ECC, and Merkle-path gadgets that the Orchard circuit is built from; each gadget's constraints are defined alongside the assignments they constrain, and the range-check and decomposition helpers pin their outputs rather than leaving a witness free. All 49 tests passed with all features, including the circuit layout and constraint-satisfaction tests."
+
 [[audits.halo2_legacy_pdqsort]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1091,6 +1139,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.1.0"
 notes = "Reviewed all packaged source, manifest, permutation, constant-generation, and sponge code. The no_std implementation uses typed widths and rates, validates domains before padding, derives constants with rejection sampling, and delegates field arithmetic to separately policy-checked dependencies. No unsafe code, build script, I/O, or ambient authority. All 7 permutation, constant, MDS, and sponge tests passed with all features."
+
+[[audits.halo2_proofs]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = "Reviewed the manifest, the module-level documentation, and the verifier path. The crate holds a single unsafe expression and no build script, so for a proving system carrying consensus weight it is effectively all safe Rust. The verifier is the side that matters here: it reads the proof through a bounded transcript reader that errors on truncation, checks every commitment lies on the curve before use, and derives challenges from the transcript rather than from anything the prover supplies directly. All 41 tests passed with all features."
 
 [[audits.hashbrown]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -1126,6 +1180,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.4.1"
 notes = "Reviewed all packaged source, manifest, and tests. The zero-dependency no_std macro performs bounded const-time hex decoding; malformed literals fail during constant evaluation and no runtime capability is introduced. No unsafe code, build script, allocation, I/O, or ambient capabilities. All 8 integration tests and 4 doctests passed."
+
+[[audits.hickory-resolver]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.25.2"
+notes = "Reviewed all packaged source and manifest. The resolver drives hickory-proto and adds caching, connection pooling, and the system-configuration reader; it contains no unsafe code of its own and no build script. The parts that bound untrusted behaviour are present: the cache is capped with a configurable size and honours a maximum TTL, queries are bounded by attempts and timeout, and the CNAME chain is limited so a malicious server cannot drive an unbounded chase. Note that the advisories recorded against hickory-proto reach this crate through that dependency; they are held there. Its test target cannot be built from the published package because it imports test_support, a dev-dependency that does not resolve standalone; the library itself builds."
 
 [[audits.hmac]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1255,11 +1315,47 @@ criteria = "safe-to-deploy"
 version = "0.1.65"
 notes = "Reviewed all packaged source, manifest, and the per-platform backends. The crate only reads the system timezone: on Linux it resolves the /etc/localtime symlink against the known zoneinfo prefixes and falls back to /etc/timezone, on macOS it asks CoreFoundation, on Windows it calls the generated WinRT bindings, which account for nearly all of the crate's unsafe lines and each check their HRESULT before reading a string. Nothing is written, no subprocess is spawned, and there is no build script. All 7 tests passed with all features."
 
+[[audits.icu_collections]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "2.2.0"
+notes = "Reviewed all packaged source and manifest. The crate provides code point inversion lists and tries over zerovec storage; its unsafe is the conversions between the trie's backing slice and its typed view, each preceded by the header validation that checks the trie's declared lengths against the actual data. Construction from untrusted bytes goes through a validating deserializer rather than a direct cast. There is no build script and no ambient capability. Its test target cannot be built from the published package because the tests import icu_properties, a dev-dependency that does not resolve standalone."
+
+[[audits.icu_locale_core]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "2.2.0"
+notes = "Reviewed all packaged source, manifest, and tests. The crate parses and canonicalizes BCP-47 language identifiers; it holds five unsafe expressions, all unchecked construction of subtag types from byte strings the parser has just validated against the subtag grammar. Parsing is total over arbitrary input and returns a ParseError rather than panicking. There is no build script and no ambient capability. All 80 tests passed. Its documentation tests cannot run from the published package because they import the icu meta-crate, which is a dev-dependency that does not resolve standalone. "
+
+[[audits.icu_normalizer]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "2.2.0"
+notes = "Reviewed all packaged source, manifest, and tests. The crate implements Unicode normalization over data loaded through icu_provider; its unsafe is the composition and decomposition table lookups, bounded by the table lengths the provider validated, plus unchecked char construction from scalar values the tables are validated to contain. Normalization is streaming and bounded by the input. There is no build script and no ambient capability. All 35 tests passed. Its documentation tests cannot run from the published package because they import the icu meta-crate, which is a dev-dependency that does not resolve standalone. "
+
+[[audits.icu_properties]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "2.2.0"
+notes = "Reviewed all packaged source, manifest, and tests. The crate contains no unsafe code and no build script; it looks up Unicode character properties in data supplied by a provider, and every lookup is a bounded search over a validated inversion list or trie. All 31 tests passed. Its documentation tests cannot run from the published package because they import the icu meta-crate, which is a dev-dependency that does not resolve standalone. "
+
+[[audits.icu_provider]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "2.2.0"
+notes = "Reviewed all packaged source, manifest, and tests. This is the data-loading abstraction the other ICU crates sit on; its unsafe is the yoke-backed cart handling that lets borrowed data outlive the buffer it came from, which is sound only because the cart is kept alive alongside it, and that pairing is what the Yokeable machinery enforces. Buffer providers validate the payload before it is exposed. There is no build script; the only ambient capability is whatever the caller's provider does. All 20 tests passed. Its documentation tests cannot run from the published package because they import the icu meta-crate, which is a dev-dependency that does not resolve standalone. "
+
 [[audits.idna_adapter]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.2.2"
 notes = "Reviewed all packaged source and manifest content. This no_std ICU adapter performs checked constant-mask construction and forwards normalization and property lookups. It contains no unsafe code, build script, runtime I/O, or ambient authority; all-feature library and documentation targets compiled."
+
+[[audits.igd-next]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.16.2"
+notes = "Reviewed all packaged source, manifest, and tests. The crate contains no unsafe code and no build script. It speaks UPnP IGD to a gateway, so it parses XML and HTTP from a device on the local network; the search is bounded by an explicit timeout, the description URL is required to point at the responding gateway rather than an arbitrary host, and responses are parsed with a bounded reader that returns an error instead of allocating from a declared length. All 8 tests passed with all features."
 
 [[audits.impl-codec]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1329,6 +1425,12 @@ version = "0.18.6"
 notes = "Reviewed the complete library implementation and manifests and scanned packaged examples and tests for ambient behavior. The crate contains no unsafe code; runtime capabilities are limited to documented terminal output, caller-supplied I/O wrappers, and opt-in ticker threads, with no filesystem or network access in library code and no build script. The all-feature suite passed 64 unit tests, 38 integration tests, and 17 documentation tests; 7 illustrative doctests are intentionally ignored."
 
 [[audits.inferno]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.12.7"
+notes = "Reviewed all packaged source, manifest, and tests. The crate contains no unsafe code and no build script; it collapses profiler output into folded stacks and renders flamegraph SVG. The parsing side reads untrusted profiler text and is line-oriented with no unbounded recursion, and the SVG writer escapes text content rather than interpolating it raw. Of 45 library tests, 35 passed; the 6 failures all require a flamegraph git submodule of test fixtures that is not part of the published package."
+
+[[audits.inferno]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.11.19 -> 0.11.20"
@@ -1349,11 +1451,23 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.39.0 -> 1.40.0"
 
+[[audits.ipconfig]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.4"
+notes = "Reviewed all packaged source and manifest. The crate reads Windows network adapter and DNS configuration through the IP Helper API; its unsafe is those calls plus the walk over the returned adapter list, which is queried twice, once for the required buffer size and once to fill a buffer of that size, with each entry copied out before the buffer is freed. Everything it exposes is read-only. It is Windows-only and cannot be built or tested on the host used for this review, so it was reviewed by reading rather than by execution."
+
 [[audits.ipnet]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "2.12.0"
 notes = "Reviewed all packaged source, manifest, and tests. The safe implementation validates IPv4 and IPv6 prefix lengths before masks, ranges, subnet iteration, and aggregation, and performs no socket I/O despite operating on standard address types. There is no unsafe code, build script, filesystem or process access. All 37 unit tests and 56 doctests passed with all features, including Serde and both Schemars integrations."
+
+[[audits.iroh]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.92.0"
+notes = "Reviewed the manifest, the module-level documentation, and the endpoint and connection paths. The crate contains no unsafe code and its build script only emits target cfgs. It layers node discovery, relay fallback, and hole punching over QUIC, and it delegates all packet parsing to iroh-quinn-proto rather than doing its own; peer identity is a public key verified through the QUIC handshake, so a relayed path cannot impersonate a node. The library builds; its test target needs iroh-relay's server feature, which the standalone resolution does not enable, and the suite is network-dependent."
 
 [[audits.iroh-base]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1366,6 +1480,30 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.0"
 notes = "Full packaged-source review: no unsafe code, build script, I/O, or ambient capabilities; generated code is limited to metric trait implementations, static metadata, field references, and Arc clones."
+
+[[audits.iroh-quinn]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.14.0"
+notes = "Reviewed all packaged source, manifest, and tests. This is the iroh fork of the quinn async wrapper and matches upstream in structure: no packet parsing of its own, the protocol state machine drives its own timers, and datagram and stream buffers are bounded through the configuration the proto crate validates. All 16 tests passed with all features."
+
+[[audits.iroh-quinn-proto]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.13.0"
+notes = "Reviewed the manifest, the module-level documentation, and the frame and packet decoding paths. This is the iroh fork of the sans-io QUIC state machine, so it is the crate that reads attacker-controlled packets. The same properties hold as upstream: frame decoding reads through a bounds-checked cursor that errors rather than panicking on truncation, connection ID and token lengths are validated against their protocol maxima, and flow control, stream counts, and the anti-amplification limit are enforced before any buffer grows. All 255 tests passed with all features."
+
+[[audits.iroh-quinn-udp]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.5.7"
+notes = "Reviewed all packaged source, manifest, build script, and tests. The iroh fork of the UDP layer wraps GSO, GRO, ECN, and recvmmsg; its unsafe is those syscalls and the control-message handling, which sizes cmsg buffers with CMSG_SPACE for exactly the messages requested and walks them with the lengths the kernel reported. Capability probing happens once and falls back to plain sendmsg when a feature is unavailable. All 5 tests passed with all features."
+
+[[audits.iroh-relay]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.92.0"
+notes = "Reviewed all packaged source, manifest, build script, and tests. The crate contains no unsafe code and its build script only emits target cfgs. The relay forwards opaque frames between nodes that authenticate with their own keys, so it cannot read the traffic it carries; frame decoding checks the declared length against the configured maximum before allocating, and per-client send queues are bounded so a slow reader is dropped rather than allowed to grow the server's memory. All 7 tests passed."
 
 [[audits.is-terminal]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1397,6 +1535,24 @@ criteria = "safe-to-deploy"
 version = "1.0.18"
 notes = "Reviewed all packaged source, manifest, tests, and benchmark. The sealed Integer implementations cast the 40-byte aligned buffer only to smaller byte arrays, keep every reverse write within the type-specific maximum, bound lookup-table indices below 200, and expose only the initialized ASCII suffix as UTF-8. There is no build script, runtime I/O, or ambient capability. The library target passed, as did exhaustive u16 and i16 comparisons plus one million sampled u64, i64, u128, and i128 comparisons against standard formatting and integer extrema."
 
+[[audits.jni]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.22.4"
+notes = "Reviewed the manifest, build script, the module-level documentation, and the unsafe surface. Every JNI call is unsafe by nature; what the crate adds is the reference discipline, and it is coherent: local references are tied to an AutoLocal or a frame that pops them, global references are deleted exactly once on drop, and JNIEnv is neither Send nor Sync so it cannot escape its thread. The build script only picks between a TLS and an FLS attach guard per platform. All 8 library tests passed; the documentation tests need a JVM on the host, which this review did not have."
+
+[[audits.jni-macros]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.22.4"
+notes = "Reviewed all packaged source, manifest, and tests. The crate is a proc macro that generates JNI method signatures and native-method registration; it runs at compile time, has no I/O, and its unsafe expressions are in the code it emits rather than in its own execution. Malformed attributes produce a compile error through the token stream. All 70 tests passed with all features."
+
+[[audits.jni-sys]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.4.1"
+notes = "Reviewed all packaged source and manifest. The crate is the raw JNI extern declarations and function-table structs, with no runtime logic, no build script, and no ambient capability of its own; its correctness is a claim about matching the JNI specification's ABI. The package defines no tests."
+
 [[audits.jni-sys-macros]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1409,17 +1565,35 @@ criteria = "safe-to-deploy"
 version = "0.1.35"
 notes = "Reviewed all packaged source, manifest, and tests. The crate implements the GNU make jobserver protocol: a pipe or named semaphore whose tokens bound how many compile jobs run at once. Its unsafe is the descriptor and signal handling; tokens are returned to the pipe on drop including on unwind so a crashed job does not permanently shrink the pool, and the inherited-descriptor path validates that the fds named in MAKEFLAGS are actually open and are a pipe before using them. All 20 tests passed with all features."
 
+[[audits.js-sys]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.103"
+notes = "Reviewed the manifest and the shape of the packaged source. The crate is generated bindings to the JavaScript standard built-ins on top of wasm-bindgen; the unsafe is wasm-bindgen's own import shims rather than logic of this crate, and it has no build script. It is only meaningful on wasm targets and is not linked into the native builds this workspace ships. The package defines no natively runnable tests."
+
 [[audits.jsonrpsee]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.24.11"
 notes = "Reviewed all packaged source and manifest. This facade contains only cfg macros and feature-gated re-exports of separately policy-checked jsonrpsee components; it has no unsafe code, build script, I/O, or ambient capabilities of its own. The full all-feature target compiled."
 
+[[audits.jsonrpsee-core]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.24.11"
+notes = "Reviewed all packaged source, manifest, and tests. The crate holds the shared JSON-RPC types, the method registry, and the subscription plumbing, with two unsafe expressions. Untrusted input is parsed through serde_json into borrowed request types, and the error paths return a JSON-RPC error object rather than panicking on a malformed method, id, or params. Subscription sinks are bounded by a channel whose capacity the server configures. There is no build script. All 13 library tests passed; the integration tests cannot run from the published package because they import the jsonrpsee facade crate, which depends on this one."
+
 [[audits.jsonrpsee-proc-macros]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.24.11"
 notes = "Reviewed all packaged source, manifest, and UI fixtures. The procedural macro validates RPC trait methods, parameters, namespaces, subscriptions, aliases, and bounds before generating type-checked client and server adapters through separately policy-checked jsonrpsee APIs. It contains no unsafe code, build script, filesystem or network access, or process execution. All 4 unit tests passed."
+
+[[audits.jsonrpsee-server]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.24.11"
+notes = "Reviewed all packaged source and manifest. The crate contains no unsafe code and no build script. It is the server side of JSON-RPC over HTTP and WebSocket, so its exposure is direct, and the limits are all present and configurable: maximum request and response body size, maximum concurrent connections enforced through a connection guard, maximum subscriptions per connection, and an explicit batch-request configuration that can disable batching or cap its length. Its test target cannot be built from the published package because it imports jsonrpsee_test_utils, a dev-dependency that does not resolve standalone; the library itself builds with all features."
 
 [[audits.jsonrpsee-types]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1438,6 +1612,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.4.2"
 notes = "Reviewed all packaged source, manifest, example, and Windows FFI. The wrapper frees every SHGetKnownFolderPath allocation with CoTaskMemFree, checks the UTF-16 byte-length multiplication, and copies the bounded NUL-terminated result into an owned OsString. No build script, network access, or process execution. The applicable non-Windows documentation test passed."
+
+[[audits.konst]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.2.20"
+notes = "Reviewed all packaged source, manifest, and tests. The crate provides const-evaluable equivalents of common slice and string operations, so its failure mode is a compile error rather than a runtime one. The unsafe is unchecked slice splitting and unchecked UTF-8 in const context, each preceded by an explicit length or char-boundary check in the same const function. There is no build script, no I/O, and no ambient capability. All 149 tests passed."
 
 [[audits.konst_macro_rules]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1467,6 +1647,12 @@ criteria = "safe-to-deploy"
 version = "0.8.9"
 notes = "Reviewed all packaged source, manifest, and tests. The crate is a wrapper over dlopen and LoadLibrary, so loading a library is inherently an ambient capability the caller invokes deliberately. The wrapper is careful where it can be: Library::get returns a Symbol whose lifetime is tied to the Library so a symbol cannot outlive its handle, the unix backend serializes dlerror handling under its own lock because dlerror is not thread-safe, and the documentation is explicit that the caller must supply a correct signature for the symbol, which is why get is unsafe. There is no build script. All 34 tests passed with all features."
 
+[[audits.librocksdb-sys]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.17.3+10.4.2"
+notes = "Reviewed the manifest and build script. The crate bundles RocksDB, whose own version header reports 10.4.2, matching the version metadata in the crate version, and compiles roughly 1334 C and C++ sources with cc while generating bindings with bindgen; it fetches nothing, and it will link a system RocksDB instead when the caller asks. Auditing the bundled C++ is out of scope for this review and is noted here so the record is not read as covering it. All 2 tests passed once libclang was available for bindgen."
+
 [[audits.libyml]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -1477,6 +1663,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "1.1.29"
 notes = "The build script is the whole capability here: it compiles C sources shipped inside the package with cc and links the result, so building this crate runs a C toolchain over vendored third-party code. It fetches nothing and reads nothing outside the package and the environment variables it documents. The vendored tree identifies itself as zlib 1.3.2. The build script prefers a system zlib through pkg-config when the static feature is not requested and falls back to compiling the bundled sources; the optional zlib-ng paths are additional vendored trees selected by feature. The Rust side is extern declarations with nine unsafe expressions and no logic. Auditing the bundled C beyond confirming its provenance is out of scope for this review and is noted here so the record is not read as covering it. The package defines no tests."
+
+[[audits.libzcash_script]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.1.0"
+notes = "Reviewed the manifest, build script, and the Rust FFI surface. The crate bundles the zcashd C++ script interpreter, roughly 127 sources covering script, interpreter, pubkey, and the RIPEMD-160, SHA-1, and SHA-256 primitives, and compiles them with cc; it fetches nothing. Its eleven unsafe expressions are the FFI shims, which pass the script and transaction buffers as pointer-and-length pairs taken from Rust slices and copy results out before returning. Auditing the bundled C++ is out of scope for this review and is noted here so the record is not read as covering it; that interpreter is consensus-critical and is the reference implementation this crate exists to expose. The library builds; its test target imports test_vectors and testing modules that zcash_script only exposes under a feature the standalone resolution does not enable."
 
 [[audits.linux-raw-sys]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -1673,6 +1865,18 @@ criteria = "safe-to-deploy"
 version = "0.2.3"
 notes = "Reviewed all packaged source and manifest. The attribute macros validate single-field enum variants and distinct field types before generating type-checked From and TryFrom implementations, or parse and clone caller-supplied named fields into enum variants. They contain no unsafe code, build script, runtime I/O, or ambient capability, and the library target passed."
 
+[[audits.netdev]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.36.0"
+notes = "Reviewed all packaged source, manifest, and tests. The crate enumerates network interfaces through the platform API, getifaddrs and routing sockets on unix and the IP Helper API on Windows; its unsafe is those calls plus the walk over the returned linked list, which follows the next pointers the kernel supplied and copies each address out before freeing the list. Everything it exposes is read-only interface metadata. All 7 tests passed with all features."
+
+[[audits.netdev]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.37.3"
+notes = "Reviewed all packaged source, manifest, and tests. The structure is unchanged from 0.36: platform interface enumeration whose unsafe is the getifaddrs, routing-socket, and IP Helper calls plus the linked-list walk, with each address copied out before the list is freed and nothing exposed but read-only metadata. All 7 tests passed with all features."
+
 [[audits.netlink-packet-core]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1682,8 +1886,20 @@ notes = "Reviewed all packaged source, manifest, packet framing, parsing, serial
 [[audits.netlink-packet-route]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
+version = "0.22.0"
+notes = "Reviewed all packaged source and manifest. The crate contains no unsafe code and no build script; it encodes and decodes rtnetlink messages, and the decoding path reads kernel-supplied bytes through a length-checked buffer wrapper that returns a DecodeError on truncation rather than indexing past the end, preserving unknown attribute types as raw bytes. It is Linux-only and cannot be built on the host used for this review, so it was reviewed by reading rather than by execution. The 0.24 entry covers the same code with the same conclusion."
+
+[[audits.netlink-packet-route]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
 version = "0.24.0"
 notes = "Reviewed all packaged source and manifest. The crate contains no unsafe code and no build script; it encodes and decodes rtnetlink messages, and the decoding path is the one that reads kernel-supplied bytes. That path is written defensively: every attribute is parsed through a length-checked buffer wrapper that returns a DecodeError on truncation rather than indexing past the end, and unknown attribute types are preserved as raw bytes instead of being rejected or misinterpreted. The crate is Linux-only and cannot be built on the host used for this review, so it was reviewed by reading rather than by execution."
+
+[[audits.netwatch]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.9.0"
+notes = "Reviewed all packaged source, manifest, build script, and tests. The crate watches for network interface and route changes and wraps UDP sockets for QUIC; its ten unsafe expressions are the platform socket options and the route-monitor callbacks. Change notifications are delivered through a watch channel with the latest state rather than an unbounded queue, and the monitor is torn down on drop. The build script only emits target cfgs. All 10 tests passed with all features."
 
 [[audits.nix]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1744,6 +1960,54 @@ criteria = "safe-to-deploy"
 version = "0.1.7"
 notes = "Reviewed all packaged source and manifest across Linux, AIX, Apple, and FreeBSD implementations. Proc-file parsing is bounded; FreeBSD validates the returned struct length, embedded length, and PID; and the Apple path releases each acquired port plus the kernel thread-list allocation. There is no build script, network access, or process execution. The all-feature library target passed; the published archive omits its declared tests.rs target."
 
+[[audits.objc2]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.6.4"
+notes = "Reviewed the manifest, build script, and the core runtime abstractions. This is the foundation the generated framework crates sit on, and the parts worth checking are its ownership rules: Retained models a +1 reference and releases on drop, the message-send macros are unsafe with the selector and signature correctness stated as the caller's obligation, and autorelease pools are tied to a closure scope so a borrowed object cannot escape the pool that owns it. The build script only emits target cfgs. It builds cleanly on default features; the all-features build additionally needs a C exception helper that does not compile on this host, and the test target needs objc2-foundation, a dev-dependency that does not resolve standalone."
+
+[[audits.objc2-cloud-kit]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = """The crate is mechanically generated from Apple's framework headers: every method is a msg_send shim, which is why the unsafe count is enormous and why there is no hand-written logic to audit. It declares no ambient capability of its own beyond what the framework method being called does, and correctness is a claim about matching those headers rather than something reproducible from the package. It reaches this workspace only through objc2-ui-kit, which os_info depends on under cfg(target_os = "ios"), so it is not compiled for any target this workspace ships; it builds cleanly on default features. Its test target needs sibling objc2 dev-dependencies that do not resolve standalone. It defines no runnable tests."""
+
+[[audits.objc2-core-data]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = """The crate is mechanically generated from Apple's framework headers: every method is a msg_send shim, which is why the unsafe count is enormous and why there is no hand-written logic to audit. It declares no ambient capability of its own beyond what the framework method being called does, and correctness is a claim about matching those headers rather than something reproducible from the package. It reaches this workspace only through objc2-ui-kit, which os_info depends on under cfg(target_os = "ios"), so it is not compiled for any target this workspace ships; it builds cleanly on default features. Its test target needs sibling objc2 dev-dependencies that do not resolve standalone. It defines no runnable tests."""
+
+[[audits.objc2-core-image]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = """The crate is mechanically generated from Apple's framework headers: every method is a msg_send shim, which is why the unsafe count is enormous and why there is no hand-written logic to audit. It declares no ambient capability of its own beyond what the framework method being called does, and correctness is a claim about matching those headers rather than something reproducible from the package. It reaches this workspace only through objc2-ui-kit, which os_info depends on under cfg(target_os = "ios"), so it is not compiled for any target this workspace ships; it builds cleanly on default features. Its test target needs sibling objc2 dev-dependencies that do not resolve standalone. It defines no runnable tests."""
+
+[[audits.objc2-core-location]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = """The crate is mechanically generated from Apple's framework headers: every method is a msg_send shim, which is why the unsafe count is enormous and why there is no hand-written logic to audit. It declares no ambient capability of its own beyond what the framework method being called does, and correctness is a claim about matching those headers rather than something reproducible from the package. It reaches this workspace only through objc2-ui-kit, which os_info depends on under cfg(target_os = "ios"), so it is not compiled for any target this workspace ships; it builds cleanly on default features. Its test target needs sibling objc2 dev-dependencies that do not resolve standalone. It defines no runnable tests."""
+
+[[audits.objc2-core-text]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = "The crate is mechanically generated from Apple's framework headers: every method is a msg_send shim, which is why the unsafe count is enormous and why there is no hand-written logic to audit. It declares no ambient capability of its own beyond what the framework method being called does, and correctness is a claim about matching those headers rather than something reproducible from the package. It is reached through the same os_info dependency chain as the other framework crates and builds cleanly on default features. Its test target needs sibling objc2 dev-dependencies that do not resolve standalone. It defines no runnable tests."
+
+[[audits.objc2-ui-kit]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = """The crate is mechanically generated from Apple's framework headers: every method is a msg_send shim, which is why the unsafe count is enormous and why there is no hand-written logic to audit. It declares no ambient capability of its own beyond what the framework method being called does, and correctness is a claim about matching those headers rather than something reproducible from the package. It reaches this workspace only through objc2-ui-kit, which os_info depends on under cfg(target_os = "ios"), so it is not compiled for any target this workspace ships; it builds cleanly on default features. Its test target needs sibling objc2 dev-dependencies that do not resolve standalone. It defines no runnable tests."""
+
+[[audits.objc2-user-notifications]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = """The crate is mechanically generated from Apple's framework headers: every method is a msg_send shim, which is why the unsafe count is enormous and why there is no hand-written logic to audit. It declares no ambient capability of its own beyond what the framework method being called does, and correctness is a claim about matching those headers rather than something reproducible from the package. It reaches this workspace only through objc2-ui-kit, which os_info depends on under cfg(target_os = "ios"), so it is not compiled for any target this workspace ships; it builds cleanly on default features. Its test target needs sibling objc2 dev-dependencies that do not resolve standalone. It defines no runnable tests."""
+
 [[audits.once_cell]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
@@ -1773,17 +2037,47 @@ criteria = "safe-to-deploy"
 version = "0.2.1"
 notes = "Reviewed all packaged source and manifest. Probing reads only SSL_CERT_FILE, SSL_CERT_DIR, and a fixed list of platform certificate paths. Process-environment mutation is isolated behind an explicitly unsafe API, preserves valid existing settings, and avoids redundant setenv calls. No build script, process execution, or network access; the library and documentation targets passed."
 
+[[audits.opentelemetry]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.32.0"
+notes = "Reviewed all packaged source, manifest, and tests. The API crate contains no unsafe code and no build script; it defines the trace, metrics, and logs traits plus context propagation, and does no I/O of its own. With no SDK installed the global functions are no-ops rather than panics. All 51 library tests passed; the remaining tests import opentelemetry_sdk, a dev-dependency that does not resolve standalone."
+
 [[audits.opentelemetry-http]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.32.0"
 notes = "Reviewed all packaged source and manifest. Header propagation validates names and values, explicit client implementations perform the documented HTTP requests, and the Hyper path applies its configured timeout. The sole unsafe pin projection maps a pinned one-field Body wrapper to the structurally retained inner body. There is no build script or hidden capability; dependencies are separately policy-checked. All 5 default-feature unit tests passed."
 
+[[audits.opentelemetry-otlp]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.32.0"
+notes = "Reviewed all packaged source, manifest, and tests. The crate contains no unsafe code and no build script. It exports telemetry to a collector the operator configures, over gRPC or HTTP, so its ambient capability is that outbound connection and the OTEL_EXPORTER_ environment variables it documents. Export failures are reported through the SDK's error handler rather than panicking, and the batch processor bounds its queue and drops rather than growing without limit. All 113 tests passed with the trace, metrics, logs, grpc-tonic, and http-proto features."
+
+[[audits.opentelemetry-proto]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.32.0"
+notes = "Reviewed all packaged source and manifest. The crate is prost-generated OTLP message types plus conversions from the SDK's own types; it contains no unsafe code, no build script in the published package, and no I/O. All 46 tests passed with all features."
+
+[[audits.opentelemetry_sdk]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.32.1"
+notes = "Reviewed the manifest, the module-level documentation, and the processor and exporter plumbing. The crate contains no unsafe code and no build script. The parts that matter operationally are bounded: the batch span and log processors have a fixed queue size and drop with a count rather than growing, the periodic metric reader runs on its own interval, and shutdown flushes with a timeout instead of blocking indefinitely. Resource detection reads only the OTEL_ environment variables it documents. All 416 tests passed with all features."
+
 [[audits.optfield]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.4.0"
 notes = "Reviewed all packaged source, manifest, and tests. This procedural macro parses struct fields and attributes and emits safe optional-field, conversion, and merge implementations; it has no unsafe code, build script, runtime I/O, or ambient capability. All 54 unit and integration tests and 39 doctests passed."
+
+[[audits.orchard]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.15.4"
+notes = "Reviewed the manifest, the module-level documentation, the bundle validation path, and the note encryption. The crate holds a single unsafe expression and no build script. Bundle validation is the consensus-bearing part and it is complete: the binding signature is checked over the value commitments, each action's spend authorization signature is verified against its randomized key, nullifiers are derived rather than trusted, and the proof is verified against the pinned verifying key before the bundle is accepted. All 164 tests passed with all features, including the circuit and test-vector suites."
 
 [[audits.orchard]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1918,6 +2212,12 @@ criteria = "safe-to-deploy"
 version = "0.2.17"
 notes = "Reviewed all packaged source, manifest, expansion fixtures, and tests. Generated projections preserve pinning by exposing pinned fields only as Pin references, require &mut access for unpinned mutation, prevent conflicting Drop implementations, and use drop/overwrite guards to remain valid during unwinding. No build script, I/O, or ambient capability. All 12 doctests passed; the published compile and expansion test targets omit their workspace-only dev dependencies."
 
+[[audits.pkarr]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "3.10.0"
+notes = "Reviewed all packaged source and manifest. The crate publishes and resolves signed DNS packets over Mainline DHT and relays, so every record it accepts is attacker-supplied until proven otherwise; the signature over the packet is verified before the contents are used, the timestamp is required to be newer than any cached record to prevent replay, and the packet size is bounded by the protocol's own limit before decoding. Its test target cannot be built from the published package because it imports pkarr_relay, a dev-dependency that does not resolve standalone; the library itself builds."
+
 [[audits.pkcs8]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1929,6 +2229,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.3.33"
 notes = "Reviewed all packaged source, manifest, fixtures, and tests. This documented build helper invokes the Cargo-environment-selected pkg-config executable with structured arguments, parses escaped flags without a shell, and emits corresponding Cargo link metadata; filesystem reads are limited to existence checks for reported libraries. It has no unsafe code or network access. All 31 unit and integration tests and 3 doctests passed."
+
+[[audits.plotters]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.7"
+notes = "Reviewed all packaged source, manifest, and tests. The plotting library holds a single unsafe expression and has no build script. Drawing operations are clipped to the backing area rather than indexing past it, and the bitmap backend computes its buffer size from the requested dimensions with checked arithmetic. Its only ambient capability is writing to a file path the caller supplies. All 80 library tests passed with all features; the documentation tests render to paths relative to the repository rather than the package."
 
 [[audits.plotters-backend]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1978,6 +2284,12 @@ criteria = "safe-to-deploy"
 version = "1.13.1"
 notes = "Reviewed the manifest, build script, the backend selection, and the unsafe surface. The crate provides atomics that the target may lack natively, so nearly all of its unsafe is inline assembly for 64-bit and 128-bit atomic operations per architecture, selected by the build script from the target and its features and never by runtime guesswork. The build script emits only cfgs; the two cfgs that would trade soundness for reach, portable_atomic_unsafe_assume_single_core and portable_atomic_unsafe_assume_privileged, are gated behind cargo features of the same name that a downstream must opt into, and nothing in this workspace enables them. The published package cannot run its own tests, since src/tests imports an unpublished test_helper crate."
 
+[[audits.portmapper]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.9.0"
+notes = "Reviewed all packaged source, manifest, and tests. The crate contains no unsafe code and no build script. It requests port mappings over UPnP, NAT-PMP, and PCP, all of which mean parsing replies from a device on the local network; each protocol decoder checks the message length and opcode before reading fields, probes are bounded by timeouts, and a mapping is renewed on a timer rather than assumed permanent. All 10 tests passed with all features."
+
 [[audits.postcard-derive]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -2013,6 +2325,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.1.9"
 notes = "Reviewed all packaged source, manifest, generators, parsers, and tests. Default behavior parses explicit caller-selected Unicode/IANA data files and writes generated tables only to caller-selected paths. The optional networking feature exposes explicit HTTPS download helpers and is not enabled in Zakura; there is no unsafe code or process execution. All 4 unit tests and 2 doctests passed with locked dependencies."
+
+[[audits.prettyplease]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.2.37"
+notes = "Reviewed all packaged source, manifest, build script, and tests. The crate formats syn syntax trees back into source text; its unsafe is the ring buffer the pretty printer uses, indexed modulo its capacity. It runs at build or macro-expansion time, has no I/O, and its build script only probes the compiler version. All 10 tests passed with all features."
 
 [[audits.primitive-types]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -2060,6 +2378,12 @@ criteria = "safe-to-deploy"
 delta = "0.13.1 -> 0.13.3"
 
 [[audits.prost-build]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.14.4"
+notes = "Reviewed all packaged source, manifest, and tests. The crate runs at build time to turn .proto files into Rust; it has three unsafe expressions and its ambient capability is what code generation needs: reading the proto files and include paths the caller names, writing generated sources into OUT_DIR, and optionally invoking protoc when the caller asks for it rather than by default. Generated output goes through prettyplease rather than a shell. All 59 tests passed with all features."
+
+[[audits.prost-build]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.12.6 -> 0.13.1"
@@ -2091,6 +2415,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.12.6 -> 0.13.1"
 
+[[audits.pulldown-cmark]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.13.4"
+notes = "Reviewed the manifest, build script, and the unsafe surface, which is seven expressions around the SIMD scanner and the arena indices used by the tree builder. Markdown is untrusted input here, and the parser is written for it: the tree is built in a flat arena with explicit indices rather than by recursion, so deeply nested input cannot overflow the stack, and the HTML writer escapes text and attribute content rather than passing it through. The build script generates spec tests only under the non-default gen-tests feature and is otherwise a no-op. All 1262 tests passed with the simd, html, and serde features."
+
 [[audits.pulldown-cmark-to-cmark]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -2108,6 +2438,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.2.3"
 notes = "Reviewed all packaged source, manifest, tests, and examples. This dependency-free macro crate generates error enums plus Display, Error, From, and context conversion implementations. It has no unsafe code, build script, runtime I/O, or ambient capabilities; file access appears only in consumer-side documentation and example code. All 18 unit tests and 12 doctests passed."
+
+[[audits.quick-xml]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.41.0"
+notes = "Reviewed the manifest, the module-level documentation, and the unsafe surface, which is ten expressions of unchecked UTF-8 over spans the reader has already validated. XML is untrusted input and the reader is built for it: it is pull-based so nesting depth is the caller's loop rather than the stack, entity expansion is not performed for external or recursive entities, and the configuration exposes explicit limits for attribute and namespace handling. There is no build script. All 240 library tests passed."
 
 [[audits.quinn]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -2175,6 +2511,12 @@ criteria = "safe-to-deploy"
 version = "0.7.0"
 notes = "Reviewed all packaged source, manifest, generators, jump functions, and tests. The no_std implementations use fixed-width wrapping transitions, rotations, and explicit seed encodings and are clearly documented as non-cryptographic generators. No unsafe code, build script, I/O, or ambient authority. All 35 vector and behavior tests and 13 doctests passed with all features."
 
+[[audits.rapidhash]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "4.5.1"
+notes = "Reviewed all packaged source and manifest. The crate is a non-cryptographic hash; its unsafe is unchecked reads of 4- and 8-byte words from the input, each guarded by a preceding length check that selects the matching read width, with a checked tail path for the remainder. It is not used for anything security-bearing in this tree, and the crate documents that it is not collision-resistant against an adversary. There is no build script. Its test target cannot be built from the published package because the tests import rapidhash_c, a dev-dependency that wraps the C reference implementation and does not resolve standalone."
+
 [[audits.raw-cpuid]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
@@ -2192,6 +2534,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.5.2"
 notes = "Reviewed all packaged source, manifest, and tests. The crate contains no unsafe code and no build script. It implements RedDSA and RedJubjub or RedPallas re-randomizable signatures over jubjub and pasta_curves; signing draws its nonce from a CryptoRng combined with the message and secret, verification recomputes the challenge and rejects non-canonical or small-order encodings, and batch verification uses random weights so a batch cannot be forced to accept an invalid signature. All 39 tests passed with all features."
+
+[[audits.redox_syscall]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.5.18"
+notes = "Reviewed all packaged source and manifest. The crate is the Redox system-call interface: inline assembly per architecture plus the type definitions around it, with no build script and no logic beyond marshalling arguments into and out of the syscall convention. It is compiled only on Redox targets, which this workspace does not ship, and it builds cleanly on default features; its test target requires nightly compiler features."
 
 [[audits.ref-cast]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -2255,11 +2603,29 @@ criteria = "safe-to-deploy"
 delta = "0.8.5 -> 0.8.11"
 notes = "Reviewed the complete published-source delta and manifest changes. The optimized interval insertion preserves sorted non-overlapping canonical ranges by merging the predecessor and every overlapping successor, and Unicode property negation now uses the parsed class's effective negation state. Remaining changes are formatting, documentation, packaging, and tests. Unsafe code remains forbidden and no build script, I/O, or ambient capability was added. All 147 all-feature unit tests and 48 doctests passed."
 
+[[audits.reqwest]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.12.28"
+notes = "Reviewed the manifest, the module-level documentation, and the unsafe surface, which is five pin projections. The security-relevant defaults are correct: TLS certificate and hostname verification are on, and turning either off requires a method whose name begins with danger; redirects follow a bounded policy that also strips sensitive headers on cross-origin hops; and decompression is applied only for the encodings the caller enabled. All 45 library tests passed with the default-tls, json, stream, and gzip features; all-features is rejected by the crate itself because http3 requires the reqwest_unstable cfg."
+
+[[audits.reqwest]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.13.4"
+notes = "Reviewed the manifest, the module-level documentation, and the unsafe surface, which is unchanged in shape from 0.12: five pin projections. The same defaults hold, with verification on unless an explicitly danger-named method turns it off, bounded redirects that strip sensitive headers across origins, and opt-in decompression. All 41 library tests passed with the default-tls, json, stream, and gzip features; one further test reads a CRL bundle fixture that is not shipped in the package, and all-features is rejected because http3 requires the reqwest_unstable cfg."
+
 [[audits.resolv-conf]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.7.6"
 notes = "Reviewed all packaged source, manifest, fixtures, and tests. Parsing operates over caller-provided bytes with ordinary bounded vectors. The sole unsafe operation passes a fully initialized 1024-byte buffer and its exact length to gethostname, checks the return value, and only scans initialized bytes; static Linux instead checks /proc hostname truncation before termination. There is no build script, process execution, or network access. All 22 unit and integration tests and 6 doctests passed."
+
+[[audits.ring]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.17.14"
+notes = 'Reviewed the manifest, build script, and the Rust surface. The build script compiles vendored BoringSSL-derived C and per-architecture assembly, so building this crate runs a C toolchain over bundled cryptographic code, with pregenerated assembly shipped for the common targets; it fetches nothing. Auditing that C and assembly is out of scope for this review and is noted here so the record is not read as covering it. The published package excludes its test vector files, so the primitives rustls depends on were exercised directly instead: the SHA-256 vector for "abc" was reproduced, and across 500 Ed25519, 200 ECDSA P-256, 1000 AEAD cases split between AES-256-GCM and ChaCha20-Poly1305, and 500 HMAC-SHA256 cases, every honest operation verified and every tampered signature, message, ciphertext, tag, nonce, and additional-data value was rejected.'
 
 [[audits.ripemd]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -2283,6 +2649,12 @@ notes = "Reviewed all packaged source, generated platform bindings and resource 
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.10.1 -> 0.10.2"
+
+[[audits.rocksdb]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.24.0"
+notes = "Reviewed the manifest, the module-level documentation, and the unsafe surface, which is the C API binding layer: every handle returned by the C side is wrapped in a type that frees it exactly once on drop, slices returned from the database are copied into Rust-owned buffers before the C allocation is released, and error strings are checked and freed on every call that can produce one. Column family handles are tied to the database's lifetime so a stale handle cannot outlive it. All 276 tests passed once libclang was available for the underlying bindgen step."
 
 [[audits.ron]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -2325,6 +2697,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.38.34 -> 0.38.37"
 
+[[audits.rustls]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.23.41"
+notes = "Reviewed the manifest, the module-level documentation, and the handshake and record layers. The properties that matter are structural and hold: certificate verification is mandatory unless the caller reaches for the explicitly named dangerous_configuration escape hatch, the client requires a server name and checks it against the presented certificate, protocol versions and cipher suites are restricted to the configured set rather than negotiated downward, and the record layer enforces the per-connection message size and rejects a fragment that would exceed it before buffering. Key material is held in zeroizing types. The published package excludes its test data files, so the test target cannot be built; the library builds cleanly and the crypto provider underneath it, ring, was exercised directly under its own entry."
+
 [[audits.rustls-native-certs]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -2336,6 +2714,24 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "1.15.0"
 notes = "Reviewed all packaged source, manifest, and tests. The crate is the shared type vocabulary for rustls: DER-encoded certificates and keys, server names, and time. It contains a single unsafe expression. The interesting validation is DNS name parsing, which enforces the label and length rules and rejects a wildcard anywhere but the leftmost label, and the PEM reader, which validates the base64 payload and the section markers rather than trusting the caller. All 13 library tests passed; the documentation tests cannot run from the published package because they embed key fixtures through relative paths that are not shipped."
+
+[[audits.rustls-platform-verifier]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.7.0"
+notes = "Reviewed all packaged source, manifest, and tests. The crate delegates certificate verification to the platform trust store, Security.framework on Apple, the Windows verifier, and the system roots elsewhere, rather than reimplementing path building. It passes the server name and the presented chain to the platform and surfaces the platform's verdict without weakening it, and the test-only override for a custom root is behind an explicit constructor. All 30 tests passed with all features."
+
+[[audits.rustls-platform-verifier-android]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.1.1"
+notes = "Reviewed all packaged source and manifest. The crate is the Android half of rustls-platform-verifier: a small JNI shim that hands the certificate chain to the Android trust manager and returns its verdict. It is compiled only for Android targets, which this workspace does not ship. The package defines no tests."
+
+[[audits.rustls-webpki]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.103.13"
+notes = "Reviewed the manifest, the module-level documentation, and the path-building and name-matching code. The invariants a verifier must hold are enforced here: path building bounds both the chain length and the number of signature verifications so a crafted chain cannot drive exponential work, every intermediate is required to carry the CA basic constraint and a key usage that permits signing, name constraints are applied across the chain, and wildcard matching is restricted to the leftmost label. Validity dates are checked against the caller-supplied time rather than the system clock. The published package excludes its third-party test corpus, so the test target cannot be built; the library builds cleanly."
 
 [[audits.rustls-webpki]]
 who = "Alfredo Garcia <alfredo@zfnd.org>"
@@ -2367,6 +2763,12 @@ version = "0.10.2"
 notes = "Reviewed all packaged source, manifest, and tests. Salsa20 and XSalsa20 enforce fixed key and nonce lengths through typed arrays and operate on exact 64-byte states and blocks using wrapping arithmetic; seek calculations are checked by the stream-cipher facade. No unsafe code, build script, I/O, or ambient authority. All 8 applicable vector and seek tests and 1 doctest passed; one intentionally long test was ignored."
 
 [[audits.sapling-crypto]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.7.0"
+notes = "Reviewed the manifest, the module-level documentation, and the bundle validation path. The crate holds a single unsafe expression and no build script. Validation covers what consensus needs: spend proofs and output proofs are verified against the pinned Groth16 verifying keys, the binding signature is checked over the value balance, spend authorization signatures are verified against the randomized validating keys, and note commitments and nullifiers are recomputed rather than accepted as given. All 70 tests passed with all features."
+
+[[audits.sapling-crypto]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.1.3 -> 0.2.0"
@@ -2375,6 +2777,12 @@ delta = "0.1.3 -> 0.2.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.2.0 -> 0.3.0"
+
+[[audits.schannel]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.1.29"
+notes = "Reviewed all packaged source and manifest. The crate wraps the Windows SChannel TLS provider; its unsafe is those calls plus the buffer descriptors handed to them, which are sized from the stream sizes SChannel reports rather than assumed. Certificate validation is left to the platform and the crate surfaces its verdict. It is Windows-only, so on this host it compiles to nothing and defines no runnable tests."
 
 [[audits.schemars]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -2399,6 +2807,18 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.2.0"
 notes = "Reviewed all packaged source, manifests, tests, and example. ManuallyDrop and ptr::read operations transfer the guarded value and closure exactly once across normal drop, conditional strategies, and into_inner; the unsafe Sync implementation exposes only a shared reference to T and leaves Send enforcement to auto traits. The library has no dependencies, build script, runtime I/O, or ambient capability beyond explicitly querying whether the current thread is panicking for its standard-library strategies. All 8 unit tests and 6 doctests passed with standard support; all 3 applicable unit tests and 5 doctests passed without default features."
+
+[[audits.secp256k1]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.29.1"
+notes = "Reviewed all packaged source, manifest, and tests. The crate is the safe wrapper over secp256k1-sys; the unsafe is the FFI calls, each passing a context pointer and fixed-size buffers whose lengths match the C declarations. The security-relevant behaviour is right: secret keys are zeroized on drop and rejected if not in range, signatures are normalized to low-S on parse, and verification returns a Result rather than a bool that could be ignored. All 126 tests passed with all features; the crate needs its lints capped to build on current rustc because of an unexpected-cfg warning."
+
+[[audits.secp256k1-sys]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.10.1"
+notes = "Reviewed all packaged source, manifest, and build script. The build script compiles the vendored libsecp256k1 C sources with cc, so building this crate runs a C toolchain over bundled third-party code; it fetches nothing. The vendored tree records upstream revision 1ad5185cd42c0636104129fcc9f6a4bf9c67cc40 and is built with the ECDH, Schnorr, extrakeys, ellswift, and recovery modules and external default callbacks, so a callback abort is handled by this crate rather than by libsecp's default. Auditing the bundled C beyond confirming its provenance and build configuration is out of scope for this review and is noted here so the record is not read as covering it. All 2 tests passed with all features."
 
 [[audits.secrecy]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -2675,6 +3095,12 @@ criteria = "safe-to-deploy"
 version = "0.6.4"
 notes = "The crate is a thin, explicitly-unsafe-at-the-edges wrapper over the platform socket API: almost all of its unsafe is a libc or Winsock call plus the sockaddr storage handling around it. That handling is the part that matters and it holds up: every accept, recv-from, and getsockname path passes the capacity in and uses the length the kernel writes back rather than the buffer size, address conversions check the family before reinterpreting the storage, and socket options pass the size of the exact type being read. Sockets are owned by an OwnedFd or SOCKET handle so a descriptor is closed once, and there is no build script. This version reworks the sockaddr and socket modules for the I/O-safety types and adds newer socket options; the length-handling discipline described above is unchanged and was checked again in the reworked paths. All 17 tests passed with all features."
 
+[[audits.soketto]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.8.1"
+notes = "Reviewed all packaged source, manifest, and tests. The WebSocket implementation holds a single unsafe expression. Framing is where untrusted bytes land and it is handled correctly: the payload length is checked against a configurable maximum before any buffer is reserved, reserved bits and unexpected opcodes are rejected, a server rejects an unmasked client frame, and text frames are validated as UTF-8 before being surfaced. There is no build script. All 14 tests passed with all features."
+
 [[audits.spandoc]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -2716,6 +3142,18 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.1.0"
 notes = "Reviewed all packaged source, manifest, and tests. Unsafe string slicing uses monotonic offsets captured from String lengths after valid UTF-8 appends, and Writer records its final boundary on drop; an interrupted caller-supplied Read can leave an ungrouped valid prefix but cannot invalidate the slicing boundaries. There are no dependencies, build script, or independently acquired ambient capabilities. All 4 unit tests and 3 doctests passed."
+
+[[audits.stun-rs]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.1.11"
+notes = "Reviewed all packaged source and manifest. The crate contains no unsafe code and no build script, which matters because STUN messages arrive from unauthenticated peers. Decoding is length-checked throughout: the header's declared message length is validated against the buffer before attributes are walked, each attribute's length and padding are checked before its value is read, and unknown attributes are collected rather than misparsed. The integrity attributes are verified over the exact prefix the RFC specifies. Its test target cannot be built from the published package because it imports stun_vectors, a dev-dependency that does not resolve standalone; the library itself builds with all features."
+
+[[audits.surge-ping]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.8.4"
+notes = "Reviewed all packaged source, manifest, and tests. The crate sends ICMP echo requests, so it needs a raw or datagram socket, which is its one ambient capability and is opened explicitly by the caller. Its two unsafe expressions are socket option calls. Replies are matched by identifier and sequence before being surfaced, and each request is bounded by a timeout, so a missing or forged reply times out rather than hanging. All 4 tests passed with all features."
 
 [[audits.symlink]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -2807,6 +3245,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.63 -> 1.0.64"
 
+[[audits.thread-priority]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "1.2.0"
+notes = "Reviewed all packaged source, manifest, and tests. The crate sets thread scheduling policy and priority through the platform API; its unsafe is those calls, each checking the return code before reporting success, and the priority values are validated against the platform's allowed range before being passed down. Failure is reported as an error rather than silently ignored, which matters because a silently-ignored priority change is the failure mode that misleads a caller. All 39 tests passed with all features."
+
 [[audits.thread_local]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -2897,6 +3341,12 @@ notes = "Reviewed the manifest, the module-level documentation, and the unsafe s
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.7.11 -> 0.7.12"
+
+[[audits.tokio-websockets]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.12.3"
+notes = "Reviewed all packaged source, manifest, and tests. Frame decoding checks the payload length against the configured limit before reserving, and text payloads are validated through simdutf8 with a streaming validator that carries a partial code point across fragments rather than accepting a split sequence. The unsafe is concentrated in the masking routines, which use align_to_mut and run the scalar fallback over the unaligned prefix and suffix, so the vector path only ever sees correctly aligned data, and the SIMD variants are behind target-feature gates. There is no build script. All 9 tests passed with the client, server, rand, fastrand, and sha1_smol features."
 
 [[audits.toml]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -3144,6 +3594,12 @@ criteria = "safe-to-deploy"
 delta = "0.1.3 -> 0.1.4"
 notes = "Reviewed the complete 0.1.3 -> 0.1.4 packaged-source delta. Runtime changes replace lazy_static with once_cell::Lazy, qualify generated Option paths, update dependency floors, and deprecate an adapter; no new unsafe code, I/O, build script, or ambient capability. The all-feature library compiled. The all-feature test target has an upstream test-only initializer arity error at Lazy::new(Mutex::new); deployed code is unaffected."
 
+[[audits.tracing-opentelemetry]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.33.0"
+notes = "Reviewed all packaged source, manifest, and tests. The bridge from tracing spans to OpenTelemetry holds three unsafe expressions, all downcast helpers paired with the type they were registered under. Span data is carried in tracing's own extensions map with the lifetime of the span, and a span that ends without a parent is exported rather than dropped. There is no build script and no ambient capability beyond what the configured exporter does. All 110 tests passed with all features."
+
 [[audits.tracing-subscriber]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
@@ -3221,6 +3677,12 @@ criteria = "safe-to-deploy"
 version = "0.9.0"
 notes = "Reviewed all packaged source, manifest, tests, and maintenance scripts. This dependency-free no_std crate provides a non-allocating cursor over caller-supplied byte slices using checked indexing and slicing. It has no unsafe code, build script, runtime I/O, or ambient capabilities; packaged shell scripts are maintenance-only and Cargo does not execute them. All 13 integration tests passed."
 
+[[audits.ureq]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "3.3.0"
+notes = "Reviewed all packaged source and manifest. The blocking HTTP client holds four unsafe expressions. Its defaults are the safe ones: TLS root certificates come from webpki-roots and verification is on, with disabling it a separately named configuration flag; redirects are bounded by a configured maximum; and the response body is read through a reader with an explicit size limit rather than being buffered without bound. There is no build script. Its test target cannot be built from the published package because it imports assert_no_alloc, a dev-dependency that does not resolve standalone; the library itself builds with all features."
+
 [[audits.ureq-proto]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -3244,6 +3706,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "1.23.4"
 notes = "Reviewed all packaged source, manifest, and tests. The crate is mostly byte manipulation over a 16-byte array; its unsafe is unchecked UTF-8 over buffers the formatter has just filled with hex digits and the layout-compatible views between the array and the Uuid newtype. Parsing validates length, hyphen placement, and each hex digit before constructing, and the v4 constructor draws from getrandom rather than a weaker source. There is no build script. All 213 tests passed with all features."
+
+[[audits.vergen]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "9.1.0"
+notes = "Reviewed all packaged source, manifest, build script, and tests. The crate runs inside someone else's build script to emit build-time metadata as cargo instructions; its six unsafe expressions are environment reads. Its ambient capability is reading the environment and, under the optional git features, invoking git or reading the repository, all bounded to the crate being built, and it emits only cargo:rustc-env and cargo:rerun-if lines. It builds with all features; its test target imports test_util, a dev-dependency that does not resolve standalone."
 
 [[audits.vergen]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -3273,6 +3741,12 @@ criteria = "safe-to-deploy"
 version = "0.11.0+wasi-snapshot-preview1"
 notes = "Reviewed all packaged generated bindings, manifest, and documentation. Closed discriminant wrappers expose only valid constants to safe construction; raw-pointer convenience wrappers are unsafe, and the low-level integer WASI import surface is explicit. The no_std crate has no build script, hidden initialization, or capabilities beyond its declared WASI API. Default and no-default-feature library targets compiled; the package defines no tests."
 
+[[audits.wasm-bindgen]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.2.126"
+notes = "Reviewed the manifest, build script, and the unsafe surface, which is the ABI shim layer that moves values across the JavaScript boundary: each type's conversion is paired with the descriptor the macro emits, and the reference-count table that owns JsValue handles frees each slot exactly once. The build script only emits deprecation warnings for old features and satisfies the links key. This crate is only meaningful on wasm targets and is not linked into the native builds this workspace ships; its tests target wasm and cannot execute natively."
+
 [[audits.wasm-bindgen-futures]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -3285,6 +3759,12 @@ criteria = "safe-to-deploy"
 version = "0.2.126"
 notes = "Reviewed all packaged source, manifest, and packaged doctest fixture. The procedural macro entry points delegate token expansion to the separately policy-checked wasm-bindgen-macro-support crate and only print generated tokens when an explicit debug cfg is set. No unsafe code, build script, filesystem or network access, or process execution. The all-feature library target passed."
 
+[[audits.wasm-bindgen-macro-support]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.2.126"
+notes = "Reviewed all packaged source, manifest, and tests. This is the compile-time half of wasm-bindgen: it parses the attribute and emits the shim functions and descriptors that the runtime half relies on. It runs at compile time with no I/O and no build script; the unsafe it contains is in the code it generates rather than in its own execution, and malformed attributes produce a compile error. All 21 tests passed with all features."
+
 [[audits.wasm-bindgen-shared]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -3296,6 +3776,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.4.2"
 notes = "Reviewed all packaged source, JavaScript bindings, manifest, examples, and tests. The safe wrappers preserve stream-reader and writer lock lifetimes, release locks on drop, copy BYOB reads through separate JavaScript buffers to avoid transferring or invalidating WebAssembly memory, and map rejected promises into errors. There is no build script or hidden ambient capability. The all-feature library target compiled with its locked wasm-bindgen dependencies."
+
+[[audits.web-sys]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.103"
+notes = "Reviewed the manifest and the shape of the packaged source. The crate is generated bindings to Web APIs, mechanically derived from WebIDL, with nineteen unsafe expressions across a quarter of a million lines and no build script; there is no hand-written logic to audit and no ambient capability beyond what the browser API being called does. Like js-sys it is only meaningful on wasm targets and is not linked into the native builds this workspace ships. The package defines no natively runnable tests."
 
 [[audits.web-time]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -3332,6 +3818,60 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "1.2.1"
 notes = "Reviewed all packaged source, manifest, and tests. The crate provides UTF-16 and UTF-32 string types for FFI; its unsafe is the layout-compatible views between the owned and borrowed forms and the unchecked constructors, which are unsafe fn with their validity requirements documented. The checked constructors validate surrogate pairing before building a U16Str, and the lossy conversions substitute the replacement character rather than producing an invalid sequence. There is no build script. All 232 tests passed; all-features cannot build on stable because it enables nightly compiler features."
+
+[[audits.winapi]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.9"
+notes = "Reviewed the manifest, build script, and the shape of the packaged source. The crate is the older generation of Windows bindings: per-module type, constant, and extern declarations behind fine-grained features, with a build script that only emits link directives for the features enabled. There is no runtime logic. It reaches this workspace through dlopen2, quanta, and thread-priority, compiles to nothing on non-Windows targets, and defines no runnable tests here. Note that on the two gnu targets it pulls in the winapi-*-pc-windows-gnu import-library crates, which are held separately."
+
+[[audits.windows]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.61.3"
+notes = "The crate is mechanically generated from the Windows metadata: the enormous unsafe count is one extern declaration or call wrapper per API, not hand-written logic, and there is no runtime behaviour of its own to audit. It declares no ambient capability beyond what the Windows API being called does, and correctness is a claim about matching that metadata rather than something reproducible from the package. It compiles to nothing on the non-Windows targets this workspace ships and defines no runnable tests here. This is the full Windows API surface crate."
+
+[[audits.windows]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.62.2"
+notes = "The crate is mechanically generated from the Windows metadata: the enormous unsafe count is one extern declaration or call wrapper per API, not hand-written logic, and there is no runtime behaviour of its own to audit. It declares no ambient capability beyond what the Windows API being called does, and correctness is a claim about matching that metadata rather than something reproducible from the package. It compiles to nothing on the non-Windows targets this workspace ships and defines no runnable tests here. This is the full Windows API surface crate; a second major version is in the graph alongside 0.61."
+
+[[audits.windows-collections]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.2.0"
+notes = "The crate is mechanically generated from the Windows metadata: the enormous unsafe count is one extern declaration or call wrapper per API, not hand-written logic, and there is no runtime behaviour of its own to audit. It declares no ambient capability beyond what the Windows API being called does, and correctness is a claim about matching that metadata rather than something reproducible from the package. It compiles to nothing on the non-Windows targets this workspace ships and defines no runnable tests here. It provides the WinRT collection interfaces. Its test target additionally fails to resolve against a freshly picked windows-core, which is a standalone-resolution artifact rather than a defect."
+
+[[audits.windows-collections]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = "The crate is mechanically generated from the Windows metadata: the enormous unsafe count is one extern declaration or call wrapper per API, not hand-written logic, and there is no runtime behaviour of its own to audit. It declares no ambient capability beyond what the Windows API being called does, and correctness is a claim about matching that metadata rather than something reproducible from the package. It compiles to nothing on the non-Windows targets this workspace ships and defines no runnable tests here. It provides the WinRT collection interfaces; a second major version is in the graph alongside 0.2."
+
+[[audits.windows-core]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.61.2"
+notes = "Reviewed all packaged source and manifest. Unlike the generated surface crates this one is hand-written and small, and it is where the COM discipline lives: interface pointers are reference counted with AddRef and Release paired to clone and drop, QueryInterface results are checked before the pointer is used, and HSTRING and BSTR wrappers free with the matching allocator. That discipline is what the generated crates depend on. It compiles to nothing on the non-Windows targets this workspace ships and defines no runnable tests here."
+
+[[audits.windows-core]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.62.2"
+notes = "Reviewed all packaged source and manifest. The COM reference-counting and string-ownership discipline is unchanged from 0.61: AddRef and Release paired to clone and drop, QueryInterface results checked before use, and HSTRING and BSTR freed with the matching allocator. A second major version is in the graph alongside 0.61. It compiles to nothing on the non-Windows targets this workspace ships and defines no runnable tests here."
+
+[[audits.windows-future]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.2.1"
+notes = "The crate is mechanically generated from the Windows metadata: the enormous unsafe count is one extern declaration or call wrapper per API, not hand-written logic, and there is no runtime behaviour of its own to audit. It declares no ambient capability beyond what the Windows API being called does, and correctness is a claim about matching that metadata rather than something reproducible from the package. It compiles to nothing on the non-Windows targets this workspace ships and defines no runnable tests here. It provides the WinRT async operation types. Its test target additionally fails to resolve against a freshly picked windows-core, which is a standalone-resolution artifact rather than a defect."
+
+[[audits.windows-future]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = "The crate is mechanically generated from the Windows metadata: the enormous unsafe count is one extern declaration or call wrapper per API, not hand-written logic, and there is no runtime behaviour of its own to audit. It declares no ambient capability beyond what the Windows API being called does, and correctness is a claim about matching that metadata rather than something reproducible from the package. It compiles to nothing on the non-Windows targets this workspace ships and defines no runnable tests here. It provides the WinRT async operation types; a second major version is in the graph alongside 0.2."
 
 [[audits.windows-interface]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -3380,6 +3920,18 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 delta = "0.4.2 -> 0.5.1"
 notes = "Reviewed the complete packaged source and manifest delta. Changes are Rust 2024 unsafe-extern syntax, Self and formatter cleanup, a safe builder Debug implementation, dependency updates, and relocation of the literal HSTRING header within the macro with the same repr(C) layout; reviewed ownership and pointer invariants are unchanged. The host library target compiled; its Windows-only doctest cannot resolve cfg-gated exports on macOS."
+
+[[audits.windows-sys]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.52.0"
+notes = "The crate is mechanically generated from the Windows metadata: the enormous unsafe count is one extern declaration or call wrapper per API, not hand-written logic, and there is no runtime behaviour of its own to audit. It declares no ambient capability beyond what the Windows API being called does, and correctness is a claim about matching that metadata rather than something reproducible from the package. It compiles to nothing on the non-Windows targets this workspace ships and defines no runnable tests here. This is the raw extern-only variant, with no COM wrappers."
+
+[[audits.windows-sys]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.61.2"
+notes = "The crate is mechanically generated from the Windows metadata: the enormous unsafe count is one extern declaration or call wrapper per API, not hand-written logic, and there is no runtime behaviour of its own to audit. It declares no ambient capability beyond what the Windows API being called does, and correctness is a claim about matching that metadata rather than something reproducible from the package. It compiles to nothing on the non-Windows targets this workspace ships and defines no runnable tests here. This is the raw extern-only variant; a second major version is in the graph alongside 0.52."
 
 [[audits.windows-sys]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -3454,11 +4006,23 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.6.13 -> 0.6.18"
 
+[[audits.wmi]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.17.3"
+notes = "Reviewed all packaged source and manifest. The crate queries Windows Management Instrumentation through COM; its unsafe is the COM vtable calls plus the VARIANT conversions, each checking the HRESULT before reading the returned value and freeing the variant afterwards. COM is initialized and uninitialized in matching pairs tied to a guard type. It is Windows-only and cannot be built or tested on the host used for this review, so it was reviewed by reading rather than by execution."
+
 [[audits.writeable]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.6.3"
 notes = "Reviewed all packaged source, manifests, tests, example, and benchmark. The crate formats caller-supplied values into caller-supplied fmt sinks using checked and saturating length hints; its unsafe UTF-8 conversions consume only an ASCII digit buffer or a prefix incrementally proven equal to valid str chunks. It has no build script, runtime I/O, or ambient capabilities, and the optional either dependency remains separately policy-checked. All 15 unit tests, 1 integration test, and 20 doctests passed with all features, and the no-allocation library target compiled. The published example omits its workspace-only instrumentation dependency and therefore prevents an unfiltered cargo test from compiling that example."
+
+[[audits.ws_stream_wasm]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.7.5"
+notes = "Reviewed all packaged source, manifest, build script, and tests. The crate adapts a browser WebSocket to the async read and write traits; it holds a single unsafe expression and its build script only emits a cfg. Close handling distinguishes a clean close from an error rather than surfacing both as end-of-stream, and the pending-message queue is bounded by the browser's own buffered-amount reporting. It is a wasm-only crate: its tests build for wasm32 and cannot execute natively, and it is not linked into the native builds this workspace ships."
 
 [[audits.wyz]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -3489,6 +4053,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.10.3"
 notes = "Reviewed all packaged source, manifest, fixtures, and tests. The parser builds owned tree nodes from xml-rs events and the emitter writes only to caller-provided writers; memory use is proportional to caller input. It has no unsafe code, build script, filesystem access beyond caller-provided handles, process execution, or network access. The library target and 15 of 19 integration tests passed; four legacy fixtures contain declarations or CDATA where the locked xml-rs parser now rejects them as invalid XML."
+
+[[audits.yoke]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.8.3"
+notes = "Reviewed all packaged source, manifest, and tests. Yoke is the lifetime-erasure mechanism the ICU stack is built on, so it is unsafe by nature: it stores data borrowed from a cart alongside the cart itself and hands out that data with a lifetime derived from the Yoke rather than the original borrow. The Yokeable trait that makes this sound is unsafe, its obligation is stated as the type being covariant in its lifetime with no other lifetime-dependent behaviour, and the derive generates the impl rather than leaving it to hand. Projection functions take a closure that cannot capture a shorter-lived borrow. There is no build script. All 58 tests passed."
 
 [[audits.yoke-derive]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -3635,6 +4205,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.0 -> 0.4.0"
 
+[[audits.zcash_script]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.4.5"
+notes = "Reviewed all packaged source, manifest, and tests. This is the pure-Rust transparent script implementation, no_std with a single unsafe expression and no build script. The interpreter is written for adversarial input: the stack and altstack are bounded by the consensus limits, opcode and script size limits are enforced before execution, disabled opcodes are rejected outright, and numeric operands go through a checked conversion that rejects overlong encodings rather than wrapping. All 8 tests passed with all features."
+
 [[audits.zcash_spec]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -3681,6 +4257,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.5.0"
 notes = "Reviewed all packaged source, manifest, and tests. The safe procedural macros generate field-wise Zeroize and Drop matches, honor explicit skip and bound attributes, reject unsupported unions and misplaced attributes, and introduce no behavior beyond calls to separately policy-checked zeroize traits. No build script, I/O, or ambient capability. All 27 unit tests passed."
+
+[[audits.zerotrie]]
+who = "Claude Opus 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.2.4"
+notes = "Reviewed all packaged source, manifest, and tests. The crate stores string-to-int maps in a compact byte trie; its unsafe is unchecked UTF-8 over key spans the trie walk has already bounded. Reading is a bounded walk over the backing slice that returns None on a malformed or truncated trie rather than indexing past the end. There is no build script and no ambient capability. All 8 tests passed."
 
 [[audits.zip32]]
 who = "OpenAI Codex <noreply@openai.com>"

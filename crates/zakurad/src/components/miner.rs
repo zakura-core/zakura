@@ -645,7 +645,7 @@ where
                     info!(?error, "could not set miner to run at a low priority: running at default priority");
                 }
 
-                Solution::solve(header, solver_action)
+                Solution::solve_cancellable(header, solver_action)
             }).expect("unable to spawn miner thread");
 
             miner_thread_handle.wait_for_panics()

@@ -212,7 +212,7 @@ impl Solution {
     /// Mines and returns one or more [`Solution`]s based on a template `header`.
     /// The returned header contains a valid `nonce` and `solution`.
     ///
-    /// Returns early with `Err(SolverCancelled)` when `solver_action()` requests a stop.
+    /// If `cancel_fn()` returns an error, returns early with `Err(SolverCancelled)`.
     ///
     /// The `nonce` in the header template is taken as the starting nonce. If you are running multiple
     /// solvers at the same time, start them with different nonces.
@@ -222,7 +222,26 @@ impl Solution {
     /// It can run for minutes or hours if the network difficulty is high.
     #[cfg(feature = "internal-miner")]
     #[allow(clippy::unwrap_in_result)]
-    pub fn solve<F>(
+    pub fn solve<F>(header: Header, mut cancel_fn: F) -> Result<AtLeastOne<Header>, SolverCancelled>
+    where
+        F: FnMut() -> Result<(), SolverCancelled>,
+    {
+        Self::solve_cancellable(header, || {
+            if cancel_fn().is_ok() {
+                SolverAction::Continue
+            } else {
+                SolverAction::StopAtNonceBoundary
+            }
+        })
+    }
+
+    /// Mines and returns one or more [`Solution`]s based on a template `header`.
+    ///
+    /// `solver_action()` can preserve the current nonce, stop before the next
+    /// nonce, or discard the current nonce at the next digit boundary.
+    #[cfg(feature = "internal-miner")]
+    #[allow(clippy::unwrap_in_result)]
+    pub fn solve_cancellable<F>(
         mut header: Header,
         mut solver_action: F,
     ) -> Result<AtLeastOne<Header>, SolverCancelled>

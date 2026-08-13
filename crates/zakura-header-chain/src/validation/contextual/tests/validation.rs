@@ -248,6 +248,15 @@ fn median_and_production_max_time_boundaries_are_exact() {
         assert_eq!(adjustment.median_time_past(), expected[expected.len() / 2]);
     }
 
+    let configured_testnet_height_one = Parameters::build()
+        .with_max_block_time_start_height(block::Height(1))
+        .to_network()
+        .expect("the configured Testnet height-one policy is valid");
+    let configured_regtest_height_one = Network::new_regtest(RegtestParameters {
+        max_block_time_start_height: Some(block::Height(1)),
+        ..Default::default()
+    });
+
     for (network, height, max_is_active) in [
         (Network::Mainnet, block::Height(1), false),
         (Network::Mainnet, block::Height(2), true),
@@ -257,6 +266,8 @@ fn median_and_production_max_time_boundaries_are_exact() {
             false,
         ),
         (Network::new_default_testnet(), block::Height(653_606), true),
+        (configured_testnet_height_one, block::Height(1), true),
+        (configured_regtest_height_one, block::Height(1), true),
     ] {
         let context = vec![
             (network.target_difficulty_limit().to_compact(), base);

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
 use zakura_chain::{
-    parameters::NetworkUpgrade,
+    parameters::{Network, NetworkUpgrade},
     work::difficulty::{CompactDifficulty, ParameterDifficulty as _},
 };
 
@@ -60,8 +60,11 @@ pub fn validate_contextual_difficulty_and_time(
         });
     }
 
-    // This rule excludes Mainnet height 1 and Testnet heights below 653,606.
-    if candidate_height.0 >= 2
+    // The production Mainnet consensus rule starts at height 2. Configured
+    // Testnet and Regtest networks can activate it at height 1.
+    let is_mainnet_height_one = matches!(network, Network::Mainnet) && candidate_height.0 == 1;
+    if candidate_height != genesis_height
+        && !is_mainnet_height_one
         && network.is_max_block_time_enforced(candidate_height)
         && candidate_time > block_time_max
     {
